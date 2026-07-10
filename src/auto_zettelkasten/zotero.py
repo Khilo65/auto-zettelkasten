@@ -9,6 +9,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from . import ENGINE_VERSION
 from .files import require_loopback_http_url
 
 
@@ -120,6 +121,17 @@ class ZoteroLocalClient:
         quoted = urllib.parse.quote(item_key, safe="")
         return self._paginate(f"users/{self.library_id}/items/{quoted}/children")
 
+    def item(self, item_key: str) -> Mapping[str, Any] | None:
+        quoted = urllib.parse.quote(item_key, safe="")
+        try:
+            payload, _ = self._request(f"users/{self.library_id}/items/{quoted}")
+        except ZoteroError as exc:
+            if "HTTP 404" in str(exc):
+                return None
+            raise
+        value = json.loads(payload.decode("utf-8") or "{}")
+        return value if isinstance(value, dict) else None
+
     def fulltext(self, item_key: str) -> Mapping[str, Any] | None:
         quoted = urllib.parse.quote(item_key, safe="")
         try:
@@ -192,7 +204,7 @@ class ZoteroLocalClient:
             headers={
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "auto-zettelkasten/0.1.0",
+                "User-Agent": f"auto-zettelkasten/{ENGINE_VERSION}",
                 "Zotero-API-Version": "3",
             },
         )

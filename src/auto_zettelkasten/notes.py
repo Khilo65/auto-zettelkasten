@@ -109,6 +109,18 @@ def propose_tags(item: Mapping[str, Any], note_id: str) -> list[dict[str, Any]]:
     return rows
 
 
+def _dump_frontmatter(frontmatter: Mapping[str, Any]) -> str:
+    # Obsidian does not treat a wiki link split across a folded YAML scalar as
+    # a navigable link. Atomic-note metadata can contain long note titles, so
+    # keep generated scalar values on one physical line.
+    return yaml.safe_dump(
+        dict(frontmatter),
+        sort_keys=False,
+        allow_unicode=True,
+        width=1_000_000,
+    ).strip()
+
+
 def normalize_tag(value: str) -> str:
     value = unicodedata.normalize("NFKC", value).casefold().strip()
     value = re.sub(r"[\s_/]+", "-", value)
@@ -118,7 +130,7 @@ def normalize_tag(value: str) -> str:
 
 
 def render_atomic_note(frontmatter: Mapping[str, Any], analysis: Mapping[str, Any]) -> str:
-    yaml_text = yaml.safe_dump(dict(frontmatter), sort_keys=False, allow_unicode=True).strip()
+    yaml_text = _dump_frontmatter(frontmatter)
     title = str(frontmatter.get("title") or "Untitled Source")
     lines = ["---", yaml_text, "---", "", f"# {title}", ""]
     for key, heading in SECTION_HEADINGS:
@@ -211,6 +223,15 @@ def parse_atomic_note(text: str) -> tuple[dict[str, Any], str]:
     return (dict(payload) if isinstance(payload, Mapping) else {}), text[end + 5 :]
 
 
+def normalize_note_frontmatter(text: str) -> str:
+    """Re-render generated note metadata without folded wiki-link scalars."""
+
+    frontmatter, body = parse_atomic_note(text)
+    if not frontmatter:
+        return text
+    return f"---\n{_dump_frontmatter(frontmatter)}\n---\n{body}"
+
+
 def read_note(path: Path) -> dict[str, Any]:
     text = path.read_text(encoding="utf-8")
     frontmatter, body = parse_atomic_note(text)
@@ -221,7 +242,7 @@ def update_note_frontmatter(path: Path, updates: Mapping[str, Any]) -> None:
     text = path.read_text(encoding="utf-8")
     frontmatter, body = parse_atomic_note(text)
     frontmatter.update(dict(updates))
-    yaml_text = yaml.safe_dump(frontmatter, sort_keys=False, allow_unicode=True).strip()
+    yaml_text = _dump_frontmatter(frontmatter)
     atomic_write_text(path, f"---\n{yaml_text}\n---\n{body}")
 
 
@@ -242,7 +263,7 @@ def update_note_graph(
         graph_lines.append(f"- cluster: [[{cluster_id}]]")
     if not related_links and not cluster_ids:
         graph_lines.append("No committed typed links or canonical clusters yet.")
-    yaml_text = yaml.safe_dump(frontmatter, sort_keys=False, allow_unicode=True).strip()
+    yaml_text = _dump_frontmatter(frontmatter)
     graph_text = "\n".join(graph_lines)
     atomic_write_text(path, f"---\n{yaml_text}\n---\n{body}{graph_text}\n")
 

@@ -60,6 +60,13 @@ def test_file_view_url_fallback_reads_local_file(tmp_path: Path) -> None:
     assert all(method == "GET" for method, endpoint in client.calls if "connector/" not in endpoint)
 
 
+def test_exact_item_lookup_is_read_only_and_404_is_none() -> None:
+    client = StubClient({"users/0/items/ITEM": (_encoded({"key": "ITEM", "data": {"key": "ITEM"}}), {})})
+    assert client.item("ITEM") == {"key": "ITEM", "data": {"key": "ITEM"}}
+    assert client.item("MISSING") is None
+    assert client.calls == [("GET", "users/0/items/ITEM"), ("GET", "users/0/items/MISSING")]
+
+
 def test_real_connector_selected_shape_resolves_unique_api_collection_path() -> None:
     connector = {
         "libraryID": 1,

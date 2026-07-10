@@ -5,7 +5,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .files import atomic_write_text, now_iso, sha256_text, slugify, write_yaml
+from .files import atomic_write_text, now_iso, read_yaml, sha256_text, slugify, write_yaml
 
 
 def build_literature_map(
@@ -166,7 +166,71 @@ def _write_clusters(workspace: Path, clusters: Sequence[Mapping[str, Any]], reje
     index_path = root / "INDEX.md"
     atomic_write_text(index_path, "\n".join(index_lines) + "\n")
     paths.append(index_path)
+    render_cluster_expansion_navigation(workspace)
     return paths
+
+
+def render_cluster_expansion_navigation(workspace: Path) -> list[Path]:
+    """Project scoped suggestions onto generated cluster pages as non-members."""
+
+    payload = read_yaml(
+        workspace / "03_literature_synthesis" / "expansion" / "candidates.yml",
+        {},
+    ) or {}
+    candidates = payload.get("candidates", []) if isinstance(payload, Mapping) else []
+    rows = [row for row in candidates if isinstance(row, Mapping)] if isinstance(candidates, list) else []
+    cluster_root = workspace / "03_literature_synthesis" / "clusters"
+    paths: list[Path] = []
+    for path in sorted(cluster_root.glob("cluster-*.md")):
+        cluster_id = path.stem
+        related = [
+            row
+            for row in rows
+            if cluster_id
+            in (
+                [str(value) for value in row.get("related_cluster_ids", [])]
+                if isinstance(row.get("related_cluster_ids"), list)
+                else []
+            )
+        ]
+        lines = ["## Expansion Suggestions (Non-Members)", ""]
+        if related:
+            for row in sorted(
+                related,
+                key=lambda value: (-_float(value.get("score")), str(value.get("suggestion_id", ""))),
+            ):
+                suggestion_id = str(row.get("suggestion_id", ""))
+                alias = _safe_expansion_title(str(row.get("title") or row.get("work_id") or suggestion_id))
+                relation = str(row.get("primary_relation", ""))
+                state = str(row.get("state", "proposed"))
+                lines.append(
+                    f"- [[{suggestion_id}|{alias}]] — discovery `{relation}`; "
+                    f"decision `{state}`; non-member"
+                )
+        else:
+            lines.append("No graph-expansion suggestions are associated with this cluster.")
+        current = path.read_text(encoding="utf-8")
+        base = re.sub(
+            r"\n*## Expansion Suggestions \(Non-Members\)\s*\n.*\Z",
+            "",
+            current,
+            flags=re.DOTALL,
+        ).rstrip()
+        atomic_write_text(path, base + "\n\n" + "\n".join(lines) + "\n")
+        paths.append(path)
+    return paths
+
+
+def _safe_expansion_title(value: str) -> str:
+    text = re.sub(r"\s+", " ", value).strip()
+    return text.replace("[[", "[").replace("]]", "]").replace("|", "-")[:500] or "Untitled suggestion"
+
+
+def _float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _write_gaps(workspace: Path, gaps: Sequence[Mapping[str, Any]]) -> list[Path]:

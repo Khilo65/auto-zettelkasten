@@ -1,0 +1,152 @@
+{
+  "benchmark_version": "1.0",
+  "recall_at_k": 25,
+  "minimum_holdout_recall": 0.7,
+  "exact_graph": {
+    "seed": {
+      "key": "EXACTSEED",
+      "title": "Exact Graph Seed",
+      "year": "2024",
+      "doi": "10.7777/exact-seed",
+      "author": "Seed Author",
+      "tags": ["Benchmark Topic"],
+      "relations": {
+        "dc:references": ["XR01", "XR01D", "XR02", "XR03", "XR04", "XR05", "XR06", "XR07", "XR08"]
+      }
+    },
+    "relation_works": [
+      {"key": "XR01", "title": "Exact Relation 01", "year": "2021", "doi": "10.7777/exact-r01"},
+      {"key": "XR01D", "title": "Exact Relation 01 Duplicate Record", "year": "2021", "doi": "10.7777/exact-r01"},
+      {"key": "XR02", "title": "Exact Relation 02", "year": "2021", "doi": "10.7777/exact-r02"},
+      {"key": "XR03", "title": "Exact Relation 03", "year": "2021", "doi": "10.7777/exact-r03"},
+      {"key": "XR04", "title": "Exact Relation 04", "year": "2021", "doi": "10.7777/exact-r04"},
+      {"key": "XR05", "title": "Exact Relation 05", "year": "2021", "doi": "10.7777/exact-r05"},
+      {"key": "XR06", "title": "Exact Relation 06", "year": "2021", "doi": "10.7777/exact-r06"},
+      {"key": "XR07", "title": "Exact Relation 07", "year": "2021", "doi": "10.7777/exact-r07"},
+      {"key": "XR08", "title": "Exact Relation 08", "year": "2021", "doi": "10.7777/exact-r08"}
+    ],
+    "citation_works": [
+      {"key": "XC01", "title": "Exact Citation 01", "year": "2020", "doi": "10.7777/exact-c01"},
+      {"key": "XC02", "title": "Exact Citation 02", "year": "2020", "doi": "10.7777/exact-c02"},
+      {"key": "XC03", "title": "Exact Citation 03", "year": "2020", "doi": "10.7777/exact-c03"},
+      {"key": "XC04", "title": "Exact Citation 04", "year": "2020", "doi": "10.7777/exact-c04"},
+      {"key": "XC05", "title": "Exact Citation 05", "year": "2020", "doi": "10.7777/exact-c05"},
+      {"key": "XC06", "title": "Exact Citation 06", "year": "2020", "doi": "10.7777/exact-c06"},
+      {"key": "XC07", "title": "Exact Citation 07", "year": "2020", "doi": "10.7777/exact-c07"},
+      {"key": "XC08", "title": "Exact Citation Overlap", "year": "2021", "doi": "10.7777/exact-r02"}
+    ],
+    "distractor_works": [
+      {"key": "XD01", "title": "Tag Distractor 01", "year": "2019", "doi": "10.7777/distractor-01", "tags": ["Benchmark Topic"]},
+      {"key": "XD02", "title": "Tag Distractor 02", "year": "2019", "doi": "10.7777/distractor-02", "tags": ["Benchmark Topic"]},
+      {"key": "XD03", "title": "Tag Distractor 03", "year": "2019", "doi": "10.7777/distractor-03", "tags": ["Benchmark Topic"]},
+      {"key": "XD04", "title": "Tag Distractor 04", "year": "2019", "doi": "10.7777/distractor-04", "tags": ["Benchmark Topic"]},
+      {"key": "XD05", "title": "Tag Distractor 05", "year": "2019", "doi": "10.7777/distractor-05", "tags": ["Benchmark Topic"]},
+      {"key": "XD06", "title": "Tag Distractor 06", "year": "2019", "doi": "10.7777/distractor-06", "tags": ["Benchmark Topic"]},
+      {"key": "XD07", "title": "Tag Distractor 07", "year": "2019", "doi": "10.7777/distractor-07", "tags": ["Benchmark Topic"]},
+      {"key": "XD08", "title": "Tag Distractor 08", "year": "2019", "doi": "10.7777/distractor-08", "tags": ["Benchmark Topic"]},
+      {"key": "XD09", "title": "Tag Distractor 09", "year": "2019", "doi": "10.7777/distractor-09", "tags": ["Benchmark Topic"]},
+      {"key": "XD10", "title": "Tag Distractor 10", "year": "2019", "doi": "10.7777/distractor-10", "tags": ["Benchmark Topic"]},
+      {"key": "XD11", "title": "Tag Distractor 11", "year": "2019", "doi": "10.7777/distractor-11", "tags": ["Benchmark Topic"]},
+      {"key": "XD12", "title": "Tag Distractor 12", "year": "2019", "doi": "10.7777/distractor-12", "tags": ["Benchmark Topic"]},
+      {"key": "XD13", "title": "Tag Distractor 13", "year": "2019", "doi": "10.7777/distractor-13", "tags": ["Benchmark Topic"]},
+      {"key": "XD14", "title": "Tag Distractor 14", "year": "2019", "doi": "10.7777/distractor-14", "tags": ["Benchmark Topic"]},
+      {"key": "XD15", "title": "Tag Distractor 15", "year": "2019", "doi": "10.7777/distractor-15", "tags": ["Benchmark Topic"]}
+    ],
+    "gold_dois": [
+      "10.7777/exact-r01", "10.7777/exact-r02", "10.7777/exact-r03", "10.7777/exact-r04",
+      "10.7777/exact-r05", "10.7777/exact-r06", "10.7777/exact-r07", "10.7777/exact-r08",
+      "10.7777/exact-c01", "10.7777/exact-c02", "10.7777/exact-c03", "10.7777/exact-c04",
+      "10.7777/exact-c05", "10.7777/exact-c06", "10.7777/exact-c07"
+    ],
+    "holdout_positive_dois": [
+      "10.7777/exact-r01", "10.7777/exact-r03", "10.7777/exact-r05", "10.7777/exact-r07",
+      "10.7777/exact-c01", "10.7777/exact-c02", "10.7777/exact-c03", "10.7777/exact-c04",
+      "10.7777/exact-c05", "10.7777/exact-c06", "10.7777/exact-c07"
+    ]
+  },
+  "depth_graph": {
+    "seed": {
+      "key": "DEPTHSEED",
+      "title": "Depth Graph Seed",
+      "year": "2024",
+      "doi": "10.7777/depth-seed",
+      "relations": {
+        "dc:references": ["DEPTHB"],
+        "dc:isReferencedBy": ["DEPTHD"]
+      }
+    },
+    "works": [
+      {
+        "key": "DEPTHB", "title": "Depth One Cited Work", "year": "2022", "doi": "10.7777/depth-b",
+        "relations": {"dc:isReferencedBy": ["DEPTHC"]}
+      },
+      {
+        "key": "DEPTHC", "title": "Depth Two Coupled Work", "year": "2021", "doi": "10.7777/depth-c",
+        "relations": {"dc:references": ["DEPTHB"]}
+      },
+      {
+        "key": "DEPTHD", "title": "Depth One Citing Work", "year": "2023", "doi": "10.7777/depth-d",
+        "relations": {"dc:references": ["DEPTHE"]}
+      },
+      {
+        "key": "DEPTHE", "title": "Depth Two Co-Cited Work", "year": "2020", "doi": "10.7777/depth-e",
+        "relations": {"dc:isReferencedBy": ["DEPTHD"]}
+      }
+    ],
+    "depth_one_dois": ["10.7777/depth-b", "10.7777/depth-d"],
+    "depth_two_relations": {
+      "10.7777/depth-c": "bibliographic_coupling",
+      "10.7777/depth-e": "co_cited_with"
+    }
+  },
+  "round_robin": {
+    "seeds": [
+      {
+        "key": "ROUNDSEEDA", "title": "Round Robin Seed A", "year": "2024", "doi": "10.7777/round-seed-a",
+        "relations": {"dc:references": ["ROUNDA1", "ROUNDA2", "ROUNDA3", "ROUNDA4"]}
+      },
+      {
+        "key": "ROUNDSEEDB", "title": "Round Robin Seed B", "year": "2024", "doi": "10.7777/round-seed-b",
+        "relations": {"dc:references": ["ROUNDB1", "ROUNDB2", "ROUNDB3", "ROUNDB4"]}
+      }
+    ],
+    "works": [
+      {"key": "ROUNDA1", "title": "Round A 1", "year": "2020", "doi": "10.7777/round-a1"},
+      {"key": "ROUNDA2", "title": "Round A 2", "year": "2020", "doi": "10.7777/round-a2"},
+      {"key": "ROUNDA3", "title": "Round A 3", "year": "2020", "doi": "10.7777/round-a3"},
+      {"key": "ROUNDA4", "title": "Round A 4", "year": "2020", "doi": "10.7777/round-a4"},
+      {"key": "ROUNDB1", "title": "Round B 1", "year": "2020", "doi": "10.7777/round-b1"},
+      {"key": "ROUNDB2", "title": "Round B 2", "year": "2020", "doi": "10.7777/round-b2"},
+      {"key": "ROUNDB3", "title": "Round B 3", "year": "2020", "doi": "10.7777/round-b3"},
+      {"key": "ROUNDB4", "title": "Round B 4", "year": "2020", "doi": "10.7777/round-b4"}
+    ],
+    "budget": 5
+  },
+  "ambiguous_identity": {
+    "seed": {"key": "AMBSEED", "title": "Ambiguous Identity Seed", "year": "2024", "doi": "10.7777/amb-seed"},
+    "reference": "Doe, Dana. (2024). Shared Ambiguous Study.",
+    "works": [
+      {"key": "AMB1", "title": "Shared Ambiguous Study", "year": "2024", "author": "Doe, Dana"},
+      {"key": "AMB2", "title": "Shared Ambiguous Study", "year": "2024", "author": "Doe, Dana"}
+    ]
+  },
+  "semantic_graph": {
+    "seed": {"key": "SEMSEED", "title": "Semantic Graph Seed", "year": "2024", "doi": "10.7777/semantic-seed"},
+    "neighbors": [
+      {
+        "title": "Semantic Co-Citation Candidate", "year": "2022", "authors": ["Co Citation"],
+        "doi": "10.7777/semantic-co-cited", "relation_type": "co_cited_with", "provider_relevance": 0.91
+      },
+      {
+        "title": "Semantic Coupling Candidate", "year": "2021", "authors": ["Bib Coupling"],
+        "doi": "10.7777/semantic-coupling", "relation_type": "bibliographic_coupling", "provider_relevance": 0.88
+      }
+    ],
+    "recommendations": [
+      {
+        "title": "Semantic Recommendation Candidate", "year": "2023", "authors": ["Recommendation Author"],
+        "doi": "10.7777/semantic-recommendation", "provider_relevance": 0.93
+      }
+    ]
+  }
+}

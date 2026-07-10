@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from auto_zettelkasten.api import doctor, export_to_obsidian, initialize_workspace, inventory
-from auto_zettelkasten.cli import main
+from auto_zettelkasten.cli import build_parser, main
 from auto_zettelkasten.files import read_yaml, write_yaml
 
 from conftest import FakeZotero
@@ -16,7 +16,7 @@ from conftest import FakeZotero
 def test_package_has_no_research_os_imports() -> None:
     package = Path(__file__).parents[1] / "src" / "auto_zettelkasten"
     violations = []
-    for path in package.glob("*.py"):
+    for path in package.rglob("*.py"):
         tree = ast.parse(path.read_text(), filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, ast.Import) and any(alias.name == "research_os" or alias.name.startswith("research_os.") for alias in node.names):
@@ -33,7 +33,7 @@ def test_inventory_only_writes_scope_manifest_and_resolves_selected(tmp_path: Pa
     assert result["item_count"] == 1
     assert result["collection_key"] == "SELECTEDKEY"
     assert result["source_set"]["zotero_collection_key"] == "SELECTEDKEY"
-    assert result["artifact_manifest"]["artifact_schema_version"] == "1.0"
+    assert result["artifact_manifest"]["artifact_schema_version"] == "1.1"
 
 
 def test_run_ids_cannot_escape_workspace_state(tmp_path: Path, sample_items) -> None:
@@ -47,7 +47,17 @@ def test_doctor_reports_each_required_surface(tmp_path: Path, sample_items) -> N
     initialize_workspace(tmp_path)
     report = doctor(tmp_path, client=FakeZotero(sample_items))
     assert report.status == "blocked"
-    assert set(report.checks) == {"workspace", "schema", "zotero", "provider", "pdf_extraction", "ocr", "privacy", "obsidian"}
+    assert set(report.checks) == {
+        "workspace",
+        "schema",
+        "zotero",
+        "provider",
+        "pdf_extraction",
+        "ocr",
+        "privacy",
+        "obsidian",
+        "expansion",
+    }
     assert report.checks["zotero"]["read_only"] is True
     assert report.checks["privacy"]["allow_cloud"] is False
     config = read_yaml(tmp_path / "auto-zettelkasten.yml")
@@ -64,7 +74,7 @@ def test_obsidian_dry_run_does_not_create_vault(tmp_path: Path) -> None:
     assert not vault.exists()
     assert result.metadata["canonical_state_edited"] is False
     assert result.metadata["missing_wikilink_count"] == 0
-    assert result.metadata["file_count"] == 5
+    assert result.metadata["file_count"] == 9
 
 
 def test_obsidian_replace_rejects_symlink_escape(tmp_path: Path) -> None:
@@ -120,3 +130,22 @@ def test_cli_uses_workspace_provider_but_requires_per_run_cloud_consent(tmp_path
     capsys.readouterr()
     assert captured["request"].provider == "deepseek"
     assert captured["request"].allow_cloud is False
+
+
+def test_expansion_map_accepted_cli_exposes_contract_options() -> None:
+    args = build_parser().parse_args(
+        [
+            "expansion",
+            "map-accepted",
+            "--workspace",
+            "/tmp/workspace",
+            "--suggestion",
+            "suggestion-one",
+            "--question",
+            "Which mechanism?",
+            "--run-id",
+            "focused-run",
+        ]
+    )
+    assert args.question == "Which mechanism?"
+    assert args.run_id == "focused-run"

@@ -16,6 +16,8 @@ class ZoteroClient(Protocol):
 
     def inventory(self, scope: str, collection_key: str | None = None) -> list[dict[str, Any]]: ...
 
+    def item(self, item_key: str) -> Mapping[str, Any] | None: ...
+
     def children(self, item_key: str) -> list[dict[str, Any]]: ...
 
     def fulltext(self, item_key: str) -> Mapping[str, Any] | None: ...
@@ -59,6 +61,52 @@ class ControllerPort(Protocol):
     def review_tag_proposals(
         self,
         proposals: Sequence[Mapping[str, Any]],
+    ) -> Sequence[Mapping[str, Any]]: ...
+
+
+@runtime_checkable
+class ScholarlyGraphProvider(Protocol):
+    """Identifier/metadata-only graph boundary. Source text must never cross it."""
+
+    name: str
+    is_network: bool
+
+    def resolve_work(self, work: Mapping[str, Any]) -> Mapping[str, Any] | None: ...
+
+    def citation_neighbors(
+        self,
+        work: Mapping[str, Any],
+        *,
+        limit: int,
+    ) -> Sequence[Mapping[str, Any]]: ...
+
+    def citation_neighbors_page(
+        self,
+        work: Mapping[str, Any],
+        *,
+        relation: str,
+        cursor: str | None,
+        limit: int,
+    ) -> Mapping[str, Any]: ...
+
+    def recommendations(
+        self,
+        positive_paper_ids: Sequence[str],
+        *,
+        negative_paper_ids: Sequence[str] = (),
+        limit: int,
+    ) -> Sequence[Mapping[str, Any]]: ...
+
+    def drain_attempts(self) -> Sequence[Mapping[str, Any]]: ...
+
+
+@runtime_checkable
+class ExpansionControllerPort(Protocol):
+    """Controller gate for graph suggestions, separate from tag review."""
+
+    def review_expansion_candidates(
+        self,
+        candidates: Sequence[Mapping[str, Any]],
     ) -> Sequence[Mapping[str, Any]]: ...
 
 

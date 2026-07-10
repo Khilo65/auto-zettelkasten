@@ -30,4 +30,4 @@ jobs:
           python -m venv /tmp/auto-zettelkasten-wheel
           /tmp/auto-zettelkasten-wheel/bin/python -m pip install dist/*.whl
           /tmp/auto-zettelkasten-wheel/bin/auto-zettelkasten --help
-          /tmp/auto-zettelkasten-wheel/bin/python -c "import auto_zettelkasten; assert auto_zettelkasten.ENGINE_VERSION == '0.1.0'"
+          /tmp/auto-zettelkasten-wheel/bin/python -c "import auto_zettelkasten; assert auto_zettelkasten.ENGINE_VERSION == '0.2.0'; assert auto_zettelkasten.ARTIFACT_SCHEMA_VERSION == '1.1'"

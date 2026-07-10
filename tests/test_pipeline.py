@@ -8,6 +8,7 @@ import yaml
 from auto_zettelkasten.api import build_map, export_to_obsidian, get_status, resume_map, run_map
 from auto_zettelkasten.models import MapRequest
 from auto_zettelkasten.notes import parse_atomic_note
+from auto_zettelkasten.obsidian import _missing_links_from_contents
 
 from conftest import FakeReader, FakeZotero
 
@@ -78,6 +79,57 @@ def test_vertical_slice_matches_golden_and_builds_obsidian_graph(tmp_path: Path,
     assert (export_root / "Indexes" / "Source Index.md").exists()
     assert (export_root / "Indexes" / "Cluster Index.md").exists()
     assert (export_root / "Indexes" / "Gap Index.md").exists()
+    gap_id = report.gap_map["gap_candidates"][0]["gap_id"]
+    assert (export_root / "Closest Prior Work" / f"closest-prior-{gap_id}.md").exists()
+
+
+def test_obsidian_link_audit_rejects_ambiguous_unqualified_targets(tmp_path: Path) -> None:
+    contents = {
+        tmp_path / "Index.md": "[[duplicate]]\n",
+        tmp_path / "First" / "duplicate.md": "# First\n",
+        tmp_path / "Second" / "duplicate.md": "# Second\n",
+    }
+
+    assert _missing_links_from_contents(tmp_path, contents) == [
+        {"source": "Index.md", "target": "duplicate", "reason": "ambiguous_target"}
+    ]
+
+
+def test_obsidian_export_repairs_folded_frontmatter_wikilinks(tmp_path: Path, sample_items) -> None:
+    report = run_map(
+        MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=1),
+        client=FakeZotero(sample_items[:1]),
+        reader=FakeReader(),
+        run_id="folded-frontmatter",
+    )
+    source_path = tmp_path / report.items[0]["note_path"]
+    long_target = (
+        "A deliberately long related note title that exceeds the default YAML wrapping width "
+        "while remaining a valid Obsidian target"
+    )
+    target_path = source_path.parent / f"{long_target}.md"
+    target_path.write_text(f"# {long_target}\n", encoding="utf-8")
+    frontmatter, body = parse_atomic_note(source_path.read_text(encoding="utf-8"))
+    frontmatter["related_notes"] = [
+        {
+            "note_id": "note-long-target",
+            "relation_type": "same_concept",
+            "wikilink": f"[[{long_target}]]",
+        }
+    ]
+    wrapped = yaml.safe_dump(frontmatter, sort_keys=False, allow_unicode=True).strip()
+    source_path.write_text(f"---\n{wrapped}\n---\n{body}", encoding="utf-8")
+    assert not any(
+        f"[[{long_target}]]" in line
+        for line in source_path.read_text(encoding="utf-8").splitlines()
+    )
+
+    exported = export_to_obsidian(tmp_path, tmp_path / "vault", new_vault=True)
+
+    assert exported.status == "exported"
+    assert exported.metadata["missing_wikilink_count"] == 0
+    projected = Path(exported.metadata["export_root"]) / "Sources" / source_path.name
+    assert any(f"[[{long_target}]]" in line for line in projected.read_text(encoding="utf-8").splitlines())
 
 
 def test_missing_attachment_and_duplicate_are_terminal_exhausted(tmp_path: Path, sample_items) -> None:

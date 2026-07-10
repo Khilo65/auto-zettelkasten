@@ -6,7 +6,7 @@ import pytest
 
 from auto_zettelkasten import ARTIFACT_SCHEMA_VERSION, ENGINE_VERSION
 from auto_zettelkasten.api import initialize_workspace
-from auto_zettelkasten.models import MapRequest
+from auto_zettelkasten.models import ExpansionRequest, MapRequest
 from auto_zettelkasten.workspace import IncompatibleArtifactSchemaError, assert_compatible
 from auto_zettelkasten.files import write_yaml
 
@@ -25,6 +25,20 @@ def test_map_request_is_versioned_serializable_and_validated(tmp_path: Path) -> 
         MapRequest(tmp_path, provider="openrouter")
     with pytest.raises(ValueError, match="boolean"):
         MapRequest.from_dict({"workspace": str(tmp_path), "allow_cloud": "maybe"})
+
+
+def test_direct_requests_require_actual_boolean_consent(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="allow_cloud must be a boolean"):
+        MapRequest(tmp_path, allow_cloud="false")  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="allow_network must be a boolean"):
+        ExpansionRequest(
+            tmp_path,
+            scope="source",
+            target_ids=("source-seed",),
+            provider="semantic-scholar",
+            allow_network="false",  # type: ignore[arg-type]
+        )
 
 
 def test_initialize_creates_compatible_file_first_workspace(tmp_path: Path) -> None:

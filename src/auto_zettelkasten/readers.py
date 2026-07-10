@@ -10,6 +10,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from . import ENGINE_VERSION
+
 from .files import require_loopback_http_url
 
 
@@ -264,7 +266,7 @@ def _post_json(
     headers: Mapping[str, str] | None = None,
     timeout: float,
 ) -> dict[str, Any]:
-    request_headers = {"Accept": "application/json", "Content-Type": "application/json", "User-Agent": "auto-zettelkasten/0.1.0"}
+    request_headers = {"Accept": "application/json", "Content-Type": "application/json", "User-Agent": f"auto-zettelkasten/{ENGINE_VERSION}"}
     request_headers.update(headers or {})
     request = urllib.request.Request(
         url,

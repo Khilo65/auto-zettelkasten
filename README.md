@@ -7,7 +7,7 @@ candidate-gap records, and an Obsidian-ready vault projection.
 It is a standalone, file-first Python package. It does not require Research OS,
 does not read `zotero.sqlite`, and never writes to Zotero.
 
-> **Release status:** v0.1 is an alpha-quality CLI and Python API. Generated gap
+> **Release status:** v0.2 is an alpha-quality CLI and Python API. Generated gap
 > records are research candidates, not verified novelty claims. Source-note
 > analysis should still be reviewed against the original document before being
 > cited or promoted into an argument.
@@ -20,7 +20,8 @@ workspace/
 ├── 01_custody/
 │   ├── zotero/inventory/
 │   ├── files/
-│   └── read_attempts/
+│   ├── read_attempts/
+│   └── citation_leads/
 ├── 02_source_memory/
 │   ├── notes/
 │   └── indexes/
@@ -32,6 +33,10 @@ workspace/
 │   ├── clusters/
 │   ├── gaps/
 │   ├── closest_prior_work/
+│   ├── expansion/
+│   │   ├── candidates.yml
+│   │   ├── decisions.yml
+│   │   └── candidates/
 │   └── packets/
 └── 11_state/
     ├── runs/
@@ -54,7 +59,7 @@ Atomic notes contain:
 
 Passing that deterministic gate commits an `analytical_atomic_note`; it does
 not label the note `verified_atomic_note`. Verification requires a separate
-source-aware human or reviewing-controller pass that v0.1 does not pretend to
+source-aware human or reviewing-controller pass that v0.2 does not pretend to
 perform.
 
 Original Zotero tags are preserved exactly. Normalized tags remain proposals
@@ -127,7 +132,7 @@ auto-zettelkasten map \
 Resume and inspect a run:
 
 ```bash
-auto-zettelkasten resume --workspace ~/Research/my-map --run-id RUN_ID
+auto-zettelkasten resume --workspace ~/Research/my-map --run-id RUN_ID --allow-cloud
 auto-zettelkasten status --workspace ~/Research/my-map --run-id RUN_ID --json
 ```
 
@@ -143,12 +148,80 @@ auto-zettelkasten export obsidian \
 The export is a generated projection. Canonical YAML registries remain in the
 workspace and are never edited through Obsidian.
 
+## Bounded graph expansion
+
+Graph expansion turns local citation relations into reviewable suggestions. It
+does not silently add items to Zotero, read an external paper, or promote a
+suggestion into evidence, a cluster, or a gap claim.
+
+Local expansion is the default and makes no external request:
+
+```bash
+auto-zettelkasten expansion run \
+  --workspace ~/Research/my-map \
+  --scope cluster \
+  --id cluster-institutions \
+  --provider internal \
+  --depth 1 \
+  --budget 100
+```
+
+Optional Semantic Scholar expansion sends only publication identifiers and
+bibliographic metadata. It requires distinct, invocation-scoped consent:
+
+```bash
+auto-zettelkasten expansion run \
+  --workspace ~/Research/my-map \
+  --scope source-set \
+  --id source-set-example \
+  --provider semantic-scholar \
+  --allow-network
+```
+
+Review and act explicitly:
+
+```bash
+auto-zettelkasten expansion list --workspace ~/Research/my-map
+auto-zettelkasten expansion decide --workspace ~/Research/my-map \
+  --suggestion SUGGESTION_ID --decision accept \
+  --expected-version 0 --reason "Directly relevant comparison"
+auto-zettelkasten expansion map-accepted --workspace ~/Research/my-map \
+  --suggestion SUGGESTION_ID --provider ollama
+auto-zettelkasten expansion export --workspace ~/Research/my-map \
+  --state accepted --format bibtex --output accepted-expansion.bib
+```
+
+Suggestions are scoped to one source, source set, cluster, or candidate gap.
+Their lifecycle is `proposed`, `accepted`, `parked`, or `rejected`; fulfillment
+is tracked separately. Decisions are append-only and protected by an expected
+version. Default depth is one, maximum depth is two, and the hard candidate
+budget is 500.
+
+Workspaces created with artifact schema 1.0 remain readable. Expansion writes
+require the explicit additive migration:
+
+```bash
+auto-zettelkasten migrate --workspace ~/Research/my-map --to 1.1 --dry-run
+auto-zettelkasten migrate --workspace ~/Research/my-map --to 1.1
+```
+
+The migration creates empty expansion registries and citation-sidecar storage;
+it does not rewrite source notes, clusters, gaps, links, or packets.
+
 ## Privacy and provider routes
 
 Cloud providers are blocked unless `--allow-cloud` is present. The guard is
 checked before inventory, text-reader, and document-vision calls. A saved
 configuration value or an available API key never substitutes for per-run CLI
 consent.
+
+`--allow-network` is a separate consent gate for Semantic Scholar and Crossref
+identifier/metadata lookup. It never authorizes source text, notes, abstracts,
+PDFs, or page images to leave the machine. Saved run requests do not authorize
+resumed network or cloud activity; consent must be supplied again. Semantic
+Scholar API keys, when used, are read from `SEMANTIC_SCHOLAR_API_KEY` or
+`S2_API_KEY` and remain environment-only. Crossref is used only as a DOI
+identity/metadata fallback.
 
 | Provider | Environment variable | Cloud | Intended route |
 |---|---|---:|---|
@@ -188,7 +261,7 @@ report = run_map(
 print(report.to_dict())
 ```
 
-Stable v0.1 entry points live in `auto_zettelkasten.api`:
+Stable v0.2 entry points live in `auto_zettelkasten.api`:
 
 - `initialize_workspace`
 - `doctor`
@@ -199,6 +272,13 @@ Stable v0.1 entry points live in `auto_zettelkasten.api`:
 - `get_status`
 - `build_map`
 - `export_to_obsidian`
+- `migrate_workspace`
+- `run_expansion`
+- `resume_expansion`
+- `list_expansion_candidates`
+- `decide_expansion`
+- `map_accepted_candidates`
+- `export_expansion_candidates`
 
 Providers, Zotero, and proposal controllers are injectable through protocols in
 `auto_zettelkasten.ports`. This is the supported integration boundary for
@@ -228,13 +308,14 @@ a separate coherent workspace source set containing all indexed notes; limited
 `fulltext_available` or metadata/abstract notes can participate in typed-link
 reconstruction but cannot form canonical clusters or support candidate gaps.
 
-## Scope deliberately deferred from v0.1
+## Scope deliberately deferred from v0.2
 
 - direct `zotero.sqlite` ingestion;
 - Zotero writes or collection synchronization;
 - group libraries;
 - a graphical interface or background daemon;
 - a database, vector store, or ontology engine; and
+- bundled Zotero or Obsidian companion plugins; and
 - claims that a generated gap is publication-grade novelty.
 
 ## License

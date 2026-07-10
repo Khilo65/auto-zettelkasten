@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .files import atomic_write_text, now_iso, read_yaml, sha256_text, slugify, write_yaml
+from .identity import identify_work
 from .notes import read_note
+from .workspace import confined_child, validate_opaque_id
 
 TYPED_RELATIONS = {
     "cites",
@@ -19,6 +21,8 @@ TYPED_RELATIONS = {
     "closest_prior_work",
     "possible_gap_relation",
     "zotero_related",
+    "co_cited_with",
+    "bibliographic_coupling",
 }
 
 
@@ -128,6 +132,85 @@ def build_typed_links(workspace: Path, notes: Sequence[Mapping[str, Any]]) -> di
                     }
                 )
     note_by_source_id = {str(row.get("source_id")): row for row in sorted_notes if row.get("source_id")}
+    note_by_work_id = {identify_work(row)[0]: row for row in sorted_notes}
+    references_by_note: dict[str, set[str]] = {}
+    mapped_references_by_origin: dict[str, set[str]] = {}
+    for source in sorted_notes:
+        source_id = str(source.get("source_id") or "")
+        if not source_id:
+            continue
+        try:
+            sidecar_path = confined_child(
+                workspace / "01_custody" / "citation_leads",
+                f"{validate_opaque_id(source_id, field='source_id')}.yml",
+            )
+        except ValueError:
+            continue
+        sidecar = read_yaml(sidecar_path, {}) or {}
+        reference_ids = {
+            str(row.get("work_id") or identify_work(row)[0])
+            for row in sidecar.get("references", [])
+            if isinstance(row, Mapping)
+        }
+        references_by_note[str(source["note_id"])] = reference_ids
+        mapped_targets: set[str] = set()
+        for work_id in sorted(reference_ids):
+            target = note_by_work_id.get(work_id)
+            if not target or target.get("note_id") == source.get("note_id"):
+                continue
+            target_note_id = str(target["note_id"])
+            mapped_targets.add(target_note_id)
+            key = (str(source["note_id"]), target_note_id, "cites")
+            if key in seen:
+                continue
+            seen.add(key)
+            links.append(
+                {
+                    "link_id": f"link-{sha256_text('|'.join(key))[:12]}",
+                    "source_note_id": source["note_id"],
+                    "target_note_id": target_note_id,
+                    "relation_type": "cites",
+                    "provenance": f"01_custody/citation_leads/{source_id}.yml",
+                }
+            )
+        mapped_references_by_origin[str(source["note_id"])] = mapped_targets
+    for targets in mapped_references_by_origin.values():
+        ordered = sorted(targets)
+        for index, left_id in enumerate(ordered):
+            for right_id in ordered[index + 1 :]:
+                key = (left_id, right_id, "co_cited_with")
+                if key in seen:
+                    continue
+                seen.add(key)
+                links.append(
+                    {
+                        "link_id": f"link-{sha256_text('|'.join(key))[:12]}",
+                        "source_note_id": left_id,
+                        "target_note_id": right_id,
+                        "relation_type": "co_cited_with",
+                        "provenance": "shared_origin_citation_sidecar",
+                    }
+                )
+    note_ids = sorted(references_by_note)
+    for index, left_id in enumerate(note_ids):
+        for right_id in note_ids[index + 1 :]:
+            shared = sorted(references_by_note[left_id] & references_by_note[right_id])
+            if not shared:
+                continue
+            key = (left_id, right_id, "bibliographic_coupling")
+            if key in seen:
+                continue
+            seen.add(key)
+            links.append(
+                {
+                    "link_id": f"link-{sha256_text('|'.join(key))[:12]}",
+                    "source_note_id": left_id,
+                    "target_note_id": right_id,
+                    "relation_type": "bibliographic_coupling",
+                    "shared_reference_work_ids": shared,
+                    "provenance": "deterministic_citation_sidecars",
+                }
+            )
     relation_registry = workspace / "01_custody" / "source_relation_registry.csv"
     if relation_registry.exists():
         with relation_registry.open("r", encoding="utf-8", newline="") as handle:

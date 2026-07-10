@@ -9,6 +9,7 @@ from typing import Any, Mapping, Sequence
 
 from . import ARTIFACT_SCHEMA_VERSION, ENGINE_VERSION
 from .controller import LocalController
+from .citations import write_citation_sidecar
 from .extraction import extract_bytes, extract_path, ocr_pdf_bytes
 from .files import (
     append_jsonl,
@@ -48,7 +49,16 @@ from .notes import (
 )
 from .ports import ControllerPort, ReaderProvider, VisionProvider, ZoteroClient
 from .readers import SECTION_KEYS, provider_from_name
-from .workspace import artifact_rows, assert_compatible, initialize, resolve_workspace, run_directory, validate_opaque_id
+from .workspace import (
+    artifact_rows,
+    assert_compatible,
+    initialize,
+    require_schema,
+    resolve_workspace,
+    run_directory,
+    validate_opaque_id,
+    workspace_schema_version,
+)
 from .zotero import ZoteroLocalClient
 
 FULL_DOCUMENT_CHAR_LIMIT = 320_000
@@ -70,6 +80,7 @@ def run_pipeline(
     workspace = resolve_workspace(request.workspace)
     initialize(workspace)
     assert_compatible(workspace)
+    artifact_schema_version = workspace_schema_version(workspace)
     run_id = run_id or _new_run_id()
     validate_opaque_id(run_id, field="run_id")
     run_dir = run_directory(workspace, run_id)
@@ -81,10 +92,15 @@ def run_pipeline(
     try:
         reader = reader or provider_from_name(request.provider, request.model, allow_cloud=request.allow_cloud)
     except Exception as exc:
-        return _blocked_report(request, run_id, f"reader_configuration:{type(exc).__name__}:{exc}")
+        return _blocked_report(
+            request,
+            run_id,
+            f"reader_configuration:{type(exc).__name__}:{exc}",
+            artifact_schema_version=artifact_schema_version,
+        )
     preflight_reason = _reader_preflight_reason(reader, request.allow_cloud)
     if preflight_reason:
-        return _blocked_report(request, run_id, preflight_reason)
+        return _blocked_report(request, run_id, preflight_reason, artifact_schema_version=artifact_schema_version)
     if vision is None and hasattr(reader, "inspect_document"):
         vision = reader  # type: ignore[assignment]
 
@@ -99,7 +115,12 @@ def run_pipeline(
                 raise ValueError("selected collection has no key")
         items = client.inventory(inventory_scope, effective_collection_key)
     except Exception as exc:
-        return _blocked_report(request, run_id, f"zotero_inventory:{type(exc).__name__}:{exc}")
+        return _blocked_report(
+            request,
+            run_id,
+            f"zotero_inventory:{type(exc).__name__}:{exc}",
+            artifact_schema_version=artifact_schema_version,
+        )
     items = [dict(item) for item in items if isinstance(item, Mapping)]
     if request.limit:
         items = items[: request.limit]
@@ -169,12 +190,16 @@ def run_pipeline(
 
     terminal_rows: list[dict[str, Any]] = []
     note_rows: list[dict[str, Any]] = []
+    citation_paths: list[Path] = []
     failed_note_ids: set[str] = set()
     attempt_path = workspace / "01_custody" / "read_attempts" / f"{slugify(run_id)}.jsonl"
     for row in prepared:
         for attempt in row.pop("attempts", []):
             append_jsonl(attempt_path, attempt)
         if row.get("reused") and row.get("note_path"):
+            sidecar = _commit_citation_sidecar(workspace, row, request.extraction_version)
+            if sidecar:
+                citation_paths.append(sidecar)
             terminal_rows.append(_public_terminal_row(row))
             note_rows.append(_note_summary_from_path(workspace, row))
             continue
@@ -183,7 +208,7 @@ def run_pipeline(
             continue
 
         normalized_tags = normalized_by_note.get(str(row["note_id"]), [])
-        frontmatter = _frontmatter(row, request, normalized_tags)
+        frontmatter = _frontmatter(row, request, normalized_tags, artifact_schema_version)
         try:
             path, validation = write_atomic_note(workspace, frontmatter, row["analysis"])
         except Exception as exc:
@@ -211,6 +236,9 @@ def run_pipeline(
             continue
         relative_path = str(path.relative_to(workspace))
         row.update(terminal_status="validated_note", note_path=relative_path, note_status="analytical_atomic_note")
+        sidecar = _commit_citation_sidecar(workspace, row, request.extraction_version)
+        if sidecar:
+            citation_paths.append(sidecar)
         fingerprint_path = workspace / "11_state" / "fingerprints" / f"{row['fingerprint']}.yml"
         write_yaml(
             fingerprint_path,
@@ -222,7 +250,7 @@ def run_pipeline(
                 "note_path": relative_path,
                 "content_hash": row["content_hash"],
                 "engine_version": ENGINE_VERSION,
-                "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+                "artifact_schema_version": artifact_schema_version,
                 "updated_at": now_iso(),
             },
         )
@@ -295,6 +323,7 @@ def run_pipeline(
         Path(tag_report["proposal_path"]),
         Path(tag_report["registry_path"]),
         *map_result["paths"],
+        *citation_paths,
         *[workspace / str(row["note_path"]) for row in terminal_rows if row.get("note_path")],
     ]
     manifest = ArtifactManifest(
@@ -311,6 +340,7 @@ def run_pipeline(
             "literature_packet": map_result["literature_packet"],
             "tag_review": tag_report,
         },
+        artifact_schema_version=artifact_schema_version,
     )
     write_yaml(run_dir / "artifact_manifest.yml", manifest.to_dict())
     report = RunReport(
@@ -329,6 +359,7 @@ def run_pipeline(
         gap_map=map_result["gap_map"],
         literature_packet=map_result["literature_packet"],
         artifact_manifest=manifest,
+        artifact_schema_version=artifact_schema_version,
     )
     write_yaml(run_dir / "run_report.yml", report.to_dict())
     return report
@@ -732,7 +763,12 @@ def _vision_content(
     }
 
 
-def _frontmatter(row: Mapping[str, Any], request: MapRequest, normalized_tags: Sequence[str]) -> dict[str, Any]:
+def _frontmatter(
+    row: Mapping[str, Any],
+    request: MapRequest,
+    normalized_tags: Sequence[str],
+    artifact_schema_version: str,
+) -> dict[str, Any]:
     data = item_data(row["item"])
     return {
         "note_id": row["note_id"],
@@ -759,7 +795,7 @@ def _frontmatter(row: Mapping[str, Any], request: MapRequest, normalized_tags: S
         "extraction_version": request.extraction_version,
         "prompt_version": request.prompt_version,
         "engine_version": ENGINE_VERSION,
-        "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+        "artifact_schema_version": artifact_schema_version,
         "created_at": now_iso(),
         "updated_at": now_iso(),
     }
@@ -776,6 +812,12 @@ def _note_summary_from_path(workspace: Path, row: Mapping[str, Any]) -> dict[str
         "note_status": str(front.get("note_status", "")),
         "title": str(front.get("title", "")),
         "date": str(front.get("date", "")),
+        "creators": list(front.get("creators", []) or []),
+        "doi": str(front.get("doi", "")),
+        "url": str(front.get("url", "")),
+        "citation_key": str(front.get("citation_key", "")),
+        "source_file": str(front.get("source_file", "")),
+        "inspected_content_hash": str(front.get("inspected_content_hash", "")),
         "method": _note_section(note["body"], "Method and Research Design")[:240],
         "original_zotero_tags": list(front.get("original_zotero_tags", []) or []),
         "normalized_tags": list(front.get("normalized_tags", []) or []),
@@ -877,6 +919,27 @@ def _attempt(
     }
 
 
+def _commit_citation_sidecar(workspace: Path, row: Mapping[str, Any], extraction_version: str) -> Path | None:
+    text = str(row.get("text") or "")
+    if not row.get("content_hash") or not row.get("source_id"):
+        return None
+    try:
+        require_schema(workspace, "1.1", operation="citation sidecar creation")
+        return write_citation_sidecar(
+            workspace,
+            item=row["item"],
+            source_id=str(row["source_id"]),
+            text=text,
+            content_hash=str(row["content_hash"]),
+            source_file=str(row.get("source_file") or ""),
+            extraction_version=extraction_version,
+        )
+    except (OSError, RuntimeError, ValueError):
+        # The validated note remains canonical. A later local-only backfill can
+        # recreate the deterministic sidecar from the inspected-content hash.
+        return None
+
+
 def _exhausted_result(index: int, item: Mapping[str, Any], route: str, reason: str) -> dict[str, Any]:
     row = {
         "inventory_index": index,
@@ -912,9 +975,21 @@ def _public_terminal_row(row: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _blocked_report(request: MapRequest, run_id: str, reason: str) -> RunReport:
+def _blocked_report(
+    request: MapRequest,
+    run_id: str,
+    reason: str,
+    *,
+    artifact_schema_version: str = ARTIFACT_SCHEMA_VERSION,
+) -> RunReport:
     workspace = resolve_workspace(request.workspace)
-    report = RunReport(status="blocked", workspace=workspace, run_id=run_id, errors=[{"reason": reason}])
+    report = RunReport(
+        status="blocked",
+        workspace=workspace,
+        run_id=run_id,
+        errors=[{"reason": reason}],
+        artifact_schema_version=artifact_schema_version,
+    )
     run_dir = run_directory(workspace, run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
     write_yaml(run_dir / "run_report.yml", report.to_dict())
