@@ -1,0 +1,4 @@
+This is redistributable synthetic source text. It describes a hypothetical
+institutional reform, an illustrative comparative design, two invented cases,
+and explicit limitations. It exists only to exercise extraction and source-note
+validation. It makes no real scholarly claim.

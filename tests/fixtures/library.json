@@ -1,0 +1,32 @@
+[
+  {
+    "key": "READABLE1",
+    "data": {
+      "key": "READABLE1",
+      "itemType": "journalArticle",
+      "title": "Readable Synthetic Source",
+      "date": "2024",
+      "creators": [{"creatorType": "author", "firstName": "Ada", "lastName": "Example"}],
+      "tags": [{"tag": "Synthetic Cluster"}]
+    }
+  },
+  {
+    "key": "SCANNED1",
+    "data": {
+      "key": "SCANNED1",
+      "itemType": "report",
+      "title": "Scanned Synthetic Source",
+      "date": "2023",
+      "tags": [{"tag": "Synthetic Cluster"}]
+    }
+  },
+  {
+    "key": "MISSING1",
+    "data": {
+      "key": "MISSING1",
+      "itemType": "book",
+      "title": "Missing Attachment Source",
+      "date": "2020"
+    }
+  }
+]
