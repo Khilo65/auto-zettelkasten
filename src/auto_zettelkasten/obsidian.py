@@ -55,17 +55,30 @@ def export_obsidian(
     source_index = root / "02_source_memory" / "indexes" / "INDEX.md"
     if source_index.exists():
         projections.append((source_index, Path("Indexes") / "Source Index.md"))
-    cluster_root = root / "03_literature_synthesis" / "clusters"
-    projections.extend((path, Path("Clusters") / path.name) for path in sorted(cluster_root.glob("cluster-*.md")))
+    latest_map = _latest_canonical_map(root / "03_literature_synthesis" / "maps")
+    cluster_root = (
+        latest_map / "clusters"
+        if latest_map is not None and (latest_map / "clusters").is_dir()
+        else root / "03_literature_synthesis" / "clusters"
+    )
+    projections.extend(
+        (path, Path("Clusters") / path.name)
+        for path in sorted(cluster_root.glob("*.md"))
+        if path.name != "INDEX.md"
+    )
     if (cluster_root / "INDEX.md").exists():
         projections.append((cluster_root / "INDEX.md", Path("Indexes") / "Cluster Index.md"))
-    gap_root = root / "03_literature_synthesis" / "gaps"
-    projections.extend((path, Path("Gaps") / path.name) for path in sorted((gap_root / "candidates").glob("*.md")))
+    gap_root = (
+        latest_map / "gaps"
+        if latest_map is not None and (latest_map / "gaps").is_dir()
+        else root / "03_literature_synthesis" / "gaps"
+    )
+    gap_notes_root = gap_root if latest_map is not None and gap_root.parent == latest_map else gap_root / "candidates"
+    projections.extend((path, Path("Gaps") / path.name) for path in sorted(gap_notes_root.glob("*.md")) if path.name != "INDEX.md")
     if (gap_root / "INDEX.md").exists():
         projections.append((gap_root / "INDEX.md", Path("Indexes") / "Gap Index.md"))
     prior_root = root / "03_literature_synthesis" / "closest_prior_work"
     projections.extend((path, Path("Closest Prior Work") / path.name) for path in sorted(prior_root.glob("*.md")))
-
     contents: dict[Path, str] = {}
     for source, relative in projections:
         target = export_root / relative
@@ -73,13 +86,19 @@ def export_obsidian(
     contents.setdefault(export_root / "Indexes" / "Source Index.md", "# Source Index\n\nNo validated atomic notes yet.\n")
     contents.setdefault(export_root / "Indexes" / "Cluster Index.md", "# Cluster Index\n\nNo canonical clusters yet.\n")
     contents.setdefault(export_root / "Indexes" / "Gap Index.md", "# Gap Candidate Index\n\nNo candidate gaps yet.\n")
+    if latest_map is not None and (latest_map / "INDEX.md").exists():
+        map_index = (latest_map / "INDEX.md").read_text(encoding="utf-8")
+        map_index = map_index.replace("[[clusters/INDEX|Cluster Index]]", "[[Cluster Index]]")
+        map_index = map_index.replace("[[gaps/INDEX|Gap Index]]", "[[Gap Index]]")
+        contents[export_root / "Indexes" / "Literature Map.md"] = map_index
     home = export_root / "Home.md"
     contents[home] = (
         "# Auto-Zettelkasten\n\n"
         "- [[Indexes/Source Index|Source Index]]\n"
         "- [[Indexes/Cluster Index|Cluster Index]]\n"
         "- [[Indexes/Gap Index|Gap Candidate Index]]\n\n"
-        "This vault is generated. Edit canonical workspace artifacts, then export again.\n"
+        + ("- [[Indexes/Literature Map|Canonical Literature Map]]\n\n" if latest_map is not None else "")
+        + "This vault is generated. Edit canonical workspace artifacts, then export again.\n"
     )
     missing = _missing_links_from_contents(export_root, contents)
     if dry_run:
@@ -191,3 +210,10 @@ def _safe_export_root(vault: Path, relative: Path) -> Path:
     if not resolved.is_relative_to(vault):
         raise ValueError(f"export target escapes vault: {resolved}")
     return resolved
+
+
+def _latest_canonical_map(maps_root: Path) -> Path | None:
+    if not maps_root.exists():
+        return None
+    candidates = [path for path in maps_root.iterdir() if path.is_dir() and (path / "manifest.yml").is_file()]
+    return max(candidates, key=lambda path: (path / "manifest.yml").stat().st_mtime_ns, default=None)

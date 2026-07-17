@@ -6,15 +6,41 @@ import importlib.util
 import os
 import shutil
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from . import ARTIFACT_SCHEMA_VERSION, ENGINE_VERSION
 from .files import now_iso, read_yaml, slugify, write_json, write_yaml
 from .indexes import write_source_set
-from .models import ArtifactManifest, MapRequest, RunReport, StatusReport
+from .literature import run_literature_map as run_profile_literature_map
+from .migration import migrate_workspace
+from .models import (
+    ArtifactManifest,
+    LiteratureMapReport,
+    LiteratureMapRequest,
+    LiteratureMappingPolicy,
+    MapRequest,
+    ProcessingPolicy,
+    RunReport,
+    StatusReport,
+)
 from .obsidian import export_obsidian
-from .pipeline import all_workspace_note_rows, rebuild_map, run_pipeline, workspace_source_set
-from .ports import ControllerPort, ReaderProvider, VisionProvider, ZoteroClient
+from .pipeline import (
+    _RunProgress,
+    _apply_reader_policy,
+    all_workspace_note_rows,
+    rebuild_map,
+    run_pipeline,
+    workspace_source_set,
+)
+from .ports import (
+    ControllerPort,
+    ExternalDiscoveryProvider,
+    LiteratureReasoner,
+    ReaderProvider,
+    VisionProvider,
+    ZoteroClient,
+)
+from .readers import provider_from_name
 from .workspace import (
     IncompatibleArtifactSchemaError,
     artifact_rows,
@@ -32,6 +58,10 @@ __all__ = [
     "ENGINE_VERSION",
     "ArtifactManifest",
     "MapRequest",
+    "ProcessingPolicy",
+    "LiteratureMappingPolicy",
+    "LiteratureMapRequest",
+    "LiteratureMapReport",
     "RunReport",
     "StatusReport",
     "build_map",
@@ -43,6 +73,7 @@ __all__ = [
     "list_collections",
     "resume_map",
     "run_map",
+    "run_literature_map",
 ]
 
 
@@ -186,6 +217,8 @@ def run_map(
     reader: ReaderProvider | None = None,
     vision: VisionProvider | None = None,
     controller: ControllerPort | None = None,
+    literature_reasoner: LiteratureReasoner | None = None,
+    external_discovery: ExternalDiscoveryProvider | None = None,
     run_id: str | None = None,
     resume: bool = False,
 ) -> RunReport:
@@ -195,6 +228,8 @@ def run_map(
         reader=reader,
         vision=vision,
         controller=controller,
+        literature_reasoner=literature_reasoner,
+        external_discovery=external_discovery,
         run_id=run_id,
         resume=resume,
     )
@@ -208,6 +243,8 @@ def resume_map(
     reader: ReaderProvider | None = None,
     vision: VisionProvider | None = None,
     controller: ControllerPort | None = None,
+    literature_reasoner: LiteratureReasoner | None = None,
+    external_discovery: ExternalDiscoveryProvider | None = None,
 ) -> RunReport:
     root = resolve_workspace(workspace)
     payload = read_yaml(run_directory(root, run_id) / "request.yml", {}) or {}
@@ -225,6 +262,8 @@ def resume_map(
         reader=reader,
         vision=vision,
         controller=controller,
+        literature_reasoner=literature_reasoner,
+        external_discovery=external_discovery,
         run_id=run_id,
         resume=True,
     )
@@ -239,27 +278,110 @@ def get_status(workspace: Path | str, run_id: str | None = None) -> StatusReport
         return StatusReport(status="blocked", workspace=root, run_id=run_id, message=str(exc))
     run_id = run_id or _latest_run_id(root)
     report_path = run_directory(root, run_id) / "run_report.yml" if run_id else None
-    if explicit_run and report_path and not report_path.exists():
+    progress_path = run_directory(root, run_id) / "progress.yml" if run_id else None
+    if explicit_run and report_path and not report_path.exists() and (progress_path is None or not progress_path.exists()):
         return StatusReport(status="blocked", workspace=root, run_id=run_id, message="run_not_found")
-    report = read_yaml(report_path, {}) or {} if report_path else {}
+    report = read_yaml(report_path, {}) or {} if report_path and report_path.exists() else {}
+    progress = read_yaml(progress_path, {}) or {} if progress_path and progress_path.exists() else {}
+    live = progress if progress.get("status") == "running" else (report or progress)
+    literature_live = live.get("literature_map", {}) if isinstance(live.get("literature_map", {}), Mapping) else {}
     clusters = (report.get("cluster_map", {}) or {}).get("clusters", [])
     gaps = (report.get("gap_map", {}) or {}).get("gap_candidates", [])
     if not report:
         clusters = (read_yaml(root / "03_literature_synthesis" / "clusters" / "clusters.yml", {}) or {}).get("clusters", [])
         gaps = (read_yaml(root / "03_literature_synthesis" / "gaps" / "gaps.yml", {}) or {}).get("gap_candidates", [])
-    source_sets = list((root / "02_source_memory" / "indexes" / "source_sets").glob("*.yml"))
+    source_sets = []
+    for path in (root / "02_source_memory" / "indexes" / "source_sets").glob("*.yml"):
+        payload = read_yaml(path, {}) or {}
+        if isinstance(payload, Mapping) and str(payload.get("source_set_id") or "") == path.stem:
+            source_sets.append(path)
     counts = {
-        "inventory_count": int(report.get("inventory_count", 0) or 0),
-        "validated_note_count": int(report.get("validated_note_count", 0) or 0),
-        "exhausted_count": int(report.get("exhausted_count", 0) or 0),
-        "terminal_count": int(report.get("terminal_count", 0) or 0),
-        "reused_count": int(report.get("reused_count", 0) or 0),
-        "cluster_count": len(clusters) if isinstance(clusters, list) else 0,
+        "inventory_count": int(live.get("inventory_count", 0) or 0),
+        "validated_note_count": int(live.get("validated_note_count", 0) or 0),
+        "limited_note_count": int(live.get("limited_note_count", 0) or 0),
+        "exhausted_count": int(live.get("exhausted_count", 0) or 0),
+        "partial_count": int(live.get("partial_count", 0) or 0),
+        "pending_count": int(live.get("pending_count", 0) or 0),
+        "terminal_count": int(live.get("terminal_count", 0) or 0),
+        "reused_count": int(live.get("reused_count", 0) or 0),
+        "profile_count": int(live.get("profile_count", literature_live.get("profile_count", 0)) or 0),
+        "profile_valid_count": int(live.get("profile_valid_count", literature_live.get("profile_valid_count", 0)) or 0),
+        "profile_excluded_count": int(live.get("profile_excluded_count", literature_live.get("profile_excluded_count", 0)) or 0),
+        "unclustered_count": int(live.get("unclustered_count", literature_live.get("unclustered_count", 0)) or 0),
+        "cluster_count": int(live.get("cluster_count", len(clusters) if isinstance(clusters, list) else 0) or 0),
+        "debate_count": int(live.get("debate_count", literature_live.get("debate_count", 0)) or 0),
+        "mapped_gap_count": int(live.get("mapped_gap_count", literature_live.get("mapped_gap_count", 0)) or 0),
+        "gap_lead_count": int(live.get("gap_lead_count", literature_live.get("gap_lead_count", 0)) or 0),
+        "synthesized_cluster_count": int(
+            live.get("synthesized_cluster_count", literature_live.get("synthesized_cluster_count", 0)) or 0
+        ),
+        "rejected_underspecified_gap_count": int(
+            live.get(
+                "rejected_underspecified_gap_count",
+                literature_live.get("rejected_underspecified_gap_count", 0),
+            )
+            or 0
+        ),
+        "rejected_gap_quality_count": int(
+            live.get(
+                "rejected_gap_quality_count",
+                literature_live.get("rejected_gap_quality_count", 0),
+            )
+            or 0
+        ),
+        "merged_gap_count": int(
+            live.get("merged_gap_count", literature_live.get("merged_gap_count", 0)) or 0
+        ),
+        "synthesis_call_count": int(
+            live.get("synthesis_call_count", literature_live.get("synthesis_call_count", 0)) or 0
+        ),
+        "synthesis_checkpoint_hit_count": int(
+            live.get(
+                "synthesis_checkpoint_hit_count",
+                literature_live.get("synthesis_checkpoint_hit_count", 0),
+            )
+            or 0
+        ),
+        "synthesis_failure_count": int(
+            live.get("synthesis_failure_count", literature_live.get("synthesis_failure_count", 0)) or 0
+        ),
         "gap_candidate_count": len(gaps) if isinstance(gaps, list) else 0,
+        "active_count": int(live.get("active_count", 0) or 0),
+        "completed_chunk_count": int(live.get("completed_chunk_count", 0) or 0),
+        "total_chunk_count": int(live.get("total_chunk_count", 0) or 0),
+        "checkpoint_hit_count": int(live.get("checkpoint_hit_count", progress.get("checkpoint_hit_count", 0)) or 0),
+        "source_provider_call_count": int(
+            live.get("source_provider_call_count", progress.get("source_provider_call_count", 0)) or 0
+        ),
+        "literature_provider_call_count": int(
+            live.get("literature_provider_call_count", progress.get("literature_provider_call_count", 0)) or 0
+        ),
+        "provider_call_count": int(live.get("provider_call_count", progress.get("provider_call_count", 0)) or 0),
+        "literature_failure_count": int(
+            live.get("literature_failure_count", progress.get("literature_failure_count", 0)) or 0
+        ),
+        "internal_falsification_count": int(
+            live.get("internal_falsification_count", literature_live.get("internal_falsification_count", 0)) or 0
+        ),
         "source_set_count": len(source_sets),
     }
-    status = str(report.get("status") or ("initialized" if root.exists() else "missing"))
-    return StatusReport(status=status, workspace=root, run_id=run_id, counts=counts)
+    status = str(live.get("status") or ("initialized" if root.exists() else "missing"))
+    return StatusReport(
+        status=status,
+        workspace=root,
+        run_id=run_id,
+        counts=counts,
+        checks={
+            "progress": {
+                "stage": str(live.get("stage") or (report.get("literature_report", {}) or {}).get("stage") or ""),
+                "stage_timestamps": dict(progress.get("stage_timestamps", {}) or {}),
+                "active_item_keys": list(progress.get("active_item_keys", []) or []),
+                "active_synthesis_packet": str(progress.get("active_synthesis_packet") or ""),
+                "active_cluster": str(progress.get("active_cluster") or ""),
+                "active_gap_packet": str(progress.get("active_gap_packet") or ""),
+            }
+        },
+    )
 
 
 def build_map(
@@ -267,25 +389,130 @@ def build_map(
     *,
     run_id: str | None = None,
     controller: ControllerPort | None = None,
+    source_set: Mapping[str, Any] | Path | str | None = None,
+    question: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+    allow_cloud: bool = False,
+    literature_policy: LiteratureMappingPolicy | Mapping[str, Any] | None = None,
+    reasoner: LiteratureReasoner | None = None,
+    external_discovery: ExternalDiscoveryProvider | None = None,
+    resume: bool = False,
 ) -> ArtifactManifest:
-    del controller  # map building consumes only already-controller-accepted canonical tags
+    del controller  # synthesis consumes validated notes and accepted typed-link evidence only
+    if not isinstance(allow_cloud, bool):
+        raise ValueError("allow_cloud must be a boolean")
     root = resolve_workspace(workspace)
     assert_compatible(root)
+    config = load_config(root)
+    provider = provider or str(config.get("provider") or "deepseek")
+    model = model or str(config.get("model") or "deepseek-v4-flash")
+    configured_policy = config.get("literature_mapping", {}) if isinstance(config.get("literature_mapping", {}), Mapping) else {}
+    policy = (
+        literature_policy
+        if isinstance(literature_policy, LiteratureMappingPolicy)
+        else LiteratureMappingPolicy.from_dict(literature_policy if isinstance(literature_policy, Mapping) else configured_policy)
+    )
+    if policy.external_discovery != "disabled":
+        raise ValueError(
+            f"external discovery is disabled in standalone Auto-Zettelkasten: {policy.external_discovery}"
+        )
+    if external_discovery is not None:
+        raise ValueError("standalone Auto-Zettelkasten does not accept an external discovery provider")
+    if reasoner is None and policy.synthesis_enabled and allow_cloud:
+        built_in_reasoner = provider_from_name(provider, model, allow_cloud=allow_cloud)
+        if not isinstance(built_in_reasoner, LiteratureReasoner):
+            raise ValueError(f"provider {provider} does not implement literature reasoning")
+        reasoner = built_in_reasoner
+    if reasoner is not None and bool(getattr(reasoner, "is_cloud", True)) and not allow_cloud:
+        raise ValueError("cloud literature reasoner requires allow_cloud=True")
+    if external_discovery is not None and bool(getattr(external_discovery, "is_cloud", True)) and not allow_cloud:
+        raise ValueError("cloud external discovery provider requires allow_cloud=True")
     run_id = run_id or _latest_run_id(root) or f"build-{now_iso().replace(':', '').replace('+00:00', 'Z')}"
     validate_opaque_id(run_id, field="run_id")
     note_rows = all_workspace_note_rows(root)
-    source_set = workspace_source_set(root, note_rows, run_id=run_id)
-    result = rebuild_map(
-        root,
-        source_set=source_set,
-        note_rows=note_rows,
-        terminal_rows=[],
-        items=[],
-        run_id=run_id,
-        question=None,
+    selected_source_set = _resolve_source_set(root, source_set)
+    if selected_source_set:
+        allowed_note_ids = {str(value) for value in selected_source_set.get("note_ids", []) or []}
+        if allowed_note_ids:
+            note_rows = [row for row in note_rows if str(row.get("note_id") or "") in allowed_note_ids]
+    else:
+        selected_source_set = workspace_source_set(root, note_rows, run_id=run_id)
+    map_request = MapRequest(
+        workspace=root,
+        provider=provider,
+        model=model,
+        allow_cloud=allow_cloud,
+        question=question,
+        processing=ProcessingPolicy.from_dict(
+            config.get("processing") if isinstance(config.get("processing"), Mapping) else {}
+        ),
+        literature_policy=policy,
     )
+    if reasoner is not None:
+        _apply_reader_policy(reasoner, map_request.processing)  # type: ignore[arg-type]
+    source_rows = selected_source_set.get("rows", []) if isinstance(selected_source_set, Mapping) else []
+    progress_items = [
+        {**dict(row), "key": str(row.get("zotero_item_key") or "")}
+        for row in source_rows
+        if isinstance(row, Mapping)
+    ]
+    progress = _RunProgress(
+        run_directory(root, run_id) / "progress.yml",
+        run_id,
+        progress_items,
+        resume=resume,
+    )
+    progress.set_stage("preflight")
+    try:
+        result = rebuild_map(
+            root,
+            source_set=selected_source_set,
+            note_rows=note_rows,
+            terminal_rows=[],
+            items=[],
+            run_id=run_id,
+            question=question,
+            request=map_request,
+            reasoner=reasoner,
+            external_discovery=external_discovery,
+            progress=progress,
+            resume=resume,
+        )
+    except Exception:
+        progress.finish("partial")
+        raise
+    literature_summary = {
+        "status": "partial" if result.get("partial_reason") else "completed",
+        "profile_count": len(result.get("profiles", []) or []),
+        "profile_valid_count": int((result.get("profile_result", {}) or {}).get("valid_count", 0) or 0),
+        "profile_excluded_count": int((result.get("profile_result", {}) or {}).get("excluded_count", 0) or 0),
+        "unclustered_count": len(result["cluster_map"].get("unclustered_sources", []) or []),
+        "cluster_count": len(result["cluster_map"].get("clusters", []) or []),
+        "mapped_gap_count": sum(
+            1 for row in result["gap_map"].get("gap_candidates", []) or [] if row.get("status") == "mapped_collection_gap"
+        ),
+        "gap_lead_count": sum(
+            1 for row in result["gap_map"].get("gap_candidates", []) or [] if "gap_lead" in str(row.get("status", ""))
+        ),
+        "synthesized_cluster_count": int(result["cluster_map"].get("synthesized_cluster_count", 0) or 0),
+        "rejected_underspecified_gap_count": int(
+            result["gap_map"].get("rejected_underspecified_gap_count", 0) or 0
+        ),
+        "rejected_gap_quality_count": int(
+            result["gap_map"].get("rejected_gap_quality_count", 0) or 0
+        ),
+        "merged_gap_count": int(result["gap_map"].get("merged_gap_count", 0) or 0),
+        "synthesis_call_count": int(result["literature_packet"].get("synthesis_call_count", 0) or 0),
+        "synthesis_checkpoint_hit_count": int(
+            result["literature_packet"].get("synthesis_checkpoint_hit_count", 0) or 0
+        ),
+        "synthesis_failure_count": int(result["literature_packet"].get("synthesis_failure_count", 0) or 0),
+        "partial_reason": str(result.get("partial_reason") or ""),
+        "profile_result": result.get("profile_result", {}),
+    }
     manifest = ArtifactManifest(
-        status="built",
+        status="partial" if result.get("partial_reason") else "built",
         workspace=root,
         run_id=run_id,
         created_at=now_iso(),
@@ -295,12 +522,102 @@ def build_map(
             "cluster_map": result["cluster_map"],
             "gap_map": result["gap_map"],
             "literature_packet": result["literature_packet"],
+            "literature_map": literature_summary,
         },
     )
     run_dir = run_directory(root, run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
     write_yaml(run_dir / "build_map_manifest.yml", manifest.to_dict())
+    progress.set_stage("reporting")
+    progress.finish("partial" if result.get("partial_reason") else "completed")
     return manifest
+
+
+def run_literature_map(
+    request: LiteratureMapRequest,
+    *,
+    source_set: Mapping[str, Any] | Path | str | None = None,
+    profiles: Sequence[Any] | None = None,
+    reasoner: LiteratureReasoner | None = None,
+    external_discovery: ExternalDiscoveryProvider | None = None,
+    resume: bool = False,
+) -> LiteratureMapReport:
+    selected_source_set = source_set or request.source_set_id or None
+    if external_discovery is not None:
+        return LiteratureMapReport(
+            status="blocked",
+            map_id=request.map_id,
+            run_id=request.run_id,
+            source_set_id=request.source_set_id,
+            stage="policy_gate",
+            partial_reason="external_discovery_provider_not_used_by_standalone_mapper",
+        )
+    if request.literature_policy.external_discovery != "disabled":
+        return LiteratureMapReport(
+            status="blocked",
+            map_id=request.map_id,
+            run_id=request.run_id,
+            source_set_id=request.source_set_id,
+            stage="policy_gate",
+            partial_reason=(
+                "external_discovery_disabled_in_standalone_mapper:"
+                f"{request.literature_policy.external_discovery}"
+            ),
+        )
+    if profiles is not None:
+        resolved_source_set = _resolve_source_set(resolve_workspace(request.workspace), selected_source_set)
+        if not resolved_source_set:
+            raise ValueError("source_set is required when profiles are supplied")
+        migrate_workspace(request.workspace)
+        return run_profile_literature_map(
+            request,
+            profiles=profiles,
+            source_set=resolved_source_set,
+            reasoner=reasoner,
+        )
+    manifest = build_map(
+        request.workspace,
+        run_id=request.run_id or None,
+        source_set=selected_source_set,
+        question=request.question,
+        provider=request.provider,
+        model=request.model,
+        allow_cloud=request.allow_cloud,
+        literature_policy=request.literature_policy,
+        reasoner=reasoner,
+        external_discovery=external_discovery,
+        resume=resume,
+    )
+    summary = manifest.metadata.get("literature_map", {}) if isinstance(manifest.metadata, Mapping) else {}
+    source_payload = manifest.metadata.get("source_set", {}) if isinstance(manifest.metadata, Mapping) else {}
+    return LiteratureMapReport(
+        status="partial" if manifest.status == "partial" else "completed",
+        map_id=str(request.map_id or summary.get("map_id") or ""),
+        run_id=str(manifest.run_id or request.run_id),
+        source_set_id=str(source_payload.get("source_set_id") or request.source_set_id),
+        stage="reporting" if manifest.status != "partial" else "profiling",
+        counts={key: int(value) for key, value in summary.items() if key.endswith("_count") and isinstance(value, int)},
+        artifact_paths={row["path"]: row["path"] for row in manifest.artifacts if row.get("path")},
+        partial_reason=str(summary.get("partial_reason") or ""),
+    )
+
+
+def _resolve_source_set(root: Path, value: Mapping[str, Any] | Path | str | None) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, Mapping):
+        return dict(value)
+    candidate = Path(value).expanduser() if isinstance(value, (str, Path)) else Path(str(value))
+    if not candidate.is_absolute():
+        workspace_candidate = root / candidate
+        identifier_candidate = root / "02_source_memory" / "indexes" / "source_sets" / f"{candidate}.yml"
+        candidate = workspace_candidate if workspace_candidate.is_file() else identifier_candidate
+    payload = read_yaml(candidate, {}) or {}
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"source set must be a mapping: {candidate}")
+    if not payload:
+        raise ValueError(f"source set not found: {candidate}")
+    return dict(payload)
 
 
 def export_to_obsidian(

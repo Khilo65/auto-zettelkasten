@@ -3,9 +3,9 @@ validated_note_count: 2
 exhausted_count: 0
 terminal_count: 2
 cluster_count: 1
-gap_candidate_count: 1
+gap_candidate_count: 0
 typed_link_count: 2
 required_note_section: Strengths and Contributions
-gap_status: candidate
+gap_status: complete_no_qualifying_gaps
 novelty_claimed: false
 missing_wikilink_count: 0

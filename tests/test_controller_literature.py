@@ -23,7 +23,7 @@ def test_local_controller_accepts_only_high_confidence_mechanical_proposals() ->
     assert [row["decision"] for row in decisions] == ["accepted", "parked", "rejected"]
 
 
-def test_parked_tag_proposals_do_not_create_canonical_clusters(tmp_path: Path, sample_items) -> None:
+def test_parked_tag_proposals_do_not_block_independent_semantic_clustering(tmp_path: Path, sample_items) -> None:
     class ParkingController:
         def review_tag_proposals(self, proposals: Sequence[Mapping[str, Any]]) -> Sequence[Mapping[str, Any]]:
             return [{**dict(row), "decision": "parked", "decision_reason": "integration_review_required"} for row in proposals]
@@ -36,7 +36,8 @@ def test_parked_tag_proposals_do_not_create_canonical_clusters(tmp_path: Path, s
         run_id="parked-tags",
     )
     assert report.validated_note_count == 2
-    assert report.cluster_map["clusters"] == []
+    assert len(report.cluster_map["clusters"]) == 1
+    assert report.cluster_map["clusters"][0]["semantic_identity"] == "institution"
     assert report.gap_map["gap_candidates"] == []
 
 

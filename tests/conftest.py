@@ -11,6 +11,7 @@ SECTION_KEYS = (
     "method_and_research_design",
     "evidence_and_data",
     "detailed_findings",
+    "plain_english_interpretation",
     "strengths_and_contributions",
     "methodological_critique",
     "limitations",

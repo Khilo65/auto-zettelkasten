@@ -17,7 +17,8 @@ from .api import (
     resume_map,
     run_map,
 )
-from .models import MapRequest
+from .models import LiteratureMappingPolicy, MapRequest, ProcessingPolicy
+from .migration import migrate_workspace
 from .workspace import load_config
 
 DEFAULT_MODELS = {
@@ -59,6 +60,17 @@ def build_parser() -> argparse.ArgumentParser:
     map_parser.add_argument("--parallel", type=int, default=None)
     map_parser.add_argument("--limit", type=int, default=None)
     map_parser.add_argument("--run-id", default="")
+    map_parser.add_argument("--direct-read-char-limit", type=int, default=None)
+    map_parser.add_argument("--chunk-char-limit", type=int, default=None)
+    map_parser.add_argument("--max-total-chunks", type=int, default=None)
+    map_parser.add_argument("--max-document-calls", type=int, default=None)
+    map_parser.add_argument("--request-deadline-seconds", type=float, default=None)
+    map_parser.add_argument("--document-deadline-seconds", type=float, default=None)
+    map_parser.add_argument("--chunk-output-tokens", type=int, default=None)
+    map_parser.add_argument("--synthesis-output-tokens", type=int, default=None)
+    map_parser.add_argument("--context-window-fraction", type=float, default=None)
+    map_parser.add_argument("--estimated-chars-per-token", type=float, default=None)
+    _add_literature_policy_arguments(map_parser)
 
     resume_parser = commands.add_parser("resume", help="Resume an interrupted or partially terminal run.")
     resume_parser.add_argument("--workspace", type=Path, required=True)
@@ -72,6 +84,17 @@ def build_parser() -> argparse.ArgumentParser:
     build_parser_command = commands.add_parser("build-map", help="Rebuild typed links, clusters, gaps, and indexes from validated notes.")
     build_parser_command.add_argument("--workspace", type=Path, required=True)
     build_parser_command.add_argument("--run-id", default="")
+    build_parser_command.add_argument("--source-set", default="")
+    build_parser_command.add_argument("--question", default="")
+    build_parser_command.add_argument("--provider", choices=("deepseek", "openrouter", "gemini", "ollama"), default=None)
+    build_parser_command.add_argument("--model", default=None)
+    build_parser_command.add_argument("--allow-cloud", action="store_true", default=None)
+    build_parser_command.add_argument("--resume", action="store_true")
+    _add_literature_policy_arguments(build_parser_command)
+
+    migrate_parser = commands.add_parser("migrate", help="Archive legacy generated maps for the current artifact schema.")
+    migrate_parser.add_argument("--workspace", type=Path, required=True)
+    migrate_parser.add_argument("--dry-run", action="store_true")
 
     export_parser = commands.add_parser("export", help="Export generated Markdown projections.")
     export_commands = export_parser.add_subparsers(dest="export_command", required=True)
@@ -116,6 +139,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 allow_cloud=args.allow_cloud is True,
                 parallel=args.parallel if args.parallel is not None else int(config.get("parallel", 4)),
                 limit=args.limit if args.limit is not None else 0,
+                processing=_processing_policy(args, config),
+                literature_policy=_literature_policy(args, config),
             )
             result = run_map(request, run_id=args.run_id or None).to_dict()
         elif args.command == "resume":
@@ -125,9 +150,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = report.to_dict()
             if not args.as_json:
                 print(_status_text(result))
-                return 0 if result.get("status") != "blocked" else 2
+                return _exit_code(result)
         elif args.command == "build-map":
-            result = build_map(args.workspace, run_id=args.run_id or None).to_dict()
+            config = load_config(args.workspace)
+            configured_provider = str(config.get("provider") or "deepseek")
+            provider = args.provider or configured_provider
+            configured_model = str(config.get("model") or "") if provider == configured_provider else ""
+            model = args.model or configured_model or DEFAULT_MODELS.get(provider, "")
+            result = build_map(
+                args.workspace,
+                run_id=args.run_id or None,
+                source_set=args.source_set or None,
+                question=args.question or None,
+                provider=provider,
+                model=model,
+                allow_cloud=args.allow_cloud is True,
+                literature_policy=_literature_policy(args, config),
+                resume=args.resume,
+            ).to_dict()
+        elif args.command == "migrate":
+            result = migrate_workspace(args.workspace, dry_run=args.dry_run)
         elif args.command == "export" and args.export_command == "obsidian":
             config = load_config(args.workspace)
             obsidian = config.get("obsidian", {}) if isinstance(config.get("obsidian", {}), dict) else {}
@@ -151,20 +193,108 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps({"status": "blocked", "error": f"{type(exc).__name__}: {exc}"}, sort_keys=True), file=sys.stderr)
         return 2
     print(json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False))
-    return 0 if result.get("status") not in {"blocked", "failed"} else 2
+    return _exit_code(result)
 
 
 def _status_text(payload: dict[str, Any]) -> str:
     counts = payload.get("counts", {})
+    progress = (payload.get("checks", {}) or {}).get("progress", {})
     return (
         f"Status: {payload.get('status', 'unknown')}\n"
         f"Run: {payload.get('run_id') or 'none'}\n"
+        f"Stage: {progress.get('stage') or 'none'}\n"
         f"Inventory: {counts.get('inventory_count', 0)}\n"
         f"Validated notes: {counts.get('validated_note_count', 0)}\n"
+        f"Limited notes: {counts.get('limited_note_count', 0)}\n"
         f"Exhausted: {counts.get('exhausted_count', 0)}\n"
+        f"Partial: {counts.get('partial_count', 0)}\n"
+        f"Pending: {counts.get('pending_count', 0)}\n"
+        f"Profiles: {counts.get('profile_count', 0)}\n"
+        f"Excluded profiles: {counts.get('profile_excluded_count', 0)}\n"
+        f"Unclustered sources: {counts.get('unclustered_count', 0)}\n"
         f"Clusters: {counts.get('cluster_count', 0)}\n"
-        f"Candidate gaps: {counts.get('gap_candidate_count', 0)}"
+        f"Synthesized clusters: {counts.get('synthesized_cluster_count', 0)}\n"
+        f"Debates: {counts.get('debate_count', 0)}\n"
+        f"Mapped collection gaps: {counts.get('mapped_gap_count', 0)}\n"
+        f"Gap leads: {counts.get('gap_lead_count', 0)}\n"
+        f"Rejected underspecified gaps: {counts.get('rejected_underspecified_gap_count', 0)}\n"
+        f"Synthesis calls: {counts.get('synthesis_call_count', 0)}\n"
+        f"Synthesis checkpoint hits: {counts.get('synthesis_checkpoint_hit_count', 0)}\n"
+        f"Provider calls: {counts.get('provider_call_count', 0)}\n"
+        f"Checkpoint hits: {counts.get('checkpoint_hit_count', 0)}"
     )
+
+
+def _processing_policy(args: argparse.Namespace, config: dict[str, Any]) -> ProcessingPolicy:
+    configured = config.get("processing", {}) if isinstance(config.get("processing", {}), dict) else {}
+    defaults = ProcessingPolicy.from_dict(configured)
+    values = {
+        "direct_read_char_limit": args.direct_read_char_limit,
+        "chunk_char_limit": args.chunk_char_limit,
+        "max_total_chunks": args.max_total_chunks,
+        "max_calls_per_document_run": args.max_document_calls,
+        "request_deadline_seconds": args.request_deadline_seconds,
+        "document_deadline_seconds": args.document_deadline_seconds,
+        "chunk_output_tokens": args.chunk_output_tokens,
+        "synthesis_output_tokens": args.synthesis_output_tokens,
+        "context_window_fraction": args.context_window_fraction,
+        "estimated_chars_per_token": args.estimated_chars_per_token,
+    }
+    payload = {field: getattr(defaults, field) for field in defaults.__dataclass_fields__}
+    payload.update({key: value for key, value in values.items() if value is not None})
+    return ProcessingPolicy.from_dict(payload)
+
+
+def _add_literature_policy_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--synthesis", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--require-question", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--auto-promote-clusters", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--auto-promote-debates", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--auto-promote-gaps", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--cluster-threshold", type=int, default=None)
+    parser.add_argument("--max-memberships", type=int, default=None)
+    parser.add_argument("--external-discovery", choices=("disabled", "per_run", "always"), default=None)
+    parser.add_argument("--max-profile-calls", type=int, default=None)
+    parser.add_argument("--max-synthesis-calls", type=int, default=None)
+    parser.add_argument("--profile-workers", type=int, default=None)
+    parser.add_argument("--literature-deadline-seconds", type=float, default=None)
+    parser.add_argument("--literature-context-fraction", type=float, default=None)
+    parser.add_argument("--weak-gap-handling", choices=("audit_only",), default=None)
+    parser.add_argument("--cluster-gap-projection", choices=("inline",), default=None)
+    parser.add_argument("--require-executable-gap-design", action=argparse.BooleanOptionalAction, default=None)
+
+
+def _literature_policy(args: argparse.Namespace, config: dict[str, Any]) -> LiteratureMappingPolicy:
+    configured = config.get("literature_mapping", {}) if isinstance(config.get("literature_mapping", {}), dict) else {}
+    defaults = LiteratureMappingPolicy.from_dict(configured)
+    overrides = {
+        "synthesis_enabled": getattr(args, "synthesis", None),
+        "require_question": getattr(args, "require_question", None),
+        "auto_promote_clusters": getattr(args, "auto_promote_clusters", None),
+        "auto_promote_debates": getattr(args, "auto_promote_debates", None),
+        "auto_promote_gaps": getattr(args, "auto_promote_gaps", None),
+        "source_backed_threshold": getattr(args, "cluster_threshold", None),
+        "max_memberships": getattr(args, "max_memberships", None),
+        "external_discovery": getattr(args, "external_discovery", None),
+        "max_profile_calls": getattr(args, "max_profile_calls", None),
+        "max_synthesis_calls": getattr(args, "max_synthesis_calls", None),
+        "profile_workers": getattr(args, "profile_workers", None),
+        "literature_deadline_seconds": getattr(args, "literature_deadline_seconds", None),
+        "deepseek_packet_context_fraction": getattr(args, "literature_context_fraction", None),
+        "weak_gap_handling": getattr(args, "weak_gap_handling", None),
+        "cluster_gap_projection": getattr(args, "cluster_gap_projection", None),
+        "require_executable_gap_design": getattr(args, "require_executable_gap_design", None),
+    }
+    payload = defaults.to_dict()
+    payload.update({key: value for key, value in overrides.items() if value is not None})
+    return LiteratureMappingPolicy.from_dict(payload)
+
+
+def _exit_code(payload: dict[str, Any]) -> int:
+    status = str(payload.get("status") or "")
+    if status == "partial":
+        return 3
+    return 2 if status in {"blocked", "failed"} else 0
 
 
 if __name__ == "__main__":

@@ -24,6 +24,45 @@ def test_gemini_vision_fails_before_document_upload_without_consent() -> None:
         reader.inspect_document(b"private-pdf", "application/pdf", {"title": "Private"})
 
 
+@pytest.mark.parametrize(
+    "reader",
+    [
+        DeepSeekReader(allow_cloud=False),
+        OpenRouterReader("openai/gpt-4.1-mini", allow_cloud=False),
+        GeminiReader(allow_cloud=False),
+    ],
+)
+def test_cloud_hierarchical_adapters_fail_before_chunk_upload_without_consent(reader, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "auto_zettelkasten.readers.urllib.request.urlopen",
+        lambda *args, **kwargs: pytest.fail("transport must not be called"),
+    )
+    with pytest.raises(CloudPermissionError, match="explicit allow_cloud"):
+        reader.summarize_chunk(
+            "private inspected text",
+            {"title": "Private"},
+            chunk_id="chunk-0001",
+            locator="pages 1-4",
+        )
+
+
+@pytest.mark.parametrize(
+    "reader",
+    [
+        DeepSeekReader(allow_cloud=False),
+        OpenRouterReader("openai/gpt-4.1-mini", allow_cloud=False),
+        GeminiReader(allow_cloud=False),
+    ],
+)
+def test_cloud_hierarchical_adapters_fail_before_memo_upload_without_consent(reader, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "auto_zettelkasten.readers.urllib.request.urlopen",
+        lambda *args, **kwargs: pytest.fail("transport must not be called"),
+    )
+    with pytest.raises(CloudPermissionError, match="explicit allow_cloud"):
+        reader.synthesize_document([{"summary": "private memo"}], {"title": "Private"})
+
+
 def test_ollama_requires_loopback_endpoint() -> None:
     with pytest.raises(ValueError, match="loopback"):
         OllamaReader(base_url="http://192.0.2.10:11434")

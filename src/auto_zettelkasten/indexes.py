@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import csv
+import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -177,9 +178,15 @@ def write_source_set(
     gap_ids: Sequence[str] = (),
     source_set_id: str | None = None,
     source_set_type: str | None = None,
+    snapshot_id: str | None = None,
 ) -> dict[str, Any]:
-    suffix = f"zotero-{slugify(collection_key)}" if collection_key else f"run-{slugify(run_id)}"
-    source_set_id = source_set_id or f"source-set-{suffix}"
+    if collection_key:
+        suffix = f"zotero-{slugify(collection_key)}"
+    elif scope in {"library", "selected"}:
+        suffix = "zotero-library"
+    else:
+        suffix = f"run-{slugify(run_id)}"
+    source_set_alias = source_set_id or f"source-set-{suffix}"
     zotero_keys = [_item_key(item) for item in items]
     original_tags = sorted({tag for row in note_rows for tag in row.get("original_zotero_tags", []) or []})
     normalized_tags = sorted({tag for row in note_rows for tag in row.get("normalized_tags", []) or []})
@@ -190,18 +197,39 @@ def write_source_set(
             "zotero_item_key": key,
             "terminal_status": terminal_by_index.get(index, {}).get("terminal_status"),
             "fingerprint": terminal_by_index.get(index, {}).get("fingerprint"),
+            "semantic_note_hash": next(
+                (
+                    str(note.get("semantic_note_hash") or note.get("note_hash") or "")
+                    for note in note_rows
+                    if str(note.get("zotero_item_key") or "") == key
+                ),
+                "",
+            ),
         }
         for index, key in enumerate(zotero_keys)
     ]
+    dependency_hash = sha256_text(json.dumps(dependency_payload, sort_keys=True, ensure_ascii=False, default=str))
+    source_set_id = snapshot_id or f"{source_set_alias}-{dependency_hash[:12]}"
+    status_counts = {
+        status: sum(1 for row in terminal_rows if str(row.get("terminal_status", "")) == status)
+        for status in ("validated_note", "limited_note", "exhausted", "partial", "pending")
+    }
     payload = {
         "source_set_id": source_set_id,
-        "source_set_type": source_set_type or ("zotero_collection" if collection_key else "auto_zettelkasten_run"),
+        "source_set_alias": source_set_alias,
+        "source_set_type": source_set_type
+        or ("zotero_collection" if collection_key else ("zotero_library" if scope in {"library", "selected"} else "auto_zettelkasten_run")),
         "scope": scope,
         "run_id": run_id,
         "zotero_collection_key": collection_key or "",
         "upstream_scope": {"kind": f"zotero_{scope}", "id": collection_key or run_id},
         "inventory_count": len(items),
-        "terminal_count": len(terminal_rows),
+        "terminal_count": status_counts["validated_note"] + status_counts["limited_note"] + status_counts["exhausted"],
+        "validated_note_count": status_counts["validated_note"],
+        "limited_note_count": status_counts["limited_note"],
+        "exhausted_count": status_counts["exhausted"],
+        "partial_count": status_counts["partial"],
+        "pending_count": status_counts["pending"],
         "source_ids": [str(row.get("source_id")) for row in note_rows],
         "note_ids": [str(row.get("note_id")) for row in note_rows],
         "note_paths": [str(row.get("note_path")) for row in note_rows],
@@ -211,7 +239,9 @@ def write_source_set(
         "normalized_tags": normalized_tags,
         "cluster_ids": sorted(set(cluster_ids)),
         "gap_ids": sorted(set(gap_ids)),
-        "dependency_hash": sha256_text(repr(dependency_payload)),
+        "dependency_hash": dependency_hash,
+        "frozen_inventory": True,
+        "refresh_requires_new_run": True,
         "stale": False,
         "updated_at": now_iso(),
         "rows": [
@@ -228,7 +258,10 @@ def write_source_set(
     }
     path = workspace / "02_source_memory" / "indexes" / "source_sets" / f"{source_set_id}.yml"
     write_yaml(path, payload)
+    latest_path = workspace / "02_source_memory" / "indexes" / "source_sets" / f"{source_set_alias}.yml"
+    write_yaml(latest_path, {**payload, "latest_snapshot_id": source_set_id, "latest_snapshot_path": str(path)})
     payload["path"] = str(path)
+    payload["latest_path"] = str(latest_path)
     return payload
 
 
@@ -238,9 +271,14 @@ def update_source_set_map(workspace: Path, source_set: Mapping[str, Any], cluste
     payload["gap_ids"] = sorted(str(row.get("gap_id")) for row in gaps if row.get("gap_id"))
     payload["updated_at"] = now_iso()
     payload.pop("path", None)
+    payload.pop("latest_path", None)
     path = workspace / "02_source_memory" / "indexes" / "source_sets" / f"{payload['source_set_id']}.yml"
     write_yaml(path, payload)
+    alias = str(payload.get("source_set_alias") or payload["source_set_id"])
+    latest_path = workspace / "02_source_memory" / "indexes" / "source_sets" / f"{alias}.yml"
+    write_yaml(latest_path, {**payload, "latest_snapshot_id": payload["source_set_id"], "latest_snapshot_path": str(path)})
     payload["path"] = str(path)
+    payload["latest_path"] = str(latest_path)
     return payload
 
 
@@ -254,7 +292,7 @@ def write_source_index(workspace: Path, note_paths: Sequence[Path]) -> Path:
             f"(`{front.get('note_id', '')}`, `{front.get('note_status', '')}`)"
         )
     target = workspace / "02_source_memory" / "indexes" / "INDEX.md"
-    atomic_write_text(target, "# Source Index\n\n" + ("\n".join(rows) if rows else "No validated atomic notes yet.") + "\n")
+    atomic_write_text(target, "# Source Index\n\n" + ("\n".join(rows) if rows else "No source notes yet.") + "\n")
     return target
 
 

@@ -2,11 +2,31 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
-from . import ARTIFACT_SCHEMA_VERSION, ENGINE_VERSION
 from .files import ensure_dir, now_iso, read_yaml, sha256_file, write_yaml
-from .models import ArtifactManifest
+from .models import (
+    CURRENT_ARTIFACT_SCHEMA_VERSION,
+    CURRENT_ENGINE_VERSION,
+    ArtifactManifest,
+    LiteratureMappingPolicy,
+    ProcessingPolicy,
+)
+
+CONFIG_FIELDS = {
+    "engine_version",
+    "artifact_schema_version",
+    "scope",
+    "provider",
+    "model",
+    "privacy",
+    "extraction",
+    "prompt_version",
+    "parallel",
+    "processing",
+    "literature_mapping",
+    "obsidian",
+}
 
 WORKSPACE_DIRECTORIES = (
     "01_custody/zotero/inventory",
@@ -14,7 +34,9 @@ WORKSPACE_DIRECTORIES = (
     "01_custody/files",
     "01_custody/read_attempts",
     "02_source_memory/notes",
+    "02_source_memory/profiles",
     "02_source_memory/indexes/source_sets",
+    "03_literature_synthesis/maps",
     "03_literature_synthesis/clusters",
     "03_literature_synthesis/gaps/candidates",
     "03_literature_synthesis/closest_prior_work",
@@ -22,6 +44,7 @@ WORKSPACE_DIRECTORIES = (
     "11_state/runs",
     "11_state/fingerprints",
     "11_state/exports",
+    "11_state/legacy_maps",
 )
 
 
@@ -54,41 +77,54 @@ def resolve_workspace(workspace: Path | str) -> Path:
 
 def initialize(workspace: Path | str, *, overwrite: bool = False) -> ArtifactManifest:
     root = resolve_workspace(workspace)
+    config_path = root / "auto-zettelkasten.yml"
+    manifest_path = root / "11_state" / "workspace_manifest.yml"
+    if not overwrite and (config_path.exists() or manifest_path.exists()):
+        assert_compatible(root)
     ensure_dir(root)
     for relative in WORKSPACE_DIRECTORIES:
         ensure_dir(root / relative)
 
-    config_path = root / "auto-zettelkasten.yml"
     if overwrite or not config_path.exists():
         write_yaml(
             config_path,
             {
-                "engine_version": ENGINE_VERSION,
-                "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+                "engine_version": CURRENT_ENGINE_VERSION,
+                "artifact_schema_version": CURRENT_ARTIFACT_SCHEMA_VERSION,
                 "scope": "library",
                 "provider": "deepseek",
                 "model": "deepseek-v4-flash",
                 "privacy": {"allow_cloud": False},
                 "extraction": {"version": "1", "ocr": "auto", "vision": "configured_only"},
-                "prompt_version": "1",
+                "prompt_version": "2",
                 "parallel": 4,
+                "processing": {
+                    "direct_read_char_limit": 120000,
+                    "chunk_char_limit": 60000,
+                    "max_total_chunks": 64,
+                    "max_calls_per_document_run": 24,
+                    "request_deadline_seconds": 120,
+                    "document_deadline_seconds": 900,
+                    "chunk_output_tokens": 900,
+                    "synthesis_output_tokens": 3000,
+                    "context_window_fraction": 0.8,
+                    "estimated_chars_per_token": 3.5,
+                },
+                "literature_mapping": LiteratureMappingPolicy().to_dict(),
                 "obsidian": {"vault": ""},
             },
         )
 
-    manifest_path = root / "11_state" / "workspace_manifest.yml"
     if overwrite or not manifest_path.exists():
         write_yaml(
             manifest_path,
             {
-                "engine_version": ENGINE_VERSION,
-                "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+                "engine_version": CURRENT_ENGINE_VERSION,
+                "artifact_schema_version": CURRENT_ARTIFACT_SCHEMA_VERSION,
                 "created_at": now_iso(),
                 "workspace": str(root),
             },
         )
-    else:
-        assert_compatible(root)
 
     artifacts = artifact_rows(root, [config_path, manifest_path])
     return ArtifactManifest(
@@ -102,19 +138,54 @@ def initialize(workspace: Path | str, *, overwrite: bool = False) -> ArtifactMan
 
 def assert_compatible(workspace: Path | str) -> None:
     root = resolve_workspace(workspace)
-    path = root / "11_state" / "workspace_manifest.yml"
-    payload = read_yaml(path, {}) or {}
-    actual = str(payload.get("artifact_schema_version") or ARTIFACT_SCHEMA_VERSION)
-    if _version_tuple(actual) > _version_tuple(ARTIFACT_SCHEMA_VERSION):
+    manifest_path = root / "11_state" / "workspace_manifest.yml"
+    config_path = root / "auto-zettelkasten.yml"
+    if not manifest_path.is_file() or not config_path.is_file():
+        raise IncompatibleArtifactSchemaError("existing workspace requires both config and workspace manifest")
+    manifest = read_yaml(manifest_path, {})
+    config = read_yaml(config_path, {})
+    if not isinstance(manifest, Mapping) or not isinstance(config, Mapping):
+        raise IncompatibleArtifactSchemaError("workspace config and manifest must be mappings")
+    manifest_version = _parse_schema_version(manifest.get("artifact_schema_version"), field="workspace manifest")
+    config_version = _parse_schema_version(config.get("artifact_schema_version"), field="workspace config")
+    if manifest_version != config_version:
         raise IncompatibleArtifactSchemaError(
-            f"workspace artifact schema {actual} is newer than supported schema {ARTIFACT_SCHEMA_VERSION}"
+            f"workspace config schema {config_version} disagrees with manifest schema {manifest_version}"
+        )
+    supported = {(1, 0), (1, 1), (1, 2), (1, 3), (1, 4)}
+    if manifest_version not in supported:
+        actual = ".".join(str(value) for value in manifest_version)
+        relation = "newer than" if manifest_version > (1, 4) else "not supported by"
+        raise IncompatibleArtifactSchemaError(
+            f"workspace artifact schema {actual} is {relation} supported schema {CURRENT_ARTIFACT_SCHEMA_VERSION}"
         )
 
 
 def load_config(workspace: Path | str) -> dict[str, Any]:
     root = resolve_workspace(workspace)
     assert_compatible(root)
-    return dict(read_yaml(root / "auto-zettelkasten.yml", {}) or {})
+    payload = read_yaml(root / "auto-zettelkasten.yml", {}) or {}
+    if not isinstance(payload, Mapping):
+        raise ValueError("workspace config must be a mapping")
+    config = dict(payload)
+    unknown = sorted(set(config) - CONFIG_FIELDS)
+    if unknown:
+        raise ValueError(f"unknown workspace config fields: {', '.join(unknown)}")
+    if "processing" in config:
+        if not isinstance(config["processing"], Mapping):
+            raise ValueError("processing must be a mapping")
+        ProcessingPolicy.from_dict(config["processing"])
+    if "literature_mapping" in config:
+        configured_policy = config["literature_mapping"]
+        if not isinstance(configured_policy, Mapping):
+            raise ValueError("literature_mapping must be a mapping")
+        LiteratureMappingPolicy.from_dict(configured_policy)
+    privacy = config.get("privacy", {})
+    if not isinstance(privacy, Mapping):
+        raise ValueError("privacy must be a mapping")
+    if "allow_cloud" in privacy and not isinstance(privacy["allow_cloud"], bool):
+        raise ValueError("privacy.allow_cloud must be a boolean")
+    return config
 
 
 def artifact_rows(workspace: Path, paths: Iterable[Path]) -> list[dict[str, Any]]:
@@ -128,11 +199,9 @@ def artifact_rows(workspace: Path, paths: Iterable[Path]) -> list[dict[str, Any]
     return rows
 
 
-def _version_tuple(value: str) -> tuple[int, ...]:
-    parts: list[int] = []
-    for part in value.split("."):
-        try:
-            parts.append(int(part))
-        except ValueError:
-            parts.append(0)
-    return tuple(parts)
+def _parse_schema_version(value: Any, *, field: str) -> tuple[int, int]:
+    text = str(value or "").strip()
+    match = re.fullmatch(r"(\d+)\.(\d+)(?:\.0+)?", text)
+    if not match:
+        raise IncompatibleArtifactSchemaError(f"{field} has malformed artifact schema: {text or '<missing>'}")
+    return int(match.group(1)), int(match.group(2))

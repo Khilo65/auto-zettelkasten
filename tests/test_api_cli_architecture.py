@@ -33,7 +33,7 @@ def test_inventory_only_writes_scope_manifest_and_resolves_selected(tmp_path: Pa
     assert result["item_count"] == 1
     assert result["collection_key"] == "SELECTEDKEY"
     assert result["source_set"]["zotero_collection_key"] == "SELECTEDKEY"
-    assert result["artifact_manifest"]["artifact_schema_version"] == "1.0"
+    assert result["artifact_manifest"]["artifact_schema_version"] == "1.4"
 
 
 def test_run_ids_cannot_escape_workspace_state(tmp_path: Path, sample_items) -> None:
@@ -120,3 +120,36 @@ def test_cli_uses_workspace_provider_but_requires_per_run_cloud_consent(tmp_path
     capsys.readouterr()
     assert captured["request"].provider == "deepseek"
     assert captured["request"].allow_cloud is False
+
+
+def test_cli_processing_overrides_and_partial_exit_code(tmp_path: Path, monkeypatch, capsys) -> None:
+    workspace = tmp_path / "processing-workspace"
+    initialize_workspace(workspace)
+    captured = {}
+
+    class Result:
+        def to_dict(self):
+            return {"status": "partial"}
+
+    def fake_run(request, **kwargs):
+        captured["request"] = request
+        return Result()
+
+    monkeypatch.setattr("auto_zettelkasten.cli.run_map", fake_run)
+    exit_code = main(
+        [
+            "map",
+            "--workspace",
+            str(workspace),
+            "--provider",
+            "ollama",
+            "--max-document-calls",
+            "9",
+            "--request-deadline-seconds",
+            "45",
+        ]
+    )
+    assert exit_code == 3
+    capsys.readouterr()
+    assert captured["request"].processing.max_calls_per_document_run == 9
+    assert captured["request"].processing.request_deadline_seconds == 45

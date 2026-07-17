@@ -1,0 +1,763 @@
+from __future__ import annotations
+
+import threading
+import time
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+
+import pytest
+import yaml
+
+from auto_zettelkasten.api import build_map, get_status, resume_map, run_map
+from auto_zettelkasten.models import EvidenceProfile, LiteratureMapRequest, LiteratureMappingPolicy, MapRequest
+from auto_zettelkasten.ports import LiteratureReasoner
+from auto_zettelkasten.profiles import (
+    deterministic_profile,
+    load_profile_sidecar,
+    profile_dependency_fingerprint,
+    profile_to_dict,
+)
+from auto_zettelkasten.readers import (
+    CloudPermissionError,
+    DeepSeekReader,
+    GeminiReader,
+    OllamaReader,
+    OpenRouterReader,
+    _validate_literature_response,
+)
+
+from conftest import SECTION_KEYS, FakeReader, FakeZotero
+
+
+def _analysis() -> dict[str, str]:
+    return {key: f"Source-grounded {key}; see page 1." for key in SECTION_KEYS}
+
+
+def _profile_response(note_text: str, marker: str) -> dict[str, Any]:
+    payload = profile_to_dict(deterministic_profile(note_text))
+    payload["concepts"] = [marker]
+    payload["theories"] = [f"{marker} theory"]
+    payload["mechanisms"] = [f"{marker} mechanism"]
+    return payload
+
+
+def _profile_from_prompt(prompt: str, marker: str) -> dict[str, Any]:
+    delimiter = "COMMITTED MARKDOWN NOTE:\n"
+    assert delimiter in prompt
+    return _profile_response(prompt.split(delimiter, 1)[1], marker)
+
+
+def _progress(workspace: Path, run_id: str) -> dict[str, Any]:
+    return yaml.safe_load((workspace / "11_state" / "runs" / run_id / "progress.yml").read_text(encoding="utf-8"))
+
+
+def _only_profile(workspace: Path) -> EvidenceProfile:
+    sidecars = list((workspace / "02_source_memory" / "profiles").glob("*.yml"))
+    assert len(sidecars) == 1
+    return load_profile_sidecar(sidecars[0])
+
+
+def test_builtin_gap_response_normalizes_optional_model_shape_errors_per_candidate() -> None:
+    normalized = _validate_literature_response(
+        {
+            "gaps": [
+                {
+                    "gap_id": "gap-1",
+                    "priority_tier": "medium",
+                    "countervailing_evidence": ["not an evidence object"],
+                    "value_assessment": {
+                        "information_gain": "medium",
+                        "competing_explanations": "selection into mediation",
+                        "non_obviousness_passed": "true",
+                        "importance_passed": True,
+                    },
+                    "study_design": {
+                        "outcomes": "one outcome",
+                        "validity_risks": "spillover across comparison cases",
+                        "identification_or_inference_stategy": "matched comparison",
+                        "ethical_constraints": ["standard research ethics"],
+                    },
+                    "anchors": [{"cluster_id": "", "section": "central_findings", "item_id": ""}],
+                }
+            ],
+            "rejected": [],
+        },
+        kind="gap_adjudication",
+    )
+
+    gap = normalized["gaps"][0]
+    assert gap["priority_tier"] == "moderate"
+    assert gap["countervailing_evidence"] == []
+    assert gap["value_assessment"]["information_gain"] == "moderate"
+    assert gap["value_assessment"]["competing_explanations"] == ["selection into mediation"]
+    assert gap["value_assessment"]["non_obviousness_passed"] is False
+    assert gap["study_design"]["outcomes"] == ["one outcome"]
+    assert gap["study_design"]["validity_risks"] == ["spillover across comparison cases"]
+    assert gap["study_design"]["identification_or_inference_strategy"] == "matched comparison"
+    assert gap["study_design"]["ethical_constraints"] == "standard research ethics"
+    assert gap["anchors"] == []
+
+
+class _SourceOnlyDeepSeek:
+    name = "deepseek"
+    model = "deepseek-v4-flash"
+    is_cloud = True
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def read_source(self, text: str, metadata: Mapping[str, Any], question: str | None = None) -> Mapping[str, Any]:
+        self.calls += 1
+        return _analysis()
+
+
+class _ExplicitReasoner:
+    name = "explicit-reasoner"
+    model = "explicit-v1"
+    is_cloud = False
+
+    def __init__(self) -> None:
+        self.profile_calls = 0
+
+    def profile_source(
+        self,
+        note: Mapping[str, Any],
+        *,
+        question: str | None = None,
+        context: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        self.profile_calls += 1
+        assert context and context["profile_prompt_version"] == "1"
+        return _profile_response(str(note["committed_note"]), "explicit-profile")
+
+    def propose_clusters(
+        self,
+        profiles: Sequence[EvidenceProfile],
+        request: LiteratureMapRequest,
+        *,
+        context: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        return {}
+
+    def map_debates(
+        self,
+        profiles: Sequence[EvidenceProfile],
+        request: LiteratureMapRequest,
+        *,
+        context: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        return {}
+
+    def detect_gaps(
+        self,
+        profiles: Sequence[EvidenceProfile],
+        request: LiteratureMapRequest,
+        *,
+        context: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        return {}
+
+
+class _ConcurrentReasoner(_ExplicitReasoner):
+    def __init__(self) -> None:
+        super().__init__()
+        self._lock = threading.Lock()
+        self.active_calls = 0
+        self.max_active_calls = 0
+
+    def profile_source(self, note, *, question=None, context=None):
+        with self._lock:
+            self.profile_calls += 1
+            self.active_calls += 1
+            self.max_active_calls = max(self.max_active_calls, self.active_calls)
+        try:
+            time.sleep(0.05)
+            return _profile_response(str(note["committed_note"]), "parallel-profile")
+        finally:
+            with self._lock:
+                self.active_calls -= 1
+
+
+class _RecoveringReasoner(_ExplicitReasoner):
+    def __init__(self, fail_keys: set[str] | None = None) -> None:
+        super().__init__()
+        self.fail_keys = fail_keys or set()
+
+    def profile_source(self, note, *, question=None, context=None):
+        self.profile_calls += 1
+        if str(note.get("zotero_item_key") or "") in self.fail_keys:
+            raise RuntimeError("malformed_profile_response")
+        return _profile_response(str(note["committed_note"]), "recovered-profile")
+
+
+class _RecoveringSourceReader(FakeReader):
+    def __init__(self, fail_keys: set[str] | None = None) -> None:
+        super().__init__()
+        self.fail_keys = fail_keys or set()
+
+    def read_source(self, text, metadata, question=None):
+        self.calls += 1
+        if str(metadata.get("key") or "") in self.fail_keys:
+            raise RuntimeError("transient_source_failure")
+        return _analysis()
+
+
+def test_configured_builtin_reader_profiles_by_default_and_totals_live_calls(
+    tmp_path: Path,
+    sample_items,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    calls: list[tuple[str, int, float]] = []
+
+    def generate(self, system_prompt, user_prompt, output_tokens, deadline_seconds):
+        route = "profile" if "COMMITTED MARKDOWN NOTE:" in user_prompt else "source"
+        calls.append((route, output_tokens, deadline_seconds))
+        if route == "profile":
+            return _profile_from_prompt(user_prompt, "built-in-profile")
+        return _analysis()
+
+    monkeypatch.setattr(DeepSeekReader, "_generate_text", generate)
+    request = MapRequest(tmp_path, provider="deepseek", model="deepseek-v4-flash", allow_cloud=True)
+
+    report = run_map(request, client=FakeZotero(sample_items[:1]), run_id="builtin-profile")
+
+    assert report.status == "completed"
+    assert [route for route, _, _ in calls] == ["source", "profile"]
+    assert calls[1][1] == 8_000
+    assert calls[1][2] == request.processing.request_deadline_seconds
+    assert isinstance(DeepSeekReader(allow_cloud=True), LiteratureReasoner)
+    profile = _only_profile(tmp_path)
+    assert profile.concepts == ["built-in-profile"]
+    assert profile.context["profile_generation_route"] == "built_in_reader"
+    progress = _progress(tmp_path, "builtin-profile")
+    assert progress["source_provider_call_count"] == 1
+    assert progress["literature_provider_call_count"] == 1
+    assert progress["provider_call_count"] == 2
+    completed_status = get_status(tmp_path, "builtin-profile")
+    assert completed_status.counts["source_provider_call_count"] == 1
+    assert completed_status.counts["literature_provider_call_count"] == 1
+    assert completed_status.counts["provider_call_count"] == 2
+
+
+def test_build_map_constructs_configured_builtin_reasoner(
+    tmp_path: Path,
+    sample_items,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_report = run_map(
+        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        client=FakeZotero(sample_items),
+        reader=FakeReader(),
+        run_id="build-map-source",
+    )
+    reasoner = _ExplicitReasoner()
+    constructed: list[tuple[str, str, bool]] = []
+
+    def fake_provider(name: str, model: str, *, allow_cloud: bool):
+        constructed.append((name, model, allow_cloud))
+        return reasoner
+
+    monkeypatch.setattr("auto_zettelkasten.api.provider_from_name", fake_provider)
+    result = build_map(
+        tmp_path,
+        run_id="build-map-reasoner",
+        source_set=source_report.source_set,
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        allow_cloud=True,
+    )
+
+    assert result.status == "built"
+    assert constructed == [("deepseek", "deepseek-v4-flash", True)]
+    assert reasoner.profile_calls == 2
+    progress = _progress(tmp_path, "build-map-reasoner")
+    assert progress["status"] == "completed"
+    assert progress["stage"] == "reporting"
+    assert progress["profile_count"] == 2
+    assert progress["literature_provider_call_count"] == (
+        progress["profile_count"] + progress["synthesis_call_count"]
+    )
+    profile_hits = result.metadata["literature_map"]["profile_result"]["checkpoint_hits"]
+    assert progress["checkpoint_hit_count"] == profile_hits + progress["synthesis_checkpoint_hit_count"]
+
+
+def test_primary_run_honors_synthesis_disabled_without_profile_or_map_artifacts(
+    tmp_path: Path,
+    sample_items,
+) -> None:
+    reader = _SourceOnlyDeepSeek()
+    report = run_map(
+        MapRequest(
+            tmp_path,
+            provider="deepseek",
+            model="deepseek-v4-flash",
+            allow_cloud=True,
+            literature_policy=LiteratureMappingPolicy(synthesis_enabled=False),
+        ),
+        client=FakeZotero(sample_items[:1]),
+        reader=reader,
+        run_id="synthesis-disabled",
+    )
+
+    assert report.status == "completed"
+    assert reader.calls == 1
+    assert report.profile_count == 0
+    assert report.cluster_map["status"] == "synthesis_disabled"
+    assert report.gap_map["status"] == "synthesis_disabled"
+    assert not list((tmp_path / "02_source_memory" / "profiles").glob("*.yml"))
+    assert not (tmp_path / "03_literature_synthesis" / "manifest.yml").exists()
+
+
+def test_profile_workers_run_independent_profile_calls_concurrently(tmp_path: Path, sample_items) -> None:
+    reasoner = _ConcurrentReasoner()
+    report = run_map(
+        MapRequest(
+            tmp_path,
+            provider="ollama",
+            model="fake-1",
+            literature_policy=LiteratureMappingPolicy(profile_workers=2),
+        ),
+        client=FakeZotero(sample_items),
+        reader=FakeReader(),
+        literature_reasoner=reasoner,
+        run_id="parallel-profiles",
+    )
+
+    assert report.status == "completed"
+    assert reasoner.profile_calls == 2
+    assert reasoner.max_active_calls == 2
+    assert report.literature_provider_call_count == 3
+    assert report.synthesis_call_count == 1
+
+
+def test_profile_call_budget_returns_resumable_partial_after_checkpointing_successes(
+    tmp_path: Path,
+    sample_items,
+) -> None:
+    reasoner = _ConcurrentReasoner()
+    report = run_map(
+        MapRequest(
+            tmp_path,
+            provider="ollama",
+            model="fake-1",
+            literature_policy=LiteratureMappingPolicy(max_profile_calls=1, profile_workers=2),
+        ),
+        client=FakeZotero(sample_items),
+        reader=FakeReader(),
+        literature_reasoner=reasoner,
+        run_id="profile-budget",
+    )
+
+    assert report.status == "partial"
+    assert report.validated_note_count == 2
+    assert report.literature_provider_call_count == 1
+    assert any(error.get("stage") == "literature_mapping" for error in report.errors)
+    assert len(list((tmp_path / "11_state" / "runs" / "profile-budget" / "literature" / "profile_calls").glob("*.yml"))) == 1
+
+
+def test_one_profile_failure_does_not_discard_other_results_and_resume_retries_only_failure(
+    tmp_path: Path,
+    sample_items,
+) -> None:
+    request = MapRequest(tmp_path, provider="ollama", model="fake-1")
+    first_reasoner = _RecoveringReasoner({"ITEMA"})
+
+    first = run_map(
+        request,
+        client=FakeZotero(sample_items),
+        reader=FakeReader(),
+        literature_reasoner=first_reasoner,
+        run_id="profile-recovery",
+    )
+
+    assert first.status == "partial"
+    assert first.profile_count == 1
+    assert first.profile_valid_count == 1
+    assert first.literature_failure_count == 1
+    assert first_reasoner.profile_calls == 2
+    failure_dir = tmp_path / "11_state" / "runs" / "profile-recovery" / "literature" / "profile_failures"
+    assert len(list(failure_dir.glob("*.yml"))) == 1
+
+    recovered_reasoner = _RecoveringReasoner()
+    recovered = resume_map(
+        tmp_path,
+        "profile-recovery",
+        client=FakeZotero([]),
+        reader=FakeReader(),
+        literature_reasoner=recovered_reasoner,
+    )
+
+    assert recovered.status == "completed"
+    assert recovered.profile_count == 2
+    assert recovered.profile_valid_count == 2
+    assert recovered.literature_failure_count == 0
+    assert recovered_reasoner.profile_calls == 1
+    assert not list(failure_dir.glob("*.yml"))
+
+
+def test_resume_keeps_frozen_source_set_identity_when_an_exhausted_source_recovers(
+    tmp_path: Path,
+    sample_items,
+) -> None:
+    request = MapRequest(tmp_path, provider="ollama", model="fake-1")
+    first_reasoner = _RecoveringReasoner()
+    first = run_map(
+        request,
+        client=FakeZotero(sample_items),
+        reader=_RecoveringSourceReader({"ITEMA"}),
+        literature_reasoner=first_reasoner,
+        run_id="source-recovery",
+    )
+
+    assert first.validated_note_count == 1
+    assert first.exhausted_count == 1
+    assert first_reasoner.profile_calls == 1
+
+    resumed_reasoner = _RecoveringReasoner()
+    resumed = resume_map(
+        tmp_path,
+        "source-recovery",
+        client=FakeZotero([]),
+        reader=_RecoveringSourceReader(),
+        literature_reasoner=resumed_reasoner,
+    )
+
+    assert resumed.validated_note_count == 2
+    assert resumed.exhausted_count == 0
+    assert resumed.source_set_id == first.source_set_id
+    assert resumed_reasoner.profile_calls == 1
+
+
+def test_profile_content_rebases_collection_lineage_without_a_new_paid_call(
+    tmp_path: Path,
+    sample_items,
+) -> None:
+    first_reasoner = _RecoveringReasoner()
+    first = run_map(
+        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        client=FakeZotero(sample_items[:1]),
+        reader=FakeReader(),
+        literature_reasoner=first_reasoner,
+        run_id="profile-lineage-first",
+    )
+    changed_source_set = {
+        **first.source_set,
+        "source_set_id": "source-set-zotero-other-snapshot",
+        "dependency_hash": "other-source-set-dependency",
+    }
+    rebased_reasoner = _RecoveringReasoner()
+
+    manifest = build_map(
+        tmp_path,
+        run_id="profile-lineage-rebase",
+        source_set=changed_source_set,
+        provider="ollama",
+        model="fake-1",
+        reasoner=rebased_reasoner,
+    )
+
+    assert manifest.status == "built"
+    assert rebased_reasoner.profile_calls == 0
+    profile = _only_profile(tmp_path)
+    assert profile.context["source_set_id"] == "source-set-zotero-other-snapshot"
+
+
+def test_explicit_reasoner_takes_precedence_over_builtin_reader(
+    tmp_path: Path,
+    sample_items,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    built_in_routes: list[str] = []
+
+    def generate(self, system_prompt, user_prompt, output_tokens, deadline_seconds):
+        route = "profile" if "COMMITTED MARKDOWN NOTE:" in user_prompt else "source"
+        built_in_routes.append(route)
+        if route == "profile":
+            raise AssertionError("the built-in profile route must not replace an explicit reasoner")
+        return _analysis()
+
+    monkeypatch.setattr(DeepSeekReader, "_generate_text", generate)
+    reasoner = _ExplicitReasoner()
+    report = run_map(
+        MapRequest(tmp_path, provider="deepseek", model="deepseek-v4-flash", allow_cloud=True),
+        client=FakeZotero(sample_items[:1]),
+        reader=DeepSeekReader(allow_cloud=True),
+        literature_reasoner=reasoner,
+        run_id="explicit-profile",
+    )
+
+    assert report.status == "completed"
+    assert built_in_routes == ["source"]
+    assert reasoner.profile_calls == 1
+    profile = _only_profile(tmp_path)
+    assert profile.concepts == ["explicit-profile"]
+    assert profile.context["profile_generation_route"] == "explicit_reasoner"
+
+
+def test_limited_note_uses_deterministic_profile_without_builtin_call(
+    tmp_path: Path,
+    sample_items,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+
+    def unexpected_generate(*args, **kwargs):
+        raise AssertionError("limited notes must not call the source reader or profile reasoner")
+
+    monkeypatch.setattr(DeepSeekReader, "_generate_text", unexpected_generate)
+    report = run_map(
+        MapRequest(tmp_path, provider="deepseek", model="deepseek-v4-flash", allow_cloud=True),
+        client=FakeZotero(sample_items[:1], missing={"ITEMA"}),
+        run_id="limited-profile",
+    )
+
+    assert report.limited_note_count == 1
+    profile = _only_profile(tmp_path)
+    assert profile.excluded_from_synthesis is True
+    assert profile.context["profile_generation_route"] == "deterministic"
+    progress = _progress(tmp_path, "limited-profile")
+    assert progress["source_provider_call_count"] == 0
+    assert progress["literature_provider_call_count"] == 0
+    assert progress["provider_call_count"] == 0
+
+
+def test_builtin_route_invalidates_legacy_deterministic_checkpoint_then_replay_is_zero_call(
+    tmp_path: Path,
+    sample_items,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    request = MapRequest(tmp_path, provider="deepseek", model="deepseek-v4-flash", allow_cloud=True)
+    source_reader = _SourceOnlyDeepSeek()
+    first = run_map(
+        request,
+        client=FakeZotero(sample_items[:1]),
+        reader=source_reader,
+        run_id="route-invalidation",
+    )
+    assert first.status == "completed"
+    assert source_reader.calls == 1
+
+    note_path = tmp_path / first.items[0]["note_path"]
+    legacy_fingerprint = profile_dependency_fingerprint(
+        note_path.read_text(encoding="utf-8"),
+        source_set_id=first.source_set_id,
+        provider=request.provider,
+        model=request.model,
+        policy=request.literature_policy,
+    )
+    sidecar_path = next((tmp_path / "02_source_memory" / "profiles").glob("*.yml"))
+    sidecar_payload = yaml.safe_load(sidecar_path.read_text(encoding="utf-8"))
+    sidecar_payload["profile"]["dependency_hash"] = legacy_fingerprint
+    sidecar_path.write_text(yaml.safe_dump(sidecar_payload, sort_keys=False), encoding="utf-8")
+    checkpoint_path = next(
+        (tmp_path / "11_state" / "runs" / "route-invalidation" / "literature" / "profile_calls").glob("*.yml")
+    )
+    checkpoint_payload = yaml.safe_load(checkpoint_path.read_text(encoding="utf-8"))
+    checkpoint_payload["fingerprint"] = legacy_fingerprint
+    checkpoint_payload["profile"]["dependency_hash"] = legacy_fingerprint
+    checkpoint_path.write_text(yaml.safe_dump(checkpoint_payload, sort_keys=False), encoding="utf-8")
+
+    calls: list[str] = []
+
+    def generate(self, system_prompt, user_prompt, output_tokens, deadline_seconds):
+        route = "profile" if "COMMITTED MARKDOWN NOTE:" in user_prompt else "source"
+        calls.append(route)
+        if route == "profile":
+            return _profile_from_prompt(user_prompt, "replacement-profile")
+        return _analysis()
+
+    monkeypatch.setattr(DeepSeekReader, "_generate_text", generate)
+    replaced = resume_map(tmp_path, "route-invalidation", client=FakeZotero([]))
+    assert replaced.status == "completed"
+    assert calls == ["profile"]
+    assert _only_profile(tmp_path).concepts == ["replacement-profile"]
+    replaced_progress = _progress(tmp_path, "route-invalidation")
+    assert replaced_progress["source_provider_call_count"] == 0
+    assert replaced_progress["literature_provider_call_count"] == 1
+    assert replaced_progress["provider_call_count"] == 1
+
+    calls.clear()
+    replayed = resume_map(tmp_path, "route-invalidation", client=FakeZotero([]))
+    assert replayed.status == "completed"
+    assert calls == []
+    replay_progress = _progress(tmp_path, "route-invalidation")
+    assert replay_progress["source_provider_call_count"] == 0
+    assert replay_progress["literature_provider_call_count"] == 0
+    assert replay_progress["provider_call_count"] == 0
+    assert replay_progress["checkpoint_hit_count"] >= 1
+
+
+@pytest.mark.parametrize(
+    "reader",
+    [
+        DeepSeekReader(allow_cloud=False),
+        OpenRouterReader("openai/gpt-4.1-mini", allow_cloud=False),
+        GeminiReader(allow_cloud=False),
+    ],
+)
+def test_cloud_builtin_profile_route_requires_consent(reader) -> None:
+    with pytest.raises(CloudPermissionError, match="explicit allow_cloud"):
+        reader.profile_source({"profile_prompt": "private committed note"})
+
+
+def test_all_builtin_readers_expose_complete_literature_reasoner_protocol() -> None:
+    readers = [
+        DeepSeekReader(),
+        OpenRouterReader("openai/gpt-4.1-mini"),
+        GeminiReader(),
+        OllamaReader(),
+    ]
+    assert all(isinstance(reader, LiteratureReasoner) for reader in readers)
+    for reader in readers:
+        assert callable(reader.propose_clusters)
+        assert callable(reader.map_debates)
+        assert callable(reader.synthesize_cluster)
+        assert callable(reader.detect_gaps)
+
+
+def test_builtin_reader_executes_typed_collection_reasoning_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    responses = {
+        "collection-clustering": {"clusters": []},
+        "debate-mapping": {"assessments": []},
+        "cluster-synthesis": {
+            "cluster_id": "cluster-1",
+            "boundaries": [
+                "Temporal: 2000-2020",
+                {
+                    "boundary": "Regional: African civil wars",
+                    "evidence": [{"source_id": "source-a", "claim_id": "claim-a", "locator": "p. 10"}],
+                },
+            ],
+            "central_findings": [
+                "unsupported prose without evidence",
+                {"finding": "Supported structure", "evidence": []},
+            ],
+            "agreements": "unsupported section without evidence objects",
+        },
+        "collection-gap": {"gaps": [], "rejected": []},
+    }
+    calls: list[str] = []
+    prompts: dict[str, str] = {}
+    output_caps: dict[str, int] = {}
+
+    def generate(self, system_prompt, user_prompt, output_tokens, deadline_seconds):
+        route = next(key for key in responses if key in system_prompt)
+        calls.append(route)
+        prompts[route] = user_prompt
+        output_caps[route] = output_tokens
+        return responses[route]
+
+    monkeypatch.setattr(DeepSeekReader, "_generate_text", generate)
+    reader = DeepSeekReader(allow_cloud=True)
+    request = LiteratureMapRequest(workspace=".", provider="deepseek", model="deepseek-v4-flash", allow_cloud=True)
+    clustering_profile = EvidenceProfile(
+        source_id="source-a",
+        note_id="note-a",
+        study_family_id="family-a",
+        concepts=["mediator legitimacy"],
+        future_research=["unused-detail-must-not-enter-clustering-packet"],
+        findings=[{"finding_id": "claim-a", "claim": "Legitimacy matters.", "locator": "p. 10"}],
+    )
+    raw_profile = clustering_profile.to_dict()
+    normalized_profile = {
+        "source_id": raw_profile["source_id"],
+        "note_id": raw_profile["note_id"],
+        "title": "Mediator legitimacy and settlement durability",
+        "study_family_id": raw_profile["study_family_id"],
+        "analytical": True,
+        "semantic_topic_scores": {"legitimacy mediator": 0.9},
+        "semantic_topic_labels": {"legitimacy mediator": "mediator legitimacy"},
+        "dimensions": {
+            "theory": ["legitimacy theory"],
+            "mechanism": ["acceptance"],
+            "method": ["comparative case study"],
+            "data": ["peace agreements"],
+            "case": ["African civil wars"],
+            "period": ["1990-2020"],
+            "outcome": ["settlement durability"],
+        },
+        "claims": [
+            {
+                "claim_id": "claim-a",
+                "text": "Legitimacy matters.",
+                "locator": "p. 10",
+                "direction": "positive",
+                "boundary_condition": "African civil wars",
+                "dimensions": {"outcome": ["settlement durability"]},
+            }
+        ],
+    }
+    limited_profile = {
+        **normalized_profile,
+        "source_id": "source-limited",
+        "note_id": "note-limited",
+        "title": "limited-profile-must-not-enter-clustering-packet",
+        "analytical": False,
+    }
+    assert reader.propose_clusters([normalized_profile, limited_profile], request) == {"clusters": []}
+    assert "claim-a" in prompts["collection-clustering"]
+    assert "Mediator legitimacy and settlement durability" in prompts["collection-clustering"]
+    assert "settlement durability" in prompts["collection-clustering"]
+    assert "limited-profile-must-not-enter-clustering-packet" not in prompts["collection-clustering"]
+    assert "unused-detail-must-not-enter-clustering-packet" not in prompts["collection-clustering"]
+    assert output_caps["collection-clustering"] == 16_000
+    assert reader.map_debates([], request) == {"assessments": []}
+    synthesis = reader.synthesize_cluster([], request)
+    assert output_caps["cluster-synthesis"] == 16_000
+    assert synthesis["cluster_id"] == "cluster-1"
+    assert synthesis["boundaries"] == ["Temporal: 2000-2020", "Regional: African civil wars"]
+    assert synthesis["boundary_conditions"] == [
+        {
+            "boundary": "Regional: African civil wars",
+            "evidence": [{"source_id": "source-a", "claim_id": "claim-a", "locator": "p. 10"}],
+        }
+    ]
+    assert synthesis["central_findings"] == [{"finding": "Supported structure", "evidence": []}]
+    assert synthesis["agreements"] == []
+    gap_context = {
+        "clusters": [{"cluster_id": "cluster-1", "label": "Mediator legitimacy"}],
+        "cluster_syntheses": {
+            "cluster-1": {
+                "cluster_id": "cluster-1",
+                "central_findings": [
+                    {
+                        "finding": "Legitimacy matters.",
+                        "evidence": [{"source_id": "source-a", "claim_id": "claim-a", "locator": "p. 10"}],
+                    }
+                ],
+            }
+        },
+        "candidates": [
+            {
+                "gap_id": "gap-1",
+                "rule": "empirical_coverage",
+                "topic": "mediator legitimacy",
+                "precise_missing_evidence": "Comparable tests outside African civil wars",
+                "supporting_evidence": [
+                    {"source_id": "source-a", "claim_id": "claim-a", "locator": "p. 10"}
+                ],
+                "internal_search_results": [
+                    {
+                        "source_id": f"source-{index}",
+                        "status": "relevant_not_answering",
+                        "semantic_overlap": ["legitimacy"],
+                    }
+                    for index in range(20)
+                ],
+                "promotion_metadata": {"redundant-promotion-detail-must-not-enter-gap-packet": "x"},
+            }
+        ],
+        "internal_search_log": [
+            {"gap_id": "gap-1", "analytical_profile_count_searched": 65, "complete": True}
+        ],
+    }
+    assert reader.detect_gaps([normalized_profile], request, context=gap_context) == {"gaps": [], "rejected": []}
+    assert "claim-a" in prompts["collection-gap"]
+    assert "Comparable tests outside African civil wars" in prompts["collection-gap"]
+    assert "redundant-promotion-detail-must-not-enter-gap-packet" not in prompts["collection-gap"]
+    assert output_caps["collection-gap"] == 32_000
+    assert calls == ["collection-clustering", "debate-mapping", "cluster-synthesis", "collection-gap"]
