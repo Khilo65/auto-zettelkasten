@@ -467,8 +467,8 @@ def test_profile_workers_run_independent_profile_calls_concurrently(tmp_path: Pa
     assert report.status == "completed"
     assert reasoner.profile_calls == 2
     assert reasoner.max_active_calls == 2
-    assert report.literature_provider_call_count == 3
-    assert report.synthesis_call_count == 1
+    assert report.literature_provider_call_count == 4
+    assert report.synthesis_call_count == 2
 
 
 def test_profile_call_budget_returns_resumable_partial_after_checkpointing_successes(
@@ -806,7 +806,9 @@ def test_all_builtin_readers_expose_complete_literature_reasoner_protocol() -> N
         assert callable(reader.detect_gaps)
 
 
-def test_builtin_reader_executes_typed_collection_reasoning_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_builtin_reader_executes_typed_collection_reasoning_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     responses = {
         "collection-clustering": {"clusters": []},
@@ -817,7 +819,13 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(monkeypatch: p
                 "Temporal: 2000-2020",
                 {
                     "boundary": "Regional: African civil wars",
-                    "evidence": [{"source_id": "source-a", "claim_id": "claim-a", "locator": "p. 10"}],
+                    "evidence": [
+                        {
+                            "source_id": "source-a",
+                            "claim_id": "claim-a",
+                            "locator": "p. 10",
+                        }
+                    ],
                 },
             ],
             "central_findings": [
@@ -838,7 +846,11 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(monkeypatch: p
                     "relation_to_cluster_question": "It addresses one bounded part of the question.",
                     "comparison_status": "single_source",
                     "evidence": [
-                        {"source_id": "source-a", "evidence_anchor_id": "claim-a", "locator": "p. 10"}
+                        {
+                            "source_id": "source-a",
+                            "evidence_anchor_id": "claim-a",
+                            "locator": "p. 10",
+                        }
                     ],
                 }
             ],
@@ -867,7 +879,13 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(monkeypatch: p
         study_family_id="family-a",
         concepts=["mediator legitimacy"],
         future_research=["unused-detail-must-not-enter-clustering-packet"],
-        findings=[{"finding_id": "claim-a", "claim": "Legitimacy matters.", "locator": "p. 10"}],
+        findings=[
+            {
+                "finding_id": "claim-a",
+                "claim": "Legitimacy matters.",
+                "locator": "p. 10",
+            }
+        ],
     )
     raw_profile = clustering_profile.to_dict()
     normalized_profile = {
@@ -941,7 +959,8 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(monkeypatch: p
     assert "settlement durability" in prompts["collection-clustering"]
     assert "study_lineage" in prompts["collection-clustering"]
     assert "source_locators" in prompts["collection-clustering"]
-    assert "cluster prompt v12" in system_prompts["collection-clustering"]
+    assert "cluster prompt v13" in system_prompts["collection-clustering"]
+    assert "family_relation" in system_prompts["collection-clustering"]
     assert "independence_assessments" in system_prompts["collection-clustering"]
     assert "limited-profile-must-not-enter-clustering-packet" not in prompts["collection-clustering"]
     assert "unused-detail-must-not-enter-clustering-packet" not in prompts["collection-clustering"]
@@ -950,7 +969,10 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(monkeypatch: p
     synthesis = reader.synthesize_cluster([], request)
     assert output_caps["cluster-synthesis"] == 16_000
     assert synthesis["cluster_id"] == "cluster-1"
-    assert synthesis["boundaries"] == ["Temporal: 2000-2020", "Regional: African civil wars"]
+    assert synthesis["boundaries"] == [
+        "Temporal: 2000-2020",
+        "Regional: African civil wars",
+    ]
     assert synthesis["boundary_conditions"] == [
         {
             "boundary": "Regional: African civil wars",
@@ -960,7 +982,7 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(monkeypatch: p
     assert synthesis["central_findings"] == [{"finding": "Supported structure", "evidence": []}]
     assert synthesis["agreements"] == []
     assert synthesis["source_contributions"][0]["comparison_status"] == "single_source"
-    assert "cluster synthesis prompt v6" in system_prompts["cluster-synthesis"]
+    assert "cluster synthesis prompt v7" in system_prompts["cluster-synthesis"]
     assert "one to three important cluster-relevant contributions" in system_prompts["cluster-synthesis"]
     assert "context_only" in system_prompts["cluster-synthesis"]
     assert "model-predicted probabilities" in system_prompts["cluster-synthesis"]
@@ -972,7 +994,13 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(monkeypatch: p
                 "central_findings": [
                     {
                         "finding": "Legitimacy matters.",
-                        "evidence": [{"source_id": "source-a", "claim_id": "claim-a", "locator": "p. 10"}],
+                        "evidence": [
+                            {
+                                "source_id": "source-a",
+                                "claim_id": "claim-a",
+                                "locator": "p. 10",
+                            }
+                        ],
                     }
                 ],
             }
@@ -983,9 +1011,7 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(monkeypatch: p
                 "rule": "empirical_coverage",
                 "topic": "mediator legitimacy",
                 "precise_missing_evidence": "Comparable tests outside African civil wars",
-                "supporting_evidence": [
-                    {"source_id": "source-a", "claim_id": "claim-a", "locator": "p. 10"}
-                ],
+                "supporting_evidence": [{"source_id": "source-a", "claim_id": "claim-a", "locator": "p. 10"}],
                 "internal_search_results": [
                     {
                         "source_id": f"source-{index}",
@@ -998,12 +1024,24 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(monkeypatch: p
             }
         ],
         "internal_search_log": [
-            {"gap_id": "gap-1", "analytical_profile_count_searched": 65, "complete": True}
+            {
+                "gap_id": "gap-1",
+                "analytical_profile_count_searched": 65,
+                "complete": True,
+            }
         ],
     }
-    assert reader.detect_gaps([normalized_profile], request, context=gap_context) == {"gaps": [], "rejected": []}
+    assert reader.detect_gaps([normalized_profile], request, context=gap_context) == {
+        "gaps": [],
+        "rejected": [],
+    }
     assert "claim-a" in prompts["collection-gap"]
     assert "Comparable tests outside African civil wars" in prompts["collection-gap"]
     assert "redundant-promotion-detail-must-not-enter-gap-packet" not in prompts["collection-gap"]
     assert output_caps["collection-gap"] == 32_000
-    assert calls == ["collection-clustering", "debate-mapping", "cluster-synthesis", "collection-gap"]
+    assert calls == [
+        "collection-clustering",
+        "debate-mapping",
+        "cluster-synthesis",
+        "collection-gap",
+    ]

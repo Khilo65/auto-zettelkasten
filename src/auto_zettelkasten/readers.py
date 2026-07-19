@@ -263,11 +263,21 @@ class _CapabilityAwareReader:
             if "analytical" in raw_profile and not bool(raw_profile.get("analytical")):
                 continue
             proposal_profiles.append(_cluster_proposal_profile(raw_profile))
+        repair_source_ids = [
+            str(value) for value in (context or {}).get("coverage_repair_source_ids", []) or [] if str(value)
+        ]
+        instruction = (
+            "Perform one coverage repair over the complete collection. Reconsider the listed analytical sources that remain "
+            "unclustered, connect them only through located debate-family relations, and return new or corrected proposals "
+            "needed for collection coverage. Do not repeat an unchanged prior proposal."
+            if repair_source_ids
+            else "Propose the complete set of coherent, overlapping collection debate families."
+        )
         user_prompt = _literature_prompt(
             proposal_profiles,
             request,
             _cluster_proposal_context(context),
-            instruction="Propose a small set of coherent, overlapping collection clusters.",
+            instruction=instruction,
         )
         return _validate_literature_response(
             self._literature_json_call(
@@ -393,9 +403,7 @@ class _CapabilityAwareReader:
         output_tokens = self._bounded_output_tokens(max_output_tokens, default=self._chunk_token_cap)
         request_deadline = self._bounded_deadline(deadline_seconds)
         self._ensure_prompt_fits(system_prompt, user_prompt, output_tokens, label="coarse chunk")
-        return _parse_chunk_evidence(
-            self._generate_text(system_prompt, user_prompt, output_tokens, request_deadline)
-        )
+        return _parse_chunk_evidence(self._generate_text(system_prompt, user_prompt, output_tokens, request_deadline))
 
     def synthesize_document(
         self,
@@ -414,9 +422,7 @@ class _CapabilityAwareReader:
         output_tokens = self._bounded_output_tokens(max_output_tokens, default=self.max_output_tokens)
         request_deadline = self._bounded_deadline(deadline_seconds)
         self._ensure_prompt_fits(system_prompt, user_prompt, output_tokens, label="chunk synthesis")
-        return _parse_analysis(
-            self._generate_text(system_prompt, user_prompt, output_tokens, request_deadline)
-        )
+        return _parse_analysis(self._generate_text(system_prompt, user_prompt, output_tokens, request_deadline))
 
     def _prompt_fits(self, system_prompt: str, user_prompt: str, output_tokens: int) -> bool:
         estimated_input = _estimate_tokens(system_prompt) + _estimate_tokens(user_prompt)
@@ -426,9 +432,7 @@ class _CapabilityAwareReader:
 
     def _ensure_prompt_fits(self, system_prompt: str, user_prompt: str, output_tokens: int, *, label: str) -> None:
         if not self._prompt_fits(system_prompt, user_prompt, output_tokens):
-            raise ProviderError(
-                f"{label} exceeds the {self.name} context budget; use coarse hierarchical chunks"
-            )
+            raise ProviderError(f"{label} exceeds the {self.name} context budget; use coarse hierarchical chunks")
 
     def _request_deadline_seconds(self) -> float:
         return float(self.request_deadline if self.request_deadline is not None else self.timeout)
@@ -764,14 +768,22 @@ def _profile_system_prompt() -> str:
 
 def _cluster_proposal_system_prompt() -> str:
     return (
-        "You are the collection-clustering reasoner for Auto-Zettelkasten cluster prompt v12. "
-        "Return exactly one compact JSON object with a clusters array. Propose at most eight of the strongest analytical "
-        "clusters in the collection. It is correct to leave an unsupported or non-comparable source out; the deterministic "
-        "mapper records it as unclustered or as a topic neighbor. Each cluster must contain only proposal_id, label, "
-        "semantic_identity, shared_question, coherence_rationale, source_ids, source_roles, and propositions. source_roles "
+        "You are the collection-clustering reasoner for Auto-Zettelkasten cluster prompt v13. "
+        "Return exactly one compact JSON object with a clusters array. Inspect the complete analytical source inventory and "
+        "propose every defensible debate family needed to account for it; do not stop after an arbitrary top-N shortlist. "
+        "It is correct to leave an unsupported source out, but every omitted analytical source must genuinely lack a located "
+        "connection to a bounded debate family. The deterministic mapper records omissions as unclustered or topic neighbors. "
+        "Each cluster must contain only proposal_id, label, semantic_identity, shared_question, bounded_object, "
+        "coherence_rationale, source_ids, source_roles, propositions, and family_relations. source_roles "
         "must be a compact object mapping each source_id to core, context, or bridge. Include no more than four total context "
         "or bridge sources per cluster. Do not output supporting_evidence, study_lineages, independence_assessments, "
         "evidence_base_groups, or effective_evidence_base_count; deterministic admission computes those fields. "
+        "Each family_relation must use {relation_type, source_ids, rationale, comparability, evidence}. relation_type must be "
+        "one of same_proposition, rival_explanation, complementary_mechanism, boundary_contrast, methodological_fault_line, "
+        "sequential_relationship, or interpretive_or_normative_disagreement. Evidence must contain a located anchor from every "
+        "source in the relation. The core-source relation graph must be connected. A family can be analytically valid even when "
+        "its sources do not support an exact shared proposition: rivals, complementary mechanisms, boundary contrasts, "
+        "sequential relationships, methodological fault lines, and interpretive disagreements are useful relationships. "
         "Each proposition must use this canonical shape: {proposition_id, semantic_identity, statement, question, "
         "proposition_type, source_ids, evidence, comparability}; source_ids is the array of participating core source IDs, "
         "and evidence is an array of {source_id, evidence_anchor_id, locator} objects. Never flatten those evidence fields "
@@ -784,7 +796,8 @@ def _cluster_proposal_system_prompt() -> str:
         "sources may explain a concept, method, institutional setting, "
         "boundary, or neighboring proposition, but may not broaden the cluster question, verdict, outcome, population, or causal "
         "claim. Only core sources count toward admission. The role field must use only core, context, or bridge; never place "
-        "publication type, coverage, document genre, or evidence type in role. Form clusters around comparable propositions or disputes—not generic vocabulary, "
+        "publication type, coverage, document genre, or evidence type in role. Form clusters around bounded propositions, "
+        "explanations, mechanisms, boundaries, sequences, or disputes—not generic vocabulary, "
         "tags, broad subject matter, citation proximity, or count. "
         "Prefer broad debate families over "
         "micro-clusters named only conflict, mediation, success, or stability. Every analytical source that coherently belongs "
@@ -817,7 +830,7 @@ def _debate_system_prompt() -> str:
 
 def _cluster_synthesis_system_prompt() -> str:
     return (
-        "You are the cluster-synthesis reasoner for Auto-Zettelkasten cluster synthesis prompt v6. Return exactly one JSON "
+        "You are the cluster-synthesis reasoner for Auto-Zettelkasten cluster synthesis prompt v7. Return exactly one JSON "
         "object containing cluster_id, scope, boundaries, coherence_rationale, synthesis, central_findings, agreements, "
         "positions, contradictions, boundary_conditions, methodological_fault_lines, related_clusters, source_roles, "
         "source_contributions, supporting_evidence, synthesis_assertions, debate_state, gap_hypotheses, evidence_base_groups, "
@@ -829,8 +842,10 @@ def _cluster_synthesis_system_prompt() -> str:
         "and evidence. Core contributions prioritize direct proposition findings, unique relevant findings, boundary evidence, and "
         "methodological contributions. Context and bridge contributions must say context_only and cannot enter the verdict, central "
         "cross-source findings, agreement, contradiction, debate classification, causal-effectiveness claim, or gap promotion. "
-        "Every substantive synthesis assertion "
-        "must name one or more admitted proposition_ids and use real source-local evidence_anchor_id and locator references. "
+        "Every substantive synthesis assertion must use real source-local evidence_anchor_id and locator references. An exact "
+        "cross-source comparison must name one or more admitted proposition_ids. A broader family assertion may instead be "
+        "supported by supplied family_relations, but must identify it as complementary, sequential, conditional, methodological, "
+        "parallel, or interpretive rather than consensus or contradiction. "
         "Descriptive, associational, illustrative, or prescriptive anchors cannot support causal wording. Do not combine "
         "differently defined actors, mechanisms, populations, outcomes, or estimands into consensus, and do not label "
         "incomparable claims as contradictions. Explain what technical findings mean in plain English while retaining "
@@ -852,7 +867,9 @@ def _cluster_synthesis_system_prompt() -> str:
         "institutional series may show within-program consistency or aligned institutional guidance, but not scholarly consensus. "
         "Use only mapped_consensus, emerging_convergence, aligned_institutional_guidance, within_program_consistency, "
         "conditional_relationship, mapped_debate, mixed_evidence, complementary_positions, parallel_literatures, single_position, "
-        "or no_debate as debate_state. Do not create a debate when evidence is consensus or incomparable. "
+        "or no_debate as debate_state. The supplied deterministic_debate is authoritative. Explain why strict consensus or "
+        "contradiction is not established when the family is instead complementary, conditional, mixed, parallel, or concentrated. "
+        "Do not create a debate when evidence is consensus or incomparable. "
         "For a source_backed_cluster, supply enough non-repetitive detail for a 1,200-2,500 word Markdown projection; for "
         "an emerging_cluster, supply enough detail for 600-1,200 words. Prefer evidence density over filler. "
         "Gap hypotheses must use one of these rules: contradictory_findings, untested_mechanism, empirical_coverage, "
@@ -867,7 +884,7 @@ def _cluster_synthesis_system_prompt() -> str:
 
 def _gap_adjudication_system_prompt() -> str:
     return (
-        "You are the collection-gap adjudicator for Auto-Zettelkasten gap prompt v6. Return exactly one JSON object with "
+        "You are the collection-gap adjudicator for Auto-Zettelkasten gap prompt v7. Return exactly one JSON object with "
         "gaps and rejected arrays. Consider only supplied candidates and their deterministic all-collection search results. "
         "You may merge equivalent candidates or perform at most one evidence-constrained reframing of a candidate, but may "
         "not manufacture a new literature gap. A missing test is not itself a worthy gap. Retain a candidate only when it "
@@ -894,7 +911,8 @@ def _gap_adjudication_system_prompt() -> str:
         "never repeat evidence or candidate prose in rejected. Deduplicate semantically "
         "equivalent candidates aggressively; list their IDs in merged_from_gap_ids on the retained canonical gap. Reject "
         "obvious, low-value, infeasible, vague, collection-answered, unlocated, or unsupported candidates with a concrete "
-        "reason. The women-or-civil-society inclusion candidate is not useful merely because a causal pathway has not been "
+        "reason. For every plausible retained lead, explain why it does or does not meet the stricter strong-gap threshold; "
+        "the deterministic collection checks remain authoritative. The women-or-civil-society inclusion candidate is not useful merely because a causal pathway has not been "
         "tested; it must distinguish selection from causal effects and specify a feasible identifying comparison. All "
         "conclusions are scoped to "
         "the frozen collection; never claim novelty across the published literature."
@@ -1313,6 +1331,12 @@ def _cluster_proposal_context(context: Mapping[str, Any] | None) -> dict[str, An
         "propositions": proposition_rows,
         "topic_neighborhoods": neighborhood_rows,
         "topic_neighborhoods_are_navigation_only": True,
+        "coverage_repair_source_ids": [
+            str(value) for value in (context or {}).get("coverage_repair_source_ids", []) or [] if str(value)
+        ],
+        "prior_proposal_identities": [
+            str(value) for value in (context or {}).get("prior_proposal_identities", []) or [] if str(value)
+        ],
     }
 
 
@@ -1472,16 +1496,20 @@ def _validate_literature_response(payload: Mapping[str, Any], *, kind: str) -> d
                 "independence_assessments",
                 "effective_evidence_base_count",
                 "quantitative_comparisons",
+                "strict_adjudications",
             ):
                 normalized.pop(derived_field, None)
             boundary_rows = normalized.get("boundaries")
-            structured_boundaries = [dict(row) for row in boundary_rows or [] if isinstance(row, Mapping)] \
-                if isinstance(boundary_rows, list) else []
-            normalized["boundaries"] = [
-                text
-                for row in boundary_rows or []
-                if (text := _cluster_boundary_text(row))
-            ] if isinstance(boundary_rows, list) else []
+            structured_boundaries = (
+                [dict(row) for row in boundary_rows or [] if isinstance(row, Mapping)]
+                if isinstance(boundary_rows, list)
+                else []
+            )
+            normalized["boundaries"] = (
+                [text for row in boundary_rows or [] if (text := _cluster_boundary_text(row))]
+                if isinstance(boundary_rows, list)
+                else []
+            )
             if structured_boundaries:
                 existing_conditions = normalized.get("boundary_conditions")
                 normalized["boundary_conditions"] = (
@@ -1539,10 +1567,9 @@ def _validate_literature_response(payload: Mapping[str, Any], *, kind: str) -> d
                 if not isinstance(raw_row, Mapping):
                     raise ValueError("gap adjudication gap records must be mappings")
                 row = {
-                    str(key): value
-                    for key, value in raw_row.items()
-                    if str(key) in GapRationale.__dataclass_fields__
+                    str(key): value for key, value in raw_row.items() if str(key) in GapRationale.__dataclass_fields__
                 }
+                row.pop("strict_adjudication", None)
                 for field_name in (
                     "gap_id",
                     "proposition_id",
@@ -1570,7 +1597,11 @@ def _validate_literature_response(payload: Mapping[str, Any], *, kind: str) -> d
                         if isinstance(values, list)
                         else []
                     )
-                for field_name in ("related_cluster_ids", "originating_cluster_ids", "merged_from_gap_ids"):
+                for field_name in (
+                    "related_cluster_ids",
+                    "originating_cluster_ids",
+                    "merged_from_gap_ids",
+                ):
                     row[field_name] = string_values(row.get(field_name))
                 row["priority_tier"] = quality_tier(row.get("priority_tier"))
                 assessment = row.get("value_assessment")
@@ -1629,10 +1660,23 @@ def _validate_literature_response(payload: Mapping[str, Any], *, kind: str) -> d
                 resolution = {
                     str(key): value
                     for key, value in resolution.items()
-                    if str(key) in {"path_type", "question", "evidence_needed", "requirements", "feasibility", "limitations"}
+                    if str(key)
+                    in {
+                        "path_type",
+                        "question",
+                        "evidence_needed",
+                        "requirements",
+                        "feasibility",
+                        "limitations",
+                    }
                 }
                 if resolution:
-                    for field_name in ("path_type", "question", "evidence_needed", "feasibility"):
+                    for field_name in (
+                        "path_type",
+                        "question",
+                        "evidence_needed",
+                        "feasibility",
+                    ):
                         resolution[field_name] = scalar_text(resolution.get(field_name))
                     resolution["requirements"] = (
                         dict(resolution.get("requirements"))
@@ -1701,24 +1745,28 @@ def _validate_literature_response(payload: Mapping[str, Any], *, kind: str) -> d
                     design[field_name] = string_values(design.get(field_name))
                 row["study_design"] = design
                 anchor_values = row.get("anchors")
-                row["anchors"] = [
-                    dict(value)
-                    for value in anchor_values or []
-                    if isinstance(value, Mapping)
-                    and str(value.get("cluster_id") or "")
-                    and str(value.get("item_id") or "")
-                    and str(value.get("section") or "")
-                    in {
-                        "central_findings",
-                        "agreements",
-                        "positions",
-                        "contradictions",
-                        "boundary_conditions",
-                        "methodological_fault_lines",
-                        "related_clusters",
-                        "source_roles",
-                    }
-                ] if isinstance(anchor_values, list) else []
+                row["anchors"] = (
+                    [
+                        dict(value)
+                        for value in anchor_values or []
+                        if isinstance(value, Mapping)
+                        and str(value.get("cluster_id") or "")
+                        and str(value.get("item_id") or "")
+                        and str(value.get("section") or "")
+                        in {
+                            "central_findings",
+                            "agreements",
+                            "positions",
+                            "contradictions",
+                            "boundary_conditions",
+                            "methodological_fault_lines",
+                            "related_clusters",
+                            "source_roles",
+                        }
+                    ]
+                    if isinstance(anchor_values, list)
+                    else []
+                )
                 normalized_gaps.append(GapRationale.from_dict(row).to_dict())
             return {
                 "gaps": normalized_gaps,

@@ -155,7 +155,7 @@ def assert_compatible(workspace: Path | str) -> None:
         raise IncompatibleArtifactSchemaError(
             f"workspace config schema {config_version} disagrees with manifest schema {manifest_version}"
         )
-    supported = {(1, 0), (1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (1, 6), (1, 7)}
+    supported = {(1, 0), (1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (1, 6), (1, 7), (1, 8)}
     current = _parse_schema_version(CURRENT_ARTIFACT_SCHEMA_VERSION, field="current artifact schema")
     if manifest_version not in supported:
         actual = ".".join(str(value) for value in manifest_version)

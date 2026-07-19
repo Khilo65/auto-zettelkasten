@@ -127,15 +127,30 @@ def test_source_specific_contributions_survive_without_becoming_agreement() -> N
 
 
 def test_effective_evidence_bases_control_admission_and_consensus_strength() -> None:
-    same_program = [_profile("a", evidence_base="program-one"), _profile("b", evidence_base="program-one")]
-    assert map_overlapping_clusters(same_program)["clusters"] == []
+    same_program = [
+        _profile("a", evidence_base="program-one"),
+        _profile("b", evidence_base="program-one"),
+    ]
+    concentrated = map_overlapping_clusters(same_program)["clusters"]
+    assert len(concentrated) == 1
+    assert concentrated[0]["qualification_status"] == "evidence_concentrated_cluster"
 
     two_base_state, _ = _proposition_debate_state(
         {
             "effective_evidence_base_count": 2,
             "cells": {
-                "a": {"source_id": "a", "evidence_base_group_id": "one", "evidence_type": ["associational"], "direction_or_interpretation": ["positive"]},
-                "b": {"source_id": "b", "evidence_base_group_id": "two", "evidence_type": ["associational"], "direction_or_interpretation": ["positive"]},
+                "a": {
+                    "source_id": "a",
+                    "evidence_base_group_id": "one",
+                    "evidence_type": ["associational"],
+                    "direction_or_interpretation": ["positive"],
+                },
+                "b": {
+                    "source_id": "b",
+                    "evidence_base_group_id": "two",
+                    "evidence_type": ["associational"],
+                    "direction_or_interpretation": ["positive"],
+                },
             },
         }
     )
@@ -143,7 +158,12 @@ def test_effective_evidence_bases_control_admission_and_consensus_strength() -> 
         {
             "effective_evidence_base_count": 3,
             "cells": {
-                key: {"source_id": key, "evidence_base_group_id": key, "evidence_type": ["associational"], "direction_or_interpretation": ["positive"]}
+                key: {
+                    "source_id": key,
+                    "evidence_base_group_id": key,
+                    "evidence_type": ["associational"],
+                    "direction_or_interpretation": ["positive"],
+                }
                 for key in ("a", "b", "c")
             },
         }
@@ -172,6 +192,36 @@ def test_quantitative_arithmetic_and_generated_note_locators_are_rejected() -> N
             ),
         }
     ) == []
+    assert _quantitative_text_errors(
+        {
+            "technical_result": (
+                "The probability rose by 41.7 percentage points (from 3.6% to 45.3%). "
+                "A different subgroup rose by 34.4 pp, while coefficient = 0.601 (p<0.01)."
+            ),
+        }
+    ) == []
+    assert _quantitative_text_errors(
+        {
+            "technical_result": (
+                "The probability rose by 40 percentage points (from 3.6% to 45.3%). "
+                "A separate estimate was 34.4 pp."
+            ),
+        }
+    ) == ["percentage_point_arithmetic_mismatch"]
+    assert _quantitative_text_errors(
+        {
+            "technical_result": (
+                "The coefficient was 0.601 (p<0.01). The predicted probability changed by 14%. "
+                "Neither statistic is reported as a marginal effect or percentage-point conversion."
+            ),
+        }
+    ) == []
+    assert _quantitative_text_errors(
+        {
+            "technical_result": "9.97 percentage point increase; 95% CI not reported.",
+            "plain_english_meaning": "The chance rises from about 38% to about 45%.",
+        }
+    ) == ["percentage_point_arithmetic_mismatch"]
 
     profile = _profile("generated")
     profile["evidence_anchors"][0]["locator"] = "Detailed Findings (1)"
@@ -381,6 +431,51 @@ def test_gap_checkpoint_ignores_projection_only_synthesis_changes() -> None:
     )
 
 
+def test_cluster_proposal_checkpoint_tracks_every_provider_visible_family_input() -> None:
+    components = {
+        key: f"hash-{key}"
+        for key in (
+            "stage",
+            "key",
+            "method",
+            "provider",
+            "model",
+            "source_set_id",
+            "profile_dependencies",
+            "context",
+            "policy",
+            "prompt_version",
+        )
+    }
+    visible = {
+        "propositions": "same-propositions",
+        "relations": "same-relations",
+        "topic_neighborhoods": "same-neighborhoods",
+        "coverage_repair_source_ids": "same-repair-sources",
+        "prior_proposal_identities": "same-prior-proposals",
+    }
+    checkpoint = {
+        "dependency_component_hashes": {**components, "context": "old-full-context"},
+        "dependency_context_hashes": visible,
+    }
+
+    assert _same_provider_inputs(
+        checkpoint,
+        {**components, "context": "new-full-context"},
+        stage="cluster_proposal",
+        current_context_hashes=visible,
+    )
+    for changed_component in visible:
+        assert not _same_provider_inputs(
+            checkpoint,
+            {**components, "context": "new-full-context"},
+            stage="cluster_proposal",
+            current_context_hashes={
+                **visible,
+                changed_component: f"changed-{changed_component}",
+            },
+        )
+
 def test_coverage_register_accounts_for_all_75_frozen_items() -> None:
     source_set = {
         "rows": [
@@ -426,7 +521,9 @@ def test_unknown_or_publication_only_lineage_does_not_count_as_independent() -> 
         profile["study_family_id"] = f"doi:10.1234/{profile['source_id']}"
     normalized = normalize_evidence_profiles(profiles)
     assert all(profile["evidence_base_counted"] is False for profile in normalized)
-    assert map_overlapping_clusters(normalized)["clusters"] == []
+    concentrated = map_overlapping_clusters(normalized)["clusters"]
+    assert len(concentrated) == 1
+    assert concentrated[0]["qualification_status"] == "evidence_concentrated_cluster"
 
     for publication_identity in ("doi:10.1234/shared", "title:shared publication"):
         colliding = [_profile("a"), _profile("b")]

@@ -7,8 +7,8 @@ candidate-gap records, and an Obsidian-ready vault projection.
 It is a standalone, file-first Python package. It does not require Research OS,
 does not read `zotero.sqlite`, and never writes to Zotero.
 
-> **Release status:** v0.8 is an alpha-quality CLI and Python API using artifact
-> schema 1.7 and evidence-profile schema 1.2. Mapped gaps are claims about the
+> **Release status:** v0.9 is an alpha-quality CLI and Python API using artifact
+> schema 1.8 and evidence-profile schema 1.2. Mapped gaps are claims about the
 > frozen collection only, never literature-wide novelty claims.
 
 ## What it produces
@@ -94,11 +94,17 @@ A `topic_neighborhood` is promoted only when at least two effective analytical
 evidence bases share a discriminative typed subject tag. Single-source facets stay
 as source-local search metadata and do not become native graph tags or neighborhoods. Neighborhoods are sparse
 retrieval aids for Obsidian navigation, never evidence for admitting a cluster,
-mapping a debate, or answering a gap. Analytical clusters are separate: each must contain a comparable,
-locator-backed proposition addressed by at least two independent core evidence bases.
-Two-core-study groupings are `emerging_cluster`; `source_backed_cluster`
-requires at least three. Context and bridge sources do not count toward those
-thresholds. Analytical membership may overlap, up to three clusters per source.
+mapping a debate, or answering a gap. Analytical clusters are separate debate
+families. Their located core-source graph may connect the same proposition,
+rival explanations, complementary mechanisms, boundary contrasts,
+methodological fault lines, sequential relationships, or interpretive and
+normative disagreements. Shared vocabulary alone is insufficient.
+`emerging_cluster` requires two effective evidence bases and
+`source_backed_cluster` requires at least three. Connected publications that
+reuse one evidence base remain visible as an `evidence_concentrated_cluster`;
+they cannot establish independent consensus. Context and bridge sources do not
+count toward qualification. Analytical membership may overlap, up to three
+core cluster roles per source.
 
 Subject tags are projected into Obsidian's native `tags` property. A cluster
 inherits a tag only after analytical admission, when at least two independent
@@ -134,7 +140,8 @@ valid result. Every promoted gap records
 `scope: collection_only`, `automation_status: promoted`, and
 `novelty_claimed: false`.
 
-Cluster-first synthesis runs after deterministic proposition-level admission.
+Cluster-first synthesis runs after deterministic debate-family admission and
+strict proposition-level comparison.
 One checkpointed reasoning call per cluster reads the complete atomic notes,
 profiles, and proposition-evidence matrix, then explains the central findings, technical
 figures and plain-English meaning, agreements, debate positions,
@@ -143,8 +150,10 @@ clusters, source roles, and specific proposition-linked gap hypotheses. It also 
 the most important cluster-relevant findings from every core study in a separate
 "What each source contributes" section, even when no other source reports the same
 finding. Those source-specific contributions are never mislabeled as agreement. Every
-substantive synthesis assertion resolves to a map-local proposition and one or
-more source-local evidence anchors. Descriptive or associational anchors cannot
+exact comparative assertion resolves to a map-local proposition and one or
+more source-local evidence anchors; broader family assertions resolve to a
+typed located family relation and cannot be presented as consensus or
+contradiction. Descriptive or associational anchors cannot
 support causal wording. Generated atomic-note headings cannot serve as strong source
 locators, and quantitative prose must pass arithmetic and estimand checks. Anchor IDs remain hidden from human Markdown unless a
 machine-readable link requires them.
@@ -167,6 +176,14 @@ canonical gap note without repeating its evidence record. Near-duplicates merge
 under a stable gap ID and remain traceable in `gap_merge_ledger.yml`.
 Underspecified, obvious, low-value, or non-executable candidates remain audit
 records and receive no Markdown or cluster mention.
+
+Every cluster Markdown note also includes deterministic strict-claim checks for
+consensus and contradiction. A failed threshold is explained rather than
+silently omitted: the note states which requirement failed, why it failed in
+the collection, and what evidence could change the judgment. Every visible gap
+or lead similarly explains whether it meets the stronger gap threshold. These
+checks are embedded in the existing cluster and gap records; they do not create
+new claim files or controller objects.
 
 ## Install
 
@@ -408,14 +425,14 @@ notes, evidence profiles, cluster/gap identities, or the underlying collection
 map. Research OS may use the lens for downstream ranking without mutating the
 base map.
 
-Artifact schemas 1.0-1.5 and evidence-profile schema 1.0 remain readable. The
-idempotent schema-1.7 migration archives superseded current cluster, tag, and neighborhood
+Artifact schemas 1.0-1.8 and evidence-profile schemas 1.0-1.2 remain readable.
+The idempotent schema-1.8 migration archives superseded current cluster and gap
 projections, preserves historical maps, profiles, analytical identities, and
 atomic-note bytes, and makes no model or Zotero call. Existing schema-1.5
 proposition anchors remain valid; unsupported legacy anchors cannot establish
 strong synthesis until they are lazily reprofiled.
 
-## Scope deliberately deferred from v0.8
+## Scope deliberately deferred from v0.9
 
 - direct `zotero.sqlite` ingestion;
 - Zotero writes or collection synchronization;

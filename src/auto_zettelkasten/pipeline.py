@@ -110,7 +110,14 @@ class DocumentCoverageLimitError(RuntimeError):
 class _RunProgress:
     """Thread-safe, atomically persisted visibility into an active run."""
 
-    def __init__(self, path: Path, run_id: str, items: Sequence[Mapping[str, Any]], *, resume: bool) -> None:
+    def __init__(
+        self,
+        path: Path,
+        run_id: str,
+        items: Sequence[Mapping[str, Any]],
+        *,
+        resume: bool,
+    ) -> None:
         self.path = path
         self.run_id = run_id
         self._lock = threading.Lock()
@@ -121,9 +128,7 @@ class _RunProgress:
         if not isinstance(prior_timestamps, Mapping):
             prior_timestamps = {}
         self.stage_timestamps: dict[str, dict[str, str]] = {
-            str(key): dict(value)
-            for key, value in prior_timestamps.items()
-            if isinstance(value, Mapping)
+            str(key): dict(value) for key, value in prior_timestamps.items() if isinstance(value, Mapping)
         }
         self.literature: dict[str, Any] = {
             "profile_count": 0,
@@ -137,11 +142,18 @@ class _RunProgress:
             "singleton_facet_count": 0,
             "proposition_count": 0,
             "cluster_count": 0,
+            "evidence_concentrated_cluster_count": 0,
             "debate_count": 0,
             "consensus_count": 0,
             "mixed_evidence_count": 0,
+            "strict_consensus_established_count": 0,
+            "strict_consensus_not_established_count": 0,
+            "strict_contradiction_established_count": 0,
+            "strict_contradiction_not_established_count": 0,
             "mapped_gap_count": 0,
             "gap_lead_count": 0,
+            "strong_gap_established_count": 0,
+            "strong_gap_not_established_count": 0,
             "synthesized_cluster_count": 0,
             "rejected_underspecified_gap_count": 0,
             "rejected_gap_quality_count": 0,
@@ -158,11 +170,7 @@ class _RunProgress:
             "provider_call_count": 0,
             "literature_failure_count": 0,
             "internal_falsification_count": 0,
-            **(
-                dict(previous.get("literature", {}))
-                if isinstance(previous.get("literature", {}), Mapping)
-                else {}
-            ),
+            **(dict(previous.get("literature", {})) if isinstance(previous.get("literature", {}), Mapping) else {}),
         }
         # Literature counters describe the current invocation. A resume starts
         # from its frozen items/checkpoints but must not display stale counts
@@ -303,7 +311,17 @@ class _RunProgress:
         literature_calls = int(self.literature.get("literature_provider_call_count", 0) or 0)
         self.literature["provider_call_count"] = source_calls + literature_calls
         statuses = [str(row.get("status", "pending")) for row in self.items.values()]
-        counts = {name: statuses.count(name) for name in ("validated_note", "limited_note", "exhausted", "partial", "pending", "active")}
+        counts = {
+            name: statuses.count(name)
+            for name in (
+                "validated_note",
+                "limited_note",
+                "exhausted",
+                "partial",
+                "pending",
+                "active",
+            )
+        }
         terminal_count = counts["validated_note"] + counts["limited_note"] + counts["exhausted"]
         payload = {
             "status": self._status,
@@ -318,7 +336,9 @@ class _RunProgress:
             "pending_count": counts["pending"] + counts["active"],
             "active_count": counts["active"],
             "terminal_count": terminal_count,
-            "active_item_keys": [row.get("zotero_item_key", "") for row in self.items.values() if row.get("status") == "active"],
+            "active_item_keys": [
+                row.get("zotero_item_key", "") for row in self.items.values() if row.get("status") == "active"
+            ],
             "completed_chunk_count": sum(int(row.get("completed_chunks", 0) or 0) for row in self.items.values()),
             "total_chunk_count": sum(int(row.get("total_chunks", 0) or 0) for row in self.items.values()),
             **self.literature,
@@ -937,7 +957,11 @@ def rebuild_map(
             "links": relations,
             "link_count": len(relations),
         }
-        typed_payload = {"updated_at": now_iso(), "relations": relations, "links": relations}
+        typed_payload = {
+            "updated_at": now_iso(),
+            "relations": relations,
+            "links": relations,
+        }
         write_yaml(Path(typed["path"]), typed_payload)
         write_yaml(Path(typed["compatibility_path"]), typed_payload)
         note_paths = [
@@ -974,7 +998,11 @@ def rebuild_map(
                 "profile_packet_count": 0,
             },
             "migration": {"status": "not_run", "reason": "synthesis_disabled"},
-            "paths": [Path(typed["path"]), Path(typed["compatibility_path"]), source_index],
+            "paths": [
+                Path(typed["path"]),
+                Path(typed["compatibility_path"]),
+                source_index,
+            ],
         }
     migration = migrate_workspace(workspace)
     try:
@@ -996,8 +1024,16 @@ def rebuild_map(
         profile_paths = sorted((workspace / "02_source_memory" / "profiles").glob("*.yml"))
         return {
             "source_set": dict(source_set),
-            "cluster_map": {"status": "partial", "clusters": [], "unclustered_sources": []},
-            "gap_map": {"status": "partial", "gap_candidates": [], "novelty_claimed": False},
+            "cluster_map": {
+                "status": "partial",
+                "clusters": [],
+                "unclustered_sources": [],
+            },
+            "gap_map": {
+                "status": "partial",
+                "gap_candidates": [],
+                "novelty_claimed": False,
+            },
             "literature_packet": {"status": "partial", "reason": reason},
             "typed_links": {"links": [], "link_count": 0},
             "profiles": [],
@@ -1009,9 +1045,7 @@ def rebuild_map(
     profiles = profile_result["profiles"]
     profile_partial_reason = ""
     if int(profile_result.get("failure_count", 0) or 0):
-        profile_partial_reason = (
-            f"literature_profiling_partial:{int(profile_result['failure_count'])}_profile_failure"
-        )
+        profile_partial_reason = f"literature_profiling_partial:{int(profile_result['failure_count'])}_profile_failure"
     if progress is not None:
         progress.set_stage(
             "relation_mapping",
@@ -1063,8 +1097,17 @@ def rebuild_map(
             )
         return {
             "source_set": dict(source_set),
-            "cluster_map": {"status": "partial", "clusters": [], "relations": [], "unclustered_sources": []},
-            "gap_map": {"status": "partial", "gap_candidates": [], "novelty_claimed": False},
+            "cluster_map": {
+                "status": "partial",
+                "clusters": [],
+                "relations": [],
+                "unclustered_sources": [],
+            },
+            "gap_map": {
+                "status": "partial",
+                "gap_candidates": [],
+                "novelty_claimed": False,
+            },
             "literature_packet": {"status": "partial", "reason": reason},
             "typed_links": typed,
             "profiles": profiles,
@@ -1114,23 +1157,30 @@ def rebuild_map(
             proposition_count=int(cluster_map.get("proposition_count", 0) or 0),
             evidence_base_group_count=int(cluster_map.get("evidence_base_group_count", 0) or 0),
             cluster_count=len(cluster_map.get("clusters", []) or []),
-            cluster_source_contribution_count=int(
-                cluster_map.get("cluster_source_contribution_count", 0) or 0
-            ),
+            evidence_concentrated_cluster_count=int(cluster_map.get("evidence_concentrated_cluster_count", 0) or 0),
+            cluster_source_contribution_count=int(cluster_map.get("cluster_source_contribution_count", 0) or 0),
             synthesized_cluster_count=int(cluster_map.get("synthesized_cluster_count", 0) or 0),
             mapped_gap_count=sum(
-                1
-                for gap in gap_map.get("gap_candidates", []) or []
-                if gap.get("status") == "collection_surviving_gap"
+                1 for gap in gap_map.get("gap_candidates", []) or [] if gap.get("status") == "collection_surviving_gap"
             ),
             gap_lead_count=sum(
-                1
-                for gap in gap_map.get("gap_candidates", []) or []
-                if gap.get("status") == "collection_gap_lead"
+                1 for gap in gap_map.get("gap_candidates", []) or [] if gap.get("status") == "collection_gap_lead"
             ),
             rejected_underspecified_gap_count=int(gap_map.get("rejected_underspecified_gap_count", 0) or 0),
             rejected_gap_quality_count=int(gap_map.get("rejected_gap_quality_count", 0) or 0),
             merged_gap_count=int(gap_map.get("merged_gap_count", 0) or 0),
+            strict_consensus_established_count=int(cluster_map.get("strict_consensus_established_count", 0) or 0),
+            strict_consensus_not_established_count=int(
+                cluster_map.get("strict_consensus_not_established_count", 0) or 0
+            ),
+            strict_contradiction_established_count=int(
+                cluster_map.get("strict_contradiction_established_count", 0) or 0
+            ),
+            strict_contradiction_not_established_count=int(
+                cluster_map.get("strict_contradiction_not_established_count", 0) or 0
+            ),
+            strong_gap_established_count=int(gap_map.get("strong_gap_established_count", 0) or 0),
+            strong_gap_not_established_count=int(gap_map.get("strong_gap_not_established_count", 0) or 0),
             synthesis_call_count=synthesis_calls,
             synthesis_checkpoint_hit_count=synthesis_checkpoint_hits,
             synthesis_failure_count=synthesis_failures,
@@ -1138,9 +1188,7 @@ def rebuild_map(
             rejected_quantitative_comparison_count=int(
                 cluster_map.get("rejected_quantitative_comparison_count", 0) or 0
             ),
-            rejected_generated_locator_count=int(
-                cluster_map.get("rejected_generated_locator_count", 0) or 0
-            ),
+            rejected_generated_locator_count=int(cluster_map.get("rejected_generated_locator_count", 0) or 0),
             coverage_inventory_count=int(cluster_map.get("coverage_inventory_count", 0) or 0),
             coverage_exhausted_count=int(cluster_map.get("coverage_exhausted_count", 0) or 0),
             coverage_accounting_valid=bool(cluster_map.get("coverage_accounting_valid", False)),
@@ -1185,15 +1233,9 @@ def rebuild_map(
     for cluster in cluster_by_id.values():
         for note_id in cluster.get("note_ids", []):
             clusters_by_note.setdefault(str(note_id), []).append(str(cluster["cluster_id"]))
-    gap_by_id = {
-        str(gap["gap_id"]): gap
-        for gap in gap_map.get("gap_candidates", []) or []
-        if gap.get("gap_id")
-    }
+    gap_by_id = {str(gap["gap_id"]): gap for gap in gap_map.get("gap_candidates", []) or [] if gap.get("gap_id")}
     note_id_by_source = {
-        str(row["source_id"]): str(row["note_id"])
-        for row in note_rows
-        if row.get("source_id") and row.get("note_id")
+        str(row["source_id"]): str(row["note_id"]) for row in note_rows if row.get("source_id") and row.get("note_id")
     }
     gaps_by_note: dict[str, list[dict[str, str]]] = {}
 
@@ -1223,8 +1265,14 @@ def rebuild_map(
         if not path.exists():
             continue
         related_links = [
-            {**link, "target_stem": note_stem_by_id.get(str(link["note_id"]), str(link["note_id"]))}
-            for link in sorted(related.get(str(row["note_id"]), []), key=lambda value: (value["note_id"], value["relation_type"]))
+            {
+                **link,
+                "target_stem": note_stem_by_id.get(str(link["note_id"]), str(link["note_id"])),
+            }
+            for link in sorted(
+                related.get(str(row["note_id"]), []),
+                key=lambda value: (value["note_id"], value["relation_type"]),
+            )
         ]
         cluster_ids = sorted(clusters_by_note.get(str(row["note_id"]), []))
         note_gap_links = sorted(
@@ -1235,8 +1283,7 @@ def rebuild_map(
             {
                 **link,
                 "wikilink": (
-                    f"[[{gap_note_stem(gap_by_id[link['gap_id']])}|"
-                    f"{gap_display_title(gap_by_id[link['gap_id']])}]]"
+                    f"[[{gap_note_stem(gap_by_id[link['gap_id']])}|{gap_display_title(gap_by_id[link['gap_id']])}]]"
                 ),
             }
             for link in note_gap_links
@@ -1245,8 +1292,7 @@ def rebuild_map(
         gap_ids = sorted({link["gap_id"] for link in note_gap_links})
         cluster_wikilinks = {
             cluster_id: (
-                f"[[{cluster_note_stem(cluster_by_id[cluster_id])}|"
-                f"{cluster_display_title(cluster_by_id[cluster_id])}]]"
+                f"[[{cluster_note_stem(cluster_by_id[cluster_id])}|{cluster_display_title(cluster_by_id[cluster_id])}]]"
             )
             for cluster_id in cluster_ids
             if cluster_id in cluster_by_id
@@ -1265,7 +1311,9 @@ def rebuild_map(
                     for link in related_links
                 ],
                 "clusters": cluster_ids,
-                "cluster_links": [cluster_wikilinks[cluster_id] for cluster_id in cluster_ids if cluster_id in cluster_wikilinks],
+                "cluster_links": [
+                    cluster_wikilinks[cluster_id] for cluster_id in cluster_ids if cluster_id in cluster_wikilinks
+                ],
                 "gaps": gap_ids,
                 "gap_links": [gap_wikilinks[gap_id] for gap_id in gap_ids],
                 "tags": sorted(subject_tags_by_note.get(str(row.get("note_id") or ""), [])),

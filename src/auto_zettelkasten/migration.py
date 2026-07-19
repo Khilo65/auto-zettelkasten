@@ -16,7 +16,7 @@ from .notes import (
     semantic_note_hash,
     strip_review_status_material,
 )
-from .models import CURRENT_ARTIFACT_SCHEMA_VERSION, CURRENT_ENGINE_VERSION, NavigationPolicy
+from .models import NavigationPolicy
 from .workspace import resolve_workspace
 
 MIGRATION_ID = "auto-zettelkasten-0.3-literature-map"
@@ -35,6 +35,19 @@ NAVIGATION_TARGET_ENGINE_VERSION = "0.7.0"
 NAVIGATION_TARGET_ARTIFACT_SCHEMA_VERSION = "1.6"
 RESEARCHER_GRADE_MIGRATION_ID = "auto-zettelkasten-0.8-researcher-grade-synthesis"
 RESEARCHER_GRADE_MIGRATION_VERSION = "1"
+
+RESEARCHER_GRADE_TARGET_ENGINE_VERSION = "0.8.0"
+
+RESEARCHER_GRADE_TARGET_ARTIFACT_SCHEMA_VERSION = "1.7"
+
+DEBATE_FAMILY_MIGRATION_ID = "auto-zettelkasten-0.9-debate-family-mapping"
+
+DEBATE_FAMILY_MIGRATION_VERSION = "1"
+
+DEBATE_FAMILY_TARGET_ENGINE_VERSION = "0.9.0"
+
+DEBATE_FAMILY_TARGET_ARTIFACT_SCHEMA_VERSION = "1.8"
+
 _MARKER_FIELDS = {
     "migration_id",
     "migration_version",
@@ -95,6 +108,9 @@ _NAVIGATION_MARKER_FIELDS = {
     "completed_at",
 }
 _RESEARCHER_GRADE_MARKER_FIELDS = set(_NAVIGATION_MARKER_FIELDS)
+
+_DEBATE_FAMILY_MARKER_FIELDS = set(_NAVIGATION_MARKER_FIELDS)
+
 _REVIEW_FIELDS = {"human_review", "review_status", "source_faithfulness_review"}
 _VERSION_FILE_RELATIVES = ("auto-zettelkasten.yml", "11_state/workspace_manifest.yml")
 
@@ -180,17 +196,27 @@ def migrate_workspace(workspace: Path | str, *, dry_run: bool = False) -> dict[s
     proposition_anchors = migrate_proposition_anchor_schema(workspace, dry_run=dry_run)
     navigation = migrate_navigation_projection_schema(workspace, dry_run=dry_run)
     researcher_grade = migrate_researcher_grade_schema(workspace, dry_run=dry_run)
+    debate_family = migrate_debate_family_schema(workspace, dry_run=dry_run)
     return {
         "status": "dry_run" if dry_run else "completed",
         "dry_run": dry_run,
         "provider_calls": 0,
-        "migrations": [legacy, review, gap_quality, proposition_anchors, navigation, researcher_grade],
+        "migrations": [
+            legacy,
+            review,
+            gap_quality,
+            proposition_anchors,
+            navigation,
+            researcher_grade,
+            debate_family,
+        ],
         "literature_map": legacy,
         "review_status": review,
         "gap_quality": gap_quality,
         "proposition_anchors": proposition_anchors,
         "navigation": navigation,
         "researcher_grade": researcher_grade,
+        "debate_family": debate_family,
     }
 
 
@@ -490,19 +516,30 @@ def migrate_researcher_grade_schema(workspace: Path | str, *, dry_run: bool = Fa
         payload = read_yaml(marker, {})
         _validate_researcher_grade_marker(root, payload)
         schema = _workspace_schema_version(root)
-        target = _parse_schema_version(CURRENT_ARTIFACT_SCHEMA_VERSION, field="current artifact schema")
+        target = _parse_schema_version(
+            RESEARCHER_GRADE_TARGET_ARTIFACT_SCHEMA_VERSION,
+            field="researcher-grade artifact schema",
+        )
         if schema is None or schema < target:
             raise ValueError("completed researcher-grade migration marker disagrees with workspace schema")
-        return {"dry_run": dry_run, **dict(payload), "status": "already_migrated", "marker": str(marker)}
+        return {
+            "dry_run": dry_run,
+            **dict(payload),
+            "status": "already_migrated",
+            "marker": str(marker),
+        }
 
     schema_version = _workspace_schema_version(root)
     if schema_version is None:
         return _researcher_grade_not_applicable(dry_run=dry_run, reason="workspace_version_files_absent")
-    target_schema = _parse_schema_version(CURRENT_ARTIFACT_SCHEMA_VERSION, field="current artifact schema")
+    target_schema = _parse_schema_version(
+        RESEARCHER_GRADE_TARGET_ARTIFACT_SCHEMA_VERSION,
+        field="researcher-grade artifact schema",
+    )
     if schema_version > target_schema:
-        actual = ".".join(str(value) for value in schema_version)
-        raise ValueError(
-            f"workspace artifact schema {actual} is newer than migration target {CURRENT_ARTIFACT_SCHEMA_VERSION}"
+        return _researcher_grade_not_applicable(
+            dry_run=dry_run,
+            reason="schema_newer_than_1.7",
         )
     if schema_version >= target_schema:
         return _researcher_grade_not_applicable(dry_run=dry_run, reason="schema_1.7_or_newer")
@@ -515,8 +552,8 @@ def migrate_researcher_grade_schema(workspace: Path | str, *, dry_run: bool = Fa
         if not isinstance(value, Mapping):
             raise ValueError(f"workspace version file must be a mapping: {path}")
         updated = dict(value)
-        updated["engine_version"] = CURRENT_ENGINE_VERSION
-        updated["artifact_schema_version"] = CURRENT_ARTIFACT_SCHEMA_VERSION
+        updated["engine_version"] = RESEARCHER_GRADE_TARGET_ENGINE_VERSION
+        updated["artifact_schema_version"] = RESEARCHER_GRADE_TARGET_ARTIFACT_SCHEMA_VERSION
         cleaned = yaml.safe_dump(updated, sort_keys=False, allow_unicode=True, width=10_000)
         if cleaned != original:
             version_changes.append((path, original, cleaned))
@@ -549,8 +586,8 @@ def migrate_researcher_grade_schema(workspace: Path | str, *, dry_run: bool = Fa
         for path, original, cleaned in version_changes
     ]
     safety = {
-        "target_engine_version": CURRENT_ENGINE_VERSION,
-        "target_artifact_schema_version": CURRENT_ARTIFACT_SCHEMA_VERSION,
+        "target_engine_version": RESEARCHER_GRADE_TARGET_ENGINE_VERSION,
+        "target_artifact_schema_version": RESEARCHER_GRADE_TARGET_ARTIFACT_SCHEMA_VERSION,
         "archive_directory": str(archive),
         "archived_files": archived_files,
         "rewritten_files": rewritten_files,
@@ -593,6 +630,132 @@ def migrate_researcher_grade_schema(workspace: Path | str, *, dry_run: bool = Fa
         raise
     return {"dry_run": False, **payload, "status": "migrated", "marker": str(marker)}
 
+
+def migrate_debate_family_schema(workspace: Path | str, *, dry_run: bool = False) -> dict[str, Any]:
+    """Archive mutable v0.8 projections and advance workspace versions to schema 1.8."""
+
+    root = resolve_workspace(workspace)
+    marker = root / "11_state" / "migrations" / f"{DEBATE_FAMILY_MIGRATION_ID}.yml"
+    if marker.is_file():
+        payload = read_yaml(marker, {})
+        _validate_debate_family_marker(root, payload)
+        schema = _workspace_schema_version(root)
+        target = _parse_schema_version(
+            DEBATE_FAMILY_TARGET_ARTIFACT_SCHEMA_VERSION,
+            field="debate-family artifact schema",
+        )
+        if schema is None or schema < target:
+            raise ValueError("completed debate-family migration marker disagrees with workspace schema")
+        return {
+            "dry_run": dry_run,
+            **dict(payload),
+            "status": "already_migrated",
+            "marker": str(marker),
+        }
+
+    schema_version = _workspace_schema_version(root)
+    if schema_version is None:
+        return _debate_family_not_applicable(dry_run=dry_run, reason="workspace_version_files_absent")
+    target_schema = _parse_schema_version(
+        DEBATE_FAMILY_TARGET_ARTIFACT_SCHEMA_VERSION,
+        field="debate-family artifact schema",
+    )
+    if schema_version > target_schema:
+        actual = ".".join(str(value) for value in schema_version)
+        raise ValueError(
+            f"workspace artifact schema {actual} is newer than migration target "
+            f"{DEBATE_FAMILY_TARGET_ARTIFACT_SCHEMA_VERSION}"
+        )
+    if schema_version >= target_schema:
+        return _debate_family_not_applicable(dry_run=dry_run, reason="schema_1.8_or_newer")
+    if schema_version < (1, 7) and not dry_run:
+        raise ValueError("debate-family migration requires the schema-1.7 migration first")
+
+    version_changes: list[tuple[Path, str, str]] = []
+    for relative in _VERSION_FILE_RELATIVES:
+        path = root / relative
+        original = path.read_text(encoding="utf-8")
+        value = yaml.safe_load(original)
+        if not isinstance(value, Mapping):
+            raise ValueError(f"workspace version file must be a mapping: {path}")
+        updated = dict(value)
+        updated["engine_version"] = DEBATE_FAMILY_TARGET_ENGINE_VERSION
+        updated["artifact_schema_version"] = DEBATE_FAMILY_TARGET_ARTIFACT_SCHEMA_VERSION
+        cleaned = yaml.safe_dump(updated, sort_keys=False, allow_unicode=True, width=10_000)
+        if cleaned != original:
+            version_changes.append((path, original, cleaned))
+
+    projection_root = root / "03_literature_synthesis"
+    legacy_paths: list[Path] = []
+    if projection_root.is_dir():
+        legacy_paths.extend(path for path in projection_root.glob("*") if path.is_file())
+        for relative in ("clusters", "gaps"):
+            directory = projection_root / relative
+            if directory.is_dir():
+                legacy_paths.extend(path for path in directory.rglob("*") if path.is_file())
+    legacy_paths = sorted(set(legacy_paths))
+    timestamp = now_iso().replace(":", "").replace("+00:00", "Z")
+    archive = root / "11_state" / "legacy_maps" / f"pre-0.9-{slugify(timestamp)}"
+    archived_files = [
+        {
+            "source": str(path.relative_to(root)),
+            "archive": str((archive / path.relative_to(root)).relative_to(root)),
+            "sha256": sha256_file(path),
+        }
+        for path in legacy_paths
+    ]
+    rewritten_files = [
+        {
+            "source": str(path.relative_to(root)),
+            "before_sha256": sha256_text(original),
+            "after_sha256": sha256_text(cleaned),
+        }
+        for path, original, cleaned in version_changes
+    ]
+    safety = {
+        "target_engine_version": DEBATE_FAMILY_TARGET_ENGINE_VERSION,
+        "target_artifact_schema_version": DEBATE_FAMILY_TARGET_ARTIFACT_SCHEMA_VERSION,
+        "archive_directory": str(archive),
+        "archived_files": archived_files,
+        "rewritten_files": rewritten_files,
+        "provider_calls": 0,
+        "source_documents_reread": 0,
+        "source_notes_rewritten": 0,
+        "profile_files_rewritten": 0,
+        "analytical_identity_changes": 0,
+    }
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "dry_run": True,
+            "migration_id": DEBATE_FAMILY_MIGRATION_ID,
+            **safety,
+        }
+
+    written: list[tuple[Path, str]] = []
+    try:
+        for row, source in zip(archived_files, legacy_paths, strict=True):
+            target = root / str(row["archive"])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            if sha256_file(target) != row["sha256"]:
+                raise RuntimeError(f"debate-family migration archive checksum mismatch: {target}")
+        for path, original, cleaned in version_changes:
+            atomic_write_text(path, cleaned)
+            written.append((path, original))
+        payload = {
+            "migration_id": DEBATE_FAMILY_MIGRATION_ID,
+            "migration_version": DEBATE_FAMILY_MIGRATION_VERSION,
+            "status": "completed",
+            **safety,
+            "completed_at": now_iso(),
+        }
+        write_yaml(marker, payload)
+    except Exception:
+        for path, original in reversed(written):
+            atomic_write_text(path, original)
+        raise
+    return {"dry_run": False, **payload, "status": "migrated", "marker": str(marker)}
 
 def migrate_review_status(workspace: Path | str, *, dry_run: bool = False) -> dict[str, Any]:
     """Remove generated review-status material and record safe profile-hash aliases."""
@@ -892,8 +1055,8 @@ def _researcher_grade_not_applicable(*, dry_run: bool, reason: str) -> dict[str,
         "dry_run": dry_run,
         "migration_id": RESEARCHER_GRADE_MIGRATION_ID,
         "reason": reason,
-        "target_engine_version": CURRENT_ENGINE_VERSION,
-        "target_artifact_schema_version": CURRENT_ARTIFACT_SCHEMA_VERSION,
+        "target_engine_version": RESEARCHER_GRADE_TARGET_ENGINE_VERSION,
+        "target_artifact_schema_version": RESEARCHER_GRADE_TARGET_ARTIFACT_SCHEMA_VERSION,
         "archive_directory": "",
         "archived_files": [],
         "rewritten_files": [],
@@ -904,6 +1067,24 @@ def _researcher_grade_not_applicable(*, dry_run: bool, reason: str) -> dict[str,
         "analytical_identity_changes": 0,
     }
 
+
+def _debate_family_not_applicable(*, dry_run: bool, reason: str) -> dict[str, Any]:
+    return {
+        "status": "not_applicable",
+        "dry_run": dry_run,
+        "migration_id": DEBATE_FAMILY_MIGRATION_ID,
+        "reason": reason,
+        "target_engine_version": DEBATE_FAMILY_TARGET_ENGINE_VERSION,
+        "target_artifact_schema_version": DEBATE_FAMILY_TARGET_ARTIFACT_SCHEMA_VERSION,
+        "archive_directory": "",
+        "archived_files": [],
+        "rewritten_files": [],
+        "provider_calls": 0,
+        "source_documents_reread": 0,
+        "source_notes_rewritten": 0,
+        "profile_files_rewritten": 0,
+        "analytical_identity_changes": 0,
+    }
 
 def _validate_navigation_marker(root: Path, value: Any) -> None:
     if not isinstance(value, Mapping):
@@ -965,8 +1146,8 @@ def _validate_researcher_grade_marker(root: Path, value: Any) -> None:
         value.get("migration_id") != RESEARCHER_GRADE_MIGRATION_ID
         or str(value.get("migration_version")) != RESEARCHER_GRADE_MIGRATION_VERSION
         or value.get("status") != "completed"
-        or value.get("target_engine_version") != CURRENT_ENGINE_VERSION
-        or value.get("target_artifact_schema_version") != CURRENT_ARTIFACT_SCHEMA_VERSION
+        or value.get("target_engine_version") != RESEARCHER_GRADE_TARGET_ENGINE_VERSION
+        or value.get("target_artifact_schema_version") != RESEARCHER_GRADE_TARGET_ARTIFACT_SCHEMA_VERSION
         or any(type(value.get(field)) is not int or value.get(field) != 0 for field in zero_fields)
         or not isinstance(value.get("completed_at"), str)
         or not str(value.get("completed_at") or "").strip()
@@ -981,11 +1162,59 @@ def _validate_researcher_grade_marker(root: Path, value: Any) -> None:
         if not archive.is_file() or sha256_file(archive) != str(row.get("sha256") or ""):
             raise ValueError(f"researcher-grade migration archive is missing or corrupt: {archive}")
     for row in value.get("rewritten_files", []) or []:
-        if not isinstance(row, Mapping) or set(row) != {"source", "before_sha256", "after_sha256"}:
+        if not isinstance(row, Mapping) or set(row) != {
+            "source",
+            "before_sha256",
+            "after_sha256",
+        }:
             raise ValueError("malformed researcher-grade migration rewritten-file record")
         if str(row.get("source") or "") not in _VERSION_FILE_RELATIVES:
             raise ValueError("malformed researcher-grade migration rewritten-file source")
 
+
+def _validate_debate_family_marker(root: Path, value: Any) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError("debate-family migration marker must be a mapping")
+    unknown = sorted(set(value) - _DEBATE_FAMILY_MARKER_FIELDS)
+    missing = sorted(_DEBATE_FAMILY_MARKER_FIELDS - set(value))
+    if unknown or missing:
+        detail = f"unknown fields: {', '.join(unknown)}" if unknown else f"missing fields: {', '.join(missing)}"
+        raise ValueError(f"malformed debate-family migration marker: {detail}")
+    zero_fields = (
+        "provider_calls",
+        "source_documents_reread",
+        "source_notes_rewritten",
+        "profile_files_rewritten",
+        "analytical_identity_changes",
+    )
+    if (
+        value.get("migration_id") != DEBATE_FAMILY_MIGRATION_ID
+        or str(value.get("migration_version")) != DEBATE_FAMILY_MIGRATION_VERSION
+        or value.get("status") != "completed"
+        or value.get("target_engine_version") != DEBATE_FAMILY_TARGET_ENGINE_VERSION
+        or value.get("target_artifact_schema_version") != DEBATE_FAMILY_TARGET_ARTIFACT_SCHEMA_VERSION
+        or any(type(value.get(field)) is not int or value.get(field) != 0 for field in zero_fields)
+        or not isinstance(value.get("completed_at"), str)
+        or not str(value.get("completed_at") or "").strip()
+    ):
+        raise ValueError("malformed debate-family migration marker")
+    if not isinstance(value.get("archived_files"), list) or not isinstance(value.get("rewritten_files"), list):
+        raise ValueError("malformed debate-family migration marker file lists")
+    for row in value.get("archived_files", []) or []:
+        if not isinstance(row, Mapping) or set(row) != {"source", "archive", "sha256"}:
+            raise ValueError("malformed debate-family migration archive record")
+        archive = _confined_marker_path(root, row.get("archive"), label="debate-family migration archive")
+        if not archive.is_file() or sha256_file(archive) != str(row.get("sha256") or ""):
+            raise ValueError(f"debate-family migration archive is missing or corrupt: {archive}")
+    for row in value.get("rewritten_files", []) or []:
+        if not isinstance(row, Mapping) or set(row) != {
+            "source",
+            "before_sha256",
+            "after_sha256",
+        }:
+            raise ValueError("malformed debate-family migration rewritten-file record")
+        if str(row.get("source") or "") not in _VERSION_FILE_RELATIVES:
+            raise ValueError("malformed debate-family migration rewritten-file source")
 
 def _validate_proposition_anchor_marker(value: Any) -> None:
     if not isinstance(value, Mapping):
@@ -1080,10 +1309,26 @@ def _validate_existing_markers(root: Path) -> None:
     marker_validators = (
         (MIGRATION_ID, lambda value: _validate_marker(root, value)),
         (REVIEW_MIGRATION_ID, lambda value: _validate_review_marker(root, value)),
-        (GAP_QUALITY_MIGRATION_ID, lambda value: _validate_gap_quality_marker(root, value)),
-        (PROPOSITION_ANCHOR_MIGRATION_ID, lambda value: _validate_proposition_anchor_marker(value)),
-        (NAVIGATION_MIGRATION_ID, lambda value: _validate_navigation_marker(root, value)),
-        (RESEARCHER_GRADE_MIGRATION_ID, lambda value: _validate_researcher_grade_marker(root, value)),
+        (
+            GAP_QUALITY_MIGRATION_ID,
+            lambda value: _validate_gap_quality_marker(root, value),
+        ),
+        (
+            PROPOSITION_ANCHOR_MIGRATION_ID,
+            lambda value: _validate_proposition_anchor_marker(value),
+        ),
+        (
+            NAVIGATION_MIGRATION_ID,
+            lambda value: _validate_navigation_marker(root, value),
+        ),
+        (
+            RESEARCHER_GRADE_MIGRATION_ID,
+            lambda value: _validate_researcher_grade_marker(root, value),
+        ),
+        (
+            DEBATE_FAMILY_MIGRATION_ID,
+            lambda value: _validate_debate_family_marker(root, value),
+        ),
     )
     for migration_id, validate in marker_validators:
         marker = marker_root / f"{migration_id}.yml"

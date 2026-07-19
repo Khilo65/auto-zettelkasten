@@ -1,7 +1,7 @@
 """Public package metadata and collection-mapping contracts."""
 
-ENGINE_VERSION = "0.8.0"
-ARTIFACT_SCHEMA_VERSION = "1.7"
+ENGINE_VERSION = "0.9.0"
+ARTIFACT_SCHEMA_VERSION = "1.8"
 __version__ = ENGINE_VERSION
 
 from .models import (  # noqa: E402 - version constants must exist before api imports this module
@@ -11,6 +11,7 @@ from .models import (  # noqa: E402 - version constants must exist before api im
     ClusterSynthesis,
     CoverageRecord,
     CoverageRegister,
+    DebateFamily,
     EvidenceAnchor,
     EvidenceBaseGroup,
     EvidenceFinding,
@@ -61,6 +62,7 @@ __all__ = [
     "ClusterSynthesisReasoner",
     "CoverageRecord",
     "CoverageRegister",
+    "DebateFamily",
     "EvidenceAnchor",
     "EvidenceBaseGroup",
     "EvidenceFinding",

@@ -294,7 +294,12 @@ def get_status(workspace: Path | str, run_id: str | None = None) -> StatusReport
     run_id = run_id or _latest_run_id(root)
     report_path = run_directory(root, run_id) / "run_report.yml" if run_id else None
     progress_path = run_directory(root, run_id) / "progress.yml" if run_id else None
-    if explicit_run and report_path and not report_path.exists() and (progress_path is None or not progress_path.exists()):
+    if (
+        explicit_run
+        and report_path
+        and not report_path.exists()
+        and (progress_path is None or not progress_path.exists())
+    ):
         return StatusReport(status="blocked", workspace=root, run_id=run_id, message="run_not_found")
     report = read_yaml(report_path, {}) or {} if report_path and report_path.exists() else {}
     progress = read_yaml(progress_path, {}) or {} if progress_path and progress_path.exists() else {}
@@ -303,7 +308,9 @@ def get_status(workspace: Path | str, run_id: str | None = None) -> StatusReport
     clusters = (report.get("cluster_map", {}) or {}).get("clusters", [])
     gaps = (report.get("gap_map", {}) or {}).get("gap_candidates", [])
     if not report:
-        clusters = (read_yaml(root / "03_literature_synthesis" / "clusters" / "clusters.yml", {}) or {}).get("clusters", [])
+        clusters = (read_yaml(root / "03_literature_synthesis" / "clusters" / "clusters.yml", {}) or {}).get(
+            "clusters", []
+        )
         gaps = (read_yaml(root / "03_literature_synthesis" / "gaps" / "gaps.yml", {}) or {}).get("gap_candidates", [])
     source_sets = []
     for path in (root / "02_source_memory" / "indexes" / "source_sets").glob("*.yml"):
@@ -321,14 +328,22 @@ def get_status(workspace: Path | str, run_id: str | None = None) -> StatusReport
         "reused_count": int(live.get("reused_count", 0) or 0),
         "profile_count": int(live.get("profile_count", literature_live.get("profile_count", 0)) or 0),
         "profile_valid_count": int(live.get("profile_valid_count", literature_live.get("profile_valid_count", 0)) or 0),
-        "profile_excluded_count": int(live.get("profile_excluded_count", literature_live.get("profile_excluded_count", 0)) or 0),
+        "profile_excluded_count": int(
+            live.get(
+                "profile_excluded_count",
+                literature_live.get("profile_excluded_count", 0),
+            )
+            or 0
+        ),
         "unclustered_count": int(live.get("unclustered_count", literature_live.get("unclustered_count", 0)) or 0),
         "topic_neighborhood_count": int(
-            live.get("topic_neighborhood_count", literature_live.get("topic_neighborhood_count", 0)) or 0
+            live.get(
+                "topic_neighborhood_count",
+                literature_live.get("topic_neighborhood_count", 0),
+            )
+            or 0
         ),
-        "subject_tag_count": int(
-            live.get("subject_tag_count", literature_live.get("subject_tag_count", 0)) or 0
-        ),
+        "subject_tag_count": int(live.get("subject_tag_count", literature_live.get("subject_tag_count", 0)) or 0),
         "subject_tag_assignment_count": int(
             live.get(
                 "subject_tag_assignment_count",
@@ -342,13 +357,22 @@ def get_status(workspace: Path | str, run_id: str | None = None) -> StatusReport
         "singleton_facet_count": int(
             live.get("singleton_facet_count", literature_live.get("singleton_facet_count", 0)) or 0
         ),
-        "proposition_count": int(
-            live.get("proposition_count", literature_live.get("proposition_count", 0)) or 0
-        ),
+        "proposition_count": int(live.get("proposition_count", literature_live.get("proposition_count", 0)) or 0),
         "evidence_base_group_count": int(
-            live.get("evidence_base_group_count", literature_live.get("evidence_base_group_count", 0)) or 0
+            live.get(
+                "evidence_base_group_count",
+                literature_live.get("evidence_base_group_count", 0),
+            )
+            or 0
         ),
         "cluster_count": int(live.get("cluster_count", len(clusters) if isinstance(clusters, list) else 0) or 0),
+        "evidence_concentrated_cluster_count": int(
+            live.get(
+                "evidence_concentrated_cluster_count",
+                literature_live.get("evidence_concentrated_cluster_count", 0),
+            )
+            or 0
+        ),
         "cluster_source_contribution_count": int(
             live.get(
                 "cluster_source_contribution_count",
@@ -359,8 +383,54 @@ def get_status(workspace: Path | str, run_id: str | None = None) -> StatusReport
         "debate_count": int(live.get("debate_count", literature_live.get("debate_count", 0)) or 0),
         "mapped_gap_count": int(live.get("mapped_gap_count", literature_live.get("mapped_gap_count", 0)) or 0),
         "gap_lead_count": int(live.get("gap_lead_count", literature_live.get("gap_lead_count", 0)) or 0),
+        "strict_consensus_established_count": int(
+            live.get(
+                "strict_consensus_established_count",
+                literature_live.get("strict_consensus_established_count", 0),
+            )
+            or 0
+        ),
+        "strict_consensus_not_established_count": int(
+            live.get(
+                "strict_consensus_not_established_count",
+                literature_live.get("strict_consensus_not_established_count", 0),
+            )
+            or 0
+        ),
+        "strict_contradiction_established_count": int(
+            live.get(
+                "strict_contradiction_established_count",
+                literature_live.get("strict_contradiction_established_count", 0),
+            )
+            or 0
+        ),
+        "strict_contradiction_not_established_count": int(
+            live.get(
+                "strict_contradiction_not_established_count",
+                literature_live.get("strict_contradiction_not_established_count", 0),
+            )
+            or 0
+        ),
+        "strong_gap_established_count": int(
+            live.get(
+                "strong_gap_established_count",
+                literature_live.get("strong_gap_established_count", 0),
+            )
+            or 0
+        ),
+        "strong_gap_not_established_count": int(
+            live.get(
+                "strong_gap_not_established_count",
+                literature_live.get("strong_gap_not_established_count", 0),
+            )
+            or 0
+        ),
         "synthesized_cluster_count": int(
-            live.get("synthesized_cluster_count", literature_live.get("synthesized_cluster_count", 0)) or 0
+            live.get(
+                "synthesized_cluster_count",
+                literature_live.get("synthesized_cluster_count", 0),
+            )
+            or 0
         ),
         "rejected_underspecified_gap_count": int(
             live.get(
@@ -376,9 +446,7 @@ def get_status(workspace: Path | str, run_id: str | None = None) -> StatusReport
             )
             or 0
         ),
-        "merged_gap_count": int(
-            live.get("merged_gap_count", literature_live.get("merged_gap_count", 0)) or 0
-        ),
+        "merged_gap_count": int(live.get("merged_gap_count", literature_live.get("merged_gap_count", 0)) or 0),
         "synthesis_call_count": int(
             live.get("synthesis_call_count", literature_live.get("synthesis_call_count", 0)) or 0
         ),
@@ -390,10 +458,18 @@ def get_status(workspace: Path | str, run_id: str | None = None) -> StatusReport
             or 0
         ),
         "synthesis_failure_count": int(
-            live.get("synthesis_failure_count", literature_live.get("synthesis_failure_count", 0)) or 0
+            live.get(
+                "synthesis_failure_count",
+                literature_live.get("synthesis_failure_count", 0),
+            )
+            or 0
         ),
         "quantitative_comparison_count": int(
-            live.get("quantitative_comparison_count", literature_live.get("quantitative_comparison_count", 0)) or 0
+            live.get(
+                "quantitative_comparison_count",
+                literature_live.get("quantitative_comparison_count", 0),
+            )
+            or 0
         ),
         "rejected_quantitative_comparison_count": int(
             live.get(
@@ -410,10 +486,18 @@ def get_status(workspace: Path | str, run_id: str | None = None) -> StatusReport
             or 0
         ),
         "coverage_inventory_count": int(
-            live.get("coverage_inventory_count", literature_live.get("coverage_inventory_count", 0)) or 0
+            live.get(
+                "coverage_inventory_count",
+                literature_live.get("coverage_inventory_count", 0),
+            )
+            or 0
         ),
         "coverage_exhausted_count": int(
-            live.get("coverage_exhausted_count", literature_live.get("coverage_exhausted_count", 0)) or 0
+            live.get(
+                "coverage_exhausted_count",
+                literature_live.get("coverage_exhausted_count", 0),
+            )
+            or 0
         ),
         "gap_candidate_count": len(gaps) if isinstance(gaps, list) else 0,
         "active_count": int(live.get("active_count", 0) or 0),
@@ -421,17 +505,29 @@ def get_status(workspace: Path | str, run_id: str | None = None) -> StatusReport
         "total_chunk_count": int(live.get("total_chunk_count", 0) or 0),
         "checkpoint_hit_count": int(live.get("checkpoint_hit_count", progress.get("checkpoint_hit_count", 0)) or 0),
         "source_provider_call_count": int(
-            live.get("source_provider_call_count", progress.get("source_provider_call_count", 0)) or 0
+            live.get(
+                "source_provider_call_count",
+                progress.get("source_provider_call_count", 0),
+            )
+            or 0
         ),
         "literature_provider_call_count": int(
-            live.get("literature_provider_call_count", progress.get("literature_provider_call_count", 0)) or 0
+            live.get(
+                "literature_provider_call_count",
+                progress.get("literature_provider_call_count", 0),
+            )
+            or 0
         ),
         "provider_call_count": int(live.get("provider_call_count", progress.get("provider_call_count", 0)) or 0),
         "literature_failure_count": int(
             live.get("literature_failure_count", progress.get("literature_failure_count", 0)) or 0
         ),
         "internal_falsification_count": int(
-            live.get("internal_falsification_count", literature_live.get("internal_falsification_count", 0)) or 0
+            live.get(
+                "internal_falsification_count",
+                literature_live.get("internal_falsification_count", 0),
+            )
+            or 0
         ),
         "source_set_count": len(source_sets),
     }

@@ -8,6 +8,7 @@ from auto_zettelkasten.models import (
     ArtifactManifest,
     ClusterProposal,
     ClusterSynthesis,
+    DebateFamily,
     EvidenceAnchor,
     EvidenceFinding,
     EvidenceProfile,
@@ -663,8 +664,7 @@ def test_literature_request_and_report_are_serializable(tmp_path: Path) -> None:
     assert legacy_count_report.proposition_count == 3
     assert legacy_count_report.topic_neighborhood_count == 5
 
-
-def test_all_report_models_default_to_engine_0_8_schema_1_7(tmp_path: Path) -> None:
+def test_all_report_models_default_to_engine_0_9_schema_1_8(tmp_path: Path) -> None:
     run_report = RunReport(status="ok", workspace=tmp_path, run_id="run-1")
     reports = (
         ArtifactManifest(status="ok", workspace=tmp_path),
@@ -672,9 +672,7 @@ def test_all_report_models_default_to_engine_0_8_schema_1_7(tmp_path: Path) -> N
         StatusReport(status="ok", workspace=tmp_path),
         LiteratureMapReport(status="ok"),
     )
-    assert {(report.engine_version, report.artifact_schema_version) for report in reports} == {
-        ("0.8.0", "1.7")
-    }
+    assert {(report.engine_version, report.artifact_schema_version) for report in reports} == {("0.9.0", "1.8")}
     assert run_report.literature_map == {}
     assert run_report.literature_report == {}
     assert {
@@ -687,3 +685,102 @@ def test_all_report_models_default_to_engine_0_8_schema_1_7(tmp_path: Path) -> N
         run_report.mapped_gap_count,
         run_report.gap_lead_count,
     } == {0}
+
+def test_debate_family_and_embedded_relations_round_trip_strictly() -> None:
+    relation = {
+        "relation_type": "complementary_mechanism",
+        "source_ids": ["source-a", "source-b"],
+        "rationale": "The studies explain different stages of the same mediation process.",
+        "evidence": [
+            {
+                "source_id": "source-a",
+                "evidence_anchor_id": "anchor-a",
+                "locator": "p. 10",
+            },
+            {
+                "source_id": "source-b",
+                "evidence_anchor_id": "anchor-b",
+                "locator": "p. 20",
+            },
+        ],
+        "comparability": {"direct": False, "reason": "Different outcomes."},
+    }
+    family = DebateFamily(
+        cluster_id="cluster-mediation-design",
+        label="Mediation design and implementation",
+        semantic_identity="mediation design and implementation",
+        shared_question="How do mediation design choices shape implementation?",
+        bounded_object="mediation design and implementation",
+        coherence_rationale="The sources address connected stages of one process.",
+        source_ids=["source-a", "source-b"],
+        core_source_ids=["source-a", "source-b"],
+        source_roles=[
+            {"source_id": "source-a", "role": "core"},
+            {"source_id": "source-b", "role": "core"},
+        ],
+        family_relations=[relation],
+        qualification_status="emerging_cluster",
+        admission_status="admitted",
+        effective_evidence_base_count=2,
+        revision_hash="revision-1",
+    )
+    assert DebateFamily.from_dict(family.to_dict()) == family
+
+    proposal = ClusterProposal.from_dict(
+        {
+            "proposal_id": "proposal-1",
+            "label": family.label,
+            "semantic_identity": family.semantic_identity,
+            "shared_question": family.shared_question,
+            "bounded_object": family.bounded_object,
+            "coherence_rationale": family.coherence_rationale,
+            "source_ids": family.source_ids,
+            "source_roles": {"source-a": "core", "source-b": "core"},
+            "family_relations": [relation],
+            "propositions": [],
+        }
+    )
+    assert ClusterProposal.from_dict(proposal.to_dict()) == proposal
+    assert proposal.bounded_object == family.bounded_object
+    with pytest.raises(ValueError, match="relation_type is invalid"):
+        ClusterProposal.from_dict(
+            {
+                **proposal.to_dict(),
+                "family_relations": [{**relation, "relation_type": "same_tag"}],
+            }
+        )
+    with pytest.raises(ValueError, match="must reference family source_ids"):
+        DebateFamily.from_dict(
+            {
+                **family.to_dict(),
+                "family_relations": [{**relation, "source_ids": ["source-a", "source-c"]}],
+            }
+        )
+
+def test_strict_adjudications_are_embedded_and_validated() -> None:
+    adjudication = {
+        "kind": "consensus",
+        "candidate": "A shared proposition",
+        "decision": "not_established",
+        "checks": [
+            {
+                "requirement": "Three independent evidence bases",
+                "passed": False,
+                "explanation": "Only two are present.",
+            }
+        ],
+        "explanation": "The evidence shows convergence, not mature consensus.",
+        "what_would_change": "A third independent study could change the classification.",
+        "proposition_ids": ["proposition-1"],
+        "related_cluster_ids": ["cluster-1"],
+        "evidence": [],
+    }
+    synthesis = ClusterSynthesis(strict_adjudications=[adjudication])
+    assert ClusterSynthesis.from_dict(synthesis.to_dict()) == synthesis
+
+    gap_adjudication = {**adjudication, "kind": "strong_gap"}
+    gap = GapRationale(strict_adjudication=gap_adjudication)
+    assert GapRationale.from_dict(gap.to_dict()) == gap
+
+    with pytest.raises(ValueError, match="decision is invalid"):
+        ClusterSynthesis(strict_adjudications=[{**adjudication, "decision": "maybe"}])

@@ -7,10 +7,22 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
-CURRENT_ENGINE_VERSION = "0.8.0"
-CURRENT_ARTIFACT_SCHEMA_VERSION = "1.7"
+CURRENT_ENGINE_VERSION = "0.9.0"
+CURRENT_ARTIFACT_SCHEMA_VERSION = "1.8"
 CURRENT_PROFILE_SCHEMA_VERSION = "1.2"
 
+
+FAMILY_RELATION_TYPES = frozenset(
+    {
+        "same_proposition",
+        "rival_explanation",
+        "complementary_mechanism",
+        "boundary_contrast",
+        "methodological_fault_line",
+        "sequential_relationship",
+        "interpretive_or_normative_disagreement",
+    }
+)
 
 def _jsonable(value: Any) -> Any:
     if is_dataclass(value):
@@ -74,6 +86,94 @@ def _any_mapping(value: Any, *, field: str) -> dict[str, Any]:
         raise ValueError(f"{field} keys must be strings")
     return dict(value)
 
+
+def _family_relation_list(value: Any, *, field: str) -> list[dict[str, Any]]:
+    rows = _mapping_list(value, field=field)
+    allowed = {"relation_type", "source_ids", "rationale", "evidence", "comparability"}
+    normalized: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        unknown = sorted(set(row) - allowed)
+        if unknown:
+            raise ValueError(f"unknown {field}[{index}] fields: {', '.join(unknown)}")
+        relation_type = _require_string(row.get("relation_type", ""), field=f"{field}[{index}].relation_type")
+        if relation_type not in FAMILY_RELATION_TYPES:
+            raise ValueError(f"{field}[{index}].relation_type is invalid")
+        source_ids = _string_list(row.get("source_ids"), field=f"{field}[{index}].source_ids")
+        if len(set(source_ids)) < 2:
+            raise ValueError(f"{field}[{index}].source_ids must contain at least two sources")
+        normalized.append(
+            {
+                "relation_type": relation_type,
+                "source_ids": source_ids,
+                "rationale": _require_string(row.get("rationale", ""), field=f"{field}[{index}].rationale"),
+                "evidence": _mapping_list(row.get("evidence"), field=f"{field}[{index}].evidence"),
+                "comparability": _any_mapping(
+                    row.get("comparability", {}),
+                    field=f"{field}[{index}].comparability",
+                ),
+            }
+        )
+    return normalized
+
+def _strict_adjudication(value: Any, *, field: str) -> dict[str, Any]:
+    row = _any_mapping(value, field=field)
+    if not row:
+        return {}
+    allowed = {
+        "kind",
+        "candidate",
+        "decision",
+        "checks",
+        "explanation",
+        "what_would_change",
+        "proposition_ids",
+        "related_cluster_ids",
+        "evidence",
+    }
+    unknown = sorted(set(row) - allowed)
+    if unknown:
+        raise ValueError(f"unknown {field} fields: {', '.join(unknown)}")
+    kind = _require_string(row.get("kind", ""), field=f"{field}.kind")
+    if kind not in {"consensus", "contradiction", "strong_gap"}:
+        raise ValueError(f"{field}.kind is invalid")
+    decision = _require_string(row.get("decision", ""), field=f"{field}.decision")
+    if decision not in {"established", "not_established"}:
+        raise ValueError(f"{field}.decision is invalid")
+    checks = _mapping_list(row.get("checks"), field=f"{field}.checks")
+    normalized_checks: list[dict[str, Any]] = []
+    for index, check in enumerate(checks):
+        if set(check) - {"requirement", "passed", "explanation"}:
+            raise ValueError(f"unknown {field}.checks[{index}] fields")
+        normalized_checks.append(
+            {
+                "requirement": _require_string(
+                    check.get("requirement", ""),
+                    field=f"{field}.checks[{index}].requirement",
+                ),
+                "passed": _require_bool(check.get("passed", False), field=f"{field}.checks[{index}].passed"),
+                "explanation": _require_string(
+                    check.get("explanation", ""),
+                    field=f"{field}.checks[{index}].explanation",
+                ),
+            }
+        )
+    return {
+        "kind": kind,
+        "candidate": _require_string(row.get("candidate", ""), field=f"{field}.candidate"),
+        "decision": decision,
+        "checks": normalized_checks,
+        "explanation": _require_string(row.get("explanation", ""), field=f"{field}.explanation"),
+        "what_would_change": _require_string(row.get("what_would_change", ""), field=f"{field}.what_would_change"),
+        "proposition_ids": _string_list(row.get("proposition_ids"), field=f"{field}.proposition_ids"),
+        "related_cluster_ids": _string_list(row.get("related_cluster_ids"), field=f"{field}.related_cluster_ids"),
+        "evidence": _mapping_list(row.get("evidence"), field=f"{field}.evidence"),
+    }
+
+def _strict_adjudication_list(value: Any, *, field: str) -> list[dict[str, Any]]:
+    return [
+        _strict_adjudication(row, field=f"{field}[{index}]")
+        for index, row in enumerate(_mapping_list(value, field=field))
+    ]
 
 def _nonnegative_int(value: Any, *, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -2754,10 +2854,12 @@ class ClusterProposal:
     label: str = ""
     semantic_identity: str = ""
     shared_question: str = ""
+    bounded_object: str = ""
     coherence_rationale: str = ""
     source_ids: list[str] = field(default_factory=list)
     supporting_evidence: list[dict[str, Any]] = field(default_factory=list)
     propositions: list[LiteratureProposition] = field(default_factory=list)
+    family_relations: list[dict[str, Any]] = field(default_factory=list)
     source_roles: list[dict[str, Any]] = field(default_factory=list)
     study_lineages: list[StudyLineage] = field(default_factory=list)
     evidence_base_groups: list[EvidenceBaseGroup] = field(default_factory=list)
@@ -2788,6 +2890,10 @@ class ClusterProposal:
         self.effective_evidence_base_count = _nonnegative_int(
             self.effective_evidence_base_count,
             field="cluster proposal.effective_evidence_base_count",
+        )
+        self.family_relations = _family_relation_list(
+            self.family_relations,
+            field="cluster proposal.family_relations",
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -2833,9 +2939,7 @@ class ClusterProposal:
                 ]
             elif propositions:
                 proposition_source_ids = {
-                    source_id
-                    for proposition in propositions
-                    for source_id in proposition.source_ids
+                    source_id for proposition in propositions for source_id in proposition.source_ids
                 }
                 source_role_rows = [
                     {
@@ -2855,17 +2959,24 @@ class ClusterProposal:
             label=str(values.get("label") or ""),
             semantic_identity=str(values.get("semantic_identity") or values.get("label") or ""),
             shared_question=str(values.get("shared_question") or ""),
+            bounded_object=str(values.get("bounded_object") or ""),
             coherence_rationale=str(values.get("coherence_rationale") or ""),
             source_ids=source_ids,
             supporting_evidence=_mapping_list(
-                values.get("supporting_evidence"), field="cluster proposal.supporting_evidence"
+                values.get("supporting_evidence"),
+                field="cluster proposal.supporting_evidence",
             ),
             propositions=propositions,
+            family_relations=_family_relation_list(
+                values.get("family_relations"),
+                field="cluster proposal.family_relations",
+            ),
             source_roles=source_role_rows,
             study_lineages=[
                 StudyLineage.from_dict(row)
                 for row in _mapping_list(
-                    values.get("study_lineages", []), field="cluster proposal.study_lineages"
+                    values.get("study_lineages", []),
+                    field="cluster proposal.study_lineages",
                 )
             ],
             evidence_base_groups=[
@@ -2888,6 +2999,80 @@ class ClusterProposal:
             ),
         )
 
+
+@dataclass(slots=True)
+class DebateFamily:
+    """An admitted analytical family that reuses the public cluster identity."""
+
+    cluster_id: str = ""
+    label: str = ""
+    semantic_identity: str = ""
+    shared_question: str = ""
+    bounded_object: str = ""
+    coherence_rationale: str = ""
+    source_ids: list[str] = field(default_factory=list)
+    core_source_ids: list[str] = field(default_factory=list)
+    context_source_ids: list[str] = field(default_factory=list)
+    bridge_source_ids: list[str] = field(default_factory=list)
+    source_roles: list[dict[str, Any]] = field(default_factory=list)
+    family_relations: list[dict[str, Any]] = field(default_factory=list)
+    proposition_ids: list[str] = field(default_factory=list)
+    qualification_status: str = ""
+    admission_status: str = ""
+    effective_evidence_base_count: int = 0
+    revision_hash: str = ""
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "cluster_id",
+            "label",
+            "semantic_identity",
+            "shared_question",
+            "bounded_object",
+            "coherence_rationale",
+            "qualification_status",
+            "admission_status",
+            "revision_hash",
+        ):
+            _require_string(getattr(self, field_name), field=f"debate family.{field_name}")
+        if self.qualification_status not in {
+            "",
+            "source_backed_cluster",
+            "emerging_cluster",
+            "evidence_concentrated_cluster",
+            "cluster_candidate",
+        }:
+            raise ValueError("debate family.qualification_status is invalid")
+        self.source_ids = _string_list(self.source_ids, field="debate family.source_ids")
+        self.core_source_ids = _string_list(self.core_source_ids, field="debate family.core_source_ids")
+        self.context_source_ids = _string_list(self.context_source_ids, field="debate family.context_source_ids")
+        self.bridge_source_ids = _string_list(self.bridge_source_ids, field="debate family.bridge_source_ids")
+        self.source_roles = _mapping_list(self.source_roles, field="debate family.source_roles")
+        self.family_relations = _family_relation_list(self.family_relations, field="debate family.family_relations")
+        self.proposition_ids = _string_list(self.proposition_ids, field="debate family.proposition_ids")
+        self.effective_evidence_base_count = _nonnegative_int(
+            self.effective_evidence_base_count,
+            field="debate family.effective_evidence_base_count",
+        )
+        source_set = set(self.source_ids)
+        if any(source_id not in source_set for source_id in self.core_source_ids):
+            raise ValueError("debate family.core_source_ids must belong to source_ids")
+        if any(source_id not in source_set for source_id in self.context_source_ids):
+            raise ValueError("debate family.context_source_ids must belong to source_ids")
+        if any(source_id not in source_set for source_id in self.bridge_source_ids):
+            raise ValueError("debate family.bridge_source_ids must belong to source_ids")
+        if any(
+            source_id not in source_set for relation in self.family_relations for source_id in relation["source_ids"]
+        ):
+            raise ValueError("debate family relations must reference family source_ids")
+
+    def to_dict(self) -> dict[str, Any]:
+        return _jsonable(self)
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> DebateFamily:
+        values = _model_payload(cls, payload, label="debate family")
+        return cls(**values)
 
 @dataclass(slots=True)
 class ClusterSynthesis:
@@ -2913,6 +3098,7 @@ class ClusterSynthesis:
     evidence_base_groups: list[EvidenceBaseGroup] = field(default_factory=list)
     independence_assessments: list[IndependenceAssessment] = field(default_factory=list)
     quantitative_comparisons: list[QuantitativeComparisonValidation] = field(default_factory=list)
+    strict_adjudications: list[dict[str, Any]] = field(default_factory=list)
     effective_evidence_base_count: int = 0
     debate_state: str = ""
 
@@ -2939,6 +3125,10 @@ class ClusterSynthesis:
             else QuantitativeComparisonValidation.from_dict(comparison)
             for comparison in self.quantitative_comparisons
         ]
+        self.strict_adjudications = _strict_adjudication_list(
+            self.strict_adjudications,
+            field="cluster synthesis.strict_adjudications",
+        )
         self.effective_evidence_base_count = _nonnegative_int(
             self.effective_evidence_base_count,
             field="cluster synthesis.effective_evidence_base_count",
@@ -3001,22 +3191,16 @@ class ClusterSynthesis:
             source_roles=mappings("source_roles"),
             supporting_evidence=mappings("supporting_evidence"),
             gap_hypotheses=mappings("gap_hypotheses"),
-            synthesis_assertions=[
-                SynthesisAssertion.from_dict(row) for row in mappings("synthesis_assertions")
-            ],
-            source_contributions=[
-                ClusterSourceContribution.from_dict(row) for row in mappings("source_contributions")
-            ],
-            evidence_base_groups=[
-                EvidenceBaseGroup.from_dict(row) for row in mappings("evidence_base_groups")
-            ],
+            synthesis_assertions=[SynthesisAssertion.from_dict(row) for row in mappings("synthesis_assertions")],
+            source_contributions=[ClusterSourceContribution.from_dict(row) for row in mappings("source_contributions")],
+            evidence_base_groups=[EvidenceBaseGroup.from_dict(row) for row in mappings("evidence_base_groups")],
             independence_assessments=[
                 IndependenceAssessment.from_dict(row) for row in mappings("independence_assessments")
             ],
             quantitative_comparisons=[
-                QuantitativeComparisonValidation.from_dict(row)
-                for row in mappings("quantitative_comparisons")
+                QuantitativeComparisonValidation.from_dict(row) for row in mappings("quantitative_comparisons")
             ],
+            strict_adjudications=mappings("strict_adjudications"),
             effective_evidence_base_count=_nonnegative_int(
                 values.get("effective_evidence_base_count", 0),
                 field="cluster synthesis.effective_evidence_base_count",
@@ -3192,6 +3376,7 @@ class GapRationale:
     merged_from_gap_ids: list[str] = field(default_factory=list)
     reframed_from_gap_id: str = ""
     priority_tier: Literal["high", "moderate", "low", ""] = ""
+    strict_adjudication: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return _jsonable(self)
@@ -3218,11 +3403,10 @@ class GapRationale:
         ):
             raise ValueError("conflicting proposition_id and originating_proposition_id")
         proposition_id = str(values.get("originating_proposition_id") or values.get("proposition_id") or "")
-        related_cluster_ids = _string_list(
-            values.get("related_cluster_ids"), field="gap rationale.related_cluster_ids"
-        )
+        related_cluster_ids = _string_list(values.get("related_cluster_ids"), field="gap rationale.related_cluster_ids")
         originating_cluster_ids = _string_list(
-            values.get("originating_cluster_ids"), field="gap rationale.originating_cluster_ids"
+            values.get("originating_cluster_ids"),
+            field="gap rationale.originating_cluster_ids",
         )
         if not originating_cluster_ids:
             originating_cluster_ids = list(related_cluster_ids)
@@ -3260,10 +3444,15 @@ class GapRationale:
             ),
             anchors=[GapAnchor.from_dict(row) for row in anchor_rows],
             merged_from_gap_ids=_string_list(
-                values.get("merged_from_gap_ids"), field="gap rationale.merged_from_gap_ids"
+                values.get("merged_from_gap_ids"),
+                field="gap rationale.merged_from_gap_ids",
             ),
             reframed_from_gap_id=str(values.get("reframed_from_gap_id") or ""),
             priority_tier=priority_tier,  # type: ignore[arg-type]
+            strict_adjudication=_strict_adjudication(
+                values.get("strict_adjudication", {}),
+                field="gap rationale.strict_adjudication",
+            ),
         )
 
 
@@ -3496,9 +3685,10 @@ def _strict_bool(value: Any, *, field: str) -> bool:
     raise ValueError(f"{field} must be a boolean")
 
 
-def _require_bool(value: Any, *, field: str) -> None:
+def _require_bool(value: Any, *, field: str) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"{field} must be a boolean")
+    return value
 
 
 def _require_positive_int(value: Any, *, field: str) -> None:
