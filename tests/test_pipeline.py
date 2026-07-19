@@ -39,7 +39,7 @@ def test_vertical_slice_matches_golden_and_builds_obsidian_graph(tmp_path: Path,
     assert report.source_set["normalized_tags"] == ["exact-tag-case", "shared-topic"]
     typed_links = yaml.safe_load((tmp_path / "02_source_memory" / "indexes" / "typed_links.yml").read_text())["links"]
     assert len(typed_links) == GOLDEN["typed_link_count"]
-    assert {row["relation_type"] for row in typed_links} == {"cites", "same_concept"}
+    assert {row["relation_type"] for row in typed_links} == {"cites", "cited_by"}
     canonical_gaps = yaml.safe_load((tmp_path / "03_literature_synthesis" / "gaps" / "gaps.yml").read_text())
     compatible_gaps = yaml.safe_load((tmp_path / "02_source_memory" / "indexes" / "gap_candidates.yml").read_text())
     assert compatible_gaps == canonical_gaps
@@ -66,10 +66,9 @@ def test_vertical_slice_matches_golden_and_builds_obsidian_graph(tmp_path: Path,
         front, _ = parse_atomic_note(text)
         assert f"## {GOLDEN['required_note_section']}" in text
         assert front["note_status"] == "analytical_atomic_note"
-        assert front["clusters"]
-        assert "auto-zettelkasten/source" in front["tags"]
-        assert "auto-zettelkasten/source/analytical" in front["tags"]
-        assert "shared-topic" in front["tags"]
+        assert front["clusters"] == []
+        assert all(not tag.startswith("auto-zettelkasten/") for tag in front["tags"])
+        assert "shared-topic" in front["normalized_tags"]
         expected_cluster_links = [
             f"[[{cluster_note_stem(cluster)}|{cluster_display_title(cluster)}]]"
             for cluster in report.cluster_map["clusters"]
@@ -77,7 +76,9 @@ def test_vertical_slice_matches_golden_and_builds_obsidian_graph(tmp_path: Path,
         ]
         assert front["cluster_links"] == expected_cluster_links
         assert front["gap_links"] == []
-        assert {row["relation_type"] for row in front["related_notes"]}.issubset({"cites", "cited_by", "same_concept"})
+        assert {row["relation_type"] for row in front["related_notes"]}.issubset(
+            {"cites", "cited_by", "same_proposition", "semantic_similarity"}
+        )
         assert "## Graph Links" in text
         assert "[[" in text.split("## Graph Links", 1)[1]
 
@@ -90,16 +91,11 @@ def test_vertical_slice_matches_golden_and_builds_obsidian_graph(tmp_path: Path,
     assert (export_root / "Indexes" / "Source Index.md").exists()
     assert (export_root / "Indexes" / "Cluster Index.md").exists()
     assert (export_root / "Indexes" / "Gap Index.md").exists()
-    exported_cluster = next((export_root / "Clusters").glob("Cluster - *.md"))
-    exported_cluster_frontmatter = yaml.safe_load(
-        exported_cluster.read_text().split("\n---\n", 1)[0].removeprefix("---\n")
-    )
-    assert exported_cluster_frontmatter["type"] == "literature_cluster"
-    assert "auto-zettelkasten/cluster" in exported_cluster_frontmatter["tags"]
+    assert list((export_root / "Clusters").glob("Cluster - *.md")) == []
     markdown_stems = [path.stem for path in export_root.rglob("*.md")]
     assert len(markdown_stems) == len(set(markdown_stems))
     assert not (export_root / "Literature Map").exists()
-    assert (export_root / "Indexes" / "Literature Map.md").exists()
+    assert len(list((export_root / "Indexes").glob("Literature Map - *.md"))) == 1
 
 
 def test_missing_attachment_becomes_limited_and_duplicate_is_exhausted(tmp_path: Path, sample_items) -> None:
@@ -229,7 +225,7 @@ def test_note_filename_collision_gets_stable_non_overwriting_suffix(tmp_path: Pa
     assert report.exhausted_count == 0
     names = sorted(path.name for path in (tmp_path / "02_source_memory" / "notes").glob("*.md"))
     assert len(names) == 2
-    assert any("[other]" in name for name in names)
+    assert any("[other]" in name or "[itema]" in name for name in names)
 
 
 def test_question_is_only_a_projection_lens_but_metadata_and_reader_remain_in_fingerprint(tmp_path: Path, sample_items) -> None:
@@ -422,8 +418,8 @@ def test_workspace_map_remains_coherent_across_collection_runs(tmp_path: Path, s
     second = run_map(request, client=FakeZotero(sample_items[:1]), reader=FakeReader(), run_id="workspace-two")
     assert second.cluster_map["clusters"] == []
     rebuilt = build_map(tmp_path, run_id="workspace-rebuild")
-    assert len(rebuilt.metadata["cluster_map"]["clusters"]) == 1
-    assert len(list((tmp_path / "03_literature_synthesis" / "clusters").glob("Cluster - *.md"))) == 1
+    assert rebuilt.metadata["cluster_map"]["clusters"] == []
+    assert list((tmp_path / "03_literature_synthesis" / "clusters").glob("Cluster - *.md")) == []
     assert list((tmp_path / "03_literature_synthesis" / "gaps" / "candidates").glob("Gap - *.md")) == []
     exported = export_to_obsidian(tmp_path, tmp_path / "vault", new_vault=True)
     assert exported.metadata["missing_wikilink_count"] == 0
@@ -450,7 +446,7 @@ def test_existing_custody_relations_feed_compatible_typed_note_links(tmp_path: P
     limited_path.write_text(limited_path.read_text().replace("note_status: analytical_atomic_note", "note_status: fulltext_available", 1))
     build_map(tmp_path, run_id="custody-rebuild")
     compatibility = yaml.safe_load((tmp_path / "02_source_memory" / "indexes" / "typed_note_links.yml").read_text())
-    assert compatibility["links"][0]["relation_type"] == "closest_prior_work"
+    assert compatibility["links"][0]["relation_type"] == "zotero_related"
     assert compatibility["links"][0]["provenance"] == "01_custody/source_relation_registry.csv"
 
 
@@ -462,7 +458,7 @@ def test_status_uses_run_snapshot_and_reports_missing_run(tmp_path: Path, sample
         run_id="snapshot-run",
     )
     (tmp_path / "03_literature_synthesis" / "clusters" / "clusters.yml").write_text("clusters: []\n")
-    assert get_status(tmp_path, "snapshot-run").counts["cluster_count"] == 1
+    assert get_status(tmp_path, "snapshot-run").counts["cluster_count"] == 0
     missing = get_status(tmp_path, "does-not-exist")
     assert missing.status == "blocked"
     assert missing.message == "run_not_found"
@@ -492,7 +488,7 @@ def test_status_reports_terminal_and_literature_counts(tmp_path: Path, sample_it
     status = get_status(tmp_path, "status-run")
     assert status.status == "completed"
     assert status.counts["inventory_count"] == status.counts["terminal_count"] == 2
-    assert status.counts["cluster_count"] == 1
+    assert status.counts["cluster_count"] == 0
     assert status.counts["gap_candidate_count"] == 0
 
     build_map(tmp_path, run_id="status-run", source_set=report.source_set, resume=True)

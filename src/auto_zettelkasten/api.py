@@ -19,6 +19,7 @@ from .models import (
     LiteratureMapRequest,
     LiteratureMappingPolicy,
     MapRequest,
+    NavigationPolicy,
     ProcessingPolicy,
     RunReport,
     StatusReport,
@@ -59,6 +60,7 @@ __all__ = [
     "ArtifactManifest",
     "MapRequest",
     "ProcessingPolicy",
+    "NavigationPolicy",
     "LiteratureMappingPolicy",
     "LiteratureMapRequest",
     "LiteratureMapReport",
@@ -166,13 +168,25 @@ def inventory(
     client = zotero_client or ZoteroLocalClient()
     effective_key = collection_key
     effective_scope = scope
+    collection_name = ""
     if scope == "selected":
         selected = client.selected_collection()
         effective_key = str(selected.get("key") or "")
+        collection_name = str(selected.get("name") or "").strip()
         effective_scope = "library" if selected.get("scope") == "library" else "collection"
         if effective_scope == "collection" and not effective_key:
             raise ValueError("selected collection has no key")
     items = [dict(row) for row in client.inventory(effective_scope, effective_key or None)]
+    if effective_key and not collection_name:
+        try:
+            for collection in client.collections():
+                data = collection.get("data") if isinstance(collection.get("data"), Mapping) else {}
+                key = str(collection.get("key") or data.get("key") or "")
+                if key == effective_key:
+                    collection_name = str(collection.get("name") or data.get("name") or "").strip()
+                    break
+        except Exception:
+            collection_name = ""
     if limit:
         items = items[:limit]
     inventory_path = root / "01_custody" / "zotero" / "inventory" / f"{slugify(run_id)}.json"
@@ -188,6 +202,7 @@ def inventory(
         items=items,
         terminal_rows=[],
         note_rows=[],
+        collection_name=collection_name,
     )
     manifest = ArtifactManifest(
         status="inventoried",
@@ -308,7 +323,39 @@ def get_status(workspace: Path | str, run_id: str | None = None) -> StatusReport
         "profile_valid_count": int(live.get("profile_valid_count", literature_live.get("profile_valid_count", 0)) or 0),
         "profile_excluded_count": int(live.get("profile_excluded_count", literature_live.get("profile_excluded_count", 0)) or 0),
         "unclustered_count": int(live.get("unclustered_count", literature_live.get("unclustered_count", 0)) or 0),
+        "topic_neighborhood_count": int(
+            live.get("topic_neighborhood_count", literature_live.get("topic_neighborhood_count", 0)) or 0
+        ),
+        "subject_tag_count": int(
+            live.get("subject_tag_count", literature_live.get("subject_tag_count", 0)) or 0
+        ),
+        "subject_tag_assignment_count": int(
+            live.get(
+                "subject_tag_assignment_count",
+                literature_live.get("subject_tag_assignment_count", 0),
+            )
+            or 0
+        ),
+        "typed_relation_count": int(
+            live.get("typed_relation_count", literature_live.get("typed_relation_count", 0)) or 0
+        ),
+        "singleton_facet_count": int(
+            live.get("singleton_facet_count", literature_live.get("singleton_facet_count", 0)) or 0
+        ),
+        "proposition_count": int(
+            live.get("proposition_count", literature_live.get("proposition_count", 0)) or 0
+        ),
+        "evidence_base_group_count": int(
+            live.get("evidence_base_group_count", literature_live.get("evidence_base_group_count", 0)) or 0
+        ),
         "cluster_count": int(live.get("cluster_count", len(clusters) if isinstance(clusters, list) else 0) or 0),
+        "cluster_source_contribution_count": int(
+            live.get(
+                "cluster_source_contribution_count",
+                literature_live.get("cluster_source_contribution_count", 0),
+            )
+            or 0
+        ),
         "debate_count": int(live.get("debate_count", literature_live.get("debate_count", 0)) or 0),
         "mapped_gap_count": int(live.get("mapped_gap_count", literature_live.get("mapped_gap_count", 0)) or 0),
         "gap_lead_count": int(live.get("gap_lead_count", literature_live.get("gap_lead_count", 0)) or 0),
@@ -344,6 +391,29 @@ def get_status(workspace: Path | str, run_id: str | None = None) -> StatusReport
         ),
         "synthesis_failure_count": int(
             live.get("synthesis_failure_count", literature_live.get("synthesis_failure_count", 0)) or 0
+        ),
+        "quantitative_comparison_count": int(
+            live.get("quantitative_comparison_count", literature_live.get("quantitative_comparison_count", 0)) or 0
+        ),
+        "rejected_quantitative_comparison_count": int(
+            live.get(
+                "rejected_quantitative_comparison_count",
+                literature_live.get("rejected_quantitative_comparison_count", 0),
+            )
+            or 0
+        ),
+        "rejected_generated_locator_count": int(
+            live.get(
+                "rejected_generated_locator_count",
+                literature_live.get("rejected_generated_locator_count", 0),
+            )
+            or 0
+        ),
+        "coverage_inventory_count": int(
+            live.get("coverage_inventory_count", literature_live.get("coverage_inventory_count", 0)) or 0
+        ),
+        "coverage_exhausted_count": int(
+            live.get("coverage_exhausted_count", literature_live.get("coverage_exhausted_count", 0)) or 0
         ),
         "gap_candidate_count": len(gaps) if isinstance(gaps, list) else 0,
         "active_count": int(live.get("active_count", 0) or 0),
@@ -395,6 +465,7 @@ def build_map(
     model: str | None = None,
     allow_cloud: bool = False,
     literature_policy: LiteratureMappingPolicy | Mapping[str, Any] | None = None,
+    navigation_policy: NavigationPolicy | Mapping[str, Any] | None = None,
     reasoner: LiteratureReasoner | None = None,
     external_discovery: ExternalDiscoveryProvider | None = None,
     resume: bool = False,
@@ -412,6 +483,14 @@ def build_map(
         literature_policy
         if isinstance(literature_policy, LiteratureMappingPolicy)
         else LiteratureMappingPolicy.from_dict(literature_policy if isinstance(literature_policy, Mapping) else configured_policy)
+    )
+    configured_navigation = config.get("navigation", {}) if isinstance(config.get("navigation", {}), Mapping) else {}
+    navigation = (
+        navigation_policy
+        if isinstance(navigation_policy, NavigationPolicy)
+        else NavigationPolicy.from_dict(
+            navigation_policy if isinstance(navigation_policy, Mapping) else configured_navigation
+        )
     )
     if policy.external_discovery != "disabled":
         raise ValueError(
@@ -448,6 +527,7 @@ def build_map(
             config.get("processing") if isinstance(config.get("processing"), Mapping) else {}
         ),
         literature_policy=policy,
+        navigation_policy=navigation,
     )
     if reasoner is not None:
         _apply_reader_policy(reasoner, map_request.processing)  # type: ignore[arg-type]
@@ -490,10 +570,14 @@ def build_map(
         "unclustered_count": len(result["cluster_map"].get("unclustered_sources", []) or []),
         "cluster_count": len(result["cluster_map"].get("clusters", []) or []),
         "mapped_gap_count": sum(
-            1 for row in result["gap_map"].get("gap_candidates", []) or [] if row.get("status") == "mapped_collection_gap"
+            1
+            for row in result["gap_map"].get("gap_candidates", []) or []
+            if row.get("status") == "collection_surviving_gap"
         ),
         "gap_lead_count": sum(
-            1 for row in result["gap_map"].get("gap_candidates", []) or [] if "gap_lead" in str(row.get("status", ""))
+            1
+            for row in result["gap_map"].get("gap_candidates", []) or []
+            if row.get("status") == "collection_gap_lead"
         ),
         "synthesized_cluster_count": int(result["cluster_map"].get("synthesized_cluster_count", 0) or 0),
         "rejected_underspecified_gap_count": int(

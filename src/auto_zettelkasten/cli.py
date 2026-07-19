@@ -17,7 +17,7 @@ from .api import (
     resume_map,
     run_map,
 )
-from .models import LiteratureMappingPolicy, MapRequest, ProcessingPolicy
+from .models import LiteratureMappingPolicy, MapRequest, NavigationPolicy, ProcessingPolicy
 from .migration import migrate_workspace
 from .workspace import load_config
 
@@ -71,6 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
     map_parser.add_argument("--context-window-fraction", type=float, default=None)
     map_parser.add_argument("--estimated-chars-per-token", type=float, default=None)
     _add_literature_policy_arguments(map_parser)
+    _add_navigation_policy_arguments(map_parser)
 
     resume_parser = commands.add_parser("resume", help="Resume an interrupted or partially terminal run.")
     resume_parser.add_argument("--workspace", type=Path, required=True)
@@ -91,6 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
     build_parser_command.add_argument("--allow-cloud", action="store_true", default=None)
     build_parser_command.add_argument("--resume", action="store_true")
     _add_literature_policy_arguments(build_parser_command)
+    _add_navigation_policy_arguments(build_parser_command)
 
     migrate_parser = commands.add_parser("migrate", help="Archive legacy generated maps for the current artifact schema.")
     migrate_parser.add_argument("--workspace", type=Path, required=True)
@@ -141,6 +143,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 limit=args.limit if args.limit is not None else 0,
                 processing=_processing_policy(args, config),
                 literature_policy=_literature_policy(args, config),
+                navigation_policy=_navigation_policy(args, config),
             )
             result = run_map(request, run_id=args.run_id or None).to_dict()
         elif args.command == "resume":
@@ -166,6 +169,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 model=model,
                 allow_cloud=args.allow_cloud is True,
                 literature_policy=_literature_policy(args, config),
+                navigation_policy=_navigation_policy(args, config),
                 resume=args.resume,
             ).to_dict()
         elif args.command == "migrate":
@@ -212,12 +216,21 @@ def _status_text(payload: dict[str, Any]) -> str:
         f"Profiles: {counts.get('profile_count', 0)}\n"
         f"Excluded profiles: {counts.get('profile_excluded_count', 0)}\n"
         f"Unclustered sources: {counts.get('unclustered_count', 0)}\n"
+        f"Topic neighborhoods: {counts.get('topic_neighborhood_count', 0)}\n"
+        f"Subject tags: {counts.get('subject_tag_count', 0)}\n"
+        f"Typed source relations: {counts.get('typed_relation_count', 0)}\n"
+        f"Propositions: {counts.get('proposition_count', 0)}\n"
+        f"Effective evidence bases: {counts.get('evidence_base_group_count', 0)}\n"
         f"Clusters: {counts.get('cluster_count', 0)}\n"
         f"Synthesized clusters: {counts.get('synthesized_cluster_count', 0)}\n"
+        f"Source contributions: {counts.get('cluster_source_contribution_count', 0)}\n"
         f"Debates: {counts.get('debate_count', 0)}\n"
-        f"Mapped collection gaps: {counts.get('mapped_gap_count', 0)}\n"
+        f"Collection-surviving gaps: {counts.get('mapped_gap_count', 0)}\n"
         f"Gap leads: {counts.get('gap_lead_count', 0)}\n"
         f"Rejected underspecified gaps: {counts.get('rejected_underspecified_gap_count', 0)}\n"
+        f"Rejected quantitative comparisons: {counts.get('rejected_quantitative_comparison_count', 0)}\n"
+        f"Rejected generated locators: {counts.get('rejected_generated_locator_count', 0)}\n"
+        f"Mapped inventory coverage: {counts.get('coverage_inventory_count', 0)}\n"
         f"Synthesis calls: {counts.get('synthesis_call_count', 0)}\n"
         f"Synthesis checkpoint hits: {counts.get('synthesis_checkpoint_hit_count', 0)}\n"
         f"Provider calls: {counts.get('provider_call_count', 0)}\n"
@@ -288,6 +301,39 @@ def _literature_policy(args: argparse.Namespace, config: dict[str, Any]) -> Lite
     payload = defaults.to_dict()
     payload.update({key: value for key, value in overrides.items() if value is not None})
     return LiteratureMappingPolicy.from_dict(payload)
+
+
+def _add_navigation_policy_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--subject-tags", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--max-candidate-tags-per-source", type=int, default=None)
+    parser.add_argument("--max-visible-tags-per-source", type=int, default=None)
+    parser.add_argument("--max-visible-tags-per-cluster-or-gap", type=int, default=None)
+    parser.add_argument("--min-sources-per-neighborhood", type=int, default=None)
+    parser.add_argument("--max-visible-neighborhoods", type=int, default=None)
+    parser.add_argument("--max-inferred-related-note-links", type=int, default=None)
+    parser.add_argument(
+        "--automatic-semantic-synonym-merging",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+
+
+def _navigation_policy(args: argparse.Namespace, config: dict[str, Any]) -> NavigationPolicy:
+    configured = config.get("navigation", {}) if isinstance(config.get("navigation", {}), dict) else {}
+    defaults = NavigationPolicy.from_dict(configured)
+    overrides = {
+        "subject_tags_enabled": getattr(args, "subject_tags", None),
+        "max_candidate_tags_per_source": getattr(args, "max_candidate_tags_per_source", None),
+        "max_visible_tags_per_source": getattr(args, "max_visible_tags_per_source", None),
+        "max_visible_tags_per_cluster_or_gap": getattr(args, "max_visible_tags_per_cluster_or_gap", None),
+        "min_sources_per_neighborhood": getattr(args, "min_sources_per_neighborhood", None),
+        "max_visible_neighborhoods": getattr(args, "max_visible_neighborhoods", None),
+        "max_inferred_related_note_links": getattr(args, "max_inferred_related_note_links", None),
+        "automatic_semantic_synonym_merging": getattr(args, "automatic_semantic_synonym_merging", None),
+    }
+    payload = defaults.to_dict()
+    payload.update({key: value for key, value in overrides.items() if value is not None})
+    return NavigationPolicy.from_dict(payload)
 
 
 def _exit_code(payload: dict[str, Any]) -> int:

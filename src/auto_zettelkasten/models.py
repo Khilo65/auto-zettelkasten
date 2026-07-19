@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
-CURRENT_ENGINE_VERSION = "0.5.0"
-CURRENT_ARTIFACT_SCHEMA_VERSION = "1.4"
+CURRENT_ENGINE_VERSION = "0.8.0"
+CURRENT_ARTIFACT_SCHEMA_VERSION = "1.7"
+CURRENT_PROFILE_SCHEMA_VERSION = "1.2"
 
 
 def _jsonable(value: Any) -> Any:
@@ -44,6 +48,56 @@ def _mapping_list(value: Any, *, field: str) -> list[dict[str, Any]]:
     if not isinstance(value, list) or any(not isinstance(item, Mapping) for item in value):
         raise ValueError(f"{field} must be a list of mappings")
     return [dict(item) for item in value]
+
+
+def _require_string(value: Any, *, field: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+    return value
+
+
+def _scope_mapping(value: Any, *, field: str) -> dict[str, list[str]]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{field} must be a mapping of string keys to lists of strings")
+    scope: dict[str, list[str]] = {}
+    for key, items in value.items():
+        if not isinstance(key, str):
+            raise ValueError(f"{field} keys must be strings")
+        scope[key] = _string_list(items, field=f"{field}.{key}")
+    return scope
+
+
+def _any_mapping(value: Any, *, field: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{field} must be a mapping")
+    if any(not isinstance(key, str) for key in value):
+        raise ValueError(f"{field} keys must be strings")
+    return dict(value)
+
+
+def _nonnegative_int(value: Any, *, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer")
+    return value
+
+
+def _stable_json_hash(value: Mapping[str, Any]) -> str:
+    encoded = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _normalized_locator(value: str) -> str:
+    normalized = value.casefold().replace("\u2013", "-").replace("\u2014", "-")
+    normalized = re.sub(r"\b(?:pages?|pp?\.?)\s*", "p ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip(" .;,:")
+    return normalized
+
+
+def _locator_identity(locator: str, locators: list[str]) -> list[str]:
+    values = list(locators)
+    if locator and locator not in values:
+        values.append(locator)
+    return sorted({_normalized_locator(value) for value in values if _normalized_locator(value)})
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +201,67 @@ class LiteratureMappingPolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class NavigationPolicy:
+    """Serializable limits for collection-native tags and navigation links."""
+
+    subject_tags_enabled: bool = True
+    max_candidate_tags_per_source: int = 24
+    max_visible_tags_per_source: int = 6
+    max_visible_tags_per_cluster_or_gap: int = 6
+    min_sources_per_neighborhood: int = 2
+    max_visible_neighborhoods: int = 8
+    max_collection_neighborhoods: int = 20
+    max_inferred_related_note_links: int = 8
+    external_ontology: Literal["disabled"] = "disabled"
+    automatic_semantic_synonym_merging: bool = False
+
+    def __post_init__(self) -> None:
+        _require_bool(self.subject_tags_enabled, field="navigation.subject_tags_enabled")
+        _require_bool(
+            self.automatic_semantic_synonym_merging,
+            field="navigation.automatic_semantic_synonym_merging",
+        )
+        for field_name in (
+            "max_candidate_tags_per_source",
+            "max_visible_tags_per_source",
+            "max_visible_tags_per_cluster_or_gap",
+            "min_sources_per_neighborhood",
+            "max_visible_neighborhoods",
+            "max_collection_neighborhoods",
+            "max_inferred_related_note_links",
+        ):
+            _require_positive_int(getattr(self, field_name), field=f"navigation.{field_name}")
+        if self.external_ontology != "disabled":
+            raise ValueError("navigation.external_ontology must be disabled")
+
+    def to_dict(self) -> dict[str, Any]:
+        return _jsonable(self)
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any] | None) -> NavigationPolicy:
+        if payload is not None and not isinstance(payload, Mapping):
+            raise ValueError("navigation must be a mapping")
+        values = dict(payload or {})
+        unknown = sorted(set(values) - set(cls.__dataclass_fields__))
+        if unknown:
+            raise ValueError(f"unknown navigation fields: {', '.join(unknown)}")
+        return cls(
+            subject_tags_enabled=values.get("subject_tags_enabled", True),
+            max_candidate_tags_per_source=values.get("max_candidate_tags_per_source", 24),
+            max_visible_tags_per_source=values.get("max_visible_tags_per_source", 6),
+            max_visible_tags_per_cluster_or_gap=values.get("max_visible_tags_per_cluster_or_gap", 6),
+            min_sources_per_neighborhood=values.get("min_sources_per_neighborhood", 2),
+            max_visible_neighborhoods=values.get("max_visible_neighborhoods", 8),
+            max_collection_neighborhoods=values.get("max_collection_neighborhoods", 20),
+            max_inferred_related_note_links=values.get("max_inferred_related_note_links", 8),
+            external_ontology=values.get("external_ontology", "disabled"),
+            automatic_semantic_synonym_merging=values.get(
+                "automatic_semantic_synonym_merging", False
+            ),
+        )  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True, slots=True)
 class ProcessingPolicy:
     """Serializable safety and cost limits for one document-processing invocation."""
 
@@ -219,6 +334,7 @@ class MapRequest:
     prompt_version: str = "2"
     processing: ProcessingPolicy = field(default_factory=ProcessingPolicy)
     literature_policy: LiteratureMappingPolicy = field(default_factory=LiteratureMappingPolicy)
+    navigation_policy: NavigationPolicy = field(default_factory=NavigationPolicy)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "workspace", Path(self.workspace).expanduser())
@@ -253,6 +369,15 @@ class MapRequest:
                 )
             else:
                 raise ValueError("literature_policy must be a LiteratureMappingPolicy or mapping")
+        if not isinstance(self.navigation_policy, NavigationPolicy):
+            if isinstance(self.navigation_policy, Mapping):
+                object.__setattr__(
+                    self,
+                    "navigation_policy",
+                    NavigationPolicy.from_dict(self.navigation_policy),
+                )
+            else:
+                raise ValueError("navigation_policy must be a NavigationPolicy or mapping")
         if self.literature_policy.require_question and not self.question:
             raise ValueError("literature_policy requires a question")
 
@@ -275,7 +400,85 @@ class MapRequest:
             prompt_version=str(payload.get("prompt_version", "2")),
             processing=ProcessingPolicy.from_dict(payload.get("processing") if isinstance(payload.get("processing"), Mapping) else None),
             literature_policy=payload.get("literature_policy", LiteratureMappingPolicy()),
+            navigation_policy=payload.get("navigation_policy", NavigationPolicy()),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class SupportEnvelope:
+    """What kind of support an anchor can provide and within which bounds."""
+
+    empirical_role: Literal["descriptive", "associational", "causal", "mechanism_evidence", "none"] = "none"
+    argument_role: Literal[
+        "conceptual",
+        "interpretive",
+        "normative",
+        "methodological",
+        "practitioner_guidance",
+        "none",
+    ] = "none"
+    coverage: Literal["full_text", "limited_text", "abstract", "metadata", "unknown"] = "unknown"
+    scope: dict[str, list[str]] = field(default_factory=dict)
+    restrictions: list[str] = field(default_factory=list)
+    support_status: Literal["supported", "support_unknown", "limited", "unsupported"] = "support_unknown"
+
+    def __post_init__(self) -> None:
+        empirical_roles = {"descriptive", "associational", "causal", "mechanism_evidence", "none"}
+        argument_roles = {
+            "conceptual",
+            "interpretive",
+            "normative",
+            "methodological",
+            "practitioner_guidance",
+            "none",
+        }
+        coverages = {"full_text", "limited_text", "abstract", "metadata", "unknown"}
+        statuses = {"supported", "support_unknown", "limited", "unsupported"}
+        _require_string(self.empirical_role, field="support_envelope.empirical_role")
+        _require_string(self.argument_role, field="support_envelope.argument_role")
+        _require_string(self.coverage, field="support_envelope.coverage")
+        _require_string(self.support_status, field="support_envelope.support_status")
+        if self.empirical_role not in empirical_roles:
+            raise ValueError("support_envelope.empirical_role is invalid")
+        if self.argument_role not in argument_roles:
+            raise ValueError("support_envelope.argument_role is invalid")
+        if self.coverage not in coverages:
+            raise ValueError("support_envelope.coverage is invalid")
+        if self.support_status not in statuses:
+            raise ValueError("support_envelope.support_status is invalid")
+        object.__setattr__(self, "scope", _scope_mapping(self.scope, field="support_envelope.scope"))
+        object.__setattr__(
+            self,
+            "restrictions",
+            _string_list(self.restrictions, field="support_envelope.restrictions"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        scope = _scope_mapping(self.scope, field="support_envelope.scope")
+        restrictions = _string_list(self.restrictions, field="support_envelope.restrictions")
+        return {
+            "empirical_role": self.empirical_role,
+            "argument_role": self.argument_role,
+            "coverage": self.coverage,
+            "scope": {key: list(values) for key, values in scope.items()},
+            "restrictions": restrictions,
+            "support_status": self.support_status,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> SupportEnvelope:
+        values = _model_payload(cls, payload, label="support envelope")
+        return cls(
+            empirical_role=values.get("empirical_role", "none"),
+            argument_role=values.get("argument_role", "none"),
+            coverage=values.get("coverage", "unknown"),
+            scope=_scope_mapping(values.get("scope", {}), field="support_envelope.scope"),
+            restrictions=_string_list(
+                values.get("restrictions", []),
+                field="support_envelope.restrictions",
+            ),
+            support_status=values.get("support_status", "support_unknown"),
+        )  # type: ignore[arg-type]
 
 
 @dataclass(frozen=True, slots=True)
@@ -315,10 +518,14 @@ class EvidenceFinding:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> EvidenceFinding:
+        finding_id = payload.get("finding_id")
+        claim_id = payload.get("claim_id")
+        if finding_id and claim_id and finding_id != claim_id:
+            raise ValueError("conflicting finding_id and claim_id")
         raw_locators = payload.get("locators") or []
         locators = [raw_locators] if isinstance(raw_locators, str) else list(raw_locators)
         return cls(
-            finding_id=str(payload.get("finding_id") or ""),
+            finding_id=str(finding_id or claim_id or ""),
             claim=str(payload.get("claim") or ""),
             finding_type=str(payload.get("finding_type") or ""),
             direction=str(payload.get("direction") or ""),
@@ -339,12 +546,632 @@ class EvidenceFinding:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class SourceLocator:
+    """A typed source-native or generated locator for one evidence anchor."""
+
+    locator_id: str = ""
+    source_id: str = ""
+    evidence_anchor_id: str = ""
+    locator_type: Literal[
+        "page",
+        "page_range",
+        "table",
+        "figure",
+        "chapter",
+        "source_heading",
+        "paragraph",
+        "quote_span",
+        "generated_heading",
+        "unknown",
+    ] = "unknown"
+    value: str = ""
+    page_start: int | None = None
+    page_end: int | None = None
+    source_native: bool = False
+    supports_strong_assertion: bool = False
+
+    def __post_init__(self) -> None:
+        for field_name in ("locator_id", "source_id", "evidence_anchor_id", "locator_type", "value"):
+            _require_string(getattr(self, field_name), field=f"source locator.{field_name}")
+        allowed_types = {
+            "page",
+            "page_range",
+            "table",
+            "figure",
+            "chapter",
+            "source_heading",
+            "paragraph",
+            "quote_span",
+            "generated_heading",
+            "unknown",
+        }
+        if self.locator_type not in allowed_types:
+            raise ValueError("source locator.locator_type is invalid")
+        for field_name in ("page_start", "page_end"):
+            value = getattr(self, field_name)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+                raise ValueError(f"source locator.{field_name} must be a positive integer or null")
+        if self.page_start is not None and self.page_end is not None and self.page_end < self.page_start:
+            raise ValueError("source locator.page_end cannot precede page_start")
+        _require_bool(self.source_native, field="source locator.source_native")
+        _require_bool(
+            self.supports_strong_assertion,
+            field="source locator.supports_strong_assertion",
+        )
+        if self.locator_type == "generated_heading" and self.source_native:
+            raise ValueError("generated headings cannot be source-native locators")
+        if self.supports_strong_assertion and (
+            not self.source_native or self.locator_type in {"generated_heading", "unknown"}
+        ):
+            raise ValueError(
+                "strong assertions require a typed source-native locator"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = _jsonable(self)
+        type(self).from_dict(payload)
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> SourceLocator:
+        values = _model_payload(cls, payload, label="source locator")
+        return cls(
+            locator_id=_require_string(values.get("locator_id", ""), field="source locator.locator_id"),
+            source_id=_require_string(values.get("source_id", ""), field="source locator.source_id"),
+            evidence_anchor_id=_require_string(
+                values.get("evidence_anchor_id", ""), field="source locator.evidence_anchor_id"
+            ),
+            locator_type=_require_string(
+                values.get("locator_type", "unknown"), field="source locator.locator_type"
+            ),  # type: ignore[arg-type]
+            value=_require_string(values.get("value", ""), field="source locator.value"),
+            page_start=values.get("page_start"),
+            page_end=values.get("page_end"),
+            source_native=values.get("source_native", False),
+            supports_strong_assertion=values.get("supports_strong_assertion", False),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class QuantitativeResult:
+    """A typed numerical result retained without conflating estimands or scales."""
+
+    quantitative_result_id: str = ""
+    source_id: str = ""
+    evidence_anchor_id: str = ""
+    statistic: str = ""
+    estimand_type: str = ""
+    outcome_definition: str = ""
+    estimate: str = ""
+    unit: str = ""
+    scale: str = ""
+    baseline: str = ""
+    reference_group: str = ""
+    comparison_group: str = ""
+    denominator: str = ""
+    sample: str = ""
+    uncertainty: str = ""
+    population: str = ""
+    period: str = ""
+    model: str = ""
+    provenance: Literal["source_reported", "system_derived", "unknown"] = "unknown"
+
+    def __post_init__(self) -> None:
+        for field_name in self.__dataclass_fields__:
+            _require_string(getattr(self, field_name), field=f"quantitative result.{field_name}")
+        if self.provenance not in {"source_reported", "system_derived", "unknown"}:
+            raise ValueError("quantitative result.provenance is invalid")
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = _jsonable(self)
+        type(self).from_dict(payload)
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> QuantitativeResult:
+        values = _model_payload(cls, payload, label="quantitative result")
+        normalized = {
+            field_name: _require_string(
+                values.get(field_name, ""), field=f"quantitative result.{field_name}"
+            )
+            for field_name in cls.__dataclass_fields__
+        }
+        return cls(**normalized)  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True, slots=True)
+class StudyLineage:
+    """Evidence-base lineage signals used to avoid publication-count inflation."""
+
+    study_lineage_id: str = ""
+    source_ids: list[str] = field(default_factory=list)
+    authors: list[str] = field(default_factory=list)
+    institutions: list[str] = field(default_factory=list)
+    datasets: list[str] = field(default_factory=list)
+    data_sources: list[str] = field(default_factory=list)
+    sampling_frame: str = ""
+    unit_of_analysis: str = ""
+    populations: list[str] = field(default_factory=list)
+    periods: list[str] = field(default_factory=list)
+    publication_relationships: list[dict[str, Any]] = field(default_factory=list)
+    institutional_series: str = ""
+    overlap_signals: list[str] = field(default_factory=list)
+    confidence: Literal["high", "moderate", "low", "unknown"] = "unknown"
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "study_lineage_id",
+            "sampling_frame",
+            "unit_of_analysis",
+            "institutional_series",
+            "confidence",
+        ):
+            _require_string(getattr(self, field_name), field=f"study lineage.{field_name}")
+        if self.confidence not in {"high", "moderate", "low", "unknown"}:
+            raise ValueError("study lineage.confidence is invalid")
+        for field_name in (
+            "source_ids",
+            "authors",
+            "institutions",
+            "datasets",
+            "data_sources",
+            "populations",
+            "periods",
+            "overlap_signals",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _string_list(getattr(self, field_name), field=f"study lineage.{field_name}"),
+            )
+        object.__setattr__(
+            self,
+            "publication_relationships",
+            _mapping_list(
+                self.publication_relationships,
+                field="study lineage.publication_relationships",
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = _jsonable(self)
+        type(self).from_dict(payload)
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> StudyLineage:
+        values = _model_payload(cls, payload, label="study lineage")
+        return cls(
+            study_lineage_id=_require_string(
+                values.get("study_lineage_id", ""), field="study lineage.study_lineage_id"
+            ),
+            source_ids=_string_list(values.get("source_ids", []), field="study lineage.source_ids"),
+            authors=_string_list(values.get("authors", []), field="study lineage.authors"),
+            institutions=_string_list(
+                values.get("institutions", []), field="study lineage.institutions"
+            ),
+            datasets=_string_list(values.get("datasets", []), field="study lineage.datasets"),
+            data_sources=_string_list(
+                values.get("data_sources", []), field="study lineage.data_sources"
+            ),
+            sampling_frame=_require_string(
+                values.get("sampling_frame", ""), field="study lineage.sampling_frame"
+            ),
+            unit_of_analysis=_require_string(
+                values.get("unit_of_analysis", ""), field="study lineage.unit_of_analysis"
+            ),
+            populations=_string_list(
+                values.get("populations", []), field="study lineage.populations"
+            ),
+            periods=_string_list(values.get("periods", []), field="study lineage.periods"),
+            publication_relationships=_mapping_list(
+                values.get("publication_relationships", []),
+                field="study lineage.publication_relationships",
+            ),
+            institutional_series=_require_string(
+                values.get("institutional_series", ""),
+                field="study lineage.institutional_series",
+            ),
+            overlap_signals=_string_list(
+                values.get("overlap_signals", []), field="study lineage.overlap_signals"
+            ),
+            confidence=_require_string(
+                values.get("confidence", "unknown"), field="study lineage.confidence"
+            ),  # type: ignore[arg-type]
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceAnchor:
+    """A revision-aware, source-located unit of evidence used by synthesis."""
+
+    evidence_anchor_id: str = ""
+    revision_hash: str = ""
+    source_id: str = ""
+    study_family_id: str = ""
+    evidence_role: str = "support_unknown"
+    claim: str = ""
+    finding_type: str = ""
+    direction: str = ""
+    magnitude: str = ""
+    comparison: str = ""
+    conditions: list[str] = field(default_factory=list)
+    plain_english_meaning: str = ""
+    uncertainty: str = ""
+    locator: str = ""
+    locators: list[str] = field(default_factory=list)
+    source_locators: list[SourceLocator] = field(default_factory=list)
+    qualifiers: list[str] = field(default_factory=list)
+    support_envelope: SupportEnvelope = field(default_factory=SupportEnvelope)
+    quantitative_result: QuantitativeResult | None = None
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "evidence_anchor_id",
+            "revision_hash",
+            "source_id",
+            "study_family_id",
+            "evidence_role",
+            "claim",
+            "finding_type",
+            "direction",
+            "magnitude",
+            "comparison",
+            "plain_english_meaning",
+            "uncertainty",
+            "locator",
+        ):
+            _require_string(getattr(self, field_name), field=f"evidence_anchor.{field_name}")
+        conditions = _string_list(self.conditions, field="evidence_anchor.conditions")
+        locators = _string_list(self.locators, field="evidence_anchor.locators")
+        qualifiers = _string_list(self.qualifiers, field="evidence_anchor.qualifiers")
+        if self.locator and self.locator not in locators:
+            locators.insert(0, self.locator)
+        locator = self.locator or (locators[0] if locators else "")
+        envelope = self.support_envelope
+        if isinstance(envelope, Mapping):
+            envelope = SupportEnvelope.from_dict(envelope)
+        elif not isinstance(envelope, SupportEnvelope):
+            raise ValueError("evidence_anchor.support_envelope must be a SupportEnvelope or mapping")
+        source_locators: list[SourceLocator] = []
+        for source_locator in self.source_locators:
+            if isinstance(source_locator, SourceLocator):
+                source_locators.append(source_locator)
+            elif isinstance(source_locator, Mapping):
+                source_locators.append(SourceLocator.from_dict(source_locator))
+            else:
+                raise ValueError(
+                    "evidence_anchor.source_locators must contain SourceLocator values or mappings"
+                )
+        quantitative_result = self.quantitative_result
+        if isinstance(quantitative_result, Mapping):
+            quantitative_result = QuantitativeResult.from_dict(quantitative_result)
+        elif quantitative_result is not None and not isinstance(
+            quantitative_result, QuantitativeResult
+        ):
+            raise ValueError(
+                "evidence_anchor.quantitative_result must be a QuantitativeResult, mapping, or null"
+            )
+        object.__setattr__(self, "conditions", conditions)
+        object.__setattr__(self, "locator", locator)
+        object.__setattr__(self, "locators", locators)
+        object.__setattr__(self, "source_locators", source_locators)
+        object.__setattr__(self, "qualifiers", qualifiers)
+        object.__setattr__(self, "support_envelope", envelope)
+        object.__setattr__(self, "quantitative_result", quantitative_result)
+        if not self.evidence_anchor_id:
+            object.__setattr__(self, "evidence_anchor_id", _base_anchor_id(self))
+        object.__setattr__(self, "revision_hash", _anchor_revision_hash(self))
+
+    def to_dict(self) -> dict[str, Any]:
+        conditions = _string_list(self.conditions, field="evidence_anchor.conditions")
+        locators = _string_list(self.locators, field="evidence_anchor.locators")
+        qualifiers = _string_list(self.qualifiers, field="evidence_anchor.qualifiers")
+        return {
+            "evidence_anchor_id": self.evidence_anchor_id,
+            "revision_hash": _anchor_revision_hash(self),
+            "source_id": self.source_id,
+            "study_family_id": self.study_family_id,
+            "evidence_role": self.evidence_role,
+            "claim": self.claim,
+            "finding_type": self.finding_type,
+            "direction": self.direction,
+            "magnitude": self.magnitude,
+            "comparison": self.comparison,
+            "conditions": conditions,
+            "plain_english_meaning": self.plain_english_meaning,
+            "uncertainty": self.uncertainty,
+            "locator": self.locator,
+            "locators": locators,
+            "source_locators": [source_locator.to_dict() for source_locator in self.source_locators],
+            "qualifiers": qualifiers,
+            "support_envelope": self.support_envelope.to_dict(),
+            "quantitative_result": (
+                self.quantitative_result.to_dict() if self.quantitative_result is not None else None
+            ),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> EvidenceAnchor:
+        if not isinstance(payload, Mapping):
+            raise ValueError("evidence anchor must be a mapping")
+        values = dict(payload)
+        canonical_present = "evidence_anchor_id" in values
+        aliases = {key: values[key] for key in ("finding_id", "claim_id") if key in values}
+        alias_values = list(aliases.values())
+        if any(not isinstance(value, str) for value in alias_values):
+            raise ValueError("evidence anchor aliases must be strings")
+        if len(set(alias_values)) > 1:
+            raise ValueError("conflicting evidence anchor aliases")
+        if canonical_present and aliases and any(value != values["evidence_anchor_id"] for value in alias_values):
+            raise ValueError("conflicting evidence_anchor_id and legacy alias")
+        if not canonical_present and aliases:
+            values["evidence_anchor_id"] = next(iter(aliases.values()))
+        values.pop("finding_id", None)
+        values.pop("claim_id", None)
+        values = _model_payload(cls, values, label="evidence anchor")
+        envelope = values.get("support_envelope", {})
+        if isinstance(envelope, SupportEnvelope):
+            support_envelope = envelope
+        elif isinstance(envelope, Mapping):
+            support_envelope = SupportEnvelope.from_dict(envelope)
+        else:
+            raise ValueError("evidence_anchor.support_envelope must be a mapping")
+        source_locators = values.get("source_locators", [])
+        if not isinstance(source_locators, list):
+            raise ValueError("evidence_anchor.source_locators must be a list")
+        quantitative_result = values.get("quantitative_result")
+        if isinstance(quantitative_result, QuantitativeResult):
+            normalized_quantitative_result = quantitative_result
+        elif isinstance(quantitative_result, Mapping):
+            normalized_quantitative_result = QuantitativeResult.from_dict(quantitative_result)
+        elif quantitative_result is None:
+            normalized_quantitative_result = None
+        else:
+            raise ValueError("evidence_anchor.quantitative_result must be a mapping or null")
+        return cls(
+            evidence_anchor_id=values.get("evidence_anchor_id", ""),
+            revision_hash=values.get("revision_hash", ""),
+            source_id=values.get("source_id", ""),
+            study_family_id=values.get("study_family_id", ""),
+            evidence_role=values.get("evidence_role", "support_unknown"),
+            claim=values.get("claim", ""),
+            finding_type=values.get("finding_type", ""),
+            direction=values.get("direction", ""),
+            magnitude=values.get("magnitude", ""),
+            comparison=values.get("comparison", ""),
+            conditions=_string_list(values.get("conditions", []), field="evidence_anchor.conditions"),
+            plain_english_meaning=values.get("plain_english_meaning", ""),
+            uncertainty=values.get("uncertainty", ""),
+            locator=values.get("locator", ""),
+            locators=_string_list(values.get("locators", []), field="evidence_anchor.locators"),
+            source_locators=[SourceLocator.from_dict(row) for row in _mapping_list(
+                source_locators, field="evidence_anchor.source_locators"
+            )],
+            qualifiers=_string_list(values.get("qualifiers", []), field="evidence_anchor.qualifiers"),
+            support_envelope=support_envelope,
+            quantitative_result=normalized_quantitative_result,
+        )
+
+
+def _base_anchor_id(anchor: EvidenceAnchor) -> str:
+    identity = {
+        "source_id": anchor.source_id,
+        "locators": _locator_identity(anchor.locator, anchor.locators),
+        "evidence_role": anchor.evidence_role.casefold().strip(),
+    }
+    return f"anchor-{_stable_json_hash(identity)[:20]}"
+
+
+def _anchor_revision_hash(anchor: EvidenceAnchor) -> str:
+    content = {
+        "source_id": anchor.source_id,
+        "study_family_id": anchor.study_family_id,
+        "evidence_role": anchor.evidence_role,
+        "claim": anchor.claim,
+        "finding_type": anchor.finding_type,
+        "direction": anchor.direction,
+        "magnitude": anchor.magnitude,
+        "comparison": anchor.comparison,
+        "conditions": anchor.conditions,
+        "plain_english_meaning": anchor.plain_english_meaning,
+        "uncertainty": anchor.uncertainty,
+        "locator": anchor.locator,
+        "locators": anchor.locators,
+        "qualifiers": anchor.qualifiers,
+        "support_envelope": anchor.support_envelope.to_dict(),
+    }
+    if anchor.source_locators:
+        content["source_locators"] = [locator.to_dict() for locator in anchor.source_locators]
+    if anchor.quantitative_result is not None:
+        content["quantitative_result"] = anchor.quantitative_result.to_dict()
+    return _stable_json_hash(content)
+
+
+def _evidence_roles(finding: EvidenceFinding) -> tuple[str, str, str]:
+    finding_type = finding.finding_type.casefold().strip().replace("-", "_").replace(" ", "_")
+    empirical_role = "none"
+    argument_role = "none"
+    if any(token in finding_type for token in ("causal", "experiment", "quasi_experiment")):
+        empirical_role = "causal"
+    elif "mechanism" in finding_type or "process_tracing" in finding_type:
+        empirical_role = "mechanism_evidence"
+    elif any(token in finding_type for token in ("association", "correlation", "regression", "statistical")) or finding.is_statistical:
+        empirical_role = "associational"
+    elif any(token in finding_type for token in ("descriptive", "qualitative", "empirical")):
+        empirical_role = "descriptive"
+    else:
+        argument_role = next(
+            (
+                role
+                for role in (
+                    "conceptual",
+                    "interpretive",
+                    "normative",
+                    "methodological",
+                    "practitioner_guidance",
+                )
+                if role in finding_type
+            ),
+            "none",
+        )
+    evidence_role = empirical_role if empirical_role != "none" else argument_role
+    return empirical_role, argument_role, evidence_role if evidence_role != "none" else "support_unknown"
+
+
+def _profile_coverage(coverage: Mapping[str, Any]) -> str:
+    explicit = str(coverage.get("status") or coverage.get("coverage") or "").casefold().strip()
+    if explicit in {"full_text", "limited_text", "abstract", "metadata", "unknown"}:
+        return explicit
+    source_scope = str(coverage.get("source_scope") or "").casefold().strip()
+    if source_scope == "full_document" and coverage.get("coverage_gate") == "passed":
+        return "full_text"
+    if "abstract" in source_scope:
+        return "abstract"
+    if "metadata" in source_scope:
+        return "metadata"
+    if source_scope:
+        return "limited_text"
+    return "unknown"
+
+
+def _anchors_from_findings(
+    findings: list[EvidenceFinding],
+    *,
+    source_id: str,
+    study_family_id: str,
+    coverage: Mapping[str, Any],
+    scope: Mapping[str, list[str]],
+    restrictions: list[str],
+) -> list[EvidenceAnchor]:
+    del scope  # Source-level retrieval metadata must not be inherited by every anchor.
+    anchor_coverage = _profile_coverage(coverage)
+    candidates: list[tuple[EvidenceFinding, EvidenceAnchor, str]] = []
+    for finding in findings:
+        empirical_role, argument_role, evidence_role = _evidence_roles(finding)
+        support_status = "support_unknown"
+        if evidence_role != "support_unknown" and anchor_coverage == "full_text" and finding.locator:
+            support_status = "supported"
+        elif evidence_role != "support_unknown" and anchor_coverage in {"limited_text", "abstract", "metadata"}:
+            support_status = "limited"
+        finding_scope = {
+            key: values
+            for key, values in {
+                "populations": [finding.population] if finding.population else [],
+                "outcomes": [finding.outcome] if finding.outcome else [],
+            }.items()
+            if values
+        }
+        envelope = SupportEnvelope(
+            empirical_role=empirical_role,  # type: ignore[arg-type]
+            argument_role=argument_role,  # type: ignore[arg-type]
+            coverage=anchor_coverage,  # type: ignore[arg-type]
+            scope=finding_scope,
+            restrictions=list(dict.fromkeys([*restrictions, *finding.qualifiers])),
+            support_status=support_status,  # type: ignore[arg-type]
+        )
+        anchor = EvidenceAnchor(
+            source_id=source_id,
+            study_family_id=study_family_id,
+            evidence_role=evidence_role,
+            claim=finding.claim,
+            finding_type=finding.finding_type,
+            direction=finding.direction,
+            magnitude=finding.magnitude,
+            comparison=finding.comparison,
+            conditions=list(finding.conditions),
+            plain_english_meaning=finding.plain_english_meaning,
+            uncertainty=finding.uncertainty,
+            locator=finding.locator,
+            locators=list(finding.locators),
+            qualifiers=list(finding.qualifiers),
+            support_envelope=envelope,
+        )
+        source_span = finding.evidence.strip() or finding.finding_id.strip()
+        if not source_span:
+            span_identity = {
+                "magnitude": finding.magnitude,
+                "comparison": finding.comparison,
+                "conditions": finding.conditions,
+                "uncertainty": finding.uncertainty,
+                "qualifiers": finding.qualifiers,
+            }
+            source_span = json.dumps(
+                span_identity if any(span_identity.values()) else {"claim": finding.claim},
+                sort_keys=True,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        candidates.append((finding, anchor, _stable_json_hash({"source_span": source_span})))
+
+    collisions: dict[str, int] = {}
+    for _, anchor, _ in candidates:
+        collisions[anchor.evidence_anchor_id] = collisions.get(anchor.evidence_anchor_id, 0) + 1
+
+    anchors: list[EvidenceAnchor] = []
+    for _, anchor, span_hash in candidates:
+        anchor_id = anchor.evidence_anchor_id
+        if collisions[anchor_id] > 1:
+            anchor_id = f"{anchor_id}-{span_hash[:12]}"
+        anchors.append(
+            EvidenceAnchor.from_dict(
+                {
+                    **anchor.to_dict(),
+                    "evidence_anchor_id": anchor_id,
+                }
+            )
+        )
+    return _dedupe_anchors(anchors)
+
+
+def _dedupe_anchors(anchors: list[EvidenceAnchor]) -> list[EvidenceAnchor]:
+    by_id: dict[str, EvidenceAnchor] = {}
+    for anchor in anchors:
+        existing = by_id.get(anchor.evidence_anchor_id)
+        if existing is None or (anchor.revision_hash, anchor.claim) < (existing.revision_hash, existing.claim):
+            by_id[anchor.evidence_anchor_id] = anchor
+    return [by_id[anchor_id] for anchor_id in sorted(by_id)]
+
+
+def _canonicalize_anchor_ids(anchors: list[EvidenceAnchor]) -> list[EvidenceAnchor]:
+    canonical: list[tuple[EvidenceAnchor, str]] = []
+    for anchor in anchors:
+        base = EvidenceAnchor.from_dict(
+            {
+                **anchor.to_dict(),
+                "evidence_anchor_id": "",
+                "revision_hash": "",
+            }
+        )
+        span_identity = {
+            "locators": _locator_identity(base.locator, base.locators),
+            "magnitude": base.magnitude,
+            "comparison": base.comparison,
+            "conditions": base.conditions,
+            "uncertainty": base.uncertainty,
+            "qualifiers": base.qualifiers,
+        }
+        span_hash = _stable_json_hash(span_identity)
+        canonical.append((base, span_hash))
+    collisions: dict[str, int] = {}
+    for anchor, _ in canonical:
+        collisions[anchor.evidence_anchor_id] = collisions.get(anchor.evidence_anchor_id, 0) + 1
+    result: list[EvidenceAnchor] = []
+    for anchor, span_hash in canonical:
+        anchor_id = anchor.evidence_anchor_id
+        if collisions[anchor_id] > 1:
+            anchor_id = f"{anchor_id}-{span_hash[:12]}"
+        result.append(EvidenceAnchor.from_dict({**anchor.to_dict(), "evidence_anchor_id": anchor_id}))
+    return _dedupe_anchors(result)
+
+
 @dataclass(slots=True)
 class EvidenceProfile:
     """Source-level features and findings consumed by literature synthesis."""
 
     profile_schema: str = "evidence_profile"
-    profile_schema_version: str = "1.0"
+    profile_schema_version: str = CURRENT_PROFILE_SCHEMA_VERSION
     profile_id: str = ""
     note_id: str = ""
     source_id: str = ""
@@ -371,7 +1198,9 @@ class EvidenceProfile:
     outcomes: list[str] = field(default_factory=list)
     measures: list[str] = field(default_factory=list)
     study_family_id: str = ""
+    study_lineage: StudyLineage | None = None
     findings: list[EvidenceFinding] = field(default_factory=list)
+    evidence_anchors: list[EvidenceAnchor] = field(default_factory=list)
     limitations: list[str] = field(default_factory=list)
     boundaries: list[str] = field(default_factory=list)
     gaps: list[str] = field(default_factory=list)
@@ -382,6 +1211,16 @@ class EvidenceProfile:
 
     def __post_init__(self) -> None:
         _require_bool(self.excluded_from_synthesis, field="excluded_from_synthesis")
+        if self.profile_schema != "evidence_profile":
+            raise ValueError("profile_schema must be evidence_profile")
+        if self.profile_schema_version not in {"1.0", "1.1", CURRENT_PROFILE_SCHEMA_VERSION}:
+            raise ValueError("profile_schema_version must be 1.0, 1.1, or 1.2")
+        lineage = self.study_lineage
+        if isinstance(lineage, Mapping):
+            lineage = StudyLineage.from_dict(lineage)
+        elif lineage is not None and not isinstance(lineage, StudyLineage):
+            raise ValueError("study_lineage must be a StudyLineage, mapping, or null")
+        self.study_lineage = lineage
         normalized_findings: list[EvidenceFinding] = []
         for finding in self.findings:
             if isinstance(finding, EvidenceFinding):
@@ -391,9 +1230,1520 @@ class EvidenceProfile:
             else:
                 raise ValueError("findings must contain EvidenceFinding values or mappings")
         self.findings = normalized_findings
+        normalized_anchors: list[EvidenceAnchor] = []
+        for anchor in self.evidence_anchors:
+            if isinstance(anchor, EvidenceAnchor):
+                normalized_anchors.append(anchor)
+            elif isinstance(anchor, Mapping):
+                normalized_anchors.append(EvidenceAnchor.from_dict(anchor))
+            else:
+                raise ValueError("evidence_anchors must contain EvidenceAnchor values or mappings")
+        if len(normalized_anchors) > 24:
+            raise ValueError("evidence_anchors cannot contain more than 24 items")
+        if not normalized_anchors and normalized_findings:
+            scope = {
+                "populations": list(self.populations),
+                "outcomes": list(self.outcomes),
+                "geography": list(self.geography),
+                "periods": list(self.periods),
+                "cases": list(self.cases),
+            }
+            normalized_anchors = _anchors_from_findings(
+                normalized_findings,
+                source_id=self.source_id,
+                study_family_id=self.study_family_id,
+                coverage=self.coverage,
+                scope=scope,
+                restrictions=[*self.boundaries, *self.limitations],
+            )
+        elif normalized_anchors:
+            normalized_anchors = _canonicalize_anchor_ids(normalized_anchors)
+        if len(normalized_anchors) > 24:
+            raise ValueError("evidence_anchors cannot contain more than 24 items")
+        self.evidence_anchors = normalized_anchors
+        self.profile_schema_version = CURRENT_PROFILE_SCHEMA_VERSION
 
     def to_dict(self) -> dict[str, Any]:
-        return _jsonable(self)
+        payload = _jsonable(self)
+        payload["profile_schema_version"] = CURRENT_PROFILE_SCHEMA_VERSION
+        payload["study_lineage"] = (
+            self.study_lineage.to_dict() if self.study_lineage is not None else None
+        )
+        payload["evidence_anchors"] = [anchor.to_dict() for anchor in self.evidence_anchors]
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class LiteratureProposition:
+    """A map-local proposition backed by comparable source-level anchors."""
+
+    proposition_id: str = ""
+    semantic_identity: str = ""
+    statement: str = ""
+    question: str = ""
+    proposition_type: str = ""
+    signature: dict[str, Any] = field(default_factory=dict)
+    source_ids: list[str] = field(default_factory=list)
+    study_family_ids: list[str] = field(default_factory=list)
+    independent_study_family_count: int = 0
+    cells: list[dict[str, Any]] = field(default_factory=list)
+    evidence: list[dict[str, Any]] = field(default_factory=list)
+    comparability: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "proposition_id",
+            "semantic_identity",
+            "statement",
+            "question",
+            "proposition_type",
+        ):
+            _require_string(getattr(self, field_name), field=f"literature proposition.{field_name}")
+        object.__setattr__(self, "signature", _any_mapping(self.signature, field="literature proposition.signature"))
+        object.__setattr__(self, "source_ids", _string_list(self.source_ids, field="literature proposition.source_ids"))
+        object.__setattr__(
+            self,
+            "study_family_ids",
+            _string_list(self.study_family_ids, field="literature proposition.study_family_ids"),
+        )
+        object.__setattr__(
+            self,
+            "independent_study_family_count",
+            _nonnegative_int(
+                self.independent_study_family_count,
+                field="literature proposition.independent_study_family_count",
+            ),
+        )
+        if self.independent_study_family_count != len(set(self.study_family_ids)):
+            raise ValueError(
+                "literature proposition.independent_study_family_count must match study_family_ids"
+            )
+        object.__setattr__(self, "cells", _mapping_list(self.cells, field="literature proposition.cells"))
+        object.__setattr__(self, "evidence", _mapping_list(self.evidence, field="literature proposition.evidence"))
+        object.__setattr__(
+            self,
+            "comparability",
+            _any_mapping(self.comparability, field="literature proposition.comparability"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = _jsonable(self)
+        type(self).from_dict(payload)
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> LiteratureProposition:
+        normalized = dict(payload)
+        if "participating_core_sources" in normalized:
+            participating_sources = _string_list(
+                normalized.pop("participating_core_sources"),
+                field="literature proposition.participating_core_sources",
+            )
+            if "source_ids" in normalized:
+                source_ids = _string_list(
+                    normalized["source_ids"],
+                    field="literature proposition.source_ids",
+                )
+                if source_ids != participating_sources:
+                    raise ValueError("conflicting literature proposition source aliases")
+            else:
+                normalized["source_ids"] = participating_sources
+        if "supporting_evidence" in normalized:
+            if "evidence" in normalized and normalized["evidence"] != normalized["supporting_evidence"]:
+                raise ValueError("conflicting literature proposition evidence aliases")
+            normalized["evidence"] = normalized.pop("supporting_evidence")
+        flattened_evidence_fields = ("source_id", "evidence_anchor_id", "locator")
+        if any(field_name in normalized for field_name in flattened_evidence_fields):
+            missing = [
+                field_name
+                for field_name in flattened_evidence_fields
+                if not isinstance(normalized.get(field_name), str)
+                or not str(normalized.get(field_name)).strip()
+            ]
+            if missing:
+                raise ValueError(
+                    "flattened literature proposition evidence requires non-empty "
+                    "source_id, evidence_anchor_id, and locator strings"
+                )
+            flattened_evidence = {
+                field_name: str(normalized.pop(field_name)).strip()
+                for field_name in flattened_evidence_fields
+            }
+            evidence = _mapping_list(
+                normalized.get("evidence", []),
+                field="literature proposition.evidence",
+            )
+            matching_rows = [
+                row
+                for row in evidence
+                if str(row.get("source_id") or "") == flattened_evidence["source_id"]
+                and str(row.get("evidence_anchor_id") or row.get("finding_id") or row.get("claim_id") or "")
+                == flattened_evidence["evidence_anchor_id"]
+            ]
+            if matching_rows and any(
+                str(row.get("locator") or "") != flattened_evidence["locator"]
+                for row in matching_rows
+            ):
+                raise ValueError("conflicting flattened literature proposition evidence")
+            if not matching_rows:
+                evidence.append(flattened_evidence)
+            normalized["evidence"] = evidence
+        if isinstance(normalized.get("comparability"), str):
+            comparability_summary = str(normalized["comparability"]).strip()
+            normalized["comparability"] = (
+                {"summary": comparability_summary}
+                if comparability_summary
+                else {}
+            )
+        values = _model_payload(cls, normalized, label="literature proposition")
+        return cls(
+            proposition_id=_require_string(values.get("proposition_id", ""), field="literature proposition.proposition_id"),
+            semantic_identity=_require_string(
+                values.get("semantic_identity", ""), field="literature proposition.semantic_identity"
+            ),
+            statement=_require_string(values.get("statement", ""), field="literature proposition.statement"),
+            question=_require_string(values.get("question", ""), field="literature proposition.question"),
+            proposition_type=_require_string(
+                values.get("proposition_type", ""), field="literature proposition.proposition_type"
+            ),
+            signature=_any_mapping(values.get("signature", {}), field="literature proposition.signature"),
+            source_ids=_string_list(values.get("source_ids", []), field="literature proposition.source_ids"),
+            study_family_ids=_string_list(
+                values.get("study_family_ids", []), field="literature proposition.study_family_ids"
+            ),
+            independent_study_family_count=_nonnegative_int(
+                values.get("independent_study_family_count", len(set(values.get("study_family_ids", [])))),
+                field="literature proposition.independent_study_family_count",
+            ),
+            cells=_mapping_list(values.get("cells", []), field="literature proposition.cells"),
+            evidence=_mapping_list(values.get("evidence", []), field="literature proposition.evidence"),
+            comparability=_any_mapping(
+                values.get("comparability", {}), field="literature proposition.comparability"
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SynthesisAssertion:
+    """A proposition-linked assertion admitted into a cluster synthesis."""
+
+    assertion_id: str = ""
+    item_id: str = ""
+    cluster_id: str = ""
+    section: str = ""
+    statement: str = ""
+    proposition_ids: list[str] = field(default_factory=list)
+    evidence: list[dict[str, Any]] = field(default_factory=list)
+    support_status: str = ""
+    qualifiers: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        for field_name in ("assertion_id", "item_id", "cluster_id", "section", "statement", "support_status"):
+            _require_string(getattr(self, field_name), field=f"synthesis assertion.{field_name}")
+        if self.assertion_id and self.item_id and self.assertion_id != self.item_id:
+            raise ValueError("synthesis assertion.assertion_id and item_id must match")
+        if self.support_status not in {"", "supported", "support_unknown", "limited", "unsupported"}:
+            raise ValueError("synthesis assertion.support_status is invalid")
+        object.__setattr__(
+            self,
+            "proposition_ids",
+            _string_list(self.proposition_ids, field="synthesis assertion.proposition_ids"),
+        )
+        object.__setattr__(self, "evidence", _mapping_list(self.evidence, field="synthesis assertion.evidence"))
+        object.__setattr__(self, "qualifiers", _string_list(self.qualifiers, field="synthesis assertion.qualifiers"))
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = _jsonable(self)
+        type(self).from_dict(payload)
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> SynthesisAssertion:
+        normalized = dict(payload)
+        if "proposition_id" in normalized:
+            proposition_id = _require_string(
+                normalized.pop("proposition_id"),
+                field="synthesis assertion.proposition_id",
+            )
+            if "proposition_ids" in normalized:
+                proposition_ids = _string_list(
+                    normalized["proposition_ids"],
+                    field="synthesis assertion.proposition_ids",
+                )
+                if proposition_ids != [proposition_id]:
+                    raise ValueError("conflicting synthesis assertion proposition aliases")
+            else:
+                normalized["proposition_ids"] = [proposition_id]
+        statement_aliases = [
+            normalized.pop(key)
+            for key in ("assertion", "finding", "position", "agreement", "contradiction", "text", "summary")
+            if key in normalized
+        ]
+        supplied_statements = [value for value in statement_aliases if value not in (None, "")]
+        if "statement" in normalized:
+            supplied_statements.append(normalized["statement"])
+        if any(not isinstance(value, str) for value in supplied_statements):
+            raise ValueError("synthesis assertion statement aliases must be strings")
+        if len(set(supplied_statements)) > 1:
+            raise ValueError("conflicting synthesis assertion statement aliases")
+        if "statement" not in normalized and supplied_statements:
+            normalized["statement"] = supplied_statements[0]
+        evidence_aliases = [
+            normalized.pop(key)
+            for key in ("supporting_evidence", "evidence_anchors")
+            if key in normalized
+        ]
+        supplied_evidence = [value for value in evidence_aliases if value not in (None, [])]
+        if "evidence" in normalized and normalized["evidence"] not in (None, []):
+            supplied_evidence.append(normalized["evidence"])
+        if len({json.dumps(value, sort_keys=True) for value in supplied_evidence}) > 1:
+            raise ValueError("conflicting synthesis assertion evidence aliases")
+        if "evidence" not in normalized and supplied_evidence:
+            normalized["evidence"] = supplied_evidence[0]
+        evidence = normalized.get("evidence")
+        if isinstance(evidence, list) and evidence and all(isinstance(value, str) for value in evidence):
+            parsed_evidence: list[dict[str, str]] = []
+            for value in evidence:
+                parts = str(value).strip().split(maxsplit=2)
+                if (
+                    len(parts) != 3
+                    or not parts[0].startswith("source-")
+                    or not parts[1].startswith("anchor-")
+                    or not parts[2].strip()
+                ):
+                    raise ValueError(
+                        "synthesis assertion string evidence must contain source_id, evidence_anchor_id, and locator"
+                    )
+                parsed_evidence.append(
+                    {
+                        "source_id": parts[0],
+                        "evidence_anchor_id": parts[1],
+                        "locator": parts[2].strip(),
+                    }
+                )
+            normalized["evidence"] = parsed_evidence
+        values = _model_payload(cls, normalized, label="synthesis assertion")
+        return cls(
+            assertion_id=_require_string(values.get("assertion_id", ""), field="synthesis assertion.assertion_id"),
+            item_id=_require_string(values.get("item_id", ""), field="synthesis assertion.item_id"),
+            cluster_id=_require_string(values.get("cluster_id", ""), field="synthesis assertion.cluster_id"),
+            section=_require_string(values.get("section", ""), field="synthesis assertion.section"),
+            statement=_require_string(values.get("statement", ""), field="synthesis assertion.statement"),
+            proposition_ids=_string_list(
+                values.get("proposition_ids", []), field="synthesis assertion.proposition_ids"
+            ),
+            evidence=_mapping_list(values.get("evidence", []), field="synthesis assertion.evidence"),
+            support_status=_require_string(
+                values.get("support_status", ""), field="synthesis assertion.support_status"
+            ),
+            qualifiers=_string_list(values.get("qualifiers", []), field="synthesis assertion.qualifiers"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ClusterSourceContribution:
+    """One cluster-relevant contribution without implying cross-source agreement."""
+
+    contribution_id: str = ""
+    source_id: str = ""
+    cluster_role: Literal["core", "context", "bridge"] = "context"
+    contribution_kind: Literal[
+        "direct_proposition_finding",
+        "unique_cluster_relevant_finding",
+        "boundary_evidence",
+        "methodological_context",
+        "conceptual_context",
+        "bridge_evidence",
+    ] = "conceptual_context"
+    related_proposition_ids: list[str] = field(default_factory=list)
+    finding: str = ""
+    technical_result: str = ""
+    plain_english_meaning: str = ""
+    relation_to_cluster_question: str = ""
+    comparison_status: Literal[
+        "single_source",
+        "supports_shared_pattern",
+        "contrasts_with_shared_pattern",
+        "context_only",
+    ] = "context_only"
+    evidence: list[dict[str, Any]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "contribution_id",
+            "source_id",
+            "cluster_role",
+            "contribution_kind",
+            "finding",
+            "technical_result",
+            "plain_english_meaning",
+            "relation_to_cluster_question",
+            "comparison_status",
+        ):
+            _require_string(getattr(self, field_name), field=f"cluster source contribution.{field_name}")
+        if self.cluster_role not in {"core", "context", "bridge"}:
+            raise ValueError("cluster source contribution.cluster_role is invalid")
+        allowed_kinds = {
+            "direct_proposition_finding",
+            "unique_cluster_relevant_finding",
+            "boundary_evidence",
+            "methodological_context",
+            "conceptual_context",
+            "bridge_evidence",
+        }
+        if self.contribution_kind not in allowed_kinds:
+            raise ValueError("cluster source contribution.contribution_kind is invalid")
+        if self.comparison_status not in {
+            "single_source",
+            "supports_shared_pattern",
+            "contrasts_with_shared_pattern",
+            "context_only",
+        }:
+            raise ValueError("cluster source contribution.comparison_status is invalid")
+        object.__setattr__(
+            self,
+            "related_proposition_ids",
+            _string_list(
+                self.related_proposition_ids,
+                field="cluster source contribution.related_proposition_ids",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "evidence",
+            _mapping_list(self.evidence, field="cluster source contribution.evidence"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = _jsonable(self)
+        type(self).from_dict(payload)
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> ClusterSourceContribution:
+        values = _model_payload(cls, payload, label="cluster source contribution")
+        return cls(
+            contribution_id=_require_string(
+                values.get("contribution_id", ""),
+                field="cluster source contribution.contribution_id",
+            ),
+            source_id=_require_string(
+                values.get("source_id", ""), field="cluster source contribution.source_id"
+            ),
+            cluster_role=_require_string(
+                values.get("cluster_role", "context"),
+                field="cluster source contribution.cluster_role",
+            ),  # type: ignore[arg-type]
+            contribution_kind=_require_string(
+                values.get("contribution_kind", "conceptual_context"),
+                field="cluster source contribution.contribution_kind",
+            ),  # type: ignore[arg-type]
+            related_proposition_ids=_string_list(
+                values.get("related_proposition_ids", []),
+                field="cluster source contribution.related_proposition_ids",
+            ),
+            finding=_require_string(
+                values.get("finding", ""), field="cluster source contribution.finding"
+            ),
+            technical_result=_require_string(
+                values.get("technical_result", ""),
+                field="cluster source contribution.technical_result",
+            ),
+            plain_english_meaning=_require_string(
+                values.get("plain_english_meaning", ""),
+                field="cluster source contribution.plain_english_meaning",
+            ),
+            relation_to_cluster_question=_require_string(
+                values.get("relation_to_cluster_question", ""),
+                field="cluster source contribution.relation_to_cluster_question",
+            ),
+            comparison_status=_require_string(
+                values.get("comparison_status", "context_only"),
+                field="cluster source contribution.comparison_status",
+            ),  # type: ignore[arg-type]
+            evidence=_mapping_list(
+                values.get("evidence", []), field="cluster source contribution.evidence"
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceBaseGroup:
+    """Publications treated as one proposition-specific evidence base."""
+
+    evidence_base_group_id: str = ""
+    proposition_id: str = ""
+    source_ids: list[str] = field(default_factory=list)
+    study_lineage_ids: list[str] = field(default_factory=list)
+    relationship: Literal[
+        "independent_evidence_base",
+        "overlapping_evidence_base",
+        "same_study",
+        "institutional_series",
+        "independence_uncertain",
+    ] = "independence_uncertain"
+    counted_as_independent: bool = False
+    rationale: str = ""
+    overlap_signals: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        for field_name in ("evidence_base_group_id", "proposition_id", "relationship", "rationale"):
+            _require_string(getattr(self, field_name), field=f"evidence base group.{field_name}")
+        if self.relationship not in {
+            "independent_evidence_base",
+            "overlapping_evidence_base",
+            "same_study",
+            "institutional_series",
+            "independence_uncertain",
+        }:
+            raise ValueError("evidence base group.relationship is invalid")
+        _require_bool(
+            self.counted_as_independent,
+            field="evidence base group.counted_as_independent",
+        )
+        if self.relationship == "independence_uncertain" and self.counted_as_independent:
+            raise ValueError("uncertain evidence bases cannot increase the independent count")
+        for field_name in ("source_ids", "study_lineage_ids", "overlap_signals"):
+            object.__setattr__(
+                self,
+                field_name,
+                _string_list(getattr(self, field_name), field=f"evidence base group.{field_name}"),
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = _jsonable(self)
+        type(self).from_dict(payload)
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> EvidenceBaseGroup:
+        values = _model_payload(cls, payload, label="evidence base group")
+        return cls(
+            evidence_base_group_id=_require_string(
+                values.get("evidence_base_group_id", ""),
+                field="evidence base group.evidence_base_group_id",
+            ),
+            proposition_id=_require_string(
+                values.get("proposition_id", ""), field="evidence base group.proposition_id"
+            ),
+            source_ids=_string_list(
+                values.get("source_ids", []), field="evidence base group.source_ids"
+            ),
+            study_lineage_ids=_string_list(
+                values.get("study_lineage_ids", []),
+                field="evidence base group.study_lineage_ids",
+            ),
+            relationship=_require_string(
+                values.get("relationship", "independence_uncertain"),
+                field="evidence base group.relationship",
+            ),  # type: ignore[arg-type]
+            counted_as_independent=values.get("counted_as_independent", False),
+            rationale=_require_string(
+                values.get("rationale", ""), field="evidence base group.rationale"
+            ),
+            overlap_signals=_string_list(
+                values.get("overlap_signals", []),
+                field="evidence base group.overlap_signals",
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class IndependenceAssessment:
+    """Proposition-specific effective evidence-base accounting."""
+
+    assessment_id: str = ""
+    proposition_id: str = ""
+    source_ids: list[str] = field(default_factory=list)
+    evidence_base_group_ids: list[str] = field(default_factory=list)
+    status: Literal[
+        "independent_evidence_base",
+        "overlapping_evidence_base",
+        "same_study",
+        "institutional_series",
+        "independence_uncertain",
+    ] = "independence_uncertain"
+    effective_evidence_base_count: int = 0
+    rationale: str = ""
+    overlap_signals: list[str] = field(default_factory=list)
+    confidence: Literal["high", "moderate", "low", "unknown"] = "unknown"
+    evidence: list[dict[str, Any]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        for field_name in ("assessment_id", "proposition_id", "status", "rationale", "confidence"):
+            _require_string(getattr(self, field_name), field=f"independence assessment.{field_name}")
+        if self.status not in {
+            "independent_evidence_base",
+            "overlapping_evidence_base",
+            "same_study",
+            "institutional_series",
+            "independence_uncertain",
+        }:
+            raise ValueError("independence assessment.status is invalid")
+        if self.confidence not in {"high", "moderate", "low", "unknown"}:
+            raise ValueError("independence assessment.confidence is invalid")
+        object.__setattr__(
+            self,
+            "effective_evidence_base_count",
+            _nonnegative_int(
+                self.effective_evidence_base_count,
+                field="independence assessment.effective_evidence_base_count",
+            ),
+        )
+        if self.status == "independence_uncertain" and self.effective_evidence_base_count > 0:
+            raise ValueError("uncertain assessments cannot increase the independent count")
+        for field_name in ("source_ids", "evidence_base_group_ids", "overlap_signals"):
+            object.__setattr__(
+                self,
+                field_name,
+                _string_list(
+                    getattr(self, field_name), field=f"independence assessment.{field_name}"
+                ),
+            )
+        object.__setattr__(
+            self,
+            "evidence",
+            _mapping_list(self.evidence, field="independence assessment.evidence"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = _jsonable(self)
+        type(self).from_dict(payload)
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> IndependenceAssessment:
+        values = _model_payload(cls, payload, label="independence assessment")
+        return cls(
+            assessment_id=_require_string(
+                values.get("assessment_id", ""), field="independence assessment.assessment_id"
+            ),
+            proposition_id=_require_string(
+                values.get("proposition_id", ""), field="independence assessment.proposition_id"
+            ),
+            source_ids=_string_list(
+                values.get("source_ids", []), field="independence assessment.source_ids"
+            ),
+            evidence_base_group_ids=_string_list(
+                values.get("evidence_base_group_ids", []),
+                field="independence assessment.evidence_base_group_ids",
+            ),
+            status=_require_string(
+                values.get("status", "independence_uncertain"),
+                field="independence assessment.status",
+            ),  # type: ignore[arg-type]
+            effective_evidence_base_count=_nonnegative_int(
+                values.get("effective_evidence_base_count", 0),
+                field="independence assessment.effective_evidence_base_count",
+            ),
+            rationale=_require_string(
+                values.get("rationale", ""), field="independence assessment.rationale"
+            ),
+            overlap_signals=_string_list(
+                values.get("overlap_signals", []),
+                field="independence assessment.overlap_signals",
+            ),
+            confidence=_require_string(
+                values.get("confidence", "unknown"), field="independence assessment.confidence"
+            ),  # type: ignore[arg-type]
+            evidence=_mapping_list(
+                values.get("evidence", []), field="independence assessment.evidence"
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class QuantitativeComparisonValidation:
+    """Deterministic comparability and arithmetic result for numerical evidence."""
+
+    comparison_id: str = ""
+    proposition_id: str = ""
+    source_ids: list[str] = field(default_factory=list)
+    quantitative_result_ids: list[str] = field(default_factory=list)
+    status: Literal["valid", "qualified", "rejected", "not_comparable"] = "not_comparable"
+    estimands_comparable: bool = False
+    outcomes_comparable: bool = False
+    populations_comparable: bool = False
+    arithmetic_reproducible: bool = False
+    reason: str = ""
+    qualifications: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        for field_name in ("comparison_id", "proposition_id", "status", "reason"):
+            _require_string(
+                getattr(self, field_name), field=f"quantitative comparison validation.{field_name}"
+            )
+        if self.status not in {"valid", "qualified", "rejected", "not_comparable"}:
+            raise ValueError("quantitative comparison validation.status is invalid")
+        for field_name in (
+            "estimands_comparable",
+            "outcomes_comparable",
+            "populations_comparable",
+            "arithmetic_reproducible",
+        ):
+            _require_bool(
+                getattr(self, field_name),
+                field=f"quantitative comparison validation.{field_name}",
+            )
+        for field_name in ("source_ids", "quantitative_result_ids", "qualifications"):
+            object.__setattr__(
+                self,
+                field_name,
+                _string_list(
+                    getattr(self, field_name),
+                    field=f"quantitative comparison validation.{field_name}",
+                ),
+            )
+        if self.status == "valid" and not all(
+            (
+                self.estimands_comparable,
+                self.outcomes_comparable,
+                self.populations_comparable,
+                self.arithmetic_reproducible,
+            )
+        ):
+            raise ValueError("valid quantitative comparisons require all checks to pass")
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = _jsonable(self)
+        type(self).from_dict(payload)
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> QuantitativeComparisonValidation:
+        values = _model_payload(cls, payload, label="quantitative comparison validation")
+        return cls(
+            comparison_id=_require_string(
+                values.get("comparison_id", ""),
+                field="quantitative comparison validation.comparison_id",
+            ),
+            proposition_id=_require_string(
+                values.get("proposition_id", ""),
+                field="quantitative comparison validation.proposition_id",
+            ),
+            source_ids=_string_list(
+                values.get("source_ids", []),
+                field="quantitative comparison validation.source_ids",
+            ),
+            quantitative_result_ids=_string_list(
+                values.get("quantitative_result_ids", []),
+                field="quantitative comparison validation.quantitative_result_ids",
+            ),
+            status=_require_string(
+                values.get("status", "not_comparable"),
+                field="quantitative comparison validation.status",
+            ),  # type: ignore[arg-type]
+            estimands_comparable=values.get("estimands_comparable", False),
+            outcomes_comparable=values.get("outcomes_comparable", False),
+            populations_comparable=values.get("populations_comparable", False),
+            arithmetic_reproducible=values.get("arithmetic_reproducible", False),
+            reason=_require_string(
+                values.get("reason", ""), field="quantitative comparison validation.reason"
+            ),
+            qualifications=_string_list(
+                values.get("qualifications", []),
+                field="quantitative comparison validation.qualifications",
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SubjectTag:
+    """A canonical, collection-native subject tag used only for retrieval."""
+
+    subject_tag_id: str = ""
+    label: str = ""
+    slug: str = ""
+    facet_type: str = ""
+    original_variants: list[str] = field(default_factory=list)
+    source_ids: list[str] = field(default_factory=list)
+    study_family_ids: list[str] = field(default_factory=list)
+    assignment_provenance: list[str] = field(default_factory=list)
+    relationship_proposals: list[dict[str, Any]] = field(default_factory=list)
+    source_count: int = 0
+    independent_source_count: int = 0
+    revision_hash: str = ""
+
+    def __post_init__(self) -> None:
+        for field_name in ("subject_tag_id", "label", "slug", "facet_type", "revision_hash"):
+            _require_string(getattr(self, field_name), field=f"subject tag.{field_name}")
+        allowed_facets = {
+            "",
+            "concept",
+            "theory",
+            "mechanism",
+            "outcome",
+            "case",
+            "population",
+            "geography",
+            "period",
+            "method",
+            "data",
+            "measure",
+        }
+        if self.facet_type not in allowed_facets:
+            raise ValueError("subject tag.facet_type is invalid")
+        object.__setattr__(
+            self,
+            "original_variants",
+            _string_list(self.original_variants, field="subject tag.original_variants"),
+        )
+        object.__setattr__(self, "source_ids", _string_list(self.source_ids, field="subject tag.source_ids"))
+        object.__setattr__(
+            self,
+            "study_family_ids",
+            _string_list(self.study_family_ids, field="subject tag.study_family_ids"),
+        )
+        object.__setattr__(
+            self,
+            "assignment_provenance",
+            _string_list(self.assignment_provenance, field="subject tag.assignment_provenance"),
+        )
+        object.__setattr__(
+            self,
+            "relationship_proposals",
+            _mapping_list(self.relationship_proposals, field="subject tag.relationship_proposals"),
+        )
+        object.__setattr__(
+            self,
+            "source_count",
+            _nonnegative_int(self.source_count, field="subject tag.source_count"),
+        )
+        object.__setattr__(
+            self,
+            "independent_source_count",
+            _nonnegative_int(
+                self.independent_source_count,
+                field="subject tag.independent_source_count",
+            ),
+        )
+        if self.source_count != len(set(self.source_ids)):
+            raise ValueError("subject tag.source_count must match source_ids")
+        if self.independent_source_count != len(set(self.study_family_ids)):
+            raise ValueError("subject tag.independent_source_count must match study_family_ids")
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = _jsonable(self)
+        type(self).from_dict(payload)
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> SubjectTag:
+        values = _model_payload(cls, payload, label="subject tag")
+        source_ids = _string_list(values.get("source_ids", []), field="subject tag.source_ids")
+        study_family_ids = _string_list(
+            values.get("study_family_ids", []), field="subject tag.study_family_ids"
+        )
+        return cls(
+            subject_tag_id=_require_string(
+                values.get("subject_tag_id", ""), field="subject tag.subject_tag_id"
+            ),
+            label=_require_string(values.get("label", ""), field="subject tag.label"),
+            slug=_require_string(values.get("slug", ""), field="subject tag.slug"),
+            facet_type=_require_string(values.get("facet_type", ""), field="subject tag.facet_type"),
+            original_variants=_string_list(
+                values.get("original_variants", []), field="subject tag.original_variants"
+            ),
+            source_ids=source_ids,
+            study_family_ids=study_family_ids,
+            assignment_provenance=_string_list(
+                values.get("assignment_provenance", []),
+                field="subject tag.assignment_provenance",
+            ),
+            relationship_proposals=_mapping_list(
+                values.get("relationship_proposals", []),
+                field="subject tag.relationship_proposals",
+            ),
+            source_count=_nonnegative_int(
+                values.get("source_count", len(set(source_ids))), field="subject tag.source_count"
+            ),
+            independent_source_count=_nonnegative_int(
+                values.get("independent_source_count", len(set(study_family_ids))),
+                field="subject tag.independent_source_count",
+            ),
+            revision_hash=_require_string(
+                values.get("revision_hash", ""), field="subject tag.revision_hash"
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SubjectTagAssignment:
+    """One provenance-preserving assignment of a subject tag to a source."""
+
+    assignment_id: str = ""
+    subject_tag_id: str = ""
+    source_id: str = ""
+    note_id: str = ""
+    facet_type: str = ""
+    original_value: str = ""
+    provenance: str = ""
+    reason: str = ""
+    confirmed_by_profile: bool = False
+    visible: bool = True
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "assignment_id",
+            "subject_tag_id",
+            "source_id",
+            "note_id",
+            "facet_type",
+            "original_value",
+            "provenance",
+            "reason",
+        ):
+            _require_string(getattr(self, field_name), field=f"subject tag assignment.{field_name}")
+        _require_bool(
+            self.confirmed_by_profile,
+            field="subject tag assignment.confirmed_by_profile",
+        )
+        _require_bool(self.visible, field="subject tag assignment.visible")
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = _jsonable(self)
+        type(self).from_dict(payload)
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> SubjectTagAssignment:
+        values = _model_payload(cls, payload, label="subject tag assignment")
+        confirmed_by_profile = values.get("confirmed_by_profile", False)
+        visible = values.get("visible", True)
+        _require_bool(
+            confirmed_by_profile,
+            field="subject tag assignment.confirmed_by_profile",
+        )
+        _require_bool(visible, field="subject tag assignment.visible")
+        return cls(
+            assignment_id=_require_string(
+                values.get("assignment_id", ""), field="subject tag assignment.assignment_id"
+            ),
+            subject_tag_id=_require_string(
+                values.get("subject_tag_id", ""), field="subject tag assignment.subject_tag_id"
+            ),
+            source_id=_require_string(
+                values.get("source_id", ""), field="subject tag assignment.source_id"
+            ),
+            note_id=_require_string(values.get("note_id", ""), field="subject tag assignment.note_id"),
+            facet_type=_require_string(
+                values.get("facet_type", ""), field="subject tag assignment.facet_type"
+            ),
+            original_value=_require_string(
+                values.get("original_value", ""), field="subject tag assignment.original_value"
+            ),
+            provenance=_require_string(
+                values.get("provenance", ""), field="subject tag assignment.provenance"
+            ),
+            reason=_require_string(values.get("reason", ""), field="subject tag assignment.reason"),
+            confirmed_by_profile=confirmed_by_profile,
+            visible=visible,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class TypedSourceRelation:
+    """A typed navigation relation that carries no analytical force."""
+
+    relation_id: str = ""
+    source_ids: list[str] = field(default_factory=list)
+    note_ids: list[str] = field(default_factory=list)
+    relation_type: str = ""
+    reasons: list[str] = field(default_factory=list)
+    subject_tag_ids: list[str] = field(default_factory=list)
+    proposition_ids: list[str] = field(default_factory=list)
+    evidence: list[dict[str, Any]] = field(default_factory=list)
+    provenance: str = ""
+    inferred: bool = False
+
+    def __post_init__(self) -> None:
+        for field_name in ("relation_id", "relation_type", "provenance"):
+            _require_string(getattr(self, field_name), field=f"typed source relation.{field_name}")
+        allowed_types = {
+            "",
+            "cites",
+            "cited_by",
+            "zotero_related",
+            "same_proposition",
+            "shared_concept",
+            "same_case",
+            "same_method",
+            "same_outcome",
+            "semantic_similarity",
+            "legacy_untyped_relation",
+        }
+        if self.relation_type not in allowed_types:
+            raise ValueError("typed source relation.relation_type is invalid")
+        object.__setattr__(
+            self,
+            "source_ids",
+            _string_list(self.source_ids, field="typed source relation.source_ids"),
+        )
+        object.__setattr__(
+            self,
+            "note_ids",
+            _string_list(self.note_ids, field="typed source relation.note_ids"),
+        )
+        object.__setattr__(
+            self,
+            "reasons",
+            _string_list(self.reasons, field="typed source relation.reasons"),
+        )
+        object.__setattr__(
+            self,
+            "subject_tag_ids",
+            _string_list(self.subject_tag_ids, field="typed source relation.subject_tag_ids"),
+        )
+        object.__setattr__(
+            self,
+            "proposition_ids",
+            _string_list(self.proposition_ids, field="typed source relation.proposition_ids"),
+        )
+        object.__setattr__(
+            self,
+            "evidence",
+            _mapping_list(self.evidence, field="typed source relation.evidence"),
+        )
+        _require_bool(self.inferred, field="typed source relation.inferred")
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = _jsonable(self)
+        type(self).from_dict(payload)
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> TypedSourceRelation:
+        values = _model_payload(cls, payload, label="typed source relation")
+        inferred = values.get("inferred", False)
+        _require_bool(inferred, field="typed source relation.inferred")
+        return cls(
+            relation_id=_require_string(
+                values.get("relation_id", ""), field="typed source relation.relation_id"
+            ),
+            source_ids=_string_list(
+                values.get("source_ids", []), field="typed source relation.source_ids"
+            ),
+            note_ids=_string_list(
+                values.get("note_ids", []), field="typed source relation.note_ids"
+            ),
+            relation_type=_require_string(
+                values.get("relation_type", ""), field="typed source relation.relation_type"
+            ),
+            reasons=_string_list(
+                values.get("reasons", []), field="typed source relation.reasons"
+            ),
+            subject_tag_ids=_string_list(
+                values.get("subject_tag_ids", []),
+                field="typed source relation.subject_tag_ids",
+            ),
+            proposition_ids=_string_list(
+                values.get("proposition_ids", []),
+                field="typed source relation.proposition_ids",
+            ),
+            evidence=_mapping_list(
+                values.get("evidence", []), field="typed source relation.evidence"
+            ),
+            provenance=_require_string(
+                values.get("provenance", ""), field="typed source relation.provenance"
+            ),
+            inferred=inferred,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class TopicNeighborhood:
+    """A non-analytical navigation grouping for related literature sources."""
+
+    topic_neighborhood_id: str = ""
+    kind: str = ""
+    semantic_identity: str = ""
+    label: str = ""
+    source_ids: list[str] = field(default_factory=list)
+    note_ids: list[str] = field(default_factory=list)
+    signals: list[dict[str, Any]] = field(default_factory=list)
+    analytical_support: bool = False
+    source_count: int = 0
+    facet_type: str = ""
+    canonical_tag_id: str = ""
+    promotion_status: str = ""
+    independent_source_count: int = 0
+    member_relationship_reasons: list[dict[str, Any]] = field(default_factory=list)
+    visibility_status: str = ""
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "topic_neighborhood_id",
+            "kind",
+            "semantic_identity",
+            "label",
+            "facet_type",
+            "canonical_tag_id",
+            "promotion_status",
+            "visibility_status",
+        ):
+            _require_string(getattr(self, field_name), field=f"topic neighborhood.{field_name}")
+        if self.kind not in {
+            "",
+            "semantic",
+            "case",
+            "method",
+            "tag",
+            "citation_or_relation",
+            "concept",
+            "theory",
+            "mechanism",
+            "outcome",
+            "population",
+            "geography",
+            "period",
+            "data",
+            "measure",
+            "typed_relation",
+        }:
+            raise ValueError("topic neighborhood.kind is invalid")
+        _require_bool(self.analytical_support, field="topic neighborhood.analytical_support")
+        if self.analytical_support:
+            raise ValueError("topic neighborhood.analytical_support must be false")
+        object.__setattr__(self, "source_ids", _string_list(self.source_ids, field="topic neighborhood.source_ids"))
+        object.__setattr__(self, "note_ids", _string_list(self.note_ids, field="topic neighborhood.note_ids"))
+        object.__setattr__(self, "signals", _mapping_list(self.signals, field="topic neighborhood.signals"))
+        object.__setattr__(
+            self,
+            "member_relationship_reasons",
+            _mapping_list(
+                self.member_relationship_reasons,
+                field="topic neighborhood.member_relationship_reasons",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "source_count",
+            _nonnegative_int(self.source_count, field="topic neighborhood.source_count"),
+        )
+        if self.source_count != len(set(self.source_ids)):
+            raise ValueError("topic neighborhood.source_count must match source_ids")
+        object.__setattr__(
+            self,
+            "independent_source_count",
+            _nonnegative_int(
+                self.independent_source_count,
+                field="topic neighborhood.independent_source_count",
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = _jsonable(self)
+        type(self).from_dict(payload)
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> TopicNeighborhood:
+        values = _model_payload(cls, payload, label="topic neighborhood")
+        analytical_support = values.get("analytical_support", False)
+        _require_bool(analytical_support, field="topic neighborhood.analytical_support")
+        return cls(
+            topic_neighborhood_id=_require_string(
+                values.get("topic_neighborhood_id", ""), field="topic neighborhood.topic_neighborhood_id"
+            ),
+            kind=_require_string(values.get("kind", ""), field="topic neighborhood.kind"),
+            semantic_identity=_require_string(
+                values.get("semantic_identity", ""), field="topic neighborhood.semantic_identity"
+            ),
+            label=_require_string(values.get("label", ""), field="topic neighborhood.label"),
+            source_ids=_string_list(values.get("source_ids", []), field="topic neighborhood.source_ids"),
+            note_ids=_string_list(values.get("note_ids", []), field="topic neighborhood.note_ids"),
+            signals=_mapping_list(values.get("signals", []), field="topic neighborhood.signals"),
+            analytical_support=analytical_support,
+            source_count=_nonnegative_int(
+                values.get("source_count", len(set(values.get("source_ids", [])))),
+                field="topic neighborhood.source_count",
+            ),
+            facet_type=_require_string(
+                values.get("facet_type", ""), field="topic neighborhood.facet_type"
+            ),
+            canonical_tag_id=_require_string(
+                values.get("canonical_tag_id", ""), field="topic neighborhood.canonical_tag_id"
+            ),
+            promotion_status=_require_string(
+                values.get("promotion_status", ""), field="topic neighborhood.promotion_status"
+            ),
+            independent_source_count=_nonnegative_int(
+                values.get("independent_source_count", 0),
+                field="topic neighborhood.independent_source_count",
+            ),
+            member_relationship_reasons=_mapping_list(
+                values.get("member_relationship_reasons", []),
+                field="topic neighborhood.member_relationship_reasons",
+            ),
+            visibility_status=_require_string(
+                values.get("visibility_status", ""), field="topic neighborhood.visibility_status"
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CoverageRecord:
+    """One frozen-inventory item and its visible inclusion or exclusion reason."""
+
+    source_id: str = ""
+    title: str = ""
+    zotero_key: str = ""
+    terminal_state: Literal[
+        "validated_note",
+        "limited_note",
+        "exhausted",
+        "partial",
+        "pending",
+    ] = "pending"
+    exclusion_reason: str = ""
+    attempted_route: list[str] = field(default_factory=list)
+    could_affect_existing_cluster: bool = False
+
+    def __post_init__(self) -> None:
+        for field_name in ("source_id", "title", "zotero_key", "terminal_state", "exclusion_reason"):
+            _require_string(getattr(self, field_name), field=f"coverage record.{field_name}")
+        if self.terminal_state not in {
+            "validated_note",
+            "limited_note",
+            "exhausted",
+            "partial",
+            "pending",
+        }:
+            raise ValueError("coverage record.terminal_state is invalid")
+        object.__setattr__(
+            self,
+            "attempted_route",
+            _string_list(self.attempted_route, field="coverage record.attempted_route"),
+        )
+        _require_bool(
+            self.could_affect_existing_cluster,
+            field="coverage record.could_affect_existing_cluster",
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = _jsonable(self)
+        type(self).from_dict(payload)
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> CoverageRecord:
+        values = _model_payload(cls, payload, label="coverage record")
+        return cls(
+            source_id=_require_string(values.get("source_id", ""), field="coverage record.source_id"),
+            title=_require_string(values.get("title", ""), field="coverage record.title"),
+            zotero_key=_require_string(values.get("zotero_key", ""), field="coverage record.zotero_key"),
+            terminal_state=_require_string(
+                values.get("terminal_state", "pending"), field="coverage record.terminal_state"
+            ),  # type: ignore[arg-type]
+            exclusion_reason=_require_string(
+                values.get("exclusion_reason", ""), field="coverage record.exclusion_reason"
+            ),
+            attempted_route=_string_list(
+                values.get("attempted_route", []), field="coverage record.attempted_route"
+            ),
+            could_affect_existing_cluster=values.get("could_affect_existing_cluster", False),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CoverageRegister:
+    """Complete accounting for the frozen source inventory."""
+
+    source_set_id: str = ""
+    inventory_count: int = 0
+    counts: dict[str, int] = field(default_factory=dict)
+    records: list[CoverageRecord] = field(default_factory=list)
+    status: Literal["complete", "complete_with_exclusions", "partial"] = "complete"
+
+    def __post_init__(self) -> None:
+        _require_string(self.source_set_id, field="coverage register.source_set_id")
+        _require_string(self.status, field="coverage register.status")
+        if self.status not in {"complete", "complete_with_exclusions", "partial"}:
+            raise ValueError("coverage register.status is invalid")
+        inventory_count = _nonnegative_int(
+            self.inventory_count, field="coverage register.inventory_count"
+        )
+        if not isinstance(self.counts, Mapping) or any(
+            not isinstance(key, str) for key in self.counts
+        ):
+            raise ValueError("coverage register.counts must be a mapping")
+        counts = {
+            key: _nonnegative_int(value, field=f"coverage register.counts.{key}")
+            for key, value in self.counts.items()
+        }
+        records: list[CoverageRecord] = []
+        for record in self.records:
+            if isinstance(record, CoverageRecord):
+                records.append(record)
+            elif isinstance(record, Mapping):
+                records.append(CoverageRecord.from_dict(record))
+            else:
+                raise ValueError("coverage register.records must contain CoverageRecord values or mappings")
+        if records and inventory_count != len(records):
+            raise ValueError("coverage register.inventory_count must match records")
+        accounting_fields = ("validated_note", "limited_note", "exhausted", "partial", "pending")
+        if any(field_name in counts for field_name in accounting_fields) and sum(
+            counts.get(field_name, 0) for field_name in accounting_fields
+        ) != inventory_count:
+            raise ValueError("coverage register counts must account for the complete inventory")
+        if self.status == "complete" and (
+            counts.get("exhausted", 0) or counts.get("partial", 0) or counts.get("pending", 0)
+        ):
+            raise ValueError("complete coverage cannot contain exhausted, partial, or pending items")
+        if self.status == "complete_with_exclusions" and not counts.get("exhausted", 0):
+            raise ValueError("complete_with_exclusions requires at least one exhausted item")
+        object.__setattr__(self, "inventory_count", inventory_count)
+        object.__setattr__(self, "counts", counts)
+        object.__setattr__(self, "records", records)
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = _jsonable(self)
+        type(self).from_dict(payload)
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> CoverageRegister:
+        values = _model_payload(cls, payload, label="coverage register")
+        counts = values.get("counts", {})
+        if not isinstance(counts, Mapping):
+            raise ValueError("coverage register.counts must be a mapping")
+        return cls(
+            source_set_id=_require_string(
+                values.get("source_set_id", ""), field="coverage register.source_set_id"
+            ),
+            inventory_count=_nonnegative_int(
+                values.get("inventory_count", 0), field="coverage register.inventory_count"
+            ),
+            counts=dict(counts),
+            records=[
+                CoverageRecord.from_dict(row)
+                for row in _mapping_list(values.get("records", []), field="coverage register.records")
+            ],
+            status=_require_string(
+                values.get("status", "complete"), field="coverage register.status"
+            ),  # type: ignore[arg-type]
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class TagConcept:
+    """A persisted collection-level tag identity and its reconciliation relations."""
+
+    tag_concept_id: str = ""
+    label: str = ""
+    slug: str = ""
+    original_variants: list[str] = field(default_factory=list)
+    source_ids: list[str] = field(default_factory=list)
+    relations: list[dict[str, Any]] = field(default_factory=list)
+    graph_active: bool = False
+    activation_reason: str = ""
+    revision_hash: str = ""
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "tag_concept_id",
+            "label",
+            "slug",
+            "activation_reason",
+            "revision_hash",
+        ):
+            _require_string(getattr(self, field_name), field=f"tag concept.{field_name}")
+        for field_name in ("original_variants", "source_ids"):
+            object.__setattr__(
+                self,
+                field_name,
+                _string_list(getattr(self, field_name), field=f"tag concept.{field_name}"),
+            )
+        relations = _mapping_list(self.relations, field="tag concept.relations")
+        for index, relation in enumerate(relations):
+            relation_type = relation.get("relation_type")
+            target_id = relation.get("target_tag_concept_id")
+            if relation_type not in {
+                "alias_of",
+                "broader_than",
+                "narrower_than",
+                "related_to",
+                "superseded_by",
+            }:
+                raise ValueError(f"tag concept.relations[{index}].relation_type is invalid")
+            _require_string(target_id, field=f"tag concept.relations[{index}].target_tag_concept_id")
+        object.__setattr__(self, "relations", relations)
+        _require_bool(self.graph_active, field="tag concept.graph_active")
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = _jsonable(self)
+        type(self).from_dict(payload)
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> TagConcept:
+        values = _model_payload(cls, payload, label="tag concept")
+        return cls(
+            tag_concept_id=_require_string(
+                values.get("tag_concept_id", ""), field="tag concept.tag_concept_id"
+            ),
+            label=_require_string(values.get("label", ""), field="tag concept.label"),
+            slug=_require_string(values.get("slug", ""), field="tag concept.slug"),
+            original_variants=_string_list(
+                values.get("original_variants", []), field="tag concept.original_variants"
+            ),
+            source_ids=_string_list(values.get("source_ids", []), field="tag concept.source_ids"),
+            relations=_mapping_list(values.get("relations", []), field="tag concept.relations"),
+            graph_active=values.get("graph_active", False),
+            activation_reason=_require_string(
+                values.get("activation_reason", ""), field="tag concept.activation_reason"
+            ),
+            revision_hash=_require_string(
+                values.get("revision_hash", ""), field="tag concept.revision_hash"
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class NeighborhoodSummary:
+    """Human-readable retrieval summary for a visible literature neighborhood."""
+
+    neighborhood_id: str = ""
+    label: str = ""
+    why_useful: str = ""
+    source_ids: list[str] = field(default_factory=list)
+    effective_evidence_base_count: int = 0
+    related_cluster_ids: list[str] = field(default_factory=list)
+    representative_source_ids: list[str] = field(default_factory=list)
+    relationship_reasons: list[str] = field(default_factory=list)
+    visible: bool = True
+
+    def __post_init__(self) -> None:
+        for field_name in ("neighborhood_id", "label", "why_useful"):
+            _require_string(getattr(self, field_name), field=f"neighborhood summary.{field_name}")
+        for field_name in (
+            "source_ids",
+            "related_cluster_ids",
+            "representative_source_ids",
+            "relationship_reasons",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _string_list(getattr(self, field_name), field=f"neighborhood summary.{field_name}"),
+            )
+        object.__setattr__(
+            self,
+            "effective_evidence_base_count",
+            _nonnegative_int(
+                self.effective_evidence_base_count,
+                field="neighborhood summary.effective_evidence_base_count",
+            ),
+        )
+        _require_bool(self.visible, field="neighborhood summary.visible")
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = _jsonable(self)
+        type(self).from_dict(payload)
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> NeighborhoodSummary:
+        values = _model_payload(cls, payload, label="neighborhood summary")
+        return cls(
+            neighborhood_id=_require_string(
+                values.get("neighborhood_id", ""), field="neighborhood summary.neighborhood_id"
+            ),
+            label=_require_string(values.get("label", ""), field="neighborhood summary.label"),
+            why_useful=_require_string(
+                values.get("why_useful", ""), field="neighborhood summary.why_useful"
+            ),
+            source_ids=_string_list(
+                values.get("source_ids", []), field="neighborhood summary.source_ids"
+            ),
+            effective_evidence_base_count=_nonnegative_int(
+                values.get("effective_evidence_base_count", 0),
+                field="neighborhood summary.effective_evidence_base_count",
+            ),
+            related_cluster_ids=_string_list(
+                values.get("related_cluster_ids", []),
+                field="neighborhood summary.related_cluster_ids",
+            ),
+            representative_source_ids=_string_list(
+                values.get("representative_source_ids", []),
+                field="neighborhood summary.representative_source_ids",
+            ),
+            relationship_reasons=_string_list(
+                values.get("relationship_reasons", []),
+                field="neighborhood summary.relationship_reasons",
+            ),
+            visible=values.get("visible", True),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ResolutionPath:
+    """A type-sensitive route for resolving a collection-scoped gap."""
+
+    path_type: Literal[
+        "quantitative",
+        "qualitative",
+        "historical_interpretive",
+        "theoretical",
+        "normative",
+        "methodological",
+        "practitioner",
+    ]
+    question: str
+    evidence_needed: str
+    requirements: dict[str, Any]
+    feasibility: str
+    limitations: list[str]
+
+    def __post_init__(self) -> None:
+        allowed = {
+            "quantitative",
+            "qualitative",
+            "historical_interpretive",
+            "theoretical",
+            "normative",
+            "methodological",
+            "practitioner",
+        }
+        for field_name in ("path_type", "question", "evidence_needed", "feasibility"):
+            _require_string(getattr(self, field_name), field=f"resolution path.{field_name}")
+        if self.path_type not in allowed:
+            raise ValueError("resolution path.path_type is invalid")
+        object.__setattr__(self, "requirements", _any_mapping(self.requirements, field="resolution path.requirements"))
+        object.__setattr__(self, "limitations", _string_list(self.limitations, field="resolution path.limitations"))
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = _jsonable(self)
+        type(self).from_dict(payload)
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> ResolutionPath:
+        values = _model_payload(cls, payload, label="resolution path")
+        missing = [field_name for field_name in cls.__dataclass_fields__ if field_name not in values]
+        if missing:
+            raise ValueError(f"missing resolution path fields: {', '.join(missing)}")
+        path_type = _require_string(values["path_type"], field="resolution path.path_type")
+        if path_type.strip().casefold() in {
+            "mixed method",
+            "mixed methods",
+            "mixed-method",
+            "mixed-methods",
+        }:
+            # The public ontology deliberately has no catch-all mixed-methods
+            # bucket. Routes whose defining work is combining/coding methods
+            # belong to the methodological resolution family.
+            path_type = "methodological"
+        return cls(
+            path_type=path_type,  # type: ignore[arg-type]
+            question=_require_string(values["question"], field="resolution path.question"),
+            evidence_needed=_require_string(
+                values["evidence_needed"], field="resolution path.evidence_needed"
+            ),
+            requirements=_any_mapping(values["requirements"], field="resolution path.requirements"),
+            feasibility=_require_string(values["feasibility"], field="resolution path.feasibility"),
+            limitations=_string_list(values["limitations"], field="resolution path.limitations"),
+        )
 
 
 @dataclass(slots=True)
@@ -407,6 +2757,38 @@ class ClusterProposal:
     coherence_rationale: str = ""
     source_ids: list[str] = field(default_factory=list)
     supporting_evidence: list[dict[str, Any]] = field(default_factory=list)
+    propositions: list[LiteratureProposition] = field(default_factory=list)
+    source_roles: list[dict[str, Any]] = field(default_factory=list)
+    study_lineages: list[StudyLineage] = field(default_factory=list)
+    evidence_base_groups: list[EvidenceBaseGroup] = field(default_factory=list)
+    independence_assessments: list[IndependenceAssessment] = field(default_factory=list)
+    effective_evidence_base_count: int = 0
+
+    def __post_init__(self) -> None:
+        normalized_lineages: list[StudyLineage] = []
+        for lineage in self.study_lineages:
+            normalized_lineages.append(
+                lineage if isinstance(lineage, StudyLineage) else StudyLineage.from_dict(lineage)
+            )
+        normalized_groups: list[EvidenceBaseGroup] = []
+        for group in self.evidence_base_groups:
+            normalized_groups.append(
+                group if isinstance(group, EvidenceBaseGroup) else EvidenceBaseGroup.from_dict(group)
+            )
+        normalized_assessments: list[IndependenceAssessment] = []
+        for assessment in self.independence_assessments:
+            normalized_assessments.append(
+                assessment
+                if isinstance(assessment, IndependenceAssessment)
+                else IndependenceAssessment.from_dict(assessment)
+            )
+        self.study_lineages = normalized_lineages
+        self.evidence_base_groups = normalized_groups
+        self.independence_assessments = normalized_assessments
+        self.effective_evidence_base_count = _nonnegative_int(
+            self.effective_evidence_base_count,
+            field="cluster proposal.effective_evidence_base_count",
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return _jsonable(self)
@@ -414,15 +2796,95 @@ class ClusterProposal:
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> ClusterProposal:
         values = _model_payload(cls, payload, label="cluster proposal")
+        source_ids = _string_list(values.get("source_ids"), field="cluster proposal.source_ids")
+        propositions = [
+            LiteratureProposition.from_dict(row)
+            for row in _mapping_list(values.get("propositions"), field="cluster proposal.propositions")
+        ]
+        source_roles = values.get("source_roles")
+        if isinstance(source_roles, Mapping):
+            if set(str(key) for key in source_roles) <= {"core", "context", "bridge"}:
+                source_role_rows = [
+                    {"source_id": str(source_id), "role": str(role)}
+                    for role, role_sources in sorted(source_roles.items(), key=lambda row: str(row[0]))
+                    for source_id in _string_list(
+                        role_sources,
+                        field=f"cluster proposal.source_roles.{role}",
+                    )
+                ]
+            else:
+                source_role_rows = [
+                    {
+                        "source_id": str(source_id),
+                        "role": str(role.get("role") if isinstance(role, Mapping) else role),
+                    }
+                    for source_id, role in sorted(source_roles.items(), key=lambda row: str(row[0]))
+                ]
+        elif source_roles == []:
+            source_role_rows = []
+        elif isinstance(source_roles, list) and all(isinstance(role, str) for role in source_roles):
+            normalized_roles = [str(role).strip().casefold() for role in source_roles]
+            if len(normalized_roles) == len(source_ids) and all(
+                role in {"core", "context", "bridge"} for role in normalized_roles
+            ):
+                source_role_rows = [
+                    {"source_id": source_id, "role": role}
+                    for source_id, role in zip(source_ids, normalized_roles, strict=True)
+                ]
+            elif propositions:
+                proposition_source_ids = {
+                    source_id
+                    for proposition in propositions
+                    for source_id in proposition.source_ids
+                }
+                source_role_rows = [
+                    {
+                        "source_id": source_id,
+                        "role": "core" if source_id in proposition_source_ids else "context",
+                    }
+                    for source_id in source_ids
+                ]
+            else:
+                raise ValueError(
+                    "cluster proposal.source_roles string lists must align with source_ids and contain only roles"
+                )
+        else:
+            source_role_rows = _mapping_list(source_roles, field="cluster proposal.source_roles")
         return cls(
             proposal_id=str(values.get("proposal_id") or ""),
             label=str(values.get("label") or ""),
             semantic_identity=str(values.get("semantic_identity") or values.get("label") or ""),
             shared_question=str(values.get("shared_question") or ""),
             coherence_rationale=str(values.get("coherence_rationale") or ""),
-            source_ids=_string_list(values.get("source_ids"), field="cluster proposal.source_ids"),
+            source_ids=source_ids,
             supporting_evidence=_mapping_list(
                 values.get("supporting_evidence"), field="cluster proposal.supporting_evidence"
+            ),
+            propositions=propositions,
+            source_roles=source_role_rows,
+            study_lineages=[
+                StudyLineage.from_dict(row)
+                for row in _mapping_list(
+                    values.get("study_lineages", []), field="cluster proposal.study_lineages"
+                )
+            ],
+            evidence_base_groups=[
+                EvidenceBaseGroup.from_dict(row)
+                for row in _mapping_list(
+                    values.get("evidence_base_groups", []),
+                    field="cluster proposal.evidence_base_groups",
+                )
+            ],
+            independence_assessments=[
+                IndependenceAssessment.from_dict(row)
+                for row in _mapping_list(
+                    values.get("independence_assessments", []),
+                    field="cluster proposal.independence_assessments",
+                )
+            ],
+            effective_evidence_base_count=_nonnegative_int(
+                values.get("effective_evidence_base_count", 0),
+                field="cluster proposal.effective_evidence_base_count",
             ),
         )
 
@@ -446,6 +2908,57 @@ class ClusterSynthesis:
     source_roles: list[dict[str, Any]] = field(default_factory=list)
     supporting_evidence: list[dict[str, Any]] = field(default_factory=list)
     gap_hypotheses: list[dict[str, Any]] = field(default_factory=list)
+    synthesis_assertions: list[SynthesisAssertion] = field(default_factory=list)
+    source_contributions: list[ClusterSourceContribution] = field(default_factory=list)
+    evidence_base_groups: list[EvidenceBaseGroup] = field(default_factory=list)
+    independence_assessments: list[IndependenceAssessment] = field(default_factory=list)
+    quantitative_comparisons: list[QuantitativeComparisonValidation] = field(default_factory=list)
+    effective_evidence_base_count: int = 0
+    debate_state: str = ""
+
+    def __post_init__(self) -> None:
+        self.source_contributions = [
+            contribution
+            if isinstance(contribution, ClusterSourceContribution)
+            else ClusterSourceContribution.from_dict(contribution)
+            for contribution in self.source_contributions
+        ]
+        self.evidence_base_groups = [
+            group if isinstance(group, EvidenceBaseGroup) else EvidenceBaseGroup.from_dict(group)
+            for group in self.evidence_base_groups
+        ]
+        self.independence_assessments = [
+            assessment
+            if isinstance(assessment, IndependenceAssessment)
+            else IndependenceAssessment.from_dict(assessment)
+            for assessment in self.independence_assessments
+        ]
+        self.quantitative_comparisons = [
+            comparison
+            if isinstance(comparison, QuantitativeComparisonValidation)
+            else QuantitativeComparisonValidation.from_dict(comparison)
+            for comparison in self.quantitative_comparisons
+        ]
+        self.effective_evidence_base_count = _nonnegative_int(
+            self.effective_evidence_base_count,
+            field="cluster synthesis.effective_evidence_base_count",
+        )
+        _require_string(self.debate_state, field="cluster synthesis.debate_state")
+        if self.debate_state not in {
+            "",
+            "mapped_debate",
+            "mapped_consensus",
+            "emerging_convergence",
+            "aligned_institutional_guidance",
+            "within_program_consistency",
+            "mixed_evidence",
+            "conditional_relationship",
+            "complementary_positions",
+            "parallel_literatures",
+            "single_position",
+            "no_debate",
+        }:
+            raise ValueError("cluster synthesis.debate_state is invalid")
 
     def to_dict(self) -> dict[str, Any]:
         return _jsonable(self)
@@ -453,6 +2966,21 @@ class ClusterSynthesis:
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> ClusterSynthesis:
         values = _model_payload(cls, payload, label="cluster synthesis")
+        debate_state_value = values.get("debate_state", "")
+        if isinstance(debate_state_value, Mapping):
+            classification = debate_state_value.get("classification") or debate_state_value.get("state")
+            if not isinstance(classification, str) or not classification.strip():
+                raise ValueError("cluster synthesis.debate_state.classification must be a string")
+            for section in (
+                "agreements",
+                "positions",
+                "contradictions",
+                "boundary_conditions",
+                "methodological_fault_lines",
+            ):
+                if not values.get(section) and debate_state_value.get(section) is not None:
+                    values[section] = debate_state_value[section]
+            values["debate_state"] = classification
 
         def mappings(key: str) -> list[dict[str, Any]]:
             return _mapping_list(values.get(key), field=f"cluster synthesis.{key}")
@@ -473,6 +3001,27 @@ class ClusterSynthesis:
             source_roles=mappings("source_roles"),
             supporting_evidence=mappings("supporting_evidence"),
             gap_hypotheses=mappings("gap_hypotheses"),
+            synthesis_assertions=[
+                SynthesisAssertion.from_dict(row) for row in mappings("synthesis_assertions")
+            ],
+            source_contributions=[
+                ClusterSourceContribution.from_dict(row) for row in mappings("source_contributions")
+            ],
+            evidence_base_groups=[
+                EvidenceBaseGroup.from_dict(row) for row in mappings("evidence_base_groups")
+            ],
+            independence_assessments=[
+                IndependenceAssessment.from_dict(row) for row in mappings("independence_assessments")
+            ],
+            quantitative_comparisons=[
+                QuantitativeComparisonValidation.from_dict(row)
+                for row in mappings("quantitative_comparisons")
+            ],
+            effective_evidence_base_count=_nonnegative_int(
+                values.get("effective_evidence_base_count", 0),
+                field="cluster synthesis.effective_evidence_base_count",
+            ),
+            debate_state=_require_string(values.get("debate_state", ""), field="cluster synthesis.debate_state"),
         )
 
 
@@ -617,6 +3166,9 @@ class GapRationale:
     """A collection-scoped explanation for one deterministically checked gap."""
 
     gap_id: str = ""
+    proposition_id: str = ""
+    originating_proposition_id: str = ""
+    originating_cluster_ids: list[str] = field(default_factory=list)
     title: str = ""
     gap_statement: str = ""
     rule: str = ""
@@ -635,6 +3187,7 @@ class GapRationale:
     confidence: str = ""
     value_assessment: GapValueAssessment = field(default_factory=GapValueAssessment)
     study_design: GapStudyDesign = field(default_factory=GapStudyDesign)
+    resolution_path: ResolutionPath | None = None
     anchors: list[GapAnchor] = field(default_factory=list)
     merged_from_gap_ids: list[str] = field(default_factory=list)
     reframed_from_gap_id: str = ""
@@ -646,7 +3199,7 @@ class GapRationale:
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> GapRationale:
         values = _model_payload(cls, payload, label="gap rationale")
-        for field_name in ("value_assessment", "study_design"):
+        for field_name in ("value_assessment", "study_design", "resolution_path"):
             nested = values.get(field_name)
             if nested is not None and not isinstance(nested, Mapping):
                 raise ValueError(f"gap rationale.{field_name} must be a mapping")
@@ -658,12 +3211,30 @@ class GapRationale:
         if priority_tier not in {"", "high", "moderate", "low"}:
             raise ValueError("gap rationale.priority_tier must be high, moderate, or low")
         anchor_rows = _mapping_list(values.get("anchors"), field="gap rationale.anchors")
+        if (
+            values.get("originating_proposition_id")
+            and values.get("proposition_id")
+            and values["originating_proposition_id"] != values["proposition_id"]
+        ):
+            raise ValueError("conflicting proposition_id and originating_proposition_id")
+        proposition_id = str(values.get("originating_proposition_id") or values.get("proposition_id") or "")
+        related_cluster_ids = _string_list(
+            values.get("related_cluster_ids"), field="gap rationale.related_cluster_ids"
+        )
+        originating_cluster_ids = _string_list(
+            values.get("originating_cluster_ids"), field="gap rationale.originating_cluster_ids"
+        )
+        if not originating_cluster_ids:
+            originating_cluster_ids = list(related_cluster_ids)
         return cls(
             gap_id=str(values.get("gap_id") or ""),
+            proposition_id=proposition_id,
+            originating_proposition_id=proposition_id,
+            originating_cluster_ids=originating_cluster_ids,
             title=str(values.get("title") or ""),
             gap_statement=str(values.get("gap_statement") or ""),
             rule=str(values.get("rule") or ""),
-            related_cluster_ids=_string_list(values.get("related_cluster_ids"), field="gap rationale.related_cluster_ids"),
+            related_cluster_ids=related_cluster_ids,
             generation_explanation=str(values.get("generation_explanation") or ""),
             observed_pattern=str(values.get("observed_pattern") or ""),
             precise_missing_evidence=str(values.get("precise_missing_evidence") or ""),
@@ -681,6 +3252,11 @@ class GapRationale:
             ),
             study_design=GapStudyDesign.from_dict(
                 values.get("study_design") if isinstance(values.get("study_design"), Mapping) else {}
+            ),
+            resolution_path=(
+                ResolutionPath.from_dict(values["resolution_path"])
+                if isinstance(values.get("resolution_path"), Mapping)
+                else None
             ),
             anchors=[GapAnchor.from_dict(row) for row in anchor_rows],
             merged_from_gap_ids=_string_list(
@@ -750,10 +3326,64 @@ class LiteratureMapReport:
     source_set_id: str = ""
     stage: str = ""
     counts: dict[str, int] = field(default_factory=dict)
+    proposition_count: int = 0
+    topic_neighborhood_count: int = 0
+    subject_tag_count: int = 0
+    subject_tag_assignment_count: int = 0
+    typed_relation_count: int = 0
+    singleton_facet_count: int = 0
+    source_contribution_count: int = 0
+    evidence_base_group_count: int = 0
+    independence_assessment_count: int = 0
+    quantitative_comparison_count: int = 0
+    coverage_record_count: int = 0
+    tag_concept_count: int = 0
+    neighborhood_summary_count: int = 0
     artifact_paths: dict[str, Path | str] = field(default_factory=dict)
     partial_reason: str = ""
     engine_version: str = CURRENT_ENGINE_VERSION
     artifact_schema_version: str = CURRENT_ARTIFACT_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.proposition_count == 0 and "proposition_count" in self.counts:
+            self.proposition_count = _nonnegative_int(
+                self.counts["proposition_count"], field="literature map report.proposition_count"
+            )
+        else:
+            self.proposition_count = _nonnegative_int(
+                self.proposition_count, field="literature map report.proposition_count"
+            )
+        if self.topic_neighborhood_count == 0 and "topic_neighborhood_count" in self.counts:
+            self.topic_neighborhood_count = _nonnegative_int(
+                self.counts["topic_neighborhood_count"],
+                field="literature map report.topic_neighborhood_count",
+            )
+        else:
+            self.topic_neighborhood_count = _nonnegative_int(
+                self.topic_neighborhood_count,
+                field="literature map report.topic_neighborhood_count",
+            )
+        for field_name in (
+            "subject_tag_count",
+            "subject_tag_assignment_count",
+            "typed_relation_count",
+            "singleton_facet_count",
+            "source_contribution_count",
+            "evidence_base_group_count",
+            "independence_assessment_count",
+            "quantitative_comparison_count",
+            "coverage_record_count",
+            "tag_concept_count",
+            "neighborhood_summary_count",
+        ):
+            value = getattr(self, field_name)
+            if value == 0 and field_name in self.counts:
+                value = self.counts[field_name]
+            setattr(
+                self,
+                field_name,
+                _nonnegative_int(value, field=f"literature map report.{field_name}"),
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return _jsonable(self)
@@ -802,6 +3432,12 @@ class RunReport:
     profile_count: int = 0
     profile_valid_count: int = 0
     profile_excluded_count: int = 0
+    proposition_count: int = 0
+    topic_neighborhood_count: int = 0
+    subject_tag_count: int = 0
+    subject_tag_assignment_count: int = 0
+    typed_relation_count: int = 0
+    singleton_facet_count: int = 0
     unclustered_count: int = 0
     cluster_count: int = 0
     debate_count: int = 0

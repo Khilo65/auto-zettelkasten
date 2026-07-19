@@ -36,8 +36,9 @@ def test_parked_tag_proposals_do_not_block_independent_semantic_clustering(tmp_p
         run_id="parked-tags",
     )
     assert report.validated_note_count == 2
-    assert len(report.cluster_map["clusters"]) == 1
-    assert report.cluster_map["clusters"][0]["semantic_identity"] == "institution"
+    assert report.cluster_map["clusters"] == []
+    assert report.cluster_map["topic_neighborhood_count"] == 0
+    assert report.cluster_map["navigation"]["promoted_subject_tag_count"] == 0
     assert report.gap_map["gap_candidates"] == []
 
 
@@ -49,10 +50,10 @@ def test_singleton_cluster_is_rejected(tmp_path: Path, sample_items) -> None:
         run_id="singleton",
     )
     assert report.cluster_map["clusters"] == []
-    assert report.cluster_map["rejected_proposals"][0]["reason"] == "singleton_cluster"
+    assert report.cluster_map["unclustered_sources"][0]["reason"] == "no_comparable_multi_source_proposition"
     assert report.gap_map["gap_candidates"] == []
     compatible = yaml.safe_load((tmp_path / "02_source_memory" / "indexes" / "gap_candidates.yml").read_text())
-    assert compatible["status"] == "blocked_no_source_backed_clusters"
+    assert compatible["status"] == "complete_no_qualifying_gaps"
     assert compatible["gap_candidates"] == []
 
 

@@ -55,6 +55,26 @@ class _ReadOneResponse(_Response):
         return super().read(size)
 
 
+class _SseResponse:
+    def __init__(self, events: list[dict[str, Any] | str], *, on_read: Callable[[], None] | None = None) -> None:
+        self.lines = [
+            (f"data: {json.dumps(event)}\n\n" if isinstance(event, dict) else f"data: {event}\n\n").encode("utf-8")
+            for event in events
+        ]
+        self.on_read = on_read
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        return None
+
+    def readline(self) -> bytes:
+        if self.on_read:
+            self.on_read()
+        return self.lines.pop(0) if self.lines else b""
+
+
 def _analysis() -> dict[str, str]:
     return {key: f"Grounded {key}; page 1." for key in SECTION_KEYS}
 
@@ -377,3 +397,55 @@ def test_deepseek_reports_truncated_finish_reason(monkeypatch: pytest.MonkeyPatc
 
     with pytest.raises(ProviderError, match="finish_reason=length"):
         DeepSeekReader(allow_cloud=True).read_source("source text", {"title": "Study"})
+
+
+def test_deepseek_uses_streaming_json_and_reassembles_sse(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    encoded = json.dumps(_analysis())
+    captured: list[dict[str, Any]] = []
+
+    def urlopen(request, timeout):
+        captured.append(json.loads(request.data))
+        return _SseResponse(
+            [
+                {
+                    "choices": [
+                        {
+                            "delta": {"reasoning_content": "r" * 200_000, "content": encoded[:50]},
+                            "finish_reason": None,
+                        }
+                    ]
+                },
+                {"choices": [{"delta": {"content": encoded[50:]}, "finish_reason": "stop"}]},
+                "[DONE]",
+            ]
+        )
+
+    monkeypatch.setattr("auto_zettelkasten.readers.urllib.request.urlopen", urlopen)
+
+    assert DeepSeekReader(allow_cloud=True).read_source("source text", {"title": "Study"}) == _analysis()
+    assert captured[0]["stream"] is True
+
+
+def test_deepseek_stream_trickle_cannot_bypass_absolute_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    clock = [0.0]
+    monkeypatch.setattr("auto_zettelkasten.readers.time.monotonic", lambda: clock[0])
+
+    def advance_clock() -> None:
+        clock[0] += 2.0
+
+    monkeypatch.setattr(
+        "auto_zettelkasten.readers.urllib.request.urlopen",
+        lambda request, timeout: _SseResponse(
+            [
+                {"choices": [{"delta": {"content": "{"}, "finish_reason": None}]},
+                {"choices": [{"delta": {"content": "}"}, "finish_reason": "stop"}]},
+                "[DONE]",
+            ],
+            on_read=advance_clock,
+        ),
+    )
+
+    with pytest.raises(ProviderError, match="deadline exceeded"):
+        DeepSeekReader(allow_cloud=True, request_deadline=3).read_source("source text", {"title": "Study"})

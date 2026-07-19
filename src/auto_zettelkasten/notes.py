@@ -12,6 +12,11 @@ import yaml
 
 from .files import atomic_write_text, now_iso, safe_filename, sha256_text, slugify
 
+# Immutable target of the historical review-status migration. These must not
+# follow the package's current release constants.
+REVIEW_STATUS_TARGET_ENGINE_VERSION = "0.5.0"
+REVIEW_STATUS_TARGET_ARTIFACT_SCHEMA_VERSION = "1.4"
+
 SECTION_HEADINGS = (
     ("thesis", "Thesis"),
     ("method_and_research_design", "Method and Research Design"),
@@ -201,15 +206,12 @@ def normalize_tag(value: str) -> str:
 
 
 def source_obsidian_tags(normalized_tags: Sequence[str], note_status: str) -> list[str]:
-    """Project accepted canonical tags into Obsidian's native ``tags`` property."""
+    """Legacy projection helper; structural status belongs in YAML properties."""
 
+    del note_status
     tags = {normalize_tag(str(value)) for value in normalized_tags}
     tags.discard("")
-    tags.add("auto-zettelkasten/source")
-    if note_status in ANALYTICAL_NOTE_STATUSES:
-        tags.add("auto-zettelkasten/source/analytical")
-    elif note_status in LIMITED_NOTE_STATUSES:
-        tags.add("auto-zettelkasten/source/limited")
+    tags = {tag for tag in tags if not tag.startswith("auto-zettelkasten")}
     return sorted(tags)
 
 
@@ -471,9 +473,9 @@ def strip_review_status_material(text: str, *, update_versions: bool = False) ->
         frontmatter.pop(field, None)
     if update_versions:
         if "engine_version" in frontmatter:
-            frontmatter["engine_version"] = "0.5.0"
+            frontmatter["engine_version"] = REVIEW_STATUS_TARGET_ENGINE_VERSION
         if "artifact_schema_version" in frontmatter:
-            frontmatter["artifact_schema_version"] = "1.4"
+            frontmatter["artifact_schema_version"] = REVIEW_STATUS_TARGET_ARTIFACT_SCHEMA_VERSION
     cleaned_body = _strip_review_status_sections(body)
     return f"---\n{_dump_frontmatter(frontmatter)}\n---\n{cleaned_body.rstrip()}\n"
 
@@ -524,7 +526,9 @@ def update_note_graph(
     body_without_graph = re.sub(r"\n*## Graph Links\s*\n.*\Z", "", body, flags=re.DOTALL).rstrip()
     graph_lines = ["", "", "## Graph Links", ""]
     for link in related_links:
-        graph_lines.append(f"- {link['relation_type']}: [[{link['target_stem']}]]")
+        reason = str(link.get("reason") or "").strip()
+        suffix = f" — {reason}" if reason else ""
+        graph_lines.append(f"- {link['relation_type']}: [[{link['target_stem']}]]{suffix}")
     cluster_wikilinks = cluster_wikilinks or {}
     for cluster_id in cluster_ids:
         graph_lines.append(f"- cluster: {cluster_wikilinks.get(cluster_id, f'[[{cluster_id}]]')}")

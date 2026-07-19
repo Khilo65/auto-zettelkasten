@@ -5,6 +5,7 @@ import mimetypes
 import os
 import threading
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -35,12 +36,12 @@ from .files import (
 )
 from .indexes import (
     accepted_tags_by_note,
-    build_typed_links,
     commit_tag_reviews,
     update_source_set_map,
     write_source_index,
     write_source_set,
 )
+from .navigation import build_typed_source_relations, rank_human_related_links
 from .literature import (
     build_literature_map,
     cluster_display_title,
@@ -60,7 +61,6 @@ from .notes import (
     propose_tags,
     read_note,
     semantic_note_hash,
-    source_obsidian_tags,
     source_id_for_item,
     update_note_graph,
     validate_note,
@@ -69,6 +69,11 @@ from .notes import (
 )
 from .ports import ControllerPort, ExternalDiscoveryProvider, LiteratureReasoner, ReaderProvider, VisionProvider, ZoteroClient
 from .profiles import (
+    COMMITTED_NOTE_ANCHOR_AUGMENTATION_VERSION,
+    PROFILE_ALGORITHM_VERSION,
+    PROFILE_CLASSIFIER_VERSION,
+    PROFILE_PROMPT_VERSION,
+    augment_profile_from_committed_note,
     build_evidence_profile,
     load_profile_checkpoint,
     load_profile_sidecar,
@@ -125,6 +130,12 @@ class _RunProgress:
             "profile_valid_count": 0,
             "profile_excluded_count": 0,
             "unclustered_count": 0,
+            "topic_neighborhood_count": 0,
+            "subject_tag_count": 0,
+            "subject_tag_assignment_count": 0,
+            "typed_relation_count": 0,
+            "singleton_facet_count": 0,
+            "proposition_count": 0,
             "cluster_count": 0,
             "debate_count": 0,
             "consensus_count": 0,
@@ -161,7 +172,15 @@ class _RunProgress:
             profile_valid_count=0,
             profile_excluded_count=0,
             unclustered_count=0,
+            topic_neighborhood_count=0,
+            subject_tag_count=0,
+            subject_tag_assignment_count=0,
+            typed_relation_count=0,
+            singleton_facet_count=0,
+            proposition_count=0,
+            evidence_base_group_count=0,
             cluster_count=0,
+            cluster_source_contribution_count=0,
             debate_count=0,
             consensus_count=0,
             mixed_evidence_count=0,
@@ -174,6 +193,12 @@ class _RunProgress:
             synthesis_call_count=0,
             synthesis_checkpoint_hit_count=0,
             synthesis_failure_count=0,
+            quantitative_comparison_count=0,
+            rejected_quantitative_comparison_count=0,
+            rejected_generated_locator_count=0,
+            coverage_inventory_count=0,
+            coverage_exhausted_count=0,
+            coverage_accounting_valid=False,
             active_cluster="",
             active_gap_packet="",
             active_synthesis_packet="",
@@ -304,6 +329,21 @@ class _RunProgress:
         write_yaml(self.path, payload)
 
 
+def _zotero_collection_name(client: ZoteroClient, collection_key: str) -> str:
+    """Resolve a display label through Zotero's read-only collections API."""
+
+    try:
+        rows = client.collections()
+    except Exception:
+        return ""
+    for row in rows:
+        data = row.get("data") if isinstance(row.get("data"), Mapping) else {}
+        key = str(row.get("key") or data.get("key") or "")
+        if key == collection_key:
+            return str(row.get("name") or data.get("name") or "").strip()
+    return ""
+
+
 def run_pipeline(
     request: MapRequest,
     *,
@@ -353,6 +393,7 @@ def run_pipeline(
     frozen_inventory_path = run_dir / "inventory.json"
     frozen_manifest_path = run_dir / "frozen_inventory.yml"
     effective_collection_key = request.collection_key
+    effective_collection_name = ""
     inventory_scope = request.scope
     frozen_source_set_snapshot_id = ""
     if resume and frozen_inventory_path.exists():
@@ -370,6 +411,7 @@ def run_pipeline(
                 raise ValueError("frozen inventory hash mismatch")
             inventory_scope = str(frozen_manifest.get("effective_scope") or inventory_scope)
             effective_collection_key = str(frozen_manifest.get("effective_collection_key") or effective_collection_key or "") or None
+            effective_collection_name = str(frozen_manifest.get("collection_name") or "").strip()
             frozen_source_set_snapshot_id = str(frozen_manifest.get("source_set_snapshot_id") or "")
             if not frozen_source_set_snapshot_id:
                 previous_report = read_yaml(run_dir / "run_report.yml", {}) or {}
@@ -382,10 +424,13 @@ def run_pipeline(
             if request.scope == "selected":
                 selected = client.selected_collection()
                 effective_collection_key = str(selected.get("key") or "")
+                effective_collection_name = str(selected.get("name") or "").strip()
                 inventory_scope = "library" if selected.get("scope") == "library" else "collection"
                 if inventory_scope == "collection" and not effective_collection_key:
                     raise ValueError("selected collection has no key")
             items = [dict(item) for item in client.inventory(inventory_scope, effective_collection_key) if isinstance(item, Mapping)]
+            if effective_collection_key and not effective_collection_name:
+                effective_collection_name = _zotero_collection_name(client, effective_collection_key)
         except Exception as exc:
             return _blocked_report(request, run_id, f"zotero_inventory:{type(exc).__name__}:{exc}")
         if request.limit:
@@ -399,6 +444,7 @@ def run_pipeline(
                 "requested_scope": request.scope,
                 "effective_scope": inventory_scope,
                 "effective_collection_key": effective_collection_key or "",
+                "collection_name": effective_collection_name,
                 "inventory_count": len(items),
                 "inventory_hash": sha256_text(json.dumps(items, sort_keys=True, ensure_ascii=False, default=str)),
                 "frozen_at": now_iso(),
@@ -410,6 +456,7 @@ def run_pipeline(
             workspace / "01_custody" / "zotero" / "collections" / f"{slugify(effective_collection_key)}.yml",
             {
                 "collection_key": effective_collection_key,
+                "collection_name": effective_collection_name,
                 "scope": request.scope,
                 "run_id": run_id,
                 "zotero_item_keys": [item_key(item) for item in items],
@@ -506,6 +553,7 @@ def run_pipeline(
         terminal_rows=terminal_rows,
         note_rows=note_rows,
         snapshot_id=frozen_source_set_snapshot_id or None,
+        collection_name=effective_collection_name,
     )
     if not frozen_source_set_snapshot_id:
         frozen_source_set_snapshot_id = str(run_source_set["source_set_id"])
@@ -541,17 +589,34 @@ def run_pipeline(
     profile_count = len(map_result.get("profiles", []) or [])
     unclustered_count = len(map_result["cluster_map"].get("unclustered_sources", []) or [])
     cluster_count = len(map_result["cluster_map"].get("clusters", []) or [])
-    debate_count = sum(1 for row in debate_rows if isinstance(row, Mapping) and row.get("classification") == "debate")
+    topic_neighborhood_count = int(map_result["cluster_map"].get("topic_neighborhood_count", 0) or 0)
+    navigation_summary = (
+        map_result["cluster_map"].get("navigation", {})
+        if isinstance(map_result["cluster_map"].get("navigation"), Mapping)
+        else {}
+    )
+    subject_tag_count = int(navigation_summary.get("promoted_subject_tag_count", 0) or 0)
+    subject_tag_assignment_count = len(navigation_summary.get("assignments", []) or [])
+    typed_relation_count = len(navigation_summary.get("typed_relations", []) or [])
+    singleton_facet_count = int(navigation_summary.get("singleton_facet_count", 0) or 0)
+    proposition_count = int(map_result["cluster_map"].get("proposition_count", 0) or 0)
+    debate_count = sum(
+        1 for row in debate_rows if isinstance(row, Mapping) and row.get("classification") == "mapped_debate"
+    )
     consensus_count = sum(1 for row in debate_rows if isinstance(row, Mapping) and row.get("classification") == "mapped_consensus")
     mixed_evidence_count = sum(1 for row in debate_rows if isinstance(row, Mapping) and row.get("classification") == "mixed_evidence")
     search_payload = read_yaml(workspace / "03_literature_synthesis" / "internal_search_log.yml", {}) or {}
     searches = search_payload.get("searches", []) if isinstance(search_payload, Mapping) else []
     internal_falsification_count = len(searches) if isinstance(searches, list) else 0
     mapped_gap_count = sum(
-        1 for row in map_result["gap_map"].get("gap_candidates", []) or [] if row.get("status") == "mapped_collection_gap"
+        1
+        for row in map_result["gap_map"].get("gap_candidates", []) or []
+        if row.get("status") == "collection_surviving_gap"
     )
     gap_lead_count = sum(
-        1 for row in map_result["gap_map"].get("gap_candidates", []) or [] if "gap_lead" in str(row.get("status", ""))
+        1
+        for row in map_result["gap_map"].get("gap_candidates", []) or []
+        if row.get("status") == "collection_gap_lead"
     )
     synthesized_cluster_count = int(map_result["cluster_map"].get("synthesized_cluster_count", 0) or 0)
     rejected_underspecified_gap_count = int(
@@ -572,6 +637,12 @@ def run_pipeline(
         "profile_valid_count": int((map_result.get("profile_result", {}) or {}).get("valid_count", 0) or 0),
         "profile_excluded_count": int((map_result.get("profile_result", {}) or {}).get("excluded_count", 0) or 0),
         "unclustered_count": unclustered_count,
+        "topic_neighborhood_count": topic_neighborhood_count,
+        "subject_tag_count": subject_tag_count,
+        "subject_tag_assignment_count": subject_tag_assignment_count,
+        "typed_relation_count": typed_relation_count,
+        "singleton_facet_count": singleton_facet_count,
+        "proposition_count": proposition_count,
         "cluster_count": cluster_count,
         "debate_count": debate_count,
         "consensus_count": consensus_count,
@@ -594,6 +665,12 @@ def run_pipeline(
         "reporting",
         profile_count=profile_count,
         unclustered_count=unclustered_count,
+        topic_neighborhood_count=topic_neighborhood_count,
+        subject_tag_count=subject_tag_count,
+        subject_tag_assignment_count=subject_tag_assignment_count,
+        typed_relation_count=typed_relation_count,
+        singleton_facet_count=singleton_facet_count,
+        proposition_count=proposition_count,
         cluster_count=cluster_count,
         debate_count=debate_count,
         consensus_count=consensus_count,
@@ -685,6 +762,12 @@ def run_pipeline(
         profile_valid_count=int(literature_summary["profile_valid_count"]),
         profile_excluded_count=int(literature_summary["profile_excluded_count"]),
         unclustered_count=unclustered_count,
+        topic_neighborhood_count=topic_neighborhood_count,
+        subject_tag_count=subject_tag_count,
+        subject_tag_assignment_count=subject_tag_assignment_count,
+        typed_relation_count=typed_relation_count,
+        singleton_facet_count=singleton_facet_count,
+        proposition_count=proposition_count,
         cluster_count=cluster_count,
         debate_count=debate_count,
         consensus_count=consensus_count,
@@ -844,7 +927,19 @@ def rebuild_map(
     del external_discovery  # Auto-Zettelkasten 0.4 maps only the frozen internal collection.
     effective_request = request or MapRequest(workspace=workspace, provider="ollama", model="deterministic-v1")
     if not effective_request.literature_policy.synthesis_enabled:
-        typed = build_typed_links(workspace, note_rows)
+        relations = build_typed_source_relations(
+            note_rows,
+            max_inferred_links_per_source=effective_request.navigation_policy.max_inferred_related_note_links,
+        )
+        typed = {
+            "path": str(workspace / "02_source_memory" / "indexes" / "typed_links.yml"),
+            "compatibility_path": str(workspace / "02_source_memory" / "indexes" / "typed_note_links.yml"),
+            "links": relations,
+            "link_count": len(relations),
+        }
+        typed_payload = {"updated_at": now_iso(), "relations": relations, "links": relations}
+        write_yaml(Path(typed["path"]), typed_payload)
+        write_yaml(Path(typed["compatibility_path"]), typed_payload)
         note_paths = [
             workspace / str(row["note_path"])
             for row in note_rows
@@ -927,7 +1022,12 @@ def rebuild_map(
             literature_provider_call_count=int(profile_result["provider_calls"]),
             literature_failure_count=int(profile_result["failure_count"]),
         )
-    typed = build_typed_links(workspace, note_rows)
+    typed = {
+        "path": str(workspace / "02_source_memory" / "indexes" / "typed_links.yml"),
+        "compatibility_path": str(workspace / "02_source_memory" / "indexes" / "typed_note_links.yml"),
+        "links": [],
+        "link_count": 0,
+    }
     base_literature_request = LiteratureMapRequest(
         workspace=workspace,
         source_set_id=str(source_set.get("source_set_id") or ""),
@@ -951,6 +1051,7 @@ def rebuild_map(
             policy=effective_request.literature_policy,
             reasoner=reasoner,
             stage_callback=(progress.set_stage if progress is not None else None),
+            navigation_policy=effective_request.navigation_policy,
         )
     except Exception as exc:
         reason = f"literature_synthesis_partial:{type(exc).__name__}:{exc}"
@@ -977,6 +1078,18 @@ def rebuild_map(
                 *_existing_source_set_paths(workspace, source_set),
             ],
         }
+    navigation = cluster_map.get("navigation", {}) if isinstance(cluster_map.get("navigation"), Mapping) else {}
+    navigation_relations = [
+        dict(row) for row in navigation.get("typed_relations", []) or [] if isinstance(row, Mapping)
+    ]
+    typed = {
+        "path": str(workspace / "02_source_memory" / "indexes" / "typed_links.yml"),
+        "compatibility_path": str(workspace / "02_source_memory" / "indexes" / "typed_note_links.yml"),
+        "links": navigation_relations,
+        "link_count": len(navigation_relations),
+        "relation_counts": dict(navigation.get("typed_relation_counts", {}) or {}),
+        "graph_projection_hash": str(navigation.get("graph_projection_hash") or ""),
+    }
     profile_packet_paths = [
         path for path in profile_result["paths"] if path.parent.name == "packets" and path.name.startswith("packet-")
     ]
@@ -985,6 +1098,7 @@ def rebuild_map(
         "profile_packet_count": len(profile_packet_paths),
         "profile_packet_paths": [str(path) for path in profile_packet_paths],
     }
+    synthesis_partial_reason = str(packet.get("partial_reason") or "")
     _attach_profile_packet_lineage(paths, profile_packet_paths)
     if progress is not None:
         synthesis_calls = int(packet.get("synthesis_call_count", 0) or 0)
@@ -992,16 +1106,44 @@ def rebuild_map(
         synthesis_failures = int(packet.get("synthesis_failure_count", 0) or 0)
         progress.update_literature(
             unclustered_count=len(cluster_map.get("unclustered_sources", []) or []),
+            topic_neighborhood_count=int(cluster_map.get("topic_neighborhood_count", 0) or 0),
+            subject_tag_count=int(navigation.get("promoted_subject_tag_count", 0) or 0),
+            subject_tag_assignment_count=len(navigation.get("assignments", []) or []),
+            typed_relation_count=len(navigation_relations),
+            singleton_facet_count=int(navigation.get("singleton_facet_count", 0) or 0),
+            proposition_count=int(cluster_map.get("proposition_count", 0) or 0),
+            evidence_base_group_count=int(cluster_map.get("evidence_base_group_count", 0) or 0),
             cluster_count=len(cluster_map.get("clusters", []) or []),
+            cluster_source_contribution_count=int(
+                cluster_map.get("cluster_source_contribution_count", 0) or 0
+            ),
             synthesized_cluster_count=int(cluster_map.get("synthesized_cluster_count", 0) or 0),
-            mapped_gap_count=sum(1 for gap in gap_map.get("gap_candidates", []) or [] if gap.get("status") == "mapped_collection_gap"),
-            gap_lead_count=sum(1 for gap in gap_map.get("gap_candidates", []) or [] if "gap_lead" in str(gap.get("status", ""))),
+            mapped_gap_count=sum(
+                1
+                for gap in gap_map.get("gap_candidates", []) or []
+                if gap.get("status") == "collection_surviving_gap"
+            ),
+            gap_lead_count=sum(
+                1
+                for gap in gap_map.get("gap_candidates", []) or []
+                if gap.get("status") == "collection_gap_lead"
+            ),
             rejected_underspecified_gap_count=int(gap_map.get("rejected_underspecified_gap_count", 0) or 0),
             rejected_gap_quality_count=int(gap_map.get("rejected_gap_quality_count", 0) or 0),
             merged_gap_count=int(gap_map.get("merged_gap_count", 0) or 0),
             synthesis_call_count=synthesis_calls,
             synthesis_checkpoint_hit_count=synthesis_checkpoint_hits,
             synthesis_failure_count=synthesis_failures,
+            quantitative_comparison_count=int(cluster_map.get("quantitative_comparison_count", 0) or 0),
+            rejected_quantitative_comparison_count=int(
+                cluster_map.get("rejected_quantitative_comparison_count", 0) or 0
+            ),
+            rejected_generated_locator_count=int(
+                cluster_map.get("rejected_generated_locator_count", 0) or 0
+            ),
+            coverage_inventory_count=int(cluster_map.get("coverage_inventory_count", 0) or 0),
+            coverage_exhausted_count=int(cluster_map.get("coverage_exhausted_count", 0) or 0),
+            coverage_accounting_valid=bool(cluster_map.get("coverage_accounting_valid", False)),
             literature_provider_call_count=int(profile_result.get("provider_calls", 0) or 0) + synthesis_calls,
             checkpoint_hit_count=int(profile_result.get("checkpoint_hits", 0) or 0) + synthesis_checkpoint_hits,
             literature_failure_count=int(profile_result.get("failure_count", 0) or 0) + synthesis_failures,
@@ -1009,13 +1151,35 @@ def rebuild_map(
             active_gap_packet="",
             active_synthesis_packet="",
         )
+    profile_rows_for_links = [profile_to_dict(profile) for profile in profiles]
     related: dict[str, list[dict[str, Any]]] = {}
-    for link in typed["links"]:
-        left, right = str(link["source_note_id"]), str(link["target_note_id"])
-        relation_type = str(link["relation_type"])
-        reverse_type = "cited_by" if relation_type == "cites" else ("cites" if relation_type == "cited_by" else relation_type)
-        related.setdefault(left, []).append({"note_id": right, "relation_type": relation_type})
-        related.setdefault(right, []).append({"note_id": left, "relation_type": reverse_type})
+    for profile in profile_rows_for_links:
+        source_id = str(profile.get("source_id") or "")
+        note_id = str(profile.get("note_id") or "")
+        if not source_id or not note_id:
+            continue
+        related[note_id] = [
+            {
+                "note_id": str(link.get("target_note_id") or ""),
+                "relation_type": str(link.get("primary_relation_type") or "semantic_similarity"),
+                "reason": str(link.get("reason") or ""),
+            }
+            for link in rank_human_related_links(
+                source_id,
+                profile_rows_for_links,
+                navigation_relations,
+                max_inferred_links=effective_request.navigation_policy.max_inferred_related_note_links,
+            )
+            if link.get("target_note_id")
+        ]
+    subject_tags_by_note: dict[str, list[str]] = defaultdict(list)
+    for assignment in navigation.get("assignments", []) or []:
+        if not isinstance(assignment, Mapping) or not assignment.get("visible"):
+            continue
+        note_id = str(assignment.get("note_id") or "")
+        canonical_tag = str(assignment.get("canonical_tag") or "")
+        if note_id and canonical_tag and canonical_tag not in subject_tags_by_note[note_id]:
+            subject_tags_by_note[note_id].append(canonical_tag)
     clusters_by_note: dict[str, list[str]] = {}
     cluster_by_id = {str(cluster["cluster_id"]): cluster for cluster in cluster_map["clusters"]}
     for cluster in cluster_by_id.values():
@@ -1092,17 +1256,21 @@ def rebuild_map(
             path,
             {
                 "related_notes": [
-                    {"note_id": link["note_id"], "relation_type": link["relation_type"], "wikilink": f"[[{link['target_stem']}]]"}
+                    {
+                        "note_id": link["note_id"],
+                        "relation_type": link["relation_type"],
+                        "reason": link.get("reason", ""),
+                        "wikilink": f"[[{link['target_stem']}]]",
+                    }
                     for link in related_links
                 ],
                 "clusters": cluster_ids,
                 "cluster_links": [cluster_wikilinks[cluster_id] for cluster_id in cluster_ids if cluster_id in cluster_wikilinks],
                 "gaps": gap_ids,
                 "gap_links": [gap_wikilinks[gap_id] for gap_id in gap_ids],
-                "tags": source_obsidian_tags(
-                    list(row.get("normalized_tags", []) or []),
-                    str(row.get("note_status") or ""),
-                ),
+                "tags": sorted(subject_tags_by_note.get(str(row.get("note_id") or ""), [])),
+                "engine_version": ENGINE_VERSION,
+                "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
                 "updated_at": now_iso(),
             },
             related_links,
@@ -1148,8 +1316,9 @@ def rebuild_map(
             Path(source_set.get("latest_path", source_set["path"])),
         ],
     }
-    if profile_partial_reason:
-        result["partial_reason"] = profile_partial_reason
+    partial_reasons = [reason for reason in (profile_partial_reason, synthesis_partial_reason) if reason]
+    if partial_reasons:
+        result["partial_reason"] = ";".join(partial_reasons)
     return result
 
 
@@ -1199,8 +1368,13 @@ def _build_profiles_for_map(
             return {"index": index, "profile": None, "paths": [], "checkpoint_hit": 0, "failure": 1}
         text = path.read_text(encoding="utf-8")
         note_id = str(row.get("note_id") or "")
+        note_status = str(row.get("note_status") or "")
+        terminal_status = str(row.get("terminal_status") or "")
         analytical = (
-            str(row.get("note_status") or "") in {"analytical_atomic_note", "verified_atomic_note"}
+            (
+                note_status in {"analytical_atomic_note", "verified_atomic_note"}
+                or terminal_status == "validated_note"
+            )
             and str(row.get("source_scope") or "full_document") == "full_document"
         )
         profile_policy, profile_route, reasoner_identity = _profile_dependency_policy(
@@ -1217,6 +1391,7 @@ def _build_profiles_for_map(
         )
         profile = load_profile_checkpoint(literature_state, note_id, fingerprint)
         checkpoint_hit = 0
+        mechanically_upgraded = False
         if profile is not None:
             checkpoint_hit = 1
         else:
@@ -1235,13 +1410,96 @@ def _build_profiles_for_map(
                         else {}
                     )
                     recorded_source_set_id = str(existing_context.get("source_set_id") or "")
+                    current_note_hash = semantic_note_hash(text)
+                    lineage_matches = (
+                        str(existing_payload.get("note_id") or "") == note_id
+                        and str(existing_payload.get("source_id") or "") == str(row.get("source_id") or "")
+                        and str(existing_payload.get("note_hash") or "")
+                        in {
+                            current_note_hash,
+                            str(review_aliases.get(note_id, {}).get("legacy_semantic_hash") or ""),
+                        }
+                    )
+                    stored_route = str(existing_context.get("profile_generation_route") or "")
+                    stored_identity = str(existing_context.get("reasoner_identity") or "")
+                    stored_validity = dict(existing_payload.get("validity") or {})
+                    if bool(stored_validity.get("legacy_profile_upgraded_mechanically")):
+                        # Older replay code could relabel a reused mechanical
+                        # profile as built_in_reader while leaving its dependency
+                        # hash and content untouched. The durable migration marker
+                        # is authoritative for repairing that metadata drift.
+                        stored_route = "mechanical_legacy_upgrade"
+                        stored_identity = "auto_zettelkasten.profiles.legacy_upgrade:v3"
+                        existing_context["profile_generation_route"] = stored_route
+                        existing_context["reasoner_identity"] = stored_identity
+                    if stored_route and stored_identity and lineage_matches:
+                        stored_policy = dict(profile_policy)
+                        stored_policy["profile_generation_route"] = stored_route
+                        stored_policy["reasoner_identity"] = stored_identity
+                        stored_recorded_fingerprint = profile_dependency_fingerprint(
+                            text,
+                            source_set_id=recorded_source_set_id,
+                            provider=request.provider,
+                            model=request.model,
+                            policy=stored_policy,
+                        )
+                        if existing_dependency == stored_recorded_fingerprint:
+                            fingerprint = profile_dependency_fingerprint(
+                                text,
+                                source_set_id=str(source_set.get("source_set_id") or ""),
+                                provider=request.provider,
+                                model=request.model,
+                                policy=stored_policy,
+                            )
+                            existing.note_hash = current_note_hash
+                            existing_context["source_set_id"] = str(source_set.get("source_set_id") or "")
+                            existing.context = existing_context
+                            existing.dependency_hash = fingerprint
+                            profile = existing
+                            checkpoint_hit = 1
+                    mechanical_route_is_current = (
+                        stored_route in {"deterministic", "mechanical_legacy_upgrade"}
+                        and all(
+                            str(stored_validity.get(field_name) or "") == expected_version
+                            for field_name, expected_version in (
+                                ("profile_prompt_version", PROFILE_PROMPT_VERSION),
+                                ("classifier_version", PROFILE_CLASSIFIER_VERSION),
+                                ("algorithm_version", PROFILE_ALGORITHM_VERSION),
+                            )
+                        )
+                        and str(existing_payload.get("provider") or "") == request.provider
+                        and str(existing_payload.get("model") or "") == request.model
+                    )
+                    if profile is None and lineage_matches and mechanical_route_is_current:
+                        # Mechanical profiles come from committed notes, not
+                        # literature-stage budgets or promotion settings. Migrate
+                        # the dependency hash without converting replay into a
+                        # paid profiling call.
+                        stored_policy = dict(profile_policy)
+                        stored_policy["profile_generation_route"] = stored_route
+                        stored_policy["reasoner_identity"] = stored_identity
+                        fingerprint = profile_dependency_fingerprint(
+                            text,
+                            source_set_id=str(source_set.get("source_set_id") or ""),
+                            provider=request.provider,
+                            model=request.model,
+                            policy=stored_policy,
+                        )
+                        existing.note_hash = current_note_hash
+                        existing_context["source_set_id"] = str(source_set.get("source_set_id") or "")
+                        existing_context["profile_generation_route"] = stored_route
+                        existing_context["reasoner_identity"] = stored_identity
+                        existing.context = existing_context
+                        existing.dependency_hash = fingerprint
+                        profile = existing
+                        checkpoint_hit = 1
                     alias = review_aliases.get(note_id, {})
                     alias_matches = (
                         str(existing_payload.get("note_hash") or "")
                         == str(alias.get("legacy_semantic_hash") or "")
                         and semantic_note_hash(text) == str(alias.get("semantic_hash") or "")
                     )
-                    if alias_matches:
+                    if profile is None and alias_matches:
                         existing.note_hash = str(alias["semantic_hash"])
                         existing_context["source_set_id"] = str(source_set.get("source_set_id") or "")
                         existing.context = existing_context
@@ -1261,6 +1519,34 @@ def _build_profiles_for_map(
                         existing.dependency_hash = fingerprint
                         profile = existing
                         checkpoint_hit = 1
+                    existing_validity = dict(existing_payload.get("validity") or {})
+                    legacy_profile = any(
+                        str(existing_validity.get(field_name) or "1") != expected_version
+                        for field_name, expected_version in (
+                            ("profile_prompt_version", PROFILE_PROMPT_VERSION),
+                            ("classifier_version", PROFILE_CLASSIFIER_VERSION),
+                            ("algorithm_version", PROFILE_ALGORITHM_VERSION),
+                        )
+                    )
+                    if profile is None and legacy_profile and lineage_matches:
+                        existing.note_hash = current_note_hash
+                        existing.provider = request.provider
+                        existing.model = request.model
+                        existing.dependency_hash = fingerprint
+                        existing_context["source_set_id"] = str(source_set.get("source_set_id") or "")
+                        existing_context["profile_generation_route"] = "mechanical_legacy_upgrade"
+                        existing_context["reasoner_identity"] = "auto_zettelkasten.profiles.legacy_upgrade:v3"
+                        existing.context = existing_context
+                        existing_validity.update(
+                            profile_prompt_version=PROFILE_PROMPT_VERSION,
+                            classifier_version=PROFILE_CLASSIFIER_VERSION,
+                            algorithm_version=PROFILE_ALGORITHM_VERSION,
+                            legacy_profile_upgraded_mechanically=True,
+                        )
+                        existing.validity = existing_validity
+                        profile = existing
+                        checkpoint_hit = 1
+                        mechanically_upgraded = True
             if profile is None:
                 if reasoner is not None and analytical:
                     reserve_provider_call()
@@ -1275,7 +1561,7 @@ def _build_profiles_for_map(
                             question=None,
                             context={
                                 "source_set_id": source_set.get("source_set_id", ""),
-                                "profile_prompt_version": "1",
+                                "profile_prompt_version": PROFILE_PROMPT_VERSION,
                                 "profile_generation_route": profile_route,
                                 "reasoner_identity": reasoner_identity,
                             },
@@ -1290,41 +1576,81 @@ def _build_profiles_for_map(
                     policy=profile_policy,
                     reasoner_method=reasoner_method,
                 )
-            validation = validate_profile(
+        note_valid = bool(row.get("validation_passed", True))
+        prior_exclusion_reason = str(getattr(profile, "exclusion_reason", "") or "")
+        if (
+            analytical
+            and note_valid
+            and prior_exclusion_reason.startswith("profile_or_note_validation_failed:")
+        ):
+            # A legacy profile may have been excluded before v1.2
+            # source-locator and quantitative records were mechanically
+            # derivable. Re-evaluate it after the zero-call committed-note
+            # upgrade instead of turning one ambiguous anchor into a
+            # permanent document-level exclusion. This must also run for an
+            # exact profile-checkpoint hit.
+            profile.excluded_from_synthesis = False
+            profile.exclusion_reason = ""
+        stored_context = dict(getattr(profile, "context", {}) or {})
+        stored_route = str(stored_context.get("profile_generation_route") or "")
+        if stored_route in {"deterministic", "mechanical_legacy_upgrade"}:
+            profile, _ = augment_profile_from_committed_note(
                 profile,
-                require_substantive=str(row.get("note_status") or "") in {"analytical_atomic_note", "verified_atomic_note"},
+                text,
+                source_set_id=str(source_set.get("source_set_id") or ""),
+                provider=request.provider,
+                model=request.model,
+                policy=profile_policy,
             )
-            note_valid = bool(row.get("validation_passed", True))
-            validity = dict(getattr(profile, "validity", {}) or {})
-            validity.update(
-                {
-                    "status": "valid" if validation.passed and note_valid else "invalid",
-                    "profile_validation": validation.to_dict(),
-                    "note_validation_passed": note_valid,
-                    "validation_mode": "automated",
-                }
-            )
-            profile.validity = validity
-            context = dict(getattr(profile, "context", {}) or {})
-            metadata = context.get("metadata", {}) if isinstance(context.get("metadata", {}), Mapping) else {}
-            context.update(
-                {
-                    "title": row.get("title", metadata.get("title", "")),
-                    "date": row.get("date", metadata.get("date", "")),
-                    "note_path": row.get("note_path", ""),
-                    "zotero_item_key": row.get("zotero_item_key", ""),
-                    "zotero_relations": dict(row.get("zotero_relations", {}) or {}),
-                    "profile_generation_route": profile_route,
-                    "reasoner_identity": reasoner_identity,
-                }
-            )
-            profile.context = context
-            if not validation.passed or not note_valid:
-                profile.excluded_from_synthesis = True
-                reasons = list(validation.errors) + list(row.get("validation_errors", []) or [])
-                profile.exclusion_reason = "profile_or_note_validation_failed:" + ",".join(sorted(set(reasons)))
-            save_profile(profiles_dir, profile)
-            write_profile_checkpoint(literature_state, note_id, fingerprint, profile)
+        validation = validate_profile(
+            profile,
+            require_substantive=analytical,
+        )
+        validity = dict(getattr(profile, "validity", {}) or {})
+        validity.update(
+            {
+                "status": "valid" if validation.passed and note_valid else "invalid",
+                "profile_validation": validation.to_dict(),
+                "note_validation_passed": note_valid,
+                "validation_mode": "automated",
+            }
+        )
+        profile.validity = validity
+        context = dict(getattr(profile, "context", {}) or {})
+        metadata = context.get("metadata", {}) if isinstance(context.get("metadata", {}), Mapping) else {}
+        preserved_route = str(context.get("profile_generation_route") or "") if checkpoint_hit else ""
+        preserved_identity = str(context.get("reasoner_identity") or "") if checkpoint_hit else ""
+        context.update(
+            {
+                "title": row.get("title", metadata.get("title", "")),
+                "date": row.get("date", metadata.get("date", "")),
+                "note_path": row.get("note_path", ""),
+                "zotero_item_key": row.get("zotero_item_key", ""),
+                "zotero_relations": dict(row.get("zotero_relations", {}) or {}),
+                "profile_generation_route": (
+                    preserved_route
+                    or ("mechanical_legacy_upgrade" if mechanically_upgraded else profile_route)
+                ),
+                "reasoner_identity": (
+                    preserved_identity
+                    or (
+                        "auto_zettelkasten.profiles.legacy_upgrade:v2"
+                        if mechanically_upgraded
+                        else reasoner_identity
+                    )
+                ),
+            }
+        )
+        profile.context = context
+        if not validation.passed or not note_valid:
+            profile.excluded_from_synthesis = True
+            reasons = list(validation.errors) + list(row.get("validation_errors", []) or [])
+            profile.exclusion_reason = "profile_or_note_validation_failed:" + ",".join(sorted(set(reasons)))
+        elif prior_exclusion_reason.startswith("profile_or_note_validation_failed:"):
+            profile.excluded_from_synthesis = False
+            profile.exclusion_reason = ""
+        save_profile(profiles_dir, profile)
+        write_profile_checkpoint(literature_state, note_id, fingerprint, profile)
         final_validation = validate_profile(profile, require_substantive=False)
         profile_path = profile_sidecar_path(profiles_dir, note_id)
         checkpoint_path = literature_state / "profile_calls" / f"{slugify(note_id, fallback='profile')}.yml"
@@ -1559,10 +1885,11 @@ def _finalize_literature_projection_hashes(
             "model": request.model,
             "literature_policy": request.literature_policy.to_dict(),
             "algorithm_versions": {
-                "collection_mapper": "0.5.0",
-                "profile_prompt": "1",
-                "profile_classifier": "1",
-                "profile_algorithm": "1",
+                "collection_mapper": ENGINE_VERSION,
+                "profile_prompt": PROFILE_PROMPT_VERSION,
+                "profile_classifier": PROFILE_CLASSIFIER_VERSION,
+                "profile_algorithm": PROFILE_ALGORITHM_VERSION,
+                "committed_note_anchor_augmentation": COMMITTED_NOTE_ANCHOR_AUGMENTATION_VERSION,
                 "source_classifier": CONTENT_CLASSIFIER_VERSION,
                 "chunking": CHUNKING_VERSION,
             },
@@ -2172,7 +2499,7 @@ def _frontmatter(row: Mapping[str, Any], request: MapRequest, normalized_tags: S
         "original_zotero_tags": original_tags(row["item"]),
         "zotero_relations": data.get("relations", {}) if isinstance(data.get("relations", {}), Mapping) else {},
         "normalized_tags": list(normalized_tags),
-        "tags": source_obsidian_tags(list(normalized_tags), str(row.get("note_status") or "analytical_atomic_note")),
+        "tags": [],
         "clusters": [],
         "cluster_links": [],
         "gaps": [],

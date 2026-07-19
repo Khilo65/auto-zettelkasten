@@ -8,8 +8,10 @@ import pytest
 import yaml
 
 from auto_zettelkasten.literature import (
-    EVIDENCE_DIMENSIONS,
+    DEBATE_STATES,
     GAP_RULES,
+    _literature_neighborhoods_markdown,
+    _proposition_debate_state,
     build_debate_registry,
     build_evidence_matrices,
     build_literature_map,
@@ -21,18 +23,70 @@ from auto_zettelkasten.literature import (
     generate_gap_candidates,
     map_overlapping_clusters,
     map_profile_relations,
+    map_topic_neighborhoods,
     normalize_evidence_profiles,
     reconcile_cluster_registry,
     search_and_validate_gaps,
 )
 from auto_zettelkasten.models import (
-    EvidenceFinding,
+    EvidenceAnchor,
     EvidenceProfile,
     LiteratureMapReport,
     LiteratureMapRequest,
     LiteratureMappingPolicy,
+    SupportEnvelope,
 )
 from auto_zettelkasten.literature import run_literature_map, stable_literature_map_id
+
+
+def supported_finding(
+    source: str,
+    topic: str,
+    *,
+    family: str | None = None,
+    direction: str = "positive",
+    method: str = "panel regression",
+    locator: str = "p. 10",
+    outcome: str | None = None,
+    boundary_condition: str | None = None,
+    evidence_role: str = "associational",
+    argument_role: str = "none",
+) -> dict[str, Any]:
+    mapped_outcome = outcome or f"{topic} outcome"
+    empirical_role = evidence_role if evidence_role in {
+        "descriptive",
+        "associational",
+        "causal",
+        "mechanism_evidence",
+    } else "none"
+    return {
+        "evidence_anchor_id": f"claim-{source}-{topic.replace(' ', '-')}",
+        "claim_id": f"claim-{source}-{topic.replace(' ', '-')}",
+        "claim": f"{topic} shapes and predicts {mapped_outcome}.",
+        "topic": topic,
+        "direction": direction,
+        "method": method,
+        "data": f"dataset-{source}",
+        "case": f"case-{source}",
+        "period": f"20{len(source):02d}-2025",
+        "outcome": mapped_outcome,
+        "locator": locator,
+        "uncertainty": "moderate",
+        "boundary_condition": boundary_condition if boundary_condition is not None else f"boundary-{source}",
+        "evidence_role": evidence_role,
+        "support_envelope": {
+            "empirical_role": empirical_role,
+            "argument_role": argument_role,
+            "coverage": "full_text",
+            "scope": {
+                "cases": [f"case-{source}"],
+                "periods": [f"20{len(source):02d}-2025"],
+                "outcomes": [mapped_outcome],
+            },
+            "restrictions": ["Does not establish causality."],
+            "support_status": "supported",
+        },
+    }
 
 
 def profile(
@@ -68,13 +122,16 @@ def profile(
         "normalized_tags": tags or [],
         "findings": [
             {
+                **supported_finding(
+                    source,
+                    topic,
+                    family=family,
+                    direction=direction,
+                    method=method,
+                    locator=locator,
+                ),
+                "evidence_anchor_id": f"claim-{source}",
                 "claim_id": f"claim-{source}",
-                "claim": f"{topic} has a {direction} result in {source}.",
-                "topic": topic,
-                "direction": direction,
-                "locator": locator,
-                "uncertainty": "moderate",
-                "boundary_condition": f"boundary-{source}",
             }
         ],
         "gap_signals": gap_signals or [],
@@ -96,6 +153,11 @@ def _quality_rationale(candidate: Mapping[str, Any]) -> dict[str, Any]:
         "gap_statement": missing,
         "rule": candidate["rule"],
         "related_cluster_ids": list(candidate.get("related_cluster_ids", []) or []),
+        "proposition_ids": list(candidate.get("proposition_ids", []) or []),
+        "proposition_id": str(candidate.get("proposition_id") or ""),
+        "originating_cluster_revisions": list(candidate.get("originating_cluster_revisions", []) or []),
+        "originating_cluster_revision": str(candidate.get("originating_cluster_revision") or ""),
+        "missing_cell": dict(candidate.get("missing_cell") or {}),
         "generation_explanation": str(candidate.get("generation_explanation") or "The cluster evidence generated this candidate."),
         "observed_pattern": str(candidate.get("observed_pattern") or f"The collection maps an unresolved pattern involving {topic}."),
         "precise_missing_evidence": missing,
@@ -120,23 +182,18 @@ def _quality_rationale(candidate: Mapping[str, Any]) -> dict[str, Any]:
             "importance_passed": True,
             "rejection_reasons": [],
         },
-        "study_design": {
-            "design_type": "matched comparative design",
-            "research_question": f"Under matched conditions, what explains variation in {topic}?",
-            "estimand": "The matched contrast in the specified outcome.",
-            "unit_of_analysis": "Study case period",
-            "target_population": "Cases represented by the frozen collection",
-            "exposure_or_treatment": f"Variation in {topic}",
-            "comparator": "Matched cases without the focal exposure",
-            "outcomes": [f"Measured outcome for {topic}"],
-            "mechanism_measures": ["Observed intermediate mechanism indicators"],
-            "identification_or_inference_strategy": "Match cases on pre-exposure covariates and compare within matched sets.",
-            "data_route": "Reuse collection-defined measures and assemble comparable case-level observations.",
-            "confounders_or_rival_explanations": ["case selection", "measurement differences"],
-            "falsification_or_process_tests": ["negative-control outcome", "pre-treatment balance test"],
-            "feasibility": "The design is feasible if the mapped source datasets expose common case identifiers.",
-            "ethical_constraints": "Use de-identified or public case-level evidence.",
-            "validity_risks": ["residual confounding", "cross-study measurement mismatch"],
+        "resolution_path": {
+            "path_type": "quantitative",
+            "question": f"Under matched conditions, what explains variation in {topic}?",
+            "evidence_needed": missing,
+            "requirements": {
+                "estimand": "The matched contrast in the specified outcome.",
+                "comparison": "Matched cases with and without the focal exposure.",
+                "identification": "Match on pre-exposure covariates and compare within matched sets.",
+                "measurement": "Use common case identifiers and collection-defined outcome measures.",
+            },
+            "feasibility": "Feasible if the mapped datasets expose common case identifiers.",
+            "limitations": ["Residual confounding", "Cross-study measurement mismatch"],
         },
         "anchors": [],
         "merged_from_gap_ids": [],
@@ -154,7 +211,8 @@ def quality_reasoner(
     candidates = [
         row
         for row in probe["gap_registry"]["rejected_candidates"]
-        if row.get("status") == "rejected_gap_quality"
+        if "gap_adjudication_did_not_retain_candidate"
+        in (row.get("quality_rejection_reasons") or [])
     ]
     reasoner["gap_rationales"] = [_quality_rationale(row) for row in candidates]
     reasoner.setdefault("rejected_gap_rationales", [])
@@ -168,6 +226,28 @@ def build_quality_report(
     return build_literature_report(rows, reasoner=quality_reasoner(rows, base_reasoner))
 
 
+def with_proposition_lineage(
+    candidate: Mapping[str, Any],
+    rows: list[dict],
+    identity: str = "institutional trust",
+) -> dict[str, Any]:
+    cluster = cluster_for(rows, identity)
+    proposition = cluster["propositions"][0]
+    missing = str(candidate.get("precise_missing_evidence") or "")
+    return {
+        **dict(candidate),
+        "related_cluster_ids": [cluster["cluster_id"]],
+        "proposition_ids": [proposition["proposition_id"]],
+        "proposition_id": proposition["proposition_id"],
+        "originating_cluster_revisions": [cluster["revision_hash"]],
+        "originating_cluster_revision": cluster["revision_hash"],
+        "missing_cell": {
+            "kind": str(candidate.get("rule") or "missing_relationship"),
+            "description": missing,
+        },
+    }
+
+
 def test_typed_untagged_profiles_cluster_semantically_and_tags_are_only_tiebreakers() -> None:
     typed = [
         EvidenceProfile(
@@ -178,13 +258,22 @@ def test_typed_untagged_profiles_cluster_semantically_and_tags_are_only_tiebreak
             validity={"status": "valid"},
             concepts=["civil resistance"],
             methods=[f"method-{index}"],
-            findings=[
-                EvidenceFinding(
-                    finding_id=f"claim-{index}",
+            evidence_anchors=[
+                EvidenceAnchor(
+                    evidence_anchor_id=f"claim-{index}",
+                    source_id=f"source-{index}",
+                    study_family_id=f"family-{index}",
+                    evidence_role="associational",
                     claim="Civil resistance changes participation.",
                     direction="positive",
-                    outcome="participation",
                     locator=f"p. {index + 1}",
+                    support_envelope=SupportEnvelope(
+                        empirical_role="associational",
+                        coverage="full_text",
+                        scope={"outcomes": ["participation"]},
+                        restrictions=["Does not alone establish causality."],
+                        support_status="supported",
+                    ),
                 )
             ],
         )
@@ -192,26 +281,34 @@ def test_typed_untagged_profiles_cluster_semantically_and_tags_are_only_tiebreak
     ]
     normalized = normalize_evidence_profiles(typed)
     mapped = map_overlapping_clusters(normalized, map_profile_relations(normalized))
-    cluster = next(row for row in mapped["clusters"] if row["semantic_identity"] == "civil resistance")
+    assert len(mapped["clusters"]) == 1
+    cluster = mapped["clusters"][0]
     assert cluster["status"] == "source_backed_cluster"
     assert cluster["independent_study_family_count"] == 3
+    assert cluster["propositions"][0]["comparability"]["passed"] is True
+    assert all(
+        reference["support_status"] == "supported"
+        for reference in cluster["propositions"][0]["evidence"]
+    )
 
     unrelated = [
         profile("a", topic="school finance", tags=["shared-tag"]),
         profile("b", topic="ocean salinity", tags=["shared-tag"]),
     ]
-    assert map_profile_relations(unrelated) == []
+    unrelated_relations = map_profile_relations(unrelated)
+    assert unrelated_relations
     assert map_overlapping_clusters(unrelated)["clusters"] == []
 
     mirrored = [
         {**profile("a", topic="school finance"), "semantic_topics": ["shared-tag"], "normalized_tags": ["shared-tag"]},
         {**profile("b", topic="ocean salinity"), "semantic_topics": ["shared-tag"], "normalized_tags": ["shared-tag"]},
     ]
-    assert map_profile_relations(mirrored) == []
+    mirrored_relations = map_profile_relations(mirrored)
+    assert mirrored_relations
     assert map_overlapping_clusters(mirrored)["clusters"] == []
 
 
-def test_partial_reasoner_proposals_enrich_without_suppressing_deterministic_clusters() -> None:
+def test_reasoner_proposals_with_any_invalid_explicit_anchor_are_rejected() -> None:
     rows = [
         profile("a", topic="institutional trust"),
         profile("b", topic="institutional trust"),
@@ -238,7 +335,7 @@ def test_partial_reasoner_proposals_enrich_without_suppressing_deterministic_clu
                 "proposal_id": "bad-locator",
                 "label": "Invented cluster",
                 "semantic_identity": "invented cluster",
-                "source_ids": ["c", "d"],
+                "source_ids": ["c"],
                 "supporting_evidence": [
                     {"source_id": "c", "claim_id": "claim-c", "locator": "p. 999"},
                     {"source_id": "d", "claim_id": "claim-d", "locator": "p. 999"},
@@ -247,26 +344,79 @@ def test_partial_reasoner_proposals_enrich_without_suppressing_deterministic_clu
         ]
     }
     report = build_literature_report(rows, reasoner=reasoner)
-    identities = {row["semantic_identity"] for row in report["cluster_registry"]["clusters"]}
-    assert {"institutional trust", "legitimacy mediator"}.issubset(identities)
-    trust = next(row for row in report["cluster_registry"]["clusters"] if row["semantic_identity"] == "institutional trust")
-    assert trust["formation_route"] == "reasoner_proposal"
-    assert trust["source_ids"] == ["a", "b", "e"]
-    assert any(
-        row.get("proposal_id") == "proposal-trust" and row.get("action") == "narrow"
+    assert report["cluster_registry"]["clusters"] == []
+    rejected = {
+        row.get("proposal_id"): row.get("reason")
         for row in report["cluster_registry"]["rejected_proposals"]
-    )
-    assert any(row.get("proposal_id") == "bad-locator" for row in report["cluster_registry"]["rejected_proposals"])
+    }
+    assert rejected == {
+        "proposal-trust": "no_valid_multi_source_proposition_row",
+        "bad-locator": "no_valid_multi_source_proposition_row",
+    }
 
 
-def test_cluster_projects_only_reconciled_tags_shared_by_independent_families() -> None:
+def test_reasoner_propositions_are_persisted_in_the_map_level_registry() -> None:
+    rows = [profile(source) for source in ("a", "b", "c")]
+    reasoner = {
+        "cluster_proposals": [
+            {
+                "proposal_id": "proposal-provider-proposition",
+                "label": "Institutional trust and participation",
+                "semantic_identity": "institutional trust and participation",
+                "source_ids": ["a", "b", "c"],
+                "source_roles": {source: "core" for source in ("a", "b", "c")},
+                "propositions": [
+                    {
+                        "statement": "Institutional trust predicts participation.",
+                        "question": "Does institutional trust predict participation?",
+                        "proposition_type": "empirical",
+                        "source_ids": ["a", "b", "c"],
+                        "evidence": [
+                            {
+                                "source_id": source,
+                                "evidence_anchor_id": f"claim-{source}",
+                                "locator": "p. 10",
+                            }
+                            for source in ("a", "b", "c")
+                        ],
+                        "comparability": {"passed": True},
+                    }
+                ],
+            }
+        ]
+    }
+
+    report = build_literature_report(rows, reasoner=reasoner)
+
+    assert report["manifest"]["cluster_count"] == 1
+    assert report["manifest"]["proposition_count"] == 1
+    assert report["propositions"] == report["cluster_registry"]["clusters"][0]["propositions"]
+
+
+def test_shared_tags_are_nonanalytical_topic_neighborhoods_not_cluster_support() -> None:
     rows = [
         profile("a", tags=["shared-topic", "one-off-a"]),
         profile("b", tags=["shared-topic", "one-off-b"]),
         profile("c", tags=["unrelated-tag"]),
     ]
-    cluster = cluster_for(rows)
-    assert cluster["shared_normalized_tags"] == ["shared-topic"]
+    normalized = normalize_evidence_profiles(rows)
+    relations = map_profile_relations(normalized)
+    neighborhoods = map_topic_neighborhoods(normalized, relations)
+    shared = next(
+        row
+        for row in neighborhoods
+        if row["kind"] == "tag" and row["semantic_identity"] == "shared topic"
+    )
+    assert shared["source_ids"] == ["a", "b"]
+    assert shared["analytical_support"] is False
+    mapped = map_overlapping_clusters(
+        normalized,
+        relations,
+        topic_neighborhoods=neighborhoods,
+    )
+    cluster = next(row for row in mapped["clusters"] if row["semantic_identity"] == "institutional trust")
+    assert cluster["shared_normalized_tags"] == []
+    assert shared["topic_neighborhood_id"] in cluster["topic_neighborhood_ids"]
 
     typed = [
         EvidenceProfile(
@@ -277,11 +427,54 @@ def test_cluster_projects_only_reconciled_tags_shared_by_independent_families() 
             validity={"status": "valid"},
             concepts=["civil resistance"],
             features={"zotero_tag_context": ["Shared Topic"]},
+            evidence_anchors=[
+                EvidenceAnchor(
+                    source_id=f"typed-{index}",
+                    study_family_id=f"typed-family-{index}",
+                    evidence_role="associational",
+                    claim="Civil resistance affects participation.",
+                    direction="positive",
+                    locator=f"p. {index + 1}",
+                    support_envelope=SupportEnvelope(
+                        empirical_role="associational",
+                        coverage="full_text",
+                        scope={"outcomes": ["participation"]},
+                        restrictions=["Does not alone establish causality."],
+                        support_status="supported",
+                    ),
+                )
+            ],
         )
         for index in range(2)
     ]
-    typed_cluster = cluster_for(normalize_evidence_profiles(typed), "civil resistance")
-    assert typed_cluster["shared_normalized_tags"] == ["shared-topic"]
+    typed_rows = normalize_evidence_profiles(typed)
+    typed_neighborhoods = map_topic_neighborhoods(typed_rows, map_profile_relations(typed_rows))
+    typed_tag = next(row for row in typed_neighborhoods if row["kind"] == "tag")
+    assert typed_tag["semantic_identity"] == "shared topic"
+    assert typed_tag["analytical_support"] is False
+
+
+def test_human_neighborhoods_link_back_to_the_clusters_that_expose_them() -> None:
+    report = build_literature_report(
+        [profile("a"), profile("b", method="comparative case study")]
+    )
+    cluster = report["cluster_registry"]["clusters"][0]
+    exposed_neighborhood_ids = set(cluster["topic_neighborhood_ids"])
+    summaries = {
+        row["neighborhood_id"]: row
+        for row in report["navigation"]["human_neighborhood_summaries"]
+    }
+
+    assert exposed_neighborhood_ids
+    for neighborhood_id in exposed_neighborhood_ids:
+        assert summaries[neighborhood_id]["related_cluster_ids"] == [cluster["cluster_id"]]
+
+    markdown = _literature_neighborhoods_markdown(
+        report,
+        {"source_set_id": "set-neighborhood-links", "collection_name": "Neighborhood Links"},
+    )
+    assert "Analytical clusters:" in markdown
+    assert f"[[{cluster_note_stem(cluster)}|{cluster_display_title(cluster)}]]" in markdown
 
 
 def test_profile_exclusion_coverage_and_validity_create_explicit_unclustered_reasons() -> None:
@@ -298,10 +491,10 @@ def test_profile_exclusion_coverage_and_validity_create_explicit_unclustered_rea
     assert reasons["limited"] == "limited_profile_excluded_from_analytical_clustering"
     assert reasons["excluded"] == "limited_profile_excluded_from_analytical_clustering"
     assert reasons["invalid"] == "limited_profile_excluded_from_analytical_clustering"
-    assert reasons["other"] == "no_coherent_multi_family_cluster"
+    assert reasons["other"] == "no_comparable_multi_source_proposition"
 
 
-def test_explicit_zotero_and_structured_finding_relations_are_mapped_without_tag_binning() -> None:
+def test_relations_create_neighborhoods_but_not_analytical_clusters() -> None:
     citation_rows = [
         {
             **profile("a", topic="school finance"),
@@ -318,9 +511,15 @@ def test_explicit_zotero_and_structured_finding_relations_are_mapped_without_tag
     finding_rows[1]["findings"][0]["claim"] = "Elite bargaining constrains implementation choices."
     relation = map_profile_relations(finding_rows)[0]
     assert any(row["kind"] == "structured_findings" for row in relation["evidence"])
-    related_cluster = map_overlapping_clusters(finding_rows, [relation])["clusters"]
-    assert len(related_cluster) == 1
-    assert set(related_cluster[0]["source_ids"]) == {"a", "b"}
+    neighborhoods = map_topic_neighborhoods(finding_rows, [relation])
+    relation_neighborhood = next(row for row in neighborhoods if row["kind"] == "citation_or_relation")
+    assert relation_neighborhood["source_ids"] == ["a", "b"]
+    assert relation_neighborhood["analytical_support"] is False
+    assert map_overlapping_clusters(
+        finding_rows,
+        [relation],
+        topic_neighborhoods=neighborhoods,
+    )["clusters"] == []
 
     weak_overlap = [profile("weak-a", topic="school finance"), profile("weak-b", topic="ocean salinity")]
     weak_overlap[0]["findings"][0]["claim"] = "An agreement can improve school financing."
@@ -330,7 +529,10 @@ def test_explicit_zotero_and_structured_finding_relations_are_mapped_without_tag
 
 def test_overlap_policy_is_hard_capped_at_three_and_honors_model_field_name() -> None:
     topics = ["alpha mechanism", "beta mechanism", "gamma mechanism", "delta mechanism"]
-    rows = [profile("a", topic=topics[0], extra_topics=topics[1:]), profile("b", topic=topics[0], extra_topics=topics[1:])]
+    rows = [profile("a", topic=topics[0]), profile("b", topic=topics[0])]
+    for row in rows:
+        source = row["source_id"]
+        row["findings"].extend(supported_finding(source, topic) for topic in topics[1:])
     mapped = map_overlapping_clusters(rows, policy=LiteratureMappingPolicy(max_memberships=3))
     memberships = [cluster["cluster_id"] for cluster in mapped["clusters"] if "a" in cluster["source_ids"]]
     assert len(memberships) == 3
@@ -358,7 +560,9 @@ def test_study_family_dedup_controls_emerging_and_source_backed_status() -> None
     only_one_family = [profile("x", family="one"), profile("x-reprint", family="one")]
     rejected = map_overlapping_clusters(only_one_family)
     assert rejected["clusters"] == []
-    assert any(row["reason"] == "insufficient_independent_study_families" for row in rejected["rejected_proposals"])
+    assert {
+        row["reason"] for row in rejected["unclustered_sources"]
+    } == {"no_comparable_independent_evidence_base_proposition"}
 
 
 def test_source_backed_threshold_policy_changes_status_without_allowing_singletons() -> None:
@@ -383,7 +587,9 @@ def test_research_question_fragments_do_not_form_clusters_and_labels_preserve_ph
         for row in map_overlapping_clusters(peace_rows)["clusters"]
         if row["semantic_identity"] == "agreement peace"
     )
-    assert peace_cluster["label"] == "peace agreement"
+    assert peace_cluster["label"] == peace_cluster["propositions"][0]["statement"]
+    assert peace_cluster["label"].startswith("peace agreement")
+    assert not peace_cluster["label"].startswith("agreement peace")
 
 
 def test_near_identical_nested_topics_do_not_create_duplicate_clusters() -> None:
@@ -391,14 +597,14 @@ def test_near_identical_nested_topics_do_not_create_duplicate_clusters() -> None
         profile(source, topic="mediation", extra_topics=["conflict mediation"])
         for source in ("a", "b", "c")
     ]
-    mapped = map_overlapping_clusters(rows)
+    neighborhoods = map_topic_neighborhoods(rows, map_profile_relations(rows))
+    mapped = map_overlapping_clusters(rows, topic_neighborhoods=neighborhoods)
     identities = {row["semantic_identity"] for row in mapped["clusters"]}
     assert identities == {"mediation"}
-    assert any(
-        row["reason"] == "redundant_semantic_cluster"
-        and row["semantic_identity"] == "conflict mediation"
-        for row in mapped["rejected_proposals"]
-    )
+    nested = next(row for row in neighborhoods if row["semantic_identity"] == "conflict mediation")
+    assert nested["analytical_support"] is False
+    assert nested["topic_neighborhood_id"] in mapped["clusters"][0]["topic_neighborhood_ids"]
+    assert mapped["rejected_proposals"] == []
 
 
 def test_cluster_auto_promotion_can_be_disabled_without_hiding_candidates() -> None:
@@ -420,54 +626,120 @@ def test_cluster_auto_promotion_can_be_disabled_without_hiding_candidates() -> N
     assert candidate["automation_status"] == "candidate"
 
 
-def test_evidence_matrix_has_all_dimensions_and_only_complete_locator_records() -> None:
+def test_proposition_matrix_has_comparable_rows_and_only_complete_locator_records() -> None:
     rows = [profile("a"), profile("b", method="comparative case study")]
     cluster = cluster_for(rows)
     matrices = build_evidence_matrices(rows, [cluster])
     matrix = matrices[0]
-    assert tuple(matrix["dimension_names"]) == EVIDENCE_DIMENSIONS
-    assert set(matrix["dimensions"]) == set(EVIDENCE_DIMENSIONS)
-    for entries in matrix["dimensions"].values():
-        for entry in entries:
-            assert all(set(reference) >= {"claim_id", "source_id", "locator"} for reference in entry["evidence"])
-            assert all(reference["locator"] for reference in entry["evidence"])
+    assert matrix["matrix_version"] == "2"
+    assert matrix["proposition_count"] == 1
+    assert matrix["admission_passed"] is True
+    assert matrix["source_level_metadata_inherited"] is False
+    proposition = matrix["propositions"][0]
+    assert proposition["comparability"]["passed"] is True
+    assert proposition["independent_core_study_family_count"] == 2
+    assert set(proposition["cells"]) == {"a", "b"}
+    for cell in proposition["cells"].values():
+        assert cell["stance_or_finding"]
+        assert cell["scope"]["outcome"] == ["institutional trust outcome"]
+        assert all(
+            set(reference) >= {"evidence_anchor_id", "source_id", "locator", "support_status"}
+            for reference in cell["evidence"]
+        )
+        assert all(reference["locator"] and reference["support_status"] == "supported" for reference in cell["evidence"])
 
     missing = deepcopy(rows)
     missing[0]["findings"][0]["locator"] = ""
-    matrix = build_evidence_matrices(missing, [cluster_for(missing)])[0]
-    assert matrix["omitted_unlocated_cell_count"] > 0
+    missing_matrix = build_evidence_matrices(missing, [cluster])[0]
+    assert missing_matrix["proposition_count"] == 0
+    assert missing_matrix["admission_passed"] is False
 
     vague = deepcopy(rows)
     vague[0]["findings"][0]["locator"] = "somewhere in the article"
-    matrix = build_evidence_matrices(vague, [cluster_for(vague)])[0]
-    assert matrix["omitted_unlocated_cell_count"] > 0
-    assert all(
-        reference["source_id"] != "a"
-        for entries in matrix["dimensions"].values()
-        for entry in entries
-        for reference in entry["evidence"]
+    vague_matrix = build_evidence_matrices(vague, [cluster])[0]
+    assert vague_matrix["proposition_count"] == 0
+    assert vague_matrix["admission_passed"] is False
+
+
+def test_all_eight_debate_states_are_declared_and_proposition_cells_drive_classification() -> None:
+    def cell(
+        source: str,
+        *,
+        direction: str = "positive",
+        evidence_type: list[str] | None = None,
+        boundaries: list[str] | None = None,
+        stance: str = "Institutional trust affects participation.",
+    ) -> dict[str, Any]:
+        return {
+            "source_id": source,
+            "study_family_id": f"family-{source}",
+            "stance_or_finding": stance,
+            "evidence_type": evidence_type or ["associational"],
+            "boundary_conditions": boundaries or [],
+            "direction_or_interpretation": [direction],
+        }
+
+    cases = {
+        "mapped_debate": {
+            "a": cell("a", direction="positive", stance="Higher trust increases participation."),
+            "b": cell("b", direction="negative", stance="Higher trust decreases participation."),
+        },
+        "emerging_convergence": {"a": cell("a"), "b": cell("b")},
+        "mixed_evidence": {
+            "a": cell("a", direction="mixed"),
+            "b": cell("b", direction="not_reported", stance="A second estimate is inconclusive."),
+        },
+        "conditional_relationship": {
+            "a": cell("a", boundaries=["urban municipalities"]),
+            "b": cell("b", boundaries=["rural districts"]),
+        },
+        "complementary_positions": {
+            "a": cell("a", evidence_type=["associational"]),
+            "b": cell("b", evidence_type=["conceptual"]),
+        },
+        "single_position": {"a": cell("a")},
+        "no_debate": {},
+    }
+    assert DEBATE_STATES == {
+        "mapped_debate",
+        "mapped_consensus",
+        "emerging_convergence",
+        "aligned_institutional_guidance",
+        "within_program_consistency",
+        "mixed_evidence",
+        "conditional_relationship",
+        "complementary_positions",
+        "parallel_literatures",
+        "single_position",
+        "no_debate",
+    }
+    for expected, cells in cases.items():
+        actual, _ = _proposition_debate_state({"cells": cells})
+        assert actual == expected
+
+
+def test_parallel_literatures_is_aggregated_from_multiple_single_position_propositions(monkeypatch) -> None:
+    matrix = {
+        "cluster_id": "cluster-parallel",
+        "propositions": [
+            {
+                "proposition_id": "proposition-a",
+                "statement": "Institutional trust shapes participation.",
+                "cells": {"a": {"direction_or_interpretation": ["positive"]}},
+            },
+            {
+                "proposition_id": "proposition-b",
+                "statement": "Mediator legitimacy shapes compliance.",
+                "cells": {"b": {"direction_or_interpretation": ["positive"]}},
+            },
+        ],
+    }
+    monkeypatch.setattr(
+        "auto_zettelkasten.literature.build_evidence_matrices",
+        lambda profiles, clusters: [matrix],
     )
-
-
-@pytest.mark.parametrize(
-    ("directions", "expected"),
-    [
-        (("positive", "negative"), "debate"),
-        (("positive", "positive"), "mapped_consensus"),
-        (("mixed", "not reported"), "mixed_evidence"),
-    ],
-)
-def test_debate_consensus_and_mixed_classification(directions: tuple[str, str], expected: str) -> None:
-    rows = [profile("a", direction=directions[0]), profile("b", direction=directions[1])]
-    assessment = build_debate_registry(rows, [cluster_for(rows)])["assessments"][0]
-    assert assessment["classification"] == expected
-    if expected == "debate":
-        assert len(assessment["positions"]) == 2
-        assert assessment["contradictions"]
-        for section in ("positions", "contradictions", "boundaries", "method_fault_lines"):
-            records = assessment[section]
-            assert records
-            assert "claim_id" in records[0]["evidence"][0]
+    assessment = build_debate_registry([], [{"cluster_id": "cluster-parallel"}])["assessments"][0]
+    assert assessment["classification"] == "parallel_literatures"
 
 
 def test_no_debate_without_two_locator_backed_findings() -> None:
@@ -488,9 +760,19 @@ def test_debate_contradictions_always_cite_different_study_families() -> None:
         profile("c", family="family-one", direction="negative"),
     ]
     assessment = build_debate_registry(rows, [cluster_for(rows)])["assessments"][0]
-    assert assessment["classification"] == "debate"
-    for contradiction in assessment["contradictions"]:
-        assert contradiction["evidence"][0]["study_family_id"] != contradiction["evidence"][1]["study_family_id"]
+    assert assessment["classification"] == "mapped_debate"
+    cells = assessment["proposition_assessments"][0]["cells"].values()
+    positive_families = {
+        cell["study_family_id"]
+        for cell in cells
+        if cell["direction_or_interpretation"] == ["positive"]
+    }
+    negative_families = {
+        cell["study_family_id"]
+        for cell in cells
+        if cell["direction_or_interpretation"] == ["negative"]
+    }
+    assert any(left != right for left in positive_families for right in negative_families)
 
 
 def test_debate_auto_promotion_can_be_disabled_without_hiding_candidate_assessment() -> None:
@@ -506,16 +788,17 @@ def test_debate_auto_promotion_can_be_disabled_without_hiding_candidate_assessme
         rows,
         policy=LiteratureMappingPolicy(auto_promote_debates=False),
     )["debate_registry"]
-    assert candidates["debate_candidates"]
-    for assessment in candidates["debate_candidates"]:
-        assert assessment["classification"] == "debate_candidate"
-        assert assessment["evidence_classification"] == "debate"
-        assert assessment["status"] == "debate_candidate"
-        assert assessment["promoted"] is False
-        assert assessment["automation_status"] == "candidate"
+    assert candidates["debate_candidates"] == []
+    assert len(candidates["assessments"]) == 1
+    assessment = candidates["assessments"][0]
+    assert assessment["classification"] == "mapped_debate"
+    assert assessment["evidence_classification"] == "mapped_debate"
+    assert assessment["status"] == "mapped_debate"
+    assert assessment["promoted"] is False
+    assert assessment["automation_status"] == "mapped"
     assert candidates["debates"] == []
     assert candidates["debate_count"] == 0
-    assert candidates["debate_candidate_count"] == len(candidates["debate_candidates"])
+    assert candidates["debate_candidate_count"] == 0
 
 
 def test_opposite_directions_for_different_outcomes_are_not_a_debate() -> None:
@@ -535,10 +818,11 @@ def test_opposite_directions_for_different_outcomes_are_not_a_debate() -> None:
         }
     )
 
-    assessment = build_debate_registry(rows, [cluster_for(rows)])["assessments"][0]
-    assert assessment["classification"] in {"no_debate", "mixed_evidence"}
-    assert assessment["positions"] == []
-    assert assessment["contradictions"] == []
+    mapped = map_overlapping_clusters(rows)
+    assert mapped["clusters"] == []
+    assert {
+        row["reason"] for row in mapped["unclustered_sources"]
+    } == {"no_comparable_multi_source_proposition"}
 
 
 def test_opposite_directions_for_different_predictors_are_not_a_debate() -> None:
@@ -560,9 +844,11 @@ def test_opposite_directions_for_different_predictors_are_not_a_debate() -> None
         }
     )
 
-    assessment = build_debate_registry(rows, [cluster_for(rows, "mediation success")])["assessments"][0]
-    assert assessment["classification"] in {"no_debate", "mixed_evidence"}
-    assert assessment["contradictions"] == []
+    mapped = map_overlapping_clusters(rows)
+    assert mapped["clusters"] == []
+    assert {
+        row["reason"] for row in mapped["unclustered_sources"]
+    } == {"no_comparable_multi_source_proposition"}
 
 
 def test_contradictory_gap_names_the_exact_mapped_proposition() -> None:
@@ -589,7 +875,6 @@ def test_every_allowed_gap_rule_has_a_deterministic_candidate_and_promotion_path
     ]
     if rule == "contradictory_findings":
         rows[1]["findings"][0]["direction"] = "negative"
-        rows[1]["findings"][0]["claim"] = "institutional trust has a negative result in b."
     if rule == "cross_cluster_integration":
         rows = [
             profile("a", topic="institutional trust"),
@@ -608,7 +893,7 @@ def test_every_allowed_gap_rule_has_a_deterministic_candidate_and_promotion_path
         rows[2]["gap_signals"] = [signal]
     report = build_quality_report(rows)
     gap = next(row for row in report["gap_registry"]["gaps"] if row["rule"] == rule)
-    assert gap["status"] == "mapped_collection_gap"
+    assert gap["status"] == "collection_surviving_gap"
     assert gap["scope"] == "collection_only"
     assert gap["promoted"] is True
     assert "human_review" not in gap
@@ -623,6 +908,9 @@ def test_every_allowed_gap_rule_has_a_deterministic_candidate_and_promotion_path
     assert metadata["supporting_locators"]
     assert metadata["internal_search"]["results"]
     assert metadata["why_matters"] and metadata["contribution"]
+    assert gap["proposition_ids"]
+    assert gap["originating_cluster_revisions"]
+    assert gap["missing_cell"]["description"] == gap["precise_missing_evidence"]
 
 
 def test_contradictory_gap_requires_opposing_comparable_claims() -> None:
@@ -642,7 +930,7 @@ def test_contradictory_gap_requires_opposing_comparable_claims() -> None:
     )
     validated, _ = search_and_validate_gaps(candidates, same_direction)
 
-    assert validated[0]["status"] == "rejected_rule_admission"
+    assert validated[0]["status"] == "underspecified_gap"
     assert validated[0]["promoted"] is False
     result = validated[0]["rule_results"][0]
     assert result["candidate_valid"] is False
@@ -654,11 +942,11 @@ def test_contradictory_gap_requires_opposing_comparable_claims() -> None:
         for row in report["gap_registry"]["rejected_candidates"]
         if row["rule"] == "contradictory_findings"
     )
-    assert rejected["status"] == "rejected_rule_admission"
+    assert rejected["status"] == "underspecified_gap"
+    assert rejected["rule_results"][0]["decision"] == "reject_rule_admission"
 
     opposing = deepcopy(same_direction)
     opposing[1]["findings"][0]["direction"] = "negative"
-    opposing[1]["findings"][0]["claim"] = "institutional trust has a negative result in b."
     candidates = generate_gap_candidates(
         opposing,
         map_overlapping_clusters(opposing)["clusters"],
@@ -666,7 +954,7 @@ def test_contradictory_gap_requires_opposing_comparable_claims() -> None:
     )
     validated, _ = search_and_validate_gaps(candidates, opposing)
 
-    assert validated[0]["status"] == "mapped_collection_gap"
+    assert validated[0]["status"] == "collection_surviving_gap"
     assert validated[0]["promoted"] is True
     assert validated[0]["rule_results"][0]["rule_specific_admission_passed"] is True
 
@@ -674,7 +962,9 @@ def test_contradictory_gap_requires_opposing_comparable_claims() -> None:
 def test_gap_evidence_resolution_is_source_scoped_when_claim_ids_collide() -> None:
     first = profile("a", topic="institutional trust")
     second = profile("b", topic="mediator legitimacy")
+    first["findings"][0]["evidence_anchor_id"] = "shared-claim"
     first["findings"][0]["claim_id"] = "shared-claim"
+    second["findings"][0]["evidence_anchor_id"] = "shared-claim"
     second["findings"][0]["claim_id"] = "shared-claim"
     normalized = normalize_evidence_profiles([first, second])
     from auto_zettelkasten.literature import _signal_evidence
@@ -727,6 +1017,7 @@ def test_zero_gaps_is_a_valid_result_and_reasoner_cannot_introduce_generic_rule(
 
 
 def test_author_gap_gate_keeps_explicit_research_needs_but_not_plain_limitations() -> None:
+    future_research = "Replicate institutional trust findings with rural populations."
     rows = [
         {
             **profile("a"),
@@ -734,33 +1025,40 @@ def test_author_gap_gate_keeps_explicit_research_needs_but_not_plain_limitations
                 "Results may not generalize beyond the sampled cases.",
                 "No empirical evidence tests the mechanism in rural cases.",
             ],
-            "future_research": ["Replicate institutional trust findings with rural populations."],
-        }
+            "future_research": [future_research],
+        },
+        {**profile("b", method="case study"), "future_research": [future_research]},
     ]
     gaps = build_quality_report(rows)["gap_registry"]["gaps"]
     missing = {row["precise_missing_evidence"] for row in gaps}
     assert "Results may not generalize beyond the sampled cases." not in missing
-    assert "No empirical evidence tests the mechanism in rural cases." not in missing
-    assert "Replicate institutional trust findings with rural populations." in missing
+    assert "No empirical evidence tests the mechanism in rural cases." in missing
+    assert future_research in missing
 
 
 def test_author_gap_observed_pattern_uses_stable_claim_order() -> None:
     row = profile("a")
-    row["findings"] = [
+    later = deepcopy(row["findings"][0])
+    earlier = deepcopy(row["findings"][0])
+    later.update(
         {
+            "evidence_anchor_id": "claim-z",
             "claim_id": "claim-z",
             "claim": "The later claim text.",
-            "topic": "institutional trust",
-            "direction": "positive",
             "locator": "p. 12",
-        },
+        }
+    )
+    earlier.update(
         {
+            "evidence_anchor_id": "claim-a",
             "claim_id": "claim-a",
             "claim": "The earlier claim text.",
-            "topic": "institutional trust",
-            "direction": "positive",
             "locator": "p. 11",
-        },
+        }
+    )
+    row["findings"] = [
+        later,
+        earlier,
     ]
     row["future_research"] = ["Replicate institutional trust findings in rural populations."]
     normalized = normalize_evidence_profiles([row])
@@ -773,7 +1071,7 @@ def test_author_gap_observed_pattern_uses_stable_claim_order() -> None:
 
 @pytest.mark.parametrize(
     ("answer_status", "expected"),
-    [("answered", "rejected_answered_elsewhere"), ("partial", "narrowed_gap_lead")],
+    [("answered", "answered_within_collection"), ("partial", "narrowed_by_collection")],
 )
 def test_internal_search_rejects_or_narrows_when_answered_elsewhere(answer_status: str, expected: str) -> None:
     signal = {
@@ -837,7 +1135,7 @@ def test_same_rule_answer_on_unrelated_subject_cannot_reject_gap() -> None:
         for row in build_quality_report(rows)["gap_registry"]["gaps"]
         if row["rule"] == "empirical_coverage"
     )
-    assert gap["status"] == "mapped_collection_gap"
+    assert gap["status"] == "collection_surviving_gap"
     assert gap["countervailing_evidence"] == []
 
 
@@ -879,7 +1177,7 @@ def test_gap_support_requires_explicit_or_semantic_link_to_the_gap_signal() -> N
         for row in build_quality_report(explicitly_linked_rows)["gap_registry"]["gaps"]
         if row["rule"] == "replication"
     )
-    assert linked_gap["status"] == "mapped_collection_gap"
+    assert linked_gap["status"] == "collection_surviving_gap"
     assert linked_gap["promoted"] is True
     assert {row["claim_id"] for row in linked_gap["supporting_evidence"]} == {"claim-a", "claim-b"}
 
@@ -1002,44 +1300,68 @@ def test_compatibility_entry_accepts_current_rows_writes_all_outputs_and_has_no_
         question="What changes trust?",
         run_id="compatibility",
     )
-    assert cluster_map["clusters"]
+    assert cluster_map["status"] == "complete_no_analytical_clusters"
+    assert cluster_map["clusters"] == []
+    assert cluster_map["topic_neighborhoods"] == []
+    assert cluster_map["navigation"]["unconfirmed_zotero_tag_count"] == 2
+    assert {
+        row["reason"] for row in cluster_map["unclustered_sources"]
+    } == {"no_comparable_multi_source_proposition"}
     assert gap_map["gap_candidates"] == []
     assert gap_map["status"] == "complete_no_qualifying_gaps"
-    assert packet["mapper_version"] == "0.5.0"
+    assert packet["mapper_version"] == "0.8.0"
     assert all(path.exists() for path in paths)
     manifest = yaml.safe_load((tmp_path / "03_literature_synthesis" / "manifest.yml").read_text())
     assert set(manifest["artifacts"]) == {
             "manifest",
             "cluster_registry",
             "cluster_ledger",
-            "cluster_syntheses",
-            "evidence_matrices",
+        "cluster_syntheses",
+        "study_lineage_registry",
+        "independence_assessments",
+        "cluster_source_contributions",
+        "quantitative_comparisons",
+        "locator_audit",
+        "coverage_register",
+        "tag_concept_registry",
+        "evidence_matrices",
+        "topic_neighborhoods",
+        "subject_tag_registry",
+        "subject_tag_assignments",
+        "typed_source_relations",
+        "navigation_audit",
+        "propositions",
         "debate_registry",
         "gap_registry",
-            "gap_memory",
-            "gap_merge_ledger",
+        "gap_memory",
+        "gap_merge_ledger",
         "internal_search_log",
         "packet",
+        "literature_map_markdown",
+        "literature_neighborhoods_markdown",
         "index",
         "canonical_map",
     }
-    assert "Candidate gap requiring falsification" not in (tmp_path / "03_literature_synthesis" / "INDEX.md").read_text()
-    cluster = cluster_map["clusters"][0]
-    cluster_path = tmp_path / "03_literature_synthesis" / "clusters" / f"{cluster_note_stem(cluster)}.md"
-    cluster_frontmatter = yaml.safe_load(cluster_path.read_text().split("\n---\n", 1)[0].removeprefix("---\n"))
-    assert cluster_frontmatter["type"] == "literature_cluster"
-    assert cluster_frontmatter["title"] == cluster_display_title(cluster)
-    assert cluster["cluster_id"] in cluster_frontmatter["aliases"]
-    assert cluster_path.name.startswith("Cluster - Institutional")
-    assert cluster["cluster_id"] in cluster_path.name
-    assert "auto-zettelkasten/cluster" in cluster_frontmatter["tags"]
-    assert "shared-topic" in cluster_frontmatter["tags"]
-    assert set(cluster_frontmatter["sources"]) == {
-        "[[a|Institutional Trust Reform]]",
-        "[[b|Institutional Trust Participation]]",
-    }
+    map_text = Path(manifest["artifacts"]["literature_map_markdown"]).read_text()
+    assert "Candidate gap requiring falsification" not in map_text
+    for heading in (
+        "# Literature Map",
+        "## What this map does",
+        "## Collection verdict",
+        "## Clusters at a glance",
+        "## How the clusters relate",
+        "## Collection gaps",
+        "## Coverage and limits",
+        "## Navigate",
+    ):
+        assert heading in map_text
+    assert "No analytical clusters were admitted in this map." in map_text
+    assert "No gap survived the collection-wide" in map_text
+    assert "Dependency hash" not in map_text and "fingerprint" not in map_text
+    cluster_root = tmp_path / "03_literature_synthesis" / "clusters"
+    assert list(cluster_root.glob("Cluster - *.md")) == []
 
-    old_cluster_path = cluster_path.with_name(f"{cluster['cluster_id']}.md")
+    old_cluster_path = cluster_root / "cluster-old-id.md"
     old_gap_path = tmp_path / "03_literature_synthesis" / "gaps" / "candidates" / "gap-old-id.md"
     old_cluster_path.write_text("stale generated projection")
     old_gap_path.write_text("stale generated projection")
@@ -1052,7 +1374,6 @@ def test_compatibility_entry_accepts_current_rows_writes_all_outputs_and_has_no_
     )
     assert not old_cluster_path.exists()
     assert not old_gap_path.exists()
-    assert cluster_path.exists()
 
     map_root = Path(packet["map_path"])
     assert map_root.name == stable_literature_map_id(source_set, "What changes trust?")
@@ -1062,6 +1383,8 @@ def test_compatibility_entry_accepts_current_rows_writes_all_outputs_and_has_no_
         "cluster_ledger.yml",
         "cluster_syntheses.yml",
         "evidence_matrices.yml",
+        "topic_neighborhoods.yml",
+        "propositions.yml",
         "debate_registry.yml",
         "gap_registry.yml",
         "gap_memory.yml",
@@ -1073,6 +1396,9 @@ def test_compatibility_entry_accepts_current_rows_writes_all_outputs_and_has_no_
         "gaps/INDEX.md",
     ):
         assert (map_root / relative).is_file(), relative
+    canonical_manifest = yaml.safe_load((map_root / "manifest.yml").read_text())
+    assert Path(canonical_manifest["artifacts"]["literature_map_markdown"]).read_text() == map_text
+    assert "the collection literature map" in (map_root / "INDEX.md").read_text()
 
 
 def test_gap_markdown_has_native_tags_and_reciprocal_evidence_links(tmp_path: Path) -> None:
@@ -1127,9 +1453,8 @@ def test_gap_markdown_has_native_tags_and_reciprocal_evidence_links(tmp_path: Pa
     assert gap["gap_id"] in frontmatter["aliases"]
     assert gap_path.name.startswith("Gap - An independent replication")
     assert gap["gap_id"] in gap_path.name
-    assert "auto-zettelkasten/gap" in frontmatter["tags"]
-    assert "auto-zettelkasten/gap/replication" in frontmatter["tags"]
-    assert "shared-topic" in frontmatter["tags"]
+    assert "concept/institutional-trust" in frontmatter["tags"]
+    assert all(not tag.startswith("auto-zettelkasten/") for tag in frontmatter["tags"])
     assert set(frontmatter["sources"]) == {
         "[[a|Institutional Trust in A]]",
         "[[b|Institutional Trust in B]]",
@@ -1146,12 +1471,14 @@ def test_gap_markdown_has_native_tags_and_reciprocal_evidence_links(tmp_path: Pa
     cluster_frontmatter = yaml.safe_load(cluster_text.split("\n---\n", 1)[0].removeprefix("---\n"))
     expected_gap_link = f"[[{gap_note_stem(gap)}|{gap_display_title(gap)}]]"
     assert cluster_frontmatter["related_gaps"] == [expected_gap_link]
-    linked_callout = (
-        f"> [!question] [[{gap_note_stem(gap)}|Research opportunity: "
-        f"{gap_display_title(gap).removeprefix('Gap: ')}]]"
-    )
-    assert linked_callout in cluster_text
-    assert "## Gaps Emerging from This Cluster" not in cluster_text
+    cluster_body = cluster_text.split("\n---\n", 1)[1]
+    gap_body = text.split("\n---\n", 1)[1]
+    assert "## Collection gaps" in cluster_body
+    assert expected_gap_link in cluster_body
+    assert "## Why findings differ" not in cluster_body
+    assert "## Counterevidence and limits" not in gap_body
+    assert "claim-a" not in cluster_body and "claim-b" not in cluster_body
+    assert "claim-a" not in gap_body and "claim-b" not in gap_body
 
 
 def test_human_facing_cluster_and_gap_titles_keep_normal_descriptive_labels() -> None:
@@ -1175,7 +1502,9 @@ def test_reasoned_cluster_markdown_explains_findings_debate_and_gap_lineage(tmp_
         {**profile("a", direction="positive"), "note_path": "02_source_memory/notes/a.md"},
         {**profile("b", direction="negative", method="case study"), "note_path": "02_source_memory/notes/b.md"},
     ]
-    cluster_id = cluster_for(rows)["cluster_id"]
+    cluster_probe = cluster_for(rows)
+    cluster_id = cluster_probe["cluster_id"]
+    proposition_id = cluster_probe["proposition_ids"][0]
     evidence = [
         {"source_id": "a", "claim_id": "claim-a", "locator": "p. 10"},
         {"source_id": "b", "claim_id": "claim-b", "locator": "p. 10"},
@@ -1187,32 +1516,50 @@ def test_reasoned_cluster_markdown_explains_findings_debate_and_gap_lineage(tmp_
                 "scope": "How institutional trust changes participation outcomes.",
                 "boundaries": ["The mapped evidence covers two study settings."],
                 "coherence_rationale": "Both studies estimate the same trust-participation relationship.",
-                "synthesis": "The studies agree that trust matters, but disagree about the direction under different designs.",
+                "synthesis": (
+                    "## Synthesis\n\nThe two studies address the same trust-participation proposition but report estimates in opposite "
+                    "directions. Read together, they do not support a single collection-wide direction; instead, the "
+                    "evidence indicates that the relationship is conditional on study setting or design. The panel and "
+                    "case-study evidence are comparable enough to expose the disagreement, but not enough to determine "
+                    "which methodological or contextual difference accounts for it. The cluster therefore establishes "
+                    "a genuine mapped debate while preserving the limits of two study settings."
+                ),
+                "debate_state": "mapped_debate",
                 "supporting_evidence": evidence,
-                "central_findings": [
-                    {
-                        "technical_finding": "The two estimates point in opposite directions.",
+                    "central_findings": [
+                        {
+                            "assertion": (
+                                "The two evidence bases estimate the same institutional-trust and participation "
+                                "relationship but report opposite directions. In plain English, higher trust aligns "
+                                "with more participation in one setting and less participation in the other. This is "
+                                "a genuine collection-level disagreement, not a pooled estimate, and the different "
+                                "research designs leave the map unable to decide whether the reversal reflects context, "
+                                "measurement, or method. The collection therefore supports a mapped disagreement while "
+                                "preserving uncertainty about the explanation for it."
+                            ),
                         "plain_english_meaning": "In practical terms, higher trust aligns with participation in one study and lower participation in the other.",
                         "evidence": evidence,
+                        "proposition_ids": [proposition_id],
                     }
                 ],
                 "agreements": [],
                 "positions": [
-                    {"position": "Trust increases participation.", "evidence": [evidence[0]]},
-                    {"position": "Trust decreases participation.", "evidence": [evidence[1]]},
+                        {"position": "Trust has a positive association with participation.", "evidence": [evidence[0]], "proposition_ids": [proposition_id]},
+                        {"position": "Trust has a negative association with participation.", "evidence": [evidence[1]], "proposition_ids": [proposition_id]},
                 ],
                 "contradictions": [
                     {
                         "proposition": "Direction of the trust-participation relationship",
                         "contradiction": "The estimated direction reverses across the two studies.",
                         "evidence": evidence,
+                        "proposition_ids": [proposition_id],
                     }
                 ],
                 "boundary_conditions": [
-                    {"boundary": "The estimates use different study designs.", "evidence": evidence}
+                    {"assertion": "The estimates use different study designs.", "evidence": evidence, "proposition_ids": [proposition_id]}
                 ],
                 "methodological_fault_lines": [
-                    {"fault_line": "Panel regression versus case-study inference.", "evidence": evidence}
+                    {"assertion": "Panel regression versus case-study inference.", "evidence": evidence, "proposition_ids": [proposition_id]}
                 ],
                 "related_clusters": [],
                 "source_roles": [
@@ -1229,13 +1576,15 @@ def test_reasoned_cluster_markdown_explains_findings_debate_and_gap_lineage(tmp_
                         "why_matters": "The collection cannot tell whether the contradiction is substantive or design-driven.",
                         "contribution": "A matched design would adjudicate the mapped contradiction.",
                         "related_cluster_ids": [cluster_id],
+                        "proposition_id": proposition_id,
+                        "originating_cluster_revision": cluster_probe["revision_hash"],
                         "supporting_evidence": evidence,
                     }
                 ],
             }
         }
     }
-    cluster_map, gap_map, _, _ = build_literature_map(
+    cluster_map, gap_map, packet, _ = build_literature_map(
         tmp_path,
         source_set={"source_set_id": "set-reasoned", "dependency_hash": "dependency"},
         notes=[],
@@ -1252,27 +1601,47 @@ def test_reasoned_cluster_markdown_explains_findings_debate_and_gap_lineage(tmp_
     gap_text = (
         tmp_path / "03_literature_synthesis" / "gaps" / "candidates" / f"{gap_note_stem(gap)}.md"
     ).read_text()
+    cluster_body = cluster_text.split("\n---\n", 1)[1]
+    gap_body = gap_text.split("\n---\n", 1)[1]
     for heading in (
-        "## Central Findings",
-        "## Debate Positions",
-        "## Contradictions",
-        "## Boundary Conditions",
-        "## Methodological and Measurement Fault Lines",
+        "## Findings and interpretation",
+        "## Relationship among the findings",
+        "### Positions",
+        "### Contradictions",
+        "## Why findings differ",
+        "### Boundaries",
+        "### Method and measurement differences",
+        "## Collection gaps",
+        "## Proposition matrix",
     ):
-        assert heading in cluster_text
-    assert "## Gaps Emerging from This Cluster" not in cluster_text
-    assert "> [!question] [[" in cluster_text
-    assert "> **Puzzle:**" in cluster_text
-    assert "> **Payoff:**" in cluster_text
-    assert "> **Test:**" in cluster_text
-    assert "Plain English:" in cluster_text
-    assert "Panel regression versus case-study inference." in cluster_text
-    assert "`claim-a`" in cluster_text and "p. 10" in cluster_text
-    assert "## How the System Identified This Gap" in gap_text
-    assert "## Why This Is Not an Obvious Gap" in gap_text
-    assert "## Executable Study Design" in gap_text
-    assert "panel-regression and case-study evidence" in gap_text
-    assert f"[[{cluster_note_stem(cluster)}|{cluster_display_title(cluster)}]]" in gap_text
+        assert heading in cluster_body
+    assert "### Agreements" not in cluster_body
+    assert "In plain English:" in cluster_body
+    assert "Panel regression versus case-study inference." in cluster_body
+    assert "[[Literature Neighborhoods - set-reasoned#" in cluster_body
+    assert "claim-a" not in cluster_body and "claim-b" not in cluster_body
+    assert "p. 10" in cluster_body
+    assert "## Where the gap came from" in gap_body
+    assert "Originating proposition:" in gap_body
+    assert "Missing evidence-matrix cell:" in gap_body
+    assert "## Why the mapper raised it" in gap_body
+    assert "## A path to resolving it" in gap_body
+    assert "panel-regression and case-study evidence" in gap_body
+    assert "claim-a" not in gap_body and "claim-b" not in gap_body
+    assert f"[[{cluster_note_stem(cluster)}|{cluster_display_title(cluster)}]]" in gap_body
+    manifest = yaml.safe_load((tmp_path / "03_literature_synthesis" / "manifest.yml").read_text())
+    map_text = Path(manifest["artifacts"]["literature_map_markdown"]).read_text()
+    assert "## What this map does" in map_text
+    assert "## Clusters at a glance" in map_text
+    assert f"### [[{cluster_note_stem(cluster)}|{cluster_display_title(cluster)}]]" in map_text
+    assert "The two evidence bases estimate the same institutional-trust" in map_text
+    assert "**Verdict:** ## Synthesis" not in map_text
+    assert "No gap survived the collection-wide" not in map_text
+    assert Path(packet["literature_map_markdown"]).read_text() == map_text
+    assert "the collection literature map" in (Path(packet["map_path"]) / "INDEX.md").read_text()
+    cluster_index_text = (tmp_path / "03_literature_synthesis" / "clusters" / "INDEX.md").read_text()
+    assert "The two evidence bases estimate the same institutional-trust" in cluster_index_text
+    assert "effective evidence bases" in cluster_index_text
 
 
 def test_synthesis_budget_resume_reuses_successful_calls_without_repayment(tmp_path: Path) -> None:
@@ -1305,9 +1674,29 @@ def test_synthesis_budget_resume_reuses_successful_calls_without_repayment(tmp_p
                 "cluster_id": cluster["cluster_id"],
                 "scope": cluster["shared_question"],
                 "coherence_rationale": cluster["coherence_rationale"],
-                "synthesis": "The two sources address the same relationship.",
+                "synthesis": (
+                    "The two sources address the same relationship and provide independent evidence for a bounded "
+                    "collection-level consensus. Their findings are comparable because they use the same proposition "
+                    "and outcome, while their different methods provide complementary perspectives rather than a "
+                    "contradiction. The evidence remains associational, so the cluster does not establish a causal "
+                    "effect or generalize beyond the mapped settings. The resulting verdict is that the shared pattern "
+                    "is credible inside this collection but still constrained by design and coverage limits."
+                ),
+                "boundaries": ["The verdict is limited to the two mapped study settings."],
+                "debate_state": "mapped_consensus",
                 "supporting_evidence": evidence,
-                "central_findings": [{"finding": "The findings are comparable.", "evidence": evidence}],
+                "central_findings": [
+                    {
+                        "finding": (
+                            "The two independent evidence bases report the same bounded association for the mapped "
+                            "proposition. In plain English, both sources identify a shared pattern, but neither "
+                            "establishes that the relationship is causal. Their different methods add useful context "
+                            "without changing the direction of the result, while the represented settings and outcome "
+                            "definitions limit any broader generalization beyond this collection."
+                        ),
+                        "evidence": evidence,
+                    }
+                ],
             }
 
     source_set = {"source_set_id": "set-checkpoint", "dependency_hash": "dependency"}
@@ -1364,6 +1753,168 @@ def test_synthesis_budget_resume_reuses_successful_calls_without_repayment(tmp_p
     assert replay_packet["synthesis_checkpoint_hit_count"] == 2
 
 
+def test_cluster_proposal_checkpoint_invalidates_when_profile_eligibility_changes(tmp_path: Path) -> None:
+    rows = [profile("a"), profile("b"), profile("c")]
+
+    class Reasoner:
+        name = "profile-content-reasoner"
+        model = "profile-content-v1"
+        is_cloud = False
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def propose_clusters(self, profiles, request, *, context=None):
+            self.calls += 1
+            return {"clusters": []}
+
+    source_set = {"source_set_id": "set-profile-content", "dependency_hash": "dependency"}
+    request = LiteratureMapRequest(
+        workspace=tmp_path,
+        source_set_id="set-profile-content",
+        run_id="profile-content-invalidation",
+        provider="ollama",
+        model="profile-content-v1",
+    )
+    first_reasoner = Reasoner()
+    build_literature_map(
+        tmp_path,
+        source_set=source_set,
+        notes=[],
+        profiles=rows,
+        question=None,
+        run_id="profile-content-invalidation",
+        request=request,
+        reasoner=first_reasoner,
+    )
+    assert first_reasoner.calls == 1
+
+    # The evidence-anchor revision and note dependency are unchanged, but the
+    # profile is no longer eligible for analytical synthesis. Reusing the old
+    # proposal would silently reason over the wrong evidence set.
+    changed_rows = [dict(row) for row in rows]
+    changed_rows[0]["excluded_from_synthesis"] = True
+    changed_rows[0]["exclusion_reason"] = "profile_or_note_validation_failed:legacy_gate"
+    second_reasoner = Reasoner()
+    _, _, packet, _ = build_literature_map(
+        tmp_path,
+        source_set=source_set,
+        notes=[],
+        profiles=changed_rows,
+        question=None,
+        run_id="profile-content-invalidation",
+        request=request,
+        reasoner=second_reasoner,
+    )
+
+    assert second_reasoner.calls == 1
+    assert packet["synthesis_call_count"] == 1
+    assert packet["synthesis_checkpoint_hit_count"] == 0
+
+
+def test_incomplete_cluster_verdict_gets_one_checkpointed_repair_call(tmp_path: Path) -> None:
+    rows = [profile("a"), profile("b", method="case study")]
+
+    class Reasoner:
+        name = "repair-reasoner"
+        model = "repair-v1"
+        is_cloud = False
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def propose_clusters(self, profiles, request, *, context=None):
+            self.calls.append("proposal")
+            return {"clusters": []}
+
+        def synthesize_cluster(self, profiles, request, *, context=None):
+            is_repair = bool((context or {}).get("repair_requirements"))
+            self.calls.append("repair" if is_repair else "synthesis")
+            cluster = context["cluster"]
+            evidence = [
+                {
+                    "source_id": row["source_id"],
+                    "claim_id": row["claims"][0]["claim_id"],
+                    "locator": row["claims"][0]["locator"],
+                }
+                for row in profiles
+            ]
+            return {
+                "cluster_id": cluster["cluster_id"],
+                "scope": cluster["shared_question"],
+                "coherence_rationale": cluster["coherence_rationale"],
+                "synthesis": (
+                    "The two sources address the same proposition and support a bounded collection-level consensus. "
+                    "Their independent evidence is comparable across the mapped outcome, while the different methods "
+                    "provide complementary perspectives rather than a contradiction. The relationship remains "
+                    "associational and cannot establish a causal effect beyond the represented settings. The cluster "
+                    "therefore supports the shared pattern while preserving clear design and coverage limits."
+                    if is_repair
+                    else ""
+                ),
+                "boundaries": ["The verdict is limited to the two represented settings."],
+                "debate_state": "mapped_consensus",
+                "supporting_evidence": evidence,
+                "central_findings": [
+                    {
+                        "finding": (
+                            "The two independent evidence bases report the same bounded association for the mapped "
+                            "proposition. In plain English, both sources identify a shared pattern, but neither "
+                            "establishes that the relationship is causal. Their different methods add useful context "
+                            "without changing the direction of the result, while the represented settings and outcome "
+                            "definitions limit any broader generalization beyond this collection."
+                            if is_repair
+                            else "The findings are comparable."
+                        ),
+                        "evidence": evidence,
+                    }
+                ],
+            }
+
+    source_set = {"source_set_id": "set-repair", "dependency_hash": "dependency"}
+    request = LiteratureMapRequest(
+        workspace=tmp_path,
+        source_set_id="set-repair",
+        run_id="synthesis-repair",
+        provider="ollama",
+        model="repair-v1",
+        literature_policy=LiteratureMappingPolicy(max_synthesis_calls=3),
+    )
+    reasoner = Reasoner()
+    cluster_map, _, packet, _ = build_literature_map(
+        tmp_path,
+        source_set=source_set,
+        notes=[],
+        profiles=rows,
+        question=None,
+        run_id="synthesis-repair",
+        request=request,
+        reasoner=reasoner,
+    )
+
+    assert reasoner.calls == ["proposal", "synthesis", "repair"]
+    assert packet["synthesis_call_count"] == 3
+    assert packet["status"] == "complete"
+    synthesis = next(iter(cluster_map["cluster_syntheses"].values()))
+    assert synthesis["status"] == "reasoned"
+    assert synthesis["repair_attempted"] is True
+
+    replay = Reasoner()
+    _, _, replay_packet, _ = build_literature_map(
+        tmp_path,
+        source_set=source_set,
+        notes=[],
+        profiles=rows,
+        question=None,
+        run_id="synthesis-repair",
+        request=request,
+        reasoner=replay,
+    )
+    assert replay.calls == []
+    assert replay_packet["synthesis_call_count"] == 0
+    assert replay_packet["synthesis_checkpoint_hit_count"] == 3
+
+
 def test_failed_synthesis_call_leaves_a_resumable_diagnostic_record(tmp_path: Path) -> None:
     rows = [profile("a"), profile("b", method="case study")]
 
@@ -1409,6 +1960,122 @@ def test_failed_synthesis_call_leaves_a_resumable_diagnostic_record(tmp_path: Pa
         "message": "provider returned malformed cluster JSON",
     }
     assert "response" not in failure
+
+
+def test_failed_paid_synthesis_response_is_revalidated_without_a_repeat_call(tmp_path: Path) -> None:
+    from auto_zettelkasten.literature import _CheckpointedReasonerCalls
+
+    rows = [profile("a"), profile("b", method="case study")]
+    raw_response = {
+        "clusters": [
+            {
+                "proposal_id": "proposal-1",
+                "label": "Mediator legitimacy",
+                "source_ids": ["source-a", "source-b"],
+                "source_roles": ["core", "core"],
+                "propositions": [
+                    {
+                        "statement": "Mediator legitimacy shapes agreement durability.",
+                        "participating_core_sources": ["source-a", "source-b"],
+                        "source_id": "source-a",
+                        "evidence_anchor_id": "anchor-a",
+                        "locator": "p. 10",
+                    }
+                ],
+            }
+        ]
+    }
+
+    class FailedAfterTransportReasoner:
+        name = "recoverable-reasoner"
+        model = "recoverable-v1"
+        last_literature_response = raw_response
+
+        def propose_clusters(self, profiles, request, *, context=None):
+            raise ValueError("local response adapter rejected provider aliases")
+
+    request = LiteratureMapRequest(
+        workspace=tmp_path,
+        source_set_id="set-raw-recovery",
+        run_id="raw-recovery",
+        provider="ollama",
+        model="recoverable-v1",
+    )
+    first = _CheckpointedReasonerCalls(
+        tmp_path,
+        "raw-recovery",
+        FailedAfterTransportReasoner(),
+        request,
+    )
+    with pytest.raises(ValueError, match="adapter rejected"):
+        first("cluster_proposal", "collection", "propose_clusters", rows, {})
+
+    checkpoint_path = (
+        tmp_path / "11_state/runs/raw-recovery/literature/synthesis/cluster_proposal/collection.yml"
+    )
+    failure = yaml.safe_load(checkpoint_path.read_text())
+    assert failure["raw_response"] == raw_response
+
+    class NoRepeatReasoner(FailedAfterTransportReasoner):
+        def propose_clusters(self, profiles, request, *, context=None):
+            raise AssertionError("paid response was repeated")
+
+    resumed = _CheckpointedReasonerCalls(
+        tmp_path,
+        "raw-recovery",
+        NoRepeatReasoner(),
+        request,
+    )
+    recovered = resumed("cluster_proposal", "collection", "propose_clusters", rows, {})
+
+    assert recovered["clusters"][0]["propositions"][0]["source_ids"] == ["source-a", "source-b"]
+    assert resumed.provider_calls == 0
+    assert resumed.checkpoint_hits == 1
+    checkpoint = yaml.safe_load(checkpoint_path.read_text())
+    assert checkpoint["status"] == "completed"
+    assert checkpoint["recovered_from_failed_raw_response"] is True
+
+
+def test_successful_paid_response_is_revalidated_after_local_algorithm_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from auto_zettelkasten import literature
+    from auto_zettelkasten.literature import _CheckpointedReasonerCalls
+
+    rows = [profile("a"), profile("b", method="case study")]
+
+    class Reasoner:
+        name = "local-revalidation-reasoner"
+        model = "local-revalidation-v1"
+        is_cloud = False
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def propose_clusters(self, profiles, request, *, context=None):
+            self.calls += 1
+            return {"clusters": []}
+
+    request = LiteratureMapRequest(
+        workspace=tmp_path,
+        source_set_id="set-local-revalidation",
+        run_id="local-revalidation",
+        provider="ollama",
+        model="local-revalidation-v1",
+    )
+    first_reasoner = Reasoner()
+    first = _CheckpointedReasonerCalls(tmp_path, "local-revalidation", first_reasoner, request)
+    assert first("cluster_proposal", "collection", "propose_clusters", rows, {}) == {"clusters": []}
+    assert first_reasoner.calls == 1
+
+    monkeypatch.setattr(literature, "PROPOSITION_ALGORITHM_VERSION", "local-repair")
+    replay_reasoner = Reasoner()
+    replay = _CheckpointedReasonerCalls(tmp_path, "local-revalidation", replay_reasoner, request)
+    assert replay("cluster_proposal", "collection", "propose_clusters", rows, {}) == {"clusters": []}
+    assert replay_reasoner.calls == 0
+    assert replay.provider_calls == 0
+    assert replay.checkpoint_hits == 1
 
 
 def test_synthesis_checkpoint_history_preserves_paid_successes_across_policy_changes(tmp_path: Path) -> None:
@@ -1510,6 +2177,8 @@ def test_gap_adjudication_rejections_are_audit_only_and_retained_rationales_win(
         }
     ]
     candidates = [
+        with_proposition_lineage(candidate, rows)
+        for candidate in [
         {
             "gap_id": "gap-retained",
             "rule": "empirical_coverage",
@@ -1525,6 +2194,7 @@ def test_gap_adjudication_rejections_are_audit_only_and_retained_rationales_win(
             "supporting_evidence": evidence,
             "rule_results": [{"analytical_profile_count_searched": 2}],
         },
+        ]
     ]
     response = {
         "gaps": [
@@ -1558,12 +2228,8 @@ def test_gap_adjudication_rejections_are_audit_only_and_retained_rationales_win(
             "obvious_answer_not_falsified",
         ),
         (
-            lambda rationale: rationale["study_design"].update(
-                comparator="",
-                identification_or_inference_strategy="process tracing",
-                falsification_or_process_tests=[],
-            ),
-            "missing_study_design_comparator",
+            lambda rationale: rationale["resolution_path"]["requirements"].update(comparison=""),
+            "missing_resolution_path_comparison",
         ),
     ],
 )
@@ -1590,7 +2256,8 @@ def test_obvious_or_nonexecutable_gaps_are_audit_only(mutation, expected_reason:
     candidate = next(
         row
         for row in probe["gap_registry"]["rejected_candidates"]
-        if row.get("status") == "rejected_gap_quality"
+        if "gap_adjudication_did_not_retain_candidate"
+        in (row.get("quality_rejection_reasons") or [])
     )
     rationale = _quality_rationale(candidate)
     mutation(rationale)
@@ -1600,7 +2267,7 @@ def test_obvious_or_nonexecutable_gaps_are_audit_only(mutation, expected_reason:
     rejected = next(
         row for row in report["gap_registry"]["rejected_candidates"] if row["gap_id"] == candidate["gap_id"]
     )
-    assert rejected["status"] == "rejected_gap_quality"
+    assert rejected["status"] == "underspecified_gap"
     assert expected_reason in rejected["quality_rejection_reasons"]
 
 
@@ -1624,7 +2291,9 @@ def test_semantic_duplicate_gaps_merge_with_a_stable_audit_ledger() -> None:
         (
             row
             for row in probe["gap_registry"]["rejected_candidates"]
-            if row.get("status") == "rejected_gap_quality" and row.get("rule") == "replication"
+            if row.get("rule") == "replication"
+            and "gap_adjudication_did_not_retain_candidate"
+            in (row.get("quality_rejection_reasons") or [])
         ),
         key=lambda row: row["gap_id"],
     )
@@ -1647,7 +2316,8 @@ def test_semantic_duplicate_gaps_merge_with_a_stable_audit_ledger() -> None:
         for row in report["gap_registry"]["rejected_candidates"]
         if row["gap_id"] == candidates[1]["gap_id"]
     )
-    assert merged["status"] == "merged_gap"
+    assert merged["status"] == "underspecified_gap"
+    assert merged["adjudication_reason"].startswith(f"Merged into {candidates[0]['gap_id']}")
 
 
 def test_rejected_gap_does_not_reserve_structured_signature() -> None:
@@ -1662,6 +2332,8 @@ def test_rejected_gap_does_not_reserve_structured_signature() -> None:
         }
     ]
     candidates = [
+        with_proposition_lineage(candidate, rows)
+        for candidate in [
         {
             "gap_id": "gap-low-quality",
             "rule": "replication",
@@ -1678,6 +2350,7 @@ def test_rejected_gap_does_not_reserve_structured_signature() -> None:
             "supporting_evidence": evidence,
             "rule_results": [{"analytical_profile_count_searched": 2}],
         },
+        ]
     ]
     low_quality = _quality_rationale(candidates[0])
     low_quality["value_assessment"]["information_gain"] = "low"
@@ -1690,39 +2363,47 @@ def test_rejected_gap_does_not_reserve_structured_signature() -> None:
     )
 
     assert [row["gap_id"] for row in visible] == ["gap-valid"]
-    assert next(row for row in rejected if row["gap_id"] == "gap-low-quality")[
-        "status"
-    ] == "rejected_gap_quality"
+    low_quality_rejection = next(row for row in rejected if row["gap_id"] == "gap-low-quality")
+    assert low_quality_rejection["status"] == "underspecified_gap"
+    assert "insufficient_information_gain" in low_quality_rejection["quality_rejection_reasons"]
 
 
 def test_gap_merge_rejects_structurally_unrelated_candidate() -> None:
     from auto_zettelkasten.literature import _apply_gap_adjudication
 
-    rows = normalize_evidence_profiles([profile("a"), profile("b", method="case study")])
-    evidence = [
-        {
-            "source_id": rows[0]["source_id"],
-            "claim_id": rows[0]["claims"][0]["claim_id"],
-            "locator": rows[0]["claims"][0]["locator"],
+    rows = normalize_evidence_profiles(
+        [
+            profile("a"),
+            profile("b", method="case study"),
+            profile("c", topic="ocean salinity"),
+            profile("d", topic="ocean salinity", method="field experiment"),
+        ]
+    )
+    evidence_by_source = {
+        row["source_id"]: {
+            "source_id": row["source_id"],
+            "claim_id": row["claims"][0]["claim_id"],
+            "locator": row["claims"][0]["locator"],
         }
-    ]
+        for row in rows
+    }
     candidates = [
-        {
+        with_proposition_lineage({
             "gap_id": "gap-trust",
             "rule": "replication",
             "topic": "institutional trust",
             "precise_missing_evidence": "Replicate institutional trust estimates.",
-            "supporting_evidence": evidence,
-            "rule_results": [{"analytical_profile_count_searched": 2}],
-        },
-        {
+            "supporting_evidence": [evidence_by_source["a"]],
+            "rule_results": [{"analytical_profile_count_searched": 4}],
+        }, rows, "institutional trust"),
+        with_proposition_lineage({
             "gap_id": "gap-salinity",
             "rule": "measurement_or_data",
             "topic": "ocean salinity",
             "precise_missing_evidence": "Validate deep-water salinity sensors.",
-            "supporting_evidence": evidence,
-            "rule_results": [{"analytical_profile_count_searched": 2}],
-        },
+            "supporting_evidence": [evidence_by_source["c"]],
+            "rule_results": [{"analytical_profile_count_searched": 4}],
+        }, rows, "ocean salinity"),
     ]
     rationale = _quality_rationale(candidates[0])
     rationale["merged_from_gap_ids"] = ["gap-salinity"]
@@ -1736,7 +2417,8 @@ def test_gap_merge_rejects_structurally_unrelated_candidate() -> None:
     assert visible[0]["merged_from_gap_ids"] == []
     assert visible[0]["merge_events"] == []
     unrelated = next(row for row in rejected if row["gap_id"] == "gap-salinity")
-    assert unrelated["status"] == "rejected_gap_quality"
+    assert unrelated["status"] == "underspecified_gap"
+    assert "gap_adjudication_did_not_retain_candidate" in unrelated["quality_rejection_reasons"]
 
 
 def test_gap_reframing_can_change_rule_when_topic_and_claim_evidence_match() -> None:
@@ -1827,8 +2509,9 @@ def test_gap_reframing_rejects_unrelated_evidence() -> None:
     assert "reframing_not_evidence_constrained" in trust_rejection["quality_rejection_reasons"]
 
 
-def test_completed_checkpoint_cleans_stringified_single_value_scalar() -> None:
+def test_completed_checkpoint_normalizes_resolution_path_scalar_and_list_fields() -> None:
     from auto_zettelkasten.literature import _apply_gap_adjudication
+    from auto_zettelkasten.readers import _validate_literature_response
 
     rows = normalize_evidence_profiles([profile("a"), profile("b", method="case study")])
     evidence = [
@@ -1838,24 +2521,34 @@ def test_completed_checkpoint_cleans_stringified_single_value_scalar() -> None:
             "locator": rows[0]["claims"][0]["locator"],
         }
     ]
-    candidate = {
-        "gap_id": "gap-checkpoint-shape",
-        "rule": "boundary_condition",
-        "topic": "institutional trust",
-        "precise_missing_evidence": "Compare institutional trust across regional settings.",
-        "supporting_evidence": evidence,
-        "rule_results": [{"analytical_profile_count_searched": 2}],
-    }
+    candidate = with_proposition_lineage(
+        {
+            "gap_id": "gap-checkpoint-shape",
+            "rule": "boundary_condition",
+            "topic": "institutional trust",
+            "precise_missing_evidence": "Compare institutional trust across regional settings.",
+            "supporting_evidence": evidence,
+            "rule_results": [{"analytical_profile_count_searched": 2}],
+        },
+        rows,
+    )
     rationale = _quality_rationale(candidate)
-    rationale["study_design"]["ethical_constraints"] = "['standard research ethics']"
+    question = rationale["resolution_path"]["question"]
+    rationale["resolution_path"]["question"] = [question]
+    rationale["resolution_path"]["limitations"] = "Residual confounding"
+    response = _validate_literature_response(
+        {"gaps": [rationale], "rejected": []},
+        kind="gap_adjudication",
+    )
 
     visible, _ = _apply_gap_adjudication(
         [candidate],
-        {"gaps": [rationale], "rejected": []},
+        response,
         rows,
     )
 
-    assert visible[0]["study_design"]["ethical_constraints"] == "standard research ethics"
+    assert visible[0]["resolution_path"]["question"] == question
+    assert visible[0]["resolution_path"]["limitations"] == ["Residual confounding"]
 
 
 def test_multiple_valid_inline_anchors_in_one_cluster_are_preserved() -> None:
@@ -1941,7 +2634,7 @@ def test_audit_only_gap_creates_no_markdown_projection(tmp_path: Path) -> None:
     registry = yaml.safe_load(
         (tmp_path / "03_literature_synthesis" / "gap_registry.yml").read_text()
     )
-    assert any(row["status"] == "rejected_gap_quality" for row in registry["rejected_candidates"])
+    assert any(row["status"] == "underspecified_gap" for row in registry["rejected_candidates"])
 
 
 def test_public_run_entry_returns_report_and_map_id_ignores_run_timestamp(tmp_path: Path) -> None:
@@ -1989,17 +2682,22 @@ def test_cluster_lifecycle_history_is_isolated_per_canonical_map(tmp_path: Path)
     assert not any(cluster_id in repr(registry_a["ledger"]) for cluster_id in b_ids)
 
 
-def test_stage_callback_fires_before_each_systematic_stage() -> None:
+def test_stage_callback_fires_before_each_v06_systematic_stage() -> None:
     stages: list[str] = []
     build_literature_report([profile("a"), profile("b")], stage_callback=stages.append)
     assert stages == [
+        "evidence_anchors",
         "relation_mapping",
+        "topic_neighborhoods",
+        "proposition_mapping",
         "clustering",
         "evidence_matrices",
+        "support_validation",
         "cluster_synthesis",
         "debate_mapping",
         "gap_detection",
         "internal_falsification",
+        "resolution_paths",
         "projection",
     ]
 

@@ -10,6 +10,7 @@ from .models import (
     CURRENT_ENGINE_VERSION,
     ArtifactManifest,
     LiteratureMappingPolicy,
+    NavigationPolicy,
     ProcessingPolicy,
 )
 
@@ -25,6 +26,7 @@ CONFIG_FIELDS = {
     "parallel",
     "processing",
     "literature_mapping",
+    "navigation",
     "obsidian",
 }
 
@@ -111,6 +113,7 @@ def initialize(workspace: Path | str, *, overwrite: bool = False) -> ArtifactMan
                     "estimated_chars_per_token": 3.5,
                 },
                 "literature_mapping": LiteratureMappingPolicy().to_dict(),
+                "navigation": NavigationPolicy().to_dict(),
                 "obsidian": {"vault": ""},
             },
         )
@@ -152,10 +155,11 @@ def assert_compatible(workspace: Path | str) -> None:
         raise IncompatibleArtifactSchemaError(
             f"workspace config schema {config_version} disagrees with manifest schema {manifest_version}"
         )
-    supported = {(1, 0), (1, 1), (1, 2), (1, 3), (1, 4)}
+    supported = {(1, 0), (1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (1, 6), (1, 7)}
+    current = _parse_schema_version(CURRENT_ARTIFACT_SCHEMA_VERSION, field="current artifact schema")
     if manifest_version not in supported:
         actual = ".".join(str(value) for value in manifest_version)
-        relation = "newer than" if manifest_version > (1, 4) else "not supported by"
+        relation = "newer than" if manifest_version > current else "not supported by"
         raise IncompatibleArtifactSchemaError(
             f"workspace artifact schema {actual} is {relation} supported schema {CURRENT_ARTIFACT_SCHEMA_VERSION}"
         )
@@ -180,6 +184,11 @@ def load_config(workspace: Path | str) -> dict[str, Any]:
         if not isinstance(configured_policy, Mapping):
             raise ValueError("literature_mapping must be a mapping")
         LiteratureMappingPolicy.from_dict(configured_policy)
+    if "navigation" in config:
+        configured_navigation = config["navigation"]
+        if not isinstance(configured_navigation, Mapping):
+            raise ValueError("navigation must be a mapping")
+        NavigationPolicy.from_dict(configured_navigation)
     privacy = config.get("privacy", {})
     if not isinstance(privacy, Mapping):
         raise ValueError("privacy must be a mapping")

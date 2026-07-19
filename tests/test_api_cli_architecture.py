@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import json
 from pathlib import Path
+import tomllib
 
 import pytest
 
@@ -33,7 +34,14 @@ def test_inventory_only_writes_scope_manifest_and_resolves_selected(tmp_path: Pa
     assert result["item_count"] == 1
     assert result["collection_key"] == "SELECTEDKEY"
     assert result["source_set"]["zotero_collection_key"] == "SELECTEDKEY"
-    assert result["artifact_manifest"]["artifact_schema_version"] == "1.4"
+    assert result["artifact_manifest"]["artifact_schema_version"] == "1.7"
+
+
+def test_release_metadata_is_0_8_0() -> None:
+    pyproject = Path(__file__).parents[1] / "pyproject.toml"
+    payload = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+
+    assert payload["project"]["version"] == "0.8.0"
 
 
 def test_run_ids_cannot_escape_workspace_state(tmp_path: Path, sample_items) -> None:
@@ -96,6 +104,33 @@ def test_cli_init_status_and_collections_smoke(tmp_path: Path, monkeypatch, caps
     assert main(["zotero", "collections"]) == 0
     collection_payload = json.loads(capsys.readouterr().out)
     assert collection_payload["collections"] == [{"key": "C1"}]
+
+
+def test_cli_migrate_dry_run_reports_1_5_plan_without_mutation(tmp_path: Path, capsys) -> None:
+    workspace = tmp_path / "migration-workspace"
+    initialize_workspace(workspace)
+    for path in (
+        workspace / "auto-zettelkasten.yml",
+        workspace / "11_state" / "workspace_manifest.yml",
+    ):
+        payload = read_yaml(path)
+        payload.update(engine_version="0.5.0", artifact_schema_version="1.4")
+        write_yaml(path, payload)
+    before = {
+        path: path.read_bytes()
+        for path in (
+            workspace / "auto-zettelkasten.yml",
+            workspace / "11_state" / "workspace_manifest.yml",
+        )
+    }
+
+    assert main(["migrate", "--workspace", str(workspace), "--dry-run"]) == 0
+    result = json.loads(capsys.readouterr().out)
+
+    assert result["status"] == "dry_run"
+    assert result["provider_calls"] == 0
+    assert result["proposition_anchors"]["status"] == "dry_run"
+    assert all(path.read_bytes() == content for path, content in before.items())
 
 
 def test_cli_uses_workspace_provider_but_requires_per_run_cloud_consent(tmp_path: Path, monkeypatch, capsys) -> None:

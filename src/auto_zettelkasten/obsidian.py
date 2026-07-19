@@ -4,7 +4,7 @@ import re
 import shutil
 from pathlib import Path
 
-from .files import atomic_write_text, ensure_dir, now_iso, sha256_text, write_yaml
+from .files import atomic_write_text, ensure_dir, now_iso, read_yaml, sha256_text, write_yaml
 from .models import ArtifactManifest
 from .workspace import artifact_rows, assert_compatible, resolve_workspace
 
@@ -86,18 +86,49 @@ def export_obsidian(
     contents.setdefault(export_root / "Indexes" / "Source Index.md", "# Source Index\n\nNo validated atomic notes yet.\n")
     contents.setdefault(export_root / "Indexes" / "Cluster Index.md", "# Cluster Index\n\nNo canonical clusters yet.\n")
     contents.setdefault(export_root / "Indexes" / "Gap Index.md", "# Gap Candidate Index\n\nNo candidate gaps yet.\n")
-    if latest_map is not None and (latest_map / "INDEX.md").exists():
-        map_index = (latest_map / "INDEX.md").read_text(encoding="utf-8")
+    map_export_relative: Path | None = None
+    neighborhoods_export_relative: Path | None = None
+    if latest_map is not None:
+        map_manifest = read_yaml(latest_map / "manifest.yml", {}) or {}
+        artifacts = map_manifest.get("artifacts", {}) if isinstance(map_manifest, dict) else {}
+        primary_value = artifacts.get("literature_map_markdown", "") if isinstance(artifacts, dict) else ""
+        primary_path = Path(str(primary_value)) if primary_value else latest_map / "INDEX.md"
+        if not primary_path.is_file():
+            primary_path = latest_map / "INDEX.md"
+        neighborhoods_value = (
+            artifacts.get("literature_neighborhoods_markdown", "") if isinstance(artifacts, dict) else ""
+        )
+        neighborhoods_path = Path(str(neighborhoods_value)) if neighborhoods_value else Path()
+    else:
+        primary_path = Path()
+        neighborhoods_path = Path()
+    if latest_map is not None and primary_path.is_file():
+        map_index = primary_path.read_text(encoding="utf-8")
         map_index = map_index.replace("[[clusters/INDEX|Cluster Index]]", "[[Cluster Index]]")
         map_index = map_index.replace("[[gaps/INDEX|Gap Index]]", "[[Gap Index]]")
-        contents[export_root / "Indexes" / "Literature Map.md"] = map_index
+        map_index = map_index.replace("[[gaps/INDEX|Gap Registry Index]]", "[[Gap Index]]")
+        map_index = map_index.replace("[[02_source_memory/indexes/INDEX|Source Index]]", "[[Source Index]]")
+        map_export_relative = Path("Indexes") / primary_path.name
+        contents[export_root / map_export_relative] = map_index
+    if latest_map is not None and neighborhoods_path.is_file():
+        neighborhoods_export_relative = Path("Indexes") / neighborhoods_path.name
+        contents[export_root / neighborhoods_export_relative] = neighborhoods_path.read_text(encoding="utf-8")
     home = export_root / "Home.md"
     contents[home] = (
         "# Auto-Zettelkasten\n\n"
         "- [[Indexes/Source Index|Source Index]]\n"
         "- [[Indexes/Cluster Index|Cluster Index]]\n"
         "- [[Indexes/Gap Index|Gap Candidate Index]]\n\n"
-        + ("- [[Indexes/Literature Map|Canonical Literature Map]]\n\n" if latest_map is not None else "")
+        + (
+            f"- [[{map_export_relative.with_suffix('')}|Canonical Literature Map]]\n\n"
+            if map_export_relative is not None
+            else ""
+        )
+        + (
+            f"- [[{neighborhoods_export_relative.with_suffix('')}|Literature Neighborhoods]]\n\n"
+            if neighborhoods_export_relative is not None
+            else ""
+        )
         + "This vault is generated. Edit canonical workspace artifacts, then export again.\n"
     )
     missing = _missing_links_from_contents(export_root, contents)

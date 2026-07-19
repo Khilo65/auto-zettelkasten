@@ -9,7 +9,7 @@ import pytest
 import yaml
 
 from auto_zettelkasten import profiles
-from auto_zettelkasten.models import EvidenceProfile
+from auto_zettelkasten.models import EvidenceAnchor, EvidenceFinding, EvidenceProfile
 from auto_zettelkasten.notes import (
     parse_atomic_note,
     render_atomic_note,
@@ -17,12 +17,17 @@ from auto_zettelkasten.notes import (
     semantic_note_hash as shared_semantic_note_hash,
 )
 from auto_zettelkasten.profiles import (
+    COMMITTED_NOTE_ANCHOR_AUGMENTATION_VERSION,
     PROFILE_ALGORITHM_VERSION,
+    ANCHOR_ALGORITHM_VERSION,
     PROFILE_CLASSIFIER_VERSION,
     PROFILE_PROMPT_VERSION,
+    PROFILE_SCHEMA_VERSION,
+    SUPPORT_ENVELOPE_VERSION,
     ProfileCheckpointError,
     ProfileParseError,
     ProfilePersistenceError,
+    augment_profile_from_committed_note,
     build_evidence_profile,
     deterministic_profile,
     load_profile_checkpoint,
@@ -30,18 +35,143 @@ from auto_zettelkasten.profiles import (
     parse_profile_json,
     profile_dependency_fingerprint,
     profile_dependency_payload,
+    profile_from_dict,
     profile_to_dict,
     semantic_note_hash,
     validate_profile,
     write_profile_checkpoint,
     write_profile_sidecar,
+    _quantitative_result_payload,
 )
 
 
 def test_profile_versions_are_explicit() -> None:
-    assert PROFILE_PROMPT_VERSION == profiles.profile_prompt_version == "1"
-    assert PROFILE_CLASSIFIER_VERSION == profiles.profile_classifier_version == "1"
-    assert PROFILE_ALGORITHM_VERSION == profiles.profile_algorithm_version == "1"
+    assert PROFILE_SCHEMA_VERSION == "1.2"
+    assert PROFILE_PROMPT_VERSION == profiles.profile_prompt_version == "3"
+    assert PROFILE_CLASSIFIER_VERSION == profiles.profile_classifier_version == "3"
+    assert PROFILE_ALGORITHM_VERSION == profiles.profile_algorithm_version == "3"
+    assert ANCHOR_ALGORITHM_VERSION == SUPPORT_ENVELOPE_VERSION == "1"
+    assert COMMITTED_NOTE_ANCHOR_AUGMENTATION_VERSION == "4"
+
+
+def test_committed_note_anchor_augmentation_repairs_a_sparse_profile_once() -> None:
+    note = _analytical_note()
+    original = profile_to_dict(deterministic_profile(note))
+    sparse = profile_from_dict({**original, "findings": [], "evidence_anchors": []})
+
+    augmented, changed = augment_profile_from_committed_note(
+        sparse,
+        note,
+        source_set_id="source-set-1",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+    )
+
+    assert changed is True
+    assert len(augmented.evidence_anchors) == 1
+    assert augmented.validity["committed_note_anchor_count_added"] == 1
+    assert augmented.validity["committed_note_anchor_augmentation_version"] == "4"
+
+    replayed, replay_changed = augment_profile_from_committed_note(
+        augmented,
+        note,
+        source_set_id="source-set-1",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+    )
+    assert replay_changed is False
+    assert profile_to_dict(replayed) == profile_to_dict(augmented)
+
+
+def test_committed_note_augmentation_downgrades_ambiguous_mechanical_composites() -> None:
+    note = _analytical_note()
+    original = profile_to_dict(deterministic_profile(note))
+    anchor = dict(original["evidence_anchors"][0])
+    anchor["locator"] = "p. 4; p. 12; p. 27; p. 48; p. 74"
+    anchor["locators"] = [anchor["locator"]]
+    anchor["support_envelope"] = {
+        **dict(anchor["support_envelope"]),
+        "support_status": "supported",
+    }
+    mechanical = profile_from_dict(
+        {
+            **original,
+            "evidence_anchors": [anchor],
+        }
+    )
+
+    augmented, changed = augment_profile_from_committed_note(
+        mechanical,
+        note,
+        source_set_id="source-set-1",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+    )
+
+    assert changed is True
+    composite = next(
+        item for item in augmented.evidence_anchors if item.locator == "p. 4; p. 12; p. 27; p. 48; p. 74"
+    )
+    assert composite.support_envelope.support_status == "support_unknown"
+    assert any("Mechanical composite" in value for value in composite.support_envelope.restrictions)
+    assert composite.revision_hash != anchor["revision_hash"]
+
+
+def test_v11_profile_is_mechanically_enriched_from_committed_note_without_a_reader() -> None:
+    note = _analytical_note()
+    legacy = profile_to_dict(deterministic_profile(note))
+    legacy["profile_schema_version"] = "1.1"
+    legacy["study_lineage"] = None
+    legacy["validity"]["committed_note_anchor_augmentation_version"] = "3"
+    for anchor in legacy["evidence_anchors"]:
+        anchor["source_locators"] = []
+        anchor["quantitative_result"] = None
+
+    upgraded, changed = augment_profile_from_committed_note(
+        profile_from_dict(legacy),
+        note,
+        source_set_id="source-set-1",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+    )
+
+    assert changed is True
+    assert upgraded.profile_schema_version == "1.2"
+    assert upgraded.study_lineage is not None
+    assert upgraded.study_lineage.datasets == ["panel survey"]
+    assert len(upgraded.evidence_anchors) == 1
+    anchor = upgraded.evidence_anchors[0]
+    assert any(locator.supports_strong_assertion for locator in anchor.source_locators)
+    assert anchor.quantitative_result is not None
+    assert anchor.quantitative_result.estimand_type == "raw_percentage"
+
+
+def test_unreconstructable_legacy_statistic_downgrades_only_its_anchor() -> None:
+    note = _analytical_note()
+    legacy = profile_to_dict(deterministic_profile(note))
+    legacy["profile_schema_version"] = "1.1"
+    legacy["validity"]["committed_note_anchor_augmentation_version"] = "3"
+    anchor = legacy["evidence_anchors"][0]
+    anchor["claim"] = "The source classifies the result as statistical but reports no extractable estimate."
+    anchor["magnitude"] = "not_reported"
+    anchor["uncertainty"] = "not_reported"
+    anchor["quantitative_result"] = None
+
+    upgraded, changed = augment_profile_from_committed_note(
+        profile_from_dict(legacy),
+        note,
+        source_set_id="source-set-1",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+    )
+
+    assert changed is True
+    upgraded_anchor = upgraded.evidence_anchors[0]
+    assert upgraded_anchor.quantitative_result is None
+    assert upgraded_anchor.support_envelope.support_status == "support_unknown"
+    validation = validate_profile(upgraded)
+    assert validation.passed
+    assert "anchor_0:typed_quantitative_result_unresolved_support_unknown" in validation.warnings
 
 
 def test_analytical_note_is_extracted_and_validated_from_committed_markdown() -> None:
@@ -66,9 +196,9 @@ def test_analytical_note_is_extracted_and_validated_from_committed_markdown() ->
         "coverage_gate": "passed",
         "full_document": True,
     }
-    assert profile.validity["profile_prompt_version"] == "1"
-    assert profile.validity["classifier_version"] == "1"
-    assert profile.validity["algorithm_version"] == "1"
+    assert profile.validity["profile_prompt_version"] == "3"
+    assert profile.validity["classifier_version"] == "3"
+    assert profile.validity["algorithm_version"] == "3"
     assert profile.research_questions
     assert {"participation", "trust"} <= set(profile.concepts)
     assert profile.theories == ["contact theory"]
@@ -103,23 +233,93 @@ def test_analytical_note_is_extracted_and_validated_from_committed_markdown() ->
     assert finding.is_statistical is True
     assert "Table 2" in finding.locator
     assert finding.locators == [finding.locator]
+    assert len(profile.evidence_anchors) == 1
+    anchor = profile.evidence_anchors[0]
+    assert anchor.evidence_anchor_id.startswith("anchor-")
+    assert anchor.source_id == profile.source_id
+    assert anchor.study_family_id == profile.study_family_id
+    assert anchor.evidence_role == "associational"
+    assert anchor.support_envelope.empirical_role == "associational"
+    assert anchor.support_envelope.coverage == "full_text"
+    assert anchor.support_envelope.support_status == "supported"
+    assert anchor.source_locators
+    assert any(locator.locator_type == "table" for locator in anchor.source_locators)
+    assert any(locator.locator_type == "page" for locator in anchor.source_locators)
+    assert all(locator.source_native for locator in anchor.source_locators)
+    assert anchor.quantitative_result is not None
+    assert anchor.quantitative_result.estimand_type == "raw_percentage"
+    assert anchor.quantitative_result.reference_group.startswith("compared with non-participants")
+    assert profile.study_lineage is not None
+    assert profile.study_lineage.authors == ["Researcher"]
+    assert "panel survey" in profile.study_lineage.datasets
+    assert profile.study_lineage.periods == ["2018–2020"]
 
     validation = validate_profile(profile)
     assert validation.passed, validation.errors
     assert validation.substantive is True
 
 
-def test_profile_validation_rejects_unlocated_and_unexplained_statistical_findings() -> None:
+def test_profile_validation_rejects_unlocated_and_unexplained_statistical_anchors() -> None:
     profile = deterministic_profile(_analytical_note())
-    finding = profile.findings[0]
+    anchor = profile.evidence_anchors[0]
 
-    profile.findings = [replace(finding, locator="", locators=[])]
+    profile.evidence_anchors = [replace(anchor, locator="", locators=[], source_locators=[])]
     unlocated = validate_profile(profile)
-    assert "finding_0:traceable_locator_required" in unlocated.errors
+    assert "anchor_0:traceable_locator_required" in unlocated.errors
 
-    profile.findings = [replace(finding, plain_english_meaning="")]
+    profile.evidence_anchors = [replace(anchor, plain_english_meaning="")]
     unexplained = validate_profile(profile)
-    assert "finding_0:plain_english_meaning_required_for_statistical_finding" in unexplained.errors
+    assert "anchor_0:plain_english_meaning_required_for_statistical_anchor" in unexplained.errors
+
+
+def test_generated_atomic_note_heading_is_not_source_native_evidence() -> None:
+    payload = profile_to_dict(deterministic_profile(_analytical_note()))
+    anchor = payload["evidence_anchors"][0]
+    anchor["locator"] = "Detailed Findings (1)"
+    anchor["locators"] = ["Detailed Findings (1)"]
+    anchor["source_locators"] = [
+        {
+            "locator_id": "locator-generated",
+            "source_id": "source-1",
+            "evidence_anchor_id": anchor["evidence_anchor_id"],
+            "locator_type": "generated_heading",
+            "value": "Detailed Findings (1)",
+            "page_start": None,
+            "page_end": None,
+            "source_native": False,
+            "supports_strong_assertion": False,
+        }
+    ]
+
+    validation = validate_profile(profile_from_dict(payload))
+
+    assert "anchor_0:source_native_locator_required" in validation.errors
+
+
+def test_mechanical_quantitative_typing_keeps_unlike_estimands_separate() -> None:
+    observed = _quantitative_result_payload(
+        {
+            "claim": "The observed success rate was 38%.",
+            "magnitude": "38%",
+            "uncertainty": "",
+        },
+        source_id="source-1",
+        evidence_anchor_id="anchor-observed",
+    )
+    predicted = _quantitative_result_payload(
+        {
+            "claim": "The model-predicted probability was 38% and the marginal effect was +0.0997.",
+            "magnitude": "marginal effect +0.0997",
+            "uncertainty": "",
+        },
+        source_id="source-1",
+        evidence_anchor_id="anchor-predicted",
+    )
+
+    assert observed is not None and observed["estimand_type"] == "observed_rate"
+    assert predicted is not None and predicted["estimand_type"] == "model_predicted_probability"
+    assert predicted["estimate"] == "marginal effect +0.0997"
+    assert observed["quantitative_result_id"] != predicted["quantitative_result_id"]
 
 
 def test_limited_note_is_deterministic_context_only_and_never_calls_reasoner() -> None:
@@ -134,6 +334,7 @@ def test_limited_note_is_deterministic_context_only_and_never_calls_reasoner() -
     assert calls == []
     assert profile.excluded_from_synthesis is True
     assert profile.findings == []
+    assert profile.evidence_anchors == []
     assert profile.methods == []
     assert profile.concepts == ["participation"]
     assert profile.source_role == "context_only"
@@ -149,8 +350,10 @@ def test_limited_note_is_deterministic_context_only_and_never_calls_reasoner() -
 
     analytical_finding = deterministic_profile(_analytical_note()).findings[0]
     profile.findings = [analytical_finding]
+    profile.evidence_anchors = deterministic_profile(_analytical_note()).evidence_anchors
     rejected = validate_profile(profile, require_substantive=False)
     assert "limited_profile_contains_substantive_findings" in rejected.errors
+    assert "limited_profile_contains_substantive_anchors" in rejected.errors
 
 
 def test_non_full_analytical_note_is_context_only_and_never_calls_reasoner() -> None:
@@ -166,6 +369,7 @@ def test_non_full_analytical_note_is_context_only_and_never_calls_reasoner() -> 
     assert calls == []
     assert profile.excluded_from_synthesis is True
     assert profile.findings == []
+    assert profile.evidence_anchors == []
     assert profile.validity["status"] == "excluded_context_only"
     assert validate_profile(profile, require_substantive=False).passed
 
@@ -250,18 +454,153 @@ def test_profile_fingerprint_includes_every_declared_dependency() -> None:
     payload = profile_dependency_payload(note, **kwargs)
 
     assert payload["note_semantic_hash"] == shared_semantic_note_hash(note)
-    assert payload["profile_prompt_version"] == "1"
-    assert payload["classifier_version"] == "1"
-    assert payload["algorithm_version"] == "1"
+    assert payload["profile_prompt_version"] == "3"
+    assert payload["classifier_version"] == "3"
+    assert payload["algorithm_version"] == "3"
+    assert payload["profile_schema_version"] == "1.2"
+    assert payload["anchor_algorithm_version"] == "1"
+    assert payload["support_envelope_version"] == "1"
     assert baseline == profile_dependency_fingerprint(_with_generated_graph(note), **kwargs)
     assert baseline != profile_dependency_fingerprint(note.replace("12%", "13%"), **kwargs)
     assert baseline != profile_dependency_fingerprint(note, **{**kwargs, "source_set_id": "source-set-2"})
     assert baseline != profile_dependency_fingerprint(note, **{**kwargs, "provider": "ollama"})
     assert baseline != profile_dependency_fingerprint(note, **{**kwargs, "model": "other-model"})
     assert baseline != profile_dependency_fingerprint(note, **{**kwargs, "policy": {"max_profile_calls": 21}})
-    assert baseline != profile_dependency_fingerprint(note, **kwargs, profile_prompt_version="2")
-    assert baseline != profile_dependency_fingerprint(note, **kwargs, profile_classifier_version="2")
-    assert baseline != profile_dependency_fingerprint(note, **kwargs, profile_algorithm_version="2")
+    assert baseline != profile_dependency_fingerprint(note, **kwargs, profile_prompt_version="4")
+    assert baseline != profile_dependency_fingerprint(note, **kwargs, profile_classifier_version="4")
+    assert baseline != profile_dependency_fingerprint(note, **kwargs, profile_algorithm_version="4")
+    assert baseline != profile_dependency_fingerprint(note, **kwargs, profile_schema_version="1.0")
+    assert baseline != profile_dependency_fingerprint(note, **kwargs, anchor_algorithm_version="2")
+    assert baseline != profile_dependency_fingerprint(note, **kwargs, support_envelope_version="2")
+
+
+def test_anchor_ids_ignore_finding_order_and_claim_prose_but_revision_hash_tracks_content() -> None:
+    first = EvidenceFinding(
+        finding_id="legacy-first",
+        claim="Participation is associated with greater trust.",
+        finding_type="association",
+        evidence="Source-native span A.",
+        locator="Table 2, p. 14",
+    )
+    second = EvidenceFinding(
+        finding_id="legacy-second",
+        claim="The association is weaker in rural cases.",
+        finding_type="association",
+        evidence="Source-native span B.",
+        locator="Table 3, p. 18",
+    )
+
+    original = EvidenceProfile(source_id="source-1", coverage={"status": "full_text"}, findings=[first, second])
+    reordered = EvidenceProfile(source_id="source-1", coverage={"status": "full_text"}, findings=[second, first])
+    original_by_locator = {anchor.locator: anchor for anchor in original.evidence_anchors}
+    reordered_ids = {anchor.locator: anchor.evidence_anchor_id for anchor in reordered.evidence_anchors}
+
+    assert {locator: anchor.evidence_anchor_id for locator, anchor in original_by_locator.items()} == reordered_ids
+
+    reworded = EvidenceProfile(
+        source_id="source-1",
+        coverage={"status": "full_text"},
+        findings=[replace(first, claim="Greater trust is associated with participation."), second],
+    )
+    reworded_first = next(anchor for anchor in reworded.evidence_anchors if anchor.locator == first.locator)
+    assert reworded_first.evidence_anchor_id == original_by_locator[first.locator].evidence_anchor_id
+    assert reworded_first.revision_hash != original_by_locator[first.locator].revision_hash
+
+
+def test_anchor_locator_collisions_use_stable_source_span_hash_not_position() -> None:
+    first = EvidenceFinding(
+        finding_id="legacy-first",
+        claim="First located result.",
+        finding_type="descriptive",
+        evidence="Stable source span A.",
+        locator="p. 22",
+    )
+    second = EvidenceFinding(
+        finding_id="legacy-second",
+        claim="Second located result.",
+        finding_type="descriptive",
+        evidence="Stable source span B.",
+        locator="p. 22",
+    )
+    forward = EvidenceProfile(source_id="source-1", coverage={"status": "full_text"}, findings=[first, second])
+    reverse = EvidenceProfile(source_id="source-1", coverage={"status": "full_text"}, findings=[second, first])
+
+    forward_ids = {anchor.claim: anchor.evidence_anchor_id for anchor in forward.evidence_anchors}
+    reverse_ids = {anchor.claim: anchor.evidence_anchor_id for anchor in reverse.evidence_anchors}
+    assert forward_ids == reverse_ids
+    assert len(set(forward_ids.values())) == 2
+
+
+def test_profile_hard_limits_anchors_to_24() -> None:
+    anchor = EvidenceAnchor(source_id="source-1", evidence_role="descriptive", claim="Located.", locator="p. 1")
+    with pytest.raises(ValueError, match="more than 24"):
+        EvidenceProfile(source_id="source-1", evidence_anchors=[anchor] * 25)
+
+
+def test_v1_profile_mapping_sidecar_and_checkpoint_upgrade_mechanically(tmp_path: Path) -> None:
+    legacy_profile = EvidenceProfile(
+        note_id="legacy-note",
+        source_id="legacy-source",
+        coverage={"status": "full_text"},
+        findings=[EvidenceFinding(finding_id="legacy-finding", claim="A located legacy claim.", locator="p. 9")],
+    ).to_dict()
+    legacy_profile["profile_schema_version"] = "1.0"
+    legacy_profile.pop("evidence_anchors")
+    legacy_profile["findings"][0]["claim_id"] = legacy_profile["findings"][0].pop("finding_id")
+
+    upgraded = profile_from_dict(legacy_profile)
+    assert upgraded.profile_schema_version == "1.2"
+    assert upgraded.evidence_anchors[0].evidence_role == "support_unknown"
+    assert upgraded.evidence_anchors[0].support_envelope.support_status == "support_unknown"
+    assert "evidence_anchor_id" in profile_to_dict(upgraded)["evidence_anchors"][0]
+
+    sidecar = tmp_path / "legacy-sidecar.yml"
+    sidecar.write_text(
+        yaml.safe_dump({"profile_schema_version": "1", "profile": legacy_profile}, sort_keys=False),
+        encoding="utf-8",
+    )
+    assert load_profile_sidecar(sidecar) == upgraded
+    assert write_profile_sidecar(sidecar, upgraded) is True
+    persisted = yaml.safe_load(sidecar.read_text(encoding="utf-8"))["profile"]
+    assert persisted["profile_schema_version"] == "1.2"
+    assert "evidence_anchor_id" in persisted["evidence_anchors"][0]
+
+    state_dir = tmp_path / "state"
+    checkpoint = write_profile_checkpoint(state_dir, upgraded.note_id, "legacy-fingerprint", upgraded)
+    checkpoint_payload = yaml.safe_load(checkpoint.read_text(encoding="utf-8"))
+    checkpoint_payload["profile"] = copy.deepcopy(legacy_profile)
+    checkpoint.write_text(yaml.safe_dump(checkpoint_payload, sort_keys=False), encoding="utf-8")
+    assert load_profile_checkpoint(state_dir, upgraded.note_id, "legacy-fingerprint") == upgraded
+
+
+def test_legacy_anchor_upgrade_does_not_inherit_source_level_scope() -> None:
+    profile = EvidenceProfile(
+        source_id="source-1",
+        coverage={"status": "full_text"},
+        populations=["all conflicts in the collection"],
+        outcomes=["all mediation outcomes"],
+        findings=[
+            EvidenceFinding(
+                claim="A bounded finding.",
+                finding_type="descriptive",
+                population="African civil wars",
+                outcome="ceasefire durability",
+                locator="p. 9",
+            ),
+            EvidenceFinding(
+                claim="A finding without reported scope.",
+                finding_type="descriptive",
+                locator="p. 10",
+            ),
+        ],
+    )
+
+    anchors = {anchor.claim: anchor for anchor in profile.evidence_anchors}
+    assert anchors["A bounded finding."].support_envelope.scope == {
+        "populations": ["African civil wars"],
+        "outcomes": ["ceasefire durability"],
+    }
+    assert anchors["A finding without reported scope."].support_envelope.scope == {}
 
 
 def test_strict_profile_json_parser_rejects_wrappers_duplicates_and_unknown_fields() -> None:
@@ -285,6 +624,26 @@ def test_strict_profile_json_parser_rejects_wrappers_duplicates_and_unknown_fiel
     unknown_finding["findings"][0]["unexpected"] = True
     with pytest.raises(ProfileParseError, match="unknown finding fields"):
         parse_profile_json(json.dumps(unknown_finding))
+
+    unknown_anchor = copy.deepcopy(payload)
+    unknown_anchor["evidence_anchors"][0]["unexpected"] = True
+    with pytest.raises(ProfileParseError, match="invalid evidence anchor"):
+        parse_profile_json(json.dumps(unknown_anchor))
+
+    unknown_envelope = copy.deepcopy(payload)
+    unknown_envelope["evidence_anchors"][0]["support_envelope"]["unexpected"] = True
+    with pytest.raises(ProfileParseError, match="unknown support envelope fields"):
+        parse_profile_json(json.dumps(unknown_envelope))
+
+    unknown_locator = copy.deepcopy(payload)
+    unknown_locator["evidence_anchors"][0]["source_locators"][0]["unexpected"] = True
+    with pytest.raises(ProfileParseError, match="unknown source locator fields"):
+        parse_profile_json(json.dumps(unknown_locator))
+
+    unknown_quantitative = copy.deepcopy(payload)
+    unknown_quantitative["evidence_anchors"][0]["quantitative_result"]["unexpected"] = True
+    with pytest.raises(ProfileParseError, match="unknown quantitative result fields"):
+        parse_profile_json(json.dumps(unknown_quantitative))
 
     wrong_type = copy.deepcopy(payload)
     wrong_type["concepts"] = "not-a-list"
@@ -322,6 +681,16 @@ def test_optional_reasoner_receives_only_committed_note_without_graph_projection
     )
     assert len(prompts) == 1
     assert "COMMITTED MARKDOWN NOTE" in prompts[0]
+    assert "8-20 synthesis-relevant evidence anchors" in prompts[0]
+    assert "24 is a hard maximum" in prompts[0]
+    assert "support_envelope" in prompts[0]
+    assert "SourceLocator" in prompts[0]
+    assert "QuantitativeResult" in prompts[0]
+    assert "StudyLineage" in prompts[0]
+    assert "Detailed Findings (1) must use locator_type generated_heading" in prompts[0]
+    assert "is not source-native" in prompts[0]
+    assert "observed rate" in prompts[0]
+    assert "do not reread" in prompts[0].casefold()
     assert "## Graph Links" not in prompts[0]
     assert "synthetic source full text sentinel" not in prompts[0]
 
@@ -363,6 +732,7 @@ def test_reasoner_profile_omits_only_findings_without_required_support() -> None
     result = build_evidence_profile(note, reasoner_method=lambda prompt: proposed)
 
     assert len(result.findings) == 1
+    assert len(result.evidence_anchors) == 1
     assert result.validity["omitted_untraceable_or_uninterpreted_finding_count"] == 1
 
 

@@ -62,11 +62,7 @@ def test_graph_update_is_idempotent(tmp_path: Path) -> None:
     assert update_note_graph(path, {**updates, "updated_at": "second-update"}, [], ["cluster-a"], gap_links) is False
     assert path.read_bytes() == first
     frontmatter, body = parse_atomic_note(first.decode())
-    assert frontmatter["tags"] == [
-        "auto-zettelkasten/source",
-        "auto-zettelkasten/source/analytical",
-        "shared-topic",
-    ]
+    assert frontmatter["tags"] == ["shared-topic"]
     assert frontmatter["cluster_links"] == ["[[cluster-a]]"]
     assert frontmatter["gap_links"] == ["[[gap-a]]"]
     assert "- supports_gap_rule: [[gap-a]]" in body

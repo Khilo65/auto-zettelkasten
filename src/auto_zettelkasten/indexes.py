@@ -179,6 +179,7 @@ def write_source_set(
     source_set_id: str | None = None,
     source_set_type: str | None = None,
     snapshot_id: str | None = None,
+    collection_name: str | None = None,
 ) -> dict[str, Any]:
     if collection_key:
         suffix = f"zotero-{slugify(collection_key)}"
@@ -222,6 +223,7 @@ def write_source_set(
         "scope": scope,
         "run_id": run_id,
         "zotero_collection_key": collection_key or "",
+        "collection_name": str(collection_name or "").strip(),
         "upstream_scope": {"kind": f"zotero_{scope}", "id": collection_key or run_id},
         "inventory_count": len(items),
         "terminal_count": status_counts["validated_note"] + status_counts["limited_note"] + status_counts["exhausted"],

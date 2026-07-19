@@ -6,6 +6,7 @@ import pytest
 import yaml
 
 from auto_zettelkasten.api import build_map, get_status, resume_map, run_literature_map, run_map
+from auto_zettelkasten.literature import _write_projection_yaml
 from auto_zettelkasten.models import LiteratureMappingPolicy, LiteratureMapRequest, MapRequest
 
 from conftest import FakeReader, FakeZotero
@@ -32,7 +33,11 @@ def literature_profile(source_id: str, *, topic: str = "institutional trust") ->
     }
 
 
-def test_canonical_map_replay_is_idempotent_and_uses_profile_sidecars(tmp_path: Path, sample_items) -> None:
+def test_canonical_map_replay_is_idempotent_and_uses_profile_sidecars(
+    tmp_path: Path,
+    sample_items,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     first_report = run_map(
         MapRequest(tmp_path, provider="ollama", model="fake-1"),
         client=FakeZotero(sample_items),
@@ -57,6 +62,55 @@ def test_canonical_map_replay_is_idempotent_and_uses_profile_sidecars(tmp_path: 
     manifest = yaml.safe_load(first_maps[0].read_text())
     assert manifest["source_set_id"]
     assert manifest["note_projection_hashes"]
+
+    tracked_paths = (
+        tmp_path / "03_literature_synthesis" / "manifest.yml",
+        first_maps[0],
+        first_maps[0].parent / "packet.yml",
+    )
+    tracked_bytes = {path: path.read_bytes() for path in tracked_paths}
+    monkeypatch.setattr("auto_zettelkasten.literature.now_iso", lambda: "2099-01-01T00:00:00+00:00")
+    replayed = build_map(
+        tmp_path,
+        run_id="canonical-replay",
+        source_set=first_report.source_set,
+        provider="ollama",
+        model="fake-1",
+    )
+
+    assert replayed.status == "built"
+    assert {path: path.read_bytes() for path in tracked_paths} == tracked_bytes
+
+
+def test_projection_yaml_writer_preserves_bytes_for_timestamp_only_replay(tmp_path: Path) -> None:
+    path = tmp_path / "projection.yml"
+    _write_projection_yaml(
+        path,
+        {
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "clusters": [{"cluster_id": "cluster-a", "created_at": "2026-01-01T00:00:00+00:00"}],
+        },
+    )
+    first_bytes = path.read_bytes()
+
+    _write_projection_yaml(
+        path,
+        {
+            "updated_at": "2099-01-01T00:00:00+00:00",
+            "clusters": [{"cluster_id": "cluster-a", "created_at": "2099-01-01T00:00:00+00:00"}],
+        },
+    )
+
+    assert path.read_bytes() == first_bytes
+
+    _write_projection_yaml(
+        path,
+        {
+            "updated_at": "2099-01-01T00:00:00+00:00",
+            "clusters": [{"cluster_id": "cluster-b", "created_at": "2099-01-01T00:00:00+00:00"}],
+        },
+    )
+    assert yaml.safe_load(path.read_text())["clusters"][0]["cluster_id"] == "cluster-b"
 
 
 def test_resume_uses_frozen_inventory_and_source_representations(tmp_path: Path, sample_items) -> None:
@@ -122,19 +176,24 @@ def test_completed_status_exposes_literature_stage_and_counts(tmp_path: Path, sa
     assert {
         "preflight",
         "frozen_inventory",
-        "source_processing",
-        "profiling",
-        "relation_mapping",
-        "clustering",
-        "evidence_matrices",
+            "source_processing",
+            "profiling",
+            "evidence_anchors",
+            "relation_mapping",
+            "topic_neighborhoods",
+            "proposition_mapping",
+            "clustering",
+            "evidence_matrices",
+            "support_validation",
         "debate_mapping",
-        "gap_detection",
-        "internal_falsification",
-        "projection",
+            "gap_detection",
+            "internal_falsification",
+            "resolution_paths",
+            "projection",
         "reporting",
     } <= set(status.checks["progress"]["stage_timestamps"])
     assert status.counts["profile_count"] == 2
-    assert status.counts["cluster_count"] == 1
+    assert status.counts["cluster_count"] == 0
     assert status.counts["mapped_gap_count"] == 0
 
 

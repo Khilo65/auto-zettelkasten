@@ -192,7 +192,7 @@ class ZoteroLocalClient:
             headers={
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "auto-zettelkasten/0.5.0",
+                "User-Agent": "auto-zettelkasten/0.7.0",
                 "Zotero-API-Version": "3",
             },
         )
