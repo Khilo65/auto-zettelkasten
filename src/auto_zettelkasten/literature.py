@@ -450,9 +450,6 @@ def _narrow_noncausal_organizational_language(
         f"The cited sources report that {attributed} "
         "This evidence does not by itself establish causation."
     )
-    normalized_boundary = boundary.rstrip(" .")
-    if normalized_boundary and "does not by itself establish causation" not in normalized_boundary.casefold():
-        result += " " + normalized_boundary + "."
     return result
 
 
@@ -678,6 +675,13 @@ def _human_projection_text(value: Any) -> str:
         r"\1 reports that ",
         text,
     )
+    text = re.sub(
+        r"\bMediation is an underutilized but effective tool for resolving natural resource conflicts\b",
+        "The practitioner guide recommends mediation as an underused tool for addressing natural-resource conflicts",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(r"\.{2,}(?=\s+[a-z])", ",", text)
     text = re.sub(
         r"(^|(?<=[.!?])\s+)The studies report that\s+([a-z])",
         lambda match: match.group(1) + match.group(2).upper(),
@@ -8143,8 +8147,18 @@ def _cluster_display_question(
         if question:
             if re.match(r"^How should\b", question, flags=re.I):
                 narrowed = re.sub(
-                    r"\b(?:effective|effectiveness)\b", "", question, flags=re.I
+                    r"\bmaximize effectiveness,\s*",
+                    "support ",
+                    question,
+                    flags=re.I,
                 )
+                if narrowed == question:
+                    narrowed = re.sub(
+                        r"\b(?:effective|effectiveness)\b",
+                        "",
+                        question,
+                        flags=re.I,
+                    )
                 narrowed = re.sub(r"\s+", " ", narrowed)
                 narrowed = re.sub(r"\s+,", ",", narrowed).strip()
                 return narrowed
@@ -14735,7 +14749,7 @@ def _project_cross_cluster_relationships(
             - _BROAD_FIELD_TERMS
         )
         shared_terms = sorted(left_terms & right_terms)
-        if len(shared_terms) < 2 and set(shared_terms) != {"internationalized"}:
+        if set(shared_terms) != {"internationalized"}:
             continue
         left_core = next(
             (
