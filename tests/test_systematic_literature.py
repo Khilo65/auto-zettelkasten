@@ -2311,6 +2311,40 @@ def test_deepseek_coverage_audit_uses_one_full_collection_packet() -> None:
     assert set(plan[0]["source_ids"]) == {row["source_id"] for row in rows}
 
 
+def test_deepseek_coverage_fit_ignores_machine_only_profile_bulk() -> None:
+    rows = normalize_evidence_profiles(
+        [profile("compact-a"), profile("compact-b")]
+    )
+    for row in rows:
+        row["machine_only_audit_blob"] = "x" * 2_000_000
+    clustered = {
+        "clusters": [],
+        "unclustered_sources": [
+            {"source_id": row["source_id"], "reason": "broad_topical_overlap_only"}
+            for row in rows
+        ],
+    }
+
+    class DeepSeekReasoner:
+        name = "deepseek"
+        model = "deepseek-v4-flash"
+        context_window_tokens = 1_000_000
+
+    plan = literature._coverage_audit_plan(
+        clustered,
+        rows,
+        [],
+        [],
+        reasoner=DeepSeekReasoner(),
+        request=LiteratureMapRequest(
+            workspace=".", provider="deepseek", model="deepseek-v4-flash"
+        ),
+    )
+
+    assert len(plan) == 1
+    assert plan[0]["mode"] == "collection"
+
+
 def test_small_context_coverage_audit_keeps_semantic_peers_together() -> None:
     rows = normalize_evidence_profiles(
         [
@@ -2354,6 +2388,94 @@ def test_small_context_coverage_audit_keeps_semantic_peers_together() -> None:
     assert {"a-first", "z-last"}.issubset(
         natural_resource_component["source_ids"]
     )
+
+
+def test_coverage_components_do_not_merge_distinct_conversations_through_bridge() -> None:
+    rows = normalize_evidence_profiles(
+        [
+            profile("track-a", topic="track two diplomacy"),
+            profile("track-b", topic="track two diplomacy"),
+            profile("local-a", topic="local mediation"),
+            profile("local-b", topic="local mediation"),
+            profile("bridge", topic="mediation practice"),
+        ]
+    )
+    by_source = {row["source_id"]: row for row in rows}
+    by_source["track-a"]["concepts"] = ["track two diplomacy", "mediation"]
+    by_source["track-b"]["concepts"] = ["track two diplomacy", "mediation"]
+    by_source["local-a"]["concepts"] = ["local mediation", "mediation"]
+    by_source["local-b"]["concepts"] = ["local mediation", "mediation"]
+    by_source["bridge"]["concepts"] = [
+        "track two diplomacy",
+        "local mediation",
+        "mediation",
+    ]
+
+    components = literature._coverage_signal_components(
+        [row["source_id"] for row in rows], rows, [], []
+    )
+    source_sets = [set(row["source_ids"]) for row in components]
+
+    assert any({"track-a", "track-b", "bridge"} <= values for values in source_sets)
+    assert any({"local-a", "local-b", "bridge"} <= values for values in source_sets)
+    assert not any(
+        {"track-a", "track-b", "local-a", "local-b"} <= values
+        for values in source_sets
+    )
+    assert set().union(*(set(row["focus_source_ids"]) for row in components)) == {
+        row["source_id"] for row in rows
+    }
+
+
+def test_component_proposal_shards_union_same_conversation_members() -> None:
+    responses = [
+        {
+            "clusters": [
+                {
+                    "proposal_id": "track-shard-a",
+                    "label": "Track I and Track II diplomacy",
+                    "semantic_identity": "track one track two diplomacy",
+                    "source_ids": ["track-a", "bridge"],
+                    "source_roles": {"track-a": "core", "bridge": "bridge"},
+                    "supporting_evidence": [
+                        {"source_id": "track-a", "claim_id": "a", "locator": "p. 1"}
+                    ],
+                    "propositions": [],
+                    "family_relations": [],
+                }
+            ]
+        },
+        {
+            "clusters": [
+                {
+                    "proposal_id": "track-shard-b",
+                    "label": "Track I and Track II diplomacy",
+                    "semantic_identity": "track one track two diplomacy",
+                    "source_ids": ["track-b", "bridge"],
+                    "source_roles": {"track-b": "core", "bridge": "bridge"},
+                    "supporting_evidence": [
+                        {"source_id": "track-b", "claim_id": "b", "locator": "p. 2"}
+                    ],
+                    "propositions": [],
+                    "family_relations": [],
+                }
+            ]
+        },
+    ]
+
+    proposals = literature._cluster_proposals_from_responses(responses)
+
+    assert len(proposals) == 1
+    assert set(proposals[0]["source_ids"]) == {"track-a", "track-b", "bridge"}
+    assert proposals[0]["source_roles"] == {
+        "track-a": "core",
+        "track-b": "core",
+        "bridge": "bridge",
+    }
+    assert {row["source_id"] for row in proposals[0]["supporting_evidence"]} == {
+        "track-a",
+        "track-b",
+    }
 
 
 def test_coverage_audit_keeps_connected_large_subliterature_in_one_component(
@@ -4129,3 +4251,62 @@ def test_v4_recognizable_subliteratures_cluster_or_receive_specific_adjudication
         "no rejection reason:\n- "
         + "\n- ".join(gaps)
     )
+
+
+def test_literature_map_counts_only_analytical_unclustered_sources() -> None:
+    report = {
+        "manifest": {
+            "coverage_inventory_count": 2,
+            "analytical_profile_count": 1,
+            "limited_profile_count": 1,
+            "coverage_exhausted_count": 0,
+            "coverage_partial_count": 0,
+            "coverage_pending_count": 0,
+        },
+        "profiles": [
+            {
+                "source_id": "analytical",
+                "note_id": "note-analytical",
+                "title": "Analytical source",
+                "note_path": "01_source_notes/Analytical source.md",
+                "analytical": True,
+                "limited": False,
+            },
+            {
+                "source_id": "limited",
+                "note_id": "note-limited",
+                "title": "Limited source",
+                "note_path": "01_source_notes/Limited source.md",
+                "analytical": False,
+                "limited": True,
+            },
+        ],
+        "cluster_registry": {
+            "clusters": [],
+            "unclustered_sources": [
+                {
+                    "source_id": "analytical",
+                    "reason": "no_valid_connected_family_relation",
+                    "reason_detail": "no_valid_connected_family_relation",
+                },
+                {
+                    "source_id": "limited",
+                    "reason": "limited_source_coverage",
+                    "reason_detail": "Limited source coverage.",
+                },
+            ],
+        },
+        "cluster_syntheses": {},
+        "gap_registry": {"gaps": [], "rejected_candidates": []},
+    }
+
+    markdown = literature._literature_map_markdown(
+        report,
+        {"source_set_id": "set-map-count", "collection_name": "Map count"},
+        map_id="map-count",
+    )
+
+    assert "Analytical sources outside clusters: 1" in markdown
+    assert "No locator-backed relationship connected the proposed core studies" in markdown
+    assert "no_valid_connected_family_relation" not in markdown
+    assert "[[01_source_notes/Limited source" not in markdown

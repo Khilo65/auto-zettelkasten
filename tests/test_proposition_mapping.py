@@ -328,6 +328,44 @@ def test_reference_locator_identity_ignores_space_after_page_marker() -> None:
     assert literature._reference_matches_profile(reference, profile)
 
 
+def test_reference_accepts_profile_validated_paragraph_locator() -> None:
+    profile = normalize_evidence_profiles([_profile("paragraph-source")])[0]
+    anchor = profile["claims"][0]
+    anchor["locator"] = "P3"
+    anchor["locator_complete"] = True
+    anchor["source_locator"] = {
+        "raw": "P3",
+        "normalized": "p3",
+        "kind": "page_or_paragraph",
+        "traceable": True,
+        "strong_synthesis_support": True,
+        "rejection_reason": "",
+    }
+    reference = _reference(profile)
+
+    assert literature._reference_matches_profile(reference, profile)
+
+
+def test_matrix_rejected_sources_remain_explicitly_unclustered() -> None:
+    profiles = normalize_evidence_profiles([_profile("kept"), _profile("dropped")])
+    unclustered = literature._reconcile_final_unclustered_sources(
+        profiles,
+        [{"cluster_id": "cluster-kept", "source_ids": ["kept"]}],
+        [],
+        [
+            {
+                "proposal_id": "proposal-dropped",
+                "label": "Internationalized civil-war mediation",
+                "source_ids": ["dropped"],
+            }
+        ],
+    )
+
+    assert [row["source_id"] for row in unclustered] == ["dropped"]
+    assert unclustered[0]["reason"] == "proposed_cluster_failed_evidence_matrix"
+    assert "Internationalized civil-war mediation" in unclustered[0]["reason_detail"]
+
+
 def test_source_level_dimensions_are_not_inherited_by_anchors_or_matrix_cells() -> None:
     source_only = {
         "methods": ["SOURCE ONLY ethnography"],
@@ -897,6 +935,50 @@ def test_african_mediation_and_government_bias_cannot_populate_each_others_propo
         mapped["rejected_proposals"][0]["reason"]
         == "no_valid_connected_family_relation"
     )
+
+
+def test_mediation_occurrence_source_is_context_in_success_cluster() -> None:
+    rows = normalize_evidence_profiles(
+        [
+            _profile(
+                "success-a",
+                topic="mediation strategy",
+                outcome="mediation success",
+                claim="Directive strategy is associated with mediation success.",
+            ),
+            _profile(
+                "success-b",
+                topic="mediator characteristics",
+                outcome="negotiated settlement",
+                claim="Mediator characteristics are associated with negotiated settlement.",
+            ),
+            _profile(
+                "occurrence",
+                topic="mediation selection",
+                outcome="mediation occurrence",
+                claim="Conflict characteristics predict whether mediation occurs.",
+            ),
+        ]
+    )
+    proposal = {
+        "proposal_id": "proposal-mediation-success",
+        "label": "Quantitative determinants of mediation success",
+        "semantic_identity": "quantitative determinants mediation success",
+        "shared_question": "Which factors are associated with mediation success?",
+        "bounded_object": "determinants of mediation success and negotiated settlement",
+        "source_ids": [row["source_id"] for row in rows],
+        "source_roles": {row["source_id"]: "core" for row in rows},
+        "supporting_evidence": [_reference(row) for row in rows],
+        "propositions": [],
+        "family_relations": [],
+    }
+
+    mapped = map_overlapping_clusters(rows, proposals=[proposal], propositions=[])
+
+    assert len(mapped["clusters"]) == 1
+    cluster = mapped["clusters"][0]
+    assert set(cluster["core_source_ids"]) == {"success-a", "success-b"}
+    assert cluster["context_source_ids"] == ["occurrence"]
 
 
 def test_missing_parallel_proposition_gets_qualified_coverage_without_inventing_a_relationship() -> (
@@ -1921,6 +2003,101 @@ def test_source_specific_thematic_threads_survive_without_proposition_lineage() 
         and "does not by itself establish causation" in row["finding"]
         for row in causal_contributions
     )
+
+
+def test_practitioner_plain_english_cannot_claim_more_lasting_peace() -> None:
+    raw = _profile(
+        "guidance",
+        topic="inclusive mediation",
+        outcome="agreement quality",
+        claim="The guidance recommends inclusion during mediation.",
+        empirical_role="none",
+        argument_role="practitioner_guidance",
+    )
+    raw["evidence_anchors"][0]["plain_english_meaning"] = (
+        "Including more groups makes peace more lasting."
+    )
+    profiles = normalize_evidence_profiles([raw])
+    cluster = {
+        "cluster_id": "cluster-guidance",
+        "label": "Inclusive mediation guidance",
+        "shared_question": "What does guidance recommend for inclusive mediation?",
+        "bounded_object": "inclusive mediation guidance",
+        "source_ids": ["guidance"],
+        "core_source_ids": ["guidance"],
+        "source_roles": [{"source_id": "guidance", "role": "core"}],
+        "propositions": [],
+        "family_relations": [],
+    }
+
+    contribution = literature._fallback_source_contributions(cluster, profiles)[0]
+
+    assert contribution["plain_english_meaning"].startswith(
+        "The cited sources report that"
+    )
+    assert "does not by itself establish causation" in contribution[
+        "plain_english_meaning"
+    ]
+
+
+def test_percentage_point_result_is_not_rendered_as_relative_percent() -> None:
+    plain = literature._normalize_percentage_point_plain_english(
+        "Government-biased mediation was 14% more likely to reach settlement.",
+        technical_context="The predicted probability was 14 percentage points higher.",
+    )
+
+    assert "14% more likely" not in plain
+    assert "14 percentage points higher" in plain
+
+
+def test_enumerated_multi_finding_anchor_is_not_rendered_as_one_study_finding() -> None:
+    raw = _profile(
+        "composite",
+        topic="conflict prevention",
+        outcome="conflict onset",
+        claim=(
+            "1) Conflict onsets fell from 21 to 16 during one period. "
+            "2) Civil war costs exceeded 30 years of GDP growth in one estimate. "
+            "3) Recovery took 14 years in another estimate. "
+            "4) Ninety percent of recent civil wars occurred in countries with a prior civil war. "
+            "5) A regional office cost less than eight million dollars each year. "
+            "These figures describe different claims and require different source locators."
+        ),
+    )
+    profiles = normalize_evidence_profiles([raw])
+    cluster = {
+        "cluster_id": "cluster-prevention",
+        "label": "Conflict prevention",
+        "shared_question": "What does the collection show about conflict prevention?",
+        "bounded_object": "conflict prevention",
+        "source_ids": ["composite"],
+        "core_source_ids": ["composite"],
+        "source_roles": [{"source_id": "composite", "role": "core"}],
+        "propositions": [],
+        "family_relations": [],
+    }
+
+    assert literature._anchor_is_composite_note_summary(profiles[0]["claims"][0])
+    assert literature._fallback_source_contributions(cluster, profiles) == []
+
+
+def test_source_keys_are_replaced_in_prose_without_breaking_wikilinks() -> None:
+    profile = {
+        "source_id": "ue6ewxin",
+        "title": "Ceasefire design evidence",
+        "note_path": "01_source_notes/Kane2022 - Ceasefire design evidence.md",
+    }
+    markdown = (
+        "---\nsource_id: ue6ewxin\n---\n"
+        "ue6ewxin describes the mechanism in "
+        "[[01_source_notes/ue6ewxin - Source|the source note]]."
+    )
+
+    rendered = literature._replace_source_keys_in_markdown_body(markdown, [profile])
+
+    assert "source_id: ue6ewxin" in rendered
+    assert "Kane (2022) describes the mechanism" in rendered
+    assert "[[01_source_notes/ue6ewxin - Source|the source note]]" in rendered
 
 
 def test_emerging_convergence_rejects_mature_consensus_language() -> None:
@@ -3077,6 +3254,45 @@ def test_gap_status_prose_cannot_call_a_failed_lead_strong_or_surviving() -> Non
     assert "stricter strong-gap threshold was not established" in gap[
         "decision_reasoning"
     ]
+
+
+def test_gap_status_prose_discards_model_design_claims() -> None:
+    gap = {
+        "status": "collection_gap_lead",
+        "decision_reasoning": (
+            "No valid resolution path passed, although an instrumental variable "
+            "or quasi-experiment would make this feasible."
+        ),
+        "strict_adjudication": {
+            "decision": "not_established",
+            "explanation": "Only one evidence base reveals the issue.",
+        },
+    }
+
+    literature._canonicalize_gap_status_prose(gap)
+
+    assert "instrumental variable" not in gap["decision_reasoning"].casefold()
+    assert "quasi-experiment" not in gap["decision_reasoning"].casefold()
+    assert "Only one evidence base" in gap["decision_reasoning"]
+
+
+def test_gap_markdown_omits_design_specific_significance_claim() -> None:
+    gap = {
+        "gap_id": "gap-safe-significance",
+        "title": "Directive mediation mechanism",
+        "gap_statement": "Which mechanism links directive strategy to settlement?",
+        "rule": "untested_mechanism",
+        "status": "collection_gap_lead",
+        "promoted": False,
+        "why_matters": "It would clarify what the observed association means.",
+        "contribution": "An instrumental variable or quasi-experiment would identify the effect.",
+    }
+
+    markdown = _gap_markdown(gap)
+
+    assert "why it matters" in markdown.casefold()
+    assert "instrumental variable" not in markdown.casefold()
+    assert "quasi-experiment" not in markdown.casefold()
 
 
 def test_gap_markdown_renders_resolution_direction_without_invented_design() -> None:
