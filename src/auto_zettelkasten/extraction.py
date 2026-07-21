@@ -187,7 +187,20 @@ def classify_pdf_text(
         }
     )
     page_coverage_passed = covered_page_ratio is None or covered_page_ratio >= 0.8
-    if metrics["char_count"] >= 80 and metrics["word_count"] >= 8 and page_coverage_passed:
+    # Page coverage says whether the extractor touched the attachment; it does
+    # not establish that those pages contain publication text. Publisher error
+    # pages and download-notice PDFs can contain a few repeated words on every
+    # page and otherwise look "complete". Require a conservative amount of
+    # usable prose for multi-page documents so those files proceed to the
+    # existing OCR/fallback route instead of becoming analytical sources.
+    minimum_word_count = 8 if page_count <= 1 else max(200, 40 * page_count)
+    metrics["minimum_word_count"] = minimum_word_count
+    metrics["word_density_passed"] = metrics["word_count"] >= minimum_word_count
+    if (
+        metrics["char_count"] >= 80
+        and metrics["word_density_passed"]
+        and page_coverage_passed
+    ):
         return ContentAdequacy(
             classification=ContentAdequacyClass.FULL_PDF_TEXT,
             source_scope="full_document",
@@ -199,7 +212,11 @@ def classify_pdf_text(
         classification=ContentAdequacyClass.METADATA_ONLY,
         source_scope="metadata_only",
         coverage_gate="failed",
-        reason="insufficient_or_partial_pdf_text",
+        reason=(
+            "insufficient_pdf_text_density"
+            if page_coverage_passed and not metrics["word_density_passed"]
+            else "insufficient_or_partial_pdf_text"
+        ),
         metrics=metrics,
     )
 

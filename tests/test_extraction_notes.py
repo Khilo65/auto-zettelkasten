@@ -9,6 +9,7 @@ from auto_zettelkasten.extraction import (
     classify_content_adequacy,
     classify_html_content,
     classify_metadata_only,
+    classify_pdf_text,
     extract_bytes,
     extract_path,
 )
@@ -56,6 +57,21 @@ def test_readable_pdf_extracts_text() -> None:
     assert result.source_scope == "full_document"
     assert result.source_coverage == "passed"
     assert result.coverage_metrics["page_count"] == 1
+
+
+def test_low_density_multi_page_pdf_is_not_treated_as_full_publication() -> None:
+    pages = "\n".join(
+        f"--- Page {page} ---\nDownloaded from SAGE. Please retry the article download."
+        for page in range(1, 12)
+    )
+
+    adequacy = classify_pdf_text(pages, page_count=11)
+
+    assert adequacy.classification == ContentAdequacyClass.METADATA_ONLY
+    assert adequacy.coverage_gate == "failed"
+    assert adequacy.reason == "insufficient_pdf_text_density"
+    assert adequacy.metrics["covered_page_ratio"] == 1.0
+    assert adequacy.metrics["word_density_passed"] is False
 
 
 def test_clean_full_article_html_passes_full_document_gate() -> None:

@@ -384,7 +384,7 @@ def test_synthetic_library_covers_readable_scanned_and_missing_sources(tmp_path:
         def fulltext(self, item_key):
             if item_key == "READABLE1PDF":
                 return {
-                    "content": "Readable inspected synthetic source. " * 30,
+                    "content": "Readable inspected synthetic source. " * 120,
                     "contentType": "application/pdf",
                     "indexedPages": 10,
                     "totalPages": 10,
