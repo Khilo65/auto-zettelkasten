@@ -16351,8 +16351,7 @@ def _cluster_markdown(
             for row in synthesis.get("central_findings", []) or []
             if narrative_text(row)
         )
-    answer_parts = [f"**Question:** {question}"] if question else []
-    answer_parts.append(f"**Evidence base:** {_cluster_researcher_status(cluster)}")
+    answer_parts = [f"**Evidence base:** {_cluster_researcher_status(cluster)}"]
     if synthesis_text:
         answer_parts.append(synthesis_text)
     else:
@@ -16364,10 +16363,10 @@ def _cluster_markdown(
     answer_parts.append(
         f"This cluster draws on {core_count} core source{'s' if core_count != 1 else ''}."
     )
-    sections = [
-        f"# {cluster_display_title(cluster)}",
-        "## Question and answer\n\n" + "\n\n".join(answer_parts),
-    ]
+    sections = [f"# {cluster_display_title(cluster)}"]
+    if question:
+        sections.append("## Research question\n\n" + question)
+    sections.append("## Verdict\n\n" + "\n\n".join(answer_parts))
 
     coherence = _cluster_display_coherence(cluster, synthesis)
     thread_rows = _cluster_display_threads(cluster, synthesis)
@@ -16396,15 +16395,20 @@ def _cluster_markdown(
         role_links[
             role_by_source.get(source_id, str(source.get("cluster_role") or "context"))
         ].append(_obsidian_note_link(source))
-    if role_links.get("core"):
-        fit_lines.append("**Core studies:** " + "; ".join(role_links["core"]))
-    related_links = [*role_links.get("bridge", []), *role_links.get("context", [])]
-    if related_links:
-        fit_lines.append("**Bridge and context sources:** " + "; ".join(related_links))
     if fit_lines:
         sections.append(
-            "## How this literature fits together\n\n" + "\n\n".join(fit_lines)
+            "## Why these studies form a cluster\n\n" + "\n\n".join(fit_lines)
         )
+    role_sections: list[str] = []
+    for role, label in (
+        ("core", "Core studies"),
+        ("context", "Context sources"),
+        ("bridge", "Bridge sources"),
+    ):
+        if role_links.get(role):
+            role_sections.append(f"**{label}:** " + "; ".join(role_links[role]))
+    if role_sections:
+        sections.append("## Sources and their roles\n\n" + "\n\n".join(role_sections))
 
     all_contributions = [
         dict(row)
@@ -16456,12 +16460,12 @@ def _cluster_markdown(
 
     findings: list[str] = []
     seen_meanings: set[str] = set()
+    central_rows = [
+        dict(row)
+        for row in synthesis.get("central_findings", []) or []
+        if isinstance(row, Mapping) and narrative_text(row)
+    ]
     if not thread_rows:
-        central_rows = [
-            dict(row)
-            for row in synthesis.get("central_findings", []) or []
-            if isinstance(row, Mapping) and narrative_text(row)
-        ]
         if central_rows:
             findings.append("### Overall pattern")
             findings.extend(render_rows(central_rows))
@@ -16553,6 +16557,11 @@ def _cluster_markdown(
                 seen_meanings.add(meaning.casefold())
     if findings:
         sections.append("## What the studies find\n\n" + "\n\n".join(findings))
+    if thread_rows and central_rows:
+        sections.append(
+            "## Connections across the findings\n\n"
+            + "\n".join(render_rows(central_rows))
+        )
 
     relationship_state = str(
         debate.get("classification") or synthesis.get("debate_state") or "no_debate"
@@ -16610,7 +16619,7 @@ def _cluster_markdown(
         else:
             relation_lines.append(f"- **{subject} is not established:** {explanation}")
     sections.append(
-        "## Where the evidence agrees, differs, or remains uncertain\n\n"
+        "## Consensus, disagreement, and uncertainty\n\n"
         + "\n".join(relation_lines)
     )
 
@@ -16643,7 +16652,10 @@ def _cluster_markdown(
         render_rows(synthesis.get("methodological_fault_lines", []) or [])
     )
     if limit_lines:
-        sections.append("## Limits of the evidence\n\n" + "\n".join(limit_lines))
+        sections.append(
+            "## Boundary, method, and measurement differences\n\n"
+            + "\n".join(limit_lines)
+        )
 
     related_cluster_lines: list[str] = []
     for relationship in synthesis.get("related_clusters", []) or []:
@@ -16680,7 +16692,7 @@ def _cluster_markdown(
 
     if related_gaps:
         sections.append(
-            "## Gaps from this cluster\n\n"
+            "## Collection gaps\n\n"
             + "\n".join(
                 f"- {_gap_wikilink(gap)} — "
                 + (
@@ -16729,13 +16741,14 @@ def _cluster_markdown(
             )
     if considered_gap_lines:
         sections.append(
-            "## Gap candidates considered\n\n"
-            "These collection-native candidates were examined but did not meet the stricter visible-gap standard.\n\n"
+            "## Why other gap candidates were not retained\n\n"
+            "These collection-native candidates were examined but did not meet the visible-gap standard.\n\n"
             + "\n".join(considered_gap_lines)
         )
     if source_links:
         sections.append(
-            "## Sources\n\n" + "\n".join(f"- {value}" for value in source_links)
+            "## Source index\n\n"
+            + "\n".join(f"- {value}" for value in source_links)
         )
     return _markdown_with_frontmatter(frontmatter, "\n\n".join(sections))
 
@@ -17880,6 +17893,12 @@ def _literature_map_markdown(
     gap_registry = _as_mapping(report.get("gap_registry"))
     gaps = list(gap_registry.get("gaps", []) or [])
     rejected_gaps = list(gap_registry.get("rejected_candidates", []) or [])
+    cluster_registry = _as_mapping(report.get("cluster_registry"))
+    unclustered = [
+        _as_mapping(row)
+        for row in cluster_registry.get("unclustered_sources", []) or []
+        if isinstance(row, Mapping)
+    ]
     collection_name = str(
         source_set.get("collection_name")
         or source_set.get("source_set_alias")
@@ -17898,12 +17917,52 @@ def _literature_map_markdown(
     sections = [
         f"# {title}",
         (
-            "## What this collection is mainly about\n\n"
+            "## How to use this map\n\n"
             "This map organizes the frozen Zotero collection into coherent subliteratures. Cluster notes explain what the "
             "sources find, how their arguments and evidence relate, and where the collection remains uncertain. The map is "
-            "collection-relative: it does not claim to cover every publication in the wider literature."
+            "collection-relative: it does not claim to cover every publication in the wider literature. Start with a cluster, "
+            "follow its links to atomic notes for source-level evidence, and open a linked gap note for the full collection-native rationale."
         ),
     ]
+
+    inventory_count = int(manifest.get("coverage_inventory_count", 0) or 0)
+    analytical_count = int(manifest.get("analytical_profile_count", 0) or 0)
+    limited_count = int(manifest.get("limited_profile_count", 0) or 0)
+    exhausted_count = int(manifest.get("coverage_exhausted_count", 0) or 0)
+    partial_count = int(manifest.get("coverage_partial_count", 0) or 0)
+    pending_count = int(manifest.get("coverage_pending_count", 0) or 0)
+    clustered_sources = {
+        str(source_id)
+        for cluster in clusters
+        for source_id in cluster.get("source_ids", []) or []
+    }
+    profiles_by_source = {
+        str(row.get("source_id") or ""): row
+        for row in report.get("profiles", []) or []
+        if isinstance(row, Mapping) and row.get("source_id")
+    }
+    coverage_lines = [
+        f"- Frozen collection items: {inventory_count}",
+        f"- Analytical profiles: {analytical_count}",
+        f"- Limited profiles: {limited_count}",
+        f"- Exhausted sources: {exhausted_count}",
+        f"- Partial sources: {partial_count}",
+        f"- Pending sources: {pending_count}",
+        f"- Sources represented in clusters: {len(clustered_sources)}",
+        f"- Analytical sources outside clusters: {len(unclustered)}",
+    ]
+    if unclustered:
+        coverage_lines.extend(["", "**Why some analytical sources remain outside clusters**"])
+        for row in unclustered:
+            source_id = str(row.get("source_id") or "")
+            source = profiles_by_source.get(source_id, row)
+            reason = _map_unclustered_reason_label(row.get("reason"))
+            detail = _human_projection_text(row.get("reason_detail") or "")
+            coverage_lines.append(
+                f"- {_obsidian_note_link(source)} — {reason}"
+                + (f". {detail}" if detail and detail.casefold() not in reason.casefold() else ".")
+            )
+    sections.append("## Collection coverage\n\n" + "\n".join(coverage_lines))
 
     cards: list[str] = []
     for cluster in clusters:
@@ -18097,42 +18156,12 @@ def _literature_map_markdown(
             + " That does not mean the wider literature has no gaps."
         )
 
-    inventory_count = int(manifest.get("coverage_inventory_count", 0) or 0)
-    analytical_count = int(manifest.get("analytical_profile_count", 0) or 0)
-    limited_count = int(manifest.get("limited_profile_count", 0) or 0)
-    exhausted_count = int(manifest.get("coverage_exhausted_count", 0) or 0)
-    clustered_sources = {
-        str(source_id)
-        for cluster in clusters
-        for source_id in cluster.get("source_ids", []) or []
-    }
-    analytical_profiles = [
-        row
-        for row in report.get("profiles", []) or []
-        if isinstance(row, Mapping) and bool(row.get("analytical"))
-    ]
-    analytical_by_source = {
-        str(row.get("source_id") or ""): row
-        for row in analytical_profiles
-        if row.get("source_id")
-    }
-    unclustered_analytical_ids = sorted(set(analytical_by_source) - clustered_sources)
-    coverage = (
-        f"The frozen collection contains {inventory_count} items. {analytical_count} profiles were admitted to analytical "
-        f"mapping, {limited_count} profiles were excluded or limited, {exhausted_count} "
-        f"source{'s' if exhausted_count != 1 else ''} could not be processed, "
-        f"and {len(clustered_sources)} sources appear in at least one cluster. "
-        f"{len(unclustered_analytical_ids)} valid analytical source"
-        f"{'s remain' if len(unclustered_analytical_ids) != 1 else ' remains'} outside a cluster."
+    sections.append(
+        "## Navigate\n\n"
+        "- [[clusters/INDEX|Cluster Index]] — every admitted research conversation\n"
+        "- [[gaps/INDEX|Gap Registry Index]] — visible collection-relative gaps and leads\n"
+        "- [[02_source_memory/indexes/INDEX|Source Index]] — every generated source note"
     )
-    if partial_cluster_ids:
-        coverage += " Some cluster syntheses remain partial, so the published map preserves the last valid projection where available."
-    if unclustered_analytical_ids:
-        coverage += (
-            " Those unclustered sources remain searchable in the source index; their detailed exclusion reasons stay in "
-            "the machine-readable cluster register rather than crowding this overview."
-        )
-    sections.append("## Coverage\n\n" + coverage)
     return _markdown_with_frontmatter(
         {
             "type": "literature_map",

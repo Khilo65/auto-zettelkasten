@@ -2555,7 +2555,7 @@ def test_human_markdown_omits_empty_audit_and_raw_id_text_while_linking_sources_
         assert "gap-raw-ceasefire" not in visible
         assert "cluster-raw-ceasefire" not in visible
     assert "## What the studies find" not in cluster_text
-    assert "## Limits of the evidence" not in cluster_text
+    assert "## Boundary, method, and measurement differences" not in cluster_text
 
 
 def test_partial_cluster_renders_a_question_without_claiming_a_verdict() -> None:
@@ -2579,7 +2579,7 @@ def test_partial_cluster_renders_a_question_without_claiming_a_verdict() -> None
         synthesis={"status": "partial", "synthesis": ""},
     )
 
-    assert "## Question and answer" in text
+    assert "## Research question" in text and "## Verdict" in text
     assert "A complete evidence-grounded synthesis has not yet passed" in text
 
 
@@ -2613,7 +2613,7 @@ def test_deterministic_cluster_renders_a_bounded_verdict_without_claiming_consen
         synthesis={"status": "deterministic_fallback", "synthesis": ""},
     )
 
-    assert "## Question and answer" in text
+    assert "## Research question" in text and "## Verdict" in text
     assert "A complete evidence-grounded synthesis has not yet passed" in text
     assert "same research program" in text
 
@@ -2878,7 +2878,7 @@ def test_strict_consensus_and_contradiction_failures_are_explained_in_cluster_ma
         synthesis={},
         profile_by_source={row["source_id"]: row for row in rows},
     )
-    assert "## Where the evidence agrees, differs, or remains uncertain" in markdown
+    assert "## Consensus, disagreement, and uncertainty" in markdown
     assert "literature-cluster/" in markdown
     assert "**Strong consensus" in markdown
     assert "is not established:**" in markdown

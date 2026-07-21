@@ -1643,10 +1643,11 @@ def test_compatibility_entry_accepts_current_rows_writes_all_outputs_and_has_no_
     assert "Candidate gap requiring falsification" not in map_text
     for heading in (
         "# Literature Map",
-        "## What this collection is mainly about",
+        "## How to use this map",
         "## Literature clusters",
         "## Collection-relative gaps",
-        "## Coverage",
+        "## Collection coverage",
+        "## Navigate",
     ):
         assert heading in map_text
     assert "No coherent multi-source cluster was admitted." in map_text
@@ -1654,6 +1655,8 @@ def test_compatibility_entry_accepts_current_rows_writes_all_outputs_and_has_no_
         "No sufficiently specific collection-native candidate was generated" in map_text
     )
     assert "Dependency hash" not in map_text and "fingerprint" not in map_text
+    assert "No locator-backed central finding supports cluster membership" in map_text
+    assert "Institutional Trust" in map_text
     cluster_root = tmp_path / "03_literature_synthesis" / "clusters"
     assert list(cluster_root.glob("Cluster - *.md")) == []
 
@@ -1810,9 +1813,9 @@ def test_gap_markdown_has_native_tags_and_reciprocal_evidence_links(
     assert cluster_frontmatter["related_gaps"] == [expected_gap_link]
     cluster_body = cluster_text.split("\n---\n", 1)[1]
     gap_body = text.split("\n---\n", 1)[1]
-    assert "## Gaps from this cluster" in cluster_body
+    assert "## Collection gaps" in cluster_body
     assert expected_gap_link in cluster_body
-    assert "## Limits of the evidence" in cluster_body
+    assert "## Boundary, method, and measurement differences" in cluster_body
     assert "## Counterevidence and limits" not in gap_body
     assert "claim-a" not in cluster_body and "claim-b" not in cluster_body
     assert "claim-a" not in gap_body and "claim-b" not in gap_body
@@ -1976,13 +1979,15 @@ def test_reasoned_cluster_markdown_explains_findings_debate_and_gap_lineage(
     cluster_body = cluster_text.split("\n---\n", 1)[1]
     gap_body = gap_text.split("\n---\n", 1)[1]
     for heading in (
-        "## Question and answer",
-        "## How this literature fits together",
+        "## Research question",
+        "## Verdict",
+        "## Why these studies form a cluster",
+        "## Sources and their roles",
         "## What the studies find",
-        "## Where the evidence agrees, differs, or remains uncertain",
-        "## Limits of the evidence",
-        "## Gaps from this cluster",
-        "## Sources",
+        "## Consensus, disagreement, and uncertainty",
+        "## Boundary, method, and measurement differences",
+        "## Collection gaps",
+        "## Source index",
     ):
         assert heading in cluster_body
     assert "### Agreements" not in cluster_body
@@ -2005,8 +2010,10 @@ def test_reasoned_cluster_markdown_explains_findings_debate_and_gap_lineage(
         (tmp_path / "03_literature_synthesis" / "manifest.yml").read_text()
     )
     map_text = Path(manifest["artifacts"]["literature_map_markdown"]).read_text()
-    assert "## What this collection is mainly about" in map_text
+    assert "## How to use this map" in map_text
+    assert "## Collection coverage" in map_text
     assert "## Literature clusters" in map_text
+    assert "## Navigate" in map_text
     assert (
         f"### [[{cluster_note_stem(cluster)}|{cluster_display_title(cluster)}]]"
         in map_text
