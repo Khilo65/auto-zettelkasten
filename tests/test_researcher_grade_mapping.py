@@ -414,6 +414,56 @@ def test_map_excerpts_stop_at_complete_sentences_and_deduplicate_threads() -> No
     )
 
 
+def test_cluster_answer_replaces_dangling_thread_fragments_with_named_findings() -> None:
+    cluster = {
+        "label": "Mediator bias and bargaining dynamics",
+        "shared_question": "How does mediator bias shape bargaining and settlement?",
+        "source_ids": ["bias", "case"],
+        "core_source_ids": ["bias", "case"],
+        "source_roles": [
+            {"source_id": "bias", "role": "core"},
+            {"source_id": "case", "role": "core"},
+        ],
+        "representative_sources": [
+            {"source_id": "bias", "note_path": "Svensson2007 - Bargaining.md"},
+            {"source_id": "case", "note_path": "Inbar1991 - Great Power.md"},
+        ],
+    }
+    synthesis = {
+        "evidence_threads": [
+            {
+                "summary": "This effect is robust to controls and selection diagnostics.",
+                "evidence": [{"source_id": "bias"}],
+            },
+            {
+                "summary": "This constrained his role, leading to hard bargaining.",
+                "evidence": [{"source_id": "case"}],
+            },
+        ],
+        "source_contributions": [
+            {
+                "source_id": "bias",
+                "finding": "Government-biased mediators are associated with a higher probability of settlement.",
+                "plain_english_meaning": "Bias can sometimes supply leverage rather than simply undermine trust.",
+                "evidence": [{"source_id": "bias", "locator": "pp. 177-192"}],
+            },
+            {
+                "source_id": "case",
+                "finding": "Mediator alignment constrained bargaining and produced hard bargaining.",
+                "plain_english_meaning": "A powerful mediator could not dictate the result.",
+                "evidence": [{"source_id": "case", "locator": "pp. 71-84"}],
+            },
+        ],
+    }
+
+    answer = _cluster_answer_excerpt(synthesis, cluster=cluster)
+
+    assert "This effect" not in answer
+    assert "This constrained" not in answer
+    assert "Svensson (2007) reports" in answer
+    assert "Inbar (1991) reports" in answer
+
+
 def test_human_cluster_projection_demotes_off_question_context() -> None:
     cluster = {
         "cluster_id": "cluster-un-support",

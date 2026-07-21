@@ -3451,3 +3451,29 @@ def test_gap_internal_search_terms_remove_rule_words_and_stopwords() -> None:
     assert "untested" not in terms
     assert "mechanism" not in terms
     assert {"legitimacy", "settlement", "durability"}.issubset(set(terms))
+
+    replication_terms = literature._gap_search_terms(
+        {
+            "rule": "replication",
+            "topic": "Replication of fatalities effect with independent data",
+            "precise_missing_evidence": (
+                "The two studies Bercovitch1991 and Bercovitch2005 share overlapping "
+                "evidence bases; an independent dataset is needed to confirm the association."
+            ),
+        }
+    )
+    assert {"fatality"}.issubset(set(replication_terms))
+    assert not {
+        "association",
+        "base",
+        "bercovitch1991",
+        "bercovitch2005",
+        "dataset",
+        "evidence",
+        "independent",
+        "needed",
+        "overlapping",
+        "share",
+        "studies",
+        "two",
+    } & set(replication_terms)

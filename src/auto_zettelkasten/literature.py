@@ -12579,7 +12579,9 @@ def _gap_search_terms(candidate: Mapping[str, Any]) -> list[str]:
         "coverage",
         "cross",
         "data",
+        "dataset",
         "empirical",
+        "evidence",
         "finding",
         "gap",
         "integration",
@@ -12587,10 +12589,28 @@ def _gap_search_terms(candidate: Mapping[str, Any]) -> list[str]:
         "measurement",
         "methodological",
         "replication",
+        "association",
+        "base",
+        "confirm",
+        "independent",
+        "needed",
+        "overlapping",
+        "share",
+        "showing",
         "stated",
+        "study",
+        "studies",
+        "testing",
+        "two",
         "untested",
     }
-    return sorted(term for term in terms if term not in generic and len(term) > 2)
+    return sorted(
+        term
+        for term in terms
+        if term not in generic
+        and len(term) > 2
+        and not re.fullmatch(r"[a-z]+(?:19|20)\d{2}[a-z]?", term)
+    )
 
 
 def _strict_gap_adjudication(
@@ -18000,6 +18020,31 @@ def _clean_display_excerpt(text: str) -> str:
     return cleaned
 
 
+def _standalone_verdict_sentence(value: Any) -> str:
+    """Return only a sentence that makes sense outside its source paragraph."""
+
+    sentence = _map_verdict_excerpt(value, sentence_limit=1, character_limit=340)
+    if not sentence:
+        return ""
+    normalized = sentence.casefold()
+    if re.match(
+        r"^(?:this|that|these|those|it|he|she|they|the former|the latter)\b",
+        normalized,
+    ):
+        return ""
+    if re.search(
+        r"\b(?:does not|did not|cannot|can not|fails? to)\s+(?:by itself\s+)?"
+        r"(?:establish|show|demonstrate|test|answer)\s*\.\s*$",
+        normalized,
+    ):
+        return ""
+    if re.search(r"\b[a-z]+(?:19|20)\d{2}[a-z]?\b", normalized):
+        return ""
+    if ".." in sentence:
+        return ""
+    return sentence
+
+
 def _cluster_answer_excerpt(
     synthesis: Mapping[str, Any],
     *,
@@ -18024,6 +18069,7 @@ def _cluster_answer_excerpt(
         )
 
     thread_sentences: list[str] = []
+    accepted_rows: list[Mapping[str, Any]] = []
     seen_sentences: set[str] = set()
     rows = (
         _cluster_display_threads(cluster, synthesis)
@@ -18040,11 +18086,7 @@ def _cluster_answer_excerpt(
         value = row.get("summary") or row.get("plain_english_meaning") or ""
         if not _human_projection_text(value):
             continue
-        sentence = _map_verdict_excerpt(
-            value,
-            sentence_limit=1,
-            character_limit=340,
-        )
+        sentence = _standalone_verdict_sentence(value)
         if not scope_safe(sentence):
             continue
         identity = _canonical_phrase(sentence)
@@ -18052,6 +18094,7 @@ def _cluster_answer_excerpt(
             continue
         seen_sentences.add(identity)
         thread_sentences.append(sentence)
+        accepted_rows.append(row)
         if len(thread_sentences) >= max_threads:
             break
     if not thread_sentences and not rows:
@@ -18069,7 +18112,7 @@ def _cluster_answer_excerpt(
         }
         covered_source_ids = {
             str(reference.get("source_id") or "")
-            for row in rows
+            for row in accepted_rows
             if str(row.get("origin") or "") != "deterministic_source_contribution_map"
             for reference in row.get("evidence", []) or []
             if isinstance(reference, Mapping) and reference.get("source_id")
@@ -18117,6 +18160,9 @@ def _cluster_answer_excerpt(
                 else str(source.get("title") or "One core source")
             )
             source_label = _human_projection_text(source_label)
+            source_label = re.sub(
+                r"(?<=[A-Za-z])n\.d\.$", " (n.d.)", source_label, flags=re.I
+            )
             finding = _map_verdict_excerpt(
                 contribution.get("finding"), sentence_limit=1, character_limit=300
             )
@@ -18636,6 +18682,10 @@ def _literature_map_markdown(
             detail = _human_projection_text(row.get("reason_detail") or "")
             if re.fullmatch(r"[a-z0-9_]+", detail):
                 detail = _map_unclustered_reason_label(detail)
+            if detail.casefold().startswith(
+                "the source shares retrieval signals with other studies"
+            ):
+                detail = ""
             coverage_lines.append(
                 f"- {_obsidian_note_link(source)} — {reason}"
                 + (f". {detail}" if detail and detail.casefold() not in reason.casefold() else ".")
