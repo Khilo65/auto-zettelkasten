@@ -708,7 +708,33 @@ def build_map(
     run_dir = run_directory(root, run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
     write_yaml(run_dir / "build_map_manifest.yml", manifest.to_dict())
-    progress.set_stage("reporting")
+    inventory_count = int(
+        selected_source_set.get("inventory_count", len(source_rows)) or 0
+    )
+    validated_note_count = int(
+        selected_source_set.get("validated_note_count", 0) or 0
+    )
+    limited_note_count = int(
+        selected_source_set.get("limited_note_count", 0) or 0
+    )
+    exhausted_count = int(selected_source_set.get("exhausted_count", 0) or 0)
+    partial_count = int(selected_source_set.get("partial_count", 0) or 0)
+    pending_count = int(selected_source_set.get("pending_count", 0) or 0)
+    progress.set_stage(
+        "reporting",
+        inventory_count=inventory_count,
+        validated_note_count=validated_note_count,
+        limited_note_count=limited_note_count,
+        exhausted_count=exhausted_count,
+        partial_count=partial_count,
+        pending_count=pending_count,
+        terminal_count=(
+            validated_note_count
+            + limited_note_count
+            + exhausted_count
+            + partial_count
+        ),
+    )
     progress.finish("partial" if result.get("partial_reason") else "completed")
     return manifest
 
