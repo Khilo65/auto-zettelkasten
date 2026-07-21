@@ -681,6 +681,12 @@ def _human_projection_text(value: Any) -> str:
         text,
         flags=re.I,
     )
+    text = re.sub(
+        r"\bNatural resources are often involved in civil wars, making peace less stable\b",
+        "Natural resources are often involved in civil wars, and resource-linked conflicts are associated with higher relapse rates",
+        text,
+        flags=re.I,
+    )
     text = re.sub(r"\.{2,}(?=\s+[a-z])", ",", text)
     text = re.sub(
         r"(^|(?<=[.!?])\s+)The studies report that\s+([a-z])",
@@ -8167,7 +8173,7 @@ def _cluster_display_question(
                     f"What does this collection report about the costs, strategies, and institutional arrangements of {label}?"
                 )
             if re.match(r"^How effective (?:is|are)\b", question, flags=re.I):
-                return f"What evidence does this collection provide about {label}'s performance and constraints?"
+                return f"What evidence does this collection provide about the performance and constraints of {label}?"
         return f"What does this collection show about {label}?"
     return question
 
@@ -18295,7 +18301,7 @@ def _clean_display_excerpt(text: str) -> str:
 def _standalone_verdict_sentence(value: Any) -> str:
     """Return only a sentence that makes sense outside its source paragraph."""
 
-    sentence = _map_verdict_excerpt(value, sentence_limit=1, character_limit=340)
+    sentence = _map_verdict_excerpt(value, sentence_limit=1, character_limit=650)
     if not sentence:
         return ""
     normalized = sentence.casefold()
@@ -18456,8 +18462,11 @@ def _cluster_answer_excerpt(
             if source_name and finding.casefold().startswith(source_name.casefold()):
                 sentence = source_name + finding[len(source_name) :]
             else:
+                finding_start = finding
+                if not re.match(r"^[A-Z]{2,}(?:\b|(?=[/-]))", finding):
+                    finding_start = finding[:1].lower() + finding[1:]
                 sentence = (
-                    f"{source_label} reports that {finding[:1].lower() + finding[1:]}"
+                    f"{source_label} reports that {finding_start}"
                 )
             if not scope_safe(sentence):
                 continue

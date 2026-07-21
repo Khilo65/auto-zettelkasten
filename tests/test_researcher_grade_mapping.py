@@ -371,6 +371,9 @@ def test_human_projection_repairs_old_narrowing_debris_and_machine_locators() ->
         "UNGA (2020) and Hellmüller (2022)"
     )
     assert _human_projection_text("the aU Commission") == "the AU Commission"
+    assert "associated with higher relapse rates" in _human_projection_text(
+        "Natural resources are often involved in civil wars, making peace less stable."
+    )
 
 
 def test_map_excerpts_stop_at_complete_sentences_and_deduplicate_threads() -> None:
@@ -463,6 +466,47 @@ def test_cluster_answer_replaces_dangling_thread_fragments_with_named_findings()
     assert "This constrained" not in answer
     assert "Svensson (2007) reports" in answer
     assert "Inbar (1991) reports" in answer
+
+
+def test_cluster_answer_preserves_acronyms_and_complete_long_findings() -> None:
+    cluster = {
+        "label": "African institutional capacity and conflict diagnosis",
+        "shared_question": "What do the sources show about institutional capacity and conflict diagnosis?",
+        "source_ids": ["au", "glasl"],
+        "core_source_ids": ["au", "glasl"],
+        "source_roles": [
+            {"source_id": "au", "role": "core"},
+            {"source_id": "glasl", "role": "core"},
+        ],
+        "representative_sources": [
+            {"source_id": "au", "note_path": "Vines2013 - APSA.md"},
+            {"source_id": "glasl", "note_path": "Glasl2008 - Diagnosis.md"},
+        ],
+    }
+    long_finding = (
+        "Glasl argues for a systems-theory-based diagnosis across five dimensions and "
+        "emphasizes cognitive, emotional, and intentional turning points that practitioners "
+        "can use to distinguish surface disputes from deeper conflict dynamics."
+    )
+    synthesis = {
+        "source_contributions": [
+            {
+                "source_id": "au",
+                "finding": "AU institutional capacity was constrained: AU Commission employed 669 people in 2012.",
+                "evidence": [{"source_id": "au", "locator": "p. 90"}],
+            },
+            {
+                "source_id": "glasl",
+                "finding": long_finding,
+                "evidence": [{"source_id": "glasl", "locator": "pp. 2-7"}],
+            },
+        ]
+    }
+
+    answer = _cluster_answer_excerpt(synthesis, cluster=cluster)
+
+    assert "Vines (2013) reports that AU institutional capacity" in answer
+    assert long_finding in answer
 
 
 def test_cluster_answer_rejects_machine_ids_incomplete_lists_and_absence_metadata() -> None:
