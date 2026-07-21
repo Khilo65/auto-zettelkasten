@@ -15244,7 +15244,6 @@ def _cluster_markdown_v09(
     *,
     synthesis: Mapping[str, Any] | None = None,
     profile_by_source: Mapping[str, Mapping[str, Any]] | None = None,
-    neighborhood_index_note: str = "Literature Neighborhoods",
 ) -> str:
     """Render the human projection; full validation traces stay in YAML."""
 
@@ -15600,12 +15599,8 @@ def _cluster_markdown_v09(
         if not label:
             continue
         tag_link = f" #{canonical_tag}" if canonical_tag else ""
-        heading = f"{facet.title()} neighborhoods"
-        neighborhood_link = (
-            f"[[{neighborhood_index_note}#{heading}|{facet.title()}: {label}]]"
-        )
         neighborhood_lines.append(
-            f"- **{neighborhood_link}** — shared by {member_count} core sources in this cluster.{tag_link}"
+            f"- **{facet.title()}: {label}** — shared by {member_count} core sources in this cluster.{tag_link}"
         )
     if neighborhood_lines:
         sections.append(
@@ -15671,11 +15666,10 @@ def _cluster_markdown(
     synthesis: Mapping[str, Any] | None = None,
     profile_by_source: Mapping[str, Mapping[str, Any]] | None = None,
     cluster_by_id: Mapping[str, Mapping[str, Any]] | None = None,
-    neighborhood_index_note: str = "Literature Neighborhoods",
 ) -> str:
     """Render the concise researcher-facing projection; detailed audits remain in YAML."""
 
-    del matrix, neighborhood_index_note
+    del matrix
     synthesis = synthesis or {}
     debate = debate or {}
     profile_by_source = profile_by_source or {}
@@ -17083,117 +17077,6 @@ def _map_unclustered_reason_label(value: Any) -> str:
     )
 
 
-def _literature_neighborhoods_markdown(
-    report: Mapping[str, Any],
-    source_set: Mapping[str, Any],
-) -> str:
-    navigation = _as_mapping(report.get("navigation"))
-    summaries = [
-        _as_mapping(row)
-        for row in navigation.get("human_neighborhood_summaries", []) or []
-        if isinstance(row, Mapping)
-    ]
-    neighborhood_by_id = {
-        str(row.get("topic_neighborhood_id") or ""): _as_mapping(row)
-        for row in navigation.get("topic_neighborhoods", []) or []
-        if isinstance(row, Mapping)
-    }
-    profile_by_source = {
-        str(row.get("source_id") or ""): row
-        for row in report.get("profiles", []) or []
-        if isinstance(row, Mapping)
-    }
-    cluster_by_id = {
-        str(row.get("cluster_id") or ""): row
-        for row in _as_mapping(report.get("cluster_registry")).get("clusters", []) or []
-        if isinstance(row, Mapping) and row.get("cluster_id")
-    }
-    collection_name = str(
-        source_set.get("collection_name")
-        or source_set.get("source_set_alias")
-        or source_set.get("source_set_id")
-        or "Collection"
-    ).strip()
-    title = f"Literature Neighborhoods - {collection_name}"
-    sections = [
-        f"# {title}",
-        (
-            "## How to use this index\n\n"
-            "Neighborhoods are collection-native browsing routes. They group sources that share a discriminative "
-            "concept, mechanism, outcome, method, case, or explicit relation. They do not establish agreement, a "
-            "debate, or a gap; those judgments belong to analytical cluster notes."
-        ),
-    ]
-    if summaries:
-        by_facet: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for row in summaries:
-            detail = neighborhood_by_id.get(str(row.get("neighborhood_id") or ""), {})
-            row = {**detail, **row}
-            by_facet[str(row.get("facet_type") or row.get("kind") or "subject")].append(
-                row
-            )
-        for facet, rows in sorted(by_facet.items()):
-            lines: list[str] = []
-            for row in sorted(
-                rows, key=lambda value: str(value.get("label") or "").casefold()
-            ):
-                label = _human_projection_text(
-                    row.get("label") or row.get("canonical_tag") or "Neighborhood"
-                )
-                explanation = _human_projection_text(
-                    row.get("explanation")
-                    or row.get("summary")
-                    or row.get("why_useful")
-                    or ""
-                )
-                source_ids = [str(value) for value in row.get("source_ids", []) or []]
-                links = [
-                    _obsidian_note_link(profile_by_source[source_id])
-                    for source_id in source_ids
-                    if source_id in profile_by_source
-                ]
-                lines.append(f"### {label}")
-                if explanation:
-                    lines.append(explanation)
-                if links:
-                    lines.append("Sources: " + "; ".join(links))
-                cluster_links = [
-                    _cluster_wikilink(cluster_by_id[cluster_id])
-                    for cluster_id in row.get("related_cluster_ids", []) or []
-                    if cluster_id in cluster_by_id
-                ]
-                if cluster_links:
-                    lines.append("Analytical clusters: " + "; ".join(cluster_links))
-            if lines:
-                sections.append(
-                    f"## {facet.replace('_', ' ').title()} neighborhoods\n\n"
-                    + "\n\n".join(lines)
-                )
-    else:
-        sections.append(
-            "## Active neighborhoods\n\n"
-            "No repeated, discriminative collection-native neighborhood met the promotion threshold. "
-            "Source-local facets remain searchable in the machine audit without crowding the Obsidian graph."
-        )
-    metrics = _as_mapping(navigation.get("navigation_metrics"))
-    if metrics:
-        sections.append(
-            "## Vocabulary health\n\n"
-            f"- Active vocabulary: {int(metrics.get('active_tag_concept_count', 0) or 0)}\n"
-            f"- Source-local singleton facets: {int(metrics.get('source_local_singleton_tag_count', 0) or 0)}\n"
-            f"- Unresolved reconciliation proposals: {int(metrics.get('unresolved_reconciliation_count', 0) or 0)}"
-        )
-    return _markdown_with_frontmatter(
-        {
-            "type": "literature_neighborhood_index",
-            "title": title,
-            "scope": "collection_only",
-            "tags": [],
-        },
-        "\n\n".join(sections),
-    )
-
-
 def _literature_map_markdown_v09(
     report: Mapping[str, Any],
     source_set: Mapping[str, Any],
@@ -17484,18 +17367,15 @@ def _literature_map_markdown_v09(
         "`mechanism/mediator-legitimacy`, `outcome/mediation-success`, or `case/syria`. They let Obsidian connect "
         "notes through a shared concept, mechanism, outcome, method, or case.\n\n"
         "A literature neighborhood is promoted only when at least two independent analytical sources share the same "
-        "typed subject tag. A neighborhood is a browsing aid, not an analytical cluster: it cannot establish a debate, "
+        "typed subject tag. Neighborhoods are browsing aids, not analytical clusters: they cannot establish a debate, "
         "admit a cluster, or answer a gap. Single-source facets remain source-local search metadata and do not become "
-        "native graph tags by default. Open [["
-        + literature_neighborhoods_note_stem(source_set)
-        + "|the neighborhood index]] "
-        "to browse the promoted routes."
+        "native graph tags by default. Promoted neighborhoods appear inside each cluster's "
+        "\"Related literature\" section."
     )
     sections.append(
         "## Navigate\n\n"
         "- [[clusters/INDEX|Cluster Index]] — concise navigation to the admitted clusters\n"
         "- [[gaps/INDEX|Gap Registry Index]] — collection-relative gaps and leads\n"
-        f"- [[{literature_neighborhoods_note_stem(source_set)}|Literature Neighborhoods]] — discriminative retrieval routes\n"
         "- [[02_source_memory/indexes/INDEX|Source Index]] — every generated source note"
     )
     return _markdown_with_frontmatter(frontmatter, "\n\n".join(sections))
@@ -17528,17 +17408,6 @@ def literature_map_note_stem(source_set: Mapping[str, Any], map_id: str) -> str:
     ).strip()
     label = safe_filename(collection_name, fallback="Collection")[:100].rstrip(" .-")
     return f"Literature Map - {label} [{map_id}]"
-
-
-def literature_neighborhoods_note_stem(source_set: Mapping[str, Any]) -> str:
-    collection_name = str(
-        source_set.get("collection_name")
-        or source_set.get("source_set_alias")
-        or source_set.get("source_set_id")
-        or "Collection"
-    ).strip()
-    label = safe_filename(collection_name, fallback="Collection")[:100].rstrip(" .-")
-    return f"Literature Neighborhoods - {label}"
 
 
 def _load_map_cluster_registry(workspace: Path, map_id: str) -> Mapping[str, Any]:
@@ -17927,7 +17796,6 @@ def persist_literature_report(
     prior_root = root / "closest_prior_work"
     packet_root = root / "packets"
     map_id = map_id or stable_literature_map_id(source_set, question)
-    neighborhoods_note_stem = literature_neighborhoods_note_stem(source_set)
     map_root = root / "maps" / map_id
     canonical_cluster_root = map_root / "clusters"
     canonical_gap_root = map_root / "gaps"
@@ -18367,7 +18235,6 @@ def persist_literature_report(
                     cluster_by_id={
                         str(row.get("cluster_id") or ""): row for row in clusters
                     },
-                    neighborhood_index_note=neighborhoods_note_stem,
                 ),
             )
         question_text = _cluster_display_question(cluster, synthesis)
@@ -18692,7 +18559,6 @@ def persist_literature_report(
                     cluster_by_id={
                         str(row.get("cluster_id") or ""): row for row in clusters
                     },
-                    neighborhood_index_note=neighborhoods_note_stem,
                 ),
             )
         question_text = _cluster_display_question(cluster, synthesis)

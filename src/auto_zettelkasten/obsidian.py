@@ -87,7 +87,6 @@ def export_obsidian(
     contents.setdefault(export_root / "Indexes" / "Cluster Index.md", "# Cluster Index\n\nNo canonical clusters yet.\n")
     contents.setdefault(export_root / "Indexes" / "Gap Index.md", "# Gap Candidate Index\n\nNo candidate gaps yet.\n")
     map_export_relative: Path | None = None
-    neighborhoods_export_relative: Path | None = None
     if latest_map is not None:
         map_manifest = read_yaml(latest_map / "manifest.yml", {}) or {}
         artifacts = map_manifest.get("artifacts", {}) if isinstance(map_manifest, dict) else {}
@@ -95,13 +94,8 @@ def export_obsidian(
         primary_path = Path(str(primary_value)) if primary_value else latest_map / "INDEX.md"
         if not primary_path.is_file():
             primary_path = latest_map / "INDEX.md"
-        neighborhoods_value = (
-            artifacts.get("literature_neighborhoods_markdown", "") if isinstance(artifacts, dict) else ""
-        )
-        neighborhoods_path = Path(str(neighborhoods_value)) if neighborhoods_value else Path()
     else:
         primary_path = Path()
-        neighborhoods_path = Path()
     if latest_map is not None and primary_path.is_file():
         map_index = primary_path.read_text(encoding="utf-8")
         map_index = map_index.replace("[[clusters/INDEX|Cluster Index]]", "[[Cluster Index]]")
@@ -110,9 +104,6 @@ def export_obsidian(
         map_index = map_index.replace("[[02_source_memory/indexes/INDEX|Source Index]]", "[[Source Index]]")
         map_export_relative = Path("Indexes") / primary_path.name
         contents[export_root / map_export_relative] = map_index
-    if latest_map is not None and neighborhoods_path.is_file():
-        neighborhoods_export_relative = Path("Indexes") / neighborhoods_path.name
-        contents[export_root / neighborhoods_export_relative] = neighborhoods_path.read_text(encoding="utf-8")
     home = export_root / "Home.md"
     contents[home] = (
         "# Auto-Zettelkasten\n\n"
@@ -122,11 +113,6 @@ def export_obsidian(
         + (
             f"- [[{map_export_relative.with_suffix('')}|Canonical Literature Map]]\n\n"
             if map_export_relative is not None
-            else ""
-        )
-        + (
-            f"- [[{neighborhoods_export_relative.with_suffix('')}|Literature Neighborhoods]]\n\n"
-            if neighborhoods_export_relative is not None
             else ""
         )
         + "This vault is generated. Edit canonical workspace artifacts, then export again.\n"

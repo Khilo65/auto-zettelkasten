@@ -11,7 +11,6 @@ from auto_zettelkasten import literature
 from auto_zettelkasten.literature import (
     DEBATE_STATES,
     GAP_RULES,
-    _literature_neighborhoods_markdown,
     _proposition_debate_state,
     build_debate_registry,
     build_evidence_matrices,
@@ -507,7 +506,7 @@ def test_shared_tags_are_nonanalytical_topic_neighborhoods_not_cluster_support()
     assert typed_tag["analytical_support"] is False
 
 
-def test_human_neighborhoods_link_back_to_the_clusters_that_expose_them() -> None:
+def test_human_neighborhoods_are_machine_navigation_with_cluster_backlinks() -> None:
     report = build_literature_report(
         [profile("a"), profile("b", method="comparative case study")]
     )
@@ -524,16 +523,11 @@ def test_human_neighborhoods_link_back_to_the_clusters_that_expose_them() -> Non
             cluster["cluster_id"]
         ]
 
-    markdown = _literature_neighborhoods_markdown(
-        report,
-        {
-            "source_set_id": "set-neighborhood-links",
-            "collection_name": "Neighborhood Links",
-        },
-    )
-    assert "Analytical clusters:" in markdown
-    assert (
-        f"[[{cluster_note_stem(cluster)}|{cluster_display_title(cluster)}]]" in markdown
+    assert report["navigation"]["human_neighborhood_summaries"]
+    assert all(
+        summary["related_cluster_ids"] == [cluster["cluster_id"]]
+        for summary in report["navigation"]["human_neighborhood_summaries"]
+        if summary["neighborhood_id"] in exposed_neighborhood_ids
     )
 
 

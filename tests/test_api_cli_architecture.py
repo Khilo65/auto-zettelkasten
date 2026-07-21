@@ -76,6 +76,62 @@ def test_obsidian_dry_run_does_not_create_vault(tmp_path: Path) -> None:
     assert result.metadata["file_count"] == 5
 
 
+def test_obsidian_export_of_canonical_literature_map_has_no_missing_wikilinks(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    initialize_workspace(workspace)
+    source_note = workspace / "02_source_memory" / "notes" / "Source A.md"
+    cluster_root = workspace / "03_literature_synthesis" / "maps" / "map-v5" / "clusters"
+    gap_root = cluster_root.parent / "gaps"
+    source_note.write_text("# Source A\n\nRelated: [[Cluster A]]\n", encoding="utf-8")
+    cluster_root.mkdir(parents=True)
+    gap_root.mkdir()
+    (cluster_root / "Cluster A.md").write_text(
+        "# Cluster A\n\nSource: [[Source A]]\n\nGap: [[Gap A]]\n",
+        encoding="utf-8",
+    )
+    (cluster_root / "INDEX.md").write_text(
+        "# Cluster Index\n\n- [[Cluster A]]\n", encoding="utf-8"
+    )
+    (gap_root / "Gap A.md").write_text(
+        "# Gap A\n\nCluster: [[Cluster A]]\n", encoding="utf-8"
+    )
+    (gap_root / "INDEX.md").write_text(
+        "# Gap Index\n\n- [[Gap A]]\n", encoding="utf-8"
+    )
+    map_path = cluster_root.parent / "Literature Map - Mediation.md"
+    map_path.write_text(
+        "# Literature Map - Mediation\n\n"
+        "- [[clusters/INDEX|Cluster Index]]\n"
+        "- [[gaps/INDEX|Gap Index]]\n"
+        "- [[02_source_memory/indexes/INDEX|Source Index]]\n",
+        encoding="utf-8",
+    )
+    write_yaml(
+        cluster_root.parent / "manifest.yml",
+        {
+            "updated_at": "2026-07-21T00:00:00Z",
+            "artifacts": {"literature_map_markdown": str(map_path)},
+        },
+    )
+
+    result = export_to_obsidian(
+        workspace,
+        tmp_path / "vault",
+        dry_run=True,
+        new_vault=True,
+    )
+
+    assert result.status == "dry_run"
+    assert result.metadata["missing_wikilink_count"] == 0
+    assert result.metadata["missing_wikilinks"] == []
+    assert all(
+        "Literature Neighborhoods" not in path
+        for path in result.metadata["planned_files"]
+    )
+
+
 def test_obsidian_replace_rejects_symlink_escape(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     initialize_workspace(workspace)
