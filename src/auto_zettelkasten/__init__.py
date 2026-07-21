@@ -1,7 +1,7 @@
 """Public package metadata and collection-mapping contracts."""
 
-ENGINE_VERSION = "0.9.0"
-ARTIFACT_SCHEMA_VERSION = "1.8"
+ENGINE_VERSION = "0.10.0"
+ARTIFACT_SCHEMA_VERSION = "1.9"
 __version__ = ENGINE_VERSION
 
 from .models import (  # noqa: E402 - version constants must exist before api imports this module

@@ -672,7 +672,9 @@ def test_all_report_models_default_to_engine_0_9_schema_1_8(tmp_path: Path) -> N
         StatusReport(status="ok", workspace=tmp_path),
         LiteratureMapReport(status="ok"),
     )
-    assert {(report.engine_version, report.artifact_schema_version) for report in reports} == {("0.9.0", "1.8")}
+    assert {(report.engine_version, report.artifact_schema_version) for report in reports} == {
+        ("0.10.0", "1.9")
+    }
     assert run_report.literature_map == {}
     assert run_report.literature_report == {}
     assert {
