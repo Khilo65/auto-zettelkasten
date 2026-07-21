@@ -7,21 +7,39 @@ from pathlib import Path
 
 import yaml
 
-from auto_zettelkasten.api import build_map, export_to_obsidian, get_status, resume_map, run_map
+from auto_zettelkasten.api import (
+    build_map,
+    export_to_obsidian,
+    get_status,
+    resume_map,
+    run_map,
+)
 from auto_zettelkasten.literature import cluster_display_title, cluster_note_stem
 from auto_zettelkasten.models import MapRequest, ProcessingPolicy
 from auto_zettelkasten.notes import parse_atomic_note
+from auto_zettelkasten.pipeline import _RunProgress
 
 from conftest import FakeReader, FakeZotero
 
 
-GOLDEN = yaml.safe_load((Path(__file__).parent / "golden" / "vertical_slice.yml").read_text())
+GOLDEN = yaml.safe_load(
+    (Path(__file__).parent / "golden" / "vertical_slice.yml").read_text()
+)
 
 
-def test_vertical_slice_matches_golden_and_builds_obsidian_graph(tmp_path: Path, sample_items) -> None:
+def test_vertical_slice_matches_golden_and_builds_obsidian_graph(
+    tmp_path: Path, sample_items
+) -> None:
     reader = FakeReader()
     report = run_map(
-        MapRequest(tmp_path, scope="collection", collection_key="COLL1", provider="ollama", model="fake-1", parallel=2),
+        MapRequest(
+            tmp_path,
+            scope="collection",
+            collection_key="COLL1",
+            provider="ollama",
+            model="fake-1",
+            parallel=2,
+        ),
         client=FakeZotero(sample_items),
         reader=reader,
         run_id="golden-run",
@@ -35,13 +53,22 @@ def test_vertical_slice_matches_golden_and_builds_obsidian_graph(tmp_path: Path,
     assert report.gap_map["status"] == GOLDEN["gap_status"]
     assert report.gap_map["novelty_claimed"] is GOLDEN["novelty_claimed"]
     assert report.source_set["inventory_count"] == report.source_set["terminal_count"]
-    assert report.source_set["original_zotero_tags"] == ["Exact Tag CASE", "Shared Topic"]
+    assert report.source_set["original_zotero_tags"] == [
+        "Exact Tag CASE",
+        "Shared Topic",
+    ]
     assert report.source_set["normalized_tags"] == ["exact-tag-case", "shared-topic"]
-    typed_links = yaml.safe_load((tmp_path / "02_source_memory" / "indexes" / "typed_links.yml").read_text())["links"]
+    typed_links = yaml.safe_load(
+        (tmp_path / "02_source_memory" / "indexes" / "typed_links.yml").read_text()
+    )["links"]
     assert len(typed_links) == GOLDEN["typed_link_count"]
     assert {row["relation_type"] for row in typed_links} == {"cites", "cited_by"}
-    canonical_gaps = yaml.safe_load((tmp_path / "03_literature_synthesis" / "gaps" / "gaps.yml").read_text())
-    compatible_gaps = yaml.safe_load((tmp_path / "02_source_memory" / "indexes" / "gap_candidates.yml").read_text())
+    canonical_gaps = yaml.safe_load(
+        (tmp_path / "03_literature_synthesis" / "gaps" / "gaps.yml").read_text()
+    )
+    compatible_gaps = yaml.safe_load(
+        (tmp_path / "02_source_memory" / "indexes" / "gap_candidates.yml").read_text()
+    )
     assert compatible_gaps == canonical_gaps
     assert compatible_gaps["status"] == "complete_no_qualifying_gaps"
     assert compatible_gaps["novelty_claimed"] is False
@@ -98,7 +125,9 @@ def test_vertical_slice_matches_golden_and_builds_obsidian_graph(tmp_path: Path,
     assert len(list((export_root / "Indexes").glob("Literature Map - *.md"))) == 1
 
 
-def test_missing_attachment_becomes_limited_and_duplicate_is_exhausted(tmp_path: Path, sample_items) -> None:
+def test_missing_attachment_becomes_limited_and_duplicate_is_exhausted(
+    tmp_path: Path, sample_items
+) -> None:
     items = [sample_items[0], sample_items[0], sample_items[1]]
     report = run_map(
         MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=1),
@@ -111,15 +140,25 @@ def test_missing_attachment_becomes_limited_and_duplicate_is_exhausted(tmp_path:
     assert report.validated_note_count == 1
     assert report.limited_note_count == 1
     assert report.exhausted_count == 1
-    reasons = {row["reason"] for row in report.items if row["terminal_status"] == "exhausted"}
+    reasons = {
+        row["reason"] for row in report.items if row["terminal_status"] == "exhausted"
+    }
     assert reasons == {"duplicate_zotero_item_key"}
-    assert [row["terminal_status"] for row in report.source_set["rows"]] == ["validated_note", "exhausted", "limited_note"]
-    attempts = (tmp_path / "01_custody" / "read_attempts" / "coverage-run.jsonl").read_text()
+    assert [row["terminal_status"] for row in report.source_set["rows"]] == [
+        "validated_note",
+        "exhausted",
+        "limited_note",
+    ]
+    attempts = (
+        tmp_path / "01_custody" / "read_attempts" / "coverage-run.jsonl"
+    ).read_text()
     assert "duplicate_zotero_item_key" in attempts
     assert "metadata_only" in attempts
 
 
-def test_cloud_reader_is_never_called_without_explicit_consent(tmp_path: Path, sample_items) -> None:
+def test_cloud_reader_is_never_called_without_explicit_consent(
+    tmp_path: Path, sample_items
+) -> None:
     class CloudSpy(FakeReader):
         name = "cloud-spy"
         is_cloud = True
@@ -137,7 +176,9 @@ def test_cloud_reader_is_never_called_without_explicit_consent(tmp_path: Path, s
     assert report.errors[0]["reason"] == "cloud_reader_requires_allow_cloud:cloud-spy"
 
 
-def test_fingerprint_rerun_and_same_run_resume_skip_reader(tmp_path: Path, sample_items) -> None:
+def test_fingerprint_rerun_and_same_run_resume_skip_reader(
+    tmp_path: Path, sample_items
+) -> None:
     client = FakeZotero(sample_items)
     first_reader = FakeReader()
     request = MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=1)
@@ -145,22 +186,79 @@ def test_fingerprint_rerun_and_same_run_resume_skip_reader(tmp_path: Path, sampl
     assert first_reader.calls == 2
 
     second_reader = FakeReader()
-    second = run_map(request, client=FakeZotero(sample_items), reader=second_reader, run_id="second")
+    second = run_map(
+        request, client=FakeZotero(sample_items), reader=second_reader, run_id="second"
+    )
     assert second.validated_note_count == 2
     assert second.reused_count == 2
     assert second_reader.calls == 0
     assert len(list((tmp_path / "02_source_memory" / "notes").glob("*.md"))) == 2
 
     resume_reader = FakeReader()
-    resumed = resume_map(tmp_path, "first", client=FakeZotero(sample_items), reader=resume_reader)
+    resumed = resume_map(
+        tmp_path, "first", client=FakeZotero(sample_items), reader=resume_reader
+    )
     assert resumed.validated_note_count == 2
     assert resumed.reused_count == 2
     assert resume_reader.calls == 0
 
 
-def test_resume_revalidates_item_identity_and_content_fingerprint(tmp_path: Path, sample_items) -> None:
+def test_processing_budget_change_reuses_current_schema_committed_note(
+    tmp_path: Path, sample_items
+) -> None:
+    first_reader = FakeReader()
+    first_request = MapRequest(
+        tmp_path,
+        provider="ollama",
+        model="fake-1",
+        parallel=1,
+        processing=ProcessingPolicy(request_deadline_seconds=120),
+    )
+    run_map(
+        first_request,
+        client=FakeZotero(sample_items[:1]),
+        reader=first_reader,
+        run_id="budget-first",
+    )
+    assert first_reader.calls == 1
+    for fingerprint_path in (tmp_path / "11_state" / "fingerprints").glob("*.yml"):
+        payload = yaml.safe_load(fingerprint_path.read_text())
+        payload["engine_version"] = "0.3.0"
+        payload["artifact_schema_version"] = "1.2"
+        payload.pop("metadata_hash", None)
+        fingerprint_path.write_text(yaml.safe_dump(payload, sort_keys=False))
+
+    second_reader = FakeReader()
+    second_request = MapRequest(
+        tmp_path,
+        provider="ollama",
+        model="fake-1",
+        parallel=1,
+        processing=ProcessingPolicy(request_deadline_seconds=240),
+    )
+    second = run_map(
+        second_request,
+        client=FakeZotero(sample_items[:1]),
+        reader=second_reader,
+        run_id="budget-second",
+    )
+
+    assert second.validated_note_count == 1
+    assert second.reused_count == 1
+    assert second.items[0]["reason"] == "compatible_committed_note"
+    assert second_reader.calls == 0
+
+
+def test_resume_revalidates_item_identity_and_content_fingerprint(
+    tmp_path: Path, sample_items
+) -> None:
     request = MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=1)
-    run_map(request, client=FakeZotero(sample_items), reader=FakeReader(), run_id="identity-run")
+    run_map(
+        request,
+        client=FakeZotero(sample_items),
+        reader=FakeReader(),
+        run_id="identity-run",
+    )
     replacement = {
         "key": "ITEMC",
         "data": {
@@ -173,7 +271,12 @@ def test_resume_revalidates_item_identity_and_content_fingerprint(tmp_path: Path
         },
     }
     reader = FakeReader()
-    resumed = resume_map(tmp_path, "identity-run", client=FakeZotero([replacement, sample_items[1]]), reader=reader)
+    resumed = resume_map(
+        tmp_path,
+        "identity-run",
+        client=FakeZotero([replacement, sample_items[1]]),
+        reader=reader,
+    )
     assert reader.calls == 0
     assert resumed.reused_count == 2
     assert [row["zotero_item_key"] for row in resumed.items] == ["ITEMA", "ITEMB"]
@@ -181,16 +284,25 @@ def test_resume_revalidates_item_identity_and_content_fingerprint(tmp_path: Path
     assert resumed.source_set["refresh_requires_new_run"] is True
 
 
-def test_interrupted_run_reuses_direct_checkpoint_for_missing_note(tmp_path: Path, sample_items) -> None:
+def test_interrupted_run_reuses_direct_checkpoint_for_missing_note(
+    tmp_path: Path, sample_items
+) -> None:
     request = MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=1)
-    completed = run_map(request, client=FakeZotero(sample_items), reader=FakeReader(), run_id="interrupted")
+    completed = run_map(
+        request,
+        client=FakeZotero(sample_items),
+        reader=FakeReader(),
+        run_id="interrupted",
+    )
     missing = next(row for row in completed.items if row["zotero_item_key"] == "ITEMB")
     (tmp_path / missing["note_path"]).unlink()
     (tmp_path / "11_state" / "fingerprints" / f"{missing['fingerprint']}.yml").unlink()
     (tmp_path / "11_state" / "runs" / "interrupted" / "run_report.yml").unlink()
 
     reader = FakeReader()
-    resumed = resume_map(tmp_path, "interrupted", client=FakeZotero(sample_items), reader=reader)
+    resumed = resume_map(
+        tmp_path, "interrupted", client=FakeZotero(sample_items), reader=reader
+    )
     assert resumed.status == "completed"
     assert resumed.inventory_count == resumed.terminal_count == 2
     assert resumed.validated_note_count == 2
@@ -198,7 +310,9 @@ def test_interrupted_run_reuses_direct_checkpoint_for_missing_note(tmp_path: Pat
     assert reader.calls == 0
 
 
-def test_untagged_source_can_commit_without_creating_cluster(tmp_path: Path, sample_items) -> None:
+def test_untagged_source_can_commit_without_creating_cluster(
+    tmp_path: Path, sample_items
+) -> None:
     sample_items[0]["data"]["tags"] = []
     report = run_map(
         MapRequest(tmp_path, provider="ollama", model="fake-1"),
@@ -212,8 +326,14 @@ def test_untagged_source_can_commit_without_creating_cluster(tmp_path: Path, sam
     assert report.cluster_map["clusters"] == []
 
 
-def test_note_filename_collision_gets_stable_non_overwriting_suffix(tmp_path: Path, sample_items) -> None:
-    collision = {**sample_items[0], "key": "OTHER", "data": {**sample_items[0]["data"], "key": "OTHER"}}
+def test_note_filename_collision_gets_stable_non_overwriting_suffix(
+    tmp_path: Path, sample_items
+) -> None:
+    collision = {
+        **sample_items[0],
+        "key": "OTHER",
+        "data": {**sample_items[0]["data"], "key": "OTHER"},
+    }
     report = run_map(
         MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=2),
         client=FakeZotero([sample_items[0], collision]),
@@ -223,19 +343,26 @@ def test_note_filename_collision_gets_stable_non_overwriting_suffix(tmp_path: Pa
     assert report.inventory_count == report.terminal_count == 2
     assert report.validated_note_count == 2
     assert report.exhausted_count == 0
-    names = sorted(path.name for path in (tmp_path / "02_source_memory" / "notes").glob("*.md"))
+    names = sorted(
+        path.name for path in (tmp_path / "02_source_memory" / "notes").glob("*.md")
+    )
     assert len(names) == 2
     assert any("[other]" in name or "[itema]" in name for name in names)
 
 
-def test_question_is_only_a_projection_lens_but_metadata_and_reader_remain_in_fingerprint(tmp_path: Path, sample_items) -> None:
+def test_question_is_only_a_projection_lens_but_metadata_and_reader_remain_in_fingerprint(
+    tmp_path: Path, sample_items
+) -> None:
     class QuestionReader(FakeReader):
         name = "actual-reader"
         model = "actual-v1"
 
         def read_source(self, text, metadata, question=None):
             self.calls += 1
-            analysis = {key: f"{question} / {metadata['title']} / {key} / page 1" for key in __import__("conftest").SECTION_KEYS}
+            analysis = {
+                key: f"{question} / {metadata['title']} / {key} / page 1"
+                for key in __import__("conftest").SECTION_KEYS
+            }
             analysis["plain_english_interpretation"] = (
                 "Direction: The reported outcome changes in the direction stated by the source.\n"
                 "Magnitude: The source's technical estimate is preserved without inventing a new scale.\n"
@@ -247,7 +374,9 @@ def test_question_is_only_a_projection_lens_but_metadata_and_reader_remain_in_fi
 
     first_reader = QuestionReader()
     first = run_map(
-        MapRequest(tmp_path, provider="ollama", model="requested-model", question="FIRST"),
+        MapRequest(
+            tmp_path, provider="ollama", model="requested-model", question="FIRST"
+        ),
         client=FakeZotero(sample_items[:1]),
         reader=first_reader,
         run_id="question-first",
@@ -261,7 +390,9 @@ def test_question_is_only_a_projection_lens_but_metadata_and_reader_remain_in_fi
     changed[0]["data"]["title"] = "Changed Metadata Title"
     second_reader = QuestionReader()
     second = run_map(
-        MapRequest(tmp_path, provider="ollama", model="requested-model", question="SECOND"),
+        MapRequest(
+            tmp_path, provider="ollama", model="requested-model", question="SECOND"
+        ),
         client=FakeZotero(changed),
         reader=second_reader,
         run_id="question-second",
@@ -273,7 +404,12 @@ def test_question_is_only_a_projection_lens_but_metadata_and_reader_remain_in_fi
 
     third_reader = QuestionReader()
     third = run_map(
-        MapRequest(tmp_path, provider="ollama", model="requested-model", question="A DIFFERENT LENS"),
+        MapRequest(
+            tmp_path,
+            provider="ollama",
+            model="requested-model",
+            question="A DIFFERENT LENS",
+        ),
         client=FakeZotero(changed),
         reader=third_reader,
         run_id="question-third",
@@ -282,7 +418,9 @@ def test_question_is_only_a_projection_lens_but_metadata_and_reader_remain_in_fi
     assert third_reader.calls == 0
 
 
-def test_prompt_v2_replaces_prompt_v1_note_instead_of_reusing_it(tmp_path: Path, sample_items) -> None:
+def test_prompt_v2_replaces_prompt_v1_note_instead_of_reusing_it(
+    tmp_path: Path, sample_items
+) -> None:
     first_reader = FakeReader()
     first = run_map(
         MapRequest(tmp_path, provider="ollama", model="fake-1", prompt_version="1"),
@@ -308,7 +446,9 @@ def test_prompt_v2_replaces_prompt_v1_note_instead_of_reusing_it(tmp_path: Path,
     assert "## Plain-English Interpretation" in body
 
 
-def test_legacy_reader_without_plain_english_field_uses_disclosed_compatibility_fallback(tmp_path: Path, sample_items) -> None:
+def test_legacy_reader_without_plain_english_field_uses_disclosed_compatibility_fallback(
+    tmp_path: Path, sample_items
+) -> None:
     class LegacyReader(FakeReader):
         def read_source(self, text, metadata, question=None):
             self.calls += 1
@@ -326,10 +466,14 @@ def test_legacy_reader_without_plain_english_field_uses_disclosed_compatibility_
     )
     assert report.validated_note_count == 1
     note = tmp_path / report.items[0]["note_path"]
-    assert "this legacy reader did not provide a separate translation" in note.read_text()
+    assert (
+        "this legacy reader did not provide a separate translation" in note.read_text()
+    )
 
 
-def test_long_document_uses_bounded_chunk_reader_route(tmp_path: Path, sample_items) -> None:
+def test_long_document_uses_bounded_chunk_reader_route(
+    tmp_path: Path, sample_items
+) -> None:
     class LongZotero(FakeZotero):
         def fulltext(self, item_key):
             if item_key.endswith("PDF"):
@@ -345,15 +489,23 @@ def test_long_document_uses_bounded_chunk_reader_route(tmp_path: Path, sample_it
     )
     assert report.validated_note_count == 1
     assert reader.calls > 1
-    attempts = (tmp_path / "01_custody" / "read_attempts" / "long-source.jsonl").read_text()
+    attempts = (
+        tmp_path / "01_custody" / "read_attempts" / "long-source.jsonl"
+    ).read_text()
     assert "fake-reader_hierarchical_text" in attempts
 
 
-def test_partial_zotero_fulltext_is_not_treated_as_exhaustive(tmp_path: Path, sample_items) -> None:
+def test_partial_zotero_fulltext_is_not_treated_as_exhaustive(
+    tmp_path: Path, sample_items
+) -> None:
     class PartialZotero(FakeZotero):
         def fulltext(self, item_key):
             if item_key.endswith("PDF"):
-                return {"content": "Only one indexed page. " * 10, "indexedPages": 1, "totalPages": 100}
+                return {
+                    "content": "Only one indexed page. " * 10,
+                    "indexedPages": 1,
+                    "totalPages": 100,
+                }
             return None
 
     client = PartialZotero(sample_items[:1])
@@ -368,18 +520,34 @@ def test_partial_zotero_fulltext_is_not_treated_as_exhaustive(tmp_path: Path, sa
     assert report.exhausted_count == 0
     assert reader.calls == 0
     assert client.file_calls == 1
-    attempts = (tmp_path / "01_custody" / "read_attempts" / "partial-fulltext.jsonl").read_text()
+    attempts = (
+        tmp_path / "01_custody" / "read_attempts" / "partial-fulltext.jsonl"
+    ).read_text()
     assert "partial_or_unproven_indexed_pdf" in attempts
 
 
-def test_synthetic_library_covers_readable_scanned_and_missing_sources(tmp_path: Path) -> None:
-    items = json.loads((Path(__file__).parent / "fixtures" / "library.json").read_text())
+def test_synthetic_library_covers_readable_scanned_and_missing_sources(
+    tmp_path: Path,
+) -> None:
+    items = json.loads(
+        (Path(__file__).parent / "fixtures" / "library.json").read_text()
+    )
 
     class ReleaseGateZotero(FakeZotero):
         def children(self, item_key):
             if item_key == "MISSING1":
                 return []
-            return [{"key": item_key + "PDF", "data": {"key": item_key + "PDF", "itemType": "attachment", "contentType": "application/pdf", "filename": item_key + ".pdf"}}]
+            return [
+                {
+                    "key": item_key + "PDF",
+                    "data": {
+                        "key": item_key + "PDF",
+                        "itemType": "attachment",
+                        "contentType": "application/pdf",
+                        "filename": item_key + ".pdf",
+                    },
+                }
+            ]
 
         def fulltext(self, item_key):
             if item_key == "READABLE1PDF":
@@ -407,25 +575,51 @@ def test_synthetic_library_covers_readable_scanned_and_missing_sources(tmp_path:
     assert report.validated_note_count == 1
     assert report.limited_note_count == 2
     assert report.exhausted_count == 0
-    attempts = (tmp_path / "01_custody" / "read_attempts" / "synthetic-release-gate.jsonl").read_text()
+    attempts = (
+        tmp_path / "01_custody" / "read_attempts" / "synthetic-release-gate.jsonl"
+    ).read_text()
     assert '"route": "local_ocr"' in attempts
     assert "metadata_only" in attempts
 
 
-def test_workspace_map_remains_coherent_across_collection_runs(tmp_path: Path, sample_items) -> None:
+def test_workspace_map_remains_coherent_across_collection_runs(
+    tmp_path: Path, sample_items
+) -> None:
     request = MapRequest(tmp_path, provider="ollama", model="fake-1")
-    run_map(request, client=FakeZotero(sample_items), reader=FakeReader(), run_id="workspace-one")
-    second = run_map(request, client=FakeZotero(sample_items[:1]), reader=FakeReader(), run_id="workspace-two")
+    run_map(
+        request,
+        client=FakeZotero(sample_items),
+        reader=FakeReader(),
+        run_id="workspace-one",
+    )
+    second = run_map(
+        request,
+        client=FakeZotero(sample_items[:1]),
+        reader=FakeReader(),
+        run_id="workspace-two",
+    )
     assert second.cluster_map["clusters"] == []
     rebuilt = build_map(tmp_path, run_id="workspace-rebuild")
     assert rebuilt.metadata["cluster_map"]["clusters"] == []
-    assert list((tmp_path / "03_literature_synthesis" / "clusters").glob("Cluster - *.md")) == []
-    assert list((tmp_path / "03_literature_synthesis" / "gaps" / "candidates").glob("Gap - *.md")) == []
+    assert (
+        list((tmp_path / "03_literature_synthesis" / "clusters").glob("Cluster - *.md"))
+        == []
+    )
+    assert (
+        list(
+            (tmp_path / "03_literature_synthesis" / "gaps" / "candidates").glob(
+                "Gap - *.md"
+            )
+        )
+        == []
+    )
     exported = export_to_obsidian(tmp_path, tmp_path / "vault", new_vault=True)
     assert exported.metadata["missing_wikilink_count"] == 0
 
 
-def test_existing_custody_relations_feed_compatible_typed_note_links(tmp_path: Path, sample_items) -> None:
+def test_existing_custody_relations_feed_compatible_typed_note_links(
+    tmp_path: Path, sample_items
+) -> None:
     import csv
 
     for item in sample_items:
@@ -439,35 +633,73 @@ def test_existing_custody_relations_feed_compatible_typed_note_links(tmp_path: P
     )
     relation_path = tmp_path / "01_custody" / "source_relation_registry.csv"
     with relation_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["relation_id", "source_id", "related_source_id", "relation_type", "route", "confidence", "created_at"])
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "relation_id",
+                "source_id",
+                "related_source_id",
+                "relation_type",
+                "route",
+                "confidence",
+                "created_at",
+            ],
+        )
         writer.writeheader()
-        writer.writerow({"relation_id": "rel-1", "source_id": report.items[0]["source_id"], "related_source_id": report.items[1]["source_id"], "relation_type": "closest_prior_work", "route": "fixture", "confidence": "high", "created_at": "2026-01-01"})
+        writer.writerow(
+            {
+                "relation_id": "rel-1",
+                "source_id": report.items[0]["source_id"],
+                "related_source_id": report.items[1]["source_id"],
+                "relation_type": "closest_prior_work",
+                "route": "fixture",
+                "confidence": "high",
+                "created_at": "2026-01-01",
+            }
+        )
     limited_path = tmp_path / report.items[1]["note_path"]
-    limited_path.write_text(limited_path.read_text().replace("note_status: analytical_atomic_note", "note_status: fulltext_available", 1))
+    limited_path.write_text(
+        limited_path.read_text().replace(
+            "note_status: analytical_atomic_note", "note_status: fulltext_available", 1
+        )
+    )
     build_map(tmp_path, run_id="custody-rebuild")
-    compatibility = yaml.safe_load((tmp_path / "02_source_memory" / "indexes" / "typed_note_links.yml").read_text())
+    compatibility = yaml.safe_load(
+        (tmp_path / "02_source_memory" / "indexes" / "typed_note_links.yml").read_text()
+    )
     assert compatibility["links"][0]["relation_type"] == "zotero_related"
-    assert compatibility["links"][0]["provenance"] == "01_custody/source_relation_registry.csv"
+    assert (
+        compatibility["links"][0]["provenance"]
+        == "01_custody/source_relation_registry.csv"
+    )
 
 
-def test_status_uses_run_snapshot_and_reports_missing_run(tmp_path: Path, sample_items) -> None:
+def test_status_uses_run_snapshot_and_reports_missing_run(
+    tmp_path: Path, sample_items
+) -> None:
     run_map(
         MapRequest(tmp_path, provider="ollama", model="fake-1"),
         client=FakeZotero(sample_items),
         reader=FakeReader(),
         run_id="snapshot-run",
     )
-    (tmp_path / "03_literature_synthesis" / "clusters" / "clusters.yml").write_text("clusters: []\n")
+    (tmp_path / "03_literature_synthesis" / "clusters" / "clusters.yml").write_text(
+        "clusters: []\n"
+    )
     assert get_status(tmp_path, "snapshot-run").counts["cluster_count"] == 0
     missing = get_status(tmp_path, "does-not-exist")
     assert missing.status == "blocked"
     assert missing.message == "run_not_found"
 
 
-def test_selected_collection_key_and_limit_are_preserved(tmp_path: Path, sample_items) -> None:
+def test_selected_collection_key_and_limit_are_preserved(
+    tmp_path: Path, sample_items
+) -> None:
     client = FakeZotero(sample_items, selected_key="ACTUALSELECTED")
     report = run_map(
-        MapRequest(tmp_path, scope="selected", provider="ollama", model="fake-1", limit=1),
+        MapRequest(
+            tmp_path, scope="selected", provider="ollama", model="fake-1", limit=1
+        ),
         client=client,
         reader=FakeReader(),
         run_id="selected-run",
@@ -478,7 +710,9 @@ def test_selected_collection_key_and_limit_are_preserved(tmp_path: Path, sample_
     assert report.source_set["source_set_type"] == "zotero_collection"
 
 
-def test_status_reports_terminal_and_literature_counts(tmp_path: Path, sample_items) -> None:
+def test_status_reports_terminal_and_literature_counts(
+    tmp_path: Path, sample_items
+) -> None:
     report = run_map(
         MapRequest(tmp_path, provider="ollama", model="fake-1"),
         client=FakeZotero(sample_items),
@@ -498,11 +732,46 @@ def test_status_reports_terminal_and_literature_counts(tmp_path: Path, sample_it
     assert rebuilt_status.counts["terminal_count"] == 2
 
 
-def test_large_document_checkpoints_and_resume_avoid_repeated_calls(tmp_path: Path, sample_items) -> None:
+def test_resumed_progress_ignores_stale_source_counts_inside_literature(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "progress.yml"
+    items = [
+        {"key": "A", "terminal_status": "validated_note"},
+        {"key": "B", "terminal_status": "limited_note"},
+    ]
+    _RunProgress(path, "progress-run", items, resume=False)
+    payload = yaml.safe_load(path.read_text())
+    payload["literature"].update(
+        inventory_count=75,
+        validated_note_count=65,
+        limited_note_count=8,
+        exhausted_count=2,
+        terminal_count=75,
+    )
+    path.write_text(yaml.safe_dump(payload, sort_keys=False))
+
+    _RunProgress(path, "progress-run", items, resume=True)
+
+    resumed = yaml.safe_load(path.read_text())
+    assert resumed["inventory_count"] == 2
+    assert resumed["validated_note_count"] == 1
+    assert resumed["limited_note_count"] == 1
+    assert resumed["exhausted_count"] == 0
+    assert resumed["terminal_count"] == 2
+    assert "validated_note_count" not in resumed["literature"]
+
+
+def test_large_document_checkpoints_and_resume_avoid_repeated_calls(
+    tmp_path: Path, sample_items
+) -> None:
     class LongTextZotero(FakeZotero):
         def fulltext(self, item_key):
             if item_key.endswith("PDF"):
-                return {"content": "Grounded paragraph with page evidence. " * 40, "contentType": "text/plain"}
+                return {
+                    "content": "Grounded paragraph with page evidence. " * 40,
+                    "contentType": "text/plain",
+                }
             return None
 
     class HierarchicalReader(FakeReader):
@@ -511,7 +780,9 @@ def test_large_document_checkpoints_and_resume_avoid_repeated_calls(tmp_path: Pa
             self.chunk_ids: list[str] = []
             self.synthesis_calls = 0
 
-        def summarize_chunk(self, text, metadata, question=None, *, chunk_id="", locator="", **kwargs):
+        def summarize_chunk(
+            self, text, metadata, question=None, *, chunk_id="", locator="", **kwargs
+        ):
             self.calls += 1
             self.chunk_ids.append(chunk_id)
             return {
@@ -525,7 +796,10 @@ def test_large_document_checkpoints_and_resume_avoid_repeated_calls(tmp_path: Pa
         def synthesize_document(self, chunk_memos, metadata, question=None, **kwargs):
             self.calls += 1
             self.synthesis_calls += 1
-            return {key: f"Synthesized {key}; see page 1." for key in __import__("conftest").SECTION_KEYS}
+            return {
+                key: f"Synthesized {key}; see page 1."
+                for key in __import__("conftest").SECTION_KEYS
+            }
 
     policy = ProcessingPolicy(
         direct_read_char_limit=100,
@@ -535,7 +809,9 @@ def test_large_document_checkpoints_and_resume_avoid_repeated_calls(tmp_path: Pa
         request_deadline_seconds=30,
         document_deadline_seconds=120,
     )
-    request = MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=1, processing=policy)
+    request = MapRequest(
+        tmp_path, provider="ollama", model="fake-1", parallel=1, processing=policy
+    )
     reader = HierarchicalReader()
     client = LongTextZotero(sample_items[:1])
 
@@ -562,7 +838,9 @@ def test_large_document_checkpoints_and_resume_avoid_repeated_calls(tmp_path: Pa
     assert len(reader.chunk_ids) == len(set(reader.chunk_ids))
 
 
-def test_completed_item_is_committed_while_another_worker_is_slow(tmp_path: Path, sample_items) -> None:
+def test_completed_item_is_committed_while_another_worker_is_slow(
+    tmp_path: Path, sample_items
+) -> None:
     slow_started = threading.Event()
     release_slow = threading.Event()
     result: list[object] = []
@@ -588,7 +866,9 @@ def test_completed_item_is_committed_while_another_worker_is_slow(tmp_path: Path
     thread.start()
     assert slow_started.wait(2)
     deadline = time.monotonic() + 2
-    while time.monotonic() < deadline and not list((tmp_path / "02_source_memory" / "notes").glob("*.md")):
+    while time.monotonic() < deadline and not list(
+        (tmp_path / "02_source_memory" / "notes").glob("*.md")
+    ):
         time.sleep(0.01)
     assert len(list((tmp_path / "02_source_memory" / "notes").glob("*.md"))) == 1
     live = get_status(tmp_path, "visible-progress")
@@ -604,11 +884,16 @@ def test_completed_item_is_committed_while_another_worker_is_slow(tmp_path: Path
     assert result and result[0].validated_note_count == 2
 
 
-def test_hard_chunk_limit_creates_fulltext_available_limited_note(tmp_path: Path, sample_items) -> None:
+def test_hard_chunk_limit_creates_fulltext_available_limited_note(
+    tmp_path: Path, sample_items
+) -> None:
     class HugeTextZotero(FakeZotero):
         def fulltext(self, item_key):
             if item_key.endswith("PDF"):
-                return {"content": "Large source paragraph. " * 100, "contentType": "text/plain"}
+                return {
+                    "content": "Large source paragraph. " * 100,
+                    "contentType": "text/plain",
+                }
             return None
 
     policy = ProcessingPolicy(
@@ -632,11 +917,16 @@ def test_hard_chunk_limit_creates_fulltext_available_limited_note(tmp_path: Path
     assert "Processing Status" in body
 
 
-def test_million_context_reader_handles_tested_book_size_in_one_call(tmp_path: Path, sample_items) -> None:
+def test_million_context_reader_handles_tested_book_size_in_one_call(
+    tmp_path: Path, sample_items
+) -> None:
     class BookZotero(FakeZotero):
         def fulltext(self, item_key):
             if item_key.endswith("PDF"):
-                return {"content": ("Grounded source evidence. " * 50_000)[:1_090_074], "contentType": "text/plain"}
+                return {
+                    "content": ("Grounded source evidence. " * 50_000)[:1_090_074],
+                    "contentType": "text/plain",
+                }
             return None
 
     class MillionContextReader(FakeReader):
@@ -644,11 +934,21 @@ def test_million_context_reader_handles_tested_book_size_in_one_call(tmp_path: P
 
     reader = MillionContextReader()
     report = run_map(
-        MapRequest(tmp_path, provider="deepseek", model="deepseek-v4-flash", allow_cloud=True),
+        MapRequest(
+            tmp_path, provider="deepseek", model="deepseek-v4-flash", allow_cloud=True
+        ),
         client=BookZotero(sample_items[:1]),
         reader=reader,
         run_id="million-context-book",
     )
     assert report.validated_note_count == 1
     assert reader.calls == 1
-    assert (tmp_path / "11_state" / "runs" / "million-context-book" / "items" / "ITEMA" / "direct.yml").exists()
+    assert (
+        tmp_path
+        / "11_state"
+        / "runs"
+        / "million-context-book"
+        / "items"
+        / "ITEMA"
+        / "direct.yml"
+    ).exists()

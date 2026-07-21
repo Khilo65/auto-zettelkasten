@@ -15,6 +15,7 @@ CURRENT_PROFILE_SCHEMA_VERSION = "1.2"
 FAMILY_RELATION_TYPES = frozenset(
     {
         "same_proposition",
+        "shared_research_problem",
         "rival_explanation",
         "complementary_mechanism",
         "boundary_contrast",
@@ -23,6 +24,7 @@ FAMILY_RELATION_TYPES = frozenset(
         "interpretive_or_normative_disagreement",
     }
 )
+
 
 def _jsonable(value: Any) -> Any:
     if is_dataclass(value):
@@ -36,7 +38,9 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
-def _model_payload(model: type[Any], payload: Mapping[str, Any], *, label: str) -> dict[str, Any]:
+def _model_payload(
+    model: type[Any], payload: Mapping[str, Any], *, label: str
+) -> dict[str, Any]:
     if not isinstance(payload, Mapping):
         raise ValueError(f"{label} must be a mapping")
     values = dict(payload)
@@ -57,7 +61,9 @@ def _string_list(value: Any, *, field: str) -> list[str]:
 def _mapping_list(value: Any, *, field: str) -> list[dict[str, Any]]:
     if value is None:
         return []
-    if not isinstance(value, list) or any(not isinstance(item, Mapping) for item in value):
+    if not isinstance(value, list) or any(
+        not isinstance(item, Mapping) for item in value
+    ):
         raise ValueError(f"{field} must be a list of mappings")
     return [dict(item) for item in value]
 
@@ -70,7 +76,9 @@ def _require_string(value: Any, *, field: str) -> str:
 
 def _scope_mapping(value: Any, *, field: str) -> dict[str, list[str]]:
     if not isinstance(value, Mapping):
-        raise ValueError(f"{field} must be a mapping of string keys to lists of strings")
+        raise ValueError(
+            f"{field} must be a mapping of string keys to lists of strings"
+        )
     scope: dict[str, list[str]] = {}
     for key, items in value.items():
         if not isinstance(key, str):
@@ -95,18 +103,28 @@ def _family_relation_list(value: Any, *, field: str) -> list[dict[str, Any]]:
         unknown = sorted(set(row) - allowed)
         if unknown:
             raise ValueError(f"unknown {field}[{index}] fields: {', '.join(unknown)}")
-        relation_type = _require_string(row.get("relation_type", ""), field=f"{field}[{index}].relation_type")
+        relation_type = _require_string(
+            row.get("relation_type", ""), field=f"{field}[{index}].relation_type"
+        )
         if relation_type not in FAMILY_RELATION_TYPES:
             raise ValueError(f"{field}[{index}].relation_type is invalid")
-        source_ids = _string_list(row.get("source_ids"), field=f"{field}[{index}].source_ids")
+        source_ids = _string_list(
+            row.get("source_ids"), field=f"{field}[{index}].source_ids"
+        )
         if len(set(source_ids)) < 2:
-            raise ValueError(f"{field}[{index}].source_ids must contain at least two sources")
+            raise ValueError(
+                f"{field}[{index}].source_ids must contain at least two sources"
+            )
         normalized.append(
             {
                 "relation_type": relation_type,
                 "source_ids": source_ids,
-                "rationale": _require_string(row.get("rationale", ""), field=f"{field}[{index}].rationale"),
-                "evidence": _mapping_list(row.get("evidence"), field=f"{field}[{index}].evidence"),
+                "rationale": _require_string(
+                    row.get("rationale", ""), field=f"{field}[{index}].rationale"
+                ),
+                "evidence": _mapping_list(
+                    row.get("evidence"), field=f"{field}[{index}].evidence"
+                ),
                 "comparability": _any_mapping(
                     row.get("comparability", {}),
                     field=f"{field}[{index}].comparability",
@@ -114,6 +132,7 @@ def _family_relation_list(value: Any, *, field: str) -> list[dict[str, Any]]:
             }
         )
     return normalized
+
 
 def _strict_adjudication(value: Any, *, field: str) -> dict[str, Any]:
     row = _any_mapping(value, field=field)
@@ -150,7 +169,9 @@ def _strict_adjudication(value: Any, *, field: str) -> dict[str, Any]:
                     check.get("requirement", ""),
                     field=f"{field}.checks[{index}].requirement",
                 ),
-                "passed": _require_bool(check.get("passed", False), field=f"{field}.checks[{index}].passed"),
+                "passed": _require_bool(
+                    check.get("passed", False), field=f"{field}.checks[{index}].passed"
+                ),
                 "explanation": _require_string(
                     check.get("explanation", ""),
                     field=f"{field}.checks[{index}].explanation",
@@ -159,21 +180,33 @@ def _strict_adjudication(value: Any, *, field: str) -> dict[str, Any]:
         )
     return {
         "kind": kind,
-        "candidate": _require_string(row.get("candidate", ""), field=f"{field}.candidate"),
+        "candidate": _require_string(
+            row.get("candidate", ""), field=f"{field}.candidate"
+        ),
         "decision": decision,
         "checks": normalized_checks,
-        "explanation": _require_string(row.get("explanation", ""), field=f"{field}.explanation"),
-        "what_would_change": _require_string(row.get("what_would_change", ""), field=f"{field}.what_would_change"),
-        "proposition_ids": _string_list(row.get("proposition_ids"), field=f"{field}.proposition_ids"),
-        "related_cluster_ids": _string_list(row.get("related_cluster_ids"), field=f"{field}.related_cluster_ids"),
+        "explanation": _require_string(
+            row.get("explanation", ""), field=f"{field}.explanation"
+        ),
+        "what_would_change": _require_string(
+            row.get("what_would_change", ""), field=f"{field}.what_would_change"
+        ),
+        "proposition_ids": _string_list(
+            row.get("proposition_ids"), field=f"{field}.proposition_ids"
+        ),
+        "related_cluster_ids": _string_list(
+            row.get("related_cluster_ids"), field=f"{field}.related_cluster_ids"
+        ),
         "evidence": _mapping_list(row.get("evidence"), field=f"{field}.evidence"),
     }
+
 
 def _strict_adjudication_list(value: Any, *, field: str) -> list[dict[str, Any]]:
     return [
         _strict_adjudication(row, field=f"{field}[{index}]")
         for index, row in enumerate(_mapping_list(value, field=field))
     ]
+
 
 def _nonnegative_int(value: Any, *, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -182,7 +215,9 @@ def _nonnegative_int(value: Any, *, field: str) -> int:
 
 
 def _stable_json_hash(value: Mapping[str, Any]) -> str:
-    encoded = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    encoded = json.dumps(
+        value, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
@@ -197,7 +232,9 @@ def _locator_identity(locator: str, locators: list[str]) -> list[str]:
     values = list(locators)
     if locator and locator not in values:
         values.append(locator)
-    return sorted({_normalized_locator(value) for value in values if _normalized_locator(value)})
+    return sorted(
+        {_normalized_locator(value) for value in values if _normalized_locator(value)}
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,7 +267,9 @@ class LiteratureMappingPolicy:
             "auto_promote_gaps",
             "require_executable_gap_design",
         ):
-            _require_bool(getattr(self, field_name), field=f"literature_mapping.{field_name}")
+            _require_bool(
+                getattr(self, field_name), field=f"literature_mapping.{field_name}"
+            )
         for field_name in (
             "source_backed_threshold",
             "max_memberships",
@@ -238,9 +277,13 @@ class LiteratureMappingPolicy:
             "max_synthesis_calls",
             "profile_workers",
         ):
-            _require_positive_int(getattr(self, field_name), field=f"literature_mapping.{field_name}")
+            _require_positive_int(
+                getattr(self, field_name), field=f"literature_mapping.{field_name}"
+            )
         if self.external_discovery not in {"disabled", "per_run", "always"}:
-            raise ValueError("literature_mapping.external_discovery must be disabled, per_run, or always")
+            raise ValueError(
+                "literature_mapping.external_discovery must be disabled, per_run, or always"
+            )
         if self.weak_gap_handling != "audit_only":
             raise ValueError("literature_mapping.weak_gap_handling must be audit_only")
         if self.cluster_gap_projection != "inline":
@@ -250,18 +293,24 @@ class LiteratureMappingPolicy:
             or not isinstance(self.literature_deadline_seconds, (int, float))
             or self.literature_deadline_seconds <= 0
         ):
-            raise ValueError("literature_mapping.literature_deadline_seconds must be a positive number")
+            raise ValueError(
+                "literature_mapping.literature_deadline_seconds must be a positive number"
+            )
         if (
             isinstance(self.deepseek_packet_context_fraction, bool)
             or not isinstance(self.deepseek_packet_context_fraction, (int, float))
             or not 0 < self.deepseek_packet_context_fraction < 1
         ):
-            raise ValueError("literature_mapping.deepseek_packet_context_fraction must be between 0 and 1")
+            raise ValueError(
+                "literature_mapping.deepseek_packet_context_fraction must be between 0 and 1"
+            )
         # Normalize equivalent API, config, and CLI values before they enter
         # dependency fingerprints. JSON distinguishes 1800 from 1800.0 even
         # though both express the same deadline, which would otherwise bypass
         # valid paid-call checkpoints.
-        object.__setattr__(self, "literature_deadline_seconds", float(self.literature_deadline_seconds))
+        object.__setattr__(
+            self, "literature_deadline_seconds", float(self.literature_deadline_seconds)
+        )
         object.__setattr__(
             self,
             "deepseek_packet_context_fraction",
@@ -292,11 +341,17 @@ class LiteratureMappingPolicy:
             max_profile_calls=values.get("max_profile_calls", 100),
             max_synthesis_calls=values.get("max_synthesis_calls", 24),
             profile_workers=values.get("profile_workers", 4),
-            literature_deadline_seconds=values.get("literature_deadline_seconds", 1_800.0),
-            deepseek_packet_context_fraction=values.get("deepseek_packet_context_fraction", 0.8),
+            literature_deadline_seconds=values.get(
+                "literature_deadline_seconds", 1_800.0
+            ),
+            deepseek_packet_context_fraction=values.get(
+                "deepseek_packet_context_fraction", 0.8
+            ),
             weak_gap_handling=values.get("weak_gap_handling", "audit_only"),
             cluster_gap_projection=values.get("cluster_gap_projection", "inline"),
-            require_executable_gap_design=values.get("require_executable_gap_design", True),
+            require_executable_gap_design=values.get(
+                "require_executable_gap_design", True
+            ),
         )  # type: ignore[arg-type]
 
 
@@ -316,7 +371,9 @@ class NavigationPolicy:
     automatic_semantic_synonym_merging: bool = False
 
     def __post_init__(self) -> None:
-        _require_bool(self.subject_tags_enabled, field="navigation.subject_tags_enabled")
+        _require_bool(
+            self.subject_tags_enabled, field="navigation.subject_tags_enabled"
+        )
         _require_bool(
             self.automatic_semantic_synonym_merging,
             field="navigation.automatic_semantic_synonym_merging",
@@ -330,7 +387,9 @@ class NavigationPolicy:
             "max_collection_neighborhoods",
             "max_inferred_related_note_links",
         ):
-            _require_positive_int(getattr(self, field_name), field=f"navigation.{field_name}")
+            _require_positive_int(
+                getattr(self, field_name), field=f"navigation.{field_name}"
+            )
         if self.external_ontology != "disabled":
             raise ValueError("navigation.external_ontology must be disabled")
 
@@ -347,13 +406,19 @@ class NavigationPolicy:
             raise ValueError(f"unknown navigation fields: {', '.join(unknown)}")
         return cls(
             subject_tags_enabled=values.get("subject_tags_enabled", True),
-            max_candidate_tags_per_source=values.get("max_candidate_tags_per_source", 24),
+            max_candidate_tags_per_source=values.get(
+                "max_candidate_tags_per_source", 24
+            ),
             max_visible_tags_per_source=values.get("max_visible_tags_per_source", 6),
-            max_visible_tags_per_cluster_or_gap=values.get("max_visible_tags_per_cluster_or_gap", 6),
+            max_visible_tags_per_cluster_or_gap=values.get(
+                "max_visible_tags_per_cluster_or_gap", 6
+            ),
             min_sources_per_neighborhood=values.get("min_sources_per_neighborhood", 2),
             max_visible_neighborhoods=values.get("max_visible_neighborhoods", 8),
             max_collection_neighborhoods=values.get("max_collection_neighborhoods", 20),
-            max_inferred_related_note_links=values.get("max_inferred_related_note_links", 8),
+            max_inferred_related_note_links=values.get(
+                "max_inferred_related_note_links", 8
+            ),
             external_ontology=values.get("external_ontology", "disabled"),
             automatic_semantic_synonym_merging=values.get(
                 "automatic_semantic_synonym_merging", False
@@ -391,9 +456,13 @@ class ProcessingPolicy:
         if self.request_deadline_seconds <= 0 or self.document_deadline_seconds <= 0:
             raise ValueError("processing deadlines must be positive")
         if self.document_deadline_seconds < self.request_deadline_seconds:
-            raise ValueError("processing.document_deadline_seconds cannot be shorter than request_deadline_seconds")
+            raise ValueError(
+                "processing.document_deadline_seconds cannot be shorter than request_deadline_seconds"
+            )
         if not 0 < self.context_window_fraction < 1:
-            raise ValueError("processing.context_window_fraction must be between 0 and 1")
+            raise ValueError(
+                "processing.context_window_fraction must be between 0 and 1"
+            )
         if self.estimated_chars_per_token <= 0:
             raise ValueError("processing.estimated_chars_per_token must be positive")
 
@@ -407,13 +476,21 @@ class ProcessingPolicy:
             direct_read_char_limit=int(values.get("direct_read_char_limit", 120_000)),
             chunk_char_limit=int(values.get("chunk_char_limit", 60_000)),
             max_total_chunks=int(values.get("max_total_chunks", 64)),
-            max_calls_per_document_run=int(values.get("max_calls_per_document_run", 24)),
-            request_deadline_seconds=float(values.get("request_deadline_seconds", 120.0)),
-            document_deadline_seconds=float(values.get("document_deadline_seconds", 900.0)),
+            max_calls_per_document_run=int(
+                values.get("max_calls_per_document_run", 24)
+            ),
+            request_deadline_seconds=float(
+                values.get("request_deadline_seconds", 120.0)
+            ),
+            document_deadline_seconds=float(
+                values.get("document_deadline_seconds", 900.0)
+            ),
             chunk_output_tokens=int(values.get("chunk_output_tokens", 900)),
             synthesis_output_tokens=int(values.get("synthesis_output_tokens", 3_000)),
             context_window_fraction=float(values.get("context_window_fraction", 0.8)),
-            estimated_chars_per_token=float(values.get("estimated_chars_per_token", 3.5)),
+            estimated_chars_per_token=float(
+                values.get("estimated_chars_per_token", 3.5)
+            ),
         )
 
 
@@ -433,14 +510,20 @@ class MapRequest:
     extraction_version: str = "1"
     prompt_version: str = "2"
     processing: ProcessingPolicy = field(default_factory=ProcessingPolicy)
-    literature_policy: LiteratureMappingPolicy = field(default_factory=LiteratureMappingPolicy)
+    literature_policy: LiteratureMappingPolicy = field(
+        default_factory=LiteratureMappingPolicy
+    )
     navigation_policy: NavigationPolicy = field(default_factory=NavigationPolicy)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "workspace", Path(self.workspace).expanduser())
         _require_bool(self.allow_cloud, field="allow_cloud")
         if self.model == "deepseek-v4-flash" and self.provider in {"ollama", "gemini"}:
-            object.__setattr__(self, "model", {"ollama": "llama3.2", "gemini": "gemini-2.5-flash"}[self.provider])
+            object.__setattr__(
+                self,
+                "model",
+                {"ollama": "llama3.2", "gemini": "gemini-2.5-flash"}[self.provider],
+            )
         if self.provider == "openrouter" and self.model == "deepseek-v4-flash":
             raise ValueError("openrouter requires an explicit routed model id")
         if self.scope not in {"library", "collection", "selected"}:
@@ -457,7 +540,9 @@ class MapRequest:
             raise ValueError("model cannot be empty")
         if not isinstance(self.processing, ProcessingPolicy):
             if isinstance(self.processing, Mapping):
-                object.__setattr__(self, "processing", ProcessingPolicy.from_dict(self.processing))
+                object.__setattr__(
+                    self, "processing", ProcessingPolicy.from_dict(self.processing)
+                )
             else:
                 raise ValueError("processing must be a ProcessingPolicy or mapping")
         if not isinstance(self.literature_policy, LiteratureMappingPolicy):
@@ -468,7 +553,9 @@ class MapRequest:
                     LiteratureMappingPolicy.from_dict(self.literature_policy),
                 )
             else:
-                raise ValueError("literature_policy must be a LiteratureMappingPolicy or mapping")
+                raise ValueError(
+                    "literature_policy must be a LiteratureMappingPolicy or mapping"
+                )
         if not isinstance(self.navigation_policy, NavigationPolicy):
             if isinstance(self.navigation_policy, Mapping):
                 object.__setattr__(
@@ -477,7 +564,9 @@ class MapRequest:
                     NavigationPolicy.from_dict(self.navigation_policy),
                 )
             else:
-                raise ValueError("navigation_policy must be a NavigationPolicy or mapping")
+                raise ValueError(
+                    "navigation_policy must be a NavigationPolicy or mapping"
+                )
         if self.literature_policy.require_question and not self.question:
             raise ValueError("literature_policy requires a question")
 
@@ -493,13 +582,21 @@ class MapRequest:
             question=payload.get("question") or None,
             provider=str(payload.get("provider", "deepseek")),
             model=str(payload.get("model", "deepseek-v4-flash")),
-            allow_cloud=_strict_bool(payload.get("allow_cloud", False), field="allow_cloud"),
+            allow_cloud=_strict_bool(
+                payload.get("allow_cloud", False), field="allow_cloud"
+            ),
             parallel=int(payload.get("parallel", 4)),
             limit=int(payload.get("limit", 0)),
             extraction_version=str(payload.get("extraction_version", "1")),
             prompt_version=str(payload.get("prompt_version", "2")),
-            processing=ProcessingPolicy.from_dict(payload.get("processing") if isinstance(payload.get("processing"), Mapping) else None),
-            literature_policy=payload.get("literature_policy", LiteratureMappingPolicy()),
+            processing=ProcessingPolicy.from_dict(
+                payload.get("processing")
+                if isinstance(payload.get("processing"), Mapping)
+                else None
+            ),
+            literature_policy=payload.get(
+                "literature_policy", LiteratureMappingPolicy()
+            ),
             navigation_policy=payload.get("navigation_policy", NavigationPolicy()),
         )
 
@@ -508,7 +605,9 @@ class MapRequest:
 class SupportEnvelope:
     """What kind of support an anchor can provide and within which bounds."""
 
-    empirical_role: Literal["descriptive", "associational", "causal", "mechanism_evidence", "none"] = "none"
+    empirical_role: Literal[
+        "descriptive", "associational", "causal", "mechanism_evidence", "none"
+    ] = "none"
     argument_role: Literal[
         "conceptual",
         "interpretive",
@@ -517,13 +616,23 @@ class SupportEnvelope:
         "practitioner_guidance",
         "none",
     ] = "none"
-    coverage: Literal["full_text", "limited_text", "abstract", "metadata", "unknown"] = "unknown"
+    coverage: Literal[
+        "full_text", "limited_text", "abstract", "metadata", "unknown"
+    ] = "unknown"
     scope: dict[str, list[str]] = field(default_factory=dict)
     restrictions: list[str] = field(default_factory=list)
-    support_status: Literal["supported", "support_unknown", "limited", "unsupported"] = "support_unknown"
+    support_status: Literal[
+        "supported", "support_unknown", "limited", "unsupported"
+    ] = "support_unknown"
 
     def __post_init__(self) -> None:
-        empirical_roles = {"descriptive", "associational", "causal", "mechanism_evidence", "none"}
+        empirical_roles = {
+            "descriptive",
+            "associational",
+            "causal",
+            "mechanism_evidence",
+            "none",
+        }
         argument_roles = {
             "conceptual",
             "interpretive",
@@ -546,7 +655,9 @@ class SupportEnvelope:
             raise ValueError("support_envelope.coverage is invalid")
         if self.support_status not in statuses:
             raise ValueError("support_envelope.support_status is invalid")
-        object.__setattr__(self, "scope", _scope_mapping(self.scope, field="support_envelope.scope"))
+        object.__setattr__(
+            self, "scope", _scope_mapping(self.scope, field="support_envelope.scope")
+        )
         object.__setattr__(
             self,
             "restrictions",
@@ -555,7 +666,9 @@ class SupportEnvelope:
 
     def to_dict(self) -> dict[str, Any]:
         scope = _scope_mapping(self.scope, field="support_envelope.scope")
-        restrictions = _string_list(self.restrictions, field="support_envelope.restrictions")
+        restrictions = _string_list(
+            self.restrictions, field="support_envelope.restrictions"
+        )
         return {
             "empirical_role": self.empirical_role,
             "argument_role": self.argument_role,
@@ -572,7 +685,9 @@ class SupportEnvelope:
             empirical_role=values.get("empirical_role", "none"),
             argument_role=values.get("argument_role", "none"),
             coverage=values.get("coverage", "unknown"),
-            scope=_scope_mapping(values.get("scope", {}), field="support_envelope.scope"),
+            scope=_scope_mapping(
+                values.get("scope", {}), field="support_envelope.scope"
+            ),
             restrictions=_string_list(
                 values.get("restrictions", []),
                 field="support_envelope.restrictions",
@@ -623,7 +738,9 @@ class EvidenceFinding:
         if finding_id and claim_id and finding_id != claim_id:
             raise ValueError("conflicting finding_id and claim_id")
         raw_locators = payload.get("locators") or []
-        locators = [raw_locators] if isinstance(raw_locators, str) else list(raw_locators)
+        locators = (
+            [raw_locators] if isinstance(raw_locators, str) else list(raw_locators)
+        )
         return cls(
             finding_id=str(finding_id or claim_id or ""),
             claim=str(payload.get("claim") or ""),
@@ -672,8 +789,16 @@ class SourceLocator:
     supports_strong_assertion: bool = False
 
     def __post_init__(self) -> None:
-        for field_name in ("locator_id", "source_id", "evidence_anchor_id", "locator_type", "value"):
-            _require_string(getattr(self, field_name), field=f"source locator.{field_name}")
+        for field_name in (
+            "locator_id",
+            "source_id",
+            "evidence_anchor_id",
+            "locator_type",
+            "value",
+        ):
+            _require_string(
+                getattr(self, field_name), field=f"source locator.{field_name}"
+            )
         allowed_types = {
             "page",
             "page_range",
@@ -690,9 +815,17 @@ class SourceLocator:
             raise ValueError("source locator.locator_type is invalid")
         for field_name in ("page_start", "page_end"):
             value = getattr(self, field_name)
-            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
-                raise ValueError(f"source locator.{field_name} must be a positive integer or null")
-        if self.page_start is not None and self.page_end is not None and self.page_end < self.page_start:
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 1
+            ):
+                raise ValueError(
+                    f"source locator.{field_name} must be a positive integer or null"
+                )
+        if (
+            self.page_start is not None
+            and self.page_end is not None
+            and self.page_end < self.page_start
+        ):
             raise ValueError("source locator.page_end cannot precede page_start")
         _require_bool(self.source_native, field="source locator.source_native")
         _require_bool(
@@ -702,11 +835,10 @@ class SourceLocator:
         if self.locator_type == "generated_heading" and self.source_native:
             raise ValueError("generated headings cannot be source-native locators")
         if self.supports_strong_assertion and (
-            not self.source_native or self.locator_type in {"generated_heading", "unknown"}
+            not self.source_native
+            or self.locator_type in {"generated_heading", "unknown"}
         ):
-            raise ValueError(
-                "strong assertions require a typed source-native locator"
-            )
+            raise ValueError("strong assertions require a typed source-native locator")
 
     def to_dict(self) -> dict[str, Any]:
         payload = _jsonable(self)
@@ -717,15 +849,23 @@ class SourceLocator:
     def from_dict(cls, payload: Mapping[str, Any]) -> SourceLocator:
         values = _model_payload(cls, payload, label="source locator")
         return cls(
-            locator_id=_require_string(values.get("locator_id", ""), field="source locator.locator_id"),
-            source_id=_require_string(values.get("source_id", ""), field="source locator.source_id"),
+            locator_id=_require_string(
+                values.get("locator_id", ""), field="source locator.locator_id"
+            ),
+            source_id=_require_string(
+                values.get("source_id", ""), field="source locator.source_id"
+            ),
             evidence_anchor_id=_require_string(
-                values.get("evidence_anchor_id", ""), field="source locator.evidence_anchor_id"
+                values.get("evidence_anchor_id", ""),
+                field="source locator.evidence_anchor_id",
             ),
             locator_type=_require_string(
-                values.get("locator_type", "unknown"), field="source locator.locator_type"
+                values.get("locator_type", "unknown"),
+                field="source locator.locator_type",
             ),  # type: ignore[arg-type]
-            value=_require_string(values.get("value", ""), field="source locator.value"),
+            value=_require_string(
+                values.get("value", ""), field="source locator.value"
+            ),
             page_start=values.get("page_start"),
             page_end=values.get("page_end"),
             source_native=values.get("source_native", False),
@@ -759,7 +899,9 @@ class QuantitativeResult:
 
     def __post_init__(self) -> None:
         for field_name in self.__dataclass_fields__:
-            _require_string(getattr(self, field_name), field=f"quantitative result.{field_name}")
+            _require_string(
+                getattr(self, field_name), field=f"quantitative result.{field_name}"
+            )
         if self.provenance not in {"source_reported", "system_derived", "unknown"}:
             raise ValueError("quantitative result.provenance is invalid")
 
@@ -807,7 +949,9 @@ class StudyLineage:
             "institutional_series",
             "confidence",
         ):
-            _require_string(getattr(self, field_name), field=f"study lineage.{field_name}")
+            _require_string(
+                getattr(self, field_name), field=f"study lineage.{field_name}"
+            )
         if self.confidence not in {"high", "moderate", "low", "unknown"}:
             raise ValueError("study lineage.confidence is invalid")
         for field_name in (
@@ -823,7 +967,9 @@ class StudyLineage:
             object.__setattr__(
                 self,
                 field_name,
-                _string_list(getattr(self, field_name), field=f"study lineage.{field_name}"),
+                _string_list(
+                    getattr(self, field_name), field=f"study lineage.{field_name}"
+                ),
             )
         object.__setattr__(
             self,
@@ -844,14 +990,21 @@ class StudyLineage:
         values = _model_payload(cls, payload, label="study lineage")
         return cls(
             study_lineage_id=_require_string(
-                values.get("study_lineage_id", ""), field="study lineage.study_lineage_id"
+                values.get("study_lineage_id", ""),
+                field="study lineage.study_lineage_id",
             ),
-            source_ids=_string_list(values.get("source_ids", []), field="study lineage.source_ids"),
-            authors=_string_list(values.get("authors", []), field="study lineage.authors"),
+            source_ids=_string_list(
+                values.get("source_ids", []), field="study lineage.source_ids"
+            ),
+            authors=_string_list(
+                values.get("authors", []), field="study lineage.authors"
+            ),
             institutions=_string_list(
                 values.get("institutions", []), field="study lineage.institutions"
             ),
-            datasets=_string_list(values.get("datasets", []), field="study lineage.datasets"),
+            datasets=_string_list(
+                values.get("datasets", []), field="study lineage.datasets"
+            ),
             data_sources=_string_list(
                 values.get("data_sources", []), field="study lineage.data_sources"
             ),
@@ -859,12 +1012,15 @@ class StudyLineage:
                 values.get("sampling_frame", ""), field="study lineage.sampling_frame"
             ),
             unit_of_analysis=_require_string(
-                values.get("unit_of_analysis", ""), field="study lineage.unit_of_analysis"
+                values.get("unit_of_analysis", ""),
+                field="study lineage.unit_of_analysis",
             ),
             populations=_string_list(
                 values.get("populations", []), field="study lineage.populations"
             ),
-            periods=_string_list(values.get("periods", []), field="study lineage.periods"),
+            periods=_string_list(
+                values.get("periods", []), field="study lineage.periods"
+            ),
             publication_relationships=_mapping_list(
                 values.get("publication_relationships", []),
                 field="study lineage.publication_relationships",
@@ -922,7 +1078,9 @@ class EvidenceAnchor:
             "uncertainty",
             "locator",
         ):
-            _require_string(getattr(self, field_name), field=f"evidence_anchor.{field_name}")
+            _require_string(
+                getattr(self, field_name), field=f"evidence_anchor.{field_name}"
+            )
         conditions = _string_list(self.conditions, field="evidence_anchor.conditions")
         locators = _string_list(self.locators, field="evidence_anchor.locators")
         qualifiers = _string_list(self.qualifiers, field="evidence_anchor.qualifiers")
@@ -933,7 +1091,9 @@ class EvidenceAnchor:
         if isinstance(envelope, Mapping):
             envelope = SupportEnvelope.from_dict(envelope)
         elif not isinstance(envelope, SupportEnvelope):
-            raise ValueError("evidence_anchor.support_envelope must be a SupportEnvelope or mapping")
+            raise ValueError(
+                "evidence_anchor.support_envelope must be a SupportEnvelope or mapping"
+            )
         source_locators: list[SourceLocator] = []
         for source_locator in self.source_locators:
             if isinstance(source_locator, SourceLocator):
@@ -984,11 +1144,15 @@ class EvidenceAnchor:
             "uncertainty": self.uncertainty,
             "locator": self.locator,
             "locators": locators,
-            "source_locators": [source_locator.to_dict() for source_locator in self.source_locators],
+            "source_locators": [
+                source_locator.to_dict() for source_locator in self.source_locators
+            ],
             "qualifiers": qualifiers,
             "support_envelope": self.support_envelope.to_dict(),
             "quantitative_result": (
-                self.quantitative_result.to_dict() if self.quantitative_result is not None else None
+                self.quantitative_result.to_dict()
+                if self.quantitative_result is not None
+                else None
             ),
         }
 
@@ -998,13 +1162,19 @@ class EvidenceAnchor:
             raise ValueError("evidence anchor must be a mapping")
         values = dict(payload)
         canonical_present = "evidence_anchor_id" in values
-        aliases = {key: values[key] for key in ("finding_id", "claim_id") if key in values}
+        aliases = {
+            key: values[key] for key in ("finding_id", "claim_id") if key in values
+        }
         alias_values = list(aliases.values())
         if any(not isinstance(value, str) for value in alias_values):
             raise ValueError("evidence anchor aliases must be strings")
         if len(set(alias_values)) > 1:
             raise ValueError("conflicting evidence anchor aliases")
-        if canonical_present and aliases and any(value != values["evidence_anchor_id"] for value in alias_values):
+        if (
+            canonical_present
+            and aliases
+            and any(value != values["evidence_anchor_id"] for value in alias_values)
+        ):
             raise ValueError("conflicting evidence_anchor_id and legacy alias")
         if not canonical_present and aliases:
             values["evidence_anchor_id"] = next(iter(aliases.values()))
@@ -1025,11 +1195,15 @@ class EvidenceAnchor:
         if isinstance(quantitative_result, QuantitativeResult):
             normalized_quantitative_result = quantitative_result
         elif isinstance(quantitative_result, Mapping):
-            normalized_quantitative_result = QuantitativeResult.from_dict(quantitative_result)
+            normalized_quantitative_result = QuantitativeResult.from_dict(
+                quantitative_result
+            )
         elif quantitative_result is None:
             normalized_quantitative_result = None
         else:
-            raise ValueError("evidence_anchor.quantitative_result must be a mapping or null")
+            raise ValueError(
+                "evidence_anchor.quantitative_result must be a mapping or null"
+            )
         return cls(
             evidence_anchor_id=values.get("evidence_anchor_id", ""),
             revision_hash=values.get("revision_hash", ""),
@@ -1041,15 +1215,24 @@ class EvidenceAnchor:
             direction=values.get("direction", ""),
             magnitude=values.get("magnitude", ""),
             comparison=values.get("comparison", ""),
-            conditions=_string_list(values.get("conditions", []), field="evidence_anchor.conditions"),
+            conditions=_string_list(
+                values.get("conditions", []), field="evidence_anchor.conditions"
+            ),
             plain_english_meaning=values.get("plain_english_meaning", ""),
             uncertainty=values.get("uncertainty", ""),
             locator=values.get("locator", ""),
-            locators=_string_list(values.get("locators", []), field="evidence_anchor.locators"),
-            source_locators=[SourceLocator.from_dict(row) for row in _mapping_list(
-                source_locators, field="evidence_anchor.source_locators"
-            )],
-            qualifiers=_string_list(values.get("qualifiers", []), field="evidence_anchor.qualifiers"),
+            locators=_string_list(
+                values.get("locators", []), field="evidence_anchor.locators"
+            ),
+            source_locators=[
+                SourceLocator.from_dict(row)
+                for row in _mapping_list(
+                    source_locators, field="evidence_anchor.source_locators"
+                )
+            ],
+            qualifiers=_string_list(
+                values.get("qualifiers", []), field="evidence_anchor.qualifiers"
+            ),
             support_envelope=support_envelope,
             quantitative_result=normalized_quantitative_result,
         )
@@ -1083,23 +1266,37 @@ def _anchor_revision_hash(anchor: EvidenceAnchor) -> str:
         "support_envelope": anchor.support_envelope.to_dict(),
     }
     if anchor.source_locators:
-        content["source_locators"] = [locator.to_dict() for locator in anchor.source_locators]
+        content["source_locators"] = [
+            locator.to_dict() for locator in anchor.source_locators
+        ]
     if anchor.quantitative_result is not None:
         content["quantitative_result"] = anchor.quantitative_result.to_dict()
     return _stable_json_hash(content)
 
 
 def _evidence_roles(finding: EvidenceFinding) -> tuple[str, str, str]:
-    finding_type = finding.finding_type.casefold().strip().replace("-", "_").replace(" ", "_")
+    finding_type = (
+        finding.finding_type.casefold().strip().replace("-", "_").replace(" ", "_")
+    )
     empirical_role = "none"
     argument_role = "none"
-    if any(token in finding_type for token in ("causal", "experiment", "quasi_experiment")):
+    if any(
+        token in finding_type for token in ("causal", "experiment", "quasi_experiment")
+    ):
         empirical_role = "causal"
     elif "mechanism" in finding_type or "process_tracing" in finding_type:
         empirical_role = "mechanism_evidence"
-    elif any(token in finding_type for token in ("association", "correlation", "regression", "statistical")) or finding.is_statistical:
+    elif (
+        any(
+            token in finding_type
+            for token in ("association", "correlation", "regression", "statistical")
+        )
+        or finding.is_statistical
+    ):
         empirical_role = "associational"
-    elif any(token in finding_type for token in ("descriptive", "qualitative", "empirical")):
+    elif any(
+        token in finding_type for token in ("descriptive", "qualitative", "empirical")
+    ):
         empirical_role = "descriptive"
     else:
         argument_role = next(
@@ -1117,11 +1314,17 @@ def _evidence_roles(finding: EvidenceFinding) -> tuple[str, str, str]:
             "none",
         )
     evidence_role = empirical_role if empirical_role != "none" else argument_role
-    return empirical_role, argument_role, evidence_role if evidence_role != "none" else "support_unknown"
+    return (
+        empirical_role,
+        argument_role,
+        evidence_role if evidence_role != "none" else "support_unknown",
+    )
 
 
 def _profile_coverage(coverage: Mapping[str, Any]) -> str:
-    explicit = str(coverage.get("status") or coverage.get("coverage") or "").casefold().strip()
+    explicit = (
+        str(coverage.get("status") or coverage.get("coverage") or "").casefold().strip()
+    )
     if explicit in {"full_text", "limited_text", "abstract", "metadata", "unknown"}:
         return explicit
     source_scope = str(coverage.get("source_scope") or "").casefold().strip()
@@ -1151,9 +1354,17 @@ def _anchors_from_findings(
     for finding in findings:
         empirical_role, argument_role, evidence_role = _evidence_roles(finding)
         support_status = "support_unknown"
-        if evidence_role != "support_unknown" and anchor_coverage == "full_text" and finding.locator:
+        if (
+            evidence_role != "support_unknown"
+            and anchor_coverage == "full_text"
+            and finding.locator
+        ):
             support_status = "supported"
-        elif evidence_role != "support_unknown" and anchor_coverage in {"limited_text", "abstract", "metadata"}:
+        elif evidence_role != "support_unknown" and anchor_coverage in {
+            "limited_text",
+            "abstract",
+            "metadata",
+        }:
             support_status = "limited"
         finding_scope = {
             key: values
@@ -1198,16 +1409,22 @@ def _anchors_from_findings(
                 "qualifiers": finding.qualifiers,
             }
             source_span = json.dumps(
-                span_identity if any(span_identity.values()) else {"claim": finding.claim},
+                span_identity
+                if any(span_identity.values())
+                else {"claim": finding.claim},
                 sort_keys=True,
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
-        candidates.append((finding, anchor, _stable_json_hash({"source_span": source_span})))
+        candidates.append(
+            (finding, anchor, _stable_json_hash({"source_span": source_span}))
+        )
 
     collisions: dict[str, int] = {}
     for _, anchor, _ in candidates:
-        collisions[anchor.evidence_anchor_id] = collisions.get(anchor.evidence_anchor_id, 0) + 1
+        collisions[anchor.evidence_anchor_id] = (
+            collisions.get(anchor.evidence_anchor_id, 0) + 1
+        )
 
     anchors: list[EvidenceAnchor] = []
     for _, anchor, span_hash in candidates:
@@ -1229,7 +1446,10 @@ def _dedupe_anchors(anchors: list[EvidenceAnchor]) -> list[EvidenceAnchor]:
     by_id: dict[str, EvidenceAnchor] = {}
     for anchor in anchors:
         existing = by_id.get(anchor.evidence_anchor_id)
-        if existing is None or (anchor.revision_hash, anchor.claim) < (existing.revision_hash, existing.claim):
+        if existing is None or (anchor.revision_hash, anchor.claim) < (
+            existing.revision_hash,
+            existing.claim,
+        ):
             by_id[anchor.evidence_anchor_id] = anchor
     return [by_id[anchor_id] for anchor_id in sorted(by_id)]
 
@@ -1256,13 +1476,19 @@ def _canonicalize_anchor_ids(anchors: list[EvidenceAnchor]) -> list[EvidenceAnch
         canonical.append((base, span_hash))
     collisions: dict[str, int] = {}
     for anchor, _ in canonical:
-        collisions[anchor.evidence_anchor_id] = collisions.get(anchor.evidence_anchor_id, 0) + 1
+        collisions[anchor.evidence_anchor_id] = (
+            collisions.get(anchor.evidence_anchor_id, 0) + 1
+        )
     result: list[EvidenceAnchor] = []
     for anchor, span_hash in canonical:
         anchor_id = anchor.evidence_anchor_id
         if collisions[anchor_id] > 1:
             anchor_id = f"{anchor_id}-{span_hash[:12]}"
-        result.append(EvidenceAnchor.from_dict({**anchor.to_dict(), "evidence_anchor_id": anchor_id}))
+        result.append(
+            EvidenceAnchor.from_dict(
+                {**anchor.to_dict(), "evidence_anchor_id": anchor_id}
+            )
+        )
     return _dedupe_anchors(result)
 
 
@@ -1313,7 +1539,11 @@ class EvidenceProfile:
         _require_bool(self.excluded_from_synthesis, field="excluded_from_synthesis")
         if self.profile_schema != "evidence_profile":
             raise ValueError("profile_schema must be evidence_profile")
-        if self.profile_schema_version not in {"1.0", "1.1", CURRENT_PROFILE_SCHEMA_VERSION}:
+        if self.profile_schema_version not in {
+            "1.0",
+            "1.1",
+            CURRENT_PROFILE_SCHEMA_VERSION,
+        }:
             raise ValueError("profile_schema_version must be 1.0, 1.1, or 1.2")
         lineage = self.study_lineage
         if isinstance(lineage, Mapping):
@@ -1328,7 +1558,9 @@ class EvidenceProfile:
             elif isinstance(finding, Mapping):
                 normalized_findings.append(EvidenceFinding.from_dict(finding))
             else:
-                raise ValueError("findings must contain EvidenceFinding values or mappings")
+                raise ValueError(
+                    "findings must contain EvidenceFinding values or mappings"
+                )
         self.findings = normalized_findings
         normalized_anchors: list[EvidenceAnchor] = []
         for anchor in self.evidence_anchors:
@@ -1337,7 +1569,9 @@ class EvidenceProfile:
             elif isinstance(anchor, Mapping):
                 normalized_anchors.append(EvidenceAnchor.from_dict(anchor))
             else:
-                raise ValueError("evidence_anchors must contain EvidenceAnchor values or mappings")
+                raise ValueError(
+                    "evidence_anchors must contain EvidenceAnchor values or mappings"
+                )
         if len(normalized_anchors) > 24:
             raise ValueError("evidence_anchors cannot contain more than 24 items")
         if not normalized_anchors and normalized_findings:
@@ -1369,7 +1603,9 @@ class EvidenceProfile:
         payload["study_lineage"] = (
             self.study_lineage.to_dict() if self.study_lineage is not None else None
         )
-        payload["evidence_anchors"] = [anchor.to_dict() for anchor in self.evidence_anchors]
+        payload["evidence_anchors"] = [
+            anchor.to_dict() for anchor in self.evidence_anchors
+        ]
         return payload
 
 
@@ -1398,13 +1634,25 @@ class LiteratureProposition:
             "question",
             "proposition_type",
         ):
-            _require_string(getattr(self, field_name), field=f"literature proposition.{field_name}")
-        object.__setattr__(self, "signature", _any_mapping(self.signature, field="literature proposition.signature"))
-        object.__setattr__(self, "source_ids", _string_list(self.source_ids, field="literature proposition.source_ids"))
+            _require_string(
+                getattr(self, field_name), field=f"literature proposition.{field_name}"
+            )
+        object.__setattr__(
+            self,
+            "signature",
+            _any_mapping(self.signature, field="literature proposition.signature"),
+        )
+        object.__setattr__(
+            self,
+            "source_ids",
+            _string_list(self.source_ids, field="literature proposition.source_ids"),
+        )
         object.__setattr__(
             self,
             "study_family_ids",
-            _string_list(self.study_family_ids, field="literature proposition.study_family_ids"),
+            _string_list(
+                self.study_family_ids, field="literature proposition.study_family_ids"
+            ),
         )
         object.__setattr__(
             self,
@@ -1418,12 +1666,22 @@ class LiteratureProposition:
             raise ValueError(
                 "literature proposition.independent_study_family_count must match study_family_ids"
             )
-        object.__setattr__(self, "cells", _mapping_list(self.cells, field="literature proposition.cells"))
-        object.__setattr__(self, "evidence", _mapping_list(self.evidence, field="literature proposition.evidence"))
+        object.__setattr__(
+            self,
+            "cells",
+            _mapping_list(self.cells, field="literature proposition.cells"),
+        )
+        object.__setattr__(
+            self,
+            "evidence",
+            _mapping_list(self.evidence, field="literature proposition.evidence"),
+        )
         object.__setattr__(
             self,
             "comparability",
-            _any_mapping(self.comparability, field="literature proposition.comparability"),
+            _any_mapping(
+                self.comparability, field="literature proposition.comparability"
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1445,11 +1703,16 @@ class LiteratureProposition:
                     field="literature proposition.source_ids",
                 )
                 if source_ids != participating_sources:
-                    raise ValueError("conflicting literature proposition source aliases")
+                    raise ValueError(
+                        "conflicting literature proposition source aliases"
+                    )
             else:
                 normalized["source_ids"] = participating_sources
         if "supporting_evidence" in normalized:
-            if "evidence" in normalized and normalized["evidence"] != normalized["supporting_evidence"]:
+            if (
+                "evidence" in normalized
+                and normalized["evidence"] != normalized["supporting_evidence"]
+            ):
                 raise ValueError("conflicting literature proposition evidence aliases")
             normalized["evidence"] = normalized.pop("supporting_evidence")
         flattened_evidence_fields = ("source_id", "evidence_anchor_id", "locator")
@@ -1477,48 +1740,75 @@ class LiteratureProposition:
                 row
                 for row in evidence
                 if str(row.get("source_id") or "") == flattened_evidence["source_id"]
-                and str(row.get("evidence_anchor_id") or row.get("finding_id") or row.get("claim_id") or "")
+                and str(
+                    row.get("evidence_anchor_id")
+                    or row.get("finding_id")
+                    or row.get("claim_id")
+                    or ""
+                )
                 == flattened_evidence["evidence_anchor_id"]
             ]
             if matching_rows and any(
                 str(row.get("locator") or "") != flattened_evidence["locator"]
                 for row in matching_rows
             ):
-                raise ValueError("conflicting flattened literature proposition evidence")
+                raise ValueError(
+                    "conflicting flattened literature proposition evidence"
+                )
             if not matching_rows:
                 evidence.append(flattened_evidence)
             normalized["evidence"] = evidence
         if isinstance(normalized.get("comparability"), str):
             comparability_summary = str(normalized["comparability"]).strip()
             normalized["comparability"] = (
-                {"summary": comparability_summary}
-                if comparability_summary
-                else {}
+                {"summary": comparability_summary} if comparability_summary else {}
             )
         values = _model_payload(cls, normalized, label="literature proposition")
         return cls(
-            proposition_id=_require_string(values.get("proposition_id", ""), field="literature proposition.proposition_id"),
+            proposition_id=_require_string(
+                values.get("proposition_id", ""),
+                field="literature proposition.proposition_id",
+            ),
             semantic_identity=_require_string(
-                values.get("semantic_identity", ""), field="literature proposition.semantic_identity"
+                values.get("semantic_identity", ""),
+                field="literature proposition.semantic_identity",
             ),
-            statement=_require_string(values.get("statement", ""), field="literature proposition.statement"),
-            question=_require_string(values.get("question", ""), field="literature proposition.question"),
+            statement=_require_string(
+                values.get("statement", ""), field="literature proposition.statement"
+            ),
+            question=_require_string(
+                values.get("question", ""), field="literature proposition.question"
+            ),
             proposition_type=_require_string(
-                values.get("proposition_type", ""), field="literature proposition.proposition_type"
+                values.get("proposition_type", ""),
+                field="literature proposition.proposition_type",
             ),
-            signature=_any_mapping(values.get("signature", {}), field="literature proposition.signature"),
-            source_ids=_string_list(values.get("source_ids", []), field="literature proposition.source_ids"),
+            signature=_any_mapping(
+                values.get("signature", {}), field="literature proposition.signature"
+            ),
+            source_ids=_string_list(
+                values.get("source_ids", []), field="literature proposition.source_ids"
+            ),
             study_family_ids=_string_list(
-                values.get("study_family_ids", []), field="literature proposition.study_family_ids"
+                values.get("study_family_ids", []),
+                field="literature proposition.study_family_ids",
             ),
             independent_study_family_count=_nonnegative_int(
-                values.get("independent_study_family_count", len(set(values.get("study_family_ids", [])))),
+                values.get(
+                    "independent_study_family_count",
+                    len(set(values.get("study_family_ids", []))),
+                ),
                 field="literature proposition.independent_study_family_count",
             ),
-            cells=_mapping_list(values.get("cells", []), field="literature proposition.cells"),
-            evidence=_mapping_list(values.get("evidence", []), field="literature proposition.evidence"),
+            cells=_mapping_list(
+                values.get("cells", []), field="literature proposition.cells"
+            ),
+            evidence=_mapping_list(
+                values.get("evidence", []), field="literature proposition.evidence"
+            ),
             comparability=_any_mapping(
-                values.get("comparability", {}), field="literature proposition.comparability"
+                values.get("comparability", {}),
+                field="literature proposition.comparability",
             ),
         )
 
@@ -1538,19 +1828,44 @@ class SynthesisAssertion:
     qualifiers: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        for field_name in ("assertion_id", "item_id", "cluster_id", "section", "statement", "support_status"):
-            _require_string(getattr(self, field_name), field=f"synthesis assertion.{field_name}")
+        for field_name in (
+            "assertion_id",
+            "item_id",
+            "cluster_id",
+            "section",
+            "statement",
+            "support_status",
+        ):
+            _require_string(
+                getattr(self, field_name), field=f"synthesis assertion.{field_name}"
+            )
         if self.assertion_id and self.item_id and self.assertion_id != self.item_id:
             raise ValueError("synthesis assertion.assertion_id and item_id must match")
-        if self.support_status not in {"", "supported", "support_unknown", "limited", "unsupported"}:
+        if self.support_status not in {
+            "",
+            "supported",
+            "support_unknown",
+            "limited",
+            "unsupported",
+        }:
             raise ValueError("synthesis assertion.support_status is invalid")
         object.__setattr__(
             self,
             "proposition_ids",
-            _string_list(self.proposition_ids, field="synthesis assertion.proposition_ids"),
+            _string_list(
+                self.proposition_ids, field="synthesis assertion.proposition_ids"
+            ),
         )
-        object.__setattr__(self, "evidence", _mapping_list(self.evidence, field="synthesis assertion.evidence"))
-        object.__setattr__(self, "qualifiers", _string_list(self.qualifiers, field="synthesis assertion.qualifiers"))
+        object.__setattr__(
+            self,
+            "evidence",
+            _mapping_list(self.evidence, field="synthesis assertion.evidence"),
+        )
+        object.__setattr__(
+            self,
+            "qualifiers",
+            _string_list(self.qualifiers, field="synthesis assertion.qualifiers"),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         payload = _jsonable(self)
@@ -1571,15 +1886,27 @@ class SynthesisAssertion:
                     field="synthesis assertion.proposition_ids",
                 )
                 if proposition_ids != [proposition_id]:
-                    raise ValueError("conflicting synthesis assertion proposition aliases")
+                    raise ValueError(
+                        "conflicting synthesis assertion proposition aliases"
+                    )
             else:
                 normalized["proposition_ids"] = [proposition_id]
         statement_aliases = [
             normalized.pop(key)
-            for key in ("assertion", "finding", "position", "agreement", "contradiction", "text", "summary")
+            for key in (
+                "assertion",
+                "finding",
+                "position",
+                "agreement",
+                "contradiction",
+                "text",
+                "summary",
+            )
             if key in normalized
         ]
-        supplied_statements = [value for value in statement_aliases if value not in (None, "")]
+        supplied_statements = [
+            value for value in statement_aliases if value not in (None, "")
+        ]
         if "statement" in normalized:
             supplied_statements.append(normalized["statement"])
         if any(not isinstance(value, str) for value in supplied_statements):
@@ -1593,7 +1920,9 @@ class SynthesisAssertion:
             for key in ("supporting_evidence", "evidence_anchors")
             if key in normalized
         ]
-        supplied_evidence = [value for value in evidence_aliases if value not in (None, [])]
+        supplied_evidence = [
+            value for value in evidence_aliases if value not in (None, [])
+        ]
         if "evidence" in normalized and normalized["evidence"] not in (None, []):
             supplied_evidence.append(normalized["evidence"])
         if len({json.dumps(value, sort_keys=True) for value in supplied_evidence}) > 1:
@@ -1601,7 +1930,11 @@ class SynthesisAssertion:
         if "evidence" not in normalized and supplied_evidence:
             normalized["evidence"] = supplied_evidence[0]
         evidence = normalized.get("evidence")
-        if isinstance(evidence, list) and evidence and all(isinstance(value, str) for value in evidence):
+        if (
+            isinstance(evidence, list)
+            and evidence
+            and all(isinstance(value, str) for value in evidence)
+        ):
             parsed_evidence: list[dict[str, str]] = []
             for value in evidence:
                 parts = str(value).strip().split(maxsplit=2)
@@ -1624,19 +1957,35 @@ class SynthesisAssertion:
             normalized["evidence"] = parsed_evidence
         values = _model_payload(cls, normalized, label="synthesis assertion")
         return cls(
-            assertion_id=_require_string(values.get("assertion_id", ""), field="synthesis assertion.assertion_id"),
-            item_id=_require_string(values.get("item_id", ""), field="synthesis assertion.item_id"),
-            cluster_id=_require_string(values.get("cluster_id", ""), field="synthesis assertion.cluster_id"),
-            section=_require_string(values.get("section", ""), field="synthesis assertion.section"),
-            statement=_require_string(values.get("statement", ""), field="synthesis assertion.statement"),
+            assertion_id=_require_string(
+                values.get("assertion_id", ""), field="synthesis assertion.assertion_id"
+            ),
+            item_id=_require_string(
+                values.get("item_id", ""), field="synthesis assertion.item_id"
+            ),
+            cluster_id=_require_string(
+                values.get("cluster_id", ""), field="synthesis assertion.cluster_id"
+            ),
+            section=_require_string(
+                values.get("section", ""), field="synthesis assertion.section"
+            ),
+            statement=_require_string(
+                values.get("statement", ""), field="synthesis assertion.statement"
+            ),
             proposition_ids=_string_list(
-                values.get("proposition_ids", []), field="synthesis assertion.proposition_ids"
+                values.get("proposition_ids", []),
+                field="synthesis assertion.proposition_ids",
             ),
-            evidence=_mapping_list(values.get("evidence", []), field="synthesis assertion.evidence"),
+            evidence=_mapping_list(
+                values.get("evidence", []), field="synthesis assertion.evidence"
+            ),
             support_status=_require_string(
-                values.get("support_status", ""), field="synthesis assertion.support_status"
+                values.get("support_status", ""),
+                field="synthesis assertion.support_status",
             ),
-            qualifiers=_string_list(values.get("qualifiers", []), field="synthesis assertion.qualifiers"),
+            qualifiers=_string_list(
+                values.get("qualifiers", []), field="synthesis assertion.qualifiers"
+            ),
         )
 
 
@@ -1656,6 +2005,7 @@ class ClusterSourceContribution:
         "bridge_evidence",
     ] = "conceptual_context"
     related_proposition_ids: list[str] = field(default_factory=list)
+    evidence_thread_id: str = ""
     finding: str = ""
     technical_result: str = ""
     plain_english_meaning: str = ""
@@ -1666,6 +2016,7 @@ class ClusterSourceContribution:
         "contrasts_with_shared_pattern",
         "context_only",
     ] = "context_only"
+    origin: Literal["reasoner", "deterministic_profile_fallback"] = "reasoner"
     evidence: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -1674,13 +2025,18 @@ class ClusterSourceContribution:
             "source_id",
             "cluster_role",
             "contribution_kind",
+            "evidence_thread_id",
             "finding",
             "technical_result",
             "plain_english_meaning",
             "relation_to_cluster_question",
             "comparison_status",
+            "origin",
         ):
-            _require_string(getattr(self, field_name), field=f"cluster source contribution.{field_name}")
+            _require_string(
+                getattr(self, field_name),
+                field=f"cluster source contribution.{field_name}",
+            )
         if self.cluster_role not in {"core", "context", "bridge"}:
             raise ValueError("cluster source contribution.cluster_role is invalid")
         allowed_kinds = {
@@ -1700,6 +2056,8 @@ class ClusterSourceContribution:
             "context_only",
         }:
             raise ValueError("cluster source contribution.comparison_status is invalid")
+        if self.origin not in {"reasoner", "deterministic_profile_fallback"}:
+            raise ValueError("cluster source contribution.origin is invalid")
         object.__setattr__(
             self,
             "related_proposition_ids",
@@ -1728,7 +2086,8 @@ class ClusterSourceContribution:
                 field="cluster source contribution.contribution_id",
             ),
             source_id=_require_string(
-                values.get("source_id", ""), field="cluster source contribution.source_id"
+                values.get("source_id", ""),
+                field="cluster source contribution.source_id",
             ),
             cluster_role=_require_string(
                 values.get("cluster_role", "context"),
@@ -1741,6 +2100,10 @@ class ClusterSourceContribution:
             related_proposition_ids=_string_list(
                 values.get("related_proposition_ids", []),
                 field="cluster source contribution.related_proposition_ids",
+            ),
+            evidence_thread_id=_require_string(
+                values.get("evidence_thread_id") or "",
+                field="cluster source contribution.evidence_thread_id",
             ),
             finding=_require_string(
                 values.get("finding", ""), field="cluster source contribution.finding"
@@ -1761,8 +2124,95 @@ class ClusterSourceContribution:
                 values.get("comparison_status", "context_only"),
                 field="cluster source contribution.comparison_status",
             ),  # type: ignore[arg-type]
+            origin=_require_string(
+                values.get("origin", "reasoner"),
+                field="cluster source contribution.origin",
+            ),  # type: ignore[arg-type]
             evidence=_mapping_list(
                 values.get("evidence", []), field="cluster source contribution.evidence"
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceThread:
+    """A human-readable line of inquiry inside a broader literature cluster."""
+
+    thread_id: str = ""
+    title: str = ""
+    question: str = ""
+    summary: str = ""
+    plain_english_meaning: str = ""
+    relationship: str = ""
+    source_ids: list[str] = field(default_factory=list)
+    proposition_ids: list[str] = field(default_factory=list)
+    evidence: list[dict[str, Any]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "thread_id",
+            "title",
+            "question",
+            "summary",
+            "plain_english_meaning",
+            "relationship",
+        ):
+            _require_string(
+                getattr(self, field_name), field=f"evidence thread.{field_name}"
+            )
+        object.__setattr__(
+            self,
+            "source_ids",
+            _string_list(self.source_ids, field="evidence thread.source_ids"),
+        )
+        object.__setattr__(
+            self,
+            "proposition_ids",
+            _string_list(self.proposition_ids, field="evidence thread.proposition_ids"),
+        )
+        object.__setattr__(
+            self,
+            "evidence",
+            _mapping_list(self.evidence, field="evidence thread.evidence"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = _jsonable(self)
+        type(self).from_dict(payload)
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> EvidenceThread:
+        values = _model_payload(cls, payload, label="evidence thread")
+        return cls(
+            thread_id=_require_string(
+                values.get("thread_id", ""), field="evidence thread.thread_id"
+            ),
+            title=_require_string(
+                values.get("title", ""), field="evidence thread.title"
+            ),
+            question=_require_string(
+                values.get("question", ""), field="evidence thread.question"
+            ),
+            summary=_require_string(
+                values.get("summary", ""), field="evidence thread.summary"
+            ),
+            plain_english_meaning=_require_string(
+                values.get("plain_english_meaning", ""),
+                field="evidence thread.plain_english_meaning",
+            ),
+            relationship=_require_string(
+                values.get("relationship", ""), field="evidence thread.relationship"
+            ),
+            source_ids=_string_list(
+                values.get("source_ids", []), field="evidence thread.source_ids"
+            ),
+            proposition_ids=_string_list(
+                values.get("proposition_ids", []),
+                field="evidence thread.proposition_ids",
+            ),
+            evidence=_mapping_list(
+                values.get("evidence", []), field="evidence thread.evidence"
             ),
         )
 
@@ -1787,8 +2237,15 @@ class EvidenceBaseGroup:
     overlap_signals: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        for field_name in ("evidence_base_group_id", "proposition_id", "relationship", "rationale"):
-            _require_string(getattr(self, field_name), field=f"evidence base group.{field_name}")
+        for field_name in (
+            "evidence_base_group_id",
+            "proposition_id",
+            "relationship",
+            "rationale",
+        ):
+            _require_string(
+                getattr(self, field_name), field=f"evidence base group.{field_name}"
+            )
         if self.relationship not in {
             "independent_evidence_base",
             "overlapping_evidence_base",
@@ -1801,13 +2258,20 @@ class EvidenceBaseGroup:
             self.counted_as_independent,
             field="evidence base group.counted_as_independent",
         )
-        if self.relationship == "independence_uncertain" and self.counted_as_independent:
-            raise ValueError("uncertain evidence bases cannot increase the independent count")
+        if (
+            self.relationship == "independence_uncertain"
+            and self.counted_as_independent
+        ):
+            raise ValueError(
+                "uncertain evidence bases cannot increase the independent count"
+            )
         for field_name in ("source_ids", "study_lineage_ids", "overlap_signals"):
             object.__setattr__(
                 self,
                 field_name,
-                _string_list(getattr(self, field_name), field=f"evidence base group.{field_name}"),
+                _string_list(
+                    getattr(self, field_name), field=f"evidence base group.{field_name}"
+                ),
             )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1824,7 +2288,8 @@ class EvidenceBaseGroup:
                 field="evidence base group.evidence_base_group_id",
             ),
             proposition_id=_require_string(
-                values.get("proposition_id", ""), field="evidence base group.proposition_id"
+                values.get("proposition_id", ""),
+                field="evidence base group.proposition_id",
             ),
             source_ids=_string_list(
                 values.get("source_ids", []), field="evidence base group.source_ids"
@@ -1870,8 +2335,16 @@ class IndependenceAssessment:
     evidence: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        for field_name in ("assessment_id", "proposition_id", "status", "rationale", "confidence"):
-            _require_string(getattr(self, field_name), field=f"independence assessment.{field_name}")
+        for field_name in (
+            "assessment_id",
+            "proposition_id",
+            "status",
+            "rationale",
+            "confidence",
+        ):
+            _require_string(
+                getattr(self, field_name), field=f"independence assessment.{field_name}"
+            )
         if self.status not in {
             "independent_evidence_base",
             "overlapping_evidence_base",
@@ -1890,14 +2363,20 @@ class IndependenceAssessment:
                 field="independence assessment.effective_evidence_base_count",
             ),
         )
-        if self.status == "independence_uncertain" and self.effective_evidence_base_count > 0:
-            raise ValueError("uncertain assessments cannot increase the independent count")
+        if (
+            self.status == "independence_uncertain"
+            and self.effective_evidence_base_count > 0
+        ):
+            raise ValueError(
+                "uncertain assessments cannot increase the independent count"
+            )
         for field_name in ("source_ids", "evidence_base_group_ids", "overlap_signals"):
             object.__setattr__(
                 self,
                 field_name,
                 _string_list(
-                    getattr(self, field_name), field=f"independence assessment.{field_name}"
+                    getattr(self, field_name),
+                    field=f"independence assessment.{field_name}",
                 ),
             )
         object.__setattr__(
@@ -1916,10 +2395,12 @@ class IndependenceAssessment:
         values = _model_payload(cls, payload, label="independence assessment")
         return cls(
             assessment_id=_require_string(
-                values.get("assessment_id", ""), field="independence assessment.assessment_id"
+                values.get("assessment_id", ""),
+                field="independence assessment.assessment_id",
             ),
             proposition_id=_require_string(
-                values.get("proposition_id", ""), field="independence assessment.proposition_id"
+                values.get("proposition_id", ""),
+                field="independence assessment.proposition_id",
             ),
             source_ids=_string_list(
                 values.get("source_ids", []), field="independence assessment.source_ids"
@@ -1944,7 +2425,8 @@ class IndependenceAssessment:
                 field="independence assessment.overlap_signals",
             ),
             confidence=_require_string(
-                values.get("confidence", "unknown"), field="independence assessment.confidence"
+                values.get("confidence", "unknown"),
+                field="independence assessment.confidence",
             ),  # type: ignore[arg-type]
             evidence=_mapping_list(
                 values.get("evidence", []), field="independence assessment.evidence"
@@ -1960,7 +2442,9 @@ class QuantitativeComparisonValidation:
     proposition_id: str = ""
     source_ids: list[str] = field(default_factory=list)
     quantitative_result_ids: list[str] = field(default_factory=list)
-    status: Literal["valid", "qualified", "rejected", "not_comparable"] = "not_comparable"
+    status: Literal["valid", "qualified", "rejected", "not_comparable"] = (
+        "not_comparable"
+    )
     estimands_comparable: bool = False
     outcomes_comparable: bool = False
     populations_comparable: bool = False
@@ -1971,7 +2455,8 @@ class QuantitativeComparisonValidation:
     def __post_init__(self) -> None:
         for field_name in ("comparison_id", "proposition_id", "status", "reason"):
             _require_string(
-                getattr(self, field_name), field=f"quantitative comparison validation.{field_name}"
+                getattr(self, field_name),
+                field=f"quantitative comparison validation.{field_name}",
             )
         if self.status not in {"valid", "qualified", "rejected", "not_comparable"}:
             raise ValueError("quantitative comparison validation.status is invalid")
@@ -2002,7 +2487,9 @@ class QuantitativeComparisonValidation:
                 self.arithmetic_reproducible,
             )
         ):
-            raise ValueError("valid quantitative comparisons require all checks to pass")
+            raise ValueError(
+                "valid quantitative comparisons require all checks to pass"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         payload = _jsonable(self)
@@ -2011,7 +2498,9 @@ class QuantitativeComparisonValidation:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> QuantitativeComparisonValidation:
-        values = _model_payload(cls, payload, label="quantitative comparison validation")
+        values = _model_payload(
+            cls, payload, label="quantitative comparison validation"
+        )
         return cls(
             comparison_id=_require_string(
                 values.get("comparison_id", ""),
@@ -2038,7 +2527,8 @@ class QuantitativeComparisonValidation:
             populations_comparable=values.get("populations_comparable", False),
             arithmetic_reproducible=values.get("arithmetic_reproducible", False),
             reason=_require_string(
-                values.get("reason", ""), field="quantitative comparison validation.reason"
+                values.get("reason", ""),
+                field="quantitative comparison validation.reason",
             ),
             qualifications=_string_list(
                 values.get("qualifications", []),
@@ -2065,8 +2555,16 @@ class SubjectTag:
     revision_hash: str = ""
 
     def __post_init__(self) -> None:
-        for field_name in ("subject_tag_id", "label", "slug", "facet_type", "revision_hash"):
-            _require_string(getattr(self, field_name), field=f"subject tag.{field_name}")
+        for field_name in (
+            "subject_tag_id",
+            "label",
+            "slug",
+            "facet_type",
+            "revision_hash",
+        ):
+            _require_string(
+                getattr(self, field_name), field=f"subject tag.{field_name}"
+            )
         allowed_facets = {
             "",
             "concept",
@@ -2088,7 +2586,11 @@ class SubjectTag:
             "original_variants",
             _string_list(self.original_variants, field="subject tag.original_variants"),
         )
-        object.__setattr__(self, "source_ids", _string_list(self.source_ids, field="subject tag.source_ids"))
+        object.__setattr__(
+            self,
+            "source_ids",
+            _string_list(self.source_ids, field="subject tag.source_ids"),
+        )
         object.__setattr__(
             self,
             "study_family_ids",
@@ -2097,12 +2599,16 @@ class SubjectTag:
         object.__setattr__(
             self,
             "assignment_provenance",
-            _string_list(self.assignment_provenance, field="subject tag.assignment_provenance"),
+            _string_list(
+                self.assignment_provenance, field="subject tag.assignment_provenance"
+            ),
         )
         object.__setattr__(
             self,
             "relationship_proposals",
-            _mapping_list(self.relationship_proposals, field="subject tag.relationship_proposals"),
+            _mapping_list(
+                self.relationship_proposals, field="subject tag.relationship_proposals"
+            ),
         )
         object.__setattr__(
             self,
@@ -2120,7 +2626,9 @@ class SubjectTag:
         if self.source_count != len(set(self.source_ids)):
             raise ValueError("subject tag.source_count must match source_ids")
         if self.independent_source_count != len(set(self.study_family_ids)):
-            raise ValueError("subject tag.independent_source_count must match study_family_ids")
+            raise ValueError(
+                "subject tag.independent_source_count must match study_family_ids"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         payload = _jsonable(self)
@@ -2130,7 +2638,9 @@ class SubjectTag:
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> SubjectTag:
         values = _model_payload(cls, payload, label="subject tag")
-        source_ids = _string_list(values.get("source_ids", []), field="subject tag.source_ids")
+        source_ids = _string_list(
+            values.get("source_ids", []), field="subject tag.source_ids"
+        )
         study_family_ids = _string_list(
             values.get("study_family_ids", []), field="subject tag.study_family_ids"
         )
@@ -2140,9 +2650,12 @@ class SubjectTag:
             ),
             label=_require_string(values.get("label", ""), field="subject tag.label"),
             slug=_require_string(values.get("slug", ""), field="subject tag.slug"),
-            facet_type=_require_string(values.get("facet_type", ""), field="subject tag.facet_type"),
+            facet_type=_require_string(
+                values.get("facet_type", ""), field="subject tag.facet_type"
+            ),
             original_variants=_string_list(
-                values.get("original_variants", []), field="subject tag.original_variants"
+                values.get("original_variants", []),
+                field="subject tag.original_variants",
             ),
             source_ids=source_ids,
             study_family_ids=study_family_ids,
@@ -2155,7 +2668,8 @@ class SubjectTag:
                 field="subject tag.relationship_proposals",
             ),
             source_count=_nonnegative_int(
-                values.get("source_count", len(set(source_ids))), field="subject tag.source_count"
+                values.get("source_count", len(set(source_ids))),
+                field="subject tag.source_count",
             ),
             independent_source_count=_nonnegative_int(
                 values.get("independent_source_count", len(set(study_family_ids))),
@@ -2193,7 +2707,9 @@ class SubjectTagAssignment:
             "provenance",
             "reason",
         ):
-            _require_string(getattr(self, field_name), field=f"subject tag assignment.{field_name}")
+            _require_string(
+                getattr(self, field_name), field=f"subject tag assignment.{field_name}"
+            )
         _require_bool(
             self.confirmed_by_profile,
             field="subject tag assignment.confirmed_by_profile",
@@ -2217,25 +2733,32 @@ class SubjectTagAssignment:
         _require_bool(visible, field="subject tag assignment.visible")
         return cls(
             assignment_id=_require_string(
-                values.get("assignment_id", ""), field="subject tag assignment.assignment_id"
+                values.get("assignment_id", ""),
+                field="subject tag assignment.assignment_id",
             ),
             subject_tag_id=_require_string(
-                values.get("subject_tag_id", ""), field="subject tag assignment.subject_tag_id"
+                values.get("subject_tag_id", ""),
+                field="subject tag assignment.subject_tag_id",
             ),
             source_id=_require_string(
                 values.get("source_id", ""), field="subject tag assignment.source_id"
             ),
-            note_id=_require_string(values.get("note_id", ""), field="subject tag assignment.note_id"),
+            note_id=_require_string(
+                values.get("note_id", ""), field="subject tag assignment.note_id"
+            ),
             facet_type=_require_string(
                 values.get("facet_type", ""), field="subject tag assignment.facet_type"
             ),
             original_value=_require_string(
-                values.get("original_value", ""), field="subject tag assignment.original_value"
+                values.get("original_value", ""),
+                field="subject tag assignment.original_value",
             ),
             provenance=_require_string(
                 values.get("provenance", ""), field="subject tag assignment.provenance"
             ),
-            reason=_require_string(values.get("reason", ""), field="subject tag assignment.reason"),
+            reason=_require_string(
+                values.get("reason", ""), field="subject tag assignment.reason"
+            ),
             confirmed_by_profile=confirmed_by_profile,
             visible=visible,
         )
@@ -2258,7 +2781,9 @@ class TypedSourceRelation:
 
     def __post_init__(self) -> None:
         for field_name in ("relation_id", "relation_type", "provenance"):
-            _require_string(getattr(self, field_name), field=f"typed source relation.{field_name}")
+            _require_string(
+                getattr(self, field_name), field=f"typed source relation.{field_name}"
+            )
         allowed_types = {
             "",
             "cites",
@@ -2292,12 +2817,16 @@ class TypedSourceRelation:
         object.__setattr__(
             self,
             "subject_tag_ids",
-            _string_list(self.subject_tag_ids, field="typed source relation.subject_tag_ids"),
+            _string_list(
+                self.subject_tag_ids, field="typed source relation.subject_tag_ids"
+            ),
         )
         object.__setattr__(
             self,
             "proposition_ids",
-            _string_list(self.proposition_ids, field="typed source relation.proposition_ids"),
+            _string_list(
+                self.proposition_ids, field="typed source relation.proposition_ids"
+            ),
         )
         object.__setattr__(
             self,
@@ -2327,7 +2856,8 @@ class TypedSourceRelation:
                 values.get("note_ids", []), field="typed source relation.note_ids"
             ),
             relation_type=_require_string(
-                values.get("relation_type", ""), field="typed source relation.relation_type"
+                values.get("relation_type", ""),
+                field="typed source relation.relation_type",
             ),
             reasons=_string_list(
                 values.get("reasons", []), field="typed source relation.reasons"
@@ -2381,7 +2911,9 @@ class TopicNeighborhood:
             "promotion_status",
             "visibility_status",
         ):
-            _require_string(getattr(self, field_name), field=f"topic neighborhood.{field_name}")
+            _require_string(
+                getattr(self, field_name), field=f"topic neighborhood.{field_name}"
+            )
         if self.kind not in {
             "",
             "semantic",
@@ -2401,12 +2933,26 @@ class TopicNeighborhood:
             "typed_relation",
         }:
             raise ValueError("topic neighborhood.kind is invalid")
-        _require_bool(self.analytical_support, field="topic neighborhood.analytical_support")
+        _require_bool(
+            self.analytical_support, field="topic neighborhood.analytical_support"
+        )
         if self.analytical_support:
             raise ValueError("topic neighborhood.analytical_support must be false")
-        object.__setattr__(self, "source_ids", _string_list(self.source_ids, field="topic neighborhood.source_ids"))
-        object.__setattr__(self, "note_ids", _string_list(self.note_ids, field="topic neighborhood.note_ids"))
-        object.__setattr__(self, "signals", _mapping_list(self.signals, field="topic neighborhood.signals"))
+        object.__setattr__(
+            self,
+            "source_ids",
+            _string_list(self.source_ids, field="topic neighborhood.source_ids"),
+        )
+        object.__setattr__(
+            self,
+            "note_ids",
+            _string_list(self.note_ids, field="topic neighborhood.note_ids"),
+        )
+        object.__setattr__(
+            self,
+            "signals",
+            _mapping_list(self.signals, field="topic neighborhood.signals"),
+        )
         object.__setattr__(
             self,
             "member_relationship_reasons",
@@ -2418,7 +2964,9 @@ class TopicNeighborhood:
         object.__setattr__(
             self,
             "source_count",
-            _nonnegative_int(self.source_count, field="topic neighborhood.source_count"),
+            _nonnegative_int(
+                self.source_count, field="topic neighborhood.source_count"
+            ),
         )
         if self.source_count != len(set(self.source_ids)):
             raise ValueError("topic neighborhood.source_count must match source_ids")
@@ -2443,16 +2991,28 @@ class TopicNeighborhood:
         _require_bool(analytical_support, field="topic neighborhood.analytical_support")
         return cls(
             topic_neighborhood_id=_require_string(
-                values.get("topic_neighborhood_id", ""), field="topic neighborhood.topic_neighborhood_id"
+                values.get("topic_neighborhood_id", ""),
+                field="topic neighborhood.topic_neighborhood_id",
             ),
-            kind=_require_string(values.get("kind", ""), field="topic neighborhood.kind"),
+            kind=_require_string(
+                values.get("kind", ""), field="topic neighborhood.kind"
+            ),
             semantic_identity=_require_string(
-                values.get("semantic_identity", ""), field="topic neighborhood.semantic_identity"
+                values.get("semantic_identity", ""),
+                field="topic neighborhood.semantic_identity",
             ),
-            label=_require_string(values.get("label", ""), field="topic neighborhood.label"),
-            source_ids=_string_list(values.get("source_ids", []), field="topic neighborhood.source_ids"),
-            note_ids=_string_list(values.get("note_ids", []), field="topic neighborhood.note_ids"),
-            signals=_mapping_list(values.get("signals", []), field="topic neighborhood.signals"),
+            label=_require_string(
+                values.get("label", ""), field="topic neighborhood.label"
+            ),
+            source_ids=_string_list(
+                values.get("source_ids", []), field="topic neighborhood.source_ids"
+            ),
+            note_ids=_string_list(
+                values.get("note_ids", []), field="topic neighborhood.note_ids"
+            ),
+            signals=_mapping_list(
+                values.get("signals", []), field="topic neighborhood.signals"
+            ),
             analytical_support=analytical_support,
             source_count=_nonnegative_int(
                 values.get("source_count", len(set(values.get("source_ids", [])))),
@@ -2462,10 +3022,12 @@ class TopicNeighborhood:
                 values.get("facet_type", ""), field="topic neighborhood.facet_type"
             ),
             canonical_tag_id=_require_string(
-                values.get("canonical_tag_id", ""), field="topic neighborhood.canonical_tag_id"
+                values.get("canonical_tag_id", ""),
+                field="topic neighborhood.canonical_tag_id",
             ),
             promotion_status=_require_string(
-                values.get("promotion_status", ""), field="topic neighborhood.promotion_status"
+                values.get("promotion_status", ""),
+                field="topic neighborhood.promotion_status",
             ),
             independent_source_count=_nonnegative_int(
                 values.get("independent_source_count", 0),
@@ -2476,7 +3038,8 @@ class TopicNeighborhood:
                 field="topic neighborhood.member_relationship_reasons",
             ),
             visibility_status=_require_string(
-                values.get("visibility_status", ""), field="topic neighborhood.visibility_status"
+                values.get("visibility_status", ""),
+                field="topic neighborhood.visibility_status",
             ),
         )
 
@@ -2500,8 +3063,16 @@ class CoverageRecord:
     could_affect_existing_cluster: bool = False
 
     def __post_init__(self) -> None:
-        for field_name in ("source_id", "title", "zotero_key", "terminal_state", "exclusion_reason"):
-            _require_string(getattr(self, field_name), field=f"coverage record.{field_name}")
+        for field_name in (
+            "source_id",
+            "title",
+            "zotero_key",
+            "terminal_state",
+            "exclusion_reason",
+        ):
+            _require_string(
+                getattr(self, field_name), field=f"coverage record.{field_name}"
+            )
         if self.terminal_state not in {
             "validated_note",
             "limited_note",
@@ -2529,19 +3100,30 @@ class CoverageRecord:
     def from_dict(cls, payload: Mapping[str, Any]) -> CoverageRecord:
         values = _model_payload(cls, payload, label="coverage record")
         return cls(
-            source_id=_require_string(values.get("source_id", ""), field="coverage record.source_id"),
-            title=_require_string(values.get("title", ""), field="coverage record.title"),
-            zotero_key=_require_string(values.get("zotero_key", ""), field="coverage record.zotero_key"),
+            source_id=_require_string(
+                values.get("source_id", ""), field="coverage record.source_id"
+            ),
+            title=_require_string(
+                values.get("title", ""), field="coverage record.title"
+            ),
+            zotero_key=_require_string(
+                values.get("zotero_key", ""), field="coverage record.zotero_key"
+            ),
             terminal_state=_require_string(
-                values.get("terminal_state", "pending"), field="coverage record.terminal_state"
+                values.get("terminal_state", "pending"),
+                field="coverage record.terminal_state",
             ),  # type: ignore[arg-type]
             exclusion_reason=_require_string(
-                values.get("exclusion_reason", ""), field="coverage record.exclusion_reason"
+                values.get("exclusion_reason", ""),
+                field="coverage record.exclusion_reason",
             ),
             attempted_route=_string_list(
-                values.get("attempted_route", []), field="coverage record.attempted_route"
+                values.get("attempted_route", []),
+                field="coverage record.attempted_route",
             ),
-            could_affect_existing_cluster=values.get("could_affect_existing_cluster", False),
+            could_affect_existing_cluster=values.get(
+                "could_affect_existing_cluster", False
+            ),
         )
 
 
@@ -2578,20 +3160,38 @@ class CoverageRegister:
             elif isinstance(record, Mapping):
                 records.append(CoverageRecord.from_dict(record))
             else:
-                raise ValueError("coverage register.records must contain CoverageRecord values or mappings")
+                raise ValueError(
+                    "coverage register.records must contain CoverageRecord values or mappings"
+                )
         if records and inventory_count != len(records):
             raise ValueError("coverage register.inventory_count must match records")
-        accounting_fields = ("validated_note", "limited_note", "exhausted", "partial", "pending")
-        if any(field_name in counts for field_name in accounting_fields) and sum(
-            counts.get(field_name, 0) for field_name in accounting_fields
-        ) != inventory_count:
-            raise ValueError("coverage register counts must account for the complete inventory")
-        if self.status == "complete" and (
-            counts.get("exhausted", 0) or counts.get("partial", 0) or counts.get("pending", 0)
+        accounting_fields = (
+            "validated_note",
+            "limited_note",
+            "exhausted",
+            "partial",
+            "pending",
+        )
+        if (
+            any(field_name in counts for field_name in accounting_fields)
+            and sum(counts.get(field_name, 0) for field_name in accounting_fields)
+            != inventory_count
         ):
-            raise ValueError("complete coverage cannot contain exhausted, partial, or pending items")
+            raise ValueError(
+                "coverage register counts must account for the complete inventory"
+            )
+        if self.status == "complete" and (
+            counts.get("exhausted", 0)
+            or counts.get("partial", 0)
+            or counts.get("pending", 0)
+        ):
+            raise ValueError(
+                "complete coverage cannot contain exhausted, partial, or pending items"
+            )
         if self.status == "complete_with_exclusions" and not counts.get("exhausted", 0):
-            raise ValueError("complete_with_exclusions requires at least one exhausted item")
+            raise ValueError(
+                "complete_with_exclusions requires at least one exhausted item"
+            )
         object.__setattr__(self, "inventory_count", inventory_count)
         object.__setattr__(self, "counts", counts)
         object.__setattr__(self, "records", records)
@@ -2612,12 +3212,15 @@ class CoverageRegister:
                 values.get("source_set_id", ""), field="coverage register.source_set_id"
             ),
             inventory_count=_nonnegative_int(
-                values.get("inventory_count", 0), field="coverage register.inventory_count"
+                values.get("inventory_count", 0),
+                field="coverage register.inventory_count",
             ),
             counts=dict(counts),
             records=[
                 CoverageRecord.from_dict(row)
-                for row in _mapping_list(values.get("records", []), field="coverage register.records")
+                for row in _mapping_list(
+                    values.get("records", []), field="coverage register.records"
+                )
             ],
             status=_require_string(
                 values.get("status", "complete"), field="coverage register.status"
@@ -2647,12 +3250,16 @@ class TagConcept:
             "activation_reason",
             "revision_hash",
         ):
-            _require_string(getattr(self, field_name), field=f"tag concept.{field_name}")
+            _require_string(
+                getattr(self, field_name), field=f"tag concept.{field_name}"
+            )
         for field_name in ("original_variants", "source_ids"):
             object.__setattr__(
                 self,
                 field_name,
-                _string_list(getattr(self, field_name), field=f"tag concept.{field_name}"),
+                _string_list(
+                    getattr(self, field_name), field=f"tag concept.{field_name}"
+                ),
             )
         relations = _mapping_list(self.relations, field="tag concept.relations")
         for index, relation in enumerate(relations):
@@ -2665,8 +3272,12 @@ class TagConcept:
                 "related_to",
                 "superseded_by",
             }:
-                raise ValueError(f"tag concept.relations[{index}].relation_type is invalid")
-            _require_string(target_id, field=f"tag concept.relations[{index}].target_tag_concept_id")
+                raise ValueError(
+                    f"tag concept.relations[{index}].relation_type is invalid"
+                )
+            _require_string(
+                target_id, field=f"tag concept.relations[{index}].target_tag_concept_id"
+            )
         object.__setattr__(self, "relations", relations)
         _require_bool(self.graph_active, field="tag concept.graph_active")
 
@@ -2685,13 +3296,19 @@ class TagConcept:
             label=_require_string(values.get("label", ""), field="tag concept.label"),
             slug=_require_string(values.get("slug", ""), field="tag concept.slug"),
             original_variants=_string_list(
-                values.get("original_variants", []), field="tag concept.original_variants"
+                values.get("original_variants", []),
+                field="tag concept.original_variants",
             ),
-            source_ids=_string_list(values.get("source_ids", []), field="tag concept.source_ids"),
-            relations=_mapping_list(values.get("relations", []), field="tag concept.relations"),
+            source_ids=_string_list(
+                values.get("source_ids", []), field="tag concept.source_ids"
+            ),
+            relations=_mapping_list(
+                values.get("relations", []), field="tag concept.relations"
+            ),
             graph_active=values.get("graph_active", False),
             activation_reason=_require_string(
-                values.get("activation_reason", ""), field="tag concept.activation_reason"
+                values.get("activation_reason", ""),
+                field="tag concept.activation_reason",
             ),
             revision_hash=_require_string(
                 values.get("revision_hash", ""), field="tag concept.revision_hash"
@@ -2715,7 +3332,9 @@ class NeighborhoodSummary:
 
     def __post_init__(self) -> None:
         for field_name in ("neighborhood_id", "label", "why_useful"):
-            _require_string(getattr(self, field_name), field=f"neighborhood summary.{field_name}")
+            _require_string(
+                getattr(self, field_name), field=f"neighborhood summary.{field_name}"
+            )
         for field_name in (
             "source_ids",
             "related_cluster_ids",
@@ -2725,7 +3344,10 @@ class NeighborhoodSummary:
             object.__setattr__(
                 self,
                 field_name,
-                _string_list(getattr(self, field_name), field=f"neighborhood summary.{field_name}"),
+                _string_list(
+                    getattr(self, field_name),
+                    field=f"neighborhood summary.{field_name}",
+                ),
             )
         object.__setattr__(
             self,
@@ -2747,9 +3369,12 @@ class NeighborhoodSummary:
         values = _model_payload(cls, payload, label="neighborhood summary")
         return cls(
             neighborhood_id=_require_string(
-                values.get("neighborhood_id", ""), field="neighborhood summary.neighborhood_id"
+                values.get("neighborhood_id", ""),
+                field="neighborhood summary.neighborhood_id",
             ),
-            label=_require_string(values.get("label", ""), field="neighborhood summary.label"),
+            label=_require_string(
+                values.get("label", ""), field="neighborhood summary.label"
+            ),
             why_useful=_require_string(
                 values.get("why_useful", ""), field="neighborhood summary.why_useful"
             ),
@@ -2806,11 +3431,21 @@ class ResolutionPath:
             "practitioner",
         }
         for field_name in ("path_type", "question", "evidence_needed", "feasibility"):
-            _require_string(getattr(self, field_name), field=f"resolution path.{field_name}")
+            _require_string(
+                getattr(self, field_name), field=f"resolution path.{field_name}"
+            )
         if self.path_type not in allowed:
             raise ValueError("resolution path.path_type is invalid")
-        object.__setattr__(self, "requirements", _any_mapping(self.requirements, field="resolution path.requirements"))
-        object.__setattr__(self, "limitations", _string_list(self.limitations, field="resolution path.limitations"))
+        object.__setattr__(
+            self,
+            "requirements",
+            _any_mapping(self.requirements, field="resolution path.requirements"),
+        )
+        object.__setattr__(
+            self,
+            "limitations",
+            _string_list(self.limitations, field="resolution path.limitations"),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         payload = _jsonable(self)
@@ -2820,10 +3455,16 @@ class ResolutionPath:
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> ResolutionPath:
         values = _model_payload(cls, payload, label="resolution path")
-        missing = [field_name for field_name in cls.__dataclass_fields__ if field_name not in values]
+        missing = [
+            field_name
+            for field_name in cls.__dataclass_fields__
+            if field_name not in values
+        ]
         if missing:
             raise ValueError(f"missing resolution path fields: {', '.join(missing)}")
-        path_type = _require_string(values["path_type"], field="resolution path.path_type")
+        path_type = _require_string(
+            values["path_type"], field="resolution path.path_type"
+        )
         if path_type.strip().casefold() in {
             "mixed method",
             "mixed methods",
@@ -2836,13 +3477,21 @@ class ResolutionPath:
             path_type = "methodological"
         return cls(
             path_type=path_type,  # type: ignore[arg-type]
-            question=_require_string(values["question"], field="resolution path.question"),
+            question=_require_string(
+                values["question"], field="resolution path.question"
+            ),
             evidence_needed=_require_string(
                 values["evidence_needed"], field="resolution path.evidence_needed"
             ),
-            requirements=_any_mapping(values["requirements"], field="resolution path.requirements"),
-            feasibility=_require_string(values["feasibility"], field="resolution path.feasibility"),
-            limitations=_string_list(values["limitations"], field="resolution path.limitations"),
+            requirements=_any_mapping(
+                values["requirements"], field="resolution path.requirements"
+            ),
+            feasibility=_require_string(
+                values["feasibility"], field="resolution path.feasibility"
+            ),
+            limitations=_string_list(
+                values["limitations"], field="resolution path.limitations"
+            ),
         )
 
 
@@ -2870,12 +3519,16 @@ class ClusterProposal:
         normalized_lineages: list[StudyLineage] = []
         for lineage in self.study_lineages:
             normalized_lineages.append(
-                lineage if isinstance(lineage, StudyLineage) else StudyLineage.from_dict(lineage)
+                lineage
+                if isinstance(lineage, StudyLineage)
+                else StudyLineage.from_dict(lineage)
             )
         normalized_groups: list[EvidenceBaseGroup] = []
         for group in self.evidence_base_groups:
             normalized_groups.append(
-                group if isinstance(group, EvidenceBaseGroup) else EvidenceBaseGroup.from_dict(group)
+                group
+                if isinstance(group, EvidenceBaseGroup)
+                else EvidenceBaseGroup.from_dict(group)
             )
         normalized_assessments: list[IndependenceAssessment] = []
         for assessment in self.independence_assessments:
@@ -2902,17 +3555,23 @@ class ClusterProposal:
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> ClusterProposal:
         values = _model_payload(cls, payload, label="cluster proposal")
-        source_ids = _string_list(values.get("source_ids"), field="cluster proposal.source_ids")
+        source_ids = _string_list(
+            values.get("source_ids"), field="cluster proposal.source_ids"
+        )
         propositions = [
             LiteratureProposition.from_dict(row)
-            for row in _mapping_list(values.get("propositions"), field="cluster proposal.propositions")
+            for row in _mapping_list(
+                values.get("propositions"), field="cluster proposal.propositions"
+            )
         ]
         source_roles = values.get("source_roles")
         if isinstance(source_roles, Mapping):
             if set(str(key) for key in source_roles) <= {"core", "context", "bridge"}:
                 source_role_rows = [
                     {"source_id": str(source_id), "role": str(role)}
-                    for role, role_sources in sorted(source_roles.items(), key=lambda row: str(row[0]))
+                    for role, role_sources in sorted(
+                        source_roles.items(), key=lambda row: str(row[0])
+                    )
                     for source_id in _string_list(
                         role_sources,
                         field=f"cluster proposal.source_roles.{role}",
@@ -2922,29 +3581,41 @@ class ClusterProposal:
                 source_role_rows = [
                     {
                         "source_id": str(source_id),
-                        "role": str(role.get("role") if isinstance(role, Mapping) else role),
+                        "role": str(
+                            role.get("role") if isinstance(role, Mapping) else role
+                        ),
                     }
-                    for source_id, role in sorted(source_roles.items(), key=lambda row: str(row[0]))
+                    for source_id, role in sorted(
+                        source_roles.items(), key=lambda row: str(row[0])
+                    )
                 ]
         elif source_roles == []:
             source_role_rows = []
-        elif isinstance(source_roles, list) and all(isinstance(role, str) for role in source_roles):
+        elif isinstance(source_roles, list) and all(
+            isinstance(role, str) for role in source_roles
+        ):
             normalized_roles = [str(role).strip().casefold() for role in source_roles]
             if len(normalized_roles) == len(source_ids) and all(
                 role in {"core", "context", "bridge"} for role in normalized_roles
             ):
                 source_role_rows = [
                     {"source_id": source_id, "role": role}
-                    for source_id, role in zip(source_ids, normalized_roles, strict=True)
+                    for source_id, role in zip(
+                        source_ids, normalized_roles, strict=True
+                    )
                 ]
             elif propositions:
                 proposition_source_ids = {
-                    source_id for proposition in propositions for source_id in proposition.source_ids
+                    source_id
+                    for proposition in propositions
+                    for source_id in proposition.source_ids
                 }
                 source_role_rows = [
                     {
                         "source_id": source_id,
-                        "role": "core" if source_id in proposition_source_ids else "context",
+                        "role": "core"
+                        if source_id in proposition_source_ids
+                        else "context",
                     }
                     for source_id in source_ids
                 ]
@@ -2953,11 +3624,15 @@ class ClusterProposal:
                     "cluster proposal.source_roles string lists must align with source_ids and contain only roles"
                 )
         else:
-            source_role_rows = _mapping_list(source_roles, field="cluster proposal.source_roles")
+            source_role_rows = _mapping_list(
+                source_roles, field="cluster proposal.source_roles"
+            )
         return cls(
             proposal_id=str(values.get("proposal_id") or ""),
             label=str(values.get("label") or ""),
-            semantic_identity=str(values.get("semantic_identity") or values.get("label") or ""),
+            semantic_identity=str(
+                values.get("semantic_identity") or values.get("label") or ""
+            ),
             shared_question=str(values.get("shared_question") or ""),
             bounded_object=str(values.get("bounded_object") or ""),
             coherence_rationale=str(values.get("coherence_rationale") or ""),
@@ -3034,7 +3709,9 @@ class DebateFamily:
             "admission_status",
             "revision_hash",
         ):
-            _require_string(getattr(self, field_name), field=f"debate family.{field_name}")
+            _require_string(
+                getattr(self, field_name), field=f"debate family.{field_name}"
+            )
         if self.qualification_status not in {
             "",
             "source_backed_cluster",
@@ -3043,13 +3720,27 @@ class DebateFamily:
             "cluster_candidate",
         }:
             raise ValueError("debate family.qualification_status is invalid")
-        self.source_ids = _string_list(self.source_ids, field="debate family.source_ids")
-        self.core_source_ids = _string_list(self.core_source_ids, field="debate family.core_source_ids")
-        self.context_source_ids = _string_list(self.context_source_ids, field="debate family.context_source_ids")
-        self.bridge_source_ids = _string_list(self.bridge_source_ids, field="debate family.bridge_source_ids")
-        self.source_roles = _mapping_list(self.source_roles, field="debate family.source_roles")
-        self.family_relations = _family_relation_list(self.family_relations, field="debate family.family_relations")
-        self.proposition_ids = _string_list(self.proposition_ids, field="debate family.proposition_ids")
+        self.source_ids = _string_list(
+            self.source_ids, field="debate family.source_ids"
+        )
+        self.core_source_ids = _string_list(
+            self.core_source_ids, field="debate family.core_source_ids"
+        )
+        self.context_source_ids = _string_list(
+            self.context_source_ids, field="debate family.context_source_ids"
+        )
+        self.bridge_source_ids = _string_list(
+            self.bridge_source_ids, field="debate family.bridge_source_ids"
+        )
+        self.source_roles = _mapping_list(
+            self.source_roles, field="debate family.source_roles"
+        )
+        self.family_relations = _family_relation_list(
+            self.family_relations, field="debate family.family_relations"
+        )
+        self.proposition_ids = _string_list(
+            self.proposition_ids, field="debate family.proposition_ids"
+        )
         self.effective_evidence_base_count = _nonnegative_int(
             self.effective_evidence_base_count,
             field="debate family.effective_evidence_base_count",
@@ -3058,11 +3749,17 @@ class DebateFamily:
         if any(source_id not in source_set for source_id in self.core_source_ids):
             raise ValueError("debate family.core_source_ids must belong to source_ids")
         if any(source_id not in source_set for source_id in self.context_source_ids):
-            raise ValueError("debate family.context_source_ids must belong to source_ids")
+            raise ValueError(
+                "debate family.context_source_ids must belong to source_ids"
+            )
         if any(source_id not in source_set for source_id in self.bridge_source_ids):
-            raise ValueError("debate family.bridge_source_ids must belong to source_ids")
+            raise ValueError(
+                "debate family.bridge_source_ids must belong to source_ids"
+            )
         if any(
-            source_id not in source_set for relation in self.family_relations for source_id in relation["source_ids"]
+            source_id not in source_set
+            for relation in self.family_relations
+            for source_id in relation["source_ids"]
         ):
             raise ValueError("debate family relations must reference family source_ids")
 
@@ -3074,6 +3771,7 @@ class DebateFamily:
         values = _model_payload(cls, payload, label="debate family")
         return cls(**values)
 
+
 @dataclass(slots=True)
 class ClusterSynthesis:
     """Evidence-referenced narrative material for one admitted cluster."""
@@ -3083,6 +3781,7 @@ class ClusterSynthesis:
     boundaries: list[str] = field(default_factory=list)
     coherence_rationale: str = ""
     synthesis: str = ""
+    evidence_threads: list[EvidenceThread] = field(default_factory=list)
     central_findings: list[dict[str, Any]] = field(default_factory=list)
     agreements: list[dict[str, Any]] = field(default_factory=list)
     positions: list[dict[str, Any]] = field(default_factory=list)
@@ -3097,12 +3796,20 @@ class ClusterSynthesis:
     source_contributions: list[ClusterSourceContribution] = field(default_factory=list)
     evidence_base_groups: list[EvidenceBaseGroup] = field(default_factory=list)
     independence_assessments: list[IndependenceAssessment] = field(default_factory=list)
-    quantitative_comparisons: list[QuantitativeComparisonValidation] = field(default_factory=list)
+    quantitative_comparisons: list[QuantitativeComparisonValidation] = field(
+        default_factory=list
+    )
     strict_adjudications: list[dict[str, Any]] = field(default_factory=list)
     effective_evidence_base_count: int = 0
     debate_state: str = ""
 
     def __post_init__(self) -> None:
+        self.evidence_threads = [
+            thread
+            if isinstance(thread, EvidenceThread)
+            else EvidenceThread.from_dict(thread)
+            for thread in self.evidence_threads
+        ]
         self.source_contributions = [
             contribution
             if isinstance(contribution, ClusterSourceContribution)
@@ -3110,7 +3817,9 @@ class ClusterSynthesis:
             for contribution in self.source_contributions
         ]
         self.evidence_base_groups = [
-            group if isinstance(group, EvidenceBaseGroup) else EvidenceBaseGroup.from_dict(group)
+            group
+            if isinstance(group, EvidenceBaseGroup)
+            else EvidenceBaseGroup.from_dict(group)
             for group in self.evidence_base_groups
         ]
         self.independence_assessments = [
@@ -3158,9 +3867,13 @@ class ClusterSynthesis:
         values = _model_payload(cls, payload, label="cluster synthesis")
         debate_state_value = values.get("debate_state", "")
         if isinstance(debate_state_value, Mapping):
-            classification = debate_state_value.get("classification") or debate_state_value.get("state")
+            classification = debate_state_value.get(
+                "classification"
+            ) or debate_state_value.get("state")
             if not isinstance(classification, str) or not classification.strip():
-                raise ValueError("cluster synthesis.debate_state.classification must be a string")
+                raise ValueError(
+                    "cluster synthesis.debate_state.classification must be a string"
+                )
             for section in (
                 "agreements",
                 "positions",
@@ -3168,7 +3881,10 @@ class ClusterSynthesis:
                 "boundary_conditions",
                 "methodological_fault_lines",
             ):
-                if not values.get(section) and debate_state_value.get(section) is not None:
+                if (
+                    not values.get(section)
+                    and debate_state_value.get(section) is not None
+                ):
                     values[section] = debate_state_value[section]
             values["debate_state"] = classification
 
@@ -3178,9 +3894,14 @@ class ClusterSynthesis:
         return cls(
             cluster_id=str(values.get("cluster_id") or ""),
             scope=str(values.get("scope") or ""),
-            boundaries=_string_list(values.get("boundaries"), field="cluster synthesis.boundaries"),
+            boundaries=_string_list(
+                values.get("boundaries"), field="cluster synthesis.boundaries"
+            ),
             coherence_rationale=str(values.get("coherence_rationale") or ""),
             synthesis=str(values.get("synthesis") or ""),
+            evidence_threads=[
+                EvidenceThread.from_dict(row) for row in mappings("evidence_threads")
+            ],
             central_findings=mappings("central_findings"),
             agreements=mappings("agreements"),
             positions=mappings("positions"),
@@ -3191,21 +3912,34 @@ class ClusterSynthesis:
             source_roles=mappings("source_roles"),
             supporting_evidence=mappings("supporting_evidence"),
             gap_hypotheses=mappings("gap_hypotheses"),
-            synthesis_assertions=[SynthesisAssertion.from_dict(row) for row in mappings("synthesis_assertions")],
-            source_contributions=[ClusterSourceContribution.from_dict(row) for row in mappings("source_contributions")],
-            evidence_base_groups=[EvidenceBaseGroup.from_dict(row) for row in mappings("evidence_base_groups")],
+            synthesis_assertions=[
+                SynthesisAssertion.from_dict(row)
+                for row in mappings("synthesis_assertions")
+            ],
+            source_contributions=[
+                ClusterSourceContribution.from_dict(row)
+                for row in mappings("source_contributions")
+            ],
+            evidence_base_groups=[
+                EvidenceBaseGroup.from_dict(row)
+                for row in mappings("evidence_base_groups")
+            ],
             independence_assessments=[
-                IndependenceAssessment.from_dict(row) for row in mappings("independence_assessments")
+                IndependenceAssessment.from_dict(row)
+                for row in mappings("independence_assessments")
             ],
             quantitative_comparisons=[
-                QuantitativeComparisonValidation.from_dict(row) for row in mappings("quantitative_comparisons")
+                QuantitativeComparisonValidation.from_dict(row)
+                for row in mappings("quantitative_comparisons")
             ],
             strict_adjudications=mappings("strict_adjudications"),
             effective_evidence_base_count=_nonnegative_int(
                 values.get("effective_evidence_base_count", 0),
                 field="cluster synthesis.effective_evidence_base_count",
             ),
-            debate_state=_require_string(values.get("debate_state", ""), field="cluster synthesis.debate_state"),
+            debate_state=_require_string(
+                values.get("debate_state", ""), field="cluster synthesis.debate_state"
+            ),
         )
 
 
@@ -3230,25 +3964,39 @@ class GapValueAssessment:
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any] | None) -> GapValueAssessment:
         values = _model_payload(cls, payload or {}, label="gap value assessment")
-        _require_bool(values.get("non_obviousness_passed", False), field="gap value assessment.non_obviousness_passed")
-        _require_bool(values.get("importance_passed", False), field="gap value assessment.importance_passed")
+        _require_bool(
+            values.get("non_obviousness_passed", False),
+            field="gap value assessment.non_obviousness_passed",
+        )
+        _require_bool(
+            values.get("importance_passed", False),
+            field="gap value assessment.importance_passed",
+        )
         information_gain = str(values.get("information_gain") or "")
         if information_gain not in {"", "high", "moderate", "low"}:
-            raise ValueError("gap value assessment.information_gain must be high, moderate, or low")
+            raise ValueError(
+                "gap value assessment.information_gain must be high, moderate, or low"
+            )
         return cls(
             puzzle_type=str(values.get("puzzle_type") or ""),
             puzzle=str(values.get("puzzle") or ""),
             strongest_obvious_answer=str(values.get("strongest_obvious_answer") or ""),
-            why_obvious_answer_is_inadequate=str(values.get("why_obvious_answer_is_inadequate") or ""),
-            competing_explanations=_string_list(
-                values.get("competing_explanations"), field="gap value assessment.competing_explanations"
+            why_obvious_answer_is_inadequate=str(
+                values.get("why_obvious_answer_is_inadequate") or ""
             ),
-            decision_or_inference_changed=str(values.get("decision_or_inference_changed") or ""),
+            competing_explanations=_string_list(
+                values.get("competing_explanations"),
+                field="gap value assessment.competing_explanations",
+            ),
+            decision_or_inference_changed=str(
+                values.get("decision_or_inference_changed") or ""
+            ),
             information_gain=information_gain,  # type: ignore[arg-type]
             non_obviousness_passed=values.get("non_obviousness_passed", False),
             importance_passed=values.get("importance_passed", False),
             rejection_reasons=_string_list(
-                values.get("rejection_reasons"), field="gap value assessment.rejection_reasons"
+                values.get("rejection_reasons"),
+                field="gap value assessment.rejection_reasons",
             ),
         )
 
@@ -3288,9 +4036,12 @@ class GapStudyDesign:
             target_population=str(values.get("target_population") or ""),
             exposure_or_treatment=str(values.get("exposure_or_treatment") or ""),
             comparator=str(values.get("comparator") or ""),
-            outcomes=_string_list(values.get("outcomes"), field="gap study design.outcomes"),
+            outcomes=_string_list(
+                values.get("outcomes"), field="gap study design.outcomes"
+            ),
             mechanism_measures=_string_list(
-                values.get("mechanism_measures"), field="gap study design.mechanism_measures"
+                values.get("mechanism_measures"),
+                field="gap study design.mechanism_measures",
             ),
             identification_or_inference_strategy=str(
                 values.get("identification_or_inference_strategy") or ""
@@ -3306,7 +4057,9 @@ class GapStudyDesign:
             ),
             feasibility=str(values.get("feasibility") or ""),
             ethical_constraints=str(values.get("ethical_constraints") or ""),
-            validity_risks=_string_list(values.get("validity_risks"), field="gap study design.validity_risks"),
+            validity_risks=_string_list(
+                values.get("validity_risks"), field="gap study design.validity_risks"
+            ),
         )
 
 
@@ -3332,6 +4085,7 @@ class GapAnchor:
         if not anchor.cluster_id or not anchor.item_id:
             raise ValueError("gap anchor.cluster_id and item_id cannot be empty")
         if anchor.section not in {
+            "evidence_threads",
             "central_findings",
             "agreements",
             "positions",
@@ -3341,7 +4095,9 @@ class GapAnchor:
             "related_clusters",
             "source_roles",
         }:
-            raise ValueError("gap anchor.section is not a supported cluster synthesis section")
+            raise ValueError(
+                "gap anchor.section is not a supported cluster synthesis section"
+            )
         return anchor
 
 
@@ -3394,16 +4150,28 @@ class GapRationale:
 
         priority_tier = str(values.get("priority_tier") or "")
         if priority_tier not in {"", "high", "moderate", "low"}:
-            raise ValueError("gap rationale.priority_tier must be high, moderate, or low")
-        anchor_rows = _mapping_list(values.get("anchors"), field="gap rationale.anchors")
+            raise ValueError(
+                "gap rationale.priority_tier must be high, moderate, or low"
+            )
+        anchor_rows = _mapping_list(
+            values.get("anchors"), field="gap rationale.anchors"
+        )
         if (
             values.get("originating_proposition_id")
             and values.get("proposition_id")
             and values["originating_proposition_id"] != values["proposition_id"]
         ):
-            raise ValueError("conflicting proposition_id and originating_proposition_id")
-        proposition_id = str(values.get("originating_proposition_id") or values.get("proposition_id") or "")
-        related_cluster_ids = _string_list(values.get("related_cluster_ids"), field="gap rationale.related_cluster_ids")
+            raise ValueError(
+                "conflicting proposition_id and originating_proposition_id"
+            )
+        proposition_id = str(
+            values.get("originating_proposition_id")
+            or values.get("proposition_id")
+            or ""
+        )
+        related_cluster_ids = _string_list(
+            values.get("related_cluster_ids"), field="gap rationale.related_cluster_ids"
+        )
         originating_cluster_ids = _string_list(
             values.get("originating_cluster_ids"),
             field="gap rationale.originating_cluster_ids",
@@ -3425,17 +4193,23 @@ class GapRationale:
             supporting_evidence=evidence("supporting_evidence"),
             countervailing_evidence=evidence("countervailing_evidence"),
             internal_search_summary=str(values.get("internal_search_summary") or ""),
-            closest_prior_explanation=str(values.get("closest_prior_explanation") or ""),
+            closest_prior_explanation=str(
+                values.get("closest_prior_explanation") or ""
+            ),
             decision_reasoning=str(values.get("decision_reasoning") or ""),
             evidence_needed=str(values.get("evidence_needed") or ""),
             why_matters=str(values.get("why_matters") or ""),
             contribution=str(values.get("contribution") or ""),
             confidence=str(values.get("confidence") or ""),
             value_assessment=GapValueAssessment.from_dict(
-                values.get("value_assessment") if isinstance(values.get("value_assessment"), Mapping) else {}
+                values.get("value_assessment")
+                if isinstance(values.get("value_assessment"), Mapping)
+                else {}
             ),
             study_design=GapStudyDesign.from_dict(
-                values.get("study_design") if isinstance(values.get("study_design"), Mapping) else {}
+                values.get("study_design")
+                if isinstance(values.get("study_design"), Mapping)
+                else {}
             ),
             resolution_path=(
                 ResolutionPath.from_dict(values["resolution_path"])
@@ -3468,7 +4242,9 @@ class LiteratureMapRequest:
     provider: str = "deepseek"
     model: str = "deepseek-v4-flash"
     allow_cloud: bool = False
-    literature_policy: LiteratureMappingPolicy = field(default_factory=LiteratureMappingPolicy)
+    literature_policy: LiteratureMappingPolicy = field(
+        default_factory=LiteratureMappingPolicy
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "workspace", Path(self.workspace).expanduser())
@@ -3485,7 +4261,9 @@ class LiteratureMapRequest:
                     LiteratureMappingPolicy.from_dict(self.literature_policy),
                 )
             else:
-                raise ValueError("literature_policy must be a LiteratureMappingPolicy or mapping")
+                raise ValueError(
+                    "literature_policy must be a LiteratureMappingPolicy or mapping"
+                )
         if self.literature_policy.require_question and not self.question:
             raise ValueError("literature_policy requires a question")
 
@@ -3502,8 +4280,12 @@ class LiteratureMapRequest:
             question=payload.get("question") or None,
             provider=str(payload.get("provider", "deepseek")),
             model=str(payload.get("model", "deepseek-v4-flash")),
-            allow_cloud=_strict_bool(payload.get("allow_cloud", False), field="allow_cloud"),
-            literature_policy=payload.get("literature_policy", LiteratureMappingPolicy()),
+            allow_cloud=_strict_bool(
+                payload.get("allow_cloud", False), field="allow_cloud"
+            ),
+            literature_policy=payload.get(
+                "literature_policy", LiteratureMappingPolicy()
+            ),
         )
 
 
@@ -3536,13 +4318,17 @@ class LiteratureMapReport:
     def __post_init__(self) -> None:
         if self.proposition_count == 0 and "proposition_count" in self.counts:
             self.proposition_count = _nonnegative_int(
-                self.counts["proposition_count"], field="literature map report.proposition_count"
+                self.counts["proposition_count"],
+                field="literature map report.proposition_count",
             )
         else:
             self.proposition_count = _nonnegative_int(
                 self.proposition_count, field="literature map report.proposition_count"
             )
-        if self.topic_neighborhood_count == 0 and "topic_neighborhood_count" in self.counts:
+        if (
+            self.topic_neighborhood_count == 0
+            and "topic_neighborhood_count" in self.counts
+        ):
             self.topic_neighborhood_count = _nonnegative_int(
                 self.counts["topic_neighborhood_count"],
                 field="literature map report.topic_neighborhood_count",
@@ -3650,7 +4436,9 @@ class RunReport:
 
     @property
     def terminal_count(self) -> int:
-        return self.validated_note_count + self.limited_note_count + self.exhausted_count
+        return (
+            self.validated_note_count + self.limited_note_count + self.exhausted_count
+        )
 
     def to_dict(self) -> dict[str, Any]:
         payload = _jsonable(self)

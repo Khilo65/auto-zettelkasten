@@ -10,6 +10,7 @@ from auto_zettelkasten import (
     CoverageRegister,
     EvidenceAnchor,
     EvidenceBaseGroup,
+    EvidenceThread,
     EvidenceProfile,
     IndependenceAssessment,
     NeighborhoodSummary,
@@ -22,15 +23,16 @@ from auto_zettelkasten import (
 from auto_zettelkasten.models import LiteratureMapReport, NavigationPolicy
 
 
-
-
 def test_v09_versions_and_navigation_defaults() -> None:
     assert ENGINE_VERSION == "0.9.0"
     assert ARTIFACT_SCHEMA_VERSION == "1.8"
     assert NavigationPolicy().max_visible_tags_per_source == 6
     assert NavigationPolicy().max_collection_neighborhoods == 20
 
-def test_profile_1_2_round_trips_typed_locator_quantitative_result_and_lineage() -> None:
+
+def test_profile_1_2_round_trips_typed_locator_quantitative_result_and_lineage() -> (
+    None
+):
     locator = SourceLocator(
         locator_id="locator-1",
         source_id="source-1",
@@ -145,6 +147,7 @@ def test_evidence_base_and_cluster_contribution_contracts_round_trip() -> None:
         cluster_role="core",
         contribution_kind="unique_cluster_relevant_finding",
         related_proposition_ids=["proposition-1"],
+        evidence_thread_id="thread-1",
         finding="The source identifies one relevant determinant.",
         technical_result="Source-reported estimate.",
         plain_english_meaning="This finding matters but is not a collection-wide agreement.",
@@ -154,6 +157,19 @@ def test_evidence_base_and_cluster_contribution_contracts_round_trip() -> None:
     )
     synthesis = ClusterSynthesis(
         cluster_id="cluster-1",
+        evidence_threads=[
+            EvidenceThread(
+                thread_id="thread-1",
+                title="How mediator legitimacy matters",
+                question="How does legitimacy affect acceptance?",
+                summary="The sources connect legitimacy to acceptance through distinct mechanisms.",
+                plain_english_meaning="Legitimacy may make proposals easier for parties to accept.",
+                relationship="complementary",
+                source_ids=["source-1", "source-2"],
+                proposition_ids=["proposition-1"],
+                evidence=[{"source_id": "source-1", "locator": "p. 14"}],
+            )
+        ],
         source_contributions=[contribution],
         evidence_base_groups=[group],
         independence_assessments=[assessment],
@@ -164,7 +180,9 @@ def test_evidence_base_and_cluster_contribution_contracts_round_trip() -> None:
         proposal_id="proposal-1",
         source_ids=["source-1", "source-2"],
         study_lineages=[
-            StudyLineage(study_lineage_id="lineage-1", source_ids=["source-1", "source-2"])
+            StudyLineage(
+                study_lineage_id="lineage-1", source_ids=["source-1", "source-2"]
+            )
         ],
         evidence_base_groups=[group],
         independence_assessments=[assessment],
@@ -174,6 +192,14 @@ def test_evidence_base_and_cluster_contribution_contracts_round_trip() -> None:
     assert EvidenceBaseGroup.from_dict(group.to_dict()) == group
     assert IndependenceAssessment.from_dict(assessment.to_dict()) == assessment
     assert ClusterSourceContribution.from_dict(contribution.to_dict()) == contribution
+
+    without_thread = contribution.to_dict()
+    without_thread["evidence_thread_id"] = None
+    assert ClusterSourceContribution.from_dict(without_thread).evidence_thread_id == ""
+    assert (
+        EvidenceThread.from_dict(synthesis.evidence_threads[0].to_dict())
+        == synthesis.evidence_threads[0]
+    )
     assert ClusterProposal.from_dict(proposal.to_dict()) == proposal
     assert ClusterSynthesis.from_dict(synthesis.to_dict()) == synthesis
 
@@ -192,7 +218,9 @@ def test_quantitative_comparison_requires_all_checks_for_valid_status() -> None:
         reason="The studies estimate comparable relationships in different populations.",
         qualifications=["Population scope differs."],
     )
-    assert QuantitativeComparisonValidation.from_dict(comparison.to_dict()) == comparison
+    assert (
+        QuantitativeComparisonValidation.from_dict(comparison.to_dict()) == comparison
+    )
 
     try:
         QuantitativeComparisonValidation(status="valid", arithmetic_reproducible=True)

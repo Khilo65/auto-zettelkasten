@@ -9,11 +9,13 @@ import pytest
 import auto_zettelkasten.literature as literature
 from auto_zettelkasten.literature import (
     DEBATE_STATES,
+    _cluster_item_text,
     _cluster_markdown,
     _gap_markdown,
     _gap_quality_errors,
     _gap_rule_admission_errors,
     _gap_specificity_errors,
+    _human_projection_text,
     _proposition_debate_state,
     build_debate_registry,
     build_evidence_matrices,
@@ -138,6 +140,123 @@ def test_coverage_repair_uses_normalized_anchor_eligibility() -> None:
 
     normalized[0]["claims"][0]["support_envelope"]["support_status"] = "support_unknown"
     assert literature._coverage_repair_source_ids(clustered, normalized) == []
+
+
+def test_thematic_cluster_admits_one_bounded_subliterature_without_exact_proposition() -> (
+    None
+):
+    rows = normalize_evidence_profiles(
+        [
+            _profile(
+                "early-warning",
+                topic="conflict prevention",
+                outcome="early diplomatic attention",
+                claim="Conflict prevention uses early warning to direct preventive diplomacy before escalation.",
+            ),
+            _profile(
+                "regional",
+                topic="conflict prevention",
+                outcome="regional preventive action",
+                claim="Regional organizations contribute local knowledge and access to conflict prevention.",
+            ),
+            _profile(
+                "envoy",
+                topic="preventive diplomacy",
+                outcome="timely engagement",
+                claim="Preventive diplomacy depends on timely engagement and political consent.",
+            ),
+        ]
+    )
+    evidence = [_reference(row) for row in rows]
+    proposal = {
+        "proposal_id": "proposal-conflict-prevention",
+        "label": "Conflict Prevention and Preventive Diplomacy",
+        "semantic_identity": "conflict prevention preventive diplomacy",
+        "shared_question": "How does preventive diplomacy try to stop conflict escalation?",
+        "bounded_object": "conflict prevention and preventive diplomacy",
+        "coherence_rationale": (
+            "The sources examine distinct but connected parts of the conflict-prevention subliterature: "
+            "early warning, regional capacity, and timely diplomatic engagement."
+        ),
+        "source_ids": [row["source_id"] for row in rows],
+        "source_roles": {row["source_id"]: "core" for row in rows},
+        "supporting_evidence": evidence,
+        "propositions": [],
+        "family_relations": [],
+    }
+
+    mapped = map_overlapping_clusters(rows, proposals=[proposal], propositions=[])
+
+    assert len(mapped["clusters"]) == 1
+    cluster = mapped["clusters"][0]
+    assert cluster["label"] == "Conflict Prevention and Preventive Diplomacy"
+    assert cluster["qualification_status"] == "source_backed_cluster"
+    assert cluster["propositions"] == []
+    assert cluster["family_relations"][0]["relation_type"] == "shared_research_problem"
+    matrix = build_evidence_matrices(rows, [cluster])[0]
+    assert matrix["exact_proposition_gate_passed"] is False
+    assert matrix["admission_passed"] is True
+
+
+def test_partial_provider_relation_does_not_split_a_supported_thematic_cluster() -> (
+    None
+):
+    rows = normalize_evidence_profiles(
+        [
+            _profile(
+                "early-warning",
+                topic="conflict prevention",
+                claim="Early warning directs preventive diplomacy before escalation.",
+            ),
+            _profile(
+                "regional",
+                topic="conflict prevention",
+                claim="Regional organizations contribute access to conflict prevention.",
+            ),
+            _profile(
+                "envoy",
+                topic="preventive diplomacy",
+                claim="Timely envoy engagement can help interrupt escalation.",
+            ),
+        ]
+    )
+    evidence = [_reference(row) for row in rows]
+    proposal = {
+        "proposal_id": "proposal-conflict-prevention",
+        "label": "Conflict Prevention and Preventive Diplomacy",
+        "semantic_identity": "conflict prevention preventive diplomacy",
+        "shared_question": "How does preventive diplomacy try to stop conflict escalation?",
+        "bounded_object": "conflict prevention and preventive diplomacy",
+        "coherence_rationale": "The located findings address distinct parts of one bounded subliterature.",
+        "source_ids": [row["source_id"] for row in rows],
+        "source_roles": {row["source_id"]: "core" for row in rows},
+        "supporting_evidence": evidence,
+        "propositions": [],
+        # The reasoner noticed one useful pair but did not redundantly repeat
+        # the collection-wide thematic relation. Admission must still use the
+        # complete, locator-backed membership evidence supplied above.
+        "family_relations": [
+            {
+                "relation_type": "shared_research_problem",
+                "source_ids": [rows[0]["source_id"], rows[1]["source_id"]],
+                "rationale": "Both sources examine preventive action before escalation.",
+                "evidence": evidence[:2],
+                "comparability": {},
+            }
+        ],
+    }
+
+    mapped = map_overlapping_clusters(rows, proposals=[proposal], propositions=[])
+
+    assert len(mapped["clusters"]) == 1
+    cluster = mapped["clusters"][0]
+    assert cluster["label"] == "Conflict Prevention and Preventive Diplomacy"
+    assert cluster["core_source_ids"] == sorted(row["source_id"] for row in rows)
+    assert any(
+        relation["relation_type"] == "shared_research_problem"
+        and set(relation["source_ids"]) == set(cluster["core_source_ids"])
+        for relation in cluster["family_relations"]
+    )
 
 
 def _manual_proposition(proposition_id: str, source_ids: list[str]) -> dict[str, Any]:
@@ -472,6 +591,44 @@ def test_disconnected_provider_proposal_splits_only_on_validated_relation_compon
     assert action["action"] == "split_disconnected_components"
     assert len(action["admitted_components"]) == 2
     assert action["discarded_source_ids"] == []
+
+
+def test_locator_backed_provider_member_demotes_to_context_instead_of_disappearing() -> (
+    None
+):
+    rows = normalize_evidence_profiles(
+        [_profile(source_id) for source_id in ("a", "b", "context", "unrelated")]
+    )
+    proposition = _manual_proposition("proposition-durability", ["a", "b"])
+    proposal = {
+        "proposal_id": "proposal-with-contextual-publication",
+        "label": "Ceasefire durability",
+        "semantic_identity": "ceasefire durability",
+        "shared_question": "What shapes ceasefire durability?",
+        "bounded_object": "ceasefire durability",
+        "source_ids": ["a", "b", "context", "unrelated"],
+        "source_roles": {
+            source_id: "core" for source_id in ("a", "b", "context", "unrelated")
+        },
+        "supporting_evidence": [_reference(rows[2])],
+        "propositions": [proposition],
+    }
+
+    mapped = map_overlapping_clusters(
+        rows,
+        proposals=[proposal],
+        propositions=[proposition],
+    )
+
+    assert len(mapped["clusters"]) == 1
+    cluster = mapped["clusters"][0]
+    assert cluster["core_source_ids"] == ["a", "b"]
+    assert cluster["context_source_ids"] == ["context"]
+    assert "unrelated" not in cluster["source_ids"]
+    assert any(
+        row["source_id"] == "unrelated"
+        for row in mapped["unclustered_sources"]
+    )
 
 
 def test_duplicate_connected_components_do_not_consume_multiple_cluster_memberships() -> (
@@ -1507,7 +1664,8 @@ def test_causal_synthesis_is_rejected_without_causal_or_mechanism_anchors() -> N
     validated = validate_cluster_synthesis(proposed, cluster, profiles)
 
     assert validated["central_findings"] == []
-    assert validated["synthesis"] == ""
+    assert "Women participation causes durable ceasefires" not in validated["synthesis"]
+    assert "findings remain source-specific" in validated["synthesis"]
     assert validated["status"] == "deterministic_fallback"
     assert (
         validated["rejected_assertions"][0]["reason"]
@@ -1573,8 +1731,8 @@ def test_cluster_synthesis_counts_admitted_section_evidence_missing_from_top_sum
         {
             "cluster_id": cluster["cluster_id"],
             "synthesis": (
-                "The mapped sources report the same relationship across two independent study families, so the "
-                "collection supports a bounded consensus about the proposition. Both sources contribute directly to "
+                "The mapped sources report the same relationship across two study families, so the "
+                "collection supports a bounded recurring pattern for the proposition. Both sources contribute directly to "
                 "that comparison, although their evidence remains associational and should not be read as a causal "
                 "estimate. The verdict is therefore a shared empirical pattern within the mapped settings, with scope "
                 "and measurement limits that should be preserved in any downstream use."
@@ -1582,13 +1740,13 @@ def test_cluster_synthesis_counts_admitted_section_evidence_missing_from_top_sum
             "boundaries": [
                 "The comparison is limited to the two mapped study settings."
             ],
-            "debate_state": "mapped_consensus",
+            "debate_state": "emerging_convergence",
             "supporting_evidence": [evidence[0]],
             "central_findings": [
                 {
                     "finding": (
                         "The mapped sources report the same bounded association between participation and "
-                        "ceasefire durability across two independent evidence bases. In plain English, both "
+                        "ceasefire durability across two mapped evidence bases. In plain English, both "
                         "sources observe that greater participation accompanies more durable ceasefires, but "
                         "neither establishes causation. The comparison remains limited to their mapped settings "
                         "and outcome measures. This makes the repeated pattern useful for orienting the debate, "
@@ -1638,6 +1796,133 @@ def test_cluster_synthesis_with_a_thin_validated_assertion_is_partial() -> None:
     assert "verdict_too_thin" in validated["quality_errors"]
 
 
+def test_evidence_thread_uses_substantive_summary_not_machine_relationship() -> None:
+    row = {
+        "relationship": "complementary",
+        "summary": "The studies explain different parts of the same bounded research problem.",
+    }
+    assert _cluster_item_text(row) == row["summary"]
+    assert _human_projection_text(
+        "Kane2022 and Jenne2017 reach related conclusions."
+    ) == ("Kane (2022) and Jenne (2017) reach related conclusions.")
+
+
+def test_source_specific_thematic_threads_survive_without_proposition_lineage() -> None:
+    raw_profiles = [
+        _profile(
+            "a",
+            topic="preventive diplomacy",
+            claim="Preventive diplomacy improves conflict prevention through early-warning institutions.",
+        ),
+        _profile(
+            "b",
+            topic="preventive diplomacy",
+            claim="Source B documents envoy practices used before escalation.",
+        ),
+    ]
+    for raw in raw_profiles:
+        second = deepcopy(raw["evidence_anchors"][0])
+        second["evidence_anchor_id"] = f"anchor-{raw['source_id']}-second"
+        second["claim"] = (
+            "Source A documents how early-warning institutions organize information before escalation."
+            if raw["source_id"] == "a"
+            else "Source B describes how envoys engage parties before escalation and records institutional limits."
+        )
+        second["locator"] = "p. 22"
+        raw["evidence_anchors"].append(second)
+    profiles = normalize_evidence_profiles(raw_profiles)
+    first_evidence = [_reference(profile) for profile in profiles]
+    second_evidence = [
+        {
+            "source_id": profile["source_id"],
+            "claim_id": next(
+                anchor["claim_id"]
+                for anchor in profile["claims"]
+                if anchor["locator"] == "p. 22"
+            ),
+            "locator": "p. 22",
+        }
+        for profile in profiles
+    ]
+    cluster = {
+        "cluster_id": "cluster-preventive-diplomacy",
+        "label": "Conflict Prevention and Preventive Diplomacy",
+        "semantic_identity": "conflict prevention preventive diplomacy",
+        "shared_question": "How does preventive diplomacy try to interrupt escalation?",
+        "bounded_object": "conflict prevention and preventive diplomacy",
+        "source_ids": ["a", "b"],
+        "core_source_ids": ["a", "b"],
+        "source_roles": [
+            {"source_id": "a", "role": "core"},
+            {"source_id": "b", "role": "core"},
+        ],
+        "propositions": [],
+        "proposition_ids": [],
+        "family_relations": [
+            {
+                "relation_type": "shared_research_problem",
+                "source_ids": ["a", "b"],
+                "evidence": first_evidence,
+            }
+        ],
+    }
+    validated = validate_cluster_synthesis(
+        {
+            "cluster_id": cluster["cluster_id"],
+            "boundaries": ["The collection contains two differently designed sources."],
+            "debate_state": "no_debate",
+            "evidence_threads": [
+                {
+                    "thread_id": "thread-a",
+                    "title": "Early-warning institutions",
+                    "summary": (
+                        "Source A documents how early-warning institutions organize information before escalation. "
+                        "Its contribution is descriptive and identifies a practical institutional pathway rather than testing whether the pathway causes prevention."
+                    ),
+                    "plain_english_meaning": "It shows what one part of preventive diplomacy looks like in practice.",
+                    "relationship": "source_specific",
+                    "source_ids": ["a"],
+                    "evidence": [second_evidence[0]],
+                },
+                {
+                    "thread_id": "thread-b",
+                    "title": "Envoy practice",
+                    "summary": (
+                        "Source B describes how envoys engage parties before escalation and records the limits they encounter. "
+                        "It adds a second practical part of the literature without claiming that its observations confirm Source A."
+                    ),
+                    "plain_english_meaning": "It explains what diplomats do and where that approach can run into trouble.",
+                    "relationship": "source_specific",
+                    "source_ids": ["b"],
+                    "evidence": [second_evidence[1]],
+                },
+            ],
+        },
+        cluster,
+        profiles,
+    )
+
+    assert validated["status"] == "reasoned"
+    assert len(validated["evidence_threads"]) == 3
+    assert any(
+        row.get("origin") == "deterministic_source_contribution_map"
+        for row in validated["evidence_threads"]
+    )
+    assert {row["source_id"] for row in validated["source_contributions"]} == {
+        "a",
+        "b",
+    }
+    causal_contributions = [
+        row for row in validated["source_contributions"] if "improves" in row["finding"]
+    ]
+    assert causal_contributions
+    assert all(
+        row["finding"].startswith("The cited sources report that")
+        and "does not by itself establish causation" in row["finding"]
+        for row in causal_contributions
+    )
+
+
 def test_emerging_convergence_rejects_mature_consensus_language() -> None:
     profiles = normalize_evidence_profiles([_profile("a"), _profile("b")])
     cluster = map_overlapping_clusters(profiles)["clusters"][0]
@@ -1672,7 +1957,7 @@ def test_emerging_convergence_rejects_mature_consensus_language() -> None:
             )
 
             assert validated[section] == []
-            assert validated["synthesis"] == ""
+            assert "findings remain source-specific" in validated["synthesis"]
             assert any(
                 row["reason"] == "consensus_strength_language_without_mature_consensus"
                 for row in validated["rejected_assertions"]
@@ -1692,6 +1977,24 @@ def test_associational_verdict_language_is_not_erased_as_causal() -> None:
         )
         is True
     )
+
+
+@pytest.mark.parametrize(
+    "statement",
+    (
+        "Study A reports an association, while study B proves mediation causes peace.",
+        "The evidence does not establish causality, but mediator pressure increases settlement durability.",
+        "Mediation is associated with talks and causes durable peace.",
+    ),
+)
+def test_causal_qualification_is_scoped_to_the_clause_it_governs(
+    statement: str,
+) -> None:
+    assert literature._has_unqualified_causal_language(statement) is True
+    narrowed = literature._narrow_noncausal_organizational_language(statement)
+    assert narrowed.startswith("The cited sources report that")
+    assert "does not by itself establish causation" in narrowed
+    assert literature._has_unqualified_causal_language(narrowed) is False
 
 
 def test_attributed_findings_and_statistical_effect_terms_are_not_causal_overclaims() -> (
@@ -2251,8 +2554,8 @@ def test_human_markdown_omits_empty_audit_and_raw_id_text_while_linking_sources_
         assert "source-raw-a" not in visible
         assert "gap-raw-ceasefire" not in visible
         assert "cluster-raw-ceasefire" not in visible
-    assert "## Findings and interpretation" not in cluster_text
-    assert "## Why findings differ" not in cluster_text
+    assert "## What the studies find" not in cluster_text
+    assert "## Limits of the evidence" not in cluster_text
 
 
 def test_partial_cluster_renders_a_question_without_claiming_a_verdict() -> None:
@@ -2276,8 +2579,8 @@ def test_partial_cluster_renders_a_question_without_claiming_a_verdict() -> None
         synthesis={"status": "partial", "synthesis": ""},
     )
 
-    assert "## Cluster question" in text
-    assert "## Question and verdict" not in text
+    assert "## Question and answer" in text
+    assert "A complete evidence-grounded synthesis has not yet passed" in text
 
 
 def test_deterministic_cluster_renders_a_bounded_verdict_without_claiming_consensus() -> (
@@ -2310,10 +2613,9 @@ def test_deterministic_cluster_renders_a_bounded_verdict_without_claiming_consen
         synthesis={"status": "deterministic_fallback", "synthesis": ""},
     )
 
-    assert "## Question and bounded verdict" in text
-    assert "strongest validated relationship is **within program consistency**" in text
-    assert "does not support a stronger cross-source conclusion" in text
-    assert "## Question and verdict" not in text
+    assert "## Question and answer" in text
+    assert "A complete evidence-grounded synthesis has not yet passed" in text
+    assert "same research program" in text
 
 
 def test_ceasefire_mapping_rejects_broad_inclusion_and_irrelevant_metadata_conflation() -> (
@@ -2576,11 +2878,50 @@ def test_strict_consensus_and_contradiction_failures_are_explained_in_cluster_ma
         synthesis={},
         profile_by_source={row["source_id"]: row for row in rows},
     )
-    assert "## Strict claim checks" in markdown
-    assert "### Consensus: not established" in markdown
-    assert "### Contradiction: not established" in markdown
-    assert "Requirements met" in markdown
-    assert "Requirements not met" in markdown
+    assert "## Where the evidence agrees, differs, or remains uncertain" in markdown
+    assert "literature-cluster/" in markdown
+    assert "**Strong consensus" in markdown
+    assert "is not established:**" in markdown
+    assert "**A direct contradiction" in markdown
+    assert "strong consensus requires at least three" in markdown
+    assert "genuinely opposite conclusions" in markdown
+    assert "What would change that assessment" not in markdown
+
+
+def test_conference_opinion_reports_map_as_guidance_not_effectiveness_evidence() -> None:
+    rows = []
+    for source_id in ("conference-a", "conference-b"):
+        raw = _profile(
+            source_id,
+            empirical_role="descriptive",
+            source_role="conference_summary",
+        )
+        raw["methods"] = ["Conference report without a research design"]
+        raw["evidence_anchors"][0]["support_envelope"]["restrictions"] = [
+            "Panelist opinions, not empirical evidence.",
+            "No original research data or methodology.",
+        ]
+        rows.append(normalize_evidence_profiles([raw])[0])
+
+    proposition = {
+        "effective_evidence_base_count": 2,
+        "cells": {
+            row["source_id"]: {
+                "source_id": row["source_id"],
+                "evidence_type": [row["claims"][0]["evidence_role"]],
+                "stance_or_finding": row["claims"][0]["text"],
+                "direction_or_interpretation": ["positive"],
+            }
+            for row in rows
+        },
+    }
+
+    assert all(
+        row["claims"][0]["evidence_role"] == "practitioner_guidance" for row in rows
+    )
+    assert _proposition_debate_state(proposition)[0] == (
+        "aligned_institutional_guidance"
+    )
 
 
 def test_strict_contradiction_reports_opposition_separately_from_independence() -> None:
@@ -2712,5 +3053,6 @@ def test_gap_markdown_explains_why_a_visible_lead_is_not_a_strong_gap() -> None:
 
     assert "## Strong-gap threshold" in markdown
     assert "**Decision:** not established" in markdown
-    assert "Requirements met" in markdown
+    assert "Requirements met" not in markdown
+    assert "Requirements not met" in markdown
     assert "Only one independent evidence base is located" in markdown

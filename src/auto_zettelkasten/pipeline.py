@@ -51,7 +51,13 @@ from .literature import (
     stable_literature_map_id,
 )
 from .migration import migrate_workspace, review_hash_aliases
-from .models import ArtifactManifest, LiteratureMapRequest, MapRequest, ProcessingPolicy, RunReport
+from .models import (
+    ArtifactManifest,
+    LiteratureMapRequest,
+    MapRequest,
+    ProcessingPolicy,
+    RunReport,
+)
 from .notes import (
     item_data,
     item_key,
@@ -67,12 +73,21 @@ from .notes import (
     write_atomic_note,
     write_limited_note,
 )
-from .ports import ControllerPort, ExternalDiscoveryProvider, LiteratureReasoner, ReaderProvider, VisionProvider, ZoteroClient
+from .ports import (
+    ControllerPort,
+    ExternalDiscoveryProvider,
+    LiteratureReasoner,
+    ReaderProvider,
+    VisionProvider,
+    ZoteroClient,
+)
 from .profiles import (
     COMMITTED_NOTE_ANCHOR_AUGMENTATION_VERSION,
     PROFILE_ALGORITHM_VERSION,
     PROFILE_CLASSIFIER_VERSION,
     PROFILE_PROMPT_VERSION,
+    ProfileContractError,
+    ProfileParseError,
     augment_profile_from_committed_note,
     build_evidence_profile,
     load_profile_checkpoint,
@@ -85,11 +100,35 @@ from .profiles import (
     write_profile_checkpoint,
 )
 from .readers import SECTION_KEYS, provider_from_name
-from .workspace import artifact_rows, assert_compatible, initialize, resolve_workspace, run_directory, validate_opaque_id
+from .workspace import (
+    artifact_rows,
+    assert_compatible,
+    initialize,
+    resolve_workspace,
+    run_directory,
+    validate_opaque_id,
+)
 from .zotero import ZoteroLocalClient
 
 CHUNKING_VERSION = "2"
-CONTENT_CLASSIFIER_VERSION = "2"
+CONTENT_CLASSIFIER_VERSION = "3"
+
+
+def _analytical_profile_source_ids(profiles: Sequence[Any]) -> set[str]:
+    source_ids: set[str] = set()
+    for profile in profiles:
+        row = dict(profile) if isinstance(profile, Mapping) else profile_to_dict(profile)
+        context = row.get("context") if isinstance(row.get("context"), Mapping) else {}
+        analytical = row.get("analytical")
+        if analytical is None:
+            analytical = bool(
+                not row.get("excluded_from_synthesis", False)
+                and str(context.get("note_status") or "")
+                == "analytical_atomic_note"
+            )
+        if analytical and row.get("source_id"):
+            source_ids.add(str(row["source_id"]))
+    return source_ids
 
 
 class DocumentPartialError(RuntimeError):
@@ -102,7 +141,9 @@ class DocumentPartialError(RuntimeError):
 
 class DocumentCoverageLimitError(RuntimeError):
     def __init__(self, total_chunks: int, maximum_chunks: int) -> None:
-        super().__init__(f"document requires {total_chunks} chunks; maximum is {maximum_chunks}")
+        super().__init__(
+            f"document requires {total_chunks} chunks; maximum is {maximum_chunks}"
+        )
         self.total_chunks = total_chunks
         self.maximum_chunks = maximum_chunks
 
@@ -122,13 +163,19 @@ class _RunProgress:
         self.run_id = run_id
         self._lock = threading.Lock()
         previous = read_yaml(path, {}) or {} if resume else {}
-        previous_items = previous.get("items", {}) if isinstance(previous.get("items", {}), Mapping) else {}
+        previous_items = (
+            previous.get("items", {})
+            if isinstance(previous.get("items", {}), Mapping)
+            else {}
+        )
         self.stage = str(previous.get("stage") or "preflight")
         prior_timestamps = previous.get("stage_timestamps", {})
         if not isinstance(prior_timestamps, Mapping):
             prior_timestamps = {}
         self.stage_timestamps: dict[str, dict[str, str]] = {
-            str(key): dict(value) for key, value in prior_timestamps.items() if isinstance(value, Mapping)
+            str(key): dict(value)
+            for key, value in prior_timestamps.items()
+            if isinstance(value, Mapping)
         }
         self.literature: dict[str, Any] = {
             "profile_count": 0,
@@ -170,7 +217,11 @@ class _RunProgress:
             "provider_call_count": 0,
             "literature_failure_count": 0,
             "internal_falsification_count": 0,
-            **(dict(previous.get("literature", {})) if isinstance(previous.get("literature", {}), Mapping) else {}),
+            **(
+                dict(previous.get("literature", {}))
+                if isinstance(previous.get("literature", {}), Mapping)
+                else {}
+            ),
         }
         # Literature counters describe the current invocation. A resume starts
         # from its frozen items/checkpoints but must not display stale counts
@@ -217,11 +268,33 @@ class _RunProgress:
             literature_failure_count=0,
             internal_falsification_count=0,
         )
+        # Source-item accounting is derived from ``self.items``. Older progress
+        # files could also persist those keys inside the literature payload;
+        # spreading that payload at the top level then replaced the live truth
+        # with stale counts from a prior invocation.
+        for source_count_key in (
+            "inventory_count",
+            "validated_note_count",
+            "limited_note_count",
+            "exhausted_count",
+            "partial_count",
+            "pending_count",
+            "active_count",
+            "terminal_count",
+        ):
+            self.literature.pop(source_count_key, None)
         self.items: dict[str, dict[str, Any]] = {}
         for index, item in enumerate(items):
             key = item_key(item)
-            prior = previous_items.get(str(index), {}) if isinstance(previous_items, Mapping) else {}
-            if not isinstance(prior, Mapping) or str(prior.get("zotero_item_key", "")) != key:
+            prior = (
+                previous_items.get(str(index), {})
+                if isinstance(previous_items, Mapping)
+                else {}
+            )
+            if (
+                not isinstance(prior, Mapping)
+                or str(prior.get("zotero_item_key", "")) != key
+            ):
                 prior = {}
             terminal_status = str(item.get("terminal_status") or "")
             default_phase = (
@@ -246,46 +319,64 @@ class _RunProgress:
 
     def update(self, index: int, **values: Any) -> None:
         with self._lock:
-            row = self.items.setdefault(str(index), {"inventory_index": index, "status": "pending"})
+            row = self.items.setdefault(
+                str(index), {"inventory_index": index, "status": "pending"}
+            )
             row.update(values)
             self._write()
 
     def finish(self, status: str) -> None:
         with self._lock:
             self._status = status
-            self.stage_timestamps.setdefault(self.stage, {}).setdefault("completed_at", now_iso())
+            self.stage_timestamps.setdefault(self.stage, {}).setdefault(
+                "completed_at", now_iso()
+            )
             self._write()
 
     def set_stage(self, stage: str, **literature_values: Any) -> None:
         with self._lock:
             timestamp = now_iso()
             if stage != self.stage:
-                self.stage_timestamps.setdefault(self.stage, {}).setdefault("completed_at", timestamp)
+                self.stage_timestamps.setdefault(self.stage, {}).setdefault(
+                    "completed_at", timestamp
+                )
                 self.stage = stage
-                self.stage_timestamps.setdefault(stage, {}).setdefault("started_at", timestamp)
+                self.stage_timestamps.setdefault(stage, {}).setdefault(
+                    "started_at", timestamp
+                )
             if "synthesis_call_count" in literature_values:
-                prior_synthesis = int(self.literature.get("synthesis_call_count", 0) or 0)
+                prior_synthesis = int(
+                    self.literature.get("synthesis_call_count", 0) or 0
+                )
                 profile_calls = max(
                     0,
-                    int(self.literature.get("literature_provider_call_count", 0) or 0) - prior_synthesis,
+                    int(self.literature.get("literature_provider_call_count", 0) or 0)
+                    - prior_synthesis,
                 )
-                literature_values["literature_provider_call_count"] = profile_calls + int(
-                    literature_values.get("synthesis_call_count", 0) or 0
+                literature_values["literature_provider_call_count"] = (
+                    profile_calls
+                    + int(literature_values.get("synthesis_call_count", 0) or 0)
                 )
             if "synthesis_checkpoint_hit_count" in literature_values:
-                prior_synthesis_hits = int(self.literature.get("synthesis_checkpoint_hit_count", 0) or 0)
+                prior_synthesis_hits = int(
+                    self.literature.get("synthesis_checkpoint_hit_count", 0) or 0
+                )
                 profile_hits = max(
                     0,
-                    int(self.literature.get("checkpoint_hit_count", 0) or 0) - prior_synthesis_hits,
+                    int(self.literature.get("checkpoint_hit_count", 0) or 0)
+                    - prior_synthesis_hits,
                 )
                 literature_values["checkpoint_hit_count"] = profile_hits + int(
                     literature_values.get("synthesis_checkpoint_hit_count", 0) or 0
                 )
             if "synthesis_failure_count" in literature_values:
-                prior_synthesis_failures = int(self.literature.get("synthesis_failure_count", 0) or 0)
+                prior_synthesis_failures = int(
+                    self.literature.get("synthesis_failure_count", 0) or 0
+                )
                 profile_failures = max(
                     0,
-                    int(self.literature.get("literature_failure_count", 0) or 0) - prior_synthesis_failures,
+                    int(self.literature.get("literature_failure_count", 0) or 0)
+                    - prior_synthesis_failures,
                 )
                 literature_values["literature_failure_count"] = profile_failures + int(
                     literature_values.get("synthesis_failure_count", 0) or 0
@@ -308,7 +399,9 @@ class _RunProgress:
 
     def _write(self) -> None:
         source_calls = int(self.literature.get("source_provider_call_count", 0) or 0)
-        literature_calls = int(self.literature.get("literature_provider_call_count", 0) or 0)
+        literature_calls = int(
+            self.literature.get("literature_provider_call_count", 0) or 0
+        )
         self.literature["provider_call_count"] = source_calls + literature_calls
         statuses = [str(row.get("status", "pending")) for row in self.items.values()]
         counts = {
@@ -322,12 +415,15 @@ class _RunProgress:
                 "active",
             )
         }
-        terminal_count = counts["validated_note"] + counts["limited_note"] + counts["exhausted"]
+        terminal_count = (
+            counts["validated_note"] + counts["limited_note"] + counts["exhausted"]
+        )
         payload = {
             "status": self._status,
             "run_id": self.run_id,
             "stage": self.stage,
             "stage_timestamps": self.stage_timestamps,
+            **self.literature,
             "inventory_count": len(self.items),
             "validated_note_count": counts["validated_note"],
             "limited_note_count": counts["limited_note"],
@@ -337,11 +433,16 @@ class _RunProgress:
             "active_count": counts["active"],
             "terminal_count": terminal_count,
             "active_item_keys": [
-                row.get("zotero_item_key", "") for row in self.items.values() if row.get("status") == "active"
+                row.get("zotero_item_key", "")
+                for row in self.items.values()
+                if row.get("status") == "active"
             ],
-            "completed_chunk_count": sum(int(row.get("completed_chunks", 0) or 0) for row in self.items.values()),
-            "total_chunk_count": sum(int(row.get("total_chunks", 0) or 0) for row in self.items.values()),
-            **self.literature,
+            "completed_chunk_count": sum(
+                int(row.get("completed_chunks", 0) or 0) for row in self.items.values()
+            ),
+            "total_chunk_count": sum(
+                int(row.get("total_chunks", 0) or 0) for row in self.items.values()
+            ),
             "literature": self.literature,
             "items": self.items,
             "updated_at": now_iso(),
@@ -388,9 +489,13 @@ def run_pipeline(
     client = client or ZoteroLocalClient()
     controller = controller or LocalController()
     try:
-        reader = reader or provider_from_name(request.provider, request.model, allow_cloud=request.allow_cloud)
+        reader = reader or provider_from_name(
+            request.provider, request.model, allow_cloud=request.allow_cloud
+        )
     except Exception as exc:
-        return _blocked_report(request, run_id, f"reader_configuration:{type(exc).__name__}:{exc}")
+        return _blocked_report(
+            request, run_id, f"reader_configuration:{type(exc).__name__}:{exc}"
+        )
     _apply_reader_policy(reader, request.processing)
     preflight_reason = _reader_preflight_reason(reader, request.allow_cloud)
     if preflight_reason:
@@ -401,15 +506,35 @@ def run_pipeline(
         vision = reader  # type: ignore[assignment]
     discovery_mode = request.literature_policy.external_discovery
     if discovery_mode != "disabled":
-        return _blocked_report(request, run_id, f"external_discovery_disabled_in_standalone_mapper:{discovery_mode}")
+        return _blocked_report(
+            request,
+            run_id,
+            f"external_discovery_disabled_in_standalone_mapper:{discovery_mode}",
+        )
     if external_discovery is not None:
-        return _blocked_report(request, run_id, "external_discovery_provider_not_used_by_standalone_mapper")
-    if external_discovery is not None and bool(getattr(external_discovery, "is_cloud", True)) and not request.allow_cloud:
-        return _blocked_report(request, run_id, "external_discovery_requires_allow_cloud")
-    if literature_reasoner is not None and bool(getattr(literature_reasoner, "is_cloud", True)) and not request.allow_cloud:
-        return _blocked_report(request, run_id, "literature_reasoner_requires_allow_cloud")
+        return _blocked_report(
+            request, run_id, "external_discovery_provider_not_used_by_standalone_mapper"
+        )
+    if (
+        external_discovery is not None
+        and bool(getattr(external_discovery, "is_cloud", True))
+        and not request.allow_cloud
+    ):
+        return _blocked_report(
+            request, run_id, "external_discovery_requires_allow_cloud"
+        )
+    if (
+        literature_reasoner is not None
+        and bool(getattr(literature_reasoner, "is_cloud", True))
+        and not request.allow_cloud
+    ):
+        return _blocked_report(
+            request, run_id, "literature_reasoner_requires_allow_cloud"
+        )
 
-    inventory_path = workspace / "01_custody" / "zotero" / "inventory" / f"{slugify(run_id)}.json"
+    inventory_path = (
+        workspace / "01_custody" / "zotero" / "inventory" / f"{slugify(run_id)}.json"
+    )
     frozen_inventory_path = run_dir / "inventory.json"
     frozen_manifest_path = run_dir / "frozen_inventory.yml"
     effective_collection_key = request.collection_key
@@ -418,41 +543,76 @@ def run_pipeline(
     frozen_source_set_snapshot_id = ""
     if resume and frozen_inventory_path.exists():
         try:
-            frozen_payload = json.loads(frozen_inventory_path.read_text(encoding="utf-8"))
-            if not isinstance(frozen_payload, list) or any(not isinstance(item, Mapping) for item in frozen_payload):
-                raise ValueError("frozen inventory must be a list of Zotero item mappings")
+            frozen_payload = json.loads(
+                frozen_inventory_path.read_text(encoding="utf-8")
+            )
+            if not isinstance(frozen_payload, list) or any(
+                not isinstance(item, Mapping) for item in frozen_payload
+            ):
+                raise ValueError(
+                    "frozen inventory must be a list of Zotero item mappings"
+                )
             items = [dict(item) for item in frozen_payload]
             frozen_manifest = read_yaml(frozen_manifest_path, {}) or {}
             if frozen_manifest and not isinstance(frozen_manifest, Mapping):
                 raise ValueError("frozen inventory manifest must be a mapping")
             expected_hash = str(frozen_manifest.get("inventory_hash") or "")
-            actual_hash = sha256_text(json.dumps(items, sort_keys=True, ensure_ascii=False, default=str))
+            actual_hash = sha256_text(
+                json.dumps(items, sort_keys=True, ensure_ascii=False, default=str)
+            )
             if expected_hash and expected_hash != actual_hash:
                 raise ValueError("frozen inventory hash mismatch")
-            inventory_scope = str(frozen_manifest.get("effective_scope") or inventory_scope)
-            effective_collection_key = str(frozen_manifest.get("effective_collection_key") or effective_collection_key or "") or None
-            effective_collection_name = str(frozen_manifest.get("collection_name") or "").strip()
-            frozen_source_set_snapshot_id = str(frozen_manifest.get("source_set_snapshot_id") or "")
+            inventory_scope = str(
+                frozen_manifest.get("effective_scope") or inventory_scope
+            )
+            effective_collection_key = (
+                str(
+                    frozen_manifest.get("effective_collection_key")
+                    or effective_collection_key
+                    or ""
+                )
+                or None
+            )
+            effective_collection_name = str(
+                frozen_manifest.get("collection_name") or ""
+            ).strip()
+            frozen_source_set_snapshot_id = str(
+                frozen_manifest.get("source_set_snapshot_id") or ""
+            )
             if not frozen_source_set_snapshot_id:
                 previous_report = read_yaml(run_dir / "run_report.yml", {}) or {}
                 if isinstance(previous_report, Mapping):
-                    frozen_source_set_snapshot_id = str(previous_report.get("source_set_id") or "")
+                    frozen_source_set_snapshot_id = str(
+                        previous_report.get("source_set_id") or ""
+                    )
         except Exception as exc:
-            return _blocked_report(request, run_id, f"frozen_inventory:{type(exc).__name__}:{exc}")
+            return _blocked_report(
+                request, run_id, f"frozen_inventory:{type(exc).__name__}:{exc}"
+            )
     else:
         try:
             if request.scope == "selected":
                 selected = client.selected_collection()
                 effective_collection_key = str(selected.get("key") or "")
                 effective_collection_name = str(selected.get("name") or "").strip()
-                inventory_scope = "library" if selected.get("scope") == "library" else "collection"
+                inventory_scope = (
+                    "library" if selected.get("scope") == "library" else "collection"
+                )
                 if inventory_scope == "collection" and not effective_collection_key:
                     raise ValueError("selected collection has no key")
-            items = [dict(item) for item in client.inventory(inventory_scope, effective_collection_key) if isinstance(item, Mapping)]
+            items = [
+                dict(item)
+                for item in client.inventory(inventory_scope, effective_collection_key)
+                if isinstance(item, Mapping)
+            ]
             if effective_collection_key and not effective_collection_name:
-                effective_collection_name = _zotero_collection_name(client, effective_collection_key)
+                effective_collection_name = _zotero_collection_name(
+                    client, effective_collection_key
+                )
         except Exception as exc:
-            return _blocked_report(request, run_id, f"zotero_inventory:{type(exc).__name__}:{exc}")
+            return _blocked_report(
+                request, run_id, f"zotero_inventory:{type(exc).__name__}:{exc}"
+            )
         if request.limit:
             items = items[: request.limit]
         write_json(inventory_path, items)
@@ -466,14 +626,20 @@ def run_pipeline(
                 "effective_collection_key": effective_collection_key or "",
                 "collection_name": effective_collection_name,
                 "inventory_count": len(items),
-                "inventory_hash": sha256_text(json.dumps(items, sort_keys=True, ensure_ascii=False, default=str)),
+                "inventory_hash": sha256_text(
+                    json.dumps(items, sort_keys=True, ensure_ascii=False, default=str)
+                ),
                 "frozen_at": now_iso(),
                 "refresh_requires_new_run": True,
             },
         )
     if effective_collection_key:
         write_yaml(
-            workspace / "01_custody" / "zotero" / "collections" / f"{slugify(effective_collection_key)}.yml",
+            workspace
+            / "01_custody"
+            / "zotero"
+            / "collections"
+            / f"{slugify(effective_collection_key)}.yml",
             {
                 "collection_key": effective_collection_key,
                 "collection_name": effective_collection_name,
@@ -493,7 +659,9 @@ def run_pipeline(
     note_rows: list[dict[str, Any]] = []
     proposals: list[dict[str, Any]] = []
     decisions: list[dict[str, Any]] = []
-    attempt_path = workspace / "01_custody" / "read_attempts" / f"{slugify(run_id)}.jsonl"
+    attempt_path = (
+        workspace / "01_custody" / "read_attempts" / f"{slugify(run_id)}.jsonl"
+    )
     seen_keys: set[str] = set()
     pending: list[tuple[int, dict[str, Any]]] = []
 
@@ -530,7 +698,9 @@ def run_pipeline(
         pending.append((index, item))
 
     workers = max(1, min(request.parallel, len(pending) or 1))
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="auto-zettelkasten") as executor:
+    with ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="auto-zettelkasten"
+    ) as executor:
         future_map = {
             executor.submit(
                 _prepare_item,
@@ -549,7 +719,9 @@ def run_pipeline(
         for future in as_completed(future_map):
             try:
                 commit_result(future.result())
-            except Exception as exc:  # defensive terminal accounting at the worker boundary
+            except (
+                Exception
+            ) as exc:  # defensive terminal accounting at the worker boundary
                 index = future_map[future]
                 commit_result(
                     _exhausted_result(
@@ -578,8 +750,18 @@ def run_pipeline(
     if not frozen_source_set_snapshot_id:
         frozen_source_set_snapshot_id = str(run_source_set["source_set_id"])
     frozen_manifest = read_yaml(frozen_manifest_path, {}) or {}
-    if isinstance(frozen_manifest, Mapping) and frozen_manifest.get("source_set_snapshot_id") != frozen_source_set_snapshot_id:
-        write_yaml(frozen_manifest_path, {**dict(frozen_manifest), "source_set_snapshot_id": frozen_source_set_snapshot_id})
+    if (
+        isinstance(frozen_manifest, Mapping)
+        and frozen_manifest.get("source_set_snapshot_id")
+        != frozen_source_set_snapshot_id
+    ):
+        write_yaml(
+            frozen_manifest_path,
+            {
+                **dict(frozen_manifest),
+                "source_set_snapshot_id": frozen_source_set_snapshot_id,
+            },
+        )
     map_source_set = run_source_set
     progress.set_stage("profiling")
     map_result = rebuild_map(
@@ -600,33 +782,71 @@ def run_pipeline(
     # generated cluster and gap belongs to the run without a second heuristic filter.
     relevant_clusters = list(map_result["cluster_map"]["clusters"])
     relevant_gaps = list(map_result["gap_map"]["gap_candidates"])
-    run_source_set = update_source_set_map(workspace, run_source_set, relevant_clusters, relevant_gaps)
+    run_source_set = update_source_set_map(
+        workspace, run_source_set, relevant_clusters, relevant_gaps
+    )
 
-    debate_payload = read_yaml(workspace / "03_literature_synthesis" / "debate_registry.yml", {}) or {}
-    debate_rows = debate_payload.get("assessments", []) if isinstance(debate_payload, Mapping) else []
+    debate_payload = (
+        read_yaml(workspace / "03_literature_synthesis" / "debate_registry.yml", {})
+        or {}
+    )
+    debate_rows = (
+        debate_payload.get("assessments", [])
+        if isinstance(debate_payload, Mapping)
+        else []
+    )
     if not isinstance(debate_rows, list):
         debate_rows = []
     profile_count = len(map_result.get("profiles", []) or [])
-    unclustered_count = len(map_result["cluster_map"].get("unclustered_sources", []) or [])
+    analytical_source_ids = _analytical_profile_source_ids(
+        map_result.get("profiles", []) or []
+    )
+    unclustered_count = sum(
+        1
+        for row in map_result["cluster_map"].get("unclustered_sources", []) or []
+        if isinstance(row, Mapping)
+        and str(row.get("source_id") or "") in analytical_source_ids
+    )
     cluster_count = len(map_result["cluster_map"].get("clusters", []) or [])
-    topic_neighborhood_count = int(map_result["cluster_map"].get("topic_neighborhood_count", 0) or 0)
+    topic_neighborhood_count = int(
+        map_result["cluster_map"].get("topic_neighborhood_count", 0) or 0
+    )
     navigation_summary = (
         map_result["cluster_map"].get("navigation", {})
         if isinstance(map_result["cluster_map"].get("navigation"), Mapping)
         else {}
     )
-    subject_tag_count = int(navigation_summary.get("promoted_subject_tag_count", 0) or 0)
+    subject_tag_count = int(
+        navigation_summary.get("promoted_subject_tag_count", 0) or 0
+    )
     subject_tag_assignment_count = len(navigation_summary.get("assignments", []) or [])
     typed_relation_count = len(navigation_summary.get("typed_relations", []) or [])
     singleton_facet_count = int(navigation_summary.get("singleton_facet_count", 0) or 0)
     proposition_count = int(map_result["cluster_map"].get("proposition_count", 0) or 0)
     debate_count = sum(
-        1 for row in debate_rows if isinstance(row, Mapping) and row.get("classification") == "mapped_debate"
+        1
+        for row in debate_rows
+        if isinstance(row, Mapping) and row.get("classification") == "mapped_debate"
     )
-    consensus_count = sum(1 for row in debate_rows if isinstance(row, Mapping) and row.get("classification") == "mapped_consensus")
-    mixed_evidence_count = sum(1 for row in debate_rows if isinstance(row, Mapping) and row.get("classification") == "mixed_evidence")
-    search_payload = read_yaml(workspace / "03_literature_synthesis" / "internal_search_log.yml", {}) or {}
-    searches = search_payload.get("searches", []) if isinstance(search_payload, Mapping) else []
+    consensus_count = sum(
+        1
+        for row in debate_rows
+        if isinstance(row, Mapping) and row.get("classification") == "mapped_consensus"
+    )
+    mixed_evidence_count = sum(
+        1
+        for row in debate_rows
+        if isinstance(row, Mapping) and row.get("classification") == "mixed_evidence"
+    )
+    search_payload = (
+        read_yaml(workspace / "03_literature_synthesis" / "internal_search_log.yml", {})
+        or {}
+    )
+    searches = (
+        search_payload.get("searches", [])
+        if isinstance(search_payload, Mapping)
+        else []
+    )
     internal_falsification_count = len(searches) if isinstance(searches, list) else 0
     mapped_gap_count = sum(
         1
@@ -638,24 +858,36 @@ def run_pipeline(
         for row in map_result["gap_map"].get("gap_candidates", []) or []
         if row.get("status") == "collection_gap_lead"
     )
-    synthesized_cluster_count = int(map_result["cluster_map"].get("synthesized_cluster_count", 0) or 0)
+    synthesized_cluster_count = int(
+        map_result["cluster_map"].get("synthesized_cluster_count", 0) or 0
+    )
     rejected_underspecified_gap_count = int(
         map_result["gap_map"].get("rejected_underspecified_gap_count", 0) or 0
     )
-    rejected_gap_quality_count = int(map_result["gap_map"].get("rejected_gap_quality_count", 0) or 0)
+    rejected_gap_quality_count = int(
+        map_result["gap_map"].get("rejected_gap_quality_count", 0) or 0
+    )
     merged_gap_count = int(map_result["gap_map"].get("merged_gap_count", 0) or 0)
-    synthesis_call_count = int(map_result["literature_packet"].get("synthesis_call_count", 0) or 0)
+    synthesis_call_count = int(
+        map_result["literature_packet"].get("synthesis_call_count", 0) or 0
+    )
     synthesis_checkpoint_hit_count = int(
         map_result["literature_packet"].get("synthesis_checkpoint_hit_count", 0) or 0
     )
-    synthesis_failure_count = int(map_result["literature_packet"].get("synthesis_failure_count", 0) or 0)
+    synthesis_failure_count = int(
+        map_result["literature_packet"].get("synthesis_failure_count", 0) or 0
+    )
     literature_partial_reason = str(map_result.get("partial_reason") or "")
     literature_summary = {
         "status": "partial" if literature_partial_reason else "completed",
         "stage": "reporting",
         "profile_count": profile_count,
-        "profile_valid_count": int((map_result.get("profile_result", {}) or {}).get("valid_count", 0) or 0),
-        "profile_excluded_count": int((map_result.get("profile_result", {}) or {}).get("excluded_count", 0) or 0),
+        "profile_valid_count": int(
+            (map_result.get("profile_result", {}) or {}).get("valid_count", 0) or 0
+        ),
+        "profile_excluded_count": int(
+            (map_result.get("profile_result", {}) or {}).get("excluded_count", 0) or 0
+        ),
         "unclustered_count": unclustered_count,
         "topic_neighborhood_count": topic_neighborhood_count,
         "subject_tag_count": subject_tag_count,
@@ -707,12 +939,25 @@ def run_pipeline(
         internal_falsification_count=internal_falsification_count,
     )
 
-    validated_count = sum(1 for row in terminal_rows if row.get("terminal_status") == "validated_note")
-    limited_count = sum(1 for row in terminal_rows if row.get("terminal_status") == "limited_note")
-    exhausted_count = sum(1 for row in terminal_rows if row.get("terminal_status") == "exhausted")
-    partial_count = sum(1 for row in terminal_rows if row.get("terminal_status") == "partial")
+    validated_count = sum(
+        1 for row in terminal_rows if row.get("terminal_status") == "validated_note"
+    )
+    limited_count = sum(
+        1 for row in terminal_rows if row.get("terminal_status") == "limited_note"
+    )
+    exhausted_count = sum(
+        1 for row in terminal_rows if row.get("terminal_status") == "exhausted"
+    )
+    partial_count = sum(
+        1 for row in terminal_rows if row.get("terminal_status") == "partial"
+    )
     pending_count = max(0, len(items) - len(terminal_rows))
-    reused_count = sum(1 for row in prepared if row.get("reused") and row.get("terminal_status") in {"validated_note", "limited_note"})
+    reused_count = sum(
+        1
+        for row in prepared
+        if row.get("reused")
+        and row.get("terminal_status") in {"validated_note", "limited_note"}
+    )
     status = (
         "partial"
         if partial_count or pending_count or literature_partial_reason
@@ -720,12 +965,17 @@ def run_pipeline(
     )
     progress.finish(status)
     errors = [
-        {"zotero_item_key": row.get("zotero_item_key", ""), "reason": row.get("reason", "")}
+        {
+            "zotero_item_key": row.get("zotero_item_key", ""),
+            "reason": row.get("reason", ""),
+        }
         for row in terminal_rows
         if row.get("terminal_status") in {"exhausted", "partial"}
     ]
     if literature_partial_reason:
-        errors.append({"stage": "literature_mapping", "reason": literature_partial_reason})
+        errors.append(
+            {"stage": "literature_mapping", "reason": literature_partial_reason}
+        )
     created_paths = [
         inventory_path,
         run_dir / "inventory.json",
@@ -738,7 +988,11 @@ def run_pipeline(
         Path(tag_report["proposal_path"]),
         Path(tag_report["registry_path"]),
         *map_result["paths"],
-        *[workspace / str(row["note_path"]) for row in terminal_rows if row.get("note_path")],
+        *[
+            workspace / str(row["note_path"])
+            for row in terminal_rows
+            if row.get("note_path")
+        ],
     ]
     manifest = ArtifactManifest(
         status="built",
@@ -801,11 +1055,19 @@ def run_pipeline(
         synthesis_call_count=synthesis_call_count,
         synthesis_checkpoint_hit_count=synthesis_checkpoint_hit_count,
         synthesis_failure_count=synthesis_failure_count,
-        checkpoint_hit_count=int(progress.literature.get("checkpoint_hit_count", 0) or 0),
-        source_provider_call_count=int(progress.literature.get("source_provider_call_count", 0) or 0),
-        literature_provider_call_count=int(progress.literature.get("literature_provider_call_count", 0) or 0),
+        checkpoint_hit_count=int(
+            progress.literature.get("checkpoint_hit_count", 0) or 0
+        ),
+        source_provider_call_count=int(
+            progress.literature.get("source_provider_call_count", 0) or 0
+        ),
+        literature_provider_call_count=int(
+            progress.literature.get("literature_provider_call_count", 0) or 0
+        ),
         provider_call_count=int(progress.literature.get("provider_call_count", 0) or 0),
-        literature_failure_count=int(progress.literature.get("literature_failure_count", 0) or 0),
+        literature_failure_count=int(
+            progress.literature.get("literature_failure_count", 0) or 0
+        ),
         internal_falsification_count=internal_falsification_count,
         artifact_manifest=manifest,
     )
@@ -833,27 +1095,46 @@ def _finalize_prepared_row(
     controller: ControllerPort,
     row: dict[str, Any],
     attempt_path: Path,
-) -> tuple[dict[str, Any], dict[str, Any] | None, list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[
+    dict[str, Any], dict[str, Any] | None, list[dict[str, Any]], list[dict[str, Any]]
+]:
     for attempt in row.pop("attempts", []):
         append_jsonl(attempt_path, attempt)
     if row.get("reused") and row.get("note_path"):
-        return _public_terminal_row(row), _note_summary_from_path(workspace, row), [], []
+        return (
+            _public_terminal_row(row),
+            _note_summary_from_path(workspace, row),
+            [],
+            [],
+        )
     has_note_content = bool(row.get("analysis") or row.get("limited_analysis"))
     if not has_note_content:
         return _public_terminal_row(row), None, [], []
 
-    proposals = [dict(value) for value in propose_tags(row["item"], str(row["note_id"]))]
+    proposals = [
+        dict(value) for value in propose_tags(row["item"], str(row["note_id"]))
+    ]
     decisions = _review_tags(controller, proposals)
     normalized_tags = accepted_tags_by_note(decisions).get(str(row["note_id"]), [])
     frontmatter = _frontmatter(row, request, normalized_tags)
-    route = "limited_note_commit" if row.get("limited_analysis") else "atomic_note_commit"
+    route = (
+        "limited_note_commit" if row.get("limited_analysis") else "atomic_note_commit"
+    )
     try:
         if row.get("limited_analysis"):
-            path, validation = write_limited_note(workspace, frontmatter, row["limited_analysis"])
+            path, validation = write_limited_note(
+                workspace, frontmatter, row["limited_analysis"]
+            )
         else:
-            path, validation = write_atomic_note(workspace, frontmatter, row["analysis"])
+            path, validation = write_atomic_note(
+                workspace, frontmatter, row["analysis"]
+            )
     except Exception as exc:
-        row.update(terminal_status="exhausted", reason=f"{route}_failed:{type(exc).__name__}:{exc}", note_path="")
+        row.update(
+            terminal_status="exhausted",
+            reason=f"{route}_failed:{type(exc).__name__}:{exc}",
+            note_path="",
+        )
         append_jsonl(attempt_path, _attempt(row, route, "failed", row["reason"]))
         decisions = _park_note_decisions(decisions)
         commit_tag_reviews(workspace, proposals, decisions)
@@ -864,28 +1145,49 @@ def _finalize_prepared_row(
             reason=f"{route}_validation_failed:" + ",".join(validation.errors),
             note_path="",
         )
-        append_jsonl(attempt_path, _attempt(row, route, "failed", row["reason"], output_path=str(path)))
+        append_jsonl(
+            attempt_path,
+            _attempt(row, route, "failed", row["reason"], output_path=str(path)),
+        )
         decisions = _park_note_decisions(decisions)
         commit_tag_reviews(workspace, proposals, decisions)
         return _public_terminal_row(row), None, proposals, decisions
 
     relative_path = str(path.relative_to(workspace))
-    terminal_status = "limited_note" if row.get("limited_analysis") else "validated_note"
+    terminal_status = (
+        "limited_note" if row.get("limited_analysis") else "validated_note"
+    )
     row.update(terminal_status=terminal_status, note_path=relative_path)
     _write_fingerprint(workspace, row, relative_path)
-    append_jsonl(attempt_path, _attempt(row, route, "succeeded", "note_committed", output_path=str(path)))
+    append_jsonl(
+        attempt_path,
+        _attempt(row, route, "succeeded", "note_committed", output_path=str(path)),
+    )
     commit_tag_reviews(workspace, proposals, decisions)
-    return _public_terminal_row(row), _note_summary_from_path(workspace, row), proposals, decisions
+    return (
+        _public_terminal_row(row),
+        _note_summary_from_path(workspace, row),
+        proposals,
+        decisions,
+    )
 
 
-def _park_note_decisions(decisions: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+def _park_note_decisions(
+    decisions: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
     return [
-        {**dict(row), "decision": "parked", "decision_reason": "source_note_not_committed"}
+        {
+            **dict(row),
+            "decision": "parked",
+            "decision_reason": "source_note_not_committed",
+        }
         for row in decisions
     ]
 
 
-def _write_fingerprint(workspace: Path, row: Mapping[str, Any], relative_path: str) -> None:
+def _write_fingerprint(
+    workspace: Path, row: Mapping[str, Any], relative_path: str
+) -> None:
     fingerprint = str(row.get("fingerprint") or "")
     if not fingerprint:
         return
@@ -900,6 +1202,7 @@ def _write_fingerprint(workspace: Path, row: Mapping[str, Any], relative_path: s
             "source_scope": row.get("source_scope", ""),
             "note_path": relative_path,
             "content_hash": row.get("content_hash", ""),
+            "metadata_hash": _prompt_metadata_hash(row.get("item", {})),
             "engine_version": ENGINE_VERSION,
             "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
             "updated_at": now_iso(),
@@ -907,7 +1210,9 @@ def _write_fingerprint(workspace: Path, row: Mapping[str, Any], relative_path: s
     )
 
 
-def _existing_source_set_paths(workspace: Path, source_set: Mapping[str, Any]) -> list[Path]:
+def _existing_source_set_paths(
+    workspace: Path, source_set: Mapping[str, Any]
+) -> list[Path]:
     candidates = [
         source_set.get("path"),
         source_set.get("latest_path"),
@@ -926,7 +1231,11 @@ def _existing_source_set_paths(workspace: Path, source_set: Mapping[str, Any]) -
         if source_set.get("source_set_alias")
         else None,
     ]
-    return list(dict.fromkeys(Path(value) for value in candidates if value and Path(value).is_file()))
+    return list(
+        dict.fromkeys(
+            Path(value) for value in candidates if value and Path(value).is_file()
+        )
+    )
 
 
 def rebuild_map(
@@ -944,8 +1253,12 @@ def rebuild_map(
     progress: _RunProgress | None = None,
     resume: bool = False,
 ) -> dict[str, Any]:
-    del external_discovery  # Auto-Zettelkasten 0.4 maps only the frozen internal collection.
-    effective_request = request or MapRequest(workspace=workspace, provider="ollama", model="deterministic-v1")
+    del (
+        external_discovery
+    )  # Auto-Zettelkasten 0.4 maps only the frozen internal collection.
+    effective_request = request or MapRequest(
+        workspace=workspace, provider="ollama", model="deterministic-v1"
+    )
     if not effective_request.literature_policy.synthesis_enabled:
         relations = build_typed_source_relations(
             note_rows,
@@ -953,7 +1266,9 @@ def rebuild_map(
         )
         typed = {
             "path": str(workspace / "02_source_memory" / "indexes" / "typed_links.yml"),
-            "compatibility_path": str(workspace / "02_source_memory" / "indexes" / "typed_note_links.yml"),
+            "compatibility_path": str(
+                workspace / "02_source_memory" / "indexes" / "typed_note_links.yml"
+            ),
             "links": relations,
             "link_count": len(relations),
         }
@@ -1020,8 +1335,12 @@ def rebuild_map(
         reason = f"literature_profiling_partial:{type(exc).__name__}:{exc}"
         if progress is not None:
             progress.update_literature(literature_failure_count=1)
-        checkpoint_paths = sorted((run_directory(workspace, run_id) / "literature").rglob("*.yml"))
-        profile_paths = sorted((workspace / "02_source_memory" / "profiles").glob("*.yml"))
+        checkpoint_paths = sorted(
+            (run_directory(workspace, run_id) / "literature").rglob("*.yml")
+        )
+        profile_paths = sorted(
+            (workspace / "02_source_memory" / "profiles").glob("*.yml")
+        )
         return {
             "source_set": dict(source_set),
             "cluster_map": {
@@ -1058,7 +1377,9 @@ def rebuild_map(
         )
     typed = {
         "path": str(workspace / "02_source_memory" / "indexes" / "typed_links.yml"),
-        "compatibility_path": str(workspace / "02_source_memory" / "indexes" / "typed_note_links.yml"),
+        "compatibility_path": str(
+            workspace / "02_source_memory" / "indexes" / "typed_note_links.yml"
+        ),
         "links": [],
         "link_count": 0,
     }
@@ -1093,7 +1414,10 @@ def rebuild_map(
             reason = f"{profile_partial_reason};{reason}"
         if progress is not None:
             progress.update_literature(
-                literature_failure_count=int(progress.literature.get("literature_failure_count", 0) or 0) + 1
+                literature_failure_count=int(
+                    progress.literature.get("literature_failure_count", 0) or 0
+                )
+                + 1
             )
         return {
             "source_set": dict(source_set),
@@ -1111,7 +1435,9 @@ def rebuild_map(
             "literature_packet": {"status": "partial", "reason": reason},
             "typed_links": typed,
             "profiles": profiles,
-            "profile_result": {key: value for key, value in profile_result.items() if key != "profiles"},
+            "profile_result": {
+                key: value for key, value in profile_result.items() if key != "profiles"
+            },
             "migration": migration,
             "partial_reason": reason,
             "paths": [
@@ -1121,20 +1447,30 @@ def rebuild_map(
                 *_existing_source_set_paths(workspace, source_set),
             ],
         }
-    navigation = cluster_map.get("navigation", {}) if isinstance(cluster_map.get("navigation"), Mapping) else {}
+    navigation = (
+        cluster_map.get("navigation", {})
+        if isinstance(cluster_map.get("navigation"), Mapping)
+        else {}
+    )
     navigation_relations = [
-        dict(row) for row in navigation.get("typed_relations", []) or [] if isinstance(row, Mapping)
+        dict(row)
+        for row in navigation.get("typed_relations", []) or []
+        if isinstance(row, Mapping)
     ]
     typed = {
         "path": str(workspace / "02_source_memory" / "indexes" / "typed_links.yml"),
-        "compatibility_path": str(workspace / "02_source_memory" / "indexes" / "typed_note_links.yml"),
+        "compatibility_path": str(
+            workspace / "02_source_memory" / "indexes" / "typed_note_links.yml"
+        ),
         "links": navigation_relations,
         "link_count": len(navigation_relations),
         "relation_counts": dict(navigation.get("typed_relation_counts", {}) or {}),
         "graph_projection_hash": str(navigation.get("graph_projection_hash") or ""),
     }
     profile_packet_paths = [
-        path for path in profile_result["paths"] if path.parent.name == "packets" and path.name.startswith("packet-")
+        path
+        for path in profile_result["paths"]
+        if path.parent.name == "packets" and path.name.startswith("packet-")
     ]
     packet = {
         **packet,
@@ -1145,31 +1481,59 @@ def rebuild_map(
     _attach_profile_packet_lineage(paths, profile_packet_paths)
     if progress is not None:
         synthesis_calls = int(packet.get("synthesis_call_count", 0) or 0)
-        synthesis_checkpoint_hits = int(packet.get("synthesis_checkpoint_hit_count", 0) or 0)
+        synthesis_checkpoint_hits = int(
+            packet.get("synthesis_checkpoint_hit_count", 0) or 0
+        )
         synthesis_failures = int(packet.get("synthesis_failure_count", 0) or 0)
+        analytical_source_ids = _analytical_profile_source_ids(profiles)
         progress.update_literature(
-            unclustered_count=len(cluster_map.get("unclustered_sources", []) or []),
-            topic_neighborhood_count=int(cluster_map.get("topic_neighborhood_count", 0) or 0),
+            unclustered_count=sum(
+                1
+                for row in cluster_map.get("unclustered_sources", []) or []
+                if isinstance(row, Mapping)
+                and str(row.get("source_id") or "") in analytical_source_ids
+            ),
+            topic_neighborhood_count=int(
+                cluster_map.get("topic_neighborhood_count", 0) or 0
+            ),
             subject_tag_count=int(navigation.get("promoted_subject_tag_count", 0) or 0),
             subject_tag_assignment_count=len(navigation.get("assignments", []) or []),
             typed_relation_count=len(navigation_relations),
             singleton_facet_count=int(navigation.get("singleton_facet_count", 0) or 0),
             proposition_count=int(cluster_map.get("proposition_count", 0) or 0),
-            evidence_base_group_count=int(cluster_map.get("evidence_base_group_count", 0) or 0),
+            evidence_base_group_count=int(
+                cluster_map.get("evidence_base_group_count", 0) or 0
+            ),
             cluster_count=len(cluster_map.get("clusters", []) or []),
-            evidence_concentrated_cluster_count=int(cluster_map.get("evidence_concentrated_cluster_count", 0) or 0),
-            cluster_source_contribution_count=int(cluster_map.get("cluster_source_contribution_count", 0) or 0),
-            synthesized_cluster_count=int(cluster_map.get("synthesized_cluster_count", 0) or 0),
+            evidence_concentrated_cluster_count=int(
+                cluster_map.get("evidence_concentrated_cluster_count", 0) or 0
+            ),
+            cluster_source_contribution_count=int(
+                cluster_map.get("cluster_source_contribution_count", 0) or 0
+            ),
+            synthesized_cluster_count=int(
+                cluster_map.get("synthesized_cluster_count", 0) or 0
+            ),
             mapped_gap_count=sum(
-                1 for gap in gap_map.get("gap_candidates", []) or [] if gap.get("status") == "collection_surviving_gap"
+                1
+                for gap in gap_map.get("gap_candidates", []) or []
+                if gap.get("status") == "collection_surviving_gap"
             ),
             gap_lead_count=sum(
-                1 for gap in gap_map.get("gap_candidates", []) or [] if gap.get("status") == "collection_gap_lead"
+                1
+                for gap in gap_map.get("gap_candidates", []) or []
+                if gap.get("status") == "collection_gap_lead"
             ),
-            rejected_underspecified_gap_count=int(gap_map.get("rejected_underspecified_gap_count", 0) or 0),
-            rejected_gap_quality_count=int(gap_map.get("rejected_gap_quality_count", 0) or 0),
+            rejected_underspecified_gap_count=int(
+                gap_map.get("rejected_underspecified_gap_count", 0) or 0
+            ),
+            rejected_gap_quality_count=int(
+                gap_map.get("rejected_gap_quality_count", 0) or 0
+            ),
             merged_gap_count=int(gap_map.get("merged_gap_count", 0) or 0),
-            strict_consensus_established_count=int(cluster_map.get("strict_consensus_established_count", 0) or 0),
+            strict_consensus_established_count=int(
+                cluster_map.get("strict_consensus_established_count", 0) or 0
+            ),
             strict_consensus_not_established_count=int(
                 cluster_map.get("strict_consensus_not_established_count", 0) or 0
             ),
@@ -1179,22 +1543,41 @@ def rebuild_map(
             strict_contradiction_not_established_count=int(
                 cluster_map.get("strict_contradiction_not_established_count", 0) or 0
             ),
-            strong_gap_established_count=int(gap_map.get("strong_gap_established_count", 0) or 0),
-            strong_gap_not_established_count=int(gap_map.get("strong_gap_not_established_count", 0) or 0),
+            strong_gap_established_count=int(
+                gap_map.get("strong_gap_established_count", 0) or 0
+            ),
+            strong_gap_not_established_count=int(
+                gap_map.get("strong_gap_not_established_count", 0) or 0
+            ),
             synthesis_call_count=synthesis_calls,
             synthesis_checkpoint_hit_count=synthesis_checkpoint_hits,
             synthesis_failure_count=synthesis_failures,
-            quantitative_comparison_count=int(cluster_map.get("quantitative_comparison_count", 0) or 0),
+            quantitative_comparison_count=int(
+                cluster_map.get("quantitative_comparison_count", 0) or 0
+            ),
             rejected_quantitative_comparison_count=int(
                 cluster_map.get("rejected_quantitative_comparison_count", 0) or 0
             ),
-            rejected_generated_locator_count=int(cluster_map.get("rejected_generated_locator_count", 0) or 0),
-            coverage_inventory_count=int(cluster_map.get("coverage_inventory_count", 0) or 0),
-            coverage_exhausted_count=int(cluster_map.get("coverage_exhausted_count", 0) or 0),
-            coverage_accounting_valid=bool(cluster_map.get("coverage_accounting_valid", False)),
-            literature_provider_call_count=int(profile_result.get("provider_calls", 0) or 0) + synthesis_calls,
-            checkpoint_hit_count=int(profile_result.get("checkpoint_hits", 0) or 0) + synthesis_checkpoint_hits,
-            literature_failure_count=int(profile_result.get("failure_count", 0) or 0) + synthesis_failures,
+            rejected_generated_locator_count=int(
+                cluster_map.get("rejected_generated_locator_count", 0) or 0
+            ),
+            coverage_inventory_count=int(
+                cluster_map.get("coverage_inventory_count", 0) or 0
+            ),
+            coverage_exhausted_count=int(
+                cluster_map.get("coverage_exhausted_count", 0) or 0
+            ),
+            coverage_accounting_valid=bool(
+                cluster_map.get("coverage_accounting_valid", False)
+            ),
+            literature_provider_call_count=int(
+                profile_result.get("provider_calls", 0) or 0
+            )
+            + synthesis_calls,
+            checkpoint_hit_count=int(profile_result.get("checkpoint_hits", 0) or 0)
+            + synthesis_checkpoint_hits,
+            literature_failure_count=int(profile_result.get("failure_count", 0) or 0)
+            + synthesis_failures,
             active_cluster="",
             active_gap_packet="",
             active_synthesis_packet="",
@@ -1209,7 +1592,9 @@ def rebuild_map(
         related[note_id] = [
             {
                 "note_id": str(link.get("target_note_id") or ""),
-                "relation_type": str(link.get("primary_relation_type") or "semantic_similarity"),
+                "relation_type": str(
+                    link.get("primary_relation_type") or "semantic_similarity"
+                ),
                 "reason": str(link.get("reason") or ""),
             }
             for link in rank_human_related_links(
@@ -1226,16 +1611,30 @@ def rebuild_map(
             continue
         note_id = str(assignment.get("note_id") or "")
         canonical_tag = str(assignment.get("canonical_tag") or "")
-        if note_id and canonical_tag and canonical_tag not in subject_tags_by_note[note_id]:
+        if (
+            note_id
+            and canonical_tag
+            and canonical_tag not in subject_tags_by_note[note_id]
+        ):
             subject_tags_by_note[note_id].append(canonical_tag)
     clusters_by_note: dict[str, list[str]] = {}
-    cluster_by_id = {str(cluster["cluster_id"]): cluster for cluster in cluster_map["clusters"]}
+    cluster_by_id = {
+        str(cluster["cluster_id"]): cluster for cluster in cluster_map["clusters"]
+    }
     for cluster in cluster_by_id.values():
         for note_id in cluster.get("note_ids", []):
-            clusters_by_note.setdefault(str(note_id), []).append(str(cluster["cluster_id"]))
-    gap_by_id = {str(gap["gap_id"]): gap for gap in gap_map.get("gap_candidates", []) or [] if gap.get("gap_id")}
+            clusters_by_note.setdefault(str(note_id), []).append(
+                str(cluster["cluster_id"])
+            )
+    gap_by_id = {
+        str(gap["gap_id"]): gap
+        for gap in gap_map.get("gap_candidates", []) or []
+        if gap.get("gap_id")
+    }
     note_id_by_source = {
-        str(row["source_id"]): str(row["note_id"]) for row in note_rows if row.get("source_id") and row.get("note_id")
+        str(row["source_id"]): str(row["note_id"])
+        for row in note_rows
+        if row.get("source_id") and row.get("note_id")
     }
     gaps_by_note: dict[str, list[dict[str, str]]] = {}
 
@@ -1254,11 +1653,17 @@ def rebuild_map(
         for evidence in gap.get("supporting_evidence", []) or []:
             add_gap_relation(evidence.get("source_id"), gap_id, "supports_gap_rule")
         for evidence in gap.get("countervailing_evidence", []) or []:
-            add_gap_relation(evidence.get("source_id"), gap_id, "countervailing_gap_evidence")
+            add_gap_relation(
+                evidence.get("source_id"), gap_id, "countervailing_gap_evidence"
+            )
         for warning in gap.get("warnings", []) or []:
             if warning.get("warning") == "possible_counterevidence_requires_full_text":
-                add_gap_relation(warning.get("source_id"), gap_id, str(warning["warning"]))
-    note_stem_by_id = {str(row["note_id"]): Path(str(row["note_path"])).stem for row in note_rows}
+                add_gap_relation(
+                    warning.get("source_id"), gap_id, str(warning["warning"])
+                )
+    note_stem_by_id = {
+        str(row["note_id"]): Path(str(row["note_path"])).stem for row in note_rows
+    }
     note_paths: list[Path] = []
     for row in note_rows:
         path = workspace / str(row["note_path"])
@@ -1267,7 +1672,9 @@ def rebuild_map(
         related_links = [
             {
                 **link,
-                "target_stem": note_stem_by_id.get(str(link["note_id"]), str(link["note_id"])),
+                "target_stem": note_stem_by_id.get(
+                    str(link["note_id"]), str(link["note_id"])
+                ),
             }
             for link in sorted(
                 related.get(str(row["note_id"]), []),
@@ -1297,7 +1704,9 @@ def rebuild_map(
             for cluster_id in cluster_ids
             if cluster_id in cluster_by_id
         }
-        gap_wikilinks = {link["gap_id"]: str(link["wikilink"]) for link in note_gap_links}
+        gap_wikilinks = {
+            link["gap_id"]: str(link["wikilink"]) for link in note_gap_links
+        }
         update_note_graph(
             path,
             {
@@ -1312,11 +1721,15 @@ def rebuild_map(
                 ],
                 "clusters": cluster_ids,
                 "cluster_links": [
-                    cluster_wikilinks[cluster_id] for cluster_id in cluster_ids if cluster_id in cluster_wikilinks
+                    cluster_wikilinks[cluster_id]
+                    for cluster_id in cluster_ids
+                    if cluster_id in cluster_wikilinks
                 ],
                 "gaps": gap_ids,
                 "gap_links": [gap_wikilinks[gap_id] for gap_id in gap_ids],
-                "tags": sorted(subject_tags_by_note.get(str(row.get("note_id") or ""), [])),
+                "tags": sorted(
+                    subject_tags_by_note.get(str(row.get("note_id") or ""), [])
+                ),
                 "engine_version": ENGINE_VERSION,
                 "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
                 "updated_at": now_iso(),
@@ -1328,19 +1741,27 @@ def rebuild_map(
         )
         note_paths.append(path)
     source_index = write_source_index(workspace, note_paths)
-    source_set = update_source_set_map(workspace, source_set, cluster_map["clusters"], gap_map["gap_candidates"])
+    source_set = update_source_set_map(
+        workspace, source_set, cluster_map["clusters"], gap_map["gap_candidates"]
+    )
     projection_hashes = {
         str(row["note_id"]): sha256_file(workspace / str(row["note_path"]))
         for row in note_rows
-        if row.get("note_id") and row.get("note_path") and (workspace / str(row["note_path"])).is_file()
+        if row.get("note_id")
+        and row.get("note_path")
+        and (workspace / str(row["note_path"])).is_file()
     }
     profile_payloads = [profile_to_dict(profile) for profile in profiles]
     _finalize_literature_projection_hashes(
         paths,
         projection_hashes,
-        profile_hashes={str(row.get("note_id") or ""): str(row.get("note_hash") or "") for row in profile_payloads},
+        profile_hashes={
+            str(row.get("note_id") or ""): str(row.get("note_hash") or "")
+            for row in profile_payloads
+        },
         profile_dependency_hashes={
-            str(row.get("note_id") or ""): str(row.get("dependency_hash") or "") for row in profile_payloads
+            str(row.get("note_id") or ""): str(row.get("dependency_hash") or "")
+            for row in profile_payloads
         },
         source_set=source_set,
         request=effective_request,
@@ -1352,7 +1773,9 @@ def rebuild_map(
         "literature_packet": packet,
         "typed_links": typed,
         "profiles": profiles,
-        "profile_result": {key: value for key, value in profile_result.items() if key != "profiles"},
+        "profile_result": {
+            key: value for key, value in profile_result.items() if key != "profiles"
+        },
         "migration": migration,
         "paths": [
             Path(typed["path"]),
@@ -1364,7 +1787,11 @@ def rebuild_map(
             Path(source_set.get("latest_path", source_set["path"])),
         ],
     }
-    partial_reasons = [reason for reason in (profile_partial_reason, synthesis_partial_reason) if reason]
+    partial_reasons = [
+        reason
+        for reason in (profile_partial_reason, synthesis_partial_reason)
+        if reason
+    ]
     if partial_reasons:
         result["partial_reason"] = ";".join(partial_reasons)
     return result
@@ -1381,7 +1808,9 @@ def _build_profiles_for_map(
     progress: _RunProgress | None,
     resume: bool,
 ) -> dict[str, Any]:
-    del resume  # Checkpoint fingerprints, rather than a caller flag, determine reuse safety.
+    del (
+        resume
+    )  # Checkpoint fingerprints, rather than a caller flag, determine reuse safety.
     profiles_dir = workspace / "02_source_memory" / "profiles"
     literature_state = run_directory(workspace, run_id) / "literature"
     profiles_dir.mkdir(parents=True, exist_ok=True)
@@ -1409,22 +1838,28 @@ def _build_profiles_for_map(
             progress.update_literature(literature_provider_call_count=current)
 
     def build_one(index: int, row: Mapping[str, Any]) -> dict[str, Any]:
-        if time.monotonic() - started >= request.literature_policy.literature_deadline_seconds:
+        if (
+            time.monotonic() - started
+            >= request.literature_policy.literature_deadline_seconds
+        ):
             raise RuntimeError("literature_stage_deadline_reached")
         path = workspace / str(row.get("note_path") or "")
         if not path.is_file():
-            return {"index": index, "profile": None, "paths": [], "checkpoint_hit": 0, "failure": 1}
+            return {
+                "index": index,
+                "profile": None,
+                "paths": [],
+                "checkpoint_hit": 0,
+                "failure": 1,
+            }
         text = path.read_text(encoding="utf-8")
         note_id = str(row.get("note_id") or "")
         note_status = str(row.get("note_status") or "")
         terminal_status = str(row.get("terminal_status") or "")
         analytical = (
-            (
-                note_status in {"analytical_atomic_note", "verified_atomic_note"}
-                or terminal_status == "validated_note"
-            )
-            and str(row.get("source_scope") or "full_document") == "full_document"
-        )
+            note_status in {"analytical_atomic_note", "verified_atomic_note"}
+            or terminal_status == "validated_note"
+        ) and str(row.get("source_scope") or "full_document") == "full_document"
         profile_policy, profile_route, reasoner_identity = _profile_dependency_policy(
             request,
             reasoner,
@@ -1457,27 +1892,41 @@ def _build_profiles_for_map(
                         if isinstance(existing_payload.get("context", {}), Mapping)
                         else {}
                     )
-                    recorded_source_set_id = str(existing_context.get("source_set_id") or "")
+                    recorded_source_set_id = str(
+                        existing_context.get("source_set_id") or ""
+                    )
                     current_note_hash = semantic_note_hash(text)
                     lineage_matches = (
                         str(existing_payload.get("note_id") or "") == note_id
-                        and str(existing_payload.get("source_id") or "") == str(row.get("source_id") or "")
+                        and str(existing_payload.get("source_id") or "")
+                        == str(row.get("source_id") or "")
                         and str(existing_payload.get("note_hash") or "")
                         in {
                             current_note_hash,
-                            str(review_aliases.get(note_id, {}).get("legacy_semantic_hash") or ""),
+                            str(
+                                review_aliases.get(note_id, {}).get(
+                                    "legacy_semantic_hash"
+                                )
+                                or ""
+                            ),
                         }
                     )
-                    stored_route = str(existing_context.get("profile_generation_route") or "")
-                    stored_identity = str(existing_context.get("reasoner_identity") or "")
+                    stored_route = str(
+                        existing_context.get("profile_generation_route") or ""
+                    )
+                    stored_identity = str(
+                        existing_context.get("reasoner_identity") or ""
+                    )
                     stored_validity = dict(existing_payload.get("validity") or {})
-                    if bool(stored_validity.get("legacy_profile_upgraded_mechanically")):
+                    if bool(
+                        stored_validity.get("legacy_profile_upgraded_mechanically")
+                    ):
                         # Older replay code could relabel a reused mechanical
                         # profile as built_in_reader while leaving its dependency
                         # hash and content untouched. The durable migration marker
                         # is authoritative for repairing that metadata drift.
                         stored_route = "mechanical_legacy_upgrade"
-                        stored_identity = "auto_zettelkasten.profiles.legacy_upgrade:v3"
+                        stored_identity = "auto_zettelkasten.profiles.legacy_upgrade:v4"
                         existing_context["profile_generation_route"] = stored_route
                         existing_context["reasoner_identity"] = stored_identity
                     if stored_route and stored_identity and lineage_matches:
@@ -1494,31 +1943,92 @@ def _build_profiles_for_map(
                         if existing_dependency == stored_recorded_fingerprint:
                             fingerprint = profile_dependency_fingerprint(
                                 text,
-                                source_set_id=str(source_set.get("source_set_id") or ""),
+                                source_set_id=str(
+                                    source_set.get("source_set_id") or ""
+                                ),
                                 provider=request.provider,
                                 model=request.model,
                                 policy=stored_policy,
                             )
                             existing.note_hash = current_note_hash
-                            existing_context["source_set_id"] = str(source_set.get("source_set_id") or "")
+                            existing_context["source_set_id"] = str(
+                                source_set.get("source_set_id") or ""
+                            )
                             existing.context = existing_context
                             existing.dependency_hash = fingerprint
                             profile = existing
                             checkpoint_hit = 1
                     mechanical_route_is_current = (
-                        stored_route in {"deterministic", "mechanical_legacy_upgrade"}
+                        stored_route
+                        in {
+                            "deterministic",
+                            "mechanical_legacy_upgrade",
+                            "mechanical_reasoner_contract_fallback",
+                        }
                         and all(
-                            str(stored_validity.get(field_name) or "") == expected_version
+                            str(stored_validity.get(field_name) or "")
+                            == expected_version
                             for field_name, expected_version in (
                                 ("profile_prompt_version", PROFILE_PROMPT_VERSION),
                                 ("classifier_version", PROFILE_CLASSIFIER_VERSION),
                                 ("algorithm_version", PROFILE_ALGORITHM_VERSION),
                             )
                         )
-                        and str(existing_payload.get("provider") or "") == request.provider
+                        and str(existing_payload.get("provider") or "")
+                        == request.provider
                         and str(existing_payload.get("model") or "") == request.model
                     )
-                    if profile is None and lineage_matches and mechanical_route_is_current:
+                    note_frontmatter, _ = parse_atomic_note(text)
+                    source_content_matches = bool(
+                        str(note_frontmatter.get("inspected_content_hash") or "")
+                        and str(existing_payload.get("source_hash") or "")
+                        == str(note_frontmatter.get("inspected_content_hash") or "")
+                    )
+                    stored_profile_validation = stored_validity.get(
+                        "profile_validation", {}
+                    )
+                    if (
+                        profile is None
+                        and mechanical_route_is_current
+                        and source_content_matches
+                        and str(existing_payload.get("note_id") or "") == note_id
+                        and str(existing_payload.get("source_id") or "")
+                        == str(row.get("source_id") or "")
+                        and isinstance(stored_profile_validation, Mapping)
+                        and bool(stored_profile_validation.get("passed"))
+                    ):
+                        # A mechanical legacy profile is derived from the same
+                        # inspected source content.  Projection/frontmatter
+                        # changes must not force a paid profile refresh when the
+                        # source lineage and current profile contract still pass.
+                        stored_policy = dict(profile_policy)
+                        stored_policy["profile_generation_route"] = stored_route
+                        stored_policy["reasoner_identity"] = stored_identity
+                        fingerprint = profile_dependency_fingerprint(
+                            text,
+                            source_set_id=str(source_set.get("source_set_id") or ""),
+                            provider=request.provider,
+                            model=request.model,
+                            policy=stored_policy,
+                        )
+                        existing.note_hash = current_note_hash
+                        existing_context["source_set_id"] = str(
+                            source_set.get("source_set_id") or ""
+                        )
+                        existing_context["profile_generation_route"] = stored_route
+                        existing_context["reasoner_identity"] = stored_identity
+                        existing_context["profile_reuse_basis"] = (
+                            "unchanged_inspected_source_content"
+                        )
+                        existing.context = existing_context
+                        existing.dependency_hash = fingerprint
+                        profile = existing
+                        checkpoint_hit = 1
+                    if (
+                        profile is None
+                        and lineage_matches
+                        and mechanical_route_is_current
+                    ):
                         # Mechanical profiles come from committed notes, not
                         # literature-stage budgets or promotion settings. Migrate
                         # the dependency hash without converting replay into a
@@ -1534,7 +2044,9 @@ def _build_profiles_for_map(
                             policy=stored_policy,
                         )
                         existing.note_hash = current_note_hash
-                        existing_context["source_set_id"] = str(source_set.get("source_set_id") or "")
+                        existing_context["source_set_id"] = str(
+                            source_set.get("source_set_id") or ""
+                        )
                         existing_context["profile_generation_route"] = stored_route
                         existing_context["reasoner_identity"] = stored_identity
                         existing.context = existing_context
@@ -1542,14 +2054,16 @@ def _build_profiles_for_map(
                         profile = existing
                         checkpoint_hit = 1
                     alias = review_aliases.get(note_id, {})
-                    alias_matches = (
-                        str(existing_payload.get("note_hash") or "")
-                        == str(alias.get("legacy_semantic_hash") or "")
-                        and semantic_note_hash(text) == str(alias.get("semantic_hash") or "")
+                    alias_matches = str(existing_payload.get("note_hash") or "") == str(
+                        alias.get("legacy_semantic_hash") or ""
+                    ) and semantic_note_hash(text) == str(
+                        alias.get("semantic_hash") or ""
                     )
                     if profile is None and alias_matches:
                         existing.note_hash = str(alias["semantic_hash"])
-                        existing_context["source_set_id"] = str(source_set.get("source_set_id") or "")
+                        existing_context["source_set_id"] = str(
+                            source_set.get("source_set_id") or ""
+                        )
                         existing.context = existing_context
                         existing.dependency_hash = fingerprint
                         profile = existing
@@ -1561,15 +2075,22 @@ def _build_profiles_for_map(
                         model=request.model,
                         policy=profile_policy,
                     )
-                    if profile is None and recorded_source_set_id and existing_dependency == recorded_fingerprint:
-                        existing_context["source_set_id"] = str(source_set.get("source_set_id") or "")
+                    if (
+                        profile is None
+                        and recorded_source_set_id
+                        and existing_dependency == recorded_fingerprint
+                    ):
+                        existing_context["source_set_id"] = str(
+                            source_set.get("source_set_id") or ""
+                        )
                         existing.context = existing_context
                         existing.dependency_hash = fingerprint
                         profile = existing
                         checkpoint_hit = 1
                     existing_validity = dict(existing_payload.get("validity") or {})
                     legacy_profile = any(
-                        str(existing_validity.get(field_name) or "1") != expected_version
+                        str(existing_validity.get(field_name) or "1")
+                        != expected_version
                         for field_name, expected_version in (
                             ("profile_prompt_version", PROFILE_PROMPT_VERSION),
                             ("classifier_version", PROFILE_CLASSIFIER_VERSION),
@@ -1581,9 +2102,15 @@ def _build_profiles_for_map(
                         existing.provider = request.provider
                         existing.model = request.model
                         existing.dependency_hash = fingerprint
-                        existing_context["source_set_id"] = str(source_set.get("source_set_id") or "")
-                        existing_context["profile_generation_route"] = "mechanical_legacy_upgrade"
-                        existing_context["reasoner_identity"] = "auto_zettelkasten.profiles.legacy_upgrade:v3"
+                        existing_context["source_set_id"] = str(
+                            source_set.get("source_set_id") or ""
+                        )
+                        existing_context["profile_generation_route"] = (
+                            "mechanical_legacy_upgrade"
+                        )
+                        existing_context["reasoner_identity"] = (
+                            "auto_zettelkasten.profiles.legacy_upgrade:v4"
+                        )
                         existing.context = existing_context
                         existing_validity.update(
                             profile_prompt_version=PROFILE_PROMPT_VERSION,
@@ -1599,7 +2126,9 @@ def _build_profiles_for_map(
                 if reasoner is not None and analytical:
                     reserve_provider_call()
 
-                    def reasoner_method(prompt: str, *, _row: Mapping[str, Any] = row, _text: str = text) -> Any:
+                    def reasoner_method(
+                        prompt: str, *, _row: Mapping[str, Any] = row, _text: str = text
+                    ) -> Any:
                         return reasoner.profile_source(
                             {
                                 **dict(_row),
@@ -1616,14 +2145,55 @@ def _build_profiles_for_map(
                         )
                 else:
                     reasoner_method = None
-                profile = build_evidence_profile(
-                    text,
-                    source_set_id=str(source_set.get("source_set_id") or ""),
-                    provider=request.provider,
-                    model=request.model,
-                    policy=profile_policy,
-                    reasoner_method=reasoner_method,
-                )
+                try:
+                    profile = build_evidence_profile(
+                        text,
+                        source_set_id=str(source_set.get("source_set_id") or ""),
+                        provider=request.provider,
+                        model=request.model,
+                        policy=profile_policy,
+                        reasoner_method=reasoner_method,
+                    )
+                except (ProfileContractError, ProfileParseError) as exc:
+                    # A complete but contract-invalid model response is not a
+                    # transient transport failure. Preserve collection progress
+                    # with a conservative committed-note profile that cannot
+                    # support synthesis until a later lazy reprofile succeeds.
+                    profile_route = "mechanical_reasoner_contract_fallback"
+                    reasoner_identity = (
+                        "auto_zettelkasten.profiles.contract_fallback:v1"
+                    )
+                    fallback_policy = dict(profile_policy)
+                    fallback_policy.update(
+                        profile_generation_route=profile_route,
+                        reasoner_identity=reasoner_identity,
+                    )
+                    fingerprint = profile_dependency_fingerprint(
+                        text,
+                        source_set_id=str(source_set.get("source_set_id") or ""),
+                        provider=request.provider,
+                        model=request.model,
+                        policy=fallback_policy,
+                    )
+                    profile = build_evidence_profile(
+                        text,
+                        source_set_id=str(source_set.get("source_set_id") or ""),
+                        provider=request.provider,
+                        model=request.model,
+                        policy=fallback_policy,
+                    )
+                    profile.excluded_from_synthesis = True
+                    profile.exclusion_reason = (
+                        "profile_reasoner_contract_fallback_requires_lazy_reprofile"
+                    )
+                    fallback_context = dict(getattr(profile, "context", {}) or {})
+                    fallback_context.update(
+                        profile_generation_route=profile_route,
+                        reasoner_identity=reasoner_identity,
+                        profile_fallback_reason=f"{type(exc).__name__}: {exc}",
+                        lazy_reprofile_required=True,
+                    )
+                    profile.context = fallback_context
         note_valid = bool(row.get("validation_passed", True))
         prior_exclusion_reason = str(getattr(profile, "exclusion_reason", "") or "")
         if (
@@ -1641,7 +2211,11 @@ def _build_profiles_for_map(
             profile.exclusion_reason = ""
         stored_context = dict(getattr(profile, "context", {}) or {})
         stored_route = str(stored_context.get("profile_generation_route") or "")
-        if stored_route in {"deterministic", "mechanical_legacy_upgrade"}:
+        if stored_route in {
+            "deterministic",
+            "mechanical_legacy_upgrade",
+            "mechanical_reasoner_contract_fallback",
+        }:
             profile, _ = augment_profile_from_committed_note(
                 profile,
                 text,
@@ -1665,9 +2239,17 @@ def _build_profiles_for_map(
         )
         profile.validity = validity
         context = dict(getattr(profile, "context", {}) or {})
-        metadata = context.get("metadata", {}) if isinstance(context.get("metadata", {}), Mapping) else {}
-        preserved_route = str(context.get("profile_generation_route") or "") if checkpoint_hit else ""
-        preserved_identity = str(context.get("reasoner_identity") or "") if checkpoint_hit else ""
+        metadata = (
+            context.get("metadata", {})
+            if isinstance(context.get("metadata", {}), Mapping)
+            else {}
+        )
+        preserved_route = (
+            str(context.get("profile_generation_route") or "") if checkpoint_hit else ""
+        )
+        preserved_identity = (
+            str(context.get("reasoner_identity") or "") if checkpoint_hit else ""
+        )
         context.update(
             {
                 "title": row.get("title", metadata.get("title", "")),
@@ -1677,7 +2259,11 @@ def _build_profiles_for_map(
                 "zotero_relations": dict(row.get("zotero_relations", {}) or {}),
                 "profile_generation_route": (
                     preserved_route
-                    or ("mechanical_legacy_upgrade" if mechanically_upgraded else profile_route)
+                    or (
+                        "mechanical_legacy_upgrade"
+                        if mechanically_upgraded
+                        else profile_route
+                    )
                 ),
                 "reasoner_identity": (
                     preserved_identity
@@ -1692,30 +2278,56 @@ def _build_profiles_for_map(
         profile.context = context
         if not validation.passed or not note_valid:
             profile.excluded_from_synthesis = True
-            reasons = list(validation.errors) + list(row.get("validation_errors", []) or [])
-            profile.exclusion_reason = "profile_or_note_validation_failed:" + ",".join(sorted(set(reasons)))
+            reasons = list(validation.errors) + list(
+                row.get("validation_errors", []) or []
+            )
+            profile.exclusion_reason = "profile_or_note_validation_failed:" + ",".join(
+                sorted(set(reasons))
+            )
         elif prior_exclusion_reason.startswith("profile_or_note_validation_failed:"):
             profile.excluded_from_synthesis = False
             profile.exclusion_reason = ""
+        profile_path = profile_sidecar_path(profiles_dir, note_id)
         save_profile(profiles_dir, profile)
+        # Feed synthesis the exact canonical object that resume will reload.
+        # Mechanical migrations can normalize nested dataclass fields during
+        # serialization; returning the pre-write instance makes the first
+        # migrated run hash differently from its immediate replay.
+        profile = load_profile_sidecar(profile_path)
         write_profile_checkpoint(literature_state, note_id, fingerprint, profile)
         final_validation = validate_profile(profile, require_substantive=False)
-        profile_path = profile_sidecar_path(profiles_dir, note_id)
-        checkpoint_path = literature_state / "profile_calls" / f"{slugify(note_id, fallback='profile')}.yml"
-        failure_path = literature_state / "profile_failures" / f"{slugify(note_id, fallback='profile')}.yml"
+        checkpoint_path = (
+            literature_state
+            / "profile_calls"
+            / f"{slugify(note_id, fallback='profile')}.yml"
+        )
+        failure_path = (
+            literature_state
+            / "profile_failures"
+            / f"{slugify(note_id, fallback='profile')}.yml"
+        )
         if failure_path.exists():
             failure_path.unlink()
         return {
             "index": index,
             "profile": profile,
-            "paths": [candidate for candidate in (profile_path, checkpoint_path) if candidate.exists()],
+            "paths": [
+                candidate
+                for candidate in (profile_path, checkpoint_path)
+                if candidate.exists()
+            ],
             "checkpoint_hit": checkpoint_hit,
             "failure": 0,
-            "excluded": bool(getattr(profile, "excluded_from_synthesis", False)) or not final_validation.passed,
+            "excluded": bool(getattr(profile, "excluded_from_synthesis", False))
+            or not final_validation.passed,
         }
 
-    workers = max(1, min(request.literature_policy.profile_workers, len(note_rows) or 1))
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="auto-zettelkasten-profile") as executor:
+    workers = max(
+        1, min(request.literature_policy.profile_workers, len(note_rows) or 1)
+    )
+    with ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="auto-zettelkasten-profile"
+    ) as executor:
         future_map = {
             executor.submit(build_one, index, row): index
             for index, row in enumerate(note_rows)
@@ -1727,7 +2339,11 @@ def _build_profiles_for_map(
                 index = future_map[future]
                 row = note_rows[index]
                 note_id = str(row.get("note_id") or f"inventory-{index}")
-                failure_path = literature_state / "profile_failures" / f"{slugify(note_id, fallback='profile')}.yml"
+                failure_path = (
+                    literature_state
+                    / "profile_failures"
+                    / f"{slugify(note_id, fallback='profile')}.yml"
+                )
                 failure_record = {
                     "status": "partial",
                     "note_id": note_id,
@@ -1805,7 +2421,10 @@ def _profile_dependency_policy(
         route = "deterministic"
         identity = "auto_zettelkasten.profiles.deterministic_profile:v1"
     else:
-        route = str(getattr(reasoner, "profile_generation_route", "explicit_reasoner") or "explicit_reasoner")
+        route = str(
+            getattr(reasoner, "profile_generation_route", "explicit_reasoner")
+            or "explicit_reasoner"
+        )
         identity = str(getattr(reasoner, "profile_reasoner_identity", "") or "")
         if not identity:
             reasoner_type = type(reasoner)
@@ -1840,10 +2459,15 @@ def _write_profile_packets(
     profile_payloads = [profile_to_dict(profile) for profile in profiles]
     configured_context = int(getattr(reasoner, "context_window_tokens", 0) or 0)
     if configured_context <= 0:
-        configured_context = 1_000_000 if (request.provider, request.model) in {
-            ("deepseek", "deepseek-v4-flash"),
-            ("gemini", "gemini-2.5-flash"),
-        } else 128_000
+        configured_context = (
+            1_000_000
+            if (request.provider, request.model)
+            in {
+                ("deepseek", "deepseek-v4-flash"),
+                ("gemini", "gemini-2.5-flash"),
+            }
+            else 128_000
+        )
     max_chars = max(
         8_000,
         int(
@@ -1856,7 +2480,9 @@ def _write_profile_packets(
     current: list[dict[str, Any]] = []
     current_chars = 0
     for profile in profile_payloads:
-        profile_chars = len(json.dumps(profile, sort_keys=True, ensure_ascii=False, default=str))
+        profile_chars = len(
+            json.dumps(profile, sort_keys=True, ensure_ascii=False, default=str)
+        )
         if current and current_chars + profile_chars > max_chars:
             packets.append(current)
             current = []
@@ -1876,13 +2502,17 @@ def _write_profile_packets(
             "provider": request.provider,
             "model": request.model,
             "literature_policy": request.literature_policy.to_dict(),
-            "profile_dependency_hashes": [row.get("dependency_hash", "") for row in packet_profiles],
+            "profile_dependency_hashes": [
+                row.get("dependency_hash", "") for row in packet_profiles
+            ],
             "packet_index": index,
             "packet_count": len(packets),
         }
         payload = {
             "packet_schema_version": "1",
-            "fingerprint": sha256_text(json.dumps(dependency, sort_keys=True, ensure_ascii=False, default=str)),
+            "fingerprint": sha256_text(
+                json.dumps(dependency, sort_keys=True, ensure_ascii=False, default=str)
+            ),
             "packet_index": index,
             "packet_count": len(packets),
             "context_window_tokens": configured_context,
@@ -1903,9 +2533,16 @@ def _write_profile_packets(
     if progress is not None:
         progress.update_literature(
             active_synthesis_packet="",
-            checkpoint_hit_count=int(progress.literature.get("checkpoint_hit_count", 0) or 0) + checkpoint_hits,
+            checkpoint_hit_count=int(
+                progress.literature.get("checkpoint_hit_count", 0) or 0
+            )
+            + checkpoint_hits,
         )
-    return {"paths": paths, "checkpoint_hits": checkpoint_hits, "packet_count": len(packets)}
+    return {
+        "paths": paths,
+        "checkpoint_hits": checkpoint_hits,
+        "packet_count": len(packets),
+    }
 
 
 def _finalize_literature_projection_hashes(
@@ -1926,7 +2563,9 @@ def _finalize_literature_projection_hashes(
         lineage = {
             "note_projection_hashes": dict(sorted(projection_hashes.items())),
             "semantic_note_hashes": dict(sorted(profile_hashes.items())),
-            "profile_dependency_hashes": dict(sorted(profile_dependency_hashes.items())),
+            "profile_dependency_hashes": dict(
+                sorted(profile_dependency_hashes.items())
+            ),
             "source_set_id": source_set.get("source_set_id", ""),
             "source_set_dependency_hash": source_set.get("dependency_hash", ""),
             "provider": request.provider,
@@ -1949,7 +2588,9 @@ def _finalize_literature_projection_hashes(
         write_yaml(path, updated)
 
 
-def _attach_profile_packet_lineage(paths: Sequence[Path], profile_packet_paths: Sequence[Path]) -> None:
+def _attach_profile_packet_lineage(
+    paths: Sequence[Path], profile_packet_paths: Sequence[Path]
+) -> None:
     values = [str(path) for path in profile_packet_paths]
     for path in paths:
         if path.name != "packet.yml" and not path.name.startswith("literature-packet-"):
@@ -1959,7 +2600,14 @@ def _attach_profile_packet_lineage(paths: Sequence[Path], profile_packet_paths: 
             raise ValueError(f"literature packet must be a mapping: {path}")
         if payload.get("profile_packet_paths") == values:
             continue
-        write_yaml(path, {**dict(payload), "profile_packet_count": len(values), "profile_packet_paths": values})
+        write_yaml(
+            path,
+            {
+                **dict(payload),
+                "profile_packet_count": len(values),
+                "profile_packet_paths": values,
+            },
+        )
 
 
 def all_workspace_note_rows(workspace: Path) -> list[dict[str, Any]]:
@@ -1993,11 +2641,16 @@ def all_workspace_note_rows(workspace: Path) -> list[dict[str, Any]]:
     return _deduplicate_note_rows(rows)
 
 
-def workspace_source_set(workspace: Path, note_rows: Sequence[Mapping[str, Any]], *, run_id: str) -> dict[str, Any]:
+def workspace_source_set(
+    workspace: Path, note_rows: Sequence[Mapping[str, Any]], *, run_id: str
+) -> dict[str, Any]:
     items = [
         {
             "key": str(row.get("zotero_item_key", "")),
-            "data": {"key": str(row.get("zotero_item_key", "")), "title": str(row.get("title", ""))},
+            "data": {
+                "key": str(row.get("zotero_item_key", "")),
+                "title": str(row.get("title", "")),
+            },
         }
         for row in note_rows
     ]
@@ -2010,7 +2663,8 @@ def workspace_source_set(workspace: Path, note_rows: Sequence[Mapping[str, Any]]
             "note_path": row.get("note_path", ""),
             "terminal_status": (
                 "validated_note"
-                if row.get("note_status") in {"analytical_atomic_note", "verified_atomic_note"}
+                if row.get("note_status")
+                in {"analytical_atomic_note", "verified_atomic_note"}
                 else "limited_note"
             ),
             "fingerprint": "",
@@ -2063,10 +2717,14 @@ def _prepare_item(
         content = _load_frozen_content(checkpoint_root)
     except Exception as exc:
         base["reason"] = f"frozen_content_invalid:{type(exc).__name__}:{exc}"
-        base["attempts"].append(_attempt(base, "frozen_content", "failed", base["reason"]))
+        base["attempts"].append(
+            _attempt(base, "frozen_content", "failed", base["reason"])
+        )
         return base
     if content is not None:
-        base["attempts"].append(_attempt(base, "frozen_content", "succeeded", "run_snapshot_reused"))
+        base["attempts"].append(
+            _attempt(base, "frozen_content", "succeeded", "run_snapshot_reused")
+        )
     else:
         content = _acquire_content(workspace, item, client, base, request, vision)
         if content:
@@ -2074,7 +2732,12 @@ def _prepare_item(
     if not content:
         base["reason"] = "all_allowed_extraction_routes_exhausted"
         base["attempts"].append(
-            _attempt(base, "extraction_router", "failed", "all_allowed_extraction_routes_exhausted")
+            _attempt(
+                base,
+                "extraction_router",
+                "failed",
+                "all_allowed_extraction_routes_exhausted",
+            )
         )
         return base
     content_hash = str(content["content_hash"])
@@ -2095,19 +2758,63 @@ def _prepare_item(
         reader_provider=effective_provider,
         reader_model=effective_model,
     )
-    prior = read_yaml(workspace / "11_state" / "fingerprints" / f"{fingerprint}.yml", {}) or {}
+    prior = (
+        read_yaml(workspace / "11_state" / "fingerprints" / f"{fingerprint}.yml", {})
+        or {}
+    )
     prior_path = workspace / str(prior.get("note_path", ""))
     if prior.get("note_path") and _reusable_note(prior_path, base, request):
         prior_frontmatter, _ = parse_atomic_note(prior_path.read_text(encoding="utf-8"))
-        prior_status = str(prior_frontmatter.get("note_status") or "analytical_atomic_note")
+        prior_status = str(
+            prior_frontmatter.get("note_status") or "analytical_atomic_note"
+        )
         base.update(
-            terminal_status="validated_note" if prior_status in {"analytical_atomic_note", "verified_atomic_note"} else "limited_note",
+            terminal_status="validated_note"
+            if prior_status in {"analytical_atomic_note", "verified_atomic_note"}
+            else "limited_note",
             note_path=str(prior["note_path"]),
             note_status=prior_status,
             reused=True,
             reason="fingerprint_match",
         )
-        base["attempts"].append(_attempt(base, "resume_fingerprint", "skipped", "existing_validated_note_reused", output_path=str(prior_path)))
+        base["attempts"].append(
+            _attempt(
+                base,
+                "resume_fingerprint",
+                "skipped",
+                "existing_validated_note_reused",
+                output_path=str(prior_path),
+            )
+        )
+        return base
+    compatible_path = _compatible_committed_note(workspace, base, request)
+    if compatible_path is not None:
+        prior_frontmatter, _ = parse_atomic_note(
+            compatible_path.read_text(encoding="utf-8")
+        )
+        prior_status = str(
+            prior_frontmatter.get("note_status") or "analytical_atomic_note"
+        )
+        relative_path = str(compatible_path.relative_to(workspace))
+        base.update(
+            terminal_status="validated_note"
+            if prior_status in {"analytical_atomic_note", "verified_atomic_note"}
+            else "limited_note",
+            note_path=relative_path,
+            note_status=prior_status,
+            reused=True,
+            reason="compatible_committed_note",
+        )
+        _write_fingerprint(workspace, base, relative_path)
+        base["attempts"].append(
+            _attempt(
+                base,
+                "resume_compatible_note",
+                "skipped",
+                "existing_current_schema_note_reused",
+                output_path=str(compatible_path),
+            )
+        )
         return base
     if content.get("analysis"):
         base["analysis"] = content["analysis"]
@@ -2127,7 +2834,9 @@ def _prepare_item(
         )
         return base
     if bool(getattr(reader, "is_cloud", True)) and not request.allow_cloud:
-        base["attempts"].append(_attempt(base, f"{reader.name}_text", "disallowed", "cloud_not_allowed"))
+        base["attempts"].append(
+            _attempt(base, f"{reader.name}_text", "disallowed", "cloud_not_allowed")
+        )
         base["reason"] = "reader_disallowed_by_privacy_policy"
         return base
     try:
@@ -2150,7 +2859,9 @@ def _prepare_item(
             completed_chunks=exc.completed_chunks,
             total_chunks=exc.total_chunks,
         )
-        base["attempts"].append(_attempt(base, "hierarchical_reader", "partial", exc.reason))
+        base["attempts"].append(
+            _attempt(base, "hierarchical_reader", "partial", exc.reason)
+        )
         return base
     except DocumentCoverageLimitError as exc:
         base.update(
@@ -2158,17 +2869,35 @@ def _prepare_item(
             note_status="fulltext_available",
             reason="document_exceeds_hard_chunk_limit",
             limited_analysis=_limited_analysis(
-                {**content, "source_scope": "fulltext_available", "coverage_reason": str(exc)},
+                {
+                    **content,
+                    "source_scope": "fulltext_available",
+                    "coverage_reason": str(exc),
+                },
                 item,
             ),
         )
-        base["attempts"].append(_attempt(base, "hierarchical_reader", "limited", base["reason"]))
+        base["attempts"].append(
+            _attempt(base, "hierarchical_reader", "limited", base["reason"])
+        )
         return base
     except Exception as exc:
-        base["attempts"].append(_attempt(base, f"{reader.name}_text", "failed", f"{type(exc).__name__}:{exc}"))
+        base["attempts"].append(
+            _attempt(
+                base, f"{reader.name}_text", "failed", f"{type(exc).__name__}:{exc}"
+            )
+        )
         base["reason"] = f"reader_failed:{type(exc).__name__}"
         return base
-    base["attempts"].append(_attempt(base, reader_route, "succeeded", reader_reason, output_path="pending_atomic_note"))
+    base["attempts"].append(
+        _attempt(
+            base,
+            reader_route,
+            "succeeded",
+            reader_reason,
+            output_path="pending_atomic_note",
+        )
+    )
     base["analysis"] = dict(analysis)
     return base
 
@@ -2223,11 +2952,17 @@ def _load_frozen_content(checkpoint_root: Path) -> dict[str, Any] | None:
     } | {"text": text}
 
 
-def _limited_analysis(content: Mapping[str, Any], item: Mapping[str, Any]) -> dict[str, str]:
+def _limited_analysis(
+    content: Mapping[str, Any], item: Mapping[str, Any]
+) -> dict[str, str]:
     data = item_data(item)
     scope = str(content.get("source_scope") or "metadata_only")
     text = str(content.get("abstract_text") or content.get("text") or "").strip()
-    available = text if text else "No abstract or document text was available; this note preserves Zotero citation metadata only."
+    available = (
+        text
+        if text
+        else "No abstract or document text was available; this note preserves Zotero citation metadata only."
+    )
     reason = str(content.get("coverage_reason") or scope)
     title = str(data.get("title") or item_key(item) or "Untitled Zotero item")
     limitation = (
@@ -2262,9 +2997,13 @@ def _acquire_content(
         children = client.children(key)
         targets.extend(children)
         if not children:
-            base["attempts"].append(_attempt(base, "zotero_children", "skipped", "no_child_attachments"))
+            base["attempts"].append(
+                _attempt(base, "zotero_children", "skipped", "no_child_attachments")
+            )
     except Exception as exc:
-        base["attempts"].append(_attempt(base, "zotero_children", "failed", f"{type(exc).__name__}:{exc}"))
+        base["attempts"].append(
+            _attempt(base, "zotero_children", "failed", f"{type(exc).__name__}:{exc}")
+        )
     for target in targets:
         target_key = item_key(target)
         if not target_key:
@@ -2274,20 +3013,40 @@ def _acquire_content(
         try:
             fulltext = client.fulltext(target_key)
         except Exception as exc:
-            base["attempts"].append(_attempt(base, "zotero_fulltext", "failed", f"{target_key}:{type(exc).__name__}:{exc}"))
+            base["attempts"].append(
+                _attempt(
+                    base,
+                    "zotero_fulltext",
+                    "failed",
+                    f"{target_key}:{type(exc).__name__}:{exc}",
+                )
+            )
             fulltext = None
         text = _fulltext_value(fulltext)
         if text:
-            effective_media_type = str((fulltext or {}).get("contentType") or media_type or "text/html")
-            if _indexed_page_coverage_incomplete(fulltext) or (effective_media_type == "application/pdf" and not _indexed_pdf_complete(fulltext)):
+            effective_media_type = str(
+                (fulltext or {}).get("contentType") or media_type or "text/html"
+            )
+            if _indexed_page_coverage_incomplete(fulltext) or (
+                effective_media_type == "application/pdf"
+                and not _indexed_pdf_complete(fulltext)
+            ):
                 base["attempts"].append(
-                    _attempt(base, "zotero_fulltext", "failed", f"{target_key}:partial_or_unproven_indexed_pdf", input_hash=sha256_text(text))
+                    _attempt(
+                        base,
+                        "zotero_fulltext",
+                        "failed",
+                        f"{target_key}:partial_or_unproven_indexed_pdf",
+                        input_hash=sha256_text(text),
+                    )
                 )
             else:
                 adequacy = classify_content_adequacy(
                     text,
                     media_type=effective_media_type,
-                    raw_html=text if effective_media_type in {"text/html", "application/xhtml+xml"} else None,
+                    raw_html=text
+                    if effective_media_type in {"text/html", "application/xhtml+xml"}
+                    else None,
                     page_count=int((fulltext or {}).get("totalPages", 0) or 0),
                     coverage_metadata=fulltext,
                 )
@@ -2310,7 +3069,14 @@ def _acquire_content(
                     )
                 )
         elif fulltext is not None:
-            base["attempts"].append(_attempt(base, "zotero_fulltext", "skipped", f"{target_key}:indexed_fulltext_empty"))
+            base["attempts"].append(
+                _attempt(
+                    base,
+                    "zotero_fulltext",
+                    "skipped",
+                    f"{target_key}:indexed_fulltext_empty",
+                )
+            )
         local = _local_attachment_path(data)
         if local:
             extracted = extract_path(local)
@@ -2327,7 +3093,12 @@ def _acquire_content(
             if extracted.status == "succeeded":
                 candidates.append(
                     _content_candidate(
-                        extracted.adequacy or classify_content_adequacy(extracted.text, media_type=extracted.media_type, page_count=extracted.page_count),
+                        extracted.adequacy
+                        or classify_content_adequacy(
+                            extracted.text,
+                            media_type=extracted.media_type,
+                            page_count=extracted.page_count,
+                        ),
                         text=extracted.text,
                         content_hash=sha256_file(local),
                         source_file=str(local),
@@ -2354,7 +3125,12 @@ def _acquire_content(
                 if ocr.status == "succeeded":
                     candidates.append(
                         _content_candidate(
-                            ocr.adequacy or classify_content_adequacy(ocr.text, media_type="application/pdf", page_count=ocr.page_count),
+                            ocr.adequacy
+                            or classify_content_adequacy(
+                                ocr.text,
+                                media_type="application/pdf",
+                                page_count=ocr.page_count,
+                            ),
                             text=ocr.text,
                             content_hash=sha256_bytes(document),
                             source_file=str(local),
@@ -2363,32 +3139,89 @@ def _acquire_content(
                         )
                     )
                 if vision is not None:
-                    visual = _vision_content(base, vision, request, document, "application/pdf", item_data(item), str(local))
+                    visual = _vision_content(
+                        base,
+                        vision,
+                        request,
+                        document,
+                        "application/pdf",
+                        item_data(item),
+                        str(local),
+                    )
                     if visual:
-                        candidates.append({**visual, "source_scope": "full_document", "source_coverage": {"coverage_gate": "passed", "reason": "document_vision"}, "coverage_reason": "document_vision", "coverage_metrics": {}, "rank": 95})
+                        candidates.append(
+                            {
+                                **visual,
+                                "source_scope": "full_document",
+                                "source_coverage": {
+                                    "coverage_gate": "passed",
+                                    "reason": "document_vision",
+                                },
+                                "coverage_reason": "document_vision",
+                                "coverage_metrics": {},
+                                "rank": 95,
+                            }
+                        )
         if target is item and str(data.get("itemType", "")) != "attachment":
             continue
         try:
             file_result = client.file(target_key)
         except Exception as exc:
-            base["attempts"].append(_attempt(base, "zotero_file", "failed", f"{target_key}:{type(exc).__name__}:{exc}"))
+            base["attempts"].append(
+                _attempt(
+                    base,
+                    "zotero_file",
+                    "failed",
+                    f"{target_key}:{type(exc).__name__}:{exc}",
+                )
+            )
             file_result = None
         if not file_result:
-            base["attempts"].append(_attempt(base, "zotero_file", "skipped", f"{target_key}:attachment_file_unavailable"))
+            base["attempts"].append(
+                _attempt(
+                    base,
+                    "zotero_file",
+                    "skipped",
+                    f"{target_key}:attachment_file_unavailable",
+                )
+            )
             continue
         document, media_type = file_result
-        extension = mimetypes.guess_extension(media_type) or Path(str(data.get("filename") or "")).suffix or ".bin"
-        custody_path = workspace / "01_custody" / "files" / f"{safe_filename(target_key)}{extension}"
+        extension = (
+            mimetypes.guess_extension(media_type)
+            or Path(str(data.get("filename") or "")).suffix
+            or ".bin"
+        )
+        custody_path = (
+            workspace
+            / "01_custody"
+            / "files"
+            / f"{safe_filename(target_key)}{extension}"
+        )
         atomic_write_bytes(custody_path, document)
-        extracted = extract_bytes(document, media_type=media_type, filename=custody_path.name)
+        extracted = extract_bytes(
+            document, media_type=media_type, filename=custody_path.name
+        )
         document_hash = sha256_bytes(document)
         base["attempts"].append(
-            _attempt(base, extracted.route, "succeeded" if extracted.status == "succeeded" else "failed", extracted.reason or "extracted", input_hash=document_hash, output_path=str(custody_path))
+            _attempt(
+                base,
+                extracted.route,
+                "succeeded" if extracted.status == "succeeded" else "failed",
+                extracted.reason or "extracted",
+                input_hash=document_hash,
+                output_path=str(custody_path),
+            )
         )
         if extracted.status == "succeeded":
             candidates.append(
                 _content_candidate(
-                    extracted.adequacy or classify_content_adequacy(extracted.text, media_type=extracted.media_type, page_count=extracted.page_count),
+                    extracted.adequacy
+                    or classify_content_adequacy(
+                        extracted.text,
+                        media_type=extracted.media_type,
+                        page_count=extracted.page_count,
+                    ),
                     text=extracted.text,
                     content_hash=document_hash,
                     source_file=str(custody_path),
@@ -2411,7 +3244,10 @@ def _acquire_content(
             if ocr.status == "succeeded":
                 candidates.append(
                     _content_candidate(
-                        ocr.adequacy or classify_content_adequacy(ocr.text, media_type=media_type, page_count=ocr.page_count),
+                        ocr.adequacy
+                        or classify_content_adequacy(
+                            ocr.text, media_type=media_type, page_count=ocr.page_count
+                        ),
                         text=ocr.text,
                         content_hash=document_hash,
                         source_file=str(custody_path),
@@ -2420,15 +3256,45 @@ def _acquire_content(
                     )
                 )
             if vision is not None:
-                visual = _vision_content(base, vision, request, document, media_type, item_data(item), str(custody_path))
+                visual = _vision_content(
+                    base,
+                    vision,
+                    request,
+                    document,
+                    media_type,
+                    item_data(item),
+                    str(custody_path),
+                )
                 if visual:
-                    candidates.append({**visual, "source_scope": "full_document", "source_coverage": {"coverage_gate": "passed", "reason": "document_vision"}, "coverage_reason": "document_vision", "coverage_metrics": {}, "rank": 95})
+                    candidates.append(
+                        {
+                            **visual,
+                            "source_scope": "full_document",
+                            "source_coverage": {
+                                "coverage_gate": "passed",
+                                "reason": "document_vision",
+                            },
+                            "coverage_reason": "document_vision",
+                            "coverage_metrics": {},
+                            "rank": 95,
+                        }
+                    )
     if candidates:
         return max(candidates, key=lambda row: int(row.get("rank", 0)))
     metadata = item_data(item)
     adequacy = classify_metadata_only(metadata)
-    metadata_hash = sha256_text(json.dumps(metadata, sort_keys=True, ensure_ascii=False, default=str))
-    base["attempts"].append(_attempt(base, "zotero_metadata", "limited", "metadata_only", input_hash=metadata_hash))
+    metadata_hash = sha256_text(
+        json.dumps(metadata, sort_keys=True, ensure_ascii=False, default=str)
+    )
+    base["attempts"].append(
+        _attempt(
+            base,
+            "zotero_metadata",
+            "limited",
+            "metadata_only",
+            input_hash=metadata_hash,
+        )
+    )
     return _content_candidate(
         adequacy,
         text="",
@@ -2448,9 +3314,23 @@ def _content_candidate(
     content_route: str,
     media_type: str,
 ) -> dict[str, Any]:
-    scope = "abstract_only" if adequacy.source_scope == "abstract" else adequacy.source_scope
-    rank = 100 if adequacy.is_full_publication and media_type == "application/pdf" else 80 if adequacy.is_full_publication else 40 if scope == "abstract_only" else 10
-    usable_text = adequacy.abstract if scope == "abstract_only" and adequacy.abstract else text
+    scope = (
+        "abstract_only"
+        if adequacy.source_scope == "abstract"
+        else adequacy.source_scope
+    )
+    rank = (
+        100
+        if adequacy.is_full_publication and media_type == "application/pdf"
+        else 80
+        if adequacy.is_full_publication
+        else 40
+        if scope == "abstract_only"
+        else 10
+    )
+    usable_text = (
+        adequacy.abstract if scope == "abstract_only" and adequacy.abstract else text
+    )
     return {
         "text": usable_text,
         "abstract_text": adequacy.abstract,
@@ -2471,7 +3351,11 @@ def _target_media_type(data: Mapping[str, Any]) -> str:
     if direct:
         return direct
     filename = str(data.get("filename") or data.get("title") or "")
-    return mimetypes.guess_type(filename)[0] or ("text/html" if str(data.get("itemType") or "") != "attachment" else "application/octet-stream")
+    return mimetypes.guess_type(filename)[0] or (
+        "text/html"
+        if str(data.get("itemType") or "") != "attachment"
+        else "application/octet-stream"
+    )
 
 
 def _indexed_pdf_complete(fulltext: Mapping[str, Any] | None) -> bool:
@@ -2486,7 +3370,11 @@ def _indexed_pdf_complete(fulltext: Mapping[str, Any] | None) -> bool:
 
 
 def _indexed_page_coverage_incomplete(fulltext: Mapping[str, Any] | None) -> bool:
-    if not fulltext or fulltext.get("indexedPages") is None or fulltext.get("totalPages") is None:
+    if (
+        not fulltext
+        or fulltext.get("indexedPages") is None
+        or fulltext.get("totalPages") is None
+    ):
         return False
     try:
         indexed = int(fulltext.get("indexedPages", 0) or 0)
@@ -2507,17 +3395,38 @@ def _vision_content(
 ) -> dict[str, Any] | None:
     document_hash = sha256_bytes(document)
     if bool(getattr(vision, "is_cloud", True)) and not request.allow_cloud:
-        base["attempts"].append(_attempt(base, f"{vision.name}_document_vision", "disallowed", "cloud_not_allowed", input_hash=document_hash))
+        base["attempts"].append(
+            _attempt(
+                base,
+                f"{vision.name}_document_vision",
+                "disallowed",
+                "cloud_not_allowed",
+                input_hash=document_hash,
+            )
+        )
         return None
     try:
         analysis = vision.inspect_document(document, media_type, metadata, None)
     except Exception as exc:
         base["attempts"].append(
-            _attempt(base, f"{vision.name}_document_vision", "failed", f"{type(exc).__name__}:{exc}", input_hash=document_hash)
+            _attempt(
+                base,
+                f"{vision.name}_document_vision",
+                "failed",
+                f"{type(exc).__name__}:{exc}",
+                input_hash=document_hash,
+            )
         )
         return None
     base["attempts"].append(
-        _attempt(base, f"{vision.name}_document_vision", "succeeded", "document_inspected", input_hash=document_hash, output_path=source_file)
+        _attempt(
+            base,
+            f"{vision.name}_document_vision",
+            "succeeded",
+            "document_inspected",
+            input_hash=document_hash,
+            output_path=source_file,
+        )
     )
     return {
         "analysis": dict(analysis),
@@ -2530,22 +3439,30 @@ def _vision_content(
     }
 
 
-def _frontmatter(row: Mapping[str, Any], request: MapRequest, normalized_tags: Sequence[str]) -> dict[str, Any]:
+def _frontmatter(
+    row: Mapping[str, Any], request: MapRequest, normalized_tags: Sequence[str]
+) -> dict[str, Any]:
     data = item_data(row["item"])
     return {
         "note_id": row["note_id"],
         "source_id": row["source_id"],
         "note_status": str(row.get("note_status") or "analytical_atomic_note"),
-        "title": str(data.get("title") or row["zotero_item_key"] or "Untitled Zotero item"),
+        "title": str(
+            data.get("title") or row["zotero_item_key"] or "Untitled Zotero item"
+        ),
         "citation_key": _citation_key(data),
         "zotero_item_key": row["zotero_item_key"],
         "source_file": row["source_file"],
-        "creators": data.get("creators", []) if isinstance(data.get("creators", []), list) else [],
+        "creators": data.get("creators", [])
+        if isinstance(data.get("creators", []), list)
+        else [],
         "date": str(data.get("date") or ""),
         "doi": str(data.get("DOI") or data.get("doi") or ""),
         "url": str(data.get("url") or ""),
         "original_zotero_tags": original_tags(row["item"]),
-        "zotero_relations": data.get("relations", {}) if isinstance(data.get("relations", {}), Mapping) else {},
+        "zotero_relations": data.get("relations", {})
+        if isinstance(data.get("relations", {}), Mapping)
+        else {},
         "normalized_tags": list(normalized_tags),
         "tags": [],
         "clusters": [],
@@ -2557,7 +3474,10 @@ def _frontmatter(row: Mapping[str, Any], request: MapRequest, normalized_tags: S
         "inspected_content_hash": row["content_hash"],
         "content_route": row["content_route"],
         "source_scope": str(row.get("source_scope") or "full_document"),
-        "source_coverage": dict(row.get("source_coverage", {}) or {"coverage_gate": "passed", "reason": "full_document"}),
+        "source_coverage": dict(
+            row.get("source_coverage", {})
+            or {"coverage_gate": "passed", "reason": "full_document"}
+        ),
         "coverage_reason": str(row.get("coverage_reason") or ""),
         "coverage_metrics": dict(row.get("coverage_metrics", {}) or {}),
         "structural_validation": {"status": "pending"},
@@ -2582,7 +3502,9 @@ def _note_summary_from_path(workspace: Path, row: Mapping[str, Any]) -> dict[str
     return {
         "note_id": str(front.get("note_id", row.get("note_id", ""))),
         "source_id": str(front.get("source_id", row.get("source_id", ""))),
-        "zotero_item_key": str(front.get("zotero_item_key", row.get("zotero_item_key", ""))),
+        "zotero_item_key": str(
+            front.get("zotero_item_key", row.get("zotero_item_key", ""))
+        ),
         "note_status": str(front.get("note_status", "")),
         "title": str(front.get("title", "")),
         "date": str(front.get("date", "")),
@@ -2596,7 +3518,9 @@ def _note_summary_from_path(workspace: Path, row: Mapping[str, Any]) -> dict[str
         "method": _note_section(body, "Method and Research Design"),
         "evidence_and_data": _note_section(body, "Evidence and Data"),
         "detailed_findings": _note_section(body, "Detailed Findings"),
-        "plain_english_interpretation": _note_section(body, "Plain-English Interpretation"),
+        "plain_english_interpretation": _note_section(
+            body, "Plain-English Interpretation"
+        ),
         "limitations": _note_section(body, "Limitations"),
         "support_boundary": _note_section(body, "What This Source Can Support"),
         "cannot_support": _note_section(body, "What This Source Cannot Support"),
@@ -2615,7 +3539,9 @@ def _note_summary_from_path(workspace: Path, row: Mapping[str, Any]) -> dict[str
     }
 
 
-def _review_tags(controller: ControllerPort, proposals: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+def _review_tags(
+    controller: ControllerPort, proposals: Sequence[Mapping[str, Any]]
+) -> list[dict[str, Any]]:
     if not proposals:
         return []
     try:
@@ -2634,9 +3560,15 @@ def _review_tags(controller: ControllerPort, proposals: Sequence[Mapping[str, An
             row["decision"] = matches[0].get("decision")
             row["decision_reason"] = str(matches[0].get("decision_reason") or "")
         elif len(matches) > 1:
-            row.update(decision="parked", decision_reason="controller_returned_duplicate_decisions")
+            row.update(
+                decision="parked",
+                decision_reason="controller_returned_duplicate_decisions",
+            )
         if row.get("decision") not in {"accepted", "parked", "rejected"}:
-            row.update(decision="parked", decision_reason="controller_returned_no_valid_decision")
+            row.update(
+                decision="parked",
+                decision_reason="controller_returned_no_valid_decision",
+            )
         decisions.append(row)
     return decisions
 
@@ -2650,8 +3582,28 @@ def _fingerprint(
     reader_model: str,
     source_scope: str,
 ) -> str:
+    payload = {
+        "zotero_item_key": key,
+        "content_hash": content_hash,
+        "extraction_version": request.extraction_version,
+        "prompt_version": request.prompt_version,
+        "reader_provider": reader_provider,
+        "reader_model": reader_model,
+        "source_scope": source_scope,
+        "question_lens_policy_version": "collection_invariant-1",
+        "metadata_hash": _prompt_metadata_hash(item),
+        "chunking_version": CHUNKING_VERSION,
+        "content_classifier_version": CONTENT_CLASSIFIER_VERSION,
+        "processing_policy_hash": sha256_text(
+            json.dumps(request.to_dict().get("processing", {}), sort_keys=True)
+        ),
+    }
+    return sha256_text(json.dumps(payload, sort_keys=True))
+
+
+def _prompt_metadata(item: Mapping[str, Any]) -> dict[str, Any]:
     metadata = item_data(item)
-    prompt_metadata = {
+    return {
         field: metadata.get(field)
         for field in (
             "title",
@@ -2669,21 +3621,17 @@ def _fingerprint(
             "extra",
         )
     }
-    payload = {
-        "zotero_item_key": key,
-        "content_hash": content_hash,
-        "extraction_version": request.extraction_version,
-        "prompt_version": request.prompt_version,
-        "reader_provider": reader_provider,
-        "reader_model": reader_model,
-        "source_scope": source_scope,
-        "question_lens_policy_version": "collection_invariant-1",
-        "metadata_hash": sha256_text(json.dumps(prompt_metadata, sort_keys=True, ensure_ascii=False, default=str)),
-        "chunking_version": CHUNKING_VERSION,
-        "content_classifier_version": CONTENT_CLASSIFIER_VERSION,
-        "processing_policy_hash": sha256_text(json.dumps(request.to_dict().get("processing", {}), sort_keys=True)),
-    }
-    return sha256_text(json.dumps(payload, sort_keys=True))
+
+
+def _prompt_metadata_hash(item: Mapping[str, Any]) -> str:
+    return sha256_text(
+        json.dumps(
+            _prompt_metadata(item),
+            sort_keys=True,
+            ensure_ascii=False,
+            default=str,
+        )
+    )
 
 
 def _attempt(
@@ -2711,7 +3659,9 @@ def _attempt(
     }
 
 
-def _exhausted_result(index: int, item: Mapping[str, Any], route: str, reason: str) -> dict[str, Any]:
+def _exhausted_result(
+    index: int, item: Mapping[str, Any], route: str, reason: str
+) -> dict[str, Any]:
     row = {
         "inventory_index": index,
         "item": dict(item),
@@ -2729,7 +3679,9 @@ def _exhausted_result(index: int, item: Mapping[str, Any], route: str, reason: s
 
 
 def _duplicate_result(index: int, item: Mapping[str, Any]) -> dict[str, Any]:
-    return _exhausted_result(index, item, "identity_reconciliation", "duplicate_zotero_item_key")
+    return _exhausted_result(
+        index, item, "identity_reconciliation", "duplicate_zotero_item_key"
+    )
 
 
 def _public_terminal_row(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -2748,7 +3700,12 @@ def _public_terminal_row(row: Mapping[str, Any]) -> dict[str, Any]:
 
 def _blocked_report(request: MapRequest, run_id: str, reason: str) -> RunReport:
     workspace = resolve_workspace(request.workspace)
-    report = RunReport(status="blocked", workspace=workspace, run_id=run_id, errors=[{"reason": reason}])
+    report = RunReport(
+        status="blocked",
+        workspace=workspace,
+        run_id=run_id,
+        errors=[{"reason": reason}],
+    )
     run_dir = run_directory(workspace, run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
     _write_run_report(run_dir, report)
@@ -2757,7 +3714,9 @@ def _blocked_report(request: MapRequest, run_id: str, reason: str) -> RunReport:
 
 def _write_run_report(run_dir: Path, report: RunReport) -> None:
     payload = report.to_dict()
-    digest = sha256_text(json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str))
+    digest = sha256_text(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    )
     snapshot = run_dir / "reports" / f"run-report-{digest[:16]}.yml"
     if not snapshot.exists():
         write_yaml(snapshot, payload)
@@ -2785,20 +3744,101 @@ def _reusable_note(path: Path, row: Mapping[str, Any], request: MapRequest) -> b
         return False
     return all(
         (
-            str(frontmatter.get("zotero_item_key", "")) == str(row.get("zotero_item_key", "")),
-            str(frontmatter.get("inspected_content_hash", "")) == str(row.get("content_hash", "")),
-            str(frontmatter.get("reader_provider", "")) == str(row.get("reader_provider", "")),
-            str(frontmatter.get("reader_model", "")) == str(row.get("reader_model", "")),
-            str(frontmatter.get("extraction_version", "")) == request.extraction_version,
+            str(frontmatter.get("zotero_item_key", ""))
+            == str(row.get("zotero_item_key", "")),
+            str(frontmatter.get("inspected_content_hash", ""))
+            == str(row.get("content_hash", "")),
+            str(frontmatter.get("reader_provider", ""))
+            == str(row.get("reader_provider", "")),
+            str(frontmatter.get("reader_model", ""))
+            == str(row.get("reader_model", "")),
+            str(frontmatter.get("source_scope", ""))
+            == str(row.get("source_scope", "")),
+            str(frontmatter.get("extraction_version", ""))
+            == request.extraction_version,
             str(frontmatter.get("prompt_version", "")) == request.prompt_version,
         )
+    )
+
+
+def _compatible_committed_note(
+    workspace: Path,
+    row: Mapping[str, Any],
+    request: MapRequest,
+) -> Path | None:
+    """Reuse a current-schema note when only the processing budget changed.
+
+    Processing limits belong in paid-call checkpoint identities, but changing a
+    timeout or chunk budget must not force the same provider and prompt to reread
+    source content that already produced a valid committed note. Restrict this
+    fallback to a committed note that passes the current validator and still
+    matches the source content, scope, provider, model, prompt, extraction
+    version, and prompt-visible metadata. This also honors the migration policy
+    for readable legacy notes without rereading their source documents.
+    """
+
+    fingerprint_root = workspace / "11_state" / "fingerprints"
+    if not fingerprint_root.is_dir():
+        return None
+    zotero_item_key = str(row.get("zotero_item_key") or "")
+    source_id = str(row.get("source_id") or "")
+    current_metadata_hash = _prompt_metadata_hash(row.get("item", {}))
+    candidates: list[Path] = []
+    for fingerprint_path in fingerprint_root.glob("*.yml"):
+        payload = read_yaml(fingerprint_path, {}) or {}
+        if str(payload.get("zotero_item_key") or "") != zotero_item_key:
+            continue
+        recorded_source_id = str(payload.get("source_id") or "")
+        if source_id and recorded_source_id and recorded_source_id != source_id:
+            continue
+        recorded_metadata_hash = str(payload.get("metadata_hash") or "")
+        if recorded_metadata_hash and recorded_metadata_hash != current_metadata_hash:
+            continue
+        note_path = workspace / str(payload.get("note_path") or "")
+        if note_path.is_file() and (
+            recorded_metadata_hash
+            or _legacy_note_metadata_matches(note_path, row.get("item", {}))
+        ):
+            candidates.append(note_path)
+    for note_path in sorted(set(candidates), key=lambda path: str(path)):
+        if _reusable_note(note_path, row, request):
+            return note_path
+    return None
+
+
+def _legacy_note_metadata_matches(note_path: Path, item: Mapping[str, Any]) -> bool:
+    """Check prompt-visible fields for fingerprints written before metadata hashes."""
+
+    try:
+        frontmatter, _ = parse_atomic_note(note_path.read_text(encoding="utf-8"))
+    except OSError:
+        return False
+    metadata = item_data(item)
+    comparisons = (
+        (frontmatter.get("title", ""), metadata.get("title", "")),
+        (frontmatter.get("creators", []), metadata.get("creators", [])),
+        (frontmatter.get("date", ""), metadata.get("date", "")),
+        (frontmatter.get("doi", ""), metadata.get("DOI") or metadata.get("doi") or ""),
+        (frontmatter.get("url", ""), metadata.get("url", "")),
+        (frontmatter.get("citation_key", ""), _citation_key(metadata)),
+        (frontmatter.get("original_zotero_tags", []), original_tags(item)),
+        (frontmatter.get("zotero_relations", {}), metadata.get("relations", {})),
+    )
+    return all(
+        json.dumps(left, sort_keys=True, ensure_ascii=False, default=str)
+        == json.dumps(right, sort_keys=True, ensure_ascii=False, default=str)
+        for left, right in comparisons
     )
 
 
 def _local_attachment_path(data: Mapping[str, Any]) -> Path | None:
     for key in ("source_file", "sourceFile", "local_path", "localPath", "path"):
         value = str(data.get(key) or "")
-        if not value or value.startswith("attachments:") or value.startswith("storage:"):
+        if (
+            not value
+            or value.startswith("attachments:")
+            or value.startswith("storage:")
+        ):
             continue
         path = Path(value).expanduser()
         if path.is_absolute() and path.exists() and path.is_file():
@@ -2820,7 +3860,11 @@ def _citation_key(data: Mapping[str, Any]) -> str:
 def _note_section(body: str, heading: str) -> str:
     import re
 
-    match = re.search(rf"^## {re.escape(heading)}\s*$\n+(.*?)(?=^## |\Z)", body, flags=re.MULTILINE | re.DOTALL)
+    match = re.search(
+        rf"^## {re.escape(heading)}\s*$\n+(.*?)(?=^## |\Z)",
+        body,
+        flags=re.MULTILINE | re.DOTALL,
+    )
     return match.group(1).strip() if match else ""
 
 
@@ -2855,7 +3899,10 @@ def _read_document(
     if context_tokens:
         context_chars = int(context_tokens * policy.estimated_chars_per_token)
         direct_limit = int(context_chars * policy.context_window_fraction)
-        chunk_limit = max(policy.chunk_char_limit, int(context_chars * min(policy.context_window_fraction, 0.65)))
+        chunk_limit = max(
+            policy.chunk_char_limit,
+            int(context_chars * min(policy.context_window_fraction, 0.65)),
+        )
     else:
         direct_limit = policy.direct_read_char_limit
         chunk_limit = policy.chunk_char_limit
@@ -2870,28 +3917,63 @@ def _read_document(
         "chunking_version": CHUNKING_VERSION,
         "content_classifier_version": CONTENT_CLASSIFIER_VERSION,
         "question_hash": sha256_text(question or ""),
-        "metadata_hash": sha256_text(json.dumps(dict(metadata), sort_keys=True, ensure_ascii=False, default=str)),
+        "metadata_hash": sha256_text(
+            json.dumps(dict(metadata), sort_keys=True, ensure_ascii=False, default=str)
+        ),
         "chunk_output_tokens": policy.chunk_output_tokens,
         "synthesis_output_tokens": policy.synthesis_output_tokens,
     }
     if len(text) <= direct_limit:
         direct_path = checkpoint_root / "direct.yml"
-        direct_checkpoint = read_yaml(direct_path, {}) or {} if checkpoint_enabled else {}
-        direct_identity = {**common_identity, "mode": "direct", "direct_limit": direct_limit}
-        if direct_checkpoint.get("identity") == direct_identity and isinstance(direct_checkpoint.get("analysis"), Mapping):
-            return _ensure_analysis_contract(dict(direct_checkpoint["analysis"])), f"{reader.name}_text", "reused_direct_source_checkpoint"
+        direct_checkpoint = (
+            read_yaml(direct_path, {}) or {} if checkpoint_enabled else {}
+        )
+        direct_identity = {
+            **common_identity,
+            "mode": "direct",
+            "direct_limit": direct_limit,
+        }
+        if direct_checkpoint.get("identity") == direct_identity and isinstance(
+            direct_checkpoint.get("analysis"), Mapping
+        ):
+            return (
+                _ensure_analysis_contract(dict(direct_checkpoint["analysis"])),
+                f"{reader.name}_text",
+                "reused_direct_source_checkpoint",
+            )
         try:
             if progress is not None:
                 progress.record_source_provider_call()
-            analysis = _ensure_analysis_contract(dict(reader.read_source(text, metadata, question)))
+            analysis = _ensure_analysis_contract(
+                dict(reader.read_source(text, metadata, question))
+            )
             if checkpoint_enabled:
-                write_yaml(direct_path, {"identity": direct_identity, "analysis": analysis, "updated_at": now_iso()})
+                write_yaml(
+                    direct_path,
+                    {
+                        "identity": direct_identity,
+                        "analysis": analysis,
+                        "updated_at": now_iso(),
+                    },
+                )
             return analysis, f"{reader.name}_text", "full_document_source_read"
         except Exception as exc:
             message = str(exc).casefold()
-            if not any(token in message for token in ("context", "token", "too long", "too large", "request size", "length")):
+            if not any(
+                token in message
+                for token in (
+                    "context",
+                    "token",
+                    "too long",
+                    "too large",
+                    "request size",
+                    "length",
+                )
+            ):
                 raise
-    chunks = _split_document(text, chunk_char_limit=chunk_limit, max_chunks=policy.max_total_chunks)
+    chunks = _split_document(
+        text, chunk_char_limit=chunk_limit, max_chunks=policy.max_total_chunks
+    )
     checkpoint_identity = {
         **common_identity,
         "mode": "hierarchical",
@@ -2902,15 +3984,25 @@ def _read_document(
     calls = 0
     analyses: list[Mapping[str, Any]] = []
     for index, chunk in enumerate(chunks):
-        checkpoint_path = checkpoint_root / "chunks" / f"{index + 1:04d}-{sha256_text(chunk)[:12]}.yml"
+        checkpoint_path = (
+            checkpoint_root
+            / "chunks"
+            / f"{index + 1:04d}-{sha256_text(chunk)[:12]}.yml"
+        )
         checkpoint = read_yaml(checkpoint_path, {}) or {} if checkpoint_enabled else {}
-        if checkpoint.get("identity") == checkpoint_identity and isinstance(checkpoint.get("analysis"), Mapping):
+        if checkpoint.get("identity") == checkpoint_identity and isinstance(
+            checkpoint.get("analysis"), Mapping
+        ):
             analysis = dict(checkpoint["analysis"])
         else:
             if calls >= policy.max_calls_per_document_run:
-                raise DocumentPartialError("document_call_budget_reached", len(analyses), len(chunks))
+                raise DocumentPartialError(
+                    "document_call_budget_reached", len(analyses), len(chunks)
+                )
             if time.monotonic() - started >= policy.document_deadline_seconds:
-                raise DocumentPartialError("document_deadline_reached", len(analyses), len(chunks))
+                raise DocumentPartialError(
+                    "document_deadline_reached", len(analyses), len(chunks)
+                )
             locator = _chunk_locator(chunk, index, len(chunks))
             attempts_before = int(getattr(reader, "transport_attempt_count", 0) or 0)
             if progress is not None:
@@ -2952,36 +4044,59 @@ def _read_document(
             )
     synthesis_path = checkpoint_root / "synthesis.yml"
     synthesis = read_yaml(synthesis_path, {}) or {} if checkpoint_enabled else {}
-    if synthesis.get("identity") == checkpoint_identity and isinstance(synthesis.get("analysis"), Mapping):
+    if synthesis.get("identity") == checkpoint_identity and isinstance(
+        synthesis.get("analysis"), Mapping
+    ):
         merged = _ensure_analysis_contract(dict(synthesis["analysis"]))
     elif hasattr(reader, "synthesize_document"):
         if calls >= policy.max_calls_per_document_run:
-            raise DocumentPartialError("document_call_budget_reached_before_synthesis", len(analyses), len(chunks))
+            raise DocumentPartialError(
+                "document_call_budget_reached_before_synthesis",
+                len(analyses),
+                len(chunks),
+            )
         if time.monotonic() - started >= policy.document_deadline_seconds:
-            raise DocumentPartialError("document_deadline_reached_before_synthesis", len(analyses), len(chunks))
+            raise DocumentPartialError(
+                "document_deadline_reached_before_synthesis", len(analyses), len(chunks)
+            )
         if progress is not None:
             progress.record_source_provider_call()
-        merged = _ensure_analysis_contract(dict(
-            reader.synthesize_document(  # type: ignore[attr-defined]
-                analyses,
-                metadata,
-                question,
-                max_output_tokens=policy.synthesis_output_tokens,
-                deadline_seconds=policy.request_deadline_seconds,
+        merged = _ensure_analysis_contract(
+            dict(
+                reader.synthesize_document(  # type: ignore[attr-defined]
+                    analyses,
+                    metadata,
+                    question,
+                    max_output_tokens=policy.synthesis_output_tokens,
+                    deadline_seconds=policy.request_deadline_seconds,
+                )
             )
-        ))
+        )
         if checkpoint_enabled:
-            write_yaml(synthesis_path, {"identity": checkpoint_identity, "analysis": merged, "updated_at": now_iso()})
-    else:
-        merged = _ensure_analysis_contract({
-            key: "\n\n".join(
-                f"Chunk {index + 1}/{len(analyses)}: {str(analysis.get(key, '')).strip()}"
-                for index, analysis in enumerate(analyses)
-                if str(analysis.get(key, "")).strip()
+            write_yaml(
+                synthesis_path,
+                {
+                    "identity": checkpoint_identity,
+                    "analysis": merged,
+                    "updated_at": now_iso(),
+                },
             )
-            for key in SECTION_KEYS
-        })
-    return merged, f"{reader.name}_hierarchical_text", f"hierarchical_source_read:{len(chunks)}"
+    else:
+        merged = _ensure_analysis_contract(
+            {
+                key: "\n\n".join(
+                    f"Chunk {index + 1}/{len(analyses)}: {str(analysis.get(key, '')).strip()}"
+                    for index, analysis in enumerate(analyses)
+                    if str(analysis.get(key, "")).strip()
+                )
+                for key in SECTION_KEYS
+            }
+        )
+    return (
+        merged,
+        f"{reader.name}_hierarchical_text",
+        f"hierarchical_source_read:{len(chunks)}",
+    )
 
 
 def _ensure_analysis_contract(analysis: Mapping[str, Any]) -> dict[str, Any]:
@@ -2990,7 +4105,10 @@ def _ensure_analysis_contract(analysis: Mapping[str, Any]) -> dict[str, Any]:
     completed = dict(analysis)
     if str(completed.get("plain_english_interpretation") or "").strip():
         return completed
-    findings = str(completed.get("detailed_findings") or "The reader did not report detailed findings.").strip()
+    findings = str(
+        completed.get("detailed_findings")
+        or "The reader did not report detailed findings."
+    ).strip()
     completed["plain_english_interpretation"] = (
         "Direction: See the reported direction in Detailed Findings; this legacy reader did not provide a separate translation.\n"
         "Magnitude: The technical result is retained in Detailed Findings, but no additional intuitive scale was supplied.\n"
@@ -3002,7 +4120,9 @@ def _ensure_analysis_contract(analysis: Mapping[str, Any]) -> dict[str, Any]:
     return completed
 
 
-def _split_document(text: str, *, chunk_char_limit: int | None = None, max_chunks: int | None = None) -> list[str]:
+def _split_document(
+    text: str, *, chunk_char_limit: int | None = None, max_chunks: int | None = None
+) -> list[str]:
     chunk_char_limit = chunk_char_limit or ProcessingPolicy().chunk_char_limit
     max_chunks = max_chunks or ProcessingPolicy().max_total_chunks
     paragraphs = text.split("\n\n")
@@ -3010,7 +4130,10 @@ def _split_document(text: str, *, chunk_char_limit: int | None = None, max_chunk
     current: list[str] = []
     current_size = 0
     for paragraph in paragraphs:
-        pieces = [paragraph[index : index + chunk_char_limit] for index in range(0, len(paragraph), chunk_char_limit)] or [""]
+        pieces = [
+            paragraph[index : index + chunk_char_limit]
+            for index in range(0, len(paragraph), chunk_char_limit)
+        ] or [""]
         for piece in pieces:
             addition = len(piece) + (2 if current else 0)
             if current and current_size + addition > chunk_char_limit:
@@ -3023,7 +4146,10 @@ def _split_document(text: str, *, chunk_char_limit: int | None = None, max_chunk
         chunks.append("\n\n".join(current))
     if len(chunks) > max_chunks:
         raise DocumentCoverageLimitError(len(chunks), max_chunks)
-    return [f"--- Document Chunk {index + 1}/{len(chunks)} ---\n{chunk}" for index, chunk in enumerate(chunks)]
+    return [
+        f"--- Document Chunk {index + 1}/{len(chunks)} ---\n{chunk}"
+        for index, chunk in enumerate(chunks)
+    ]
 
 
 def _chunk_locator(chunk: str, index: int, total: int) -> str:

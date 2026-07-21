@@ -4,7 +4,15 @@ import json
 import re
 from dataclasses import MISSING, asdict, dataclass, fields, is_dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence, get_args, get_origin, get_type_hints
+from typing import (
+    Any,
+    Callable,
+    Mapping,
+    Sequence,
+    get_args,
+    get_origin,
+    get_type_hints,
+)
 
 import yaml
 
@@ -23,8 +31,8 @@ PROFILE_SIDECAR_VERSION = "1"
 PROFILE_CHECKPOINT_VERSION = "1"
 PROFILE_PROMPT_VERSION = "3"
 PROFILE_CLASSIFIER_VERSION = "3"
-PROFILE_ALGORITHM_VERSION = "3"
-COMMITTED_NOTE_ANCHOR_AUGMENTATION_VERSION = "4"
+PROFILE_ALGORITHM_VERSION = "4"
+COMMITTED_NOTE_ANCHOR_AUGMENTATION_VERSION = "8"
 ANCHOR_ALGORITHM_VERSION = "1"
 SUPPORT_ENVELOPE_VERSION = "1"
 
@@ -45,13 +53,13 @@ GENERATED_NOTE_SECTION_MARKERS = (
 _SIDECAR_FIELDS = frozenset({"profile_schema_version", "profile"})
 _CHECKPOINT_FIELDS = frozenset({"checkpoint_schema_version", "fingerprint", "profile"})
 _TRACEABLE_LOCATOR = re.compile(
-    r"(?:\b(?:p{1,2}\.?|pages?|paragraphs?)\s*\d+(?:\s*[-\u2013\u2014]\s*\d+)?\b|"
+    r"(?:\b(?:(?:p{1,2}\.\s*|p{1,2}\s+|pages?\s+|paragraphs?\s+)\d+(?:\s*[-\u2013\u2014]\s*\d+)?)\b|"
     r"\b(?:abstract|introduction|background|literature review|methods?|methodology|data|results?|findings?|"
     r"discussion|conclusions?|limitations?|appendix)\b|\b(?:table|figure)\s*\d+[a-z]?\b)",
     flags=re.IGNORECASE,
 )
 _PAGE_LOCATOR = re.compile(
-    r"\b(?P<label>p{1,2}\.?|pages?)\s*(?P<start>\d+)(?:\s*[-\u2013\u2014]\s*(?P<end>\d+))?\b",
+    r"\b(?P<label>p{1,2}\.|p{1,2}(?=\s)|pages?(?=\s))\s*(?P<start>\d+)(?:\s*[-\u2013\u2014]\s*(?P<end>\d+))?\b",
     flags=re.IGNORECASE,
 )
 _TABLE_LOCATOR = re.compile(r"\btable\s+\d+[a-z]?\b", flags=re.IGNORECASE)
@@ -71,6 +79,10 @@ _GENERATED_NOTE_HEADING = re.compile(
     r"^(?:detailed findings|plain-english interpretation|thesis|method and research design|evidence and data|"
     r"strengths and contributions|methodological critique|limitations|what this source can support|"
     r"what this source cannot support|locators)(?:\s*\(\d+\))?$",
+    flags=re.IGNORECASE,
+)
+_WEAK_BARE_LOCATOR = re.compile(
+    r"^(?:abstract|analysis|data|findings?|limitations?|method|methods?|results?|statistical context|thesis)$",
     flags=re.IGNORECASE,
 )
 _STATISTICAL_FIGURE = re.compile(
@@ -101,25 +113,84 @@ _CONDITION = re.compile(
     flags=re.IGNORECASE,
 )
 _DIRECTION_TERMS = (
-    ("negative", ("decrease", "decreased", "decline", "declined", "lower", "negative", "reduce", "reduced")),
-    ("positive", ("increase", "increased", "higher", "positive", "raise", "raised", "grow", "grew")),
-    ("no_clear_difference", ("no difference", "null effect", "not statistically significant", "unchanged")),
+    (
+        "negative",
+        (
+            "decrease",
+            "decreased",
+            "decline",
+            "declined",
+            "lower",
+            "negative",
+            "reduce",
+            "reduced",
+        ),
+    ),
+    (
+        "positive",
+        (
+            "increase",
+            "increased",
+            "higher",
+            "positive",
+            "raise",
+            "raised",
+            "grow",
+            "grew",
+        ),
+    ),
+    (
+        "no_clear_difference",
+        ("no difference", "null effect", "not statistically significant", "unchanged"),
+    ),
     ("mixed", ("mixed", "heterogeneous", "varied", "inconsistent")),
 )
 _LABEL_ALIASES: Mapping[str, tuple[str, ...]] = {
-    "research_questions": ("research questions", "research question", "questions", "question"),
-    "concepts": ("concepts", "concept", "constructs", "construct", "keywords", "keyword"),
+    "research_questions": (
+        "research questions",
+        "research question",
+        "questions",
+        "question",
+    ),
+    "concepts": (
+        "concepts",
+        "concept",
+        "constructs",
+        "construct",
+        "keywords",
+        "keyword",
+    ),
     "theories": ("theories", "theory", "frameworks", "framework"),
     "mechanisms": ("mechanisms", "mechanism", "processes", "process"),
     "outcomes": ("outcomes", "outcome", "dependent variables", "dependent variable"),
     "cases": ("cases", "case", "units of analysis", "unit of analysis"),
     "populations": ("populations", "population", "sample", "participants"),
-    "geographies": ("geographies", "geography", "locations", "location", "countries", "country"),
+    "geographies": (
+        "geographies",
+        "geography",
+        "locations",
+        "location",
+        "countries",
+        "country",
+    ),
     "periods": ("periods", "period", "timeframe", "time frame", "study period"),
     "methods": ("methods", "method", "research design", "design"),
     "data_sources": ("data sources", "data source", "data", "dataset", "datasets"),
-    "measures": ("measures", "measure", "measurement", "operationalization", "indicators", "indicator"),
-    "author_stated_gaps": ("author stated gaps", "author-stated gaps", "research gaps", "gap", "gaps"),
+    "measures": (
+        "measures",
+        "measure",
+        "measurement",
+        "operationalization",
+        "indicators",
+        "indicator",
+    ),
+    "author_stated_gaps": (
+        "author stated gaps",
+        "author-stated gaps",
+        "research gaps",
+        "gap",
+        "gaps",
+    ),
     "future_research": ("future research", "further research", "research agenda"),
 }
 _PROFILE_ALIASES: Mapping[str, tuple[str, ...]] = {
@@ -149,7 +220,9 @@ class _UniqueKeyLoader(yaml.SafeLoader):
     pass
 
 
-def _construct_unique_mapping(loader: _UniqueKeyLoader, node: yaml.MappingNode, deep: bool = False) -> dict[Any, Any]:
+def _construct_unique_mapping(
+    loader: _UniqueKeyLoader, node: yaml.MappingNode, deep: bool = False
+) -> dict[Any, Any]:
     loader.flatten_mapping(node)
     result: dict[Any, Any] = {}
     for key_node, value_node in node.value:
@@ -165,7 +238,9 @@ def _construct_unique_mapping(loader: _UniqueKeyLoader, node: yaml.MappingNode, 
     return result
 
 
-_UniqueKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping)
+_UniqueKeyLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping
+)
 
 
 class ProfileError(RuntimeError):
@@ -281,7 +356,9 @@ def profile_dependency_fingerprint(
         anchor_algorithm_version=anchor_algorithm_version,
         support_envelope_version=support_envelope_version,
     )
-    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    encoded = json.dumps(
+        payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    )
     return sha256_text(encoded)
 
 
@@ -328,14 +405,18 @@ def parse_profile_json(value: str | bytes | bytearray) -> Any:
     if not isinstance(value, (str, bytes, bytearray)):
         raise ProfileParseError("profile response must be JSON text")
     try:
-        text = bytes(value).decode("utf-8") if isinstance(value, (bytes, bytearray)) else value
+        text = (
+            bytes(value).decode("utf-8")
+            if isinstance(value, (bytes, bytearray))
+            else value
+        )
     except UnicodeDecodeError as exc:
         raise ProfileParseError("profile response must be UTF-8 JSON text") from exc
     try:
         payload = json.loads(
             text,
             object_pairs_hook=_reject_duplicate_json_keys,
-            parse_constant=lambda token: (_raise_invalid_json_constant(token)),
+            parse_constant=lambda token: _raise_invalid_json_constant(token),
         )
     except (json.JSONDecodeError, ValueError) as exc:
         raise ProfileParseError(f"profile response is not strict JSON: {exc}") from exc
@@ -369,7 +450,13 @@ def build_evidence_profile(
             policy=policy,
         )
     response = reasoner_method(build_profile_prompt(note_text))
-    profile = parse_profile_json(response) if isinstance(response, (str, bytes, bytearray)) else profile_from_dict(response)
+    if isinstance(response, Mapping):
+        response = _normalize_reasoner_profile_payload(response)
+    profile = (
+        parse_profile_json(response)
+        if isinstance(response, (str, bytes, bytearray))
+        else profile_from_dict(response)
+    )
     _require_matching_lineage(profile, frontmatter)
     profile = _apply_controlled_profile_metadata(
         profile,
@@ -382,8 +469,61 @@ def build_evidence_profile(
     )
     validation = validate_profile(profile)
     if not validation.passed:
-        raise ProfileParseError(f"reasoner profile failed validation: {', '.join(validation.errors)}")
+        raise ProfileParseError(
+            f"reasoner profile failed validation: {', '.join(validation.errors)}"
+        )
     return profile
+
+
+def _normalize_reasoner_profile_payload(
+    payload: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Normalize narrow, unambiguous JSON-shape slips from a live reasoner.
+
+    Persisted profile readers remain strict. This adapter applies only to the
+    fresh provider response before contract validation, and only converts a
+    scalar support-envelope scope value into its one-item list equivalent.
+    """
+
+    normalized = dict(payload)
+    normalized["profile_schema_version"] = PROFILE_SCHEMA_VERSION
+    raw_anchors = normalized.get("evidence_anchors")
+    if not isinstance(raw_anchors, list):
+        return normalized
+    anchors: list[Any] = []
+    for raw_anchor in raw_anchors:
+        if not isinstance(raw_anchor, Mapping):
+            anchors.append(raw_anchor)
+            continue
+        anchor = dict(raw_anchor)
+        raw_envelope = anchor.get("support_envelope")
+        if not isinstance(raw_envelope, Mapping):
+            anchors.append(anchor)
+            continue
+        envelope = dict(raw_envelope)
+        raw_scope = envelope.get("scope")
+        if isinstance(raw_scope, Mapping):
+            envelope["scope"] = {
+                str(key): _normalize_reasoner_scope_value(value)
+                for key, value in raw_scope.items()
+            }
+        anchor["support_envelope"] = envelope
+        anchors.append(anchor)
+    normalized["evidence_anchors"] = anchors
+    return normalized
+
+
+def _normalize_reasoner_scope_value(value: Any) -> Any:
+    scalar_types = (str, int, float)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, scalar_types):
+        return [str(value)]
+    if isinstance(value, list) and all(
+        not isinstance(item, bool) and isinstance(item, scalar_types) for item in value
+    ):
+        return [str(item) for item in value]
+    return value
 
 
 profile_note = build_evidence_profile
@@ -428,11 +568,23 @@ def augment_profile_from_committed_note(
         )
     )
     existing_anchors = [
-        dict(anchor) for anchor in payload.get("evidence_anchors", []) or [] if isinstance(anchor, Mapping)
+        dict(anchor)
+        for anchor in payload.get("evidence_anchors", []) or []
+        if isinstance(anchor, Mapping)
     ]
     generated_anchors = [
-        dict(anchor) for anchor in generated.get("evidence_anchors", []) or [] if isinstance(anchor, Mapping)
+        dict(anchor)
+        for anchor in generated.get("evidence_anchors", []) or []
+        if isinstance(anchor, Mapping)
     ]
+    generated_by_semantic_key = {
+        (
+            re.sub(r"\s+", " ", str(anchor.get("claim") or "")).casefold().strip(),
+            str(anchor.get("evidence_role") or "").casefold().strip(),
+        ): anchor
+        for anchor in generated_anchors
+        if str(anchor.get("claim") or "").strip()
+    }
     merged_by_id: dict[str, dict[str, Any]] = {}
     existing_semantic_keys = {
         (
@@ -455,6 +607,25 @@ def augment_profile_from_committed_note(
             continue
         if anchor_id and anchor_id not in merged_by_id:
             candidate = dict(anchor)
+            if origin == "existing":
+                generated_match = generated_by_semantic_key.get(semantic_key)
+                if generated_match and _has_strong_source_locator(generated_match):
+                    current_locator = str(candidate.get("locator") or "").strip()
+                    if (
+                        not current_locator
+                        or _WEAK_BARE_LOCATOR.fullmatch(current_locator)
+                        or not _has_strong_source_locator(candidate)
+                    ):
+                        candidate["locator"] = str(generated_match.get("locator") or "")
+                        candidate["locators"] = list(
+                            generated_match.get("locators") or []
+                        )
+                        candidate["source_locators"] = [
+                            dict(row)
+                            for row in generated_match.get("source_locators", []) or []
+                            if isinstance(row, Mapping)
+                        ]
+                        candidate["revision_hash"] = ""
             if _ambiguous_mechanical_composite_anchor(candidate):
                 envelope = dict(candidate.get("support_envelope") or {})
                 restrictions = [
@@ -468,7 +639,9 @@ def augment_profile_from_committed_note(
                 )
                 if restriction not in restrictions:
                     restrictions.append(restriction)
-                envelope.update(support_status="support_unknown", restrictions=restrictions)
+                envelope.update(
+                    support_status="support_unknown", restrictions=restrictions
+                )
                 candidate["support_envelope"] = envelope
                 # Support status is part of the anchor content revision even
                 # though the source-local identity remains stable.
@@ -485,7 +658,9 @@ def augment_profile_from_committed_note(
     payload["validity"] = validity
     # The dependency hash identifies the same committed note and profile route;
     # downstream synthesis fingerprints independently include anchor revisions.
-    payload["dependency_hash"] = str(profile_to_dict(profile).get("dependency_hash") or "")
+    payload["dependency_hash"] = str(
+        profile_to_dict(profile).get("dependency_hash") or ""
+    )
     return profile_from_dict(payload), True
 
 
@@ -500,7 +675,9 @@ def _ambiguous_mechanical_composite_anchor(anchor: Mapping[str, Any]) -> bool:
 
     locator_values = [str(anchor.get("locator") or "")]
     raw_locators = anchor.get("locators") or []
-    if isinstance(raw_locators, Sequence) and not isinstance(raw_locators, (str, bytes, bytearray)):
+    if isinstance(raw_locators, Sequence) and not isinstance(
+        raw_locators, (str, bytes, bytearray)
+    ):
         locator_values.extend(str(value) for value in raw_locators)
     distinct_locators = {
         re.sub(r"\s+", " ", match.group(0)).strip().casefold()
@@ -525,7 +702,11 @@ def deterministic_profile(
     coverage_gate = _coverage_gate(frontmatter.get("source_coverage"))
     limited = not _is_analytical_full_document(frontmatter)
     context_metadata = _context_metadata(frontmatter)
-    zotero_tag_context = [str(value) for value in frontmatter.get("normalized_tags", []) if str(value).strip()]
+    zotero_tag_context = [
+        str(value)
+        for value in frontmatter.get("normalized_tags", [])
+        if str(value).strip()
+    ]
     stated_concepts = _labeled_values(body, "concepts")
     # Zotero tags are context for limited notes and a weak relation signal for
     # analytical notes; they are not substantive semantic evidence by themselves.
@@ -540,14 +721,28 @@ def deterministic_profile(
     locator_text = sections.get("Locators", "")
     populations = [] if limited else _populations(sections)
     outcomes = [] if limited else _labeled_values(body, "outcomes")
-    finding_payloads = [] if limited else _extract_findings(
-        detailed_findings,
-        plain_english,
-        locator_text,
-        note_id=str(frontmatter.get("note_id") or ""),
-        populations=populations,
-        outcomes=outcomes,
+    finding_payloads = (
+        []
+        if limited
+        else _extract_findings(
+            detailed_findings,
+            plain_english,
+            locator_text,
+            note_id=str(frontmatter.get("note_id") or ""),
+            populations=populations,
+            outcomes=outcomes,
+        )
     )
+    if not limited:
+        finding_payloads.extend(
+            _extract_central_argument_findings(
+                sections,
+                locator_text,
+                note_id=str(frontmatter.get("note_id") or ""),
+                populations=populations,
+                outcomes=outcomes,
+            )
+        )
     findings = [_construct_finding(payload) for payload in finding_payloads]
     support_boundaries = _support_boundaries(sections, exclusion_reason)
     semantic_hash = semantic_note_hash(note_text)
@@ -562,7 +757,11 @@ def deterministic_profile(
     periods = [] if limited else _periods(sections)
     data_sources = [] if limited else _data_sources(sections)
     study_family = _study_family(frontmatter)
-    full_document = note_status in ANALYTICAL_NOTE_STATUSES and source_scope == "full_document" and coverage_gate == "passed"
+    full_document = (
+        note_status in ANALYTICAL_NOTE_STATUSES
+        and source_scope == "full_document"
+        and coverage_gate == "passed"
+    )
     coverage = {
         "note_status": note_status,
         "source_scope": source_scope,
@@ -634,9 +833,13 @@ def deterministic_profile(
             else None
         ),
         "findings": findings,
-        "limitations": [] if limited else _content_items(sections.get("Limitations", "")),
+        "limitations": []
+        if limited
+        else _content_items(sections.get("Limitations", "")),
         "support_boundaries": support_boundaries,
-        "author_stated_gaps": [] if limited else _labeled_values(body, "author_stated_gaps"),
+        "author_stated_gaps": []
+        if limited
+        else _labeled_values(body, "author_stated_gaps"),
         "future_research": [] if limited else _labeled_values(body, "future_research"),
         "exclusion_reason": exclusion_reason,
         "context_metadata": context_metadata,
@@ -673,7 +876,22 @@ def _enrich_profile_v12_records(
         return profile
     payload = profile.to_dict()
     source_id = str(payload.get("source_id") or frontmatter.get("source_id") or "")
-    if "study_lineage" in profile_fields and not payload.get("study_lineage") and not payload.get("excluded_from_synthesis"):
+    validity = (
+        payload.get("validity") if isinstance(payload.get("validity"), Mapping) else {}
+    )
+    prior_augmentation_version = str(
+        validity.get("committed_note_anchor_augmentation_version") or ""
+    )
+    note_locator_text = sections.get("Locators", "")
+    prior_aggregate_fallback = _bounded_note_locator(note_locator_text)
+    note_locator_matches = _dedupe(
+        [match.group(0) for match in _TRACEABLE_LOCATOR.finditer(note_locator_text)]
+    )
+    if (
+        "study_lineage" in profile_fields
+        and not payload.get("study_lineage")
+        and not payload.get("excluded_from_synthesis")
+    ):
         payload["study_lineage"] = _study_lineage_payload(
             frontmatter,
             sections,
@@ -688,13 +906,55 @@ def _enrich_profile_v12_records(
             continue
         anchor = dict(raw_anchor)
         anchor_id = str(anchor.get("evidence_anchor_id") or "")
+        current_locator = str(anchor.get("locator") or "").strip()
+        unsafe_v5_aggregate = bool(
+            prior_augmentation_version == "5"
+            and len(note_locator_matches) > 1
+            and current_locator.casefold() == prior_aggregate_fallback.casefold()
+        )
+        weak_locator = bool(
+            not current_locator or _weak_generated_locator_text(current_locator)
+        )
+        if unsafe_v5_aggregate or weak_locator:
+            envelope = dict(anchor.get("support_envelope") or {})
+            restrictions = [
+                str(value)
+                for value in envelope.get("restrictions", []) or []
+                if str(value).strip()
+            ]
+            restriction = (
+                "Aggregate document coverage does not establish claim-level support; "
+                "lazily reprofile this anchor before substantive synthesis"
+                if unsafe_v5_aggregate
+                else "A claim-specific source locator was not recovered mechanically; "
+                "lazily reprofile this anchor before substantive synthesis"
+            )
+            if restriction not in restrictions:
+                restrictions.append(restriction)
+            envelope.update(support_status="support_unknown", restrictions=restrictions)
+            anchor["support_envelope"] = envelope
+            if "source_locators" in anchor_fields:
+                anchor["source_locators"] = [
+                    {
+                        **dict(row),
+                        "supports_strong_assertion": False,
+                    }
+                    for row in _source_locator_payloads(
+                        current_locator,
+                        source_id=source_id,
+                        evidence_anchor_id=anchor_id,
+                    )
+                ]
+            anchor["revision_hash"] = ""
         if "source_locators" in anchor_fields and not anchor.get("source_locators"):
             anchor["source_locators"] = _source_locator_payloads(
                 str(anchor.get("locator") or ""),
                 source_id=source_id,
                 evidence_anchor_id=anchor_id,
             )
-        if "quantitative_result" in anchor_fields and not anchor.get("quantitative_result"):
+        if "quantitative_result" in anchor_fields and not anchor.get(
+            "quantitative_result"
+        ):
             anchor["quantitative_result"] = _quantitative_result_payload(
                 anchor,
                 source_id=source_id,
@@ -707,7 +967,9 @@ def _enrich_profile_v12_records(
                 str(anchor.get("finding_type") or "").casefold() == "statistical"
                 or bool(_STATISTICAL_FIGURE.search(str(anchor.get("claim") or "")))
                 or bool(_STATISTICAL_FIGURE.search(str(anchor.get("magnitude") or "")))
-                or bool(_STATISTICAL_FIGURE.search(str(anchor.get("uncertainty") or "")))
+                or bool(
+                    _STATISTICAL_FIGURE.search(str(anchor.get("uncertainty") or ""))
+                )
             )
             if statistical and not anchor.get("quantitative_result"):
                 envelope = dict(anchor.get("support_envelope") or {})
@@ -722,7 +984,9 @@ def _enrich_profile_v12_records(
                 )
                 if restriction not in restrictions:
                     restrictions.append(restriction)
-                envelope.update(support_status="support_unknown", restrictions=restrictions)
+                envelope.update(
+                    support_status="support_unknown", restrictions=restrictions
+                )
                 anchor["support_envelope"] = envelope
                 anchor["revision_hash"] = ""
         enriched.append(anchor)
@@ -731,21 +995,41 @@ def _enrich_profile_v12_records(
     return profile_from_dict(payload)
 
 
-def validate_profile(profile: Any, *, require_substantive: bool = True) -> ProfileValidation:
+def validate_profile(
+    profile: Any, *, require_substantive: bool = True
+) -> ProfileValidation:
     payload = profile_to_dict(profile)
     errors: list[str] = []
     warnings: list[str] = []
-    coverage = payload.get("coverage") if isinstance(payload.get("coverage"), Mapping) else {}
-    context = payload.get("context") if isinstance(payload.get("context"), Mapping) else {}
-    status = str(_value(payload, "note_status") or coverage.get("note_status") or context.get("note_status") or "")
-    scope = str(_value(payload, "source_scope") or coverage.get("source_scope") or context.get("source_scope") or "")
+    coverage = (
+        payload.get("coverage") if isinstance(payload.get("coverage"), Mapping) else {}
+    )
+    context = (
+        payload.get("context") if isinstance(payload.get("context"), Mapping) else {}
+    )
+    status = str(
+        _value(payload, "note_status")
+        or coverage.get("note_status")
+        or context.get("note_status")
+        or ""
+    )
+    scope = str(
+        _value(payload, "source_scope")
+        or coverage.get("source_scope")
+        or context.get("source_scope")
+        or ""
+    )
     gate = str(_value(payload, "coverage_gate") or coverage.get("coverage_gate") or "")
     findings = _value(payload, "findings") or []
-    if not isinstance(findings, Sequence) or isinstance(findings, (str, bytes, bytearray)):
+    if not isinstance(findings, Sequence) or isinstance(
+        findings, (str, bytes, bytearray)
+    ):
         errors.append("findings_must_be_a_list")
         findings = []
     anchors = payload.get("evidence_anchors") or []
-    if not isinstance(anchors, Sequence) or isinstance(anchors, (str, bytes, bytearray)):
+    if not isinstance(anchors, Sequence) or isinstance(
+        anchors, (str, bytes, bytearray)
+    ):
         errors.append("evidence_anchors_must_be_a_list")
         anchors = []
     if len(anchors) > 24:
@@ -755,7 +1039,12 @@ def validate_profile(profile: Any, *, require_substantive: bool = True) -> Profi
         or bool(payload.get("excluded_from_synthesis"))
         or str(_value(payload, "profile_status") or "").startswith("limited")
     )
-    substantive = status in ANALYTICAL_NOTE_STATUSES and scope == "full_document" and gate == "passed" and not limited
+    substantive = (
+        status in ANALYTICAL_NOTE_STATUSES
+        and scope == "full_document"
+        and gate == "passed"
+        and not limited
+    )
     if limited and findings:
         errors.append("limited_profile_contains_substantive_findings")
     if limited and anchors:
@@ -769,7 +1058,9 @@ def validate_profile(profile: Any, *, require_substantive: bool = True) -> Profi
         claim = str(anchor.get("claim") or "").strip()
         locator_values = [str(anchor.get("locator") or "")]
         raw_locators = anchor.get("locators") or []
-        if isinstance(raw_locators, Sequence) and not isinstance(raw_locators, (str, bytes, bytearray)):
+        if isinstance(raw_locators, Sequence) and not isinstance(
+            raw_locators, (str, bytes, bytearray)
+        ):
             locator_values.extend(str(value) for value in raw_locators)
         meaning = str(anchor.get("plain_english_meaning") or "").strip()
         statistical = (
@@ -781,22 +1072,59 @@ def validate_profile(profile: Any, *, require_substantive: bool = True) -> Profi
         if not claim:
             errors.append(f"anchor_{index}:missing_claim")
         source_locator_rows = anchor.get("source_locators") or []
+        envelope = (
+            anchor.get("support_envelope")
+            if isinstance(anchor.get("support_envelope"), Mapping)
+            else {}
+        )
+        support_status = str(envelope.get("support_status") or "support_unknown")
         if source_locator_rows:
             if not _has_strong_source_locator(anchor):
-                errors.append(f"anchor_{index}:source_native_locator_required")
-        elif not any(_TRACEABLE_LOCATOR.search(locator) for locator in locator_values if locator.strip()):
-            errors.append(f"anchor_{index}:traceable_locator_required")
+                if support_status == "support_unknown":
+                    warnings.append(
+                        f"anchor_{index}:source_native_locator_unresolved_support_unknown"
+                    )
+                else:
+                    errors.append(f"anchor_{index}:source_native_locator_required")
+        elif not any(
+            _TRACEABLE_LOCATOR.search(locator)
+            for locator in locator_values
+            if locator.strip()
+        ):
+            if support_status == "support_unknown":
+                warnings.append(
+                    f"anchor_{index}:traceable_locator_unresolved_support_unknown"
+                )
+            else:
+                errors.append(f"anchor_{index}:traceable_locator_required")
         if statistical and not meaning:
-            errors.append(f"anchor_{index}:plain_english_meaning_required_for_statistical_anchor")
-        if statistical and "quantitative_result" in anchor and not isinstance(anchor.get("quantitative_result"), Mapping):
-            envelope = anchor.get("support_envelope") if isinstance(anchor.get("support_envelope"), Mapping) else {}
+            errors.append(
+                f"anchor_{index}:plain_english_meaning_required_for_statistical_anchor"
+            )
+        if (
+            statistical
+            and "quantitative_result" in anchor
+            and not isinstance(anchor.get("quantitative_result"), Mapping)
+        ):
+            envelope = (
+                anchor.get("support_envelope")
+                if isinstance(anchor.get("support_envelope"), Mapping)
+                else {}
+            )
             if envelope.get("support_status") == "support_unknown":
-                warnings.append(f"anchor_{index}:typed_quantitative_result_unresolved_support_unknown")
+                warnings.append(
+                    f"anchor_{index}:typed_quantitative_result_unresolved_support_unknown"
+                )
             else:
                 errors.append(f"anchor_{index}:typed_quantitative_result_required")
     if substantive and not anchors:
         warnings.append("analytical_profile_has_no_substantive_anchors")
-    return ProfileValidation(passed=not errors, errors=tuple(errors), warnings=tuple(warnings), substantive=substantive)
+    return ProfileValidation(
+        passed=not errors,
+        errors=tuple(errors),
+        warnings=tuple(warnings),
+        substantive=substantive,
+    )
 
 
 validate_evidence_profile = validate_profile
@@ -818,7 +1146,9 @@ def profile_from_dict(payload: Mapping[str, Any]) -> Any:
     allowed = {field.name for field in fields(profile_class)}
     unknown = set(payload) - allowed
     if unknown:
-        raise ProfileContractError(f"unknown profile fields: {', '.join(sorted(unknown))}")
+        raise ProfileContractError(
+            f"unknown profile fields: {', '.join(sorted(unknown))}"
+        )
     values = dict(payload)
     version = str(values.get("profile_schema_version") or "1.0")
     if version not in {"1.0", "1.1", PROFILE_SCHEMA_VERSION}:
@@ -830,18 +1160,27 @@ def profile_from_dict(payload: Mapping[str, Any]) -> Any:
         raw_findings = values[findings_field]
         if not isinstance(raw_findings, list):
             raise ProfileContractError("profile.findings must be a list")
-        values[findings_field] = [_finding_from_dict(row, index=index) for index, row in enumerate(raw_findings)]
-    anchors_field = _actual_field_name(profile_class, "evidence_anchors", _PROFILE_ALIASES)
+        values[findings_field] = [
+            _finding_from_dict(row, index=index)
+            for index, row in enumerate(raw_findings)
+        ]
+    anchors_field = _actual_field_name(
+        profile_class, "evidence_anchors", _PROFILE_ALIASES
+    )
     if anchors_field and anchors_field in values:
         raw_anchors = values[anchors_field]
         if not isinstance(raw_anchors, list):
             raise ProfileContractError("profile.evidence_anchors must be a list")
-        values[anchors_field] = [_anchor_from_dict(row, index=index) for index, row in enumerate(raw_anchors)]
+        values[anchors_field] = [
+            _anchor_from_dict(row, index=index) for index, row in enumerate(raw_anchors)
+        ]
     _require_dataclass_fields(profile_class, values, "profile")
     try:
         return profile_class(**values)
     except (TypeError, ValueError) as exc:
-        raise ProfileContractError(f"profile does not match EvidenceProfile: {exc}") from exc
+        raise ProfileContractError(
+            f"profile does not match EvidenceProfile: {exc}"
+        ) from exc
 
 
 def profile_sidecar_path(profiles_dir: Path | str, note_id: str) -> Path:
@@ -852,7 +1191,9 @@ def profile_sidecar_path(profiles_dir: Path | str, note_id: str) -> Path:
 def save_profile(profiles_dir: Path | str, profile: Any) -> Path:
     note_id = str(_value(profile_to_dict(profile), "note_id") or "")
     if not note_id:
-        raise ProfilePersistenceError("profile.note_id is required for sidecar persistence")
+        raise ProfilePersistenceError(
+            "profile.note_id is required for sidecar persistence"
+        )
     path = profile_sidecar_path(profiles_dir, note_id)
     write_profile_sidecar(path, profile)
     return path
@@ -860,20 +1201,37 @@ def save_profile(profiles_dir: Path | str, profile: Any) -> Path:
 
 def write_profile_sidecar(path: Path | str, profile: Any) -> bool:
     target = Path(path)
-    payload = {"profile_schema_version": PROFILE_SIDECAR_VERSION, "profile": profile_to_dict(profile)}
+    payload = {
+        "profile_schema_version": PROFILE_SIDECAR_VERSION,
+        "profile": profile_to_dict(profile),
+    }
     if target.exists():
-        existing = _read_yaml_mapping(target, error_type=ProfilePersistenceError, label="profile sidecar")
-        _validate_wrapper(existing, _SIDECAR_FIELDS, "profile_schema_version", PROFILE_SIDECAR_VERSION, ProfilePersistenceError)
+        existing = _read_yaml_mapping(
+            target, error_type=ProfilePersistenceError, label="profile sidecar"
+        )
+        _validate_wrapper(
+            existing,
+            _SIDECAR_FIELDS,
+            "profile_schema_version",
+            PROFILE_SIDECAR_VERSION,
+            ProfilePersistenceError,
+        )
         try:
-            existing_profile = profile_from_dict(_required_mapping(existing, "profile", ProfilePersistenceError))
+            existing_profile = profile_from_dict(
+                _required_mapping(existing, "profile", ProfilePersistenceError)
+            )
         except ProfileContractError as exc:
-            raise ProfilePersistenceError(f"malformed profile sidecar {target}: {exc}") from exc
+            raise ProfilePersistenceError(
+                f"malformed profile sidecar {target}: {exc}"
+            ) from exc
         if (
             profile_to_dict(existing_profile) == payload["profile"]
             and _canonical_value(existing.get("profile")) == payload["profile"]
         ):
             return False
-    atomic_write_text(target, yaml.safe_dump(payload, sort_keys=False, allow_unicode=True))
+    atomic_write_text(
+        target, yaml.safe_dump(payload, sort_keys=False, allow_unicode=True)
+    )
     return True
 
 
@@ -883,12 +1241,24 @@ def load_profile(profiles_dir: Path | str, note_id: str) -> Any:
 
 def load_profile_sidecar(path: Path | str) -> Any:
     target = Path(path)
-    payload = _read_yaml_mapping(target, error_type=ProfilePersistenceError, label="profile sidecar")
-    _validate_wrapper(payload, _SIDECAR_FIELDS, "profile_schema_version", PROFILE_SIDECAR_VERSION, ProfilePersistenceError)
+    payload = _read_yaml_mapping(
+        target, error_type=ProfilePersistenceError, label="profile sidecar"
+    )
+    _validate_wrapper(
+        payload,
+        _SIDECAR_FIELDS,
+        "profile_schema_version",
+        PROFILE_SIDECAR_VERSION,
+        ProfilePersistenceError,
+    )
     try:
-        return profile_from_dict(_required_mapping(payload, "profile", ProfilePersistenceError))
+        return profile_from_dict(
+            _required_mapping(payload, "profile", ProfilePersistenceError)
+        )
     except ProfileContractError as exc:
-        raise ProfilePersistenceError(f"malformed profile sidecar {target}: {exc}") from exc
+        raise ProfilePersistenceError(
+            f"malformed profile sidecar {target}: {exc}"
+        ) from exc
 
 
 def profile_checkpoint_path(literature_state_dir: Path | str, note_id: str) -> Path:
@@ -908,14 +1278,18 @@ def write_profile_checkpoint(
     serialized_profile = profile_to_dict(profile)
     profile_note_id = str(_value(serialized_profile, "note_id") or "")
     if profile_note_id != str(note_id):
-        raise ProfileCheckpointError("profile checkpoint note_id does not match the profile")
+        raise ProfileCheckpointError(
+            "profile checkpoint note_id does not match the profile"
+        )
     payload = {
         "checkpoint_schema_version": PROFILE_CHECKPOINT_VERSION,
         "fingerprint": str(fingerprint),
         "profile": serialized_profile,
     }
     if path.exists():
-        existing = _read_yaml_mapping(path, error_type=ProfileCheckpointError, label="profile checkpoint")
+        existing = _read_yaml_mapping(
+            path, error_type=ProfileCheckpointError, label="profile checkpoint"
+        )
         _validate_wrapper(
             existing,
             _CHECKPOINT_FIELDS,
@@ -924,12 +1298,18 @@ def write_profile_checkpoint(
             ProfileCheckpointError,
         )
         try:
-            profile_from_dict(_required_mapping(existing, "profile", ProfileCheckpointError))
+            profile_from_dict(
+                _required_mapping(existing, "profile", ProfileCheckpointError)
+            )
         except ProfileContractError as exc:
-            raise ProfileCheckpointError(f"malformed profile checkpoint {path}: {exc}") from exc
+            raise ProfileCheckpointError(
+                f"malformed profile checkpoint {path}: {exc}"
+            ) from exc
         if _canonical_value(existing) == _canonical_value(payload):
             return path
-    atomic_write_text(path, yaml.safe_dump(payload, sort_keys=False, allow_unicode=True))
+    atomic_write_text(
+        path, yaml.safe_dump(payload, sort_keys=False, allow_unicode=True)
+    )
     return path
 
 
@@ -944,7 +1324,9 @@ def load_profile_checkpoint(
     path = profile_checkpoint_path(literature_state_dir, note_id)
     if not path.exists():
         return None
-    payload = _read_yaml_mapping(path, error_type=ProfileCheckpointError, label="profile checkpoint")
+    payload = _read_yaml_mapping(
+        path, error_type=ProfileCheckpointError, label="profile checkpoint"
+    )
     _validate_wrapper(
         payload,
         _CHECKPOINT_FIELDS,
@@ -953,9 +1335,13 @@ def load_profile_checkpoint(
         ProfileCheckpointError,
     )
     try:
-        profile = profile_from_dict(_required_mapping(payload, "profile", ProfileCheckpointError))
+        profile = profile_from_dict(
+            _required_mapping(payload, "profile", ProfileCheckpointError)
+        )
     except ProfileContractError as exc:
-        raise ProfileCheckpointError(f"malformed profile checkpoint {path}: {exc}") from exc
+        raise ProfileCheckpointError(
+            f"malformed profile checkpoint {path}: {exc}"
+        ) from exc
     if str(payload.get("fingerprint") or "") != str(expected_fingerprint):
         return None
     return profile
@@ -1009,7 +1395,9 @@ def _construct_profile(canonical: Mapping[str, Any]) -> Any:
     try:
         return profile_class(**values)
     except (TypeError, ValueError) as exc:
-        raise ProfileContractError(f"EvidenceProfile integration contract mismatch: {exc}") from exc
+        raise ProfileContractError(
+            f"EvidenceProfile integration contract mismatch: {exc}"
+        ) from exc
 
 
 def _construct_finding(canonical: Mapping[str, Any]) -> Any:
@@ -1019,7 +1407,9 @@ def _construct_finding(canonical: Mapping[str, Any]) -> Any:
     try:
         return finding_class(**values)
     except (TypeError, ValueError) as exc:
-        raise ProfileContractError(f"EvidenceFinding integration contract mismatch: {exc}") from exc
+        raise ProfileContractError(
+            f"EvidenceFinding integration contract mismatch: {exc}"
+        ) from exc
 
 
 def _finding_from_dict(payload: Any, *, index: int) -> Any:
@@ -1028,13 +1418,20 @@ def _finding_from_dict(payload: Any, *, index: int) -> Any:
     _, finding_class = _model_classes()
     normalized_payload = dict(payload)
     if "claim_id" in normalized_payload:
-        if "finding_id" in normalized_payload and normalized_payload["finding_id"] != normalized_payload["claim_id"]:
-            raise ProfileContractError(f"conflicting finding_id and claim_id at index {index}")
+        if (
+            "finding_id" in normalized_payload
+            and normalized_payload["finding_id"] != normalized_payload["claim_id"]
+        ):
+            raise ProfileContractError(
+                f"conflicting finding_id and claim_id at index {index}"
+            )
         normalized_payload["finding_id"] = normalized_payload.pop("claim_id")
     allowed = {field.name for field in fields(finding_class)}
     unknown = set(normalized_payload) - allowed
     if unknown:
-        raise ProfileContractError(f"unknown finding fields at index {index}: {', '.join(sorted(unknown))}")
+        raise ProfileContractError(
+            f"unknown finding fields at index {index}: {', '.join(sorted(unknown))}"
+        )
     values = normalized_payload
     _validate_dataclass_value_types(finding_class, values, f"profile.findings[{index}]")
     _require_dataclass_fields(finding_class, values, f"profile.findings[{index}]")
@@ -1046,12 +1443,16 @@ def _finding_from_dict(payload: Any, *, index: int) -> Any:
 
 def _anchor_from_dict(payload: Any, *, index: int) -> Any:
     if not isinstance(payload, Mapping):
-        raise ProfileContractError(f"profile.evidence_anchors[{index}] must be an object")
+        raise ProfileContractError(
+            f"profile.evidence_anchors[{index}] must be an object"
+        )
     anchor_class, _ = _anchor_classes()
     try:
         return anchor_class.from_dict(payload)
     except (TypeError, ValueError) as exc:
-        raise ProfileContractError(f"invalid evidence anchor at index {index}: {exc}") from exc
+        raise ProfileContractError(
+            f"invalid evidence anchor at index {index}: {exc}"
+        ) from exc
 
 
 def _adapt_canonical_values(
@@ -1072,7 +1473,9 @@ def _adapt_canonical_values(
         )
         if canonical_name not in canonical:
             continue
-        values[field.name] = _coerce_for_annotation(canonical[canonical_name], hints.get(field.name, field.type))
+        values[field.name] = _coerce_for_annotation(
+            canonical[canonical_name], hints.get(field.name, field.type)
+        )
     return values
 
 
@@ -1086,9 +1489,15 @@ def _coerce_for_annotation(value: Any, annotation: Any) -> Any:
             return list(value)
         return [] if value in (None, "") else [value]
     if origin is tuple:
-        return tuple(value) if isinstance(value, (list, tuple)) else (() if value in (None, "") else (value,))
+        return (
+            tuple(value)
+            if isinstance(value, (list, tuple))
+            else (() if value in (None, "") else (value,))
+        )
     if origin is not None and type(None) in args:
-        non_none = next((candidate for candidate in args if candidate is not type(None)), Any)
+        non_none = next(
+            (candidate for candidate in args if candidate is not type(None)), Any
+        )
         return None if value is None else _coerce_for_annotation(value, non_none)
     if annotation is str and isinstance(value, (list, tuple)):
         return "; ".join(str(item) for item in value)
@@ -1097,14 +1506,21 @@ def _coerce_for_annotation(value: Any, annotation: Any) -> Any:
     return value
 
 
-def _require_dataclass_fields(dataclass_type: type[Any], values: Mapping[str, Any], label: str) -> None:
+def _require_dataclass_fields(
+    dataclass_type: type[Any], values: Mapping[str, Any], label: str
+) -> None:
     missing = [
         field.name
         for field in fields(dataclass_type)
-        if field.init and field.default is MISSING and field.default_factory is MISSING and field.name not in values
+        if field.init
+        and field.default is MISSING
+        and field.default_factory is MISSING
+        and field.name not in values
     ]
     if missing:
-        raise ProfileContractError(f"missing required {label} fields: {', '.join(missing)}")
+        raise ProfileContractError(
+            f"missing required {label} fields: {', '.join(missing)}"
+        )
 
 
 def _validate_dataclass_value_types(
@@ -1115,7 +1531,11 @@ def _validate_dataclass_value_types(
     hints = get_type_hints(dataclass_type)
     for field in fields(dataclass_type):
         if field.name in values:
-            _require_value_type(values[field.name], hints.get(field.name, field.type), f"{label}.{field.name}")
+            _require_value_type(
+                values[field.name],
+                hints.get(field.name, field.type),
+                f"{label}.{field.name}",
+            )
 
 
 def _require_value_type(value: Any, annotation: Any, label: str) -> None:
@@ -1147,7 +1567,9 @@ def _require_value_type(value: Any, annotation: Any, label: str) -> None:
         raise ProfileContractError(f"{label} must be a boolean")
     if annotation is int and (isinstance(value, bool) or not isinstance(value, int)):
         raise ProfileContractError(f"{label} must be an integer")
-    if annotation is float and (isinstance(value, bool) or not isinstance(value, (int, float))):
+    if annotation is float and (
+        isinstance(value, bool) or not isinstance(value, (int, float))
+    ):
         raise ProfileContractError(f"{label} must be a number")
 
 
@@ -1157,14 +1579,23 @@ def _actual_field_name(
     aliases: Mapping[str, tuple[str, ...]],
 ) -> str | None:
     names = {field.name for field in fields(dataclass_type)}
-    return next((name for name in (canonical_name, *aliases.get(canonical_name, ())) if name in names), None)
+    return next(
+        (
+            name
+            for name in (canonical_name, *aliases.get(canonical_name, ()))
+            if name in names
+        ),
+        None,
+    )
 
 
 def _parse_note(note_text: str) -> tuple[dict[str, Any], str]:
     try:
         frontmatter, body = parse_atomic_note(note_text)
     except yaml.YAMLError as exc:
-        raise ProfileParseError(f"committed note has malformed YAML frontmatter: {exc}") from exc
+        raise ProfileParseError(
+            f"committed note has malformed YAML frontmatter: {exc}"
+        ) from exc
     return frontmatter, body
 
 
@@ -1173,8 +1604,12 @@ def _committed_note_text(note_text: str) -> str:
 
 
 def _strip_generated_body(body: str) -> str:
-    marker_pattern = "|".join(re.escape(marker) for marker in GENERATED_NOTE_SECTION_MARKERS)
-    return re.sub(rf"\n*(?:{marker_pattern})\s*\n.*\Z", "", body, flags=re.DOTALL).rstrip()
+    marker_pattern = "|".join(
+        re.escape(marker) for marker in GENERATED_NOTE_SECTION_MARKERS
+    )
+    return re.sub(
+        rf"\n*(?:{marker_pattern})\s*\n.*\Z", "", body, flags=re.DOTALL
+    ).rstrip()
 
 
 def _normalize_markdown(value: str) -> str:
@@ -1206,10 +1641,16 @@ def _context_metadata(frontmatter: Mapping[str, Any]) -> dict[str, Any]:
         "original_zotero_tags",
         "normalized_tags",
     )
-    return {key: _canonical_value(frontmatter[key]) for key in fields_to_keep if frontmatter.get(key) not in (None, "", [], {})}
+    return {
+        key: _canonical_value(frontmatter[key])
+        for key in fields_to_keep
+        if frontmatter.get(key) not in (None, "", [], {})
+    }
 
 
-def _limited_reason(note_status: str, source_scope: str, sections: Mapping[str, str]) -> str:
+def _limited_reason(
+    note_status: str, source_scope: str, sections: Mapping[str, str]
+) -> str:
     supplied = sections.get("Scope Limitation") or sections.get("Processing Status")
     if supplied:
         return supplied
@@ -1248,7 +1689,17 @@ def _source_role(frontmatter: Mapping[str, Any], sections: Mapping[str, str]) ->
         return "theoretical"
     if "methodological" in text or "measurement" in text:
         return "methodological"
-    if any(term in text for term in ("experiment", "randomized", "regression", "survey", "interview", "case study")):
+    if any(
+        term in text
+        for term in (
+            "experiment",
+            "randomized",
+            "regression",
+            "survey",
+            "interview",
+            "case study",
+        )
+    ):
         return "empirical"
     return "analytical_source"
 
@@ -1264,7 +1715,11 @@ def _labeled_values(text: str, key: str) -> list[str]:
     aliases = _LABEL_ALIASES[key]
     label_pattern = "|".join(re.escape(alias) for alias in aliases)
     values: list[str] = []
-    for match in re.finditer(rf"^(?:[-*]\s*)?(?:\*\*)?(?:{label_pattern})(?:\*\*)?\s*:\s*(.+)$", text, flags=re.MULTILINE | re.IGNORECASE):
+    for match in re.finditer(
+        rf"^(?:[-*]\s*)?(?:\*\*)?(?:{label_pattern})(?:\*\*)?\s*:\s*(.+)$",
+        text,
+        flags=re.MULTILINE | re.IGNORECASE,
+    ):
         values.extend(_split_values(match.group(1)))
     return _dedupe(values)
 
@@ -1302,20 +1757,43 @@ def _methods(sections: Mapping[str, str]) -> list[str]:
 
 
 def _data_sources(sections: Mapping[str, str]) -> list[str]:
-    text = "\n".join((sections.get("Method and Research Design", ""), sections.get("Evidence and Data", "")))
+    text = "\n".join(
+        (
+            sections.get("Method and Research Design", ""),
+            sections.get("Evidence and Data", ""),
+        )
+    )
     explicit = _labeled_values(text, "data_sources")
-    terms = ("survey data", "administrative data", "census data", "interview data", "archival data", "panel data", "registry data")
+    terms = (
+        "survey data",
+        "administrative data",
+        "census data",
+        "interview data",
+        "archival data",
+        "panel data",
+        "registry data",
+    )
     lowered = text.casefold()
     return _dedupe([*explicit, *(term for term in terms if term in lowered)])
 
 
 def _measures(sections: Mapping[str, str]) -> list[str]:
-    text = "\n".join((sections.get("Method and Research Design", ""), sections.get("Evidence and Data", "")))
+    text = "\n".join(
+        (
+            sections.get("Method and Research Design", ""),
+            sections.get("Evidence and Data", ""),
+        )
+    )
     return _labeled_values(text, "measures")
 
 
 def _populations(sections: Mapping[str, str]) -> list[str]:
-    text = "\n".join((sections.get("Method and Research Design", ""), sections.get("Evidence and Data", "")))
+    text = "\n".join(
+        (
+            sections.get("Method and Research Design", ""),
+            sections.get("Evidence and Data", ""),
+        )
+    )
     return _labeled_values(text, "populations")
 
 
@@ -1328,9 +1806,16 @@ def _geographies(frontmatter: Mapping[str, Any], body: str) -> list[str]:
 
 
 def _periods(sections: Mapping[str, str]) -> list[str]:
-    text = "\n".join((sections.get("Method and Research Design", ""), sections.get("Evidence and Data", "")))
+    text = "\n".join(
+        (
+            sections.get("Method and Research Design", ""),
+            sections.get("Evidence and Data", ""),
+        )
+    )
     explicit = _labeled_values(text, "periods")
-    year_ranges = re.findall(r"\b(?:19|20)\d{2}\s*[-\u2013\u2014]\s*(?:19|20)\d{2}\b", text)
+    year_ranges = re.findall(
+        r"\b(?:19|20)\d{2}\s*[-\u2013\u2014]\s*(?:19|20)\d{2}\b", text
+    )
     return _dedupe([*explicit, *year_ranges])
 
 
@@ -1338,7 +1823,10 @@ def _study_family(frontmatter: Mapping[str, Any]) -> dict[str, str]:
     doi = str(frontmatter.get("DOI") or frontmatter.get("doi") or "").strip().casefold()
     title = re.sub(r"\W+", " ", str(frontmatter.get("title") or "")).casefold().strip()
     identity = f"doi:{doi}" if doi else (f"title:{title}" if title else "")
-    return {"identity": identity, "basis": "doi" if doi else ("normalized_title" if title else "unavailable")}
+    return {
+        "identity": identity,
+        "basis": "doi" if doi else ("normalized_title" if title else "unavailable"),
+    }
 
 
 def _study_lineage_payload(
@@ -1351,7 +1839,10 @@ def _study_lineage_payload(
     periods: Sequence[str],
 ) -> dict[str, Any]:
     method_text = "\n".join(
-        (sections.get("Method and Research Design", ""), sections.get("Evidence and Data", ""))
+        (
+            sections.get("Method and Research Design", ""),
+            sections.get("Evidence and Data", ""),
+        )
     )
     authors: list[str] = []
     institutions: list[str] = []
@@ -1361,12 +1852,17 @@ def _study_lineage_payload(
                 creator.get("name")
                 or " ".join(
                     value
-                    for value in (str(creator.get("firstName") or "").strip(), str(creator.get("lastName") or "").strip())
+                    for value in (
+                        str(creator.get("firstName") or "").strip(),
+                        str(creator.get("lastName") or "").strip(),
+                    )
                     if value
                 )
             ).strip()
             if name:
-                if creator.get("fieldMode") == 1 or str(creator.get("creatorType") or "").casefold() in {
+                if creator.get("fieldMode") == 1 or str(
+                    creator.get("creatorType") or ""
+                ).casefold() in {
                     "contributor",
                     "sponsor",
                 }:
@@ -1427,7 +1923,9 @@ def _study_lineage_payload(
             {"relationship": value, "basis": "committed_note"}
             for value in publication_relationship_values
         ],
-        "institutional_series": institutional_series_values[0] if institutional_series_values else "",
+        "institutional_series": institutional_series_values[0]
+        if institutional_series_values
+        else "",
         "overlap_signals": overlap_signals,
         "confidence": "moderate" if overlap_signals else "unknown",
     }
@@ -1451,7 +1949,9 @@ def _explicit_lineage_values(text: str, labels: Sequence[str]) -> list[str]:
     return _dedupe(values)
 
 
-def _support_boundaries(sections: Mapping[str, str], exclusion_reason: str) -> list[str]:
+def _support_boundaries(
+    sections: Mapping[str, str], exclusion_reason: str
+) -> list[str]:
     boundaries: list[str] = []
     supported = sections.get("What This Source Can Support", "")
     unsupported = sections.get("What This Source Cannot Support", "")
@@ -1520,11 +2020,113 @@ def _extract_findings(
                 "locator": locator,
                 "locators": [locator] if locator else [],
                 "qualifiers": [] if condition == "not_reported" else [condition],
-                "confidence": "uncertainty_reported" if uncertainty != "not_reported" else "not_reported",
+                "confidence": "uncertainty_reported"
+                if uncertainty != "not_reported"
+                else "not_reported",
                 "is_statistical": statistical,
             }
         )
     return findings
+
+
+def _extract_central_argument_findings(
+    sections: Mapping[str, str],
+    locator_text: str,
+    *,
+    note_id: str,
+    populations: Sequence[str],
+    outcomes: Sequence[str],
+) -> list[dict[str, Any]]:
+    """Retain a note's central theory or contribution when it has a matched locator."""
+
+    findings: list[dict[str, Any]] = []
+    seen_claims: set[str] = set()
+    for section_name in ("Thesis", "Strengths and Contributions"):
+        for raw_claim in _content_items(sections.get(section_name, ""))[:1]:
+            claim = re.sub(r"\s+", " ", raw_claim).strip()
+            if not claim or len(claim) > 1200:
+                continue
+            identity_claim = claim.casefold()
+            if identity_claim in seen_claims:
+                continue
+            locator = _best_matching_source_locator(claim, locator_text)
+            if not locator:
+                continue
+            seen_claims.add(identity_claim)
+            identity = json.dumps(
+                {
+                    "note_id": note_id,
+                    "section": section_name,
+                    "claim": claim,
+                    "locator": locator,
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            findings.append(
+                {
+                    "finding_id": f"finding-{sha256_text(identity)[:16]}",
+                    "claim": claim,
+                    "finding_type": "conceptual",
+                    "direction": "not_reported",
+                    "magnitude": "not_reported",
+                    "comparison": "not_reported",
+                    "conditions": [],
+                    "plain_english_meaning": "",
+                    "population": populations[0] if populations else "not_reported",
+                    "outcome": outcomes[0] if outcomes else "not_reported",
+                    "estimate": "",
+                    "uncertainty": "not_reported",
+                    "evidence": claim,
+                    "locator": locator,
+                    "locators": [locator],
+                    "qualifiers": [f"atomic_note_section:{section_name}"],
+                    "confidence": "source_located_argument",
+                    "is_statistical": False,
+                }
+            )
+    return findings
+
+
+def _best_matching_source_locator(claim: str, locator_text: str) -> str:
+    """Choose a source-native locator whose nearby label matches the argument."""
+
+    stopwords = {
+        "article",
+        "argues",
+        "contribution",
+        "finds",
+        "identifies",
+        "paper",
+        "provides",
+        "source",
+        "study",
+        "theory",
+        "this",
+    }
+
+    def tokens(value: str) -> set[str]:
+        return {
+            token
+            for token in re.findall(r"[a-z]{4,}", value.casefold())
+            if token not in stopwords
+        }
+
+    claim_tokens = tokens(claim)
+    candidates: list[tuple[int, int, str]] = []
+    for segment in re.split(r"\s*;\s*", locator_text):
+        locators = _dedupe(
+            [match.group(0) for match in _TRACEABLE_LOCATOR.finditer(segment)]
+        )
+        if not locators:
+            continue
+        overlap = len(claim_tokens & tokens(segment))
+        candidates.append((overlap, -len(segment), "; ".join(locators)))
+    if not candidates:
+        return ""
+    best_overlap, _, locator = max(candidates)
+    return locator if best_overlap >= 2 else ""
 
 
 def _content_items(text: str) -> list[str]:
@@ -1537,7 +2139,11 @@ def _content_items(text: str) -> list[str]:
     ]
     if bullets:
         return _dedupe(bullets)
-    paragraphs = [re.sub(r"\s+", " ", paragraph).strip() for paragraph in re.split(r"\n\s*\n", text) if paragraph.strip()]
+    paragraphs = [
+        re.sub(r"\s+", " ", paragraph).strip()
+        for paragraph in re.split(r"\n\s*\n", text)
+        if paragraph.strip()
+    ]
     return _dedupe(paragraphs)
 
 
@@ -1564,7 +2170,41 @@ def _direction(text: str) -> str:
 
 
 def _first_locator(text: str) -> str:
-    return "; ".join(_dedupe([match.group(0) for match in _TRACEABLE_LOCATOR.finditer(text)]))
+    return "; ".join(
+        _dedupe([match.group(0) for match in _TRACEABLE_LOCATOR.finditer(text)])
+    )
+
+
+def _weak_generated_locator_text(text: str) -> bool:
+    """Return true when every locator fragment is only a generated note label."""
+
+    fragments = [
+        fragment.strip(" .:#")
+        for fragment in re.split(r"[;,]", str(text or ""))
+        if fragment.strip(" .:#")
+    ]
+    return bool(fragments) and all(
+        _WEAK_BARE_LOCATOR.fullmatch(fragment)
+        or _GENERATED_NOTE_HEADING.fullmatch(fragment)
+        for fragment in fragments
+    )
+
+
+def _bounded_note_locator(text: str) -> str:
+    """Turn a note's source locator section into one inspectable fallback range."""
+
+    page_ranges = [
+        (
+            int(match.group("start")),
+            int(match.group("end") or match.group("start")),
+        )
+        for match in _PAGE_LOCATOR.finditer(str(text or ""))
+    ]
+    if page_ranges:
+        start = min(value[0] for value in page_ranges)
+        end = max(value[1] for value in page_ranges)
+        return f"p. {start}" if start == end else f"pages {start}-{end}"
+    return _first_locator(text)
 
 
 def _source_locator_payloads(
@@ -1585,12 +2225,23 @@ def _source_locator_payloads(
         if fragment.strip(" .:#")
     ]
     for fragment in generated_fragments:
-        if _GENERATED_NOTE_HEADING.fullmatch(fragment):
+        if _GENERATED_NOTE_HEADING.fullmatch(fragment) or _WEAK_BARE_LOCATOR.fullmatch(
+            fragment
+        ):
             records.append(("generated_heading", fragment, None, None, False, False))
     for match in _PAGE_LOCATOR.finditer(locator):
         start = int(match.group("start"))
         end = int(match.group("end") or start)
-        records.append(("page_range" if end != start else "page", match.group(0), start, end, True, True))
+        records.append(
+            (
+                "page_range" if end != start else "page",
+                match.group(0),
+                start,
+                end,
+                True,
+                True,
+            )
+        )
     for locator_type, pattern in (
         ("table", _TABLE_LOCATOR),
         ("figure", _FIGURE_LOCATOR),
@@ -1601,7 +2252,9 @@ def _source_locator_payloads(
     ):
         for match in pattern.finditer(locator):
             value = match.group(0).strip()
-            if _GENERATED_NOTE_HEADING.fullmatch(value):
+            if _GENERATED_NOTE_HEADING.fullmatch(value) or _WEAK_BARE_LOCATOR.fullmatch(
+                value
+            ):
                 continue
             records.append((locator_type, value, None, None, True, True))
     seen: set[tuple[str, str]] = set()
@@ -1612,7 +2265,11 @@ def _source_locator_payloads(
             continue
         seen.add(key)
         identity = json.dumps(
-            {"source_id": source_id, "locator_type": locator_type, "value": value.casefold()},
+            {
+                "source_id": source_id,
+                "locator_type": locator_type,
+                "value": value.casefold(),
+            },
             sort_keys=True,
             ensure_ascii=False,
             separators=(",", ":"),
@@ -1643,7 +2300,10 @@ def _has_strong_source_locator(anchor: Mapping[str, Any]) -> bool:
         value = str(row.get("value") or "").strip()
         if _GENERATED_NOTE_HEADING.fullmatch(value):
             continue
-        if row.get("source_native") is True and row.get("supports_strong_assertion") is True:
+        if (
+            row.get("source_native") is True
+            and row.get("supports_strong_assertion") is True
+        ):
             return True
     return False
 
@@ -1664,7 +2324,11 @@ def _quantitative_result_payload(
     if not _STATISTICAL_FIGURE.search(text):
         return None
     estimand_type = _quantitative_estimand_type(text)
-    estimate = magnitude if magnitude and magnitude != "not_reported" else _match_text(_NUMBERED_MAGNITUDE, text)
+    estimate = (
+        magnitude
+        if magnitude and magnitude != "not_reported"
+        else _match_text(_NUMBERED_MAGNITUDE, text)
+    )
     if estimate == "not_reported":
         estimate = ""
     unit = ""
@@ -1700,19 +2364,25 @@ def _quantitative_result_payload(
         "estimate": estimate,
         "unit": unit,
         "scale": "probability" if "probab" in lowered else "",
-        "baseline": _match_group_text(r"\bbaseline(?: probability| rate| value)?\s*(?:of|=|:)\s*([^,.;]+)", text),
+        "baseline": _match_group_text(
+            r"\bbaseline(?: probability| rate| value)?\s*(?:of|=|:)\s*([^,.;]+)", text
+        ),
         "reference_group": reference,
         "comparison_group": "",
         "denominator": denominator_match.group(1) if denominator_match else "",
         "sample": sample_match.group(1) if sample_match else "",
         "uncertainty": "" if uncertainty == "not_reported" else uncertainty,
-        "population": str(anchor.get("population") or (populations[0] if populations else "")),
+        "population": str(
+            anchor.get("population") or (populations[0] if populations else "")
+        ),
         "period": periods[0] if periods else "",
         "model": _match_group_text(
             r"\b((?:logit|probit|logistic|linear|cox|multilevel|fixed[- ]effects|random[- ]effects)[^,.;]*)",
             text,
         ),
-        "provenance": "system_derived" if any(term in lowered for term in ("calculated", "derived")) else "source_reported",
+        "provenance": "system_derived"
+        if any(term in lowered for term in ("calculated", "derived"))
+        else "source_reported",
     }
 
 
@@ -1724,7 +2394,10 @@ def _quantitative_estimand_type(text: str) -> str:
         ("odds_ratio", ("odds ratio",)),
         ("hazard_ratio", ("hazard ratio",)),
         ("coefficient", ("coefficient", "beta")),
-        ("observed_rate", ("observed rate", "success rate", "prevalence", "proportion")),
+        (
+            "observed_rate",
+            ("observed rate", "success rate", "prevalence", "proportion"),
+        ),
         ("raw_percentage", ("%", "percent")),
     ):
         if any(term in lowered for term in terms):
@@ -1803,7 +2476,10 @@ def _apply_controlled_profile_metadata(
         statistical = bool(candidate.get("is_statistical")) or bool(
             _STATISTICAL_FIGURE.search(str(candidate.get("claim") or ""))
         )
-        if not locator or (statistical and not str(candidate.get("plain_english_meaning") or "").strip()):
+        if not locator or (
+            statistical
+            and not str(candidate.get("plain_english_meaning") or "").strip()
+        ):
             omitted_findings += 1
             continue
         filtered_findings.append(candidate)
@@ -1812,8 +2488,12 @@ def _apply_controlled_profile_metadata(
     for anchor in payload.get("evidence_anchors", []) or []:
         candidate = dict(anchor)
         locator_values = [str(candidate.get("locator") or "")]
-        locator_values.extend(str(value) for value in candidate.get("locators", []) or [])
-        locator = next((value for value in locator_values if _TRACEABLE_LOCATOR.search(value)), "")
+        locator_values.extend(
+            str(value) for value in candidate.get("locators", []) or []
+        )
+        locator = next(
+            (value for value in locator_values if _TRACEABLE_LOCATOR.search(value)), ""
+        )
         statistical = (
             str(candidate.get("finding_type") or "").casefold() == "statistical"
             or bool(_STATISTICAL_FIGURE.search(str(candidate.get("claim") or "")))
@@ -1839,12 +2519,18 @@ def _apply_controlled_profile_metadata(
                         "supports_strong_assertion": False,
                     }
                     if isinstance(row, Mapping)
-                    and _GENERATED_NOTE_HEADING.fullmatch(str(row.get("value") or "").strip())
+                    and _GENERATED_NOTE_HEADING.fullmatch(
+                        str(row.get("value") or "").strip()
+                    )
                     else dict(row)
                     for row in supplied_locators
                     if isinstance(row, Mapping)
                 ]
-        if "quantitative_result" in anchor_fields and statistical and not candidate.get("quantitative_result"):
+        if (
+            "quantitative_result" in anchor_fields
+            and statistical
+            and not candidate.get("quantitative_result")
+        ):
             candidate["quantitative_result"] = _quantitative_result_payload(
                 candidate,
                 source_id=source_id,
@@ -1858,7 +2544,10 @@ def _apply_controlled_profile_metadata(
             if "source_locators" in anchor_fields
             else bool(locator and _TRACEABLE_LOCATOR.search(locator))
         )
-        if not source_locator_valid or (statistical and not str(candidate.get("plain_english_meaning") or "").strip()):
+        if not source_locator_valid or (
+            statistical
+            and not str(candidate.get("plain_english_meaning") or "").strip()
+        ):
             continue
         candidate.update(
             evidence_anchor_id="",
@@ -1914,7 +2603,9 @@ def _apply_controlled_profile_metadata(
     )
     payload["context"] = context
     profile_class, _ = _model_classes()
-    if "study_lineage" in {field.name for field in fields(profile_class)} and not payload.get("study_lineage"):
+    if "study_lineage" in {
+        field.name for field in fields(profile_class)
+    } and not payload.get("study_lineage"):
         payload["study_lineage"] = _study_lineage_payload(
             frontmatter,
             sections,
@@ -1926,7 +2617,9 @@ def _apply_controlled_profile_metadata(
     return profile_from_dict(payload)
 
 
-def _rebind_anchor_extension_ids(candidate: Mapping[str, Any], anchor_class: type[Any]) -> dict[str, Any]:
+def _rebind_anchor_extension_ids(
+    candidate: Mapping[str, Any], anchor_class: type[Any]
+) -> dict[str, Any]:
     """Bind nested v1.2 records to the stable anchor ID after controlled normalization."""
 
     normalized = anchor_class.from_dict(candidate).to_dict()
@@ -1965,7 +2658,9 @@ def _value(
     return None
 
 
-def _read_yaml_mapping(path: Path, *, error_type: type[ProfileError], label: str) -> dict[str, Any]:
+def _read_yaml_mapping(
+    path: Path, *, error_type: type[ProfileError], label: str
+) -> dict[str, Any]:
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -1998,7 +2693,9 @@ def _validate_wrapper(
         raise error_type(f"missing persisted fields: {', '.join(sorted(missing))}")
 
 
-def _required_mapping(payload: Mapping[str, Any], key: str, error_type: type[ProfileError]) -> Mapping[str, Any]:
+def _required_mapping(
+    payload: Mapping[str, Any], key: str, error_type: type[ProfileError]
+) -> Mapping[str, Any]:
     value = payload.get(key)
     if not isinstance(value, Mapping):
         raise error_type(f"persisted {key} must be a mapping")
@@ -2007,7 +2704,10 @@ def _required_mapping(payload: Mapping[str, Any], key: str, error_type: type[Pro
 
 def _dataclass_shape(dataclass_type: type[Any]) -> dict[str, str]:
     hints = get_type_hints(dataclass_type)
-    return {field.name: _annotation_kind(hints.get(field.name, field.type)) for field in fields(dataclass_type)}
+    return {
+        field.name: _annotation_kind(hints.get(field.name, field.type))
+        for field in fields(dataclass_type)
+    }
 
 
 def _annotation_kind(annotation: Any) -> str:
@@ -2018,7 +2718,9 @@ def _annotation_kind(annotation: Any) -> str:
     if origin in {dict, Mapping}:
         return "object"
     if origin is not None and type(None) in args:
-        return _annotation_kind(next(candidate for candidate in args if candidate is not type(None)))
+        return _annotation_kind(
+            next(candidate for candidate in args if candidate is not type(None))
+        )
     if annotation is bool:
         return "boolean"
     if annotation in {int, float}:
@@ -2034,14 +2736,22 @@ def _canonical_value(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, Mapping):
-        return {str(key): _canonical_value(item) for key, item in sorted(value.items(), key=lambda row: str(row[0]))}
+        return {
+            str(key): _canonical_value(item)
+            for key, item in sorted(value.items(), key=lambda row: str(row[0]))
+        }
     if isinstance(value, (list, tuple)):
         return [_canonical_value(item) for item in value]
     if isinstance(value, (set, frozenset)):
-        return sorted((_canonical_value(item) for item in value), key=lambda item: json.dumps(item, sort_keys=True, ensure_ascii=False))
+        return sorted(
+            (_canonical_value(item) for item in value),
+            key=lambda item: json.dumps(item, sort_keys=True, ensure_ascii=False),
+        )
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
-    raise TypeError(f"value is not deterministically serializable: {type(value).__name__}")
+    raise TypeError(
+        f"value is not deterministically serializable: {type(value).__name__}"
+    )
 
 
 def _dedupe(values: Sequence[str]) -> list[str]:

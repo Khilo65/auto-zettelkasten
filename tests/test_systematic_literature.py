@@ -7,6 +7,7 @@ from typing import Any, Mapping
 import pytest
 import yaml
 
+from auto_zettelkasten import literature
 from auto_zettelkasten.literature import (
     DEBATE_STATES,
     GAP_RULES,
@@ -345,7 +346,9 @@ def test_typed_untagged_profiles_cluster_semantically_and_tags_are_only_tiebreak
     assert map_overlapping_clusters(mirrored)["clusters"] == []
 
 
-def test_reasoner_proposals_with_any_invalid_explicit_anchor_are_rejected() -> None:
+def test_reasoner_proposal_narrows_invalid_members_without_erasing_valid_cluster() -> (
+    None
+):
     rows = [
         profile("a", topic="institutional trust"),
         profile("b", topic="institutional trust"),
@@ -381,13 +384,15 @@ def test_reasoner_proposals_with_any_invalid_explicit_anchor_are_rejected() -> N
         ]
     }
     report = build_literature_report(rows, reasoner=reasoner)
-    assert report["cluster_registry"]["clusters"] == []
+    clusters = report["cluster_registry"]["clusters"]
+    assert len(clusters) == 1
+    assert clusters[0]["label"] == "Institutional trust mechanisms"
+    assert clusters[0]["core_source_ids"] == ["a", "b"]
     rejected = {
         row.get("proposal_id"): row.get("reason")
         for row in report["cluster_registry"]["rejected_proposals"]
     }
     assert rejected == {
-        "proposal-trust": "no_valid_connected_family_relation",
         "bad-locator": "no_valid_connected_family_relation",
     }
 
@@ -650,11 +655,11 @@ def test_study_family_dedup_controls_emerging_and_source_backed_status() -> None
     assert backed["status"] == "source_backed_cluster"
 
     only_one_family = [profile("x", family="one"), profile("x-reprint", family="one")]
-    rejected = map_overlapping_clusters(only_one_family)
-    assert rejected["clusters"] == []
-    assert {row["reason"] for row in rejected["unclustered_sources"]} == {
-        "no_valid_connected_family_relation"
-    }
+    concentrated = map_overlapping_clusters(only_one_family)
+    assert len(concentrated["clusters"]) == 1
+    assert concentrated["clusters"][0]["qualification_status"] == (
+        "evidence_concentrated_cluster"
+    )
 
 
 def test_source_backed_threshold_policy_changes_status_without_allowing_singletons() -> (
@@ -1579,6 +1584,15 @@ def test_compatibility_entry_accepts_current_rows_writes_all_outputs_and_has_no_
         },
     ]
     source_set = {"source_set_id": "set-1", "dependency_hash": "dependency"}
+    stale_neighborhood = (
+        tmp_path
+        / "03_literature_synthesis"
+        / "maps"
+        / stable_literature_map_id(source_set)
+        / "Literature Neighborhoods - set-1.md"
+    )
+    stale_neighborhood.parent.mkdir(parents=True, exist_ok=True)
+    stale_neighborhood.write_text("# Stale neighborhood projection\n")
     cluster_map, gap_map, packet, paths = build_literature_map(
         tmp_path,
         source_set=source_set,
@@ -1595,8 +1609,9 @@ def test_compatibility_entry_accepts_current_rows_writes_all_outputs_and_has_no_
     }
     assert gap_map["gap_candidates"] == []
     assert gap_map["status"] == "complete_no_qualifying_gaps"
-    assert packet["mapper_version"] == "0.9.0"
+    assert packet["mapper_version"] == "0.10.0"
     assert all(path.exists() for path in paths)
+    assert not stale_neighborhood.exists()
     manifest = yaml.safe_load(
         (tmp_path / "03_literature_synthesis" / "manifest.yml").read_text()
     )
@@ -1613,6 +1628,7 @@ def test_compatibility_entry_accepts_current_rows_writes_all_outputs_and_has_no_
         "coverage_register",
         "tag_concept_registry",
         "evidence_matrices",
+        "navigation_facets",
         "topic_neighborhoods",
         "subject_tag_registry",
         "subject_tag_assignments",
@@ -1626,7 +1642,6 @@ def test_compatibility_entry_accepts_current_rows_writes_all_outputs_and_has_no_
         "internal_search_log",
         "packet",
         "literature_map_markdown",
-        "literature_neighborhoods_markdown",
         "index",
         "canonical_map",
     }
@@ -1634,17 +1649,16 @@ def test_compatibility_entry_accepts_current_rows_writes_all_outputs_and_has_no_
     assert "Candidate gap requiring falsification" not in map_text
     for heading in (
         "# Literature Map",
-        "## What this map does",
-        "## Collection verdict",
-        "## Clusters at a glance",
-        "## How the clusters relate",
-        "## Collection gaps",
-        "## Coverage and limits",
-        "## Navigate",
+        "## What this collection is mainly about",
+        "## Literature clusters",
+        "## Collection-relative gaps",
+        "## Coverage",
     ):
         assert heading in map_text
-    assert "No analytical clusters were admitted in this map." in map_text
-    assert "No gap survived the collection-wide" in map_text
+    assert "No coherent multi-source cluster was admitted." in map_text
+    assert (
+        "No sufficiently specific collection-native candidate was generated" in map_text
+    )
     assert "Dependency hash" not in map_text and "fingerprint" not in map_text
     cluster_root = tmp_path / "03_literature_synthesis" / "clusters"
     assert list(cluster_root.glob("Cluster - *.md")) == []
@@ -1732,9 +1746,19 @@ def test_gap_markdown_has_native_tags_and_reciprocal_evidence_links(
                 "supporting_evidence": evidence,
                 "central_findings": [
                     {
-                        "finding": "Both studies estimate institutional trust outcomes.",
+                        "finding": (
+                            "Both studies estimate the same institutional-trust outcome and report a compatible "
+                            "association, so the collection contains an emerging cross-study pattern rather than "
+                            "a causal conclusion. In plain English, the result is repeated in two independent "
+                            "settings, which makes it more credible inside this collection, but two studies do "
+                            "not establish a mature collection-wide conclusion. Differences in design and case coverage also "
+                            "limit how far the pattern can be generalized."
+                        ),
                         "evidence": evidence,
                     }
+                ],
+                "boundaries": [
+                    "The evidence covers only the two mapped study settings."
                 ],
             }
         }
@@ -1792,9 +1816,9 @@ def test_gap_markdown_has_native_tags_and_reciprocal_evidence_links(
     assert cluster_frontmatter["related_gaps"] == [expected_gap_link]
     cluster_body = cluster_text.split("\n---\n", 1)[1]
     gap_body = text.split("\n---\n", 1)[1]
-    assert "## Collection gaps" in cluster_body
+    assert "## Gaps from this cluster" in cluster_body
     assert expected_gap_link in cluster_body
-    assert "## Why findings differ" not in cluster_body
+    assert "## Limits of the evidence" in cluster_body
     assert "## Counterevidence and limits" not in gap_body
     assert "claim-a" not in cluster_body and "claim-b" not in cluster_body
     assert "claim-a" not in gap_body and "claim-b" not in gap_body
@@ -1958,21 +1982,19 @@ def test_reasoned_cluster_markdown_explains_findings_debate_and_gap_lineage(
     cluster_body = cluster_text.split("\n---\n", 1)[1]
     gap_body = gap_text.split("\n---\n", 1)[1]
     for heading in (
-        "## Findings and interpretation",
-        "## Relationship among the findings",
-        "### Positions",
-        "### Contradictions",
-        "## Why findings differ",
-        "### Boundaries",
-        "### Method and measurement differences",
-        "## Collection gaps",
-        "## Proposition matrix",
+        "## Question and answer",
+        "## How this literature fits together",
+        "## What the studies find",
+        "## Where the evidence agrees, differs, or remains uncertain",
+        "## Limits of the evidence",
+        "## Gaps from this cluster",
+        "## Sources",
     ):
         assert heading in cluster_body
     assert "### Agreements" not in cluster_body
-    assert "In plain English:" in cluster_body
+    assert "In practical terms" in cluster_body
     assert "Panel regression versus case-study inference." in cluster_body
-    assert "[[Literature Neighborhoods - set-reasoned#" in cluster_body
+    assert "Literature Neighborhoods" not in cluster_body
     assert "claim-a" not in cluster_body and "claim-b" not in cluster_body
     assert "p. 10" in cluster_body
     assert "## Where the gap came from" in gap_body
@@ -1989,15 +2011,15 @@ def test_reasoned_cluster_markdown_explains_findings_debate_and_gap_lineage(
         (tmp_path / "03_literature_synthesis" / "manifest.yml").read_text()
     )
     map_text = Path(manifest["artifacts"]["literature_map_markdown"]).read_text()
-    assert "## What this map does" in map_text
-    assert "## Clusters at a glance" in map_text
+    assert "## What this collection is mainly about" in map_text
+    assert "## Literature clusters" in map_text
     assert (
         f"### [[{cluster_note_stem(cluster)}|{cluster_display_title(cluster)}]]"
         in map_text
     )
     assert "The two evidence bases estimate the same institutional-trust" in map_text
     assert "**Verdict:** ## Synthesis" not in map_text
-    assert "No gap survived the collection-wide" not in map_text
+    assert "No candidate survived the collection-wide" not in map_text
     assert Path(packet["literature_map_markdown"]).read_text() == map_text
     assert (
         "the collection literature map"
@@ -2010,7 +2032,7 @@ def test_reasoned_cluster_markdown_explains_findings_debate_and_gap_lineage(
         "The two evidence bases estimate the same institutional-trust"
         in cluster_index_text
     )
-    assert "effective evidence bases" in cluster_index_text
+    assert "core sources" in cluster_index_text
 
 
 def test_synthesis_budget_resume_reuses_successful_calls_without_repayment(
@@ -2249,6 +2271,283 @@ def test_coverage_repair_recovers_supported_family_and_replays_without_calls(
     assert replay_packet["synthesis_checkpoint_hit_count"] == 2
 
 
+def test_coverage_repair_uses_distinct_coarse_batches_for_large_source_sets(
+    tmp_path: Path,
+) -> None:
+    rows = [profile(f"source-{index:02d}") for index in range(26)]
+
+    class Reasoner:
+        name = "batched-coverage-repair-reasoner"
+        model = "batched-coverage-repair-v1"
+        is_cloud = False
+
+        def __init__(self) -> None:
+            self.repair_batches: list[list[str]] = []
+
+        def propose_clusters(self, profiles, request, *, context=None):
+            repair_source_ids = list(
+                (context or {}).get("coverage_repair_source_ids", []) or []
+            )
+            if not repair_source_ids:
+                source_ids = [row["source_id"] for row in profiles]
+                return {
+                    "clusters": [
+                        {
+                            "proposal_id": "unsupported-initial-family",
+                            "label": "Unsupported initial family",
+                            "semantic_identity": "unsupported initial family",
+                            "shared_question": "Does an unsupported topic connect every source?",
+                            "bounded_object": "unsupported initial topic",
+                            "source_ids": source_ids,
+                            "source_roles": {
+                                source_id: "core" for source_id in source_ids
+                            },
+                            "propositions": [
+                                {
+                                    "proposition_id": "unsupported-initial-proposition",
+                                    "statement": "Ocean salinity determines school finance.",
+                                    "source_ids": source_ids,
+                                    "evidence": [],
+                                }
+                            ],
+                            "family_relations": [],
+                        }
+                    ]
+                }
+
+            self.repair_batches.append(repair_source_ids)
+            batch_number = len(self.repair_batches)
+            evidence = [
+                {
+                    "source_id": row["source_id"],
+                    "evidence_anchor_id": row["claims"][0]["evidence_anchor_id"],
+                    "locator": row["claims"][0]["locator"],
+                }
+                for row in profiles
+                if row["source_id"] in repair_source_ids
+            ]
+            return {
+                "clusters": [
+                    {
+                        "proposal_id": f"repair-batch-{batch_number}",
+                        "label": f"Institutional trust evidence family {batch_number}",
+                        "semantic_identity": f"institutional trust family {batch_number}",
+                        "shared_question": "How does institutional trust relate to the mapped outcome?",
+                        "bounded_object": "institutional trust outcome relationship",
+                        "source_ids": repair_source_ids,
+                        "source_roles": {
+                            source_id: "core" for source_id in repair_source_ids
+                        },
+                        "propositions": [
+                            {
+                                "proposition_id": f"repair-proposition-{batch_number}",
+                                "statement": "Institutional trust predicts the mapped outcome.",
+                                "question": "How does institutional trust relate to the mapped outcome?",
+                                "proposition_type": "empirical",
+                                "source_ids": repair_source_ids,
+                                "evidence": evidence,
+                                "comparability": {"passed": True},
+                            }
+                        ],
+                        "family_relations": [],
+                    }
+                ]
+            }
+
+    source_set = {
+        "source_set_id": "set-batched-coverage-repair",
+        "dependency_hash": "dependency",
+    }
+    request = LiteratureMapRequest(
+        workspace=tmp_path,
+        source_set_id="set-batched-coverage-repair",
+        run_id="batched-coverage-repair",
+        provider="ollama",
+        model="batched-coverage-repair-v1",
+        literature_policy=LiteratureMappingPolicy(max_synthesis_calls=12),
+    )
+    reasoner = Reasoner()
+
+    build_literature_map(
+        tmp_path,
+        source_set=source_set,
+        notes=[],
+        profiles=rows,
+        question=None,
+        run_id="batched-coverage-repair",
+        request=request,
+        reasoner=reasoner,
+    )
+
+    assert [len(batch) for batch in reasoner.repair_batches] == [12, 12, 2]
+    assert len({source_id for batch in reasoner.repair_batches for source_id in batch}) == 26
+
+
+def test_coverage_repair_history_remains_available_to_a_resumed_frozen_run(
+    tmp_path: Path,
+) -> None:
+    class Reasoner:
+        name = "history-reasoner"
+        model = "history-v1"
+
+    request = LiteratureMapRequest(
+        workspace=tmp_path,
+        source_set_id="frozen-set",
+        run_id="history-run",
+        provider="ollama",
+        model="history-v1",
+    )
+    calls = literature._CheckpointedReasonerCalls(
+        tmp_path,
+        "history-run",
+        Reasoner(),
+        request,
+    )
+    current = calls.root / "cluster_proposal" / "collection--coverage-repair.yml"
+    historical = (
+        calls.root
+        / "history"
+        / "cluster_proposal"
+        / "collection--coverage-repair"
+        / "prior.yml"
+    )
+    current.parent.mkdir(parents=True, exist_ok=True)
+    historical.parent.mkdir(parents=True, exist_ok=True)
+    current.write_text(
+        yaml.safe_dump(
+            {
+                "status": "completed",
+                "provider": "history-reasoner",
+                "model": "history-v1",
+                "response": {
+                    "clusters": [
+                        {"semantic_identity": "current", "source_ids": ["c", "d"]}
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    historical.write_text(
+        yaml.safe_dump(
+            {
+                "status": "completed",
+                "provider": "history-reasoner",
+                "model": "history-v1",
+                "response": {
+                    "clusters": [
+                        {"semantic_identity": "prior", "source_ids": ["a", "b"]}
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    responses = calls.completed_responses(
+        "cluster_proposal", "collection--coverage-repair"
+    )
+    proposals = literature._cluster_proposals_from_responses(responses)
+
+    assert {row["semantic_identity"] for row in proposals} == {"current", "prior"}
+
+
+def test_coverage_repair_history_rejects_stale_profile_dependencies(
+    tmp_path: Path,
+) -> None:
+    class Reasoner:
+        name = "history-reasoner"
+        model = "history-v1"
+
+    request = LiteratureMapRequest(
+        workspace=tmp_path,
+        source_set_id="frozen-set",
+        run_id="history-dependency-run",
+        provider="ollama",
+        model="history-v1",
+    )
+    calls = literature._CheckpointedReasonerCalls(
+        tmp_path,
+        "history-dependency-run",
+        Reasoner(),
+        request,
+    )
+    current = calls.root / "cluster_proposal" / "collection--coverage-repair.yml"
+    historical = (
+        calls.root
+        / "history"
+        / "cluster_proposal"
+        / "collection--coverage-repair"
+        / "prior.yml"
+    )
+    current.parent.mkdir(parents=True, exist_ok=True)
+    historical.parent.mkdir(parents=True, exist_ok=True)
+    base = {
+        "status": "completed",
+        "provider": "history-reasoner",
+        "model": "history-v1",
+    }
+    current.write_text(
+        yaml.safe_dump(
+            {
+                **base,
+                "dependency_component_hashes": {
+                    "profile_dependencies": "current-profiles",
+                    "prompt_version": "same-prompt",
+                    "context": "current-repair-context",
+                },
+                "response": {
+                    "clusters": [
+                        {"semantic_identity": "current", "source_ids": ["c", "d"]}
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    historical.write_text(
+        yaml.safe_dump(
+            {
+                **base,
+                "dependency_component_hashes": {
+                    "profile_dependencies": "stale-profiles",
+                    "prompt_version": "same-prompt",
+                    "context": "prior-repair-context",
+                },
+                "response": {
+                    "clusters": [
+                        {"semantic_identity": "stale", "source_ids": ["a", "b"]}
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    responses = calls.completed_responses(
+        "cluster_proposal", "collection--coverage-repair"
+    )
+    proposals = literature._cluster_proposals_from_responses(responses)
+
+    assert {row["semantic_identity"] for row in proposals} == {"current"}
+
+
+def test_five_source_clusters_receive_a_compact_response_budget() -> None:
+    def cluster(core_count: int) -> dict[str, Any]:
+        return {
+            "source_roles": [
+                {"source_id": f"source-{index}", "role": "core"}
+                for index in range(core_count)
+            ]
+        }
+
+    assert literature._cluster_synthesis_response_budget(cluster(4)) == {}
+    budget = literature._cluster_synthesis_response_budget(cluster(5))
+    assert budget["source_contributions_per_core"] == 1
+    assert budget["max_evidence_threads"] == 3
+    assert budget["max_output_tokens"] == 4_500
+
+
 def test_cluster_proposal_checkpoint_invalidates_when_profile_eligibility_changes(
     tmp_path: Path,
 ) -> None:
@@ -2422,7 +2721,7 @@ def test_incomplete_cluster_verdict_gets_one_checkpointed_repair_call(
     assert replay_packet["synthesis_checkpoint_hit_count"] == 3
 
 
-def test_failed_quality_repair_uses_audited_deterministic_fallback_instead_of_staying_partial(
+def test_failed_quality_repair_stays_partial_and_does_not_publish_a_thin_cluster(
     tmp_path: Path,
 ) -> None:
     rows = [profile("a"), profile("b", method="case study")]
@@ -2485,11 +2784,15 @@ def test_failed_quality_repair_uses_audited_deterministic_fallback_instead_of_st
 
     synthesis = next(iter(cluster_map["cluster_syntheses"].values()))
     assert reasoner.calls == ["proposal", "synthesis", "repair"]
-    assert packet["status"] == "complete"
-    assert synthesis["status"] == "deterministic_fallback"
-    assert synthesis["quality_status"] == "fallback_after_failed_repair"
-    assert synthesis["model_synthesis_rejected"] is True
+    assert packet["status"] == "partial"
+    assert synthesis["status"] == "partial"
+    assert synthesis["quality_status"] == "incomplete"
+    assert synthesis["repair_attempted"] is True
     assert "verdict_too_thin" in synthesis["quality_errors"]
+    assert (
+        list((tmp_path / "03_literature_synthesis" / "clusters").glob("Cluster - *.md"))
+        == []
+    )
 
     replay = Reasoner()
     _, _, replay_packet, _ = build_literature_map(
@@ -2503,8 +2806,164 @@ def test_failed_quality_repair_uses_audited_deterministic_fallback_instead_of_st
         reasoner=replay,
     )
     assert replay.calls == []
-    assert replay_packet["status"] == "complete"
+    assert replay_packet["status"] == "partial"
     assert replay_packet["synthesis_checkpoint_hit_count"] == 3
+
+
+def test_partial_remap_preserves_the_last_published_cluster_markdown(
+    tmp_path: Path,
+) -> None:
+    rows = [profile("a"), profile("b", method="case study")]
+    cluster = cluster_for(rows)
+    cluster_id = cluster["cluster_id"]
+    proposition_id = cluster["proposition_ids"][0]
+    evidence = [
+        {
+            "source_id": row["source_id"],
+            "claim_id": row["findings"][0]["claim_id"],
+            "locator": "p. 10",
+        }
+        for row in rows
+    ]
+    complete_reasoner = {
+        "cluster_syntheses": {
+            cluster_id: {
+                "cluster_id": cluster_id,
+                "coherence_rationale": "Both studies address one bounded relationship.",
+                "boundaries": ["The evidence is limited to the two mapped settings."],
+                "central_findings": [
+                    {
+                        "finding": (
+                            "The two independent studies report a compatible association for the same bounded "
+                            "institutional-trust outcome. In plain English, the repeated direction makes the pattern "
+                            "more credible within this collection, while the study designs still do not establish "
+                            "causation. Because only two settings are represented, the finding should not be treated "
+                            "as universal or as a mature conclusion beyond the frozen source set."
+                        ),
+                        "proposition_ids": [proposition_id],
+                        "evidence": evidence,
+                    }
+                ],
+                "supporting_evidence": evidence,
+            }
+        }
+    }
+    source_set = {"source_set_id": "set-quality-ratchet", "dependency_hash": "same"}
+    first_map, _, _, _ = build_literature_map(
+        tmp_path,
+        source_set=source_set,
+        notes=[],
+        profiles=rows,
+        question=None,
+        run_id="quality-ratchet-good",
+        reasoner=complete_reasoner,
+    )
+    synthesis = first_map["cluster_syntheses"][cluster_id]
+    assert synthesis["status"] == "reasoned"
+    path = (
+        tmp_path
+        / "03_literature_synthesis"
+        / "clusters"
+        / f"{cluster_note_stem(cluster)}.md"
+    )
+    published = path.read_text()
+
+    partial_reasoner = {
+        "cluster_syntheses": {
+            cluster_id: {
+                "cluster_id": cluster_id,
+                "central_findings": [
+                    {"finding": "A thin replacement.", "evidence": evidence}
+                ],
+            }
+        }
+    }
+    second_map, _, packet, _ = build_literature_map(
+        tmp_path,
+        source_set=source_set,
+        notes=[],
+        profiles=rows,
+        question=None,
+        run_id="quality-ratchet-partial",
+        reasoner=partial_reasoner,
+    )
+
+    assert second_map["cluster_syntheses"][cluster_id]["status"] == "partial"
+    assert packet["status"] == "partial"
+    assert path.read_text() == published
+
+
+def test_cluster_projection_explains_machine_assessments_and_failed_gap_gates() -> None:
+    cluster = {
+        "cluster_id": "cluster-readable",
+        "label": "Readable Mediation Findings",
+        "shared_question": "What does the collection show about mediation timing and success?",
+        "core_source_ids": ["source-a", "source-b"],
+        "source_ids": ["source-a", "source-b"],
+        "source_roles": [
+            {"source_id": "source-a", "role": "core"},
+            {"source_id": "source-b", "role": "core"},
+        ],
+        "representative_sources": [],
+    }
+    synthesis = {
+        "status": "reasoned",
+        "quality_status": "complete",
+        "evidence_threads": [
+            {
+                "thread_id": "thread-1",
+                "title": "Mediation timing and success",
+                "summary": "Two publications report the same bounded association between mediation timing and success.",
+                "plain_english_meaning": "The pattern repeats, but causation is not established.",
+                "evidence": [
+                    {"source_id": "source-a", "locator": "p. 10"},
+                    {"source_id": "source-b", "locator": "p. 14"},
+                ],
+            }
+        ],
+        "source_contributions": [],
+    }
+    debate = {
+        "classification": "within_program_consistency",
+        "proposition_assessments": [
+            {
+                "statement": "Mediation timing is associated with success.",
+                "state": "within_program_consistency",
+                "explanation": {"publication_count": 3},
+            },
+            {
+                "statement": "Mediator strategy is associated with success.",
+                "state": "emerging_convergence",
+                "explanation": {
+                    "effective_evidence_base_count": 2,
+                    "shared_terms": ["1945", "1995", "mediation"],
+                },
+            },
+        ],
+    }
+    rejected_gap = {
+        "gap_statement": "Whether conflict type changes the intensity-success relationship.",
+        "quality_rejection_reasons": [
+            "missing_resolution_path_comparison",
+            "missing_resolution_path_estimand",
+            "missing_resolution_path_identification",
+        ],
+    }
+
+    text = literature._cluster_markdown(
+        cluster,
+        None,
+        debate,
+        rejected_gap_candidates=[rejected_gap],
+        synthesis=synthesis,
+    )
+
+    assert "3 publications point in the same direction" in text
+    assert "2 independent evidence bases point in the same direction" in text
+    assert "1945 1995" not in text
+    assert "comparison group, estimand, identification strategy" in text
+    assert "This gap is retained" not in text
+    assert "**In plain English:**" in text
 
 
 def test_failed_synthesis_call_leaves_a_resumable_diagnostic_record(
@@ -2871,17 +3330,9 @@ def test_gap_adjudication_rejections_are_audit_only_and_retained_rationales_win(
             ),
             "obvious_answer_not_falsified",
         ),
-        (
-            lambda rationale: rationale["resolution_path"]["requirements"].update(
-                comparison=""
-            ),
-            "missing_resolution_path_comparison",
-        ),
     ],
 )
-def test_obvious_or_nonexecutable_gaps_are_audit_only(
-    mutation, expected_reason: str
-) -> None:
+def test_obvious_gaps_are_audit_only(mutation, expected_reason: str) -> None:
     signal = {
         "rule": "untested_mechanism",
         "topic": "women inclusion and ceasefire durability",
@@ -2921,6 +3372,65 @@ def test_obvious_or_nonexecutable_gaps_are_audit_only(
     )
     assert rejected["status"] == "underspecified_gap"
     assert expected_reason in rejected["quality_rejection_reasons"]
+
+
+def test_non_obvious_gap_with_incomplete_resolution_path_remains_visible_as_lead() -> (
+    None
+):
+    signal = {
+        "rule": "untested_mechanism",
+        "topic": "women inclusion and ceasefire durability",
+        "missing_evidence": (
+            "Evidence distinguishing selection into inclusive negotiations from a causal effect "
+            "of inclusion on ceasefire durability."
+        ),
+        "supporting_claim_ids": ["claim-a", "claim-b"],
+    }
+    rows = [
+        profile(
+            "a", topic="women inclusion and ceasefire durability", gap_signals=[signal]
+        ),
+        profile(
+            "b",
+            topic="women inclusion and ceasefire durability",
+            method="comparative case study",
+            gap_signals=[signal],
+        ),
+    ]
+    probe = build_literature_report(rows)
+    candidate = next(
+        row
+        for row in probe["gap_registry"]["rejected_candidates"]
+        if "gap_adjudication_did_not_retain_candidate"
+        in (row.get("quality_rejection_reasons") or [])
+    )
+    rationale = _quality_rationale(candidate)
+    rationale["value_assessment"]["puzzle_type"] = "quantitative"
+    rationale["resolution_path"]["requirements"]["comparison"] = ""
+
+    report = build_literature_report(rows, reasoner={"gap_rationales": [rationale]})
+
+    lead = next(
+        row
+        for row in report["gap_registry"]["gaps"]
+        if row["gap_id"] == candidate["gap_id"]
+    )
+    assert lead["status"] == "collection_gap_lead"
+    assert lead["promoted"] is False
+    assert lead["quality_gate_passed"] is False
+    assert "missing_resolution_path_comparison" in lead["quality_warnings"]
+    value_check = next(
+        check
+        for check in lead["strict_adjudication"]["checks"]
+        if "non-obvious and consequential" in check["requirement"]
+    )
+    assert value_check["passed"] is True
+    resolution_check = next(
+        check
+        for check in lead["strict_adjudication"]["checks"]
+        if "type-sensitive path" in check["requirement"]
+    )
+    assert resolution_check["passed"] is False
 
 
 def test_semantic_duplicate_gaps_merge_with_a_stable_audit_ledger() -> None:
@@ -3430,4 +3940,97 @@ def test_question_is_only_a_projection_lens_and_never_changes_map_identity() -> 
     ) == stable_literature_map_id(
         source_set,
         "Where does participation matter?",
+    )
+
+
+def test_v4_every_promoted_neighborhood_maps_to_an_admitted_cluster_or_records_a_substantive_rejection_reason() -> (
+    None
+):
+    """V-4 characterization: every promoted topic_neighborhood of an
+    analytical facet type (concept, outcome, subject, case, tag) either
+    maps to at least one admitted thematic cluster via
+    cluster.topic_neighborhood_ids, or has a persisted, human-readable
+    rejection reason explaining why it remains retrieval-only.
+
+    Neighborhoods of inherently retrieval-only facet types (method, period,
+    citation_or_relation) are excluded because they exist purely as
+    navigation aids and are never analytical candidates."""
+
+    analytical_facet_types = {"concept", "outcome", "subject", "case", "tag"}
+
+    rows = [
+        profile("alpha", topic="institutional trust"),
+        profile("beta", topic="institutional trust", method="case study"),
+        profile("gamma", topic="civic engagement"),
+        profile("delta", topic="civic engagement", method="experiment"),
+    ]
+
+    report = build_literature_report(rows)
+
+    promoted_neighborhoods = [
+        neighborhood
+        for neighborhood in report["navigation"].get("topic_neighborhoods", []) or []
+        if int(neighborhood.get("source_count", 0) or 0) >= 2
+        and len(neighborhood.get("source_ids", []) or []) >= 2
+        and str(neighborhood.get("facet_type") or "") in analytical_facet_types
+    ]
+    assert promoted_neighborhoods, (
+        "fixture must produce at least one promoted analytical-facet "
+        "neighborhood with >=2 analytical sources for the V-4 "
+        "characterization to be meaningful"
+    )
+
+    admitted_clusters = [
+        cluster for cluster in report["cluster_registry"].get("clusters", []) or []
+    ]
+    cluster_neighborhood_coverage: dict[str, set[str]] = {}
+    for cluster in admitted_clusters:
+        for neighborhood_id in cluster.get("topic_neighborhood_ids", []) or []:
+            cluster_neighborhood_coverage.setdefault(
+                str(neighborhood_id), set()
+            ).add(str(cluster["cluster_id"]))
+
+    unclustered_reasons: dict[str, str] = {
+        str(row.get("source_id") or ""): str(row.get("reason") or "")
+        for row in report["cluster_registry"].get("unclustered_sources", []) or []
+    }
+    rejected_proposals = report["cluster_registry"].get("rejected_proposals", []) or []
+    rejected_neighborhood_notes: dict[str, str] = {}
+    for rejected in rejected_proposals:
+        semantic_identity = str(rejected.get("semantic_identity") or "")
+        reason = str(rejected.get("reason") or "")
+        if semantic_identity and reason:
+            rejected_neighborhood_notes.setdefault(semantic_identity, reason)
+
+    gaps: list[str] = []
+    for neighborhood in promoted_neighborhoods:
+        neighborhood_id = str(neighborhood.get("topic_neighborhood_id") or "")
+        semantic_identity = str(neighborhood.get("semantic_identity") or "")
+        source_ids = [str(s) for s in neighborhood.get("source_ids", []) or []]
+        facet_type = str(neighborhood.get("facet_type") or "")
+
+        if neighborhood_id in cluster_neighborhood_coverage:
+            continue
+
+        rejection_reasons = [
+            unclustered_reasons.get(source_id, "") for source_id in source_ids
+        ]
+        rejection_reasons = [reason for reason in rejection_reasons if reason]
+        rejected_identity_note = rejected_neighborhood_notes.get(semantic_identity, "")
+
+        if rejection_reasons or rejected_identity_note:
+            continue
+
+        gaps.append(
+            f"neighborhood {neighborhood_id!r} "
+            f"(facet_type={facet_type!r}, "
+            f"semantic_identity={semantic_identity!r}, "
+            f"source_ids={source_ids}) maps to no admitted cluster and has "
+            f"no persisted rejection reason"
+        )
+
+    assert not gaps, (
+        "Promoted analytical-facet neighborhoods with no admitted cluster and "
+        "no rejection reason:\n- "
+        + "\n- ".join(gaps)
     )

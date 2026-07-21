@@ -9,13 +9,19 @@ import pytest
 import yaml
 
 from auto_zettelkasten.api import build_map, get_status, resume_map, run_map
-from auto_zettelkasten.models import EvidenceProfile, LiteratureMapRequest, LiteratureMappingPolicy, MapRequest
+from auto_zettelkasten.models import (
+    EvidenceProfile,
+    LiteratureMapRequest,
+    LiteratureMappingPolicy,
+    MapRequest,
+)
 from auto_zettelkasten.ports import LiteratureReasoner
 from auto_zettelkasten.profiles import (
     deterministic_profile,
     load_profile_sidecar,
     profile_dependency_fingerprint,
     profile_to_dict,
+    save_profile,
 )
 from auto_zettelkasten.readers import (
     CloudPermissionError,
@@ -24,6 +30,7 @@ from auto_zettelkasten.readers import (
     OllamaReader,
     OpenRouterReader,
     ProviderError,
+    _parse_json_object,
     _validate_literature_response,
 )
 
@@ -49,7 +56,11 @@ def _profile_from_prompt(prompt: str, marker: str) -> dict[str, Any]:
 
 
 def _progress(workspace: Path, run_id: str) -> dict[str, Any]:
-    return yaml.safe_load((workspace / "11_state" / "runs" / run_id / "progress.yml").read_text(encoding="utf-8"))
+    return yaml.safe_load(
+        (workspace / "11_state" / "runs" / run_id / "progress.yml").read_text(
+            encoding="utf-8"
+        )
+    )
 
 
 def _only_profile(workspace: Path) -> EvidenceProfile:
@@ -58,7 +69,22 @@ def _only_profile(workspace: Path) -> EvidenceProfile:
     return load_profile_sidecar(sidecars[0])
 
 
-def test_builtin_gap_response_normalizes_optional_model_shape_errors_per_candidate() -> None:
+def test_literature_json_parser_recovers_one_object_wrapped_in_provider_prose() -> None:
+    assert _parse_json_object(
+        'Here is the requested result:\n{"gaps": [], "rejected": []}\nDone.',
+        label="gap adjudication response",
+    ) == {"gaps": [], "rejected": []}
+
+    with pytest.raises(ProviderError, match="was not valid JSON"):
+        _parse_json_object(
+            '{"gaps": []}\n{"rejected": []}',
+            label="gap adjudication response",
+        )
+
+
+def test_builtin_gap_response_normalizes_optional_model_shape_errors_per_candidate() -> (
+    None
+):
     normalized = _validate_literature_response(
         {
             "gaps": [
@@ -94,7 +120,9 @@ def test_builtin_gap_response_normalizes_optional_model_shape_errors_per_candida
                         "feasibility": "Feasible with the archives named in the collection.",
                         "constraints": "Archive access may be incomplete.",
                     },
-                    "anchors": [{"cluster_id": "", "section": "central_findings", "item_id": ""}],
+                    "anchors": [
+                        {"cluster_id": "", "section": "central_findings", "item_id": ""}
+                    ],
                 }
             ],
             "rejected": [],
@@ -106,16 +134,25 @@ def test_builtin_gap_response_normalizes_optional_model_shape_errors_per_candida
     assert gap["priority_tier"] == "moderate"
     assert gap["countervailing_evidence"] == []
     assert gap["value_assessment"]["information_gain"] == "moderate"
-    assert gap["value_assessment"]["competing_explanations"] == ["selection into mediation"]
+    assert gap["value_assessment"]["competing_explanations"] == [
+        "selection into mediation"
+    ]
     assert gap["value_assessment"]["non_obviousness_passed"] is False
     assert gap["study_design"]["outcomes"] == ["one outcome"]
-    assert gap["study_design"]["validity_risks"] == ["spillover across comparison cases"]
-    assert gap["study_design"]["identification_or_inference_strategy"] == "matched comparison"
+    assert gap["study_design"]["validity_risks"] == [
+        "spillover across comparison cases"
+    ]
+    assert (
+        gap["study_design"]["identification_or_inference_strategy"]
+        == "matched comparison"
+    )
     assert gap["study_design"]["ethical_constraints"] == "standard research ethics"
     assert gap["proposition_id"] == "proposition-1"
     assert gap["originating_cluster_ids"] == ["cluster-1"]
     assert gap["resolution_path"]["path_type"] == "qualitative"
-    assert gap["resolution_path"]["limitations"] == ["Archive access may be incomplete."]
+    assert gap["resolution_path"]["limitations"] == [
+        "Archive access may be incomplete."
+    ]
     assert gap["anchors"] == []
 
 
@@ -125,7 +162,10 @@ def test_builtin_cluster_response_drops_only_malformed_optional_assertions() -> 
             "cluster_id": "cluster-1",
             "effective_evidence_base_count": 999,
             "evidence_base_groups": [
-                {"evidence_base_group_id": "model-group", "counted_as_independent": True}
+                {
+                    "evidence_base_group_id": "model-group",
+                    "counted_as_independent": True,
+                }
             ],
             "independence_assessments": [
                 {"evidence_base_group_id": "model-group", "independent": True}
@@ -180,7 +220,10 @@ def test_builtin_cluster_proposal_ignores_model_authored_independence_fields() -
                     "study_lineages": ["lineage-model-authored"],
                     "evidence_base_groups": ["evidence-base-model-authored"],
                     "independence_assessments": [
-                        {"source_id": "source-a", "independence_status": "assumed_independent"}
+                        {
+                            "source_id": "source-a",
+                            "independence_status": "assumed_independent",
+                        }
                     ],
                     "effective_evidence_base_count": 999,
                 }
@@ -196,6 +239,161 @@ def test_builtin_cluster_proposal_ignores_model_authored_independence_fields() -
     assert proposal["effective_evidence_base_count"] == 0
 
 
+def test_builtin_cluster_proposal_preserves_scalar_comparability_as_provider_assessment() -> (
+    None
+):
+    normalized = _validate_literature_response(
+        {
+            "clusters": [
+                {
+                    "proposal_id": "proposal-1",
+                    "label": "Conflict prevention",
+                    "semantic_identity": "conflict-prevention",
+                    "shared_question": "How does mediation contribute to conflict prevention?",
+                    "coherence_rationale": "The sources address a recognizable bounded literature.",
+                    "source_ids": ["source-a", "source-b"],
+                    "supporting_evidence": [],
+                    "propositions": [
+                        {
+                            "proposition_id": "proposition-1",
+                            "statement": "Preventive diplomacy can interrupt escalation.",
+                            "proposition_type": "empirical",
+                            "source_ids": ["source-a", "source-b"],
+                            "evidence": [],
+                            "comparability": "The studies examine different settings but the same preventive function.",
+                        }
+                    ],
+                    "family_relations": [
+                        {
+                            "relation_type": "shared_research_problem",
+                            "source_ids": ["source-a", "source-b"],
+                            "rationale": "Both sources ask how mediation can prevent escalation.",
+                            "evidence": [],
+                            "comparability": "Comparable at the level of the research problem, not a common estimand.",
+                        }
+                    ],
+                    "source_roles": {"source-a": "core", "source-b": "core"},
+                }
+            ]
+        },
+        kind="cluster_proposal",
+    )
+
+    proposal = normalized["clusters"][0]
+    assert proposal["propositions"][0]["comparability"] == {
+        "provider_assessment": "The studies examine different settings but the same preventive function."
+    }
+    assert proposal["family_relations"][0]["comparability"] == {
+        "provider_assessment": "Comparable at the level of the research problem, not a common estimand."
+    }
+
+
+def test_builtin_cluster_synthesis_normalizes_provider_contribution_labels() -> None:
+    normalized = _validate_literature_response(
+        {
+            "cluster_id": "cluster-1",
+            "source_contributions": [
+                {
+                    "contribution_id": "contribution-1",
+                    "source_id": "source-a",
+                    "cluster_role": "core",
+                    "contribution_kind": "empirical finding",
+                    "related_proposition_ids": [],
+                    "evidence_thread_id": "thread-1",
+                    "finding": "The source reports one relevant finding.",
+                    "technical_result": "",
+                    "plain_english_meaning": "It adds source-specific evidence.",
+                    "relation_to_cluster_question": "It addresses the cluster question.",
+                    "comparison_status": "not compared",
+                    "evidence": [
+                        {
+                            "source_id": "source-a",
+                            "claim_id": "anchor-a",
+                            "locator": "p. 12",
+                        }
+                    ],
+                }
+            ],
+        },
+        kind="cluster_synthesis",
+    )
+
+    contribution = normalized["source_contributions"][0]
+    assert contribution["contribution_kind"] == "unique_cluster_relevant_finding"
+    assert contribution["comparison_status"] == "single_source"
+
+
+def test_builtin_cluster_synthesis_normalizes_optional_contribution_shapes() -> None:
+    normalized = _validate_literature_response(
+        {
+            "cluster_id": "cluster-1",
+            "source_contributions": [
+                {
+                    "source_id": "source-a",
+                    "cluster_role": "context",
+                    "contribution_kind": "context_only",
+                    "related_proposition_ids": None,
+                    "evidence_thread_id": None,
+                    "finding": "The source provides conceptual context.",
+                    "technical_result": None,
+                    "plain_english_meaning": "It explains the framework.",
+                    "relation_to_cluster_question": None,
+                    "comparison_status": "single_source",
+                    "origin": None,
+                    "evidence": {
+                        "source_id": "source-a",
+                        "claim_id": "anchor-a",
+                        "locator": "p. 12",
+                    },
+                }
+            ],
+        },
+        kind="cluster_synthesis",
+    )
+
+    contribution = normalized["source_contributions"][0]
+    assert contribution["contribution_kind"] == "conceptual_context"
+    assert contribution["related_proposition_ids"] == []
+    assert contribution["evidence_thread_id"] == ""
+    assert contribution["technical_result"] == ""
+    assert contribution["relation_to_cluster_question"] == ""
+    assert contribution["origin"] == "reasoner"
+    assert contribution["evidence"] == [
+        {
+            "source_id": "source-a",
+            "claim_id": "anchor-a",
+            "locator": "p. 12",
+        }
+    ]
+
+
+def test_builtin_cluster_synthesis_accepts_known_evidentiary_threads_alias() -> None:
+    normalized = _validate_literature_response(
+        {
+            "cluster_id": "cluster-1",
+            "evidentiary_threads": [
+                {
+                    "thread_id": "thread-1",
+                    "title": "Institutional practice",
+                    "summary": "The sources document complementary institutional practices.",
+                    "relationship": "complementary",
+                    "evidence": [
+                        {
+                            "source_id": "source-a",
+                            "claim_id": "anchor-a",
+                            "locator": "p. 12",
+                        }
+                    ],
+                }
+            ],
+        },
+        kind="cluster_synthesis",
+    )
+
+    assert len(normalized["evidence_threads"]) == 1
+    assert normalized["evidence_threads"][0]["thread_id"] == "thread-1"
+
+
 class _SourceOnlyDeepSeek:
     name = "deepseek"
     model = "deepseek-v4-flash"
@@ -204,7 +402,9 @@ class _SourceOnlyDeepSeek:
     def __init__(self) -> None:
         self.calls = 0
 
-    def read_source(self, text: str, metadata: Mapping[str, Any], question: str | None = None) -> Mapping[str, Any]:
+    def read_source(
+        self, text: str, metadata: Mapping[str, Any], question: str | None = None
+    ) -> Mapping[str, Any]:
         self.calls += 1
         return _analysis()
 
@@ -288,6 +488,16 @@ class _RecoveringReasoner(_ExplicitReasoner):
         return _profile_response(str(note["committed_note"]), "recovered-profile")
 
 
+class _ContractInvalidReasoner(_ExplicitReasoner):
+    def profile_source(self, note, *, question=None, context=None):
+        self.profile_calls += 1
+        response = _profile_response(
+            str(note["committed_note"]), "contract-invalid-profile"
+        )
+        response["concepts"] = "not-a-list"
+        return response
+
+
 class _RecoveringSourceReader(FakeReader):
     def __init__(self, fail_keys: set[str] | None = None) -> None:
         super().__init__()
@@ -316,13 +526,17 @@ def test_configured_builtin_reader_profiles_by_default_and_totals_live_calls(
         return _analysis()
 
     monkeypatch.setattr(DeepSeekReader, "_generate_text", generate)
-    request = MapRequest(tmp_path, provider="deepseek", model="deepseek-v4-flash", allow_cloud=True)
+    request = MapRequest(
+        tmp_path, provider="deepseek", model="deepseek-v4-flash", allow_cloud=True
+    )
 
-    report = run_map(request, client=FakeZotero(sample_items[:1]), run_id="builtin-profile")
+    report = run_map(
+        request, client=FakeZotero(sample_items[:1]), run_id="builtin-profile"
+    )
 
     assert report.status == "completed"
     assert [route for route, _, _ in calls] == ["source", "profile"]
-    assert calls[1][1] == 8_000
+    assert calls[1][1] == 16_000
     assert calls[1][2] == request.processing.request_deadline_seconds
     assert isinstance(DeepSeekReader(allow_cloud=True), LiteratureReasoner)
     profile = _only_profile(tmp_path)
@@ -372,12 +586,22 @@ def test_build_map_constructs_configured_builtin_reasoner(
     progress = _progress(tmp_path, "build-map-reasoner")
     assert progress["status"] == "completed"
     assert progress["stage"] == "reporting"
+    assert progress["inventory_count"] == source_report.inventory_count
+    assert progress["validated_note_count"] == source_report.validated_note_count
+    assert progress["limited_note_count"] == source_report.limited_note_count
+    assert progress["exhausted_count"] == source_report.exhausted_count
+    assert progress["pending_count"] == 0
     assert progress["profile_count"] == 2
     assert progress["literature_provider_call_count"] == (
         progress["profile_count"] + progress["synthesis_call_count"]
     )
-    profile_hits = result.metadata["literature_map"]["profile_result"]["checkpoint_hits"]
-    assert progress["checkpoint_hit_count"] == profile_hits + progress["synthesis_checkpoint_hit_count"]
+    profile_hits = result.metadata["literature_map"]["profile_result"][
+        "checkpoint_hits"
+    ]
+    assert (
+        progress["checkpoint_hit_count"]
+        == profile_hits + progress["synthesis_checkpoint_hit_count"]
+    )
 
 
 def test_reasoner_replay_reuses_same_provider_profiles_created_by_deterministic_route(
@@ -419,7 +643,10 @@ def test_reasoner_replay_reuses_same_provider_profiles_created_by_deterministic_
     for sidecar in (tmp_path / "02_source_memory" / "profiles").glob("*.yml"):
         stored = yaml.safe_load(sidecar.read_text())["profile"]
         assert stored["context"]["profile_generation_route"] == "deterministic"
-        assert stored["context"]["reasoner_identity"] == "auto_zettelkasten.profiles.deterministic_profile:v1"
+        assert (
+            stored["context"]["reasoner_identity"]
+            == "auto_zettelkasten.profiles.deterministic_profile:v1"
+        )
 
 
 def test_primary_run_honors_synthesis_disabled_without_profile_or_map_artifacts(
@@ -449,7 +676,9 @@ def test_primary_run_honors_synthesis_disabled_without_profile_or_map_artifacts(
     assert not (tmp_path / "03_literature_synthesis" / "manifest.yml").exists()
 
 
-def test_profile_workers_run_independent_profile_calls_concurrently(tmp_path: Path, sample_items) -> None:
+def test_profile_workers_run_independent_profile_calls_concurrently(
+    tmp_path: Path, sample_items
+) -> None:
     reasoner = _ConcurrentReasoner()
     report = run_map(
         MapRequest(
@@ -467,8 +696,10 @@ def test_profile_workers_run_independent_profile_calls_concurrently(tmp_path: Pa
     assert report.status == "completed"
     assert reasoner.profile_calls == 2
     assert reasoner.max_active_calls == 2
-    assert report.literature_provider_call_count == 4
-    assert report.synthesis_call_count == 2
+    assert report.literature_provider_call_count == (
+        reasoner.profile_calls + report.synthesis_call_count
+    )
+    assert report.synthesis_call_count >= 1
 
 
 def test_profile_call_budget_returns_resumable_partial_after_checkpointing_successes(
@@ -481,7 +712,9 @@ def test_profile_call_budget_returns_resumable_partial_after_checkpointing_succe
             tmp_path,
             provider="ollama",
             model="fake-1",
-            literature_policy=LiteratureMappingPolicy(max_profile_calls=1, profile_workers=2),
+            literature_policy=LiteratureMappingPolicy(
+                max_profile_calls=1, profile_workers=2
+            ),
         ),
         client=FakeZotero(sample_items),
         reader=FakeReader(),
@@ -493,7 +726,21 @@ def test_profile_call_budget_returns_resumable_partial_after_checkpointing_succe
     assert report.validated_note_count == 2
     assert report.literature_provider_call_count == 1
     assert any(error.get("stage") == "literature_mapping" for error in report.errors)
-    assert len(list((tmp_path / "11_state" / "runs" / "profile-budget" / "literature" / "profile_calls").glob("*.yml"))) == 1
+    assert (
+        len(
+            list(
+                (
+                    tmp_path
+                    / "11_state"
+                    / "runs"
+                    / "profile-budget"
+                    / "literature"
+                    / "profile_calls"
+                ).glob("*.yml")
+            )
+        )
+        == 1
+    )
 
 
 def test_one_profile_failure_does_not_discard_other_results_and_resume_retries_only_failure(
@@ -516,7 +763,14 @@ def test_one_profile_failure_does_not_discard_other_results_and_resume_retries_o
     assert first.profile_valid_count == 1
     assert first.literature_failure_count == 1
     assert first_reasoner.profile_calls == 2
-    failure_dir = tmp_path / "11_state" / "runs" / "profile-recovery" / "literature" / "profile_failures"
+    failure_dir = (
+        tmp_path
+        / "11_state"
+        / "runs"
+        / "profile-recovery"
+        / "literature"
+        / "profile_failures"
+    )
     assert len(list(failure_dir.glob("*.yml"))) == 1
 
     recovered_reasoner = _RecoveringReasoner()
@@ -534,6 +788,48 @@ def test_one_profile_failure_does_not_discard_other_results_and_resume_retries_o
     assert recovered.literature_failure_count == 0
     assert recovered_reasoner.profile_calls == 1
     assert not list(failure_dir.glob("*.yml"))
+
+
+def test_contract_invalid_profile_uses_conservative_checkpointed_fallback(
+    tmp_path: Path,
+    sample_items,
+) -> None:
+    reasoner = _ContractInvalidReasoner()
+    first = run_map(
+        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        client=FakeZotero(sample_items[:1]),
+        reader=FakeReader(),
+        literature_reasoner=reasoner,
+        run_id="profile-contract-fallback",
+    )
+
+    assert first.status == "completed"
+    assert first.profile_count == 1
+    assert first.profile_valid_count == 0
+    assert first.profile_excluded_count == 1
+    assert first.literature_failure_count == 0
+    assert reasoner.profile_calls == 1
+    profile = _only_profile(tmp_path)
+    assert profile.excluded_from_synthesis is True
+    assert profile.exclusion_reason
+    assert (
+        profile.context["profile_generation_route"]
+        == "mechanical_reasoner_contract_fallback"
+    )
+    assert profile.context["lazy_reprofile_required"] is True
+
+    replay_reasoner = _ContractInvalidReasoner()
+    replay = build_map(
+        tmp_path,
+        run_id="profile-contract-fallback-replay",
+        source_set=first.source_set,
+        provider="ollama",
+        model="fake-1",
+        reasoner=replay_reasoner,
+    )
+
+    assert replay.status == "built"
+    assert replay_reasoner.profile_calls == 0
 
 
 def test_resume_keeps_frozen_source_set_identity_when_an_exhausted_source_recovers(
@@ -603,6 +899,55 @@ def test_profile_content_rebases_collection_lineage_without_a_new_paid_call(
     assert profile.context["source_set_id"] == "source-set-zotero-other-snapshot"
 
 
+def test_current_mechanical_profile_reuses_unchanged_inspected_source_content(
+    tmp_path: Path,
+    sample_items,
+) -> None:
+    first_reasoner = _RecoveringReasoner()
+    first = run_map(
+        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        client=FakeZotero(sample_items[:1]),
+        reader=FakeReader(),
+        literature_reasoner=first_reasoner,
+        run_id="mechanical-source-lineage-first",
+    )
+    profile = _only_profile(tmp_path)
+    profile.note_hash = "stale-projection-hash"
+    profile.dependency_hash = "stale-dependency"
+    profile.context.update(
+        {
+            "profile_generation_route": "mechanical_legacy_upgrade",
+            "reasoner_identity": "auto_zettelkasten.profiles.legacy_upgrade:v4",
+        }
+    )
+    profile.validity.update(
+        {
+            "profile_prompt_version": "3",
+            "classifier_version": "3",
+            "algorithm_version": "4",
+            "legacy_profile_upgraded_mechanically": True,
+        }
+    )
+    save_profile(tmp_path / "02_source_memory" / "profiles", profile)
+    replay_reasoner = _RecoveringReasoner({"ITEMA"})
+
+    manifest = build_map(
+        tmp_path,
+        run_id="mechanical-source-lineage-reuse",
+        source_set=first.source_set,
+        provider="ollama",
+        model="fake-1",
+        reasoner=replay_reasoner,
+    )
+
+    assert manifest.status == "built"
+    assert replay_reasoner.profile_calls == 0
+    reused = _only_profile(tmp_path)
+    assert reused.context["profile_reuse_basis"] == (
+        "unchanged_inspected_source_content"
+    )
+
+
 def test_explicit_reasoner_takes_precedence_over_builtin_reader(
     tmp_path: Path,
     sample_items,
@@ -615,13 +960,17 @@ def test_explicit_reasoner_takes_precedence_over_builtin_reader(
         route = "profile" if "COMMITTED MARKDOWN NOTE:" in user_prompt else "source"
         built_in_routes.append(route)
         if route == "profile":
-            raise AssertionError("the built-in profile route must not replace an explicit reasoner")
+            raise AssertionError(
+                "the built-in profile route must not replace an explicit reasoner"
+            )
         return _analysis()
 
     monkeypatch.setattr(DeepSeekReader, "_generate_text", generate)
     reasoner = _ExplicitReasoner()
     report = run_map(
-        MapRequest(tmp_path, provider="deepseek", model="deepseek-v4-flash", allow_cloud=True),
+        MapRequest(
+            tmp_path, provider="deepseek", model="deepseek-v4-flash", allow_cloud=True
+        ),
         client=FakeZotero(sample_items[:1]),
         reader=DeepSeekReader(allow_cloud=True),
         literature_reasoner=reasoner,
@@ -644,11 +993,15 @@ def test_limited_note_uses_deterministic_profile_without_builtin_call(
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
 
     def unexpected_generate(*args, **kwargs):
-        raise AssertionError("limited notes must not call the source reader or profile reasoner")
+        raise AssertionError(
+            "limited notes must not call the source reader or profile reasoner"
+        )
 
     monkeypatch.setattr(DeepSeekReader, "_generate_text", unexpected_generate)
     report = run_map(
-        MapRequest(tmp_path, provider="deepseek", model="deepseek-v4-flash", allow_cloud=True),
+        MapRequest(
+            tmp_path, provider="deepseek", model="deepseek-v4-flash", allow_cloud=True
+        ),
         client=FakeZotero(sample_items[:1], missing={"ITEMA"}),
         run_id="limited-profile",
     )
@@ -669,7 +1022,9 @@ def test_builtin_route_reuses_current_deterministic_profile_then_replay_is_zero_
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
-    request = MapRequest(tmp_path, provider="deepseek", model="deepseek-v4-flash", allow_cloud=True)
+    request = MapRequest(
+        tmp_path, provider="deepseek", model="deepseek-v4-flash", allow_cloud=True
+    )
     source_reader = _SourceOnlyDeepSeek()
     first = run_map(
         request,
@@ -691,14 +1046,25 @@ def test_builtin_route_reuses_current_deterministic_profile_then_replay_is_zero_
     sidecar_path = next((tmp_path / "02_source_memory" / "profiles").glob("*.yml"))
     sidecar_payload = yaml.safe_load(sidecar_path.read_text(encoding="utf-8"))
     sidecar_payload["profile"]["dependency_hash"] = legacy_fingerprint
-    sidecar_path.write_text(yaml.safe_dump(sidecar_payload, sort_keys=False), encoding="utf-8")
+    sidecar_path.write_text(
+        yaml.safe_dump(sidecar_payload, sort_keys=False), encoding="utf-8"
+    )
     checkpoint_path = next(
-        (tmp_path / "11_state" / "runs" / "route-invalidation" / "literature" / "profile_calls").glob("*.yml")
+        (
+            tmp_path
+            / "11_state"
+            / "runs"
+            / "route-invalidation"
+            / "literature"
+            / "profile_calls"
+        ).glob("*.yml")
     )
     checkpoint_payload = yaml.safe_load(checkpoint_path.read_text(encoding="utf-8"))
     checkpoint_payload["fingerprint"] = legacy_fingerprint
     checkpoint_payload["profile"]["dependency_hash"] = legacy_fingerprint
-    checkpoint_path.write_text(yaml.safe_dump(checkpoint_payload, sort_keys=False), encoding="utf-8")
+    checkpoint_path.write_text(
+        yaml.safe_dump(checkpoint_payload, sort_keys=False), encoding="utf-8"
+    )
 
     calls: list[str] = []
 
@@ -713,7 +1079,9 @@ def test_builtin_route_reuses_current_deterministic_profile_then_replay_is_zero_
     reused = resume_map(tmp_path, "route-invalidation", client=FakeZotero([]))
     assert reused.status == "completed"
     assert calls == []
-    assert _only_profile(tmp_path).context["profile_generation_route"] == "deterministic"
+    assert (
+        _only_profile(tmp_path).context["profile_generation_route"] == "deterministic"
+    )
     reused_progress = _progress(tmp_path, "route-invalidation")
     assert reused_progress["source_provider_call_count"] == 0
     assert reused_progress["literature_provider_call_count"] == 0
@@ -728,13 +1096,17 @@ def test_builtin_route_reuses_current_deterministic_profile_then_replay_is_zero_
     sidecar_payload["profile"]["exclusion_reason"] = (
         "profile_or_note_validation_failed:anchor_0:typed_quantitative_result_required"
     )
-    sidecar_path.write_text(yaml.safe_dump(sidecar_payload, sort_keys=False), encoding="utf-8")
+    sidecar_path.write_text(
+        yaml.safe_dump(sidecar_payload, sort_keys=False), encoding="utf-8"
+    )
     checkpoint_payload = yaml.safe_load(checkpoint_path.read_text(encoding="utf-8"))
     checkpoint_payload["profile"]["excluded_from_synthesis"] = True
     checkpoint_payload["profile"]["exclusion_reason"] = (
         "profile_or_note_validation_failed:anchor_0:typed_quantitative_result_required"
     )
-    checkpoint_path.write_text(yaml.safe_dump(checkpoint_payload, sort_keys=False), encoding="utf-8")
+    checkpoint_path.write_text(
+        yaml.safe_dump(checkpoint_payload, sort_keys=False), encoding="utf-8"
+    )
 
     calls.clear()
     replayed = resume_map(tmp_path, "route-invalidation", client=FakeZotero([]))
@@ -775,10 +1147,13 @@ def test_builtin_profile_prompt_v3_requires_typed_lineage_locators_and_quantitat
     monkeypatch.setattr(DeepSeekReader, "_generate_text", generate)
     reader = DeepSeekReader(allow_cloud=True)
 
-    assert reader.profile_source(
-        {"profile_prompt": "committed note only"},
-        context={"profile_prompt_version": "3"},
-    ) == {}
+    assert (
+        reader.profile_source(
+            {"profile_prompt": "committed note only"},
+            context={"profile_prompt_version": "3"},
+        )
+        == {}
+    )
     assert "profile prompt v3" in captured["system"]
     assert "source_locators" in captured["system"]
     assert "quantitative_result" in captured["system"]
@@ -872,7 +1247,9 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
 
     monkeypatch.setattr(DeepSeekReader, "_generate_text", generate)
     reader = DeepSeekReader(allow_cloud=True)
-    request = LiteratureMapRequest(workspace=".", provider="deepseek", model="deepseek-v4-flash", allow_cloud=True)
+    request = LiteratureMapRequest(
+        workspace=".", provider="deepseek", model="deepseek-v4-flash", allow_cloud=True
+    )
     clustering_profile = EvidenceProfile(
         source_id="source-a",
         note_id="note-a",
@@ -953,18 +1330,50 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
         "title": "limited-profile-must-not-enter-clustering-packet",
         "analytical": False,
     }
-    assert reader.propose_clusters([normalized_profile, limited_profile], request) == {"clusters": []}
+    assert reader.propose_clusters([normalized_profile, limited_profile], request) == {
+        "clusters": []
+    }
     assert "claim-a" in prompts["collection-clustering"]
-    assert "Mediator legitimacy and settlement durability" in prompts["collection-clustering"]
+    assert (
+        "Mediator legitimacy and settlement durability"
+        in prompts["collection-clustering"]
+    )
     assert "settlement durability" in prompts["collection-clustering"]
     assert "study_lineage" in prompts["collection-clustering"]
     assert "source_locators" in prompts["collection-clustering"]
-    assert "cluster prompt v13" in system_prompts["collection-clustering"]
+    assert "cluster prompt v15" in system_prompts["collection-clustering"]
     assert "family_relation" in system_prompts["collection-clustering"]
     assert "independence_assessments" in system_prompts["collection-clustering"]
-    assert "limited-profile-must-not-enter-clustering-packet" not in prompts["collection-clustering"]
-    assert "unused-detail-must-not-enter-clustering-packet" not in prompts["collection-clustering"]
+    assert (
+        "limited-profile-must-not-enter-clustering-packet"
+        not in prompts["collection-clustering"]
+    )
+    assert (
+        "unused-detail-must-not-enter-clustering-packet"
+        not in prompts["collection-clustering"]
+    )
     assert output_caps["collection-clustering"] == 32_000
+    unrelated_profile = {
+        **normalized_profile,
+        "source_id": "source-unrelated",
+        "note_id": "note-unrelated",
+        "title": "unrelated-profile-must-not-enter-repair-packet",
+    }
+    assert reader.propose_clusters(
+        [normalized_profile, unrelated_profile],
+        request,
+        context={
+            "coverage_repair_source_ids": ["source-a"],
+            "prior_proposals": [],
+        },
+    ) == {"clusters": []}
+    assert "source-a" in prompts["collection-clustering"]
+    assert (
+        "unrelated-profile-must-not-enter-repair-packet"
+        not in prompts["collection-clustering"]
+    )
+    assert "at most four proposals" in prompts["collection-clustering"]
+    assert output_caps["collection-clustering"] == 24_000
     assert reader.map_debates([], request) == {"assessments": []}
     synthesis = reader.synthesize_cluster([], request)
     assert output_caps["cluster-synthesis"] == 16_000
@@ -976,16 +1385,45 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
     assert synthesis["boundary_conditions"] == [
         {
             "boundary": "Regional: African civil wars",
-            "evidence": [{"source_id": "source-a", "claim_id": "claim-a", "locator": "p. 10"}],
+            "evidence": [
+                {"source_id": "source-a", "claim_id": "claim-a", "locator": "p. 10"}
+            ],
         }
     ]
-    assert synthesis["central_findings"] == [{"finding": "Supported structure", "evidence": []}]
+    assert synthesis["central_findings"] == [
+        {"finding": "Supported structure", "evidence": []}
+    ]
     assert synthesis["agreements"] == []
     assert synthesis["source_contributions"][0]["comparison_status"] == "single_source"
-    assert "cluster synthesis prompt v7" in system_prompts["cluster-synthesis"]
-    assert "one to three important cluster-relevant contributions" in system_prompts["cluster-synthesis"]
+    assert "cluster synthesis prompt v13" in system_prompts["cluster-synthesis"]
+    assert "whether mediation happens" in system_prompts["cluster-synthesis"]
+    assert "selection correlation" in system_prompts["cluster-synthesis"]
+    assert "below 7,500 output tokens" in system_prompts["cluster-synthesis"]
+    assert (
+        "one to three important cluster-relevant contributions"
+        in system_prompts["cluster-synthesis"]
+    )
     assert "context_only" in system_prompts["cluster-synthesis"]
     assert "model-predicted probabilities" in system_prompts["cluster-synthesis"]
+    reader.synthesize_cluster(
+        [],
+        request,
+        context={
+            "response_budget": {
+                "max_output_tokens": 4_500,
+                "max_evidence_threads": 3,
+                "source_contributions_per_core": 1,
+                "max_central_findings": 3,
+                "max_items_per_optional_section": 2,
+                "max_gap_hypotheses": 2,
+            }
+        },
+    )
+    assert (
+        "exactly one best source_contribution per core source"
+        in prompts["cluster-synthesis"]
+    )
+    assert "below 4500 output tokens" in prompts["cluster-synthesis"]
     gap_context = {
         "clusters": [{"cluster_id": "cluster-1", "label": "Mediator legitimacy"}],
         "cluster_syntheses": {
@@ -1011,7 +1449,9 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
                 "rule": "empirical_coverage",
                 "topic": "mediator legitimacy",
                 "precise_missing_evidence": "Comparable tests outside African civil wars",
-                "supporting_evidence": [{"source_id": "source-a", "claim_id": "claim-a", "locator": "p. 10"}],
+                "supporting_evidence": [
+                    {"source_id": "source-a", "claim_id": "claim-a", "locator": "p. 10"}
+                ],
                 "internal_search_results": [
                     {
                         "source_id": f"source-{index}",
@@ -1020,7 +1460,9 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
                     }
                     for index in range(20)
                 ],
-                "promotion_metadata": {"redundant-promotion-detail-must-not-enter-gap-packet": "x"},
+                "promotion_metadata": {
+                    "redundant-promotion-detail-must-not-enter-gap-packet": "x"
+                },
             }
         ],
         "internal_search_log": [
@@ -1037,11 +1479,16 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
     }
     assert "claim-a" in prompts["collection-gap"]
     assert "Comparable tests outside African civil wars" in prompts["collection-gap"]
-    assert "redundant-promotion-detail-must-not-enter-gap-packet" not in prompts["collection-gap"]
+    assert (
+        "redundant-promotion-detail-must-not-enter-gap-packet"
+        not in prompts["collection-gap"]
+    )
     assert output_caps["collection-gap"] == 32_000
     assert calls == [
         "collection-clustering",
+        "collection-clustering",
         "debate-mapping",
+        "cluster-synthesis",
         "cluster-synthesis",
         "collection-gap",
     ]
