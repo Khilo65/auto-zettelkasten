@@ -50,7 +50,7 @@ def test_singleton_cluster_is_rejected(tmp_path: Path, sample_items) -> None:
         run_id="singleton",
     )
     assert report.cluster_map["clusters"] == []
-    assert report.cluster_map["unclustered_sources"][0]["reason"] == "no_connected_debate_family_proposal"
+    assert report.cluster_map["unclustered_sources"][0]["reason"] == "singleton_bounded_literature"
     assert report.gap_map["gap_candidates"] == []
     compatible = yaml.safe_load((tmp_path / "02_source_memory" / "indexes" / "gap_candidates.yml").read_text())
     assert compatible["status"] == "complete_no_qualifying_gaps"

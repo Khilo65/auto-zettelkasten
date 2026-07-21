@@ -1341,7 +1341,7 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
     assert "settlement durability" in prompts["collection-clustering"]
     assert "study_lineage" in prompts["collection-clustering"]
     assert "source_locators" in prompts["collection-clustering"]
-    assert "cluster prompt v15" in system_prompts["collection-clustering"]
+    assert "cluster prompt v17" in system_prompts["collection-clustering"]
     assert "family_relation" in system_prompts["collection-clustering"]
     assert "independence_assessments" in system_prompts["collection-clustering"]
     assert (
@@ -1372,7 +1372,9 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
         "unrelated-profile-must-not-enter-repair-packet"
         not in prompts["collection-clustering"]
     )
-    assert "at most four proposals" in prompts["collection-clustering"]
+    assert "semantically connected whole-profile component" in prompts[
+        "collection-clustering"
+    ]
     assert output_caps["collection-clustering"] == 24_000
     assert reader.map_debates([], request) == {"assessments": []}
     synthesis = reader.synthesize_cluster([], request)

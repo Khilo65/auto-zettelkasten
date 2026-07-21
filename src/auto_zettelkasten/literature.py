@@ -64,8 +64,8 @@ GAP_RULES = (
     "cross_cluster_integration",
     "author_stated_gap",
 )
-LITERATURE_ALGORITHM_VERSION = "28"
-CLUSTER_PROPOSAL_PROMPT_VERSION = "16"
+LITERATURE_ALGORITHM_VERSION = "29"
+CLUSTER_PROPOSAL_PROMPT_VERSION = "17"
 CLUSTER_SYNTHESIS_PROMPT_VERSION = "13"
 GAP_REASONING_PROMPT_VERSION = "9"
 ANCHOR_ALGORITHM_VERSION = "3"
@@ -73,9 +73,6 @@ SUPPORT_ENVELOPE_VERSION = "2"
 PROPOSITION_ALGORITHM_VERSION = "14"
 PROPOSITION_MATRIX_VERSION = "3"
 GAP_RULE_VERSION = "3"
-
-COVERAGE_REPAIR_SOURCE_BATCH_SIZE = 12
-MAX_COVERAGE_REPAIR_CALLS = 3
 
 FAMILY_RELATION_VERSION = "6"
 
@@ -1522,6 +1519,12 @@ def _same_provider_inputs(
             "relations",
             "topic_neighborhoods",
             "coverage_repair_source_ids",
+            "coverage_focus_source_ids",
+            "coverage_component_source_ids",
+            "coverage_audit_mode",
+            "coverage_component_signature",
+            "current_clusters",
+            "current_unclustered_sources",
             "prior_proposal_identities",
         )
         if stage == "cluster_proposal"
@@ -5777,6 +5780,57 @@ def _proposition_cells_from_references(
     return cells
 
 
+def _specific_unclustered_reason(
+    source_id: str,
+    profile: Mapping[str, Any],
+    rejected: Sequence[Mapping[str, Any]],
+    topic_neighborhoods: Sequence[Mapping[str, Any]] | None,
+) -> tuple[str, str]:
+    source_rejections = [
+        str(row.get("reason") or "")
+        for row in rejected
+        if source_id in {str(value) for value in row.get("source_ids", []) or []}
+        and str(row.get("reason") or "")
+    ]
+    detail = source_rejections[0] if source_rejections else ""
+    normalized = detail.casefold()
+    if "membership" in normalized and "limit" in normalized:
+        return "membership_limit_exceeded", detail
+    if "independent" in normalized or "evidence_base" in normalized:
+        return "insufficient_independent_evidence_bases", detail
+    if "locator" in normalized or "anchor" in normalized or "support" in normalized:
+        return "no_central_locator_backed_membership_anchor", detail
+    if "incompar" in normalized or "bounded_object" in normalized:
+        return "incomparable_research_problem", detail
+    if not any(
+        _anchor_is_synthesis_eligible(claim) for claim in profile.get("claims", []) or []
+    ):
+        return (
+            "no_central_locator_backed_membership_anchor",
+            detail or "No synthesis-eligible locator-backed finding supports cluster membership.",
+        )
+    neighborhood_peers = {
+        str(value)
+        for neighborhood in topic_neighborhoods or []
+        if isinstance(neighborhood, Mapping)
+        and source_id
+        in {str(item) for item in neighborhood.get("source_ids", []) or []}
+        for value in neighborhood.get("source_ids", []) or []
+        if str(value) and str(value) != source_id
+    }
+    if neighborhood_peers:
+        return (
+            "broad_topical_overlap_only",
+            detail
+            or "The source shares retrieval signals with other studies, but no bounded research conversation passed admission.",
+        )
+    return (
+        "singleton_bounded_literature",
+        detail
+        or "No second independent analytical source addresses a sufficiently connected research problem.",
+    )
+
+
 def map_overlapping_clusters(
     profiles: Sequence[Any],
     relations: Sequence[Mapping[str, Any]] | None = None,
@@ -6814,20 +6868,18 @@ def map_overlapping_clusters(
                 profile.get("exclusion_reason")
                 or "limited_profile_excluded_from_analytical_clustering"
             )
+            reason_detail = "Limited coverage cannot support analytical cluster admission."
         else:
-            source_rejections = [
-                str(row.get("reason") or "")
-                for row in rejected
-                if source_id
-                in {str(value) for value in row.get("source_ids", []) or []}
-            ]
-            reason = (
-                source_rejections[0]
-                if source_rejections
-                else "no_connected_debate_family_proposal"
+            reason, reason_detail = _specific_unclustered_reason(
+                source_id, profile, rejected, topic_neighborhoods
             )
         unclustered.append(
-            {"source_id": source_id, "note_id": profile["note_id"], "reason": reason}
+            {
+                "source_id": source_id,
+                "note_id": profile["note_id"],
+                "reason": reason,
+                "reason_detail": reason_detail,
+            }
         )
     return {
         "clusters": sorted(clusters, key=lambda row: row["cluster_id"]),
@@ -14047,6 +14099,170 @@ def _coverage_repair_source_ids(
     )
 
 
+def _coverage_signal_components(
+    focus_source_ids: Sequence[str],
+    profiles: Sequence[Mapping[str, Any]],
+    relations: Sequence[Mapping[str, Any]],
+    topic_neighborhoods: Sequence[Mapping[str, Any]],
+) -> list[dict[str, list[str]]]:
+    """Build semantic repair components without identifier-based micro-batches."""
+
+    profile_by_source = {
+        str(profile.get("source_id") or ""): profile
+        for profile in profiles
+        if profile.get("analytical") and profile.get("source_id")
+    }
+    eligible = set(profile_by_source)
+    focus = {source_id for source_id in focus_source_ids if source_id in eligible}
+    adjacency: dict[str, set[str]] = {source_id: set() for source_id in eligible}
+
+    def connect(values: Sequence[Any]) -> None:
+        source_ids = sorted({str(value) for value in values if str(value) in eligible})
+        if len(source_ids) < 2:
+            return
+        for left in source_ids:
+            adjacency[left].update(right for right in source_ids if right != left)
+
+    for relation in relations:
+        if isinstance(relation, Mapping):
+            connect(relation.get("source_ids", []) or [])
+    for neighborhood in topic_neighborhoods:
+        if not isinstance(neighborhood, Mapping):
+            continue
+        if str(neighborhood.get("kind") or neighborhood.get("facet_type") or "") in {
+            "period",
+        }:
+            continue
+        connect(neighborhood.get("source_ids", []) or [])
+
+    # Exact profile facets are candidate signals only. They connect the audit
+    # packet; deterministic admission still decides whether a cluster exists.
+    for field in ("concepts", "theories", "mechanisms", "outcomes", "cases", "methods"):
+        sources_by_value: dict[str, list[str]] = defaultdict(list)
+        for source_id, profile in profile_by_source.items():
+            for value in profile.get(field, []) or []:
+                normalized = _canonical_phrase(value)
+                if normalized:
+                    sources_by_value[normalized].append(source_id)
+        for source_ids in sources_by_value.values():
+            connect(source_ids)
+
+    components: list[dict[str, list[str]]] = []
+    remaining = set(focus)
+    while remaining:
+        seed = min(remaining)
+        stack = [seed]
+        connected: set[str] = set()
+        while stack:
+            current = stack.pop()
+            if current in connected:
+                continue
+            connected.add(current)
+            stack.extend(adjacency.get(current, set()) - connected)
+        focus_component = connected & focus
+        remaining -= focus_component
+        if not focus_component:
+            continue
+        context_sources = set(focus_component)
+        for source_id in focus_component:
+            context_sources.update(adjacency.get(source_id, set()))
+        components.append(
+            {
+                "focus_source_ids": sorted(focus_component),
+                "source_ids": sorted(context_sources),
+            }
+        )
+    return sorted(
+        components,
+        key=lambda row: (
+            -len(row["focus_source_ids"]),
+            _stable_hash(row["focus_source_ids"]),
+        ),
+    )
+
+
+def _coverage_audit_plan(
+    clustered: Mapping[str, Any],
+    profiles: Sequence[Mapping[str, Any]],
+    relations: Sequence[Mapping[str, Any]],
+    topic_neighborhoods: Sequence[Mapping[str, Any]],
+    *,
+    reasoner: Any,
+    request: Any,
+) -> list[dict[str, Any]]:
+    """Choose one coarse DeepSeek audit or semantic whole-profile components."""
+
+    focus_source_ids = _coverage_repair_source_ids(clustered, profiles)
+    if not focus_source_ids:
+        return []
+    analytical_source_ids = sorted(
+        str(profile.get("source_id") or "")
+        for profile in profiles
+        if profile.get("analytical") and profile.get("source_id")
+    )
+    provider = str(
+        getattr(reasoner, "name", "")
+        or _as_mapping(request).get("provider")
+        or ""
+    ).casefold()
+    model = str(
+        getattr(reasoner, "model", "")
+        or _as_mapping(request).get("model")
+        or ""
+    ).casefold()
+    context_window = int(getattr(reasoner, "context_window_tokens", 0) or 0)
+    policy = _as_mapping(_as_mapping(request).get("literature_policy"))
+    context_fraction = float(policy.get("deepseek_packet_context_fraction", 0.8) or 0.8)
+    estimated_tokens = max(
+        1,
+        len(
+            json.dumps(
+                {
+                    "profiles": profiles,
+                    "relations": relations,
+                    "topic_neighborhoods": topic_neighborhoods,
+                    "clusters": clustered.get("clusters", []),
+                    "unclustered": clustered.get("unclustered_sources", []),
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
+        // 4,
+    )
+    if (
+        "deepseek" in {provider, model}
+        or "deepseek" in provider
+        or "deepseek" in model
+    ) and context_window > 0 and estimated_tokens <= int(context_window * context_fraction):
+        return [
+            {
+                "mode": "collection",
+                "key": "collection--coverage-audit",
+                "focus_source_ids": focus_source_ids,
+                "source_ids": analytical_source_ids,
+            }
+        ]
+
+    components = _coverage_signal_components(
+        focus_source_ids, profiles, relations, topic_neighborhoods
+    )
+    return [
+        {
+            "mode": "semantic_component",
+            "key": "collection--coverage-component-"
+            + _stable_hash(
+                {
+                    "focus_source_ids": component["focus_source_ids"],
+                    "source_ids": component["source_ids"],
+                }
+            )[:12],
+            **component,
+        }
+        for component in components
+    ]
+
+
 def _cluster_proposals_from_responses(
     responses: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -14163,30 +14379,29 @@ def build_literature_report(
     proposal_responses: list[Mapping[str, Any]] = [proposal_response]
     combined_proposals = _cluster_proposals_from_responses(proposal_responses)
     completed_responses = getattr(reasoner_call, "completed_responses", None)
-    attempted_repair_source_ids: set[str] = set()
-    for repair_attempt in range(1, MAX_COVERAGE_REPAIR_CALLS + 1):
-        repair_source_ids = [
-            source_id
-            for source_id in _coverage_repair_source_ids(clustered, normalized)
-            if source_id not in attempted_repair_source_ids
-        ][:COVERAGE_REPAIR_SOURCE_BATCH_SIZE]
-        if (
-            len(analytical_families) < 2
-            or not repair_source_ids
-            or reasoner_call is None
-        ):
-            break
-        attempted_repair_source_ids.update(repair_source_ids)
-        repair_key = (
-            "collection--coverage-repair"
-            if repair_attempt == 1
-            else f"collection--coverage-repair-{repair_attempt}"
+    coverage_plan = (
+        _coverage_audit_plan(
+            clustered,
+            normalized,
+            relations,
+            topic_neighborhoods,
+            reasoner=reasoner,
+            request=request,
         )
+        if len(analytical_families) >= 2 and reasoner_call is not None
+        else []
+    )
+    for audit_index, audit in enumerate(coverage_plan, start=1):
+        audit_source_ids = list(audit.get("source_ids", []) or [])
+        focus_source_ids = list(audit.get("focus_source_ids", []) or [])
+        if len(audit_source_ids) < 2 or not focus_source_ids:
+            continue
+        audit_key = str(audit.get("key") or "")
         repair_response = _reasoner_stage(
             reasoner,
             reasoner_call,
             stage="cluster_proposal",
-            key=repair_key,
+            key=audit_key,
             method_name="propose_clusters",
             profiles=normalized,
             request=request,
@@ -14194,8 +14409,18 @@ def build_literature_report(
                 "propositions": propositions,
                 "relations": relations,
                 "topic_neighborhoods": topic_neighborhoods,
-                "coverage_repair_source_ids": repair_source_ids,
-                "coverage_repair_attempt": repair_attempt,
+                # Keep the legacy field for custom reasoners while the built-in
+                # reader uses the broader component packet.
+                "coverage_repair_source_ids": focus_source_ids,
+                "coverage_focus_source_ids": focus_source_ids,
+                "coverage_component_source_ids": audit_source_ids,
+                "coverage_audit_mode": str(audit.get("mode") or "semantic_component"),
+                "coverage_component_signature": audit_key,
+                "coverage_repair_attempt": audit_index,
+                "current_clusters": list(clustered.get("clusters", []) or []),
+                "current_unclustered_sources": list(
+                    clustered.get("unclustered_sources", []) or []
+                ),
                 "prior_proposal_identities": [
                     str(row.get("semantic_identity") or row.get("label") or "")
                     for row in combined_proposals
@@ -14210,7 +14435,7 @@ def build_literature_report(
         preserved_repair_responses: list[Mapping[str, Any]] = []
         if callable(completed_responses):
             preserved_repair_responses = list(
-                completed_responses("cluster_proposal", repair_key) or []
+                completed_responses("cluster_proposal", audit_key) or []
             )
         proposal_responses.extend([*preserved_repair_responses, repair_response])
         combined_proposals = _cluster_proposals_from_responses(proposal_responses)
@@ -17070,8 +17295,17 @@ def _map_unclustered_reason_label(value: Any) -> str:
         return "Limited source coverage"
     if "membership" in normalized and "limit" in normalized:
         return "Analytical-cluster membership limit"
-    if "debate family" in normalized:
-        return "No sufficiently specific multi-source literature cluster was admitted"
+    labels = {
+        "limited_source_coverage": "Limited source coverage",
+        "singleton_bounded_literature": "No second independent study addresses this bounded research problem",
+        "insufficient_independent_evidence_bases": "Too few independent evidence bases for cluster admission",
+        "broad_topical_overlap_only": "Related by topic, but not by a sufficiently bounded research conversation",
+        "no_central_locator_backed_membership_anchor": "No locator-backed central finding supports cluster membership",
+        "incomparable_research_problem": "The source addresses a materially different research problem",
+        "membership_limit_exceeded": "Analytical-cluster membership limit",
+    }
+    if reason in labels:
+        return labels[reason]
     return (
         reason.replace("_", " ").strip().capitalize() or "No admission reason recorded"
     )

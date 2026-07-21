@@ -547,7 +547,7 @@ def test_profile_exclusion_coverage_and_validity_create_explicit_unclustered_rea
     assert reasons["limited"] == "limited_profile_excluded_from_analytical_clustering"
     assert reasons["excluded"] == "limited_profile_excluded_from_analytical_clustering"
     assert reasons["invalid"] == "limited_profile_excluded_from_analytical_clustering"
-    assert reasons["other"] == "no_connected_debate_family_proposal"
+    assert reasons["other"] == "singleton_bounded_literature"
 
 
 def test_relations_create_neighborhoods_but_not_analytical_clusters() -> None:
@@ -970,7 +970,7 @@ def test_opposite_directions_for_different_outcomes_are_not_a_debate() -> None:
     mapped = map_overlapping_clusters(rows)
     assert mapped["clusters"] == []
     assert {row["reason"] for row in mapped["unclustered_sources"]} == {
-        "no_connected_debate_family_proposal"
+        "singleton_bounded_literature"
     }
 
 
@@ -999,7 +999,7 @@ def test_opposite_directions_for_different_predictors_are_not_a_debate() -> None
     mapped = map_overlapping_clusters(rows)
     assert mapped["clusters"] == []
     assert {row["reason"] for row in mapped["unclustered_sources"]} == {
-        "no_connected_debate_family_proposal"
+        "singleton_bounded_literature"
     }
 
 
@@ -1599,7 +1599,7 @@ def test_compatibility_entry_accepts_current_rows_writes_all_outputs_and_has_no_
     assert cluster_map["topic_neighborhoods"] == []
     assert cluster_map["navigation"]["unconfirmed_zotero_tag_count"] == 2
     assert {row["reason"] for row in cluster_map["unclustered_sources"]} == {
-        "no_connected_debate_family_proposal"
+        "no_central_locator_backed_membership_anchor"
     }
     assert gap_map["gap_candidates"] == []
     assert gap_map["status"] == "complete_no_qualifying_gaps"
@@ -2265,14 +2265,98 @@ def test_coverage_repair_recovers_supported_family_and_replays_without_calls(
     assert replay_packet["synthesis_checkpoint_hit_count"] == 2
 
 
-def test_coverage_repair_uses_distinct_coarse_batches_for_large_source_sets(
+def test_deepseek_coverage_audit_uses_one_full_collection_packet() -> None:
+    rows = normalize_evidence_profiles(
+        [profile(f"source-{index:02d}") for index in range(20)]
+    )
+    relations = map_profile_relations(rows)
+    neighborhoods = map_topic_neighborhoods(rows, relations)
+    clustered = {
+        "clusters": [],
+        "unclustered_sources": [
+            {"source_id": row["source_id"], "reason": "broad_topical_overlap_only"}
+            for row in rows
+        ],
+    }
+
+    class DeepSeekReasoner:
+        name = "deepseek"
+        model = "deepseek-v4-flash"
+        context_window_tokens = 1_000_000
+
+    plan = literature._coverage_audit_plan(
+        clustered,
+        rows,
+        relations,
+        neighborhoods,
+        reasoner=DeepSeekReasoner(),
+        request=LiteratureMapRequest(
+            workspace=".", provider="deepseek", model="deepseek-v4-flash"
+        ),
+    )
+
+    assert len(plan) == 1
+    assert plan[0]["mode"] == "collection"
+    assert plan[0]["key"] == "collection--coverage-audit"
+    assert set(plan[0]["focus_source_ids"]) == {
+        row["source_id"] for row in rows
+    }
+    assert set(plan[0]["source_ids"]) == {row["source_id"] for row in rows}
+
+
+def test_small_context_coverage_audit_keeps_semantic_peers_together() -> None:
+    rows = normalize_evidence_profiles(
+        [
+            profile("a-first", topic="natural resource mediation"),
+            profile("z-last", topic="natural resource mediation", method="case study"),
+            profile("middle", topic="track two diplomacy"),
+        ]
+    )
+    relations = map_profile_relations(rows)
+    neighborhoods = map_topic_neighborhoods(rows, relations)
+    clustered = {
+        "clusters": [],
+        "unclustered_sources": [
+            {"source_id": row["source_id"], "reason": "broad_topical_overlap_only"}
+            for row in rows
+        ],
+    }
+
+    class SmallReasoner:
+        name = "ollama"
+        model = "small-local"
+        context_window_tokens = 8_192
+
+    plan = literature._coverage_audit_plan(
+        clustered,
+        rows,
+        relations,
+        neighborhoods,
+        reasoner=SmallReasoner(),
+        request=LiteratureMapRequest(
+            workspace=".", provider="ollama", model="small-local"
+        ),
+    )
+
+    natural_resource_component = next(
+        row
+        for row in plan
+        if "a-first" in row["focus_source_ids"]
+    )
+    assert natural_resource_component["mode"] == "semantic_component"
+    assert {"a-first", "z-last"}.issubset(
+        natural_resource_component["source_ids"]
+    )
+
+
+def test_coverage_audit_keeps_connected_large_subliterature_in_one_component(
     tmp_path: Path,
 ) -> None:
     rows = [profile(f"source-{index:02d}") for index in range(26)]
 
     class Reasoner:
-        name = "batched-coverage-repair-reasoner"
-        model = "batched-coverage-repair-v1"
+        name = "component-coverage-repair-reasoner"
+        model = "component-coverage-repair-v1"
         is_cloud = False
 
         def __init__(self) -> None:
@@ -2373,8 +2457,10 @@ def test_coverage_repair_uses_distinct_coarse_batches_for_large_source_sets(
         reasoner=reasoner,
     )
 
-    assert [len(batch) for batch in reasoner.repair_batches] == [12, 12, 2]
-    assert len({source_id for batch in reasoner.repair_batches for source_id in batch}) == 26
+    assert [len(batch) for batch in reasoner.repair_batches] == [26]
+    assert set(reasoner.repair_batches[0]) == {
+        f"source-{index:02d}" for index in range(26)
+    }
 
 
 def test_coverage_repair_history_remains_available_to_a_resumed_frozen_run(
@@ -3937,7 +4023,7 @@ def test_question_is_only_a_projection_lens_and_never_changes_map_identity() -> 
     )
 
 
-def test_v4_every_promoted_neighborhood_maps_to_an_admitted_cluster_or_records_a_substantive_rejection_reason() -> (
+def test_v4_recognizable_subliteratures_cluster_or_receive_specific_adjudication() -> (
     None
 ):
     """V-4 characterization: every promoted topic_neighborhood of an
@@ -3984,9 +4070,17 @@ def test_v4_every_promoted_neighborhood_maps_to_an_admitted_cluster_or_records_a
                 str(neighborhood_id), set()
             ).add(str(cluster["cluster_id"]))
 
+    unclustered_rows = list(
+        report["cluster_registry"].get("unclustered_sources", []) or []
+    )
+    assert all(
+        row.get("reason") != "no_connected_debate_family_proposal"
+        and str(row.get("reason_detail") or "").strip()
+        for row in unclustered_rows
+    )
     unclustered_reasons: dict[str, str] = {
         str(row.get("source_id") or ""): str(row.get("reason") or "")
-        for row in report["cluster_registry"].get("unclustered_sources", []) or []
+        for row in unclustered_rows
     }
     rejected_proposals = report["cluster_registry"].get("rejected_proposals", []) or []
     rejected_neighborhood_notes: dict[str, str] = {}

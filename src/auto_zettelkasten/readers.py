@@ -286,20 +286,33 @@ class _CapabilityAwareReader:
             for value in (context or {}).get("coverage_repair_source_ids", []) or []
             if str(value)
         ]
-        if repair_source_ids:
-            repair_source_id_set = set(repair_source_ids)
+        component_source_ids = [
+            str(value)
+            for value in (context or {}).get("coverage_component_source_ids", []) or []
+            if str(value)
+        ]
+        packet_source_ids = component_source_ids or repair_source_ids
+        if packet_source_ids:
+            component_source_id_set = set(packet_source_ids)
             proposal_profiles = [
                 profile
                 for profile in proposal_profiles
-                if str(profile.get("source_id") or "") in repair_source_id_set
+                if str(profile.get("source_id") or "") in component_source_id_set
             ]
+        audit_mode = str((context or {}).get("coverage_audit_mode") or "")
         instruction = (
-            "Perform a bounded thematic coverage repair for only the listed unclustered sources. First test whether two or more "
-            "of those sources form a recognizable subliterature; then test whether a listed source belongs in a supplied prior "
-            "proposal. Exact proposition agreement is not required. Never return a singleton cluster. Return only a genuinely "
-            "new proposal or a prior proposal whose membership changes. For a changed prior proposal, preserve its semantic "
-            "identity and return its complete corrected membership and relations. Do not repeat unchanged proposals, do not "
-            "recapitulate the collection map, and return at most four proposals in this repair response."
+            "Audit thematic coverage across the complete analytical collection. The focus-source list identifies sources that "
+            "remain unclustered, but every supplied profile may be used to recover a missing cluster, repair fragmented membership, "
+            "or distinguish overlapping clusters. Test recognizable research conversations and evidence bases even when their "
+            "studies address different propositions. Exact proposition agreement is not required for thematic cluster formation. "
+            "Never return a singleton cluster. Return only new proposals or complete corrected versions of prior proposals whose "
+            "membership changes, and preserve stable semantic identities for corrected proposals."
+            if audit_mode == "collection"
+            else
+            "Audit one semantically connected whole-profile component for missing or fragmented thematic clusters. Focus on the "
+            "listed unclustered sources while using supplied neighboring or already-clustered profiles as comparison, context, or "
+            "bridge evidence. Exact proposition agreement is not required. Never return a singleton cluster. Return only a genuinely "
+            "new proposal or a complete corrected prior proposal whose membership changes; preserve its semantic identity."
             if repair_source_ids
             else "Propose the complete set of coherent, overlapping collection debate families."
         )
@@ -865,7 +878,7 @@ def _profile_system_prompt() -> str:
 
 def _cluster_proposal_system_prompt() -> str:
     return (
-        "You are the collection-clustering reasoner for Auto-Zettelkasten cluster prompt v15. "
+        "You are the collection-clustering reasoner for Auto-Zettelkasten cluster prompt v17. "
         "Return exactly one compact JSON object with a clusters array. Inspect the complete analytical source inventory and "
         "propose every defensible, recognizable subliterature needed to map it; do not stop after an arbitrary top-N shortlist. "
         "A cluster is a bounded topic, problem, mechanism, case family, theoretical dispute, institutional practice, or practice question that is central "
@@ -1579,6 +1592,43 @@ def _cluster_proposal_context(context: Mapping[str, Any] | None) -> dict[str, An
             str(value)
             for value in (context or {}).get("coverage_repair_source_ids", []) or []
             if str(value)
+        ],
+        "coverage_focus_source_ids": [
+            str(value)
+            for value in (context or {}).get("coverage_focus_source_ids", []) or []
+            if str(value)
+        ],
+        "coverage_component_source_ids": [
+            str(value)
+            for value in (context or {}).get("coverage_component_source_ids", []) or []
+            if str(value)
+        ],
+        "coverage_audit_mode": str(
+            (context or {}).get("coverage_audit_mode") or ""
+        ),
+        "coverage_component_signature": str(
+            (context or {}).get("coverage_component_signature") or ""
+        ),
+        "current_clusters": [
+            {
+                key: cluster.get(key)
+                for key in (
+                    "cluster_id",
+                    "label",
+                    "semantic_identity",
+                    "shared_question",
+                    "source_ids",
+                    "source_roles",
+                )
+                if cluster.get(key) not in (None, "", [])
+            }
+            for cluster in (context or {}).get("current_clusters", []) or []
+            if isinstance(cluster, Mapping)
+        ],
+        "current_unclustered_sources": [
+            dict(row)
+            for row in (context or {}).get("current_unclustered_sources", []) or []
+            if isinstance(row, Mapping)
         ],
         "prior_proposal_identities": [
             str(value)
