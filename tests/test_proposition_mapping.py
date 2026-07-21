@@ -988,6 +988,45 @@ def test_mediation_occurrence_source_is_context_in_success_cluster() -> None:
     assert cluster["context_source_ids"] == ["occurrence"]
 
 
+def test_non_mediation_onset_and_result_terms_do_not_trigger_stage_mismatch() -> None:
+    rows = normalize_evidence_profiles(
+        [
+            _profile(
+                "resource-a",
+                topic="natural resource conflict",
+                outcome="conflict onset",
+                claim="Resource exploitation is linked to conflict onset.",
+            ),
+            _profile(
+                "resource-b",
+                topic="natural resource conflict",
+                outcome="peacebuilding result",
+                claim="Resource governance is integrated into peacebuilding.",
+            ),
+        ]
+    )
+    proposal = {
+        "proposal_id": "proposal-natural-resources",
+        "label": "Natural Resources, Conflict, and Peacebuilding",
+        "semantic_identity": "natural resources conflict onset and peacebuilding",
+        "shared_question": "How do natural resources shape conflict and peacebuilding?",
+        "bounded_object": "natural resource conflict onset and peacebuilding",
+        "source_ids": [row["source_id"] for row in rows],
+        "source_roles": {row["source_id"]: "core" for row in rows},
+        "supporting_evidence": [_reference(row) for row in rows],
+        "propositions": [],
+        "family_relations": [],
+    }
+
+    mapped = map_overlapping_clusters(rows, proposals=[proposal], propositions=[])
+
+    assert len(mapped["clusters"]) == 1
+    assert set(mapped["clusters"][0]["core_source_ids"]) == {
+        "resource-a",
+        "resource-b",
+    }
+
+
 def test_missing_parallel_proposition_gets_qualified_coverage_without_inventing_a_relationship() -> (
     None
 ):

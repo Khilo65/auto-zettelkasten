@@ -64,7 +64,7 @@ GAP_RULES = (
     "cross_cluster_integration",
     "author_stated_gap",
 )
-LITERATURE_ALGORITHM_VERSION = "31"
+LITERATURE_ALGORITHM_VERSION = "32"
 CLUSTER_PROPOSAL_PROMPT_VERSION = "17"
 CLUSTER_SYNTHESIS_PROMPT_VERSION = "14"
 GAP_REASONING_PROMPT_VERSION = "10"
@@ -4666,11 +4666,18 @@ def _proposal_membership_evidence(
             )
         else:
             profile_match_passed = bool(profile_overlap or profile_outcome_alias)
-        profile_stage_conflict = _outcome_stage_conflicts(
-            profile_terms, raw_proposal_terms
-        ) or bool(
-            primary_profile_terms
-            and _outcome_stage_conflicts(primary_profile_terms, raw_proposal_terms)
+        mediation_stage_comparison = bool(
+            profile_terms & {"mediation", "mediator"}
+            and raw_proposal_terms & {"mediation", "mediator"}
+        )
+        profile_stage_conflict = mediation_stage_comparison and (
+            _outcome_stage_conflicts(profile_terms, raw_proposal_terms)
+            or bool(
+                primary_profile_terms
+                and _outcome_stage_conflicts(
+                    primary_profile_terms, raw_proposal_terms
+                )
+            )
         )
         if profile_stage_conflict:
             profile_match_passed = False
@@ -4755,7 +4762,11 @@ def _proposal_membership_evidence(
                         and relationship_terms
                     )
                 )
-            if _outcome_stage_conflicts(anchor_terms, raw_proposal_terms):
+            if (
+                mediation_stage_comparison
+                and anchor_terms & {"mediation", "mediator"}
+                and _outcome_stage_conflicts(anchor_terms, raw_proposal_terms)
+            ):
                 anchor_match_passed = False
             if not anchor_match_passed:
                 continue
@@ -14862,7 +14873,7 @@ def _coverage_audit_plan(
         candidate_components = _coverage_signal_components(
             focus_source_ids, profiles, relations, topic_neighborhoods
         )
-        return [
+        plan = [
             {
                 "mode": "collection",
                 "key": "collection--coverage-audit",
@@ -14871,6 +14882,17 @@ def _coverage_audit_plan(
                 "candidate_components": candidate_components,
             }
         ]
+        if candidate_components and len(candidate_components[0]["source_ids"]) >= 2:
+            residual = candidate_components[0]
+            plan.append(
+                {
+                    "mode": "semantic_component",
+                    "key": "collection--coverage-residual-"
+                    + _stable_hash(residual)[:12],
+                    **residual,
+                }
+            )
+        return plan
 
     components = _coverage_signal_components(
         focus_source_ids, profiles, relations, topic_neighborhoods
@@ -15086,6 +15108,17 @@ def build_literature_report(
     for audit_index, audit in enumerate(coverage_plan, start=1):
         audit_source_ids = list(audit.get("source_ids", []) or [])
         focus_source_ids = list(audit.get("focus_source_ids", []) or [])
+        if str(audit.get("mode") or "") == "semantic_component":
+            currently_unclustered = {
+                str(row.get("source_id") or "")
+                for row in clustered.get("unclustered_sources", []) or []
+                if isinstance(row, Mapping)
+            }
+            focus_source_ids = [
+                source_id
+                for source_id in focus_source_ids
+                if source_id in currently_unclustered
+            ]
         if len(audit_source_ids) < 2 or not focus_source_ids:
             continue
         audit_key = str(audit.get("key") or "")

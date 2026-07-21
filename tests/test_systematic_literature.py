@@ -2272,7 +2272,9 @@ def test_coverage_repair_recovers_supported_family_and_replays_without_calls(
     assert replay_packet["synthesis_checkpoint_hit_count"] == 2
 
 
-def test_deepseek_coverage_audit_uses_one_full_collection_packet() -> None:
+def test_deepseek_coverage_audit_uses_one_full_packet_and_one_residual_component() -> (
+    None
+):
     rows = normalize_evidence_profiles(
         [profile(f"source-{index:02d}") for index in range(20)]
     )
@@ -2302,7 +2304,7 @@ def test_deepseek_coverage_audit_uses_one_full_collection_packet() -> None:
         ),
     )
 
-    assert len(plan) == 1
+    assert len(plan) == 2
     assert plan[0]["mode"] == "collection"
     assert plan[0]["key"] == "collection--coverage-audit"
     assert set(plan[0]["focus_source_ids"]) == {
@@ -2315,6 +2317,9 @@ def test_deepseek_coverage_audit_uses_one_full_collection_packet() -> None:
         for component in plan[0]["candidate_components"]
         for source_id in component["focus_source_ids"]
     } == {row["source_id"] for row in rows}
+    assert plan[1]["mode"] == "semantic_component"
+    assert plan[1]["key"].startswith("collection--coverage-residual-")
+    assert len(plan[1]["source_ids"]) >= 2
 
 
 def test_deepseek_coverage_fit_ignores_machine_only_profile_bulk() -> None:
