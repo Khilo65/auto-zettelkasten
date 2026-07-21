@@ -308,6 +308,8 @@ class _CapabilityAwareReader:
             "Use the deterministic candidate components as attention hints, checking whether each contains an overlooked coherent "
             "conversation; they are not evidence and must not force admission. Account for every focus source by either returning a "
             "supported cluster proposal or leaving it unproposed when the supplied evidence does not establish a coherent group. "
+            "Keep this audit packet compact: use one best locator-backed anchor per core source, at most one proposition and one "
+            "family relation per proposed cluster, no repeated findings, and no rationale longer than two sentences. "
             "Never return a singleton cluster. Return only new proposals or complete corrected versions of prior proposals whose "
             "membership changes, and preserve stable semantic identities for corrected proposals."
             if audit_mode == "collection"
@@ -331,7 +333,9 @@ class _CapabilityAwareReader:
                 user_prompt,
                 label="cluster proposal",
                 output_tokens=(
-                    24_000
+                    CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS
+                    if audit_mode == "collection"
+                    else 24_000
                     if repair_source_ids
                     else CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS
                 ),

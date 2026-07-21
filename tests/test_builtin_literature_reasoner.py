@@ -1376,6 +1376,27 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
         "collection-clustering"
     ]
     assert output_caps["collection-clustering"] == 24_000
+    assert reader.propose_clusters(
+        [normalized_profile, unrelated_profile],
+        request,
+        context={
+            "coverage_repair_source_ids": ["source-a"],
+            "coverage_component_source_ids": ["source-a"],
+            "coverage_audit_mode": "collection",
+            "coverage_candidate_components": [
+                {
+                    "focus_source_ids": ["source-a"],
+                    "source_ids": ["source-a"],
+                }
+            ],
+            "prior_proposals": [],
+        },
+    ) == {"clusters": []}
+    assert "one best locator-backed anchor per core source" in prompts[
+        "collection-clustering"
+    ]
+    assert "coverage_candidate_components" in prompts["collection-clustering"]
+    assert output_caps["collection-clustering"] == 32_000
     assert reader.map_debates([], request) == {"assessments": []}
     synthesis = reader.synthesize_cluster([], request)
     assert output_caps["cluster-synthesis"] == 16_000
@@ -1487,6 +1508,7 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
     )
     assert output_caps["collection-gap"] == 32_000
     assert calls == [
+        "collection-clustering",
         "collection-clustering",
         "collection-clustering",
         "debate-mapping",
