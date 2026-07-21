@@ -1041,7 +1041,7 @@ def _cluster_synthesis_system_prompt() -> str:
 
 def _gap_adjudication_system_prompt() -> str:
     return (
-        "You are the collection-gap adjudicator for Auto-Zettelkasten gap prompt v9. Return exactly one JSON object with "
+        "You are the collection-gap adjudicator for Auto-Zettelkasten gap prompt v10. Return exactly one JSON object with "
         "gaps and rejected arrays. Consider only supplied candidates and their deterministic all-collection search results. "
         "You may merge equivalent candidates or perform at most one evidence-constrained reframing of a candidate, but may "
         "not manufacture a new literature gap. A missing test is not itself a worthy gap. Retain a candidate only when it "
@@ -1069,8 +1069,11 @@ def _gap_adjudication_system_prompt() -> str:
         "robustness; practitioner requires implementation_evidence, institutional_context, and bias_checks. Each requirement "
         "must say concretely what would be compared, observed, measured, derived, or checked for this candidate. Do not return "
         "an empty requirements object. This is a route to "
-        "discriminating evidence, not a finalized project study design. competing_explanations, rejection_reasons, and "
-        "resolution-path limitations must be arrays of non-empty strings. information_gain and priority_tier must each be exactly "
+        "discriminating evidence, not a finalized project study design. "
+        "Do not invent named cases, datasets, instruments, comparison groups, or identification strategies. Mention one only "
+        "when it is explicitly present in the supplied collection evidence; otherwise state the type of comparison or evidence needed. "
+        "competing_explanations, rejection_reasons, and resolution-path limitations must be arrays of non-empty strings. "
+        "information_gain and priority_tier must each be exactly "
         "high, moderate, or low. Anchors must copy cluster_id, section, and item_id from a supplied cluster item whose evidence "
         "generated the puzzle; omit an anchor rather than inventing one. Evidence references must use supplied source_id, "
         "claim_id, and locator values. Preserve full "

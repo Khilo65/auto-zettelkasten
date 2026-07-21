@@ -1995,7 +1995,7 @@ def test_reasoned_cluster_markdown_explains_findings_debate_and_gap_lineage(
     assert "Originating proposition:" in gap_body
     assert "Missing evidence-matrix cell:" in gap_body
     assert "## Why the mapper raised it" in gap_body
-    assert "## A path to resolving it" in gap_body
+    assert "## A route to resolving it" in gap_body
     assert "panel-regression and case-study evidence" in gap_body
     assert "claim-a" not in gap_body and "claim-b" not in gap_body
     assert (

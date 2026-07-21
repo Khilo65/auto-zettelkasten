@@ -3056,3 +3056,77 @@ def test_gap_markdown_explains_why_a_visible_lead_is_not_a_strong_gap() -> None:
     assert "Requirements met" not in markdown
     assert "Requirements not met" in markdown
     assert "Only one independent evidence base is located" in markdown
+
+
+def test_gap_status_prose_cannot_call_a_failed_lead_strong_or_surviving() -> None:
+    gap = {
+        "status": "collection_gap_lead",
+        "decision_reasoning": (
+            "This is a strong gap that survived adjudication and was promoted."
+        ),
+        "strict_adjudication": {
+            "decision": "not_established",
+            "explanation": "Only one independent evidence base reveals the issue.",
+        },
+    }
+
+    literature._canonicalize_gap_status_prose(gap)
+
+    assert "strong gap" not in gap["decision_reasoning"].casefold()
+    assert "survived adjudication" not in gap["decision_reasoning"].casefold()
+    assert "stricter strong-gap threshold was not established" in gap[
+        "decision_reasoning"
+    ]
+
+
+def test_gap_markdown_renders_resolution_direction_without_invented_design() -> None:
+    gap = {
+        "gap_id": "gap-resolution",
+        "title": "Mediator legitimacy outside observed settings",
+        "gap_statement": "Whether mediator legitimacy travels beyond the observed settings.",
+        "rule": "boundary_condition",
+        "status": "collection_gap_lead",
+        "promoted": False,
+        "resolution_path": {
+            "path_type": "quantitative",
+            "question": "Does mediator legitimacy predict settlement durability elsewhere?",
+            "evidence_needed": "Comparable observations of legitimacy and settlement durability.",
+            "requirements": {
+                "estimand": "Average treatment effect in Colombia",
+                "comparison": "South Africa versus Angola",
+                "identification": "Security Council voting as an instrument",
+                "measurement": "PA-X and UCDP/PRIO",
+            },
+            "feasibility": "Merge named external datasets.",
+            "limitations": [],
+        },
+    }
+
+    markdown = _gap_markdown(gap)
+
+    assert "## A route to resolving it" in markdown
+    assert "estimand, comparison, identification, measurement" in markdown
+    assert "Colombia" not in markdown
+    assert "South Africa" not in markdown
+    assert "Angola" not in markdown
+    assert "Security Council" not in markdown
+    assert "PA-X" not in markdown
+    assert "UCDP/PRIO" not in markdown
+    assert "not a finalized study design" in markdown
+
+
+def test_gap_internal_search_terms_remove_rule_words_and_stopwords() -> None:
+    terms = literature._gap_search_terms(
+        {
+            "rule": "untested_mechanism",
+            "topic": "mediator legitimacy but settlement durability",
+            "precise_missing_evidence": (
+                "Comparable evidence linking legitimacy to durable settlements"
+            ),
+        }
+    )
+
+    assert "but" not in terms
+    assert "untested" not in terms
+    assert "mechanism" not in terms
+    assert {"legitimacy", "settlement", "durability"}.issubset(set(terms))

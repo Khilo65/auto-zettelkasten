@@ -67,7 +67,7 @@ GAP_RULES = (
 LITERATURE_ALGORITHM_VERSION = "29"
 CLUSTER_PROPOSAL_PROMPT_VERSION = "17"
 CLUSTER_SYNTHESIS_PROMPT_VERSION = "14"
-GAP_REASONING_PROMPT_VERSION = "9"
+GAP_REASONING_PROMPT_VERSION = "10"
 ANCHOR_ALGORITHM_VERSION = "3"
 SUPPORT_ENVELOPE_VERSION = "2"
 PROPOSITION_ALGORITHM_VERSION = "14"
@@ -12145,7 +12145,27 @@ def _gap_search_terms(candidate: Mapping[str, Any]) -> list[str]:
             candidate.get("precise_missing_evidence", ""),
         ]
     )
-    return sorted(terms)
+    generic = {
+        "author",
+        "boundary",
+        "but",
+        "condition",
+        "contradictory",
+        "coverage",
+        "cross",
+        "data",
+        "empirical",
+        "finding",
+        "gap",
+        "integration",
+        "mechanism",
+        "measurement",
+        "methodological",
+        "replication",
+        "stated",
+        "untested",
+    }
+    return sorted(term for term in terms if term not in generic and len(term) > 2)
 
 
 def _strict_gap_adjudication(
@@ -13347,6 +13367,74 @@ def _apply_gap_rationales(
     return result
 
 
+def _canonicalize_gap_status_prose(gap: dict[str, Any]) -> None:
+    """Make user-facing gap language follow deterministic adjudication."""
+
+    strict = _as_mapping(gap.get("strict_adjudication"))
+    strict_decision = str(strict.get("decision") or "not_established")
+    status = str(gap.get("status") or "collection_gap_lead")
+    reasoning = _human_projection_text(gap.get("decision_reasoning") or "")
+    if strict_decision != "established":
+        reasoning = re.sub(
+            r"\b(?:a\s+)?(?:strong|definitive|confirmed)\s+(?:collection\s+)?gap\b",
+            "a collection gap candidate",
+            reasoning,
+            flags=re.I,
+        )
+    if status != "collection_surviving_gap":
+        reasoning = re.sub(
+            r"\b(?:survived|was promoted|qualifies as a mapped gap)\b",
+            "remains under collection-level adjudication",
+            reasoning,
+            flags=re.I,
+        )
+    status_sentence = {
+        "collection_surviving_gap": (
+            "The candidate survived the collection-wide checks and is retained as a collection-scoped gap."
+        ),
+        "collection_gap_lead": (
+            "The candidate remains a collection gap lead; the stricter strong-gap threshold was not established."
+        ),
+        "answered_within_collection": (
+            "The candidate was answered within the frozen collection and is not a visible gap."
+        ),
+        "narrowed_by_collection": (
+            "Collection evidence narrowed the candidate; only the bounded remainder is retained."
+        ),
+    }.get(status, "The candidate did not pass visible collection-gap promotion.")
+    explanation = _human_projection_text(strict.get("explanation") or "")
+    gap["decision_reasoning"] = " ".join(
+        part for part in (status_sentence, explanation, reasoning) if part
+    )
+
+
+def _resolution_path_summary(resolution: Mapping[str, Any]) -> list[str]:
+    """Render an evidence route without turning it into a project study design."""
+
+    path_type = str(resolution.get("path_type") or "")
+    requirements = _as_mapping(resolution.get("requirements"))
+    requirement_names = [
+        str(field_name).replace("_", " ")
+        for field_name in _RESOLUTION_PATH_REQUIREMENTS.get(path_type, ())
+        if _flatten_values(requirements.get(field_name))
+    ]
+    lines = [
+        f"**Approach:** {path_type.replace('_', ' ')}",
+        f"**Question:** {_human_projection_text(resolution.get('question') or '')}",
+        f"**Evidence needed:** {_human_projection_text(resolution.get('evidence_needed') or '')}",
+    ]
+    if requirement_names:
+        lines.append(
+            "**The evidence route must specify:** "
+            + ", ".join(requirement_names)
+            + "."
+        )
+    lines.append(
+        "This is a collection-grounded direction for resolving the uncertainty, not a finalized study design."
+    )
+    return [line for line in lines if not line.endswith(": ")]
+
+
 def _apply_gap_adjudication(
     gaps: Sequence[Mapping[str, Any]],
     response: Mapping[str, Any],
@@ -13463,6 +13551,7 @@ def _apply_gap_adjudication(
                     automation_status="lead",
                     quality_warnings=quality_record["quality_rejection_reasons"],
                 )
+                _canonicalize_gap_status_prose(quality_record)
                 visible.append(quality_record)
                 continue
             rejected_by_id[gap_id] = quality_record
@@ -13473,6 +13562,7 @@ def _apply_gap_adjudication(
             gap,
             min_families=min_gap_families,
         )
+        _canonicalize_gap_status_prose(gap)
         visible.append(gap)
 
     merge_ledger: list[dict[str, Any]] = []
@@ -17108,20 +17198,7 @@ def _gap_markdown(
             and not missing_fields
             and len(_tokens(resolution.get("feasibility", ""))) >= 2
         )
-        path_lines = [
-            f"**Approach:** {path_type.replace('_', ' ')}",
-            f"**Question:** {resolution.get('question', '')}",
-            f"**Evidence needed:** {resolution.get('evidence_needed', '')}",
-        ]
-        if requirements:
-            path_lines.append("**Requirements:**")
-            path_lines.extend(
-                f"- {str(key).replace('_', ' ').title()}: {'; '.join(_flatten_values(value))}"
-                for key, value in requirements.items()
-                if _flatten_values(value)
-            )
-        if resolution.get("feasibility"):
-            path_lines.append(f"**Feasibility:** {resolution.get('feasibility')}")
+        path_lines = _resolution_path_summary(resolution)
         if not resolution_valid:
             caveat = "This is a provisional direction, not a validated research design."
             if missing_fields:
@@ -17131,9 +17208,9 @@ def _gap_markdown(
             path_lines.insert(0, caveat)
         sections.append(
             (
-                "## A path to resolving it"
+                "## A route to resolving it"
                 if resolution_valid
-                else "## A provisional path to resolving it"
+                else "## A provisional route to resolving it"
             )
             + "\n\n"
             + "\n\n".join(path_lines)
