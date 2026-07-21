@@ -938,8 +938,7 @@ def test_african_mediation_and_government_bias_cannot_populate_each_others_propo
 
 
 def test_mediation_occurrence_source_is_context_in_success_cluster() -> None:
-    rows = normalize_evidence_profiles(
-        [
+    raw_rows = [
             _profile(
                 "success-a",
                 topic="mediation strategy",
@@ -959,7 +958,15 @@ def test_mediation_occurrence_source_is_context_in_success_cluster() -> None:
                 claim="Conflict characteristics predict whether mediation occurs.",
             ),
         ]
-    )
+    occurrence = next(row for row in raw_rows if row["source_id"] == "occurrence")
+    occurrence["research_questions"] = [
+        "What factors determine whether mediation occurs in civil wars?"
+    ]
+    occurrence["outcomes"] = [
+        "mediation occurrence",
+        "descriptive mediation success rate",
+    ]
+    rows = normalize_evidence_profiles(raw_rows)
     proposal = {
         "proposal_id": "proposal-mediation-success",
         "label": "Quantitative determinants of mediation success",
@@ -1850,7 +1857,9 @@ def test_cluster_synthesis_counts_admitted_section_evidence_missing_from_top_sum
     assert {row["source_id"] for row in validated["supporting_evidence"]} == {"a", "b"}
 
 
-def test_cluster_synthesis_with_a_thin_validated_assertion_is_partial() -> None:
+def test_thin_cluster_assertion_is_completed_from_reasoner_source_contributions() -> (
+    None
+):
     profiles = normalize_evidence_profiles([_profile("a"), _profile("b")])
     cluster = map_overlapping_clusters(profiles)["clusters"][0]
     proposition = cluster["propositions"][0]
@@ -1868,14 +1877,37 @@ def test_cluster_synthesis_with_a_thin_validated_assertion_is_partial() -> None:
                     "evidence": proposition["evidence"],
                 }
             ],
+            "source_contributions": [
+                {
+                    "source_id": profile["source_id"],
+                    "finding": str(
+                        profile["claims"][0].get("text")
+                        or profile["claims"][0].get("claim")
+                        or profile["claims"][0].get("finding")
+                        or ""
+                    ),
+                    "evidence": [
+                        {
+                            "source_id": profile["source_id"],
+                            "claim_id": profile["claims"][0]["claim_id"],
+                            "locator": profile["claims"][0]["locator"],
+                        }
+                    ],
+                }
+                for profile in profiles
+            ],
         },
         cluster,
         profiles,
     )
 
-    assert validated["status"] == "partial"
-    assert validated["quality_status"] == "incomplete"
-    assert "verdict_too_thin" in validated["quality_errors"]
+    assert validated["status"] == "reasoned"
+    assert validated["quality_status"] == "complete"
+    assert validated["quality_errors"] == []
+    assert any(
+        row.get("origin") == "deterministic_source_contribution_map"
+        for row in validated["evidence_threads"]
+    )
 
 
 def test_evidence_thread_uses_substantive_summary_not_machine_relationship() -> None:

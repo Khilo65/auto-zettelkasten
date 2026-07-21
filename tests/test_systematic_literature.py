@@ -2309,6 +2309,12 @@ def test_deepseek_coverage_audit_uses_one_full_collection_packet() -> None:
         row["source_id"] for row in rows
     }
     assert set(plan[0]["source_ids"]) == {row["source_id"] for row in rows}
+    assert plan[0]["candidate_components"]
+    assert {
+        source_id
+        for component in plan[0]["candidate_components"]
+        for source_id in component["focus_source_ids"]
+    } == {row["source_id"] for row in rows}
 
 
 def test_deepseek_coverage_fit_ignores_machine_only_profile_bulk() -> None:

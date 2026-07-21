@@ -1902,6 +1902,43 @@ def test_display_scope_broadens_cluster_when_core_sources_cover_wider_domains() 
     assert "international disputes" in cluster["display_scope_note"]
 
 
+def test_display_safeguard_keeps_supported_second_half_of_cluster_title() -> None:
+    cluster = {
+        "cluster_id": "cluster-internationalized-management",
+        "label": "Mediation and Management of Internationalized Civil Wars",
+        "shared_question": (
+            "How does mediation and management address internationalized civil wars?"
+        ),
+        "source_roles": [
+            {"source_id": "study-a", "role": "core"},
+            {"source_id": "study-b", "role": "core"},
+        ],
+    }
+    profiles = [
+        {
+            "source_id": "study-a",
+            "title": "Mediation in Internationalized Civil Wars",
+            "research_questions": [
+                "How are internationalized civil wars managed through mediation?"
+            ],
+            "claims": [],
+        },
+        {
+            "source_id": "study-b",
+            "title": "External Intervention and Civil War Management",
+            "research_questions": [
+                "How does foreign involvement shape conflict management?"
+            ],
+            "claims": [],
+        },
+    ]
+
+    _apply_researcher_display_safeguards([cluster], profiles)
+
+    assert cluster.get("display_label", cluster["label"]) == cluster["label"]
+    assert "display_scope_note" not in cluster
+
+
 def test_display_safeguard_recognizes_a_conference_series_from_profile_titles() -> None:
     cluster = {
         "cluster_id": "cluster-conference",

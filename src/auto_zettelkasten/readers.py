@@ -305,6 +305,9 @@ class _CapabilityAwareReader:
             "remain unclustered, but every supplied profile may be used to recover a missing cluster, repair fragmented membership, "
             "or distinguish overlapping clusters. Test recognizable research conversations and evidence bases even when their "
             "studies address different propositions. Exact proposition agreement is not required for thematic cluster formation. "
+            "Use the deterministic candidate components as attention hints, checking whether each contains an overlooked coherent "
+            "conversation; they are not evidence and must not force admission. Account for every focus source by either returning a "
+            "supported cluster proposal or leaving it unproposed when the supplied evidence does not establish a coherent group. "
             "Never return a singleton cluster. Return only new proposals or complete corrected versions of prior proposals whose "
             "membership changes, and preserve stable semantic identities for corrected proposals."
             if audit_mode == "collection"
@@ -1615,6 +1618,22 @@ def _cluster_proposal_context(context: Mapping[str, Any] | None) -> dict[str, An
         "coverage_component_signature": str(
             (context or {}).get("coverage_component_signature") or ""
         ),
+        "coverage_candidate_components": [
+            {
+                "focus_source_ids": [
+                    str(value)
+                    for value in row.get("focus_source_ids", []) or []
+                    if str(value)
+                ],
+                "source_ids": [
+                    str(value)
+                    for value in row.get("source_ids", []) or []
+                    if str(value)
+                ],
+            }
+            for row in (context or {}).get("coverage_candidate_components", []) or []
+            if isinstance(row, Mapping)
+        ],
         "current_clusters": [
             {
                 key: cluster.get(key)

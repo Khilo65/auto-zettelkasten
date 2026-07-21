@@ -64,7 +64,7 @@ GAP_RULES = (
     "cross_cluster_integration",
     "author_stated_gap",
 )
-LITERATURE_ALGORITHM_VERSION = "30"
+LITERATURE_ALGORITHM_VERSION = "31"
 CLUSTER_PROPOSAL_PROMPT_VERSION = "17"
 CLUSTER_SYNTHESIS_PROMPT_VERSION = "14"
 GAP_REASONING_PROMPT_VERSION = "10"
@@ -1591,6 +1591,7 @@ def _same_provider_inputs(
             "coverage_component_source_ids",
             "coverage_audit_mode",
             "coverage_component_signature",
+            "coverage_candidate_components",
             "current_clusters",
             "current_unclustered_sources",
             "prior_proposal_identities",
@@ -4649,6 +4650,10 @@ def _proposal_membership_evidence(
             )
             - _GENERIC_FAMILY_RELATION_TERMS
         )
+        primary_profile_terms = (
+            _tokens([profile.get("research_questions"), profile.get("thesis")])
+            - _GENERIC_FAMILY_RELATION_TERMS
+        )
         profile_overlap, profile_outcome_alias = term_match(profile_terms, family_terms)
         profile_theme_overlap = profile_overlap & discriminating_family_terms
         profile_has_target = bool(profile_terms & target_terms)
@@ -4663,6 +4668,9 @@ def _proposal_membership_evidence(
             profile_match_passed = bool(profile_overlap or profile_outcome_alias)
         profile_stage_conflict = _outcome_stage_conflicts(
             profile_terms, raw_proposal_terms
+        ) or bool(
+            primary_profile_terms
+            and _outcome_stage_conflicts(primary_profile_terms, raw_proposal_terms)
         )
         if profile_stage_conflict:
             profile_match_passed = False
@@ -8005,7 +8013,10 @@ def _apply_researcher_display_safeguards(
                     if _anchor_is_synthesis_eligible(anchor)
                 ]
             )
-            if promised_terms and not (promised_terms & located_terms):
+            core_scope_terms = _comparability_tokens(core_texts)
+            if promised_terms and not (
+                promised_terms & (located_terms | core_scope_terms)
+            ):
                 narrowed_label = label_parts[0].strip(" ,;:-")
                 cluster["display_label"] = narrowed_label
                 cluster["display_question"] = (
@@ -10058,6 +10069,13 @@ def validate_cluster_synthesis(
         if cluster_role_by_source.get(str(row.get("source_id") or ""), "context")
         == "core"
     }
+    reasoner_core_contribution_source_ids = {
+        str(row.get("source_id") or "")
+        for row in sections["source_contributions"]
+        if cluster_role_by_source.get(str(row.get("source_id") or ""), "context")
+        == "core"
+        and str(row.get("origin") or "") == "reasoner"
+    }
     model_comparative_assertion_present = any(
         not str(row.get("origin") or "").startswith("deterministic_")
         for section in verdict_sections
@@ -10067,9 +10085,46 @@ def validate_cluster_synthesis(
         str(row.get("origin") or "") == "reasoner"
         for row in sections["source_contributions"]
     )
+    projected_verdict_text = " ".join(
+        " ".join(
+            value
+            for value in (
+                _cluster_item_text(row),
+                str(
+                    row.get("plain_english_meaning")
+                    or row.get("plain_english")
+                    or ""
+                ).strip(),
+                str(
+                    row.get("technical_result")
+                    or row.get("technical_detail")
+                    or row.get("technical_context")
+                    or row.get("statistics")
+                    or ""
+                ).strip(),
+            )
+            if value
+        )
+        for section in verdict_sections
+        for row in sections[section]
+    )
+    projected_verdict_words = re.findall(r"\b[\w'-]+\b", projected_verdict_text)
+    projected_verdict_sentences = [
+        value.strip()
+        for value in re.split(r"(?<=[.!?])\s+", projected_verdict_text)
+        if value.strip()
+    ]
+    projected_verdict_is_thin = bool(
+        len(projected_verdict_words) < MIN_CLUSTER_VERDICT_WORDS
+        or len(projected_verdict_sentences) < 2
+    )
     if len(core_contribution_source_ids) >= 2 and (
         len(verdict_core_source_ids) < minimum_verdict_source_count
         or not model_multi_source_verdict_present
+        or (
+            projected_verdict_is_thin
+            and len(reasoner_core_contribution_source_ids) >= 2
+        )
     ):
         contribution_thread = _source_contribution_map_thread(
             cluster,
@@ -14804,12 +14859,16 @@ def _coverage_audit_plan(
         or "deepseek" in provider
         or "deepseek" in model
     ) and context_window > 0 and estimated_tokens <= int(context_window * context_fraction):
+        candidate_components = _coverage_signal_components(
+            focus_source_ids, profiles, relations, topic_neighborhoods
+        )
         return [
             {
                 "mode": "collection",
                 "key": "collection--coverage-audit",
                 "focus_source_ids": focus_source_ids,
                 "source_ids": analytical_source_ids,
+                "candidate_components": candidate_components,
             }
         ]
 
@@ -15049,6 +15108,9 @@ def build_literature_report(
                 "coverage_component_source_ids": audit_source_ids,
                 "coverage_audit_mode": str(audit.get("mode") or "semantic_component"),
                 "coverage_component_signature": audit_key,
+                "coverage_candidate_components": list(
+                    audit.get("candidate_components", []) or []
+                ),
                 "coverage_repair_attempt": audit_index,
                 "current_clusters": list(clustered.get("clusters", []) or []),
                 "current_unclustered_sources": list(
