@@ -7,8 +7,8 @@ candidate-gap records, and an Obsidian-ready vault projection.
 It is a standalone, file-first Python package. It does not require Research OS,
 does not read `zotero.sqlite`, and never writes to Zotero.
 
-> **Release status:** v0.9 is an alpha-quality CLI and Python API using artifact
-> schema 1.8 and evidence-profile schema 1.2. Mapped gaps are claims about the
+> **Release status:** v0.10 is an alpha-quality CLI and Python API using artifact
+> schema 1.9 and evidence-profile schema 1.2. Mapped gaps are claims about the
 > frozen collection only, never literature-wide novelty claims.
 
 ## What it produces
@@ -31,7 +31,6 @@ workspace/
 │       └── typed_links.yml
 ├── 03_literature_synthesis/
 │   ├── maps/MAP_ID/Literature Map - COLLECTION [MAP_ID].md
-│   ├── maps/MAP_ID/Literature Neighborhoods - COLLECTION.md
 │   ├── clusters/
 │   ├── gaps/
 │   ├── propositions.yml
@@ -92,13 +91,12 @@ status or note type remain YAML properties and are not written as subject tags.
 
 A `topic_neighborhood` is promoted only when at least two effective analytical
 evidence bases share a discriminative typed subject tag. Single-source facets stay
-as source-local search metadata and do not become native graph tags or neighborhoods. Neighborhoods are sparse
-retrieval aids for Obsidian navigation, never evidence for admitting a cluster,
-mapping a debate, or answering a gap. Analytical clusters are separate debate
-families. Their located core-source graph may connect the same proposition,
+as source-local search metadata and do not become native graph tags or neighborhoods. Neighborhoods remain machine-sidecar
+retrieval and candidate-discovery signals; they do not receive a competing researcher-facing Markdown map and never establish
+a cluster, debate, or gap. Analytical clusters are coherent research conversations or evidence bases. They may connect the same proposition,
 rival explanations, complementary mechanisms, boundary contrasts,
 methodological fault lines, sequential relationships, or interpretive and
-normative disagreements. Shared vocabulary alone is insufficient.
+normative disagreements. A cluster does not require consensus or disagreement to exist, and shared vocabulary alone is insufficient.
 `emerging_cluster` requires two effective evidence bases and
 `source_backed_cluster` requires at least three. Connected publications that
 reuse one evidence base remain visible as an `evidence_concentrated_cluster`;
@@ -140,15 +138,18 @@ valid result. Every promoted gap records
 `scope: collection_only`, `automation_status: promoted`, and
 `novelty_claimed: false`.
 
-Cluster-first synthesis runs after deterministic debate-family admission and
-strict proposition-level comparison.
+The generated **Literature Map** is the main human entry point. It reports frozen-collection coverage, explains specific reasons for
+unclustered analytical sources, catalogs admitted clusters and their verdicts, links collection-relative gaps, and points to source,
+cluster, and gap indexes. Topic neighborhoods and complete audit matrices remain machine-readable sidecars.
+
+Cluster-first synthesis runs after thematic-cluster admission and strict proposition-level comparison.
 One checkpointed reasoning call per cluster reads the complete atomic notes,
 profiles, and proposition-evidence matrix, then explains the central findings, technical
 figures and plain-English meaning, agreements, debate positions,
 contradictions, boundary conditions, methodological fault lines, neighboring
 clusters, source roles, and specific proposition-linked gap hypotheses. It also retains
-the most important cluster-relevant findings from every core study in a separate
-"What each source contributes" section, even when no other source reports the same
+the most important cluster-relevant findings from every core study in the
+"What the studies find" section, even when no other source reports the same
 finding. Those source-specific contributions are never mislabeled as agreement. Every
 exact comparative assertion resolves to a map-local proposition and one or
 more source-local evidence anchors; broader family assertions resolve to a
@@ -410,7 +411,9 @@ active cluster and gap packet, rejected underspecified and quality-gated gaps,
 merged gaps, provider calls, failures, and internal-falsification counts. `resume` uses the
 run's frozen inventory and frozen acquired representations, reuses completed
 direct, chunk, profile, and packet checkpoints, and continues only missing
-work. Zotero changes require a new run. A partial CLI run exits with code 3.
+work. A completed replay with unchanged source, model, policy, prompt, and
+algorithm fingerprints reuses those checkpoints and makes no paid model calls.
+Zotero changes require a new run. A partial CLI run exits with code 3.
 
 The run source set records exactly what that run attempted. Automatic mapping
 uses that frozen run collection—not unrelated notes elsewhere in the
@@ -425,14 +428,14 @@ notes, evidence profiles, cluster/gap identities, or the underlying collection
 map. Research OS may use the lens for downstream ranking without mutating the
 base map.
 
-Artifact schemas 1.0-1.8 and evidence-profile schemas 1.0-1.2 remain readable.
-The idempotent schema-1.8 migration archives superseded current cluster and gap
+Artifact schemas 1.0-1.9 and evidence-profile schemas 1.0-1.2 remain readable.
+The idempotent schema-1.9 migration retires the standalone Literature Neighborhoods Markdown projection, archives superseded current cluster and gap
 projections, preserves historical maps, profiles, analytical identities, and
 atomic-note bytes, and makes no model or Zotero call. Existing schema-1.5
 proposition anchors remain valid; unsupported legacy anchors cannot establish
 strong synthesis until they are lazily reprofiled.
 
-## Scope deliberately deferred from v0.9
+## Scope deliberately deferred from v0.10
 
 - direct `zotero.sqlite` ingestion;
 - Zotero writes or collection synchronization;
