@@ -613,6 +613,7 @@ def _human_projection_text(value: Any) -> str:
     text = re.sub(r"\bthe studies report that\b", "the evidence indicates that", text)
     text = re.sub(r"\bAll sources converge on\b", "The cited sources repeatedly emphasize", text, flags=re.I)
     text = re.sub(r"\buN\b", "UN", text)
+    text = re.sub(r"\baU\b", "AU", text)
     text = re.sub(
         r"\b([a-z][a-zà-öø-ÿ'’-]+)\s+\((19\d{2}|20\d{2})\)",
         lambda match: f"{match.group(1).capitalize()} ({match.group(2)})",
@@ -18040,6 +18041,17 @@ def _standalone_verdict_sentence(value: Any) -> str:
         return ""
     if re.search(r"\b[a-z]+(?:19|20)\d{2}[a-z]?\b", normalized):
         return ""
+    if re.search(
+        r"\b(?=[a-z0-9]{8}\b)(?=[a-z0-9]*\d)[a-z0-9]+\b", normalized
+    ):
+        return ""
+    if re.search(
+        r"\bno (?:quantitative|empirical|statistical) (?:findings|results|estimates)\b",
+        normalized,
+    ):
+        return ""
+    if re.search(r";\s*[A-Z][^.;!?]{0,80}\((?:19|20)\d{2}\)\.\s*$", sentence):
+        return ""
     if ".." in sentence:
         return ""
     return sentence
@@ -18163,14 +18175,19 @@ def _cluster_answer_excerpt(
             source_label = re.sub(
                 r"(?<=[A-Za-z])n\.d\.$", " (n.d.)", source_label, flags=re.I
             )
-            finding = _map_verdict_excerpt(
-                contribution.get("finding"), sentence_limit=1, character_limit=300
+            source_label = re.sub(
+                r"^([A-Za-z][A-Za-z.-]*?)(\d{4})$", r"\1 (\2)", source_label
             )
+            finding = _standalone_verdict_sentence(contribution.get("finding"))
             if not finding:
                 continue
-            sentence = (
-                f"{source_label} reports that {finding[:1].lower() + finding[1:]}"
-            )
+            source_name = re.sub(r"\s*\((?:19|20)\d{2}\)\s*$", "", source_label)
+            if source_name and finding.casefold().startswith(source_name.casefold()):
+                sentence = source_name + finding[len(source_name) :]
+            else:
+                sentence = (
+                    f"{source_label} reports that {finding[:1].lower() + finding[1:]}"
+                )
             if not scope_safe(sentence):
                 continue
             identity = _canonical_phrase(sentence)

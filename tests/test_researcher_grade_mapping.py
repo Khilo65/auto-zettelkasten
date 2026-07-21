@@ -370,6 +370,7 @@ def test_human_projection_repairs_old_narrowing_debris_and_machine_locators() ->
     assert _human_projection_text("uNGA2020 and hellmüller2022 (finding-1)") == (
         "UNGA (2020) and Hellmüller (2022)"
     )
+    assert _human_projection_text("the aU Commission") == "the AU Commission"
 
 
 def test_map_excerpts_stop_at_complete_sentences_and_deduplicate_threads() -> None:
@@ -462,6 +463,60 @@ def test_cluster_answer_replaces_dangling_thread_fragments_with_named_findings()
     assert "This constrained" not in answer
     assert "Svensson (2007) reports" in answer
     assert "Inbar (1991) reports" in answer
+
+
+def test_cluster_answer_rejects_machine_ids_incomplete_lists_and_absence_metadata() -> None:
+    cluster = {
+        "label": "UN mediation guidance",
+        "shared_question": "What does UN mediation guidance recommend?",
+        "source_ids": ["manual", "guide"],
+        "core_source_ids": ["manual", "guide"],
+        "source_roles": [
+            {"source_id": "manual", "role": "core"},
+            {"source_id": "guide", "role": "core"},
+        ],
+        "representative_sources": [
+            {"source_id": "manual", "note_path": "UN2016 - Manual.md"},
+            {"source_id": "guide", "note_path": "UNDPPA2012 - Guide.md"},
+        ],
+    }
+    synthesis = {
+        "evidence_threads": [
+            {
+                "summary": "The commentary (eb4kdrh7) supplies case illustrations.",
+                "evidence": [{"source_id": "manual"}],
+            },
+            {
+                "summary": "The reports divide into contributions: UNGA (2020); Ministry (2022).",
+                "evidence": [{"source_id": "guide"}],
+            },
+        ],
+        "source_contributions": [
+            {
+                "source_id": "manual",
+                "finding": "UN guidance organizes conflict diagnosis around five practical dimensions.",
+                "evidence": [{"source_id": "manual", "locator": "pp. 2-5"}],
+            },
+            {
+                "source_id": "guide",
+                "finding": "No quantitative findings or estimates are reported.",
+                "evidence": [{"source_id": "guide", "locator": "p. 4"}],
+            },
+            {
+                "source_id": "guide",
+                "finding": "The mediation guidance recommends a checklist from assessment through steady-state operations.",
+                "evidence": [{"source_id": "guide", "locator": "pp. 4-20"}],
+            },
+        ],
+    }
+
+    answer = _cluster_answer_excerpt(synthesis, cluster=cluster)
+
+    assert "eb4kdrh7" not in answer
+    assert "Ministry (2022)" not in answer
+    assert "No quantitative findings" not in answer
+    assert "UN guidance organizes" in answer
+    assert "UNDPPA (2012) reports" in answer
 
 
 def test_human_cluster_projection_demotes_off_question_context() -> None:
