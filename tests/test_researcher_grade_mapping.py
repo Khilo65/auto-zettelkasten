@@ -1043,6 +1043,23 @@ def test_broad_generated_section_locator_cannot_support_synthesis() -> None:
     assert not literature._anchor_is_synthesis_eligible(normalized[0]["claims"][0])
 
 
+def test_dense_single_locator_quantitative_summary_is_composite() -> None:
+    text = " ".join(
+        [
+            "Table I reports probit results.",
+            "Territorial war has coefficient 0.114 (p<0.05).",
+            "Duration has coefficient 0.351 (p<0.1).",
+            "Battle deaths have coefficient 0.103 (p<0.1).",
+            "Repeat wars have coefficient -0.394 (p<0.005).",
+            "Global democracy has coefficient 0.944 (p<0.005).",
+            "The model predicts 77 percent correctly.",
+        ]
+    ) + (" Additional bundled model detail." * 15)
+    anchor = {"text": text, "locator": "pp. 665-666"}
+
+    assert literature._anchor_is_composite_note_summary(anchor)
+
+
 def test_cluster_verdict_need_not_enumerate_every_core_source() -> None:
     normalized = normalize_evidence_profiles(
         [_profile("a"), _profile("b"), _profile("c")]

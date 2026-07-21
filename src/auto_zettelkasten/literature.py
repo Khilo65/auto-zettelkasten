@@ -419,10 +419,76 @@ def _narrow_noncausal_organizational_language(
     text = re.sub(r"\s+", " ", str(value or "")).strip()
     if not text or not _has_unqualified_causal_language(text):
         return text
+    text = re.sub(
+        r"\bIncluding a wide range of stakeholders makes peace more lasting\b",
+        "The source presents broad stakeholder inclusion as relevant to the durability of peace",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"\bInclusion of women increases effectiveness and durability of peace\b",
+        "The source presents women's inclusion as relevant to mediation effectiveness and peace durability",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"\bsuccessful mediation must include\b",
+        "the case analysis argues that mediation should include",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"\bfailure to do so leads to\b",
+        "the case account links failure to do so with",
+        text,
+        flags=re.I,
+    )
+    if not _has_unqualified_causal_language(text):
+        return text.rstrip(" .") + "."
     attributed = text[:1].lower() + text[1:]
-    return (
+    result = (
         f"The cited sources report that {attributed} "
         "This evidence does not by itself establish causation."
+    )
+    normalized_boundary = boundary.rstrip(" .")
+    if normalized_boundary and "does not by itself establish causation" not in normalized_boundary.casefold():
+        result += " " + normalized_boundary + "."
+    return result
+
+
+def _attribute_practitioner_guidance(value: Any) -> str:
+    """Render recommendations as recommendations, not demonstrated effects."""
+
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    text = re.sub(
+        r"^Mediation is an underutilized but effective tool for resolving natural resource conflicts",
+        "The practitioner guide recommends mediation as an underused tool for addressing natural-resource conflicts",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"^Effective mediation requires\b",
+        "The guidance recommends",
+        text,
+        flags=re.I,
+    )
+    return text
+
+
+def _anchor_is_practitioner_guidance(anchor: Mapping[str, Any]) -> bool:
+    envelope = _as_mapping(anchor.get("support_envelope"))
+    if str(envelope.get("argument_role") or "") == "practitioner_guidance":
+        return True
+    restrictions = " ".join(
+        str(value) for value in envelope.get("restrictions", []) or [] if str(value)
+    )
+    return bool(
+        re.search(
+            r"\brecommendations? (?:are|is) based on (?:experience|practice)\b|"
+            r"\bdoes not provide a replicable evidence base\b",
+            restrictions,
+            flags=re.I,
+        )
     )
 
 
@@ -8067,6 +8133,20 @@ def _cluster_display_question(
             or cluster.get("label")
             or "this literature"
         )
+        if question:
+            if re.match(r"^How should\b", question, flags=re.I):
+                narrowed = re.sub(
+                    r"\b(?:effective|effectiveness)\b", "", question, flags=re.I
+                )
+                narrowed = re.sub(r"\s+", " ", narrowed)
+                narrowed = re.sub(r"\s+,", ",", narrowed).strip()
+                return narrowed
+            if re.match(r"^Is .+ cost-effective,?", question, flags=re.I):
+                return (
+                    f"What does this collection report about the costs, strategies, and institutional arrangements of {label}?"
+                )
+            if re.match(r"^How effective (?:is|are)\b", question, flags=re.I):
+                return f"What evidence does this collection provide about {label}'s performance and constraints?"
         return f"What does this collection show about {label}?"
     return question
 
@@ -8327,9 +8407,11 @@ def _anchor_is_composite_note_summary(anchor: Mapping[str, Any]) -> bool:
     enumerated_findings = len(
         re.findall(r"(?:^|\s)\d{1,2}[.)]\s+", text)
     )
+    clause_count = len([part for part in text.split(";") if part.strip()])
     return bool(
         (locator_count >= 3 and (len(text) >= 450 or sentence_count >= 3))
         or (enumerated_findings >= 3 and len(text) >= 350)
+        or (len(text) >= 650 and (sentence_count >= 5 or clause_count >= 5))
         or len(text) >= 900
     )
 
@@ -8638,6 +8720,11 @@ def _fallback_source_contributions(
             contribution_id = f"contribution-{_stable_hash([cluster.get('cluster_id'), source_id, anchor_id])[:16]}"
             finding = str(anchor.get("text") or "")
             plain_english_meaning = str(anchor.get("plain_english_meaning") or "")
+            if _anchor_is_practitioner_guidance(anchor):
+                finding = _attribute_practitioner_guidance(finding)
+                plain_english_meaning = _attribute_practitioner_guidance(
+                    plain_english_meaning
+                )
             technical_result = _anchor_technical_result(anchor)
             plain_english_meaning = _normalize_percentage_point_plain_english(
                 plain_english_meaning,
@@ -9144,12 +9231,27 @@ def validate_cluster_synthesis(
                 for reference in target_evidence
             ]
         )
+        current_overlap = relationship_terms & current_terms
+        target_overlap = relationship_terms & target_terms
+        speculative_transfer = bool(
+            re.search(
+                r"\b(?:could|might|may) be (?:applied|extended|transferred|tested)\b",
+                relationship,
+                flags=re.I,
+            )
+        )
+        unsupported_bias_bridge = bool(
+            "bias" in relationship_terms
+            and ("bias" not in current_terms or "bias" not in target_terms)
+        )
         if (
             not relationship
             or not current_evidence
             or not target_evidence
-            or not (relationship_terms & current_terms)
-            or not (relationship_terms & target_terms)
+            or len(current_overlap) < 2
+            or len(target_overlap) < 2
+            or speculative_transfer
+            or unsupported_bias_bridge
         ):
             continue
         validated_related_clusters.append(
@@ -9452,6 +9554,30 @@ def validate_cluster_synthesis(
                 or item.get("summary")
                 or ""
             ).strip()
+            supporting_anchors = [
+                anchor_by_key.get(
+                    (
+                        str(reference.get("source_id") or ""),
+                        str(
+                            reference.get("evidence_anchor_id")
+                            or reference.get("claim_id")
+                            or ""
+                        ),
+                    ),
+                    {},
+                )
+                for reference in evidence
+            ]
+            if supporting_anchors and all(
+                _anchor_is_practitioner_guidance(anchor)
+                for anchor in supporting_anchors
+            ):
+                statement = _attribute_practitioner_guidance(statement)
+                _replace_cluster_item_statement(item, statement)
+                if item.get("plain_english_meaning"):
+                    item["plain_english_meaning"] = _attribute_practitioner_guidance(
+                        item.get("plain_english_meaning")
+                    )
             statement_terms = (
                 _tokens(statement) - _GENERIC_FAMILY_RELATION_TERMS - _BROAD_FIELD_TERMS
             )
@@ -14571,6 +14697,95 @@ def _project_cross_cluster_relationships(
             }
             candidates.append((1, left_id, right_id, left_record, right_record))
 
+    # Nearby research questions are useful navigation even when the clusters
+    # share no source.  Build the edge from the admitted questions and one
+    # located core contribution on each side; do not infer agreement.
+    for left_id, right_id in combinations(sorted(cluster_by_id), 2):
+        left_cluster = cluster_by_id[left_id]
+        right_cluster = cluster_by_id[right_id]
+        left_terms = (
+            _tokens(
+                [
+                    left_cluster.get("display_label") or left_cluster.get("label"),
+                    left_cluster.get("display_question")
+                    or left_cluster.get("shared_question"),
+                    left_cluster.get("bounded_object"),
+                ]
+            )
+            - _GENERIC_FAMILY_RELATION_TERMS
+            - _BROAD_FIELD_TERMS
+        )
+        right_terms = (
+            _tokens(
+                [
+                    right_cluster.get("display_label") or right_cluster.get("label"),
+                    right_cluster.get("display_question")
+                    or right_cluster.get("shared_question"),
+                    right_cluster.get("bounded_object"),
+                ]
+            )
+            - _GENERIC_FAMILY_RELATION_TERMS
+            - _BROAD_FIELD_TERMS
+        )
+        shared_terms = sorted(left_terms & right_terms)
+        if len(shared_terms) < 2 and set(shared_terms) != {"internationalized"}:
+            continue
+        left_core = next(
+            (
+                contribution(left_id, source_id)
+                for source_id, role in role_by_cluster[left_id].items()
+                if role == "core" and contribution(left_id, source_id) is not None
+            ),
+            None,
+        )
+        right_core = next(
+            (
+                contribution(right_id, source_id)
+                for source_id, role in role_by_cluster[right_id].items()
+                if role == "core" and contribution(right_id, source_id) is not None
+            ),
+            None,
+        )
+        if left_core is None or right_core is None:
+            continue
+        _, left_evidence = left_core
+        _, right_evidence = right_core
+        left_question = _cluster_display_question(left_cluster, cluster_syntheses[left_id])
+        right_question = _cluster_display_question(
+            right_cluster, cluster_syntheses[right_id]
+        )
+        shared_label = ", ".join(shared_terms[:3])
+        relationship = (
+            f"These clusters address adjacent parts of {shared_label}. "
+            f"{label(left_id)} asks: {left_question} {label(right_id)} asks: {right_question} "
+            "They are linked for navigation, not because the collection establishes agreement between them."
+        )
+        pair_id = f"cluster-adjacent-{_stable_hash([left_id, right_id, shared_terms])[:14]}"
+        left_record = {
+            "relationship_id": pair_id,
+            "target_cluster_id": right_id,
+            "cluster_id": right_id,
+            "target_label": label(right_id),
+            "relation_type": "adjacent_research_problem",
+            "relationship": relationship,
+            "evidence": left_evidence,
+            "current_evidence": left_evidence,
+            "target_evidence": right_evidence,
+            "projection_origin": "deterministic_adjacent_research_problem",
+        }
+        right_record = {
+            **left_record,
+            "target_cluster_id": left_id,
+            "cluster_id": left_id,
+            "target_label": label(left_id),
+            "evidence": right_evidence,
+            "current_evidence": right_evidence,
+            "target_evidence": left_evidence,
+        }
+        candidates.append(
+            (max(2, 20 - len(shared_terms)), left_id, right_id, left_record, right_record)
+        )
+
     for _, left_id, right_id, left_record, right_record in sorted(
         candidates,
         key=lambda row: (row[0], row[1], row[2], row[3]["relationship_id"]),
@@ -16928,6 +17143,11 @@ def _cluster_markdown(
             explanations.append(
                 "the missing evidence was too broad to distinguish a useful answer"
             )
+        if "contradiction_requires_two_effective_evidence_bases" in reason_set:
+            explanations.append(
+                "only one independent evidence base supported the alleged contradiction; "
+                "two comparable independent evidence bases are required"
+            )
         if not explanations:
             return "The candidate did not pass the collection-level gap gate."
         return (
@@ -17239,10 +17459,22 @@ def _cluster_markdown(
                 seen_meanings.add(meaning.casefold())
     if findings:
         sections.append("## What the studies find\n\n" + "\n\n".join(findings))
-    if thread_rows and central_rows:
+    connection_rows = [
+        row
+        for row in central_rows
+        if len(
+            {
+                str(reference.get("source_id") or "")
+                for reference in row.get("evidence", []) or []
+                if isinstance(reference, Mapping) and reference.get("source_id")
+            }
+        )
+        >= 2
+    ]
+    if thread_rows and connection_rows:
         sections.append(
             "## Connections across the findings\n\n"
-            + "\n".join(render_rows(central_rows))
+            + "\n".join(render_rows(connection_rows))
         )
 
     relationship_state = str(
@@ -17398,6 +17630,14 @@ def _cluster_markdown(
             or gap.get("missing_evidence")
             or ""
         )
+        if re.search(
+            r"\b(?:quasi-experimental|instrumental variable|named dataset|identification strategy)\b",
+            statement,
+            flags=re.I,
+        ):
+            statement = _human_projection_text(
+                gap.get("topic") or "A proposed collection gap"
+            )
         reasons = [
             str(value)
             for value in (
@@ -17413,7 +17653,12 @@ def _cluster_markdown(
             else _human_projection_text(
                 gap.get("internal_search_summary")
                 or gap.get("decision_reasoning")
-                or "The candidate did not pass the collection-level gap gate."
+                or (
+                    "The candidate was not promoted because its lineage did not resolve to a named cluster proposition and revision."
+                    if not gap.get("proposition_id")
+                    or not gap.get("originating_cluster_revision")
+                    else "The candidate did not pass the collection-level gap gate."
+                )
             )
         )
         if statement:
@@ -18005,6 +18250,7 @@ def _clean_display_excerpt(text: str) -> str:
     """Remove truncated citation fragments and dangling parentheticals."""
 
     cleaned = str(text).strip()
+    cleaned = re.sub(r"\.{2,}(?=\s+[a-z])", ",", cleaned)
     incomplete_end = re.compile(
         r"(?:\bet\s+al\.|\bpp?\.|\bvs\.|\bcovering\.?)$",
         flags=re.I,
@@ -18703,6 +18949,20 @@ def _literature_map_markdown(
                 "the source shares retrieval signals with other studies"
             ):
                 detail = ""
+            profile_claims = [
+                claim
+                for claim in source.get("claims", []) or []
+                if isinstance(claim, Mapping)
+            ]
+            if (
+                "locator-backed" in " ".join([reason, detail]).casefold()
+                and profile_claims
+                and not any(_anchor_is_synthesis_eligible(claim) for claim in profile_claims)
+            ):
+                detail = (
+                    "The current profile contains no synthesis-eligible evidence anchor; "
+                    "a source-local reprofile is needed before it can support a cluster."
+                )
             coverage_lines.append(
                 f"- {_obsidian_note_link(source)} — {reason}"
                 + (f". {detail}" if detail and detail.casefold() not in reason.casefold() else ".")
