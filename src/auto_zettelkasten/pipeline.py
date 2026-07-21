@@ -301,7 +301,9 @@ class _RunProgress:
                 "committed"
                 if terminal_status in {"validated_note", "limited_note"}
                 else "finished"
-                if terminal_status in {"exhausted", "partial"}
+                if terminal_status == "exhausted"
+                else "paused"
+                if terminal_status == "partial"
                 else "queued"
             )
             self.items[str(index)] = {

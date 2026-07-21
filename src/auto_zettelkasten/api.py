@@ -550,6 +550,79 @@ def get_status(workspace: Path | str, run_id: str | None = None) -> StatusReport
     )
 
 
+_SOURCE_PROGRESS_COUNT_FIELDS = (
+    "validated_note_count",
+    "limited_note_count",
+    "exhausted_count",
+    "partial_count",
+    "pending_count",
+)
+
+
+def _progress_items_from_source_set(
+    source_set: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Return item-level progress rows for both current and legacy source sets."""
+
+    rows = [
+        dict(row)
+        for row in source_set.get("rows", []) or []
+        if isinstance(row, Mapping)
+    ]
+    inventory_count = int(source_set.get("inventory_count", len(rows)) or 0)
+    if inventory_count < 0:
+        raise ValueError("source-set inventory_count cannot be negative")
+    if rows:
+        if len(rows) != inventory_count:
+            raise ValueError(
+                "source-set rows do not reconcile with inventory_count: "
+                f"{len(rows)} != {inventory_count}"
+            )
+        return [
+            {**row, "key": str(row.get("zotero_item_key") or f"inventory-{index + 1}")}
+            for index, row in enumerate(rows)
+        ]
+
+    counts = {
+        field: int(source_set.get(field, 0) or 0)
+        for field in _SOURCE_PROGRESS_COUNT_FIELDS
+    }
+    if any(value < 0 for value in counts.values()):
+        raise ValueError("source-set progress counts cannot be negative")
+    accounted = sum(counts.values())
+    if accounted != inventory_count:
+        raise ValueError(
+            "source-set progress counts do not reconcile with inventory_count: "
+            f"{accounted} != {inventory_count}"
+        )
+
+    keys = [str(value).strip() for value in source_set.get("zotero_item_keys", []) or []]
+    keys = [value for value in keys if value]
+    keys.extend(
+        f"reconstructed-{index + 1}"
+        for index in range(len(keys), inventory_count)
+    )
+    statuses: list[str] = []
+    for field, status in (
+        ("validated_note_count", "validated_note"),
+        ("limited_note_count", "limited_note"),
+        ("exhausted_count", "exhausted"),
+        ("partial_count", "partial"),
+        ("pending_count", "pending"),
+    ):
+        statuses.extend([status] * counts[field])
+    return [
+        {
+            "inventory_index": index,
+            "zotero_item_key": keys[index],
+            "key": keys[index],
+            "terminal_status": status,
+            "reason": "reconstructed_from_source_set_counts",
+        }
+        for index, status in enumerate(statuses)
+    ]
+
+
 def build_map(
     workspace: Path | str,
     *,
@@ -627,12 +700,7 @@ def build_map(
     )
     if reasoner is not None:
         _apply_reader_policy(reasoner, map_request.processing)  # type: ignore[arg-type]
-    source_rows = selected_source_set.get("rows", []) if isinstance(selected_source_set, Mapping) else []
-    progress_items = [
-        {**dict(row), "key": str(row.get("zotero_item_key") or "")}
-        for row in source_rows
-        if isinstance(row, Mapping)
-    ]
+    progress_items = _progress_items_from_source_set(selected_source_set)
     progress = _RunProgress(
         run_directory(root, run_id) / "progress.yml",
         run_id,
@@ -708,34 +776,14 @@ def build_map(
     run_dir = run_directory(root, run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
     write_yaml(run_dir / "build_map_manifest.yml", manifest.to_dict())
-    inventory_count = int(
-        selected_source_set.get("inventory_count", len(source_rows)) or 0
+    progress.set_stage("reporting")
+    source_work_remains = any(
+        str(row.get("terminal_status") or "") in {"partial", "pending"}
+        for row in progress_items
     )
-    validated_note_count = int(
-        selected_source_set.get("validated_note_count", 0) or 0
+    progress.finish(
+        "partial" if result.get("partial_reason") or source_work_remains else "completed"
     )
-    limited_note_count = int(
-        selected_source_set.get("limited_note_count", 0) or 0
-    )
-    exhausted_count = int(selected_source_set.get("exhausted_count", 0) or 0)
-    partial_count = int(selected_source_set.get("partial_count", 0) or 0)
-    pending_count = int(selected_source_set.get("pending_count", 0) or 0)
-    progress.set_stage(
-        "reporting",
-        inventory_count=inventory_count,
-        validated_note_count=validated_note_count,
-        limited_note_count=limited_note_count,
-        exhausted_count=exhausted_count,
-        partial_count=partial_count,
-        pending_count=pending_count,
-        terminal_count=(
-            validated_note_count
-            + limited_note_count
-            + exhausted_count
-            + partial_count
-        ),
-    )
-    progress.finish("partial" if result.get("partial_reason") else "completed")
     return manifest
 
 

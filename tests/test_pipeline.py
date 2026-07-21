@@ -5,9 +5,11 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
 import yaml
 
 from auto_zettelkasten.api import (
+    _progress_items_from_source_set,
     build_map,
     export_to_obsidian,
     get_status,
@@ -732,6 +734,39 @@ def test_status_reports_terminal_and_literature_counts(
     assert rebuilt_status.counts["terminal_count"] == 2
 
 
+def test_build_map_reconstructs_progress_for_legacy_source_set_without_rows(
+    tmp_path: Path, sample_items
+) -> None:
+    report = run_map(
+        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        client=FakeZotero(sample_items),
+        reader=FakeReader(),
+        run_id="legacy-source-run",
+    )
+    legacy_source_set = dict(report.source_set)
+    legacy_source_set.pop("rows", None)
+
+    build_map(
+        tmp_path,
+        run_id="legacy-build-run",
+        source_set=legacy_source_set,
+    )
+
+    progress = yaml.safe_load(
+        (
+            tmp_path
+            / "11_state"
+            / "runs"
+            / "legacy-build-run"
+            / "progress.yml"
+        ).read_text()
+    )
+    assert progress["status"] == "completed"
+    assert progress["inventory_count"] == 2
+    assert progress["validated_note_count"] == 2
+    assert progress["terminal_count"] == 2
+
+
 def test_resumed_progress_ignores_stale_source_counts_inside_literature(
     tmp_path: Path,
 ) -> None:
@@ -760,6 +795,58 @@ def test_resumed_progress_ignores_stale_source_counts_inside_literature(
     assert resumed["exhausted_count"] == 0
     assert resumed["terminal_count"] == 2
     assert "validated_note_count" not in resumed["literature"]
+
+
+def test_reporting_stage_preserves_75_item_progress_and_partial_is_not_terminal(
+    tmp_path: Path,
+) -> None:
+    source_set = {
+        "inventory_count": 75,
+        "validated_note_count": 60,
+        "limited_note_count": 10,
+        "exhausted_count": 2,
+        "partial_count": 1,
+        "pending_count": 2,
+        "zotero_item_keys": [f"ITEM-{index:02d}" for index in range(75)],
+    }
+    progress = _RunProgress(
+        tmp_path / "progress.yml",
+        "progress-75",
+        _progress_items_from_source_set(source_set),
+        resume=False,
+    )
+
+    progress.set_stage("reporting")
+    progress.finish("partial")
+
+    payload = yaml.safe_load((tmp_path / "progress.yml").read_text())
+    assert payload["inventory_count"] == 75
+    assert payload["validated_note_count"] == 60
+    assert payload["limited_note_count"] == 10
+    assert payload["exhausted_count"] == 2
+    assert payload["partial_count"] == 1
+    assert payload["pending_count"] == 2
+    assert payload["terminal_count"] == 72
+    assert payload["inventory_count"] == (
+        payload["terminal_count"]
+        + payload["partial_count"]
+        + payload["pending_count"]
+    )
+    assert payload["status"] == "partial"
+
+
+def test_progress_reconstruction_rejects_malformed_source_set_counts() -> None:
+    with pytest.raises(ValueError, match="do not reconcile"):
+        _progress_items_from_source_set(
+            {
+                "inventory_count": 75,
+                "validated_note_count": 60,
+                "limited_note_count": 10,
+                "exhausted_count": 2,
+                "partial_count": 1,
+                "pending_count": 1,
+            }
+        )
 
 
 def test_large_document_checkpoints_and_resume_avoid_repeated_calls(
