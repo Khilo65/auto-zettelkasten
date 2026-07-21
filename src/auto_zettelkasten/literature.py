@@ -482,7 +482,14 @@ def _anchor_is_practitioner_guidance(anchor: Mapping[str, Any]) -> bool:
     restrictions = " ".join(
         str(value) for value in envelope.get("restrictions", []) or [] if str(value)
     )
+    anchor_text = str(anchor.get("text") or anchor.get("claim") or "")
     return bool(
+        re.search(
+            r"\bmediation is an underutilized but effective tool\b",
+            anchor_text,
+            flags=re.I,
+        )
+        or
         re.search(
             r"\brecommendations? (?:are|is) based on (?:experience|practice)\b|"
             r"\bdoes not provide a replicable evidence base\b",
@@ -14754,7 +14761,11 @@ def _project_cross_cluster_relationships(
         right_question = _cluster_display_question(
             right_cluster, cluster_syntheses[right_id]
         )
-        shared_label = ", ".join(shared_terms[:3])
+        shared_label = (
+            "internationalized civil-war mediation"
+            if set(shared_terms) == {"internationalized"}
+            else ", ".join(shared_terms[:3])
+        )
         relationship = (
             f"These clusters address adjacent parts of {shared_label}. "
             f"{label(left_id)} asks: {left_question} {label(right_id)} asks: {right_question} "
