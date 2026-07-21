@@ -1127,6 +1127,108 @@ def test_universal_direction_summary_is_rejected_when_a_cited_source_declines() 
     )
 
 
+def test_named_source_attribution_requires_that_sources_locator() -> None:
+    carnegie = _profile("carnegie")
+    carnegie["citation_key"] = "Carnegie2024"
+    carnegie["study_lineage"]["authors"] = ["Carnegie"]
+    world_bank = _profile("world-bank")
+    world_bank["citation_key"] = "WorldBank2024"
+    profiles = normalize_evidence_profiles([carnegie, world_bank])
+    cluster = map_overlapping_clusters(profiles)["clusters"][0]
+
+    result = validate_cluster_synthesis(
+        {
+            "cluster_id": cluster["cluster_id"],
+            "debate_state": "complementary_positions",
+            "boundaries": ["The studies use different evidence."],
+            "evidence_threads": [
+                {
+                    "title": "Mediation design evidence",
+                    "summary": (
+                        "Carnegie reports that mediation design is positively associated with settlement durability."
+                    ),
+                    "relationship": "complementary",
+                    "evidence": [_reference("world-bank")],
+                }
+            ],
+        },
+        cluster,
+        profiles,
+    )
+
+    assert any(
+        row["reason"]
+        == "named_source_attribution_not_supported_by_cited_source"
+        for row in result["rejected_assertions"]
+    )
+
+
+def test_universal_summary_requires_every_core_source() -> None:
+    profiles = normalize_evidence_profiles(
+        [_profile("a"), _profile("b"), _profile("c")]
+    )
+    cluster = map_overlapping_clusters(profiles)["clusters"][0]
+
+    result = validate_cluster_synthesis(
+        {
+            "cluster_id": cluster["cluster_id"],
+            "debate_state": "mapped_consensus",
+            "boundaries": ["The collection contains three core studies."],
+            "central_findings": [
+                {
+                    "finding": "All studies associate mediation design with settlement durability.",
+                    "evidence": [_reference("a"), _reference("b")],
+                }
+            ],
+        },
+        cluster,
+        profiles,
+    )
+
+    assert any(
+        row["reason"] == "universal_claim_missing_core_source_coverage"
+        for row in result["rejected_assertions"]
+    )
+
+
+def test_evidence_thread_rejects_any_number_absent_from_cited_anchors() -> None:
+    first = _profile("a")
+    first["evidence_anchors"][0]["finding"] = (
+        "Mediation design is associated with a 10 percent increase in settlement durability."
+    )
+    second = _profile("b")
+    second["evidence_anchors"][0]["finding"] = (
+        "Mediation design is associated with a 20 percent increase in settlement durability."
+    )
+    profiles = normalize_evidence_profiles([first, second])
+    cluster = map_overlapping_clusters(profiles)["clusters"][0]
+
+    result = validate_cluster_synthesis(
+        {
+            "cluster_id": cluster["cluster_id"],
+            "debate_state": "complementary_positions",
+            "boundaries": ["The estimates differ."],
+            "evidence_threads": [
+                {
+                    "title": "Reported estimates",
+                    "summary": (
+                        "The studies report 10 percent and 30 percent increases in settlement durability."
+                    ),
+                    "relationship": "complementary",
+                    "evidence": [_reference("a"), _reference("b")],
+                }
+            ],
+        },
+        cluster,
+        profiles,
+    )
+
+    assert any(
+        row["reason"] == "evidence_thread_sentence_not_supported_by_locator"
+        for row in result["rejected_assertions"]
+    )
+
+
 def test_shared_located_source_projects_a_reciprocal_cluster_bridge_only() -> None:
     profiles = normalize_evidence_profiles(
         [_profile("shared"), _profile("left"), _profile("right")]

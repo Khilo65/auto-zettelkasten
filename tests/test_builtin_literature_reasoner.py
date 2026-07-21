@@ -1397,7 +1397,7 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
     ]
     assert synthesis["agreements"] == []
     assert synthesis["source_contributions"][0]["comparison_status"] == "single_source"
-    assert "cluster synthesis prompt v13" in system_prompts["cluster-synthesis"]
+    assert "cluster synthesis prompt v14" in system_prompts["cluster-synthesis"]
     assert "whether mediation happens" in system_prompts["cluster-synthesis"]
     assert "selection correlation" in system_prompts["cluster-synthesis"]
     assert "below 7,500 output tokens" in system_prompts["cluster-synthesis"]

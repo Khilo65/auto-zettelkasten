@@ -66,7 +66,7 @@ GAP_RULES = (
 )
 LITERATURE_ALGORITHM_VERSION = "29"
 CLUSTER_PROPOSAL_PROMPT_VERSION = "17"
-CLUSTER_SYNTHESIS_PROMPT_VERSION = "13"
+CLUSTER_SYNTHESIS_PROMPT_VERSION = "14"
 GAP_REASONING_PROMPT_VERSION = "9"
 ANCHOR_ALGORITHM_VERSION = "3"
 SUPPORT_ENVELOPE_VERSION = "2"
@@ -5132,6 +5132,7 @@ def _reconcile_evidence_thread_support(
         sentence_numbers = _numeric_tokens(sentence)
         sentence_terms = _comparability_tokens(sentence)
         sentence_references: list[dict[str, Any]] = []
+        sentence_anchors: list[Mapping[str, Any]] = []
         for source_id, candidates in candidates_by_source.items():
             supported = [
                 anchor
@@ -5149,6 +5150,14 @@ def _reconcile_evidence_thread_support(
                 ),
             )
             sentence_references.append(_evidence_ref(best))
+            sentence_anchors.append(best)
+        supported_numbers = {
+            number
+            for anchor in sentence_anchors
+            for number in _numeric_tokens(anchor.get("text") or anchor.get("claim"))
+        }
+        if sentence_numbers and not sentence_numbers.issubset(supported_numbers):
+            sentence_references = []
         organizational = bool(
             not sentence_numbers
             and re.search(
@@ -8135,6 +8144,86 @@ def _universal_direction_conflicts_with_evidence(
     )
 
 
+def _universal_claim_missing_core_coverage(
+    statement: Any,
+    evidence: Sequence[Mapping[str, Any]],
+    core_source_ids: set[str],
+) -> bool:
+    """Universal summaries require evidence from every core study they describe."""
+
+    text = _human_projection_text(statement)
+    if not re.search(
+        r"\b(?:all|both|each|every|consistently)\b|"
+        r"\bthe literature\s+(?:agrees|shows|finds|reports|establishes|demonstrates)\b",
+        text,
+        re.I,
+    ):
+        return False
+    if len(core_source_ids) < 2:
+        return False
+    evidence_source_ids = {
+        str(reference.get("source_id") or "")
+        for reference in evidence
+        if str(reference.get("source_id") or "")
+    }
+    return not core_source_ids.issubset(evidence_source_ids)
+
+
+def _source_attribution_aliases(
+    profile: Mapping[str, Any], source_id: str
+) -> set[str]:
+    """Return conservative author or institution names safe for prose matching."""
+
+    aliases: set[str] = set()
+    context = _as_mapping(profile.get("context"))
+    for value in (profile.get("citation_key"), context.get("citation_key")):
+        compact = re.sub(r"\d{4}[a-z]?$", "", str(value or ""), flags=re.I)
+        compact = re.sub(r"[^A-Za-z][A-Za-z]*$", "", compact).strip()
+        if len(compact) >= 5:
+            aliases.add(compact)
+    lineage = _as_mapping(profile.get("study_lineage"))
+    for author in lineage.get("authors", []) or []:
+        parts = re.findall(r"[A-Za-z][A-Za-z'’-]+", str(author))
+        if parts and len(parts[-1]) >= 5:
+            aliases.add(parts[-1])
+    for institution in lineage.get("institutions", []) or []:
+        label = str(institution or "").strip()
+        if len(label) >= 5:
+            aliases.add(label)
+    label = _source_attribution_label(profile, source_id)
+    compact_label = re.sub(r"\d{4}[a-z]?$", "", label, flags=re.I).strip(" -–—")
+    if re.fullmatch(r"[A-Za-z][A-Za-z'’-]{4,}", compact_label):
+        aliases.add(compact_label)
+    return aliases
+
+
+def _named_attribution_missing_source_ids(
+    statement: Any,
+    evidence: Sequence[Mapping[str, Any]],
+    profile_by_source: Mapping[str, Mapping[str, Any]],
+    allowed_source_ids: set[str],
+) -> list[str]:
+    """Detect prose that names one mapped source but cites another."""
+
+    text = _human_projection_text(statement)
+    evidence_source_ids = {
+        str(reference.get("source_id") or "")
+        for reference in evidence
+        if str(reference.get("source_id") or "")
+    }
+    missing: list[str] = []
+    for source_id in sorted(allowed_source_ids):
+        aliases = _source_attribution_aliases(
+            profile_by_source.get(source_id, {}), source_id
+        )
+        if any(
+            re.search(rf"(?<![A-Za-z]){re.escape(alias)}(?![A-Za-z])", text, re.I)
+            for alias in aliases
+        ) and source_id not in evidence_source_ids:
+            missing.append(source_id)
+    return missing
+
+
 def _anchor_technical_result(anchor: Mapping[str, Any]) -> str:
     return "; ".join(
         value
@@ -8666,6 +8755,13 @@ def validate_cluster_synthesis(
         str(row.get("source_id") or ""): str(row.get("role") or "context")
         for row in cluster.get("source_roles", []) or []
         if isinstance(row, Mapping) and row.get("source_id")
+    }
+    core_source_ids = {
+        source_id
+        for source_id, role in cluster_role_by_source.items()
+        if role == "core"
+    } or {
+        str(value) for value in cluster.get("core_source_ids", []) or [] if str(value)
     }
     raw_sections = {
         key: _sanitize_reasoned_items(
@@ -9404,6 +9500,19 @@ def validate_cluster_synthesis(
                 and len(proposition_ids) > 1
             ):
                 rejection_reason = "assertion_spans_parallel_propositions_without_cross_proposition_relation"
+            elif _named_attribution_missing_source_ids(
+                statement,
+                evidence,
+                profile_by_source,
+                allowed_source_ids,
+            ):
+                rejection_reason = "named_source_attribution_not_supported_by_cited_source"
+            elif section != "source_contributions" and _universal_claim_missing_core_coverage(
+                statement,
+                evidence,
+                core_source_ids,
+            ):
+                rejection_reason = "universal_claim_missing_core_source_coverage"
             elif section != "source_contributions" and _universal_direction_conflicts_with_evidence(
                 statement,
                 evidence,

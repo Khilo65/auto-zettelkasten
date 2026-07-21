@@ -1889,7 +1889,7 @@ def test_source_specific_thematic_threads_survive_without_proposition_lineage() 
                     "title": "Envoy practice",
                     "summary": (
                         "Source B describes how envoys engage parties before escalation and records the limits they encounter. "
-                        "It adds a second practical part of the literature without claiming that its observations confirm Source A."
+                        "It adds a second practical part of the literature without claiming that its observations confirm the other account."
                     ),
                     "plain_english_meaning": "It explains what diplomats do and where that approach can run into trouble.",
                     "relationship": "source_specific",

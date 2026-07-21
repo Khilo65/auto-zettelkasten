@@ -949,7 +949,7 @@ def _debate_system_prompt() -> str:
 
 def _cluster_synthesis_system_prompt() -> str:
     return (
-        "You are the cluster-synthesis reasoner for Auto-Zettelkasten cluster synthesis prompt v13. Read the complete atomic "
+        "You are the cluster-synthesis reasoner for Auto-Zettelkasten cluster synthesis prompt v14. Read the complete atomic "
         "notes supplied for this admitted cluster. Return exactly one JSON object containing cluster_id, scope, boundaries, "
         "coherence_rationale, synthesis, evidence_threads, central_findings, agreements, "
         "positions, contradictions, boundary_conditions, methodological_fault_lines, related_clusters, source_roles, "
@@ -985,6 +985,9 @@ def _cluster_synthesis_system_prompt() -> str:
         "whether mediation happens cannot by itself answer whether mediation succeeds. Preserve temporal tensions and opposite "
         "directions. Never say all, both, every, or consistently when one cited source reports decline, a null result, a different "
         "period, or an evidentiary qualification. State that tension and explain what changes across periods or evidence designs. "
+        "Universal wording must cite every core source it describes. If prose names an author, report, or institution, the evidence "
+        "for that exact sentence must include that source; never attach one publication's name to another publication's number. "
+        "Every displayed number must occur in the union of the cited source-local anchors for that sentence. "
         "For each publication, choose the finding that most changes the cluster-level inference. Training counts, web visits, "
         "workshop totals, and other implementation activity belong only when implementation reach is part of the cluster question; "
         "otherwise prefer the source's substantive finding, mechanism, boundary, comparison, or central recommendation. "
