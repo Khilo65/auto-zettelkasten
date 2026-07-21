@@ -48,6 +48,14 @@ DEBATE_FAMILY_TARGET_ENGINE_VERSION = "0.9.0"
 
 DEBATE_FAMILY_TARGET_ARTIFACT_SCHEMA_VERSION = "1.8"
 
+THEMATIC_CLUSTER_MIGRATION_ID = "auto-zettelkasten-0.10-thematic-cluster-mapping"
+
+THEMATIC_CLUSTER_MIGRATION_VERSION = "1"
+
+THEMATIC_CLUSTER_TARGET_ENGINE_VERSION = "0.10.0"
+
+THEMATIC_CLUSTER_TARGET_ARTIFACT_SCHEMA_VERSION = "1.9"
+
 _MARKER_FIELDS = {
     "migration_id",
     "migration_version",
@@ -110,6 +118,8 @@ _NAVIGATION_MARKER_FIELDS = {
 _RESEARCHER_GRADE_MARKER_FIELDS = set(_NAVIGATION_MARKER_FIELDS)
 
 _DEBATE_FAMILY_MARKER_FIELDS = set(_NAVIGATION_MARKER_FIELDS)
+
+_THEMATIC_CLUSTER_MARKER_FIELDS = set(_NAVIGATION_MARKER_FIELDS)
 
 _REVIEW_FIELDS = {"human_review", "review_status", "source_faithfulness_review"}
 _VERSION_FILE_RELATIVES = ("auto-zettelkasten.yml", "11_state/workspace_manifest.yml")
@@ -191,12 +201,55 @@ def migrate_workspace(workspace: Path | str, *, dry_run: bool = False) -> dict[s
         legacy = _literature_map_not_applicable(dry_run=dry_run, reason="schema_1.2_or_newer")
     else:
         legacy = migrate_literature_map(root, dry_run=dry_run)
-    review = migrate_review_status(workspace, dry_run=dry_run)
-    gap_quality = migrate_gap_quality_schema(workspace, dry_run=dry_run)
-    proposition_anchors = migrate_proposition_anchor_schema(workspace, dry_run=dry_run)
-    navigation = migrate_navigation_projection_schema(workspace, dry_run=dry_run)
-    researcher_grade = migrate_researcher_grade_schema(workspace, dry_run=dry_run)
-    debate_family = migrate_debate_family_schema(workspace, dry_run=dry_run)
+    review = (
+        _review_not_applicable(dry_run=dry_run, reason="schema_1.3_or_newer")
+        if starting_schema is not None
+        and starting_schema >= (1, 3)
+        and not (root / "11_state" / "migrations" / f"{REVIEW_MIGRATION_ID}.yml").is_file()
+        else migrate_review_status(workspace, dry_run=dry_run)
+    )
+    gap_quality = (
+        _gap_quality_not_applicable(dry_run=dry_run, reason="schema_1.4_or_newer")
+        if starting_schema is not None
+        and starting_schema >= (1, 4)
+        and not (root / "11_state" / "migrations" / f"{GAP_QUALITY_MIGRATION_ID}.yml").is_file()
+        else migrate_gap_quality_schema(workspace, dry_run=dry_run)
+    )
+    proposition_anchors = (
+        _proposition_anchor_not_applicable(dry_run=dry_run, reason="schema_1.5_or_newer")
+        if starting_schema is not None
+        and starting_schema >= (1, 5)
+        and not (root / "11_state" / "migrations" / f"{PROPOSITION_ANCHOR_MIGRATION_ID}.yml").is_file()
+        else migrate_proposition_anchor_schema(workspace, dry_run=dry_run)
+    )
+    navigation = (
+        _navigation_not_applicable(dry_run=dry_run, reason="schema_1.6_or_newer")
+        if starting_schema is not None
+        and starting_schema >= (1, 6)
+        and not (root / "11_state" / "migrations" / f"{NAVIGATION_MIGRATION_ID}.yml").is_file()
+        else migrate_navigation_projection_schema(workspace, dry_run=dry_run)
+    )
+    researcher_grade = (
+        _researcher_grade_not_applicable(dry_run=dry_run, reason="schema_1.7_or_newer")
+        if starting_schema is not None
+        and starting_schema >= (1, 7)
+        and not (root / "11_state" / "migrations" / f"{RESEARCHER_GRADE_MIGRATION_ID}.yml").is_file()
+        else migrate_researcher_grade_schema(workspace, dry_run=dry_run)
+    )
+    debate_family = (
+        _debate_family_not_applicable(dry_run=dry_run, reason="schema_1.8_or_newer")
+        if starting_schema is not None
+        and starting_schema >= (1, 8)
+        and not (root / "11_state" / "migrations" / f"{DEBATE_FAMILY_MIGRATION_ID}.yml").is_file()
+        else migrate_debate_family_schema(workspace, dry_run=dry_run)
+    )
+    thematic_clusters = (
+        _thematic_cluster_not_applicable(dry_run=dry_run, reason="schema_1.9_or_newer")
+        if starting_schema is not None
+        and starting_schema >= (1, 9)
+        and not (root / "11_state" / "migrations" / f"{THEMATIC_CLUSTER_MIGRATION_ID}.yml").is_file()
+        else migrate_thematic_cluster_schema(workspace, dry_run=dry_run)
+    )
     return {
         "status": "dry_run" if dry_run else "completed",
         "dry_run": dry_run,
@@ -209,6 +262,7 @@ def migrate_workspace(workspace: Path | str, *, dry_run: bool = False) -> dict[s
             navigation,
             researcher_grade,
             debate_family,
+            thematic_clusters,
         ],
         "literature_map": legacy,
         "review_status": review,
@@ -217,6 +271,7 @@ def migrate_workspace(workspace: Path | str, *, dry_run: bool = False) -> dict[s
         "navigation": navigation,
         "researcher_grade": researcher_grade,
         "debate_family": debate_family,
+        "thematic_clusters": thematic_clusters,
     }
 
 
@@ -757,6 +812,154 @@ def migrate_debate_family_schema(workspace: Path | str, *, dry_run: bool = False
         raise
     return {"dry_run": False, **payload, "status": "migrated", "marker": str(marker)}
 
+
+def migrate_thematic_cluster_schema(
+    workspace: Path | str,
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Retire v0.9 Markdown projections and advance workspace versions to schema 1.9."""
+
+    root = resolve_workspace(workspace)
+    marker = root / "11_state" / "migrations" / f"{THEMATIC_CLUSTER_MIGRATION_ID}.yml"
+    if marker.is_file():
+        payload = read_yaml(marker, {})
+        _validate_thematic_cluster_marker(root, payload)
+        schema = _workspace_schema_version(root)
+        target = _parse_schema_version(
+            THEMATIC_CLUSTER_TARGET_ARTIFACT_SCHEMA_VERSION,
+            field="thematic-cluster artifact schema",
+        )
+        if schema is None or schema < target:
+            raise ValueError("completed thematic-cluster migration marker disagrees with workspace schema")
+        return {
+            "dry_run": dry_run,
+            **dict(payload),
+            "status": "already_migrated",
+            "marker": str(marker),
+        }
+
+    schema_version = _workspace_schema_version(root)
+    if schema_version is None:
+        return _thematic_cluster_not_applicable(
+            dry_run=dry_run,
+            reason="workspace_version_files_absent",
+        )
+    target_schema = _parse_schema_version(
+        THEMATIC_CLUSTER_TARGET_ARTIFACT_SCHEMA_VERSION,
+        field="thematic-cluster artifact schema",
+    )
+    if schema_version > target_schema:
+        actual = ".".join(str(value) for value in schema_version)
+        raise ValueError(
+            f"workspace artifact schema {actual} is newer than migration target "
+            f"{THEMATIC_CLUSTER_TARGET_ARTIFACT_SCHEMA_VERSION}"
+        )
+    if schema_version >= target_schema:
+        return _thematic_cluster_not_applicable(
+            dry_run=dry_run,
+            reason="schema_1.9_or_newer",
+        )
+    if schema_version < (1, 8) and not dry_run:
+        raise ValueError("thematic-cluster migration requires the schema-1.8 migration first")
+
+    version_changes: list[tuple[Path, str, str]] = []
+    for relative in _VERSION_FILE_RELATIVES:
+        path = root / relative
+        original = path.read_text(encoding="utf-8")
+        value = yaml.safe_load(original)
+        if not isinstance(value, Mapping):
+            raise ValueError(f"workspace version file must be a mapping: {path}")
+        updated = dict(value)
+        updated["engine_version"] = THEMATIC_CLUSTER_TARGET_ENGINE_VERSION
+        updated["artifact_schema_version"] = THEMATIC_CLUSTER_TARGET_ARTIFACT_SCHEMA_VERSION
+        cleaned = yaml.safe_dump(updated, sort_keys=False, allow_unicode=True, width=10_000)
+        if cleaned != original:
+            version_changes.append((path, original, cleaned))
+
+    # Canonical maps under maps/<map-id>/ are immutable history. Only mutable,
+    # researcher-facing compatibility Markdown is retired before v0.10 renders it again.
+    projection_root = root / "03_literature_synthesis"
+    legacy_paths: list[Path] = []
+    if projection_root.is_dir():
+        legacy_paths.extend(projection_root.glob("*.md"))
+        for relative in ("clusters", "gaps"):
+            directory = projection_root / relative
+            if directory.is_dir():
+                legacy_paths.extend(directory.rglob("*.md"))
+    legacy_paths = sorted({path for path in legacy_paths if path.is_file()})
+    timestamp = now_iso().replace(":", "").replace("+00:00", "Z")
+    archive = root / "11_state" / "legacy_maps" / f"pre-0.10-{slugify(timestamp)}"
+    archived_files = [
+        {
+            "source": str(path.relative_to(root)),
+            "archive": str((archive / path.relative_to(root)).relative_to(root)),
+            "sha256": sha256_file(path),
+        }
+        for path in legacy_paths
+    ]
+    rewritten_files = [
+        {
+            "source": str(path.relative_to(root)),
+            "before_sha256": sha256_text(original),
+            "after_sha256": sha256_text(cleaned),
+        }
+        for path, original, cleaned in version_changes
+    ]
+    safety = {
+        "target_engine_version": THEMATIC_CLUSTER_TARGET_ENGINE_VERSION,
+        "target_artifact_schema_version": THEMATIC_CLUSTER_TARGET_ARTIFACT_SCHEMA_VERSION,
+        "archive_directory": str(archive),
+        "archived_files": archived_files,
+        "rewritten_files": rewritten_files,
+        "provider_calls": 0,
+        "source_documents_reread": 0,
+        "source_notes_rewritten": 0,
+        "profile_files_rewritten": 0,
+        "analytical_identity_changes": 0,
+    }
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "dry_run": True,
+            "migration_id": THEMATIC_CLUSTER_MIGRATION_ID,
+            **safety,
+        }
+
+    written: list[tuple[Path, str]] = []
+    removed: list[Path] = []
+    try:
+        for row, source in zip(archived_files, legacy_paths, strict=True):
+            target = root / str(row["archive"])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            if sha256_file(target) != row["sha256"]:
+                raise RuntimeError(f"thematic-cluster migration archive checksum mismatch: {target}")
+        for path, original, cleaned in version_changes:
+            atomic_write_text(path, cleaned)
+            written.append((path, original))
+        for source in legacy_paths:
+            source.unlink()
+            removed.append(source)
+        payload = {
+            "migration_id": THEMATIC_CLUSTER_MIGRATION_ID,
+            "migration_version": THEMATIC_CLUSTER_MIGRATION_VERSION,
+            "status": "completed",
+            **safety,
+            "completed_at": now_iso(),
+        }
+        write_yaml(marker, payload)
+    except Exception:
+        for path in removed:
+            archived = archive / path.relative_to(root)
+            if archived.is_file():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(archived, path)
+        for path, original in reversed(written):
+            atomic_write_text(path, original)
+        raise
+    return {"dry_run": False, **payload, "status": "migrated", "marker": str(marker)}
+
 def migrate_review_status(workspace: Path | str, *, dry_run: bool = False) -> dict[str, Any]:
     """Remove generated review-status material and record safe profile-hash aliases."""
 
@@ -1086,6 +1289,25 @@ def _debate_family_not_applicable(*, dry_run: bool, reason: str) -> dict[str, An
         "analytical_identity_changes": 0,
     }
 
+
+def _thematic_cluster_not_applicable(*, dry_run: bool, reason: str) -> dict[str, Any]:
+    return {
+        "status": "not_applicable",
+        "dry_run": dry_run,
+        "migration_id": THEMATIC_CLUSTER_MIGRATION_ID,
+        "reason": reason,
+        "target_engine_version": THEMATIC_CLUSTER_TARGET_ENGINE_VERSION,
+        "target_artifact_schema_version": THEMATIC_CLUSTER_TARGET_ARTIFACT_SCHEMA_VERSION,
+        "archive_directory": "",
+        "archived_files": [],
+        "rewritten_files": [],
+        "provider_calls": 0,
+        "source_documents_reread": 0,
+        "source_notes_rewritten": 0,
+        "profile_files_rewritten": 0,
+        "analytical_identity_changes": 0,
+    }
+
 def _validate_navigation_marker(root: Path, value: Any) -> None:
     if not isinstance(value, Mapping):
         raise ValueError("navigation migration marker must be a mapping")
@@ -1216,6 +1438,77 @@ def _validate_debate_family_marker(root: Path, value: Any) -> None:
         if str(row.get("source") or "") not in _VERSION_FILE_RELATIVES:
             raise ValueError("malformed debate-family migration rewritten-file source")
 
+
+def _validate_thematic_cluster_marker(root: Path, value: Any) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError("thematic-cluster migration marker must be a mapping")
+    unknown = sorted(set(value) - _THEMATIC_CLUSTER_MARKER_FIELDS)
+    missing = sorted(_THEMATIC_CLUSTER_MARKER_FIELDS - set(value))
+    if unknown or missing:
+        detail = (
+            f"unknown fields: {', '.join(unknown)}"
+            if unknown
+            else f"missing fields: {', '.join(missing)}"
+        )
+        raise ValueError(f"malformed thematic-cluster migration marker: {detail}")
+    zero_fields = (
+        "provider_calls",
+        "source_documents_reread",
+        "source_notes_rewritten",
+        "profile_files_rewritten",
+        "analytical_identity_changes",
+    )
+    if (
+        value.get("migration_id") != THEMATIC_CLUSTER_MIGRATION_ID
+        or str(value.get("migration_version")) != THEMATIC_CLUSTER_MIGRATION_VERSION
+        or value.get("status") != "completed"
+        or value.get("target_engine_version") != THEMATIC_CLUSTER_TARGET_ENGINE_VERSION
+        or value.get("target_artifact_schema_version")
+        != THEMATIC_CLUSTER_TARGET_ARTIFACT_SCHEMA_VERSION
+        or any(type(value.get(field)) is not int or value.get(field) != 0 for field in zero_fields)
+        or not isinstance(value.get("completed_at"), str)
+        or not str(value.get("completed_at") or "").strip()
+    ):
+        raise ValueError("malformed thematic-cluster migration marker")
+    if not isinstance(value.get("archived_files"), list) or not isinstance(
+        value.get("rewritten_files"), list
+    ):
+        raise ValueError("malformed thematic-cluster migration marker file lists")
+    allowed_projection_roots = (
+        "03_literature_synthesis/clusters/",
+        "03_literature_synthesis/gaps/",
+    )
+    for row in value.get("archived_files", []) or []:
+        if not isinstance(row, Mapping) or set(row) != {"source", "archive", "sha256"}:
+            raise ValueError("malformed thematic-cluster migration archive record")
+        source = str(row.get("source") or "")
+        is_top_level_markdown = (
+            source.startswith("03_literature_synthesis/")
+            and source.endswith(".md")
+            and source.count("/") == 1
+        )
+        is_projection_markdown = source.endswith(".md") and source.startswith(
+            allowed_projection_roots
+        )
+        if not is_top_level_markdown and not is_projection_markdown:
+            raise ValueError("malformed thematic-cluster migration archive source")
+        archive = _confined_marker_path(
+            root,
+            row.get("archive"),
+            label="thematic-cluster migration archive",
+        )
+        if not archive.is_file() or sha256_file(archive) != str(row.get("sha256") or ""):
+            raise ValueError(f"thematic-cluster migration archive is missing or corrupt: {archive}")
+    for row in value.get("rewritten_files", []) or []:
+        if not isinstance(row, Mapping) or set(row) != {
+            "source",
+            "before_sha256",
+            "after_sha256",
+        }:
+            raise ValueError("malformed thematic-cluster migration rewritten-file record")
+        if str(row.get("source") or "") not in _VERSION_FILE_RELATIVES:
+            raise ValueError("malformed thematic-cluster migration rewritten-file source")
+
 def _validate_proposition_anchor_marker(value: Any) -> None:
     if not isinstance(value, Mapping):
         raise ValueError("proposition-anchor migration marker must be a mapping")
@@ -1328,6 +1621,10 @@ def _validate_existing_markers(root: Path) -> None:
         (
             DEBATE_FAMILY_MIGRATION_ID,
             lambda value: _validate_debate_family_marker(root, value),
+        ),
+        (
+            THEMATIC_CLUSTER_MIGRATION_ID,
+            lambda value: _validate_thematic_cluster_marker(root, value),
         ),
     )
     for migration_id, validate in marker_validators:
