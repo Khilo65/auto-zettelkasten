@@ -64,7 +64,7 @@ GAP_RULES = (
     "cross_cluster_integration",
     "author_stated_gap",
 )
-LITERATURE_ALGORITHM_VERSION = "32"
+LITERATURE_ALGORITHM_VERSION = "33"
 CLUSTER_PROPOSAL_PROMPT_VERSION = "17"
 CLUSTER_SYNTHESIS_PROMPT_VERSION = "14"
 GAP_REASONING_PROMPT_VERSION = "10"
@@ -6682,6 +6682,125 @@ def map_overlapping_clusters(
             )
     candidates = merged_candidates
 
+    # Coarse and residual audits can return a corrected superset alongside the
+    # earlier, narrower proposal. Exact researcher-facing labels plus nested
+    # core membership identify one evidence base, not two clusters. Preserve
+    # the broader membership and union the already validated internal rows.
+    candidates_by_label: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    unlabeled_candidates: list[dict[str, Any]] = []
+    for candidate in candidates:
+        label_identity = re.sub(
+            r"\s+",
+            " ",
+            str(_as_mapping(candidate.get("proposal")).get("label") or "")
+            .casefold()
+            .strip(" .,:;—–-"),
+        )
+        if label_identity:
+            candidates_by_label[label_identity].append(candidate)
+        else:
+            unlabeled_candidates.append(candidate)
+    merged_named_candidates = list(unlabeled_candidates)
+    for label_identity, family in sorted(candidates_by_label.items()):
+        remaining = list(family)
+        while remaining:
+            winner = max(
+                remaining,
+                key=lambda row: (
+                    len(row["core_source_ids"]),
+                    len(row["propositions"]),
+                    len(row["family_relations"]),
+                    str(row["semantic_identity"]),
+                ),
+            )
+            winner_core = set(winner["core_source_ids"])
+            nested = [
+                row
+                for row in remaining
+                if set(row["core_source_ids"]).issubset(winner_core)
+            ]
+            remaining = [row for row in remaining if row not in nested]
+            if len(nested) == 1:
+                merged_named_candidates.append(winner)
+                continue
+            merged = dict(winner)
+            merged["propositions"] = list(
+                {
+                    str(row.get("proposition_id") or _stable_hash(row)): dict(row)
+                    for candidate in nested
+                    for row in candidate["propositions"]
+                }.values()
+            )
+            merged["family_relations"] = list(
+                {
+                    _stable_hash(row): dict(row)
+                    for candidate in nested
+                    for row in candidate["family_relations"]
+                }.values()
+            )
+            merged["context_source_ids"] = sorted(
+                {
+                    source_id
+                    for candidate in nested
+                    for source_id in candidate["context_source_ids"]
+                    if source_id not in winner_core
+                }
+            )
+            merged["bridge_source_ids"] = sorted(
+                {
+                    source_id
+                    for candidate in nested
+                    for source_id in candidate["bridge_source_ids"]
+                    if source_id not in winner_core
+                }
+            )
+            merged["source_ids"] = sorted(
+                winner_core
+                | set(merged["context_source_ids"])
+                | set(merged["bridge_source_ids"])
+            )
+            merged["component_lineage"] = {
+                "proposition_ids": sorted(
+                    str(row.get("proposition_id") or "")
+                    for row in merged["propositions"]
+                ),
+                "family_relations": [
+                    {
+                        "relation_type": str(row.get("relation_type") or ""),
+                        "source_ids": sorted(row.get("source_ids", []) or []),
+                        "evidence": sorted(
+                            (
+                                str(reference.get("source_id") or ""),
+                                str(
+                                    reference.get("evidence_anchor_id")
+                                    or reference.get("claim_id")
+                                    or ""
+                                ),
+                            )
+                            for reference in row.get("evidence", []) or []
+                        ),
+                    }
+                    for row in merged["family_relations"]
+                ],
+            }
+            proposal = dict(winner["proposal"])
+            proposal["formation_route"] = "merged_nested_thematic_cluster"
+            proposal["parent_proposal_ids"] = sorted(
+                str(candidate["proposal"].get("proposal_id") or "")
+                for candidate in nested
+            )
+            merged["proposal"] = proposal
+            merged_named_candidates.append(merged)
+            component_actions.append(
+                {
+                    "action": "merge_nested_thematic_clusters",
+                    "label": str(proposal.get("label") or label_identity),
+                    "kept_core_source_ids": sorted(winner_core),
+                    "parent_proposal_ids": proposal["parent_proposal_ids"],
+                }
+            )
+    candidates = merged_named_candidates
+
     # Cap only core analytical memberships. Context, bridge, and topic-
     # neighborhood membership do not consume the three-family core limit.
     selected_by_source: dict[str, set[str]] = defaultdict(set)
@@ -8099,6 +8218,8 @@ def _apply_researcher_display_safeguards(
         )
         if conference_series:
             base = str(cluster.get("bounded_object") or label)
+            if re.search(r"\bIstanbul Mediation Conferences?\b", base, re.I):
+                base = "Istanbul Mediation Conferences"
             base = re.sub(
                 r"^\s*conference reports? from (?:the )?", "", base, flags=re.I
             )

@@ -1027,6 +1027,40 @@ def test_non_mediation_onset_and_result_terms_do_not_trigger_stage_mismatch() ->
     }
 
 
+def test_nested_proposals_with_the_same_human_label_merge_into_one_cluster() -> None:
+    rows = normalize_evidence_profiles(
+        [_profile(source_id) for source_id in ("a", "b", "c")]
+    )
+
+    def proposal(proposal_id: str, source_ids: list[str]) -> dict[str, object]:
+        selected = [row for row in rows if row["source_id"] in source_ids]
+        return {
+            "proposal_id": proposal_id,
+            "label": "UN Mediation Guidance and Operational Practice",
+            "semantic_identity": proposal_id,
+            "shared_question": "How does UN guidance organize mediation practice?",
+            "bounded_object": "UN mediation guidance and operational practice",
+            "source_ids": source_ids,
+            "source_roles": {source_id: "core" for source_id in source_ids},
+            "supporting_evidence": [_reference(row) for row in selected],
+            "propositions": [],
+            "family_relations": [],
+        }
+
+    mapped = map_overlapping_clusters(
+        rows,
+        proposals=[proposal("narrow", ["a", "b"]), proposal("broad", ["a", "b", "c"])],
+        propositions=[],
+    )
+
+    assert len(mapped["clusters"]) == 1
+    assert mapped["clusters"][0]["core_source_ids"] == ["a", "b", "c"]
+    assert any(
+        row.get("action") == "merge_nested_thematic_clusters"
+        for row in mapped["component_actions"]
+    )
+
+
 def test_missing_parallel_proposition_gets_qualified_coverage_without_inventing_a_relationship() -> (
     None
 ):

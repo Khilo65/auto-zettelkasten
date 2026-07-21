@@ -1964,6 +1964,32 @@ def test_display_safeguard_recognizes_a_conference_series_from_profile_titles() 
     assert "conference reports identify" in cluster["display_question"]
 
 
+def test_display_safeguard_shortens_verbose_istanbul_conference_scope() -> None:
+    cluster = {
+        "cluster_id": "cluster-conference-verbose",
+        "label": "Istanbul mediation practice",
+        "shared_question": "What priorities emerge from the conference reports?",
+        "bounded_object": (
+            "Summary reports of the 7th and 8th Istanbul Mediation Conferences (2020-2022), "
+            "synthesizing practitioner discussions on mediation trends and challenges."
+        ),
+        "source_roles": [
+            {"source_id": "conference-a", "role": "core"},
+            {"source_id": "conference-b", "role": "core"},
+        ],
+    }
+    profiles = [
+        {"source_id": "conference-a", "title": "7th Istanbul Mediation Conference Report"},
+        {"source_id": "conference-b", "title": "8th Istanbul Mediation Conference Report"},
+    ]
+
+    _apply_researcher_display_safeguards([cluster], profiles)
+
+    assert cluster["display_label"] == (
+        "Practitioner Priorities from the Istanbul Mediation Conferences"
+    )
+
+
 def test_inconsistent_fallback_anchor_keeps_finding_but_omits_conflicting_numbers() -> (
     None
 ):
