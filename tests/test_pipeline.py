@@ -18,7 +18,7 @@ from auto_zettelkasten.api import (
 )
 from auto_zettelkasten.literature import cluster_display_title, cluster_note_stem
 from auto_zettelkasten.models import MapRequest, ProcessingPolicy
-from auto_zettelkasten.notes import parse_atomic_note
+from auto_zettelkasten.notes import parse_atomic_note, read_note
 from auto_zettelkasten.pipeline import _RunProgress
 
 from conftest import FakeReader, FakeZotero
@@ -92,8 +92,16 @@ def test_vertical_slice_matches_golden_and_builds_obsidian_graph(
     assert len(note_paths) == 2
     for path in note_paths:
         text = path.read_text()
-        front, _ = parse_atomic_note(text)
+        projected, _ = parse_atomic_note(text)
+        front = read_note(path)["frontmatter"]
         assert f"## {GOLDEN['required_note_section']}" in text
+        assert projected["type"] == "atomic-note"
+        assert projected["coverage"] == "full text"
+        assert "content_route" not in projected
+        assert "coverage_metrics" not in projected
+        assert "normalized_tags" not in projected
+        assert projected["zotero_tags"]
+        assert projected.get("tags", []) == front["tags"]
         assert front["note_status"] == "analytical_atomic_note"
         assert front["clusters"] == []
         assert all(not tag.startswith("auto-zettelkasten/") for tag in front["tags"])
@@ -384,7 +392,7 @@ def test_question_is_only_a_projection_lens_but_metadata_and_reader_remain_in_fi
         run_id="question-first",
     )
     note_path = tmp_path / first.items[0]["note_path"]
-    front, _ = parse_atomic_note(note_path.read_text())
+    front = read_note(note_path)["frontmatter"]
     assert front["reader_provider"] == "actual-reader"
     assert front["reader_model"] == "actual-v1"
 
@@ -443,7 +451,8 @@ def test_current_prompt_replaces_prompt_v1_note_instead_of_reusing_it(
     assert second.reused_count == 0
     assert second_reader.calls == 1
     note = tmp_path / second.items[0]["note_path"]
-    frontmatter, body = parse_atomic_note(note.read_text())
+    frontmatter = read_note(note)["frontmatter"]
+    _, body = parse_atomic_note(note.read_text())
     assert frontmatter["prompt_version"] == "8"
     assert "## Plain-English Interpretation" in body
 
@@ -1007,7 +1016,8 @@ def test_hard_chunk_limit_creates_fulltext_available_limited_note(
     )
     assert report.limited_note_count == 1
     note = tmp_path / report.items[0]["note_path"]
-    frontmatter, body = parse_atomic_note(note.read_text())
+    frontmatter = read_note(note)["frontmatter"]
+    _, body = parse_atomic_note(note.read_text())
     assert frontmatter["note_status"] == "fulltext_available"
     assert frontmatter["source_scope"] == "full_document"
     assert "Processing Status" in body

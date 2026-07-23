@@ -46,6 +46,7 @@ WORKSPACE_DIRECTORIES = (
     "03_literature_synthesis/packets",
     "11_state/runs",
     "11_state/fingerprints",
+    "11_state/note_metadata",
     "11_state/exports",
     "11_state/legacy_maps",
 )

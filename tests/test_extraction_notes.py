@@ -14,10 +14,13 @@ from auto_zettelkasten.extraction import (
     extract_path,
 )
 from auto_zettelkasten.notes import (
+    parse_atomic_note,
+    read_note,
     render_atomic_note,
     render_limited_note,
     validate_atomic_note,
     validate_limited_note,
+    write_atomic_note,
     write_limited_note,
 )
 
@@ -342,6 +345,56 @@ def test_write_limited_note_reuses_note_id_path_and_atomically_replaces_old_note
     replaced = second_path.read_text()
     assert "New catalog record" in replaced
     assert "Old catalog record" not in replaced
+    projected, _ = parse_atomic_note(replaced)
+    assert projected["type"] == "limited-source-note"
+    assert projected["coverage"] == "metadata only"
+    assert "content_route" not in projected
+    assert read_note(second_path)["frontmatter"]["note_status"] == "metadata_only_source_note"
+
+
+def test_committed_note_projects_clean_frontmatter_and_keeps_machine_sidecar(
+    tmp_path: Path,
+) -> None:
+    frontmatter = _note_frontmatter(
+        status="analytical_atomic_note",
+        source_scope="full_document",
+        coverage_gate="passed",
+    )
+    frontmatter.update(
+        note_id="note-clean",
+        source_id="source-clean",
+        title="Clean Projection",
+        creators=[{"firstName": "Ada", "lastName": "Lovelace"}],
+        date="1843",
+        doi="10.1/clean",
+        reader_provider="deepseek",
+        reader_model="deepseek-v4-flash",
+        inspected_content_hash="c" * 64,
+        content_route="pypdf_pdfium_tesseract",
+        coverage_metrics={
+            "ocr_page_count": 11,
+            "page_routes": ["pdfium_tesseract"] * 11,
+        },
+    )
+    analysis = {key: f"Grounded {key}; see page 1." for key in SECTION_KEYS}
+
+    path, validation = write_atomic_note(tmp_path, frontmatter, analysis)
+
+    assert validation.passed
+    projected, _ = parse_atomic_note(path.read_text())
+    assert projected == {
+        "note_id": "note-clean",
+        "type": "atomic-note",
+        "title": "Clean Projection",
+        "authors": ["Ada Lovelace"],
+        "date": "1843",
+        "doi": "10.1/clean",
+        "coverage": "full text",
+    }
+    machine = read_note(path)["frontmatter"]
+    assert machine["content_route"] == "pypdf_pdfium_tesseract"
+    assert machine["coverage_metrics"]["ocr_page_count"] == 11
+    assert (tmp_path / "11_state" / "note_metadata" / "note-clean.yml").is_file()
 
 
 def _note_frontmatter(*, status: str, source_scope: str, coverage_gate: str) -> dict[str, object]:

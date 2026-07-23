@@ -10,7 +10,15 @@ from typing import Any, Mapping, Sequence
 
 import yaml
 
-from .files import atomic_write_text, now_iso, safe_filename, sha256_text, slugify
+from .files import (
+    atomic_write_text,
+    now_iso,
+    read_yaml,
+    safe_filename,
+    sha256_text,
+    slugify,
+    write_yaml,
+)
 
 # Immutable target of the historical review-status migration. These must not
 # follow the package's current release constants.
@@ -74,6 +82,7 @@ REVIEW_STATUS_FRONTMATTER_FIELDS = frozenset(
     {"human_review", "review_status", "source_faithfulness_review"}
 )
 REVIEW_STATUS_HEADINGS = ("Automated Validation", "Source-Faithfulness Review")
+NOTE_METADATA_SCHEMA_VERSION = "1"
 REQUIRED_LIMITED_FRONTMATTER = (REQUIRED_FRONTMATTER - {"reader_provider", "reader_model"}) | {
     "source_scope",
     "source_coverage",
@@ -211,6 +220,68 @@ def render_atomic_note(frontmatter: Mapping[str, Any], analysis: Mapping[str, An
     for key, heading in SECTION_HEADINGS:
         lines.extend([f"## {heading}", "", str(analysis.get(key, "")).strip(), ""])
     return "\n".join(lines)
+
+
+def public_note_frontmatter(frontmatter: Mapping[str, Any]) -> dict[str, Any]:
+    """Project only readable, useful Obsidian properties into Markdown."""
+
+    title = str(frontmatter.get("title") or "Untitled Source")
+    status = str(frontmatter.get("note_status") or "")
+    creators = frontmatter.get("creators") or []
+    authors: list[str] = []
+    if isinstance(creators, Sequence) and not isinstance(creators, (str, bytes)):
+        for creator in creators:
+            if isinstance(creator, Mapping):
+                name = " ".join(
+                    str(creator.get(key) or "").strip()
+                    for key in ("firstName", "lastName")
+                ).strip() or str(creator.get("name") or "").strip()
+            else:
+                name = str(creator).strip()
+            if name and name not in authors:
+                authors.append(name)
+
+    coverage = {
+        "analytical_atomic_note": "full text",
+        "verified_atomic_note": "full text",
+        "abstract_only_atomic_note": "abstract only",
+        "metadata_only_source_note": "metadata only",
+        "fulltext_available": "full text available; analysis pending",
+    }.get(status, str(frontmatter.get("source_scope") or "").replace("_", " "))
+    related = [
+        str(row.get("wikilink") or "")
+        for row in frontmatter.get("related_notes", []) or []
+        if isinstance(row, Mapping) and row.get("wikilink")
+    ]
+    aliases = [
+        str(value)
+        for value in frontmatter.get("aliases", []) or []
+        if str(value).strip() and str(value).strip() != title
+    ]
+    projected = {
+        "note_id": str(frontmatter.get("note_id") or ""),
+        "type": "atomic-note"
+        if status in ANALYTICAL_NOTE_STATUSES
+        else "limited-source-note",
+        "title": title,
+        "authors": authors,
+        "date": str(frontmatter.get("date") or ""),
+        "citation_key": str(frontmatter.get("citation_key") or ""),
+        "doi": str(frontmatter.get("doi") or frontmatter.get("DOI") or ""),
+        "url": str(frontmatter.get("url") or ""),
+        "coverage": coverage,
+        "zotero_tags": list(frontmatter.get("original_zotero_tags", []) or []),
+        "tags": list(frontmatter.get("tags", []) or []),
+        "clusters": list(frontmatter.get("cluster_links", []) or []),
+        "gaps": list(frontmatter.get("gap_links", []) or []),
+        "related": related,
+        "aliases": aliases,
+    }
+    return {
+        key: value
+        for key, value in projected.items()
+        if value not in (None, "", [], {})
+    }
 
 
 def validate_atomic_note(text: str) -> NoteValidation:
@@ -351,7 +422,8 @@ def write_atomic_note(workspace: Path, frontmatter: Mapping[str, Any], analysis:
     text = render_atomic_note(committed, analysis)
     final_validation = validate_atomic_note(text)
     if final_validation.passed:
-        atomic_write_text(candidate, text)
+        _write_note_metadata(workspace, candidate, committed)
+        atomic_write_text(candidate, _public_note_text(text, committed))
     return candidate, final_validation
 
 
@@ -373,7 +445,8 @@ def write_limited_note(
         text = render_limited_note(committed, content)
         validation = validate_limited_note(text)
         if validation.passed:
-            atomic_write_text(candidate, text)
+            _write_note_metadata(workspace, candidate, committed)
+            atomic_write_text(candidate, _public_note_text(text, committed))
     return candidate, validation
 
 
@@ -404,8 +477,19 @@ def parse_atomic_note(text: str) -> tuple[dict[str, Any], str]:
 
 def read_note(path: Path) -> dict[str, Any]:
     text = path.read_text(encoding="utf-8")
-    frontmatter, body = parse_atomic_note(text)
+    projected_frontmatter, body = parse_atomic_note(text)
+    frontmatter = _read_note_metadata(path, projected_frontmatter)
     return {"path": str(path), "frontmatter": frontmatter, "body": body, "sha256": hashlib.sha256(text.encode()).hexdigest()}
+
+
+def internal_note_text(path: Path) -> str:
+    """Reconstruct the canonical note used by validators and synthesis."""
+
+    note = read_note(path)
+    return (
+        f"---\n{_dump_frontmatter(note['frontmatter'])}\n---\n"
+        f"{str(note['body'])}"
+    )
 
 
 def semantic_note_hash(text: str) -> str:
@@ -487,9 +571,14 @@ def _strip_review_status_sections(body: str) -> str:
 
 
 def update_note_frontmatter(path: Path, updates: Mapping[str, Any]) -> None:
-    text = path.read_text(encoding="utf-8")
-    frontmatter, body = parse_atomic_note(text)
+    note = read_note(path)
+    frontmatter = dict(note["frontmatter"])
+    body = str(note["body"])
     frontmatter.update(dict(updates))
+    workspace = _workspace_for_note(path)
+    if workspace is not None:
+        _write_note_metadata(workspace, path, frontmatter)
+        frontmatter = public_note_frontmatter(frontmatter)
     yaml_text = _dump_frontmatter(frontmatter)
     atomic_write_text(path, f"---\n{yaml_text}\n---\n{body}")
 
@@ -503,7 +592,9 @@ def update_note_graph(
     cluster_wikilinks: Mapping[str, str] | None = None,
 ) -> bool:
     text = path.read_text(encoding="utf-8")
-    frontmatter, body = parse_atomic_note(text)
+    note = read_note(path)
+    frontmatter = dict(note["frontmatter"])
+    body = str(note["body"])
     for field in REVIEW_STATUS_FRONTMATTER_FIELDS:
         frontmatter.pop(field, None)
     body = _strip_review_status_sections(body).rstrip() + "\n"
@@ -529,13 +620,71 @@ def update_note_graph(
     projected_frontmatter = {**frontmatter, **desired_updates}
     if not unchanged_frontmatter and desired_updated_at is not None:
         projected_frontmatter["updated_at"] = desired_updated_at
-    yaml_text = _dump_frontmatter(projected_frontmatter)
+    workspace = _workspace_for_note(path)
+    rendered_frontmatter = (
+        public_note_frontmatter(projected_frontmatter)
+        if workspace is not None
+        else projected_frontmatter
+    )
+    yaml_text = _dump_frontmatter(rendered_frontmatter)
     frontmatter_end = text.find("\n---\n", 4)
     existing_yaml_text = text[4:frontmatter_end] if frontmatter_end >= 0 else ""
     if unchanged_frontmatter and body == desired_body and existing_yaml_text == yaml_text:
         return False
+    if workspace is not None:
+        _write_note_metadata(workspace, path, projected_frontmatter)
     atomic_write_text(path, f"---\n{yaml_text}\n---\n{desired_body}")
     return True
+
+
+def _workspace_for_note(path: Path) -> Path | None:
+    path = path.resolve()
+    if path.parent.name != "notes" or path.parent.parent.name != "02_source_memory":
+        return None
+    return path.parent.parent.parent
+
+
+def _note_metadata_path(workspace: Path, note_id: str) -> Path:
+    return workspace / "11_state" / "note_metadata" / f"{note_id}.yml"
+
+
+def _write_note_metadata(
+    workspace: Path,
+    note_path: Path,
+    frontmatter: Mapping[str, Any],
+) -> None:
+    note_id = str(frontmatter.get("note_id") or "")
+    if not note_id:
+        raise ValueError("note metadata requires note_id")
+    write_yaml(
+        _note_metadata_path(workspace, note_id),
+        {
+            "metadata_schema_version": NOTE_METADATA_SCHEMA_VERSION,
+            "note_path": str(note_path.resolve().relative_to(workspace.resolve())),
+            "frontmatter": dict(frontmatter),
+        },
+    )
+
+
+def _read_note_metadata(
+    path: Path,
+    projected_frontmatter: Mapping[str, Any],
+) -> dict[str, Any]:
+    workspace = _workspace_for_note(path)
+    note_id = str(projected_frontmatter.get("note_id") or "")
+    if workspace is None or not note_id:
+        return dict(projected_frontmatter)
+    payload = read_yaml(_note_metadata_path(workspace, note_id), {}) or {}
+    stored = payload.get("frontmatter") if isinstance(payload, Mapping) else None
+    return dict(stored) if isinstance(stored, Mapping) else dict(projected_frontmatter)
+
+
+def _public_note_text(text: str, frontmatter: Mapping[str, Any]) -> str:
+    _, body = parse_atomic_note(text)
+    return (
+        f"---\n{_dump_frontmatter(public_note_frontmatter(frontmatter))}\n---\n"
+        f"{body}"
+    )
 
 
 def _existing_note_for_id(notes_dir: Path, note_id: str) -> Path | None:

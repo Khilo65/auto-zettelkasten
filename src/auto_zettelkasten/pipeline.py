@@ -59,6 +59,7 @@ from .models import (
     RunReport,
 )
 from .notes import (
+    internal_note_text,
     item_data,
     item_key,
     note_id_for_item,
@@ -1853,7 +1854,7 @@ def _build_profiles_for_map(
                 "checkpoint_hit": 0,
                 "failure": 1,
             }
-        text = path.read_text(encoding="utf-8")
+        text = internal_note_text(path)
         note_id = str(row.get("note_id") or "")
         note_status = str(row.get("note_status") or "")
         terminal_status = str(row.get("terminal_status") or "")
@@ -2623,7 +2624,7 @@ def all_workspace_note_rows(workspace: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for path in sorted((workspace / "02_source_memory" / "notes").glob("*.md")):
         try:
-            frontmatter, _ = parse_atomic_note(path.read_text(encoding="utf-8"))
+            frontmatter = read_note(path)["frontmatter"]
         except OSError:
             continue
         if frontmatter.get("note_status") not in {
@@ -2773,7 +2774,7 @@ def _prepare_item(
     )
     prior_path = workspace / str(prior.get("note_path", ""))
     if prior.get("note_path") and _reusable_note(prior_path, base, request):
-        prior_frontmatter, _ = parse_atomic_note(prior_path.read_text(encoding="utf-8"))
+        prior_frontmatter = read_note(prior_path)["frontmatter"]
         prior_status = str(
             prior_frontmatter.get("note_status") or "analytical_atomic_note"
         )
@@ -2798,9 +2799,7 @@ def _prepare_item(
         return base
     compatible_path = _compatible_committed_note(workspace, base, request)
     if compatible_path is not None:
-        prior_frontmatter, _ = parse_atomic_note(
-            compatible_path.read_text(encoding="utf-8")
-        )
+        prior_frontmatter = read_note(compatible_path)["frontmatter"]
         prior_status = str(
             prior_frontmatter.get("note_status") or "analytical_atomic_note"
         )
@@ -3707,11 +3706,11 @@ def _frontmatter(
 
 def _note_summary_from_path(workspace: Path, row: Mapping[str, Any]) -> dict[str, Any]:
     path = workspace / str(row.get("note_path", ""))
-    text = path.read_text(encoding="utf-8")
     note = read_note(path)
+    internal_text = internal_note_text(path)
     front = note["frontmatter"]
     body = str(note["body"])
-    validation = validate_note(text)
+    validation = validate_note(internal_text)
     return {
         "note_id": str(front.get("note_id", row.get("note_id", ""))),
         "source_id": str(front.get("source_id", row.get("source_id", ""))),
@@ -3745,7 +3744,7 @@ def _note_summary_from_path(workspace: Path, row: Mapping[str, Any]) -> dict[str
         "note_path": str(path.relative_to(workspace)),
         "note_hash": note["sha256"],
         "projection_hash": note["sha256"],
-        "semantic_note_hash": semantic_note_hash(text),
+        "semantic_note_hash": semantic_note_hash(internal_text),
         "validation_passed": validation.passed,
         "validation_errors": list(validation.errors),
         "validation_warnings": list(validation.warnings),
@@ -3954,7 +3953,7 @@ def _reusable_note(path: Path, row: Mapping[str, Any], request: MapRequest) -> b
     if not path.exists() or not path.is_file():
         return False
     try:
-        text = path.read_text(encoding="utf-8")
+        text = internal_note_text(path)
         frontmatter, _ = parse_atomic_note(text)
     except OSError:
         return False
@@ -4028,7 +4027,7 @@ def _legacy_note_metadata_matches(note_path: Path, item: Mapping[str, Any]) -> b
     """Check prompt-visible fields for fingerprints written before metadata hashes."""
 
     try:
-        frontmatter, _ = parse_atomic_note(note_path.read_text(encoding="utf-8"))
+        frontmatter = read_note(note_path)["frontmatter"]
     except OSError:
         return False
     metadata = item_data(item)
