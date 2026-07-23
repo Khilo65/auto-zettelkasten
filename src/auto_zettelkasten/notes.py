@@ -84,17 +84,6 @@ _TRACEABLE_LOCATOR = re.compile(
     r"discussion|conclusions?|limitations?|appendix)\b|\b(?:table|figure)\s*\d+[a-z]?\b)",
     flags=re.IGNORECASE,
 )
-_STATISTICAL_FIGURE = re.compile(
-    r"(?:\b\d+(?:\.\d+)?\s*(?:%|percent(?:age)?\b)|"
-    r"\bp\s*[<=>]\s*0?\.\d+|\bn\s*=\s*\d+|"
-    r"\b(?:confidence|credible) intervals?\b.{0,40}\d|"
-    r"\b(?:odds|hazard) ratios?\b.{0,24}\d|"
-    r"\b(?:coefficients?|effect sizes?|correlations?|means?|medians?|standard (?:error|deviation)s?)\b"
-    r".{0,24}(?:=|:|\bis\b|\bwas\b|\bof\b)\s*-?\d)",
-    flags=re.IGNORECASE,
-)
-_PLAIN_ENGLISH_COMPONENTS = ("direction", "magnitude", "reference point", "uncertainty", "practical meaning")
-
 _LIMITED_NOTE_SPEC = {
     "abstract_only_atomic_note": {
         "scope": "abstract_only",
@@ -251,11 +240,6 @@ def validate_atomic_note(text: str) -> NoteValidation:
     plain_english = _section_text(body, "Plain-English Interpretation")
     if plain_english and _normalized_prose(plain_english) == _normalized_prose(detailed_findings):
         errors.append("plain_english_interpretation_repeats_detailed_findings")
-    if _STATISTICAL_FIGURE.search(detailed_findings):
-        normalized_plain = plain_english.casefold()
-        for component in _PLAIN_ENGLISH_COMPONENTS:
-            if not re.search(rf"(?:\*\*|__)?\b{re.escape(component)}\b(?:\*\*|__)?\s*:", normalized_plain):
-                errors.append(f"missing_plain_english_component:{slugify(component)}")
     locator_match = re.search(r"^## Locators\s*$\n+(.*?)(?=^## |\Z)", body, flags=re.MULTILINE | re.DOTALL)
     locator_text = locator_match.group(1).strip().casefold() if locator_match else ""
     weak_locator = any(

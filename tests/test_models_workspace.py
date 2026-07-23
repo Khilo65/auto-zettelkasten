@@ -19,7 +19,9 @@ def test_map_request_is_versioned_serializable_and_validated(tmp_path: Path) -> 
     )
     assert MapRequest.from_dict(request.to_dict()) == request
     assert request.processing.max_calls_per_document_run == 7
-    assert request.prompt_version == "2"
+    assert request.prompt_version == "8"
+    assert request.extraction_version == "2"
+    assert request.extraction_policy.ocr == "auto"
     with pytest.raises(ValueError, match="collection_key"):
         MapRequest(tmp_path, scope="collection")
     with pytest.raises(ValueError, match="limit"):
@@ -71,7 +73,9 @@ def test_initialize_creates_compatible_file_first_workspace(tmp_path: Path) -> N
     assert config["engine_version"] == "0.10.0"
     assert config["artifact_schema_version"] == "1.9"
     assert config["privacy"]["allow_cloud"] is False
-    assert config["prompt_version"] == "2"
+    assert config["prompt_version"] == "8"
+    assert config["extraction"]["version"] == "2"
+    assert config["extraction"]["ocr"] == "auto"
     assert config["literature_mapping"]["synthesis_enabled"] is True
     assert config["literature_mapping"]["external_discovery"] == "disabled"
 

@@ -174,26 +174,39 @@ def classify_pdf_text(
     coverage_metadata: Mapping[str, Any] | None = None,
 ) -> ContentAdequacy:
     cleaned = _clean_text(text)
-    page_sections = re.findall(r"--- Page \d+ ---\s*(.*?)(?=--- Page \d+ ---|\Z)", cleaned, flags=re.DOTALL)
+    page_matches = re.findall(
+        r"--- Page (\d+) ---\s*(.*?)(?=--- Page \d+ ---|\Z)",
+        cleaned,
+        flags=re.DOTALL,
+    )
+    marker_numbers = [int(number) for number, _section in page_matches]
+    page_sections = [section for _number, section in page_matches]
     content_text = _clean_text("\n\n".join(page_sections)) if page_sections else cleaned
     metrics = _coverage_metrics(content_text, page_count=page_count, coverage_metadata=coverage_metadata)
     nonempty_page_count = sum(len(_clean_text(section)) >= 20 for section in page_sections)
-    covered_page_ratio = nonempty_page_count / page_count if page_count > 0 and page_sections else None
+    covered_page_ratio = len(set(marker_numbers)) / page_count if page_count > 0 and page_sections else None
+    nonempty_page_ratio = nonempty_page_count / page_count if page_count > 0 and page_sections else None
+    markers_in_order = marker_numbers == list(range(1, page_count + 1)) if page_count > 0 else bool(page_sections)
     metrics.update(
         {
             "extracted_page_marker_count": len(page_sections),
             "nonempty_page_count": nonempty_page_count,
+            "nonempty_page_ratio": nonempty_page_ratio,
             "covered_page_ratio": covered_page_ratio,
+            "page_markers_in_order": markers_in_order,
         }
     )
-    page_coverage_passed = covered_page_ratio is None or covered_page_ratio >= 0.8
+    # A blank cover or divider still has full page coverage. Coverage therefore
+    # follows the ordered markers, while substantive-text checks happen at the
+    # document level.
+    page_coverage_passed = markers_in_order
     # Page coverage says whether the extractor touched the attachment; it does
     # not establish that those pages contain publication text. Publisher error
     # pages and download-notice PDFs can contain a few repeated words on every
     # page and otherwise look "complete". Require a conservative amount of
     # usable prose for multi-page documents so those files proceed to the
     # existing OCR/fallback route instead of becoming analytical sources.
-    minimum_word_count = 8 if page_count <= 1 else max(200, 40 * page_count)
+    minimum_word_count = max(200, 40 * page_count)
     metrics["minimum_word_count"] = minimum_word_count
     metrics["word_density_passed"] = metrics["word_count"] >= minimum_word_count
     if (
@@ -369,7 +382,12 @@ def classify_content_adequacy(
 classify_html = classify_html_content
 
 
-def extract_path(path: Path) -> ExtractionResult:
+def extract_path(
+    path: Path,
+    *,
+    ocr_mode: Literal["auto", "off", "required"] = "auto",
+    ocr_languages: tuple[str, ...] = ("eng",),
+) -> ExtractionResult:
     if not path.exists() or not path.is_file():
         return ExtractionResult(status="failed", route="local_file", reason="file_not_found")
     media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
@@ -377,13 +395,28 @@ def extract_path(path: Path) -> ExtractionResult:
         data = path.read_bytes()
     except OSError as exc:
         return ExtractionResult(status="failed", route="local_file", reason=f"read_error:{exc}", media_type=media_type)
-    return extract_bytes(data, media_type=media_type, filename=path.name)
+    return extract_bytes(
+        data,
+        media_type=media_type,
+        filename=path.name,
+        ocr_mode=ocr_mode,
+        ocr_languages=ocr_languages,
+    )
 
 
-def extract_bytes(data: bytes, *, media_type: str, filename: str = "") -> ExtractionResult:
+def extract_bytes(
+    data: bytes,
+    *,
+    media_type: str,
+    filename: str = "",
+    ocr_mode: Literal["auto", "off", "required"] = "auto",
+    ocr_languages: tuple[str, ...] = ("eng",),
+) -> ExtractionResult:
+    if ocr_mode not in {"auto", "off", "required"}:
+        raise ValueError("ocr_mode must be one of: auto, off, required")
     suffix = Path(filename).suffix.lower()
     if media_type == "application/pdf" or suffix == ".pdf":
-        return _extract_pdf(data)
+        return _extract_pdf(data, ocr_mode=ocr_mode, ocr_languages=ocr_languages)
     if media_type in {"text/html", "application/xhtml+xml"} or suffix in {".html", ".htm"}:
         decoded = _decode_text(data)
         parser = _parse_html(decoded)
@@ -400,15 +433,49 @@ def extract_bytes(data: bytes, *, media_type: str, filename: str = "") -> Extrac
     return ExtractionResult(status="failed", route="unsupported", reason="unsupported_media_type", media_type=media_type)
 
 
-def _extract_pdf(data: bytes) -> ExtractionResult:
+@dataclass(frozen=True, slots=True)
+class _OCRPageResult:
+    text: str = ""
+    route: str = ""
+    available: bool = False
+    retry_used: bool = False
+    nonprose_or_blank: bool = False
+
+
+_BOILERPLATE_TERMS = (
+    "downloaded from",
+    "download this article",
+    "article download",
+    "access provided by",
+    "access denied",
+    "copyright",
+    "all rights reserved",
+    "watermark",
+    "sage publications",
+)
+
+
+def _extract_pdf(
+    data: bytes,
+    *,
+    ocr_mode: Literal["auto", "off", "required"] = "auto",
+    ocr_languages: tuple[str, ...] = ("eng",),
+) -> ExtractionResult:
     try:
         from pypdf import PdfReader
     except ImportError:
         return ExtractionResult(status="failed", route="pypdf_text", reason="pypdf_not_installed", media_type="application/pdf")
     try:
         reader = PdfReader(io.BytesIO(data))
-        page_text = [f"--- Page {number} ---\n{page.extract_text() or ''}" for number, page in enumerate(reader.pages, start=1)]
-        text = _clean_text("\n\n".join(page_text))
+        page_count = len(reader.pages)
+        if page_count <= 0:
+            return ExtractionResult(
+                status="failed",
+                route="pypdf_text",
+                reason="pdf_page_count_unavailable",
+                media_type="application/pdf",
+            )
+        embedded_pages = [_clean_text(page.extract_text() or "") for page in reader.pages]
     except Exception as exc:
         return ExtractionResult(
             status="failed",
@@ -416,93 +483,396 @@ def _extract_pdf(data: bytes) -> ExtractionResult:
             reason=f"pdf_error:{type(exc).__name__}",
             media_type="application/pdf",
         )
-    adequacy = classify_pdf_text(text, page_count=len(reader.pages))
-    if not adequacy.is_full_publication:
+    repeated = _repeated_pdf_units(embedded_pages)
+    suspicious_pages = {
+        index
+        for index, page_text in enumerate(embedded_pages)
+        if _page_text_is_suspicious(page_text, repeated_units=repeated)
+    }
+    embedded_analysis = _document_text_analysis(embedded_pages)
+    if embedded_analysis["document_suspicious"]:
+        # The document-level test catches publisher-error PDFs such as Touval,
+        # where every page has enough characters to evade a blank-page test.
+        suspicious_pages.update(range(page_count))
+
+    final_pages = list(embedded_pages)
+    page_routes = ["embedded_text" if index not in suspicious_pages else "unresolved" for index in range(page_count)]
+    ocr_pages: list[int] = []
+    unresolved_pages: list[int] = []
+    ocr_unavailable = False
+    orientation_retries: list[int] = []
+    if suspicious_pages and ocr_mode != "off":
+        for index in sorted(suspicious_pages):
+            recovered = _ocr_pdf_page(data, index, ocr_languages)
+            if not recovered.available:
+                ocr_unavailable = True
+                unresolved_pages.append(index + 1)
+                page_routes[index] = "unresolved"
+                continue
+            if recovered.retry_used:
+                orientation_retries.append(index + 1)
+            if not _page_text_is_suspicious(
+                recovered.text
+            ) or _short_ocr_text_is_readable(recovered.text):
+                final_pages[index] = recovered.text
+                page_routes[index] = recovered.route or "ocr"
+                ocr_pages.append(index + 1)
+            elif not recovered.nonprose_or_blank:
+                unresolved_pages.append(index + 1)
+                page_routes[index] = "unresolved"
+            else:
+                # No lexical OCR output is consistent with a blank cover,
+                # divider, or illustration page. Such pages do not make an
+                # otherwise substantive document incomplete.
+                page_routes[index] = "nonprose_or_blank"
+    elif suspicious_pages:
+        for index in sorted(suspicious_pages):
+            if _pdf_page_is_nonprose(data, index):
+                page_routes[index] = "nonprose_or_blank"
+            else:
+                page_routes[index] = "unresolved"
+                unresolved_pages.append(index + 1)
+
+    text = _page_marked_text(final_pages)
+    final_analysis = _document_text_analysis(final_pages)
+    extraction_route = (
+        "pypdf_pdfium_tesseract"
+        if any(route.startswith("pdfium") for route in page_routes)
+        else "pypdf_poppler_tesseract"
+        if any(route.startswith("poppler") for route in page_routes)
+        else "pypdf_text"
+    )
+    extra_metrics = {
+        "embedded_text_page_count": sum(route == "embedded_text" for route in page_routes),
+        "ocr_page_count": len(ocr_pages),
+        "unresolved_pages": tuple(unresolved_pages),
+        "extraction_route": extraction_route,
+        "page_routes": tuple(page_routes),
+        "orientation_retry_pages": tuple(orientation_retries),
+        "repeated_boilerplate_ratio": embedded_analysis["dominant_repeated_ratio"],
+    }
+    adequacy = classify_pdf_text(text, page_count=page_count)
+    adequacy = _adequacy_with_metrics(adequacy, extra_metrics)
+    required_ocr_missing = ocr_mode == "required" and bool(suspicious_pages) and ocr_unavailable
+    failed = (
+        not adequacy.is_full_publication
+        or final_analysis["document_suspicious"]
+        or bool(unresolved_pages)
+        or required_ocr_missing
+    )
+    if failed:
         return ExtractionResult(
             status="failed",
             text=text,
-            route="pypdf_text",
-            reason="empty_or_scanned_pdf",
+            route=extraction_route,
+            reason=(
+                "required_ocr_unavailable"
+                if required_ocr_missing
+                else "unresolved_textual_pages"
+                if unresolved_pages
+                else "empty_or_scanned_pdf"
+            ),
             media_type="application/pdf",
-            page_count=len(reader.pages),
+            page_count=page_count,
             adequacy=adequacy,
         )
     return ExtractionResult(
         status="succeeded",
         text=text,
-        route="pypdf_text",
+        route=extraction_route,
         media_type="application/pdf",
-        page_count=len(reader.pages),
+        page_count=page_count,
         adequacy=adequacy,
     )
 
 
 def ocr_pdf_bytes(data: bytes) -> ExtractionResult:
-    tesseract = shutil.which("tesseract")
-    if not tesseract:
-        return ExtractionResult(status="failed", route="local_ocr", reason="tesseract_not_installed", media_type="application/pdf")
+    """Backward-compatible entry point for callers that explicitly request OCR."""
+
+    result = _extract_pdf(data, ocr_mode="required")
+    result.route = "local_ocr"
+    return result
+
+
+def _ocr_pdf_page(data: bytes, page_index: int, languages: tuple[str, ...]) -> _OCRPageResult:
     try:
-        from pypdf import PdfReader
-    except ImportError:
-        return ExtractionResult(status="failed", route="local_ocr", reason="pypdf_not_installed", media_type="application/pdf")
-    try:
-        reader = PdfReader(io.BytesIO(data))
-        outputs: list[str] = []
-        image_count = 0
         with tempfile.TemporaryDirectory(prefix="auto-zettelkasten-ocr-") as temporary:
             temporary_root = Path(temporary)
-            for page_number, page in enumerate(reader.pages, start=1):
-                page_outputs: list[str] = []
-                for image_number, image in enumerate(page.images, start=1):
-                    image_count += 1
-                    suffix = Path(str(image.name or "image.png")).suffix or ".png"
-                    image_path = temporary_root / f"page-{page_number}-{image_number}{suffix}"
-                    image_path.write_bytes(image.data)
-                    completed = subprocess.run(
-                        [tesseract, str(image_path), "stdout"],
-                        check=False,
-                        capture_output=True,
-                        text=True,
-                        timeout=120,
+            rendered = _render_pdf_page(data, page_index, temporary_root)
+            if rendered is None:
+                return _OCRPageResult()
+            image_path, renderer = rendered
+            tesseract = shutil.which("tesseract")
+            if not tesseract:
+                return _OCRPageResult()
+            language = "+".join(language.strip() for language in languages if language.strip()) or "eng"
+            first = _run_tesseract(tesseract, image_path, language=language, psm=3)
+            orientation_retry = _rendered_page_is_landscape(image_path)
+            if not _page_text_is_suspicious(first) and not orientation_retry:
+                return _OCRPageResult(
+                    text=first,
+                    route=f"{renderer}_tesseract",
+                    available=True,
+                )
+            # PSM 1 is the single orientation-aware retry for a failed or
+            # implausible first pass.
+            second = _run_tesseract(tesseract, image_path, language=language, psm=1)
+            chosen = second if not _page_text_is_suspicious(second) else first
+            return _OCRPageResult(
+                text=chosen,
+                route=f"{renderer}_tesseract",
+                available=True,
+                retry_used=True,
+                nonprose_or_blank=(
+                    not _alphabetic_words(first) and not _alphabetic_words(second)
+                    and _rendered_page_is_nonprose(
+                        image_path, allow_sparse_divider=True
                     )
-                    if completed.returncode == 0 and completed.stdout.strip():
-                        page_outputs.append(completed.stdout.strip())
-                if page_outputs:
-                    outputs.append(f"--- Page {page_number} ---\n" + "\n".join(page_outputs))
-    except (OSError, subprocess.SubprocessError, Exception) as exc:
-        return ExtractionResult(
-            status="failed",
-            route="local_ocr",
-            reason=f"ocr_error:{type(exc).__name__}",
-            media_type="application/pdf",
-        )
-    text = _clean_text("\n\n".join(outputs))
-    if image_count == 0:
-        return ExtractionResult(
-            status="failed",
-            route="local_ocr",
-            reason="no_extractable_images",
-            media_type="application/pdf",
-            page_count=len(reader.pages),
-            adequacy=classify_pdf_text("", page_count=len(reader.pages)),
-        )
-    if len(text) < 40:
-        return ExtractionResult(
-            status="failed",
-            text=text,
-            route="local_ocr",
-            reason="insufficient_ocr_text",
-            media_type="application/pdf",
-            page_count=len(reader.pages),
-            adequacy=classify_pdf_text(text, page_count=len(reader.pages)),
-        )
-    return ExtractionResult(
-        status="succeeded",
-        text=text,
-        route="local_ocr",
-        media_type="application/pdf",
-        page_count=len(reader.pages),
-        adequacy=classify_pdf_text(text, page_count=len(reader.pages)),
+                ),
+            )
+    except (OSError, subprocess.SubprocessError, RuntimeError):
+        return _OCRPageResult()
+
+
+def _render_pdf_page(data: bytes, page_index: int, temporary_root: Path) -> tuple[Path, str] | None:
+    try:
+        import pypdfium2 as pdfium
+
+        document = pdfium.PdfDocument(data)
+        try:
+            page = document[page_index]
+            try:
+                bitmap = page.render(scale=300 / 72)
+                try:
+                    image_path = temporary_root / f"page-{page_index + 1}.png"
+                    bitmap.to_pil().save(image_path, format="PNG")
+                finally:
+                    bitmap.close()
+            finally:
+                page.close()
+        finally:
+            document.close()
+        return image_path, "pdfium"
+    except (ImportError, OSError, RuntimeError, ValueError):
+        pass
+
+    pdftoppm = shutil.which("pdftoppm")
+    if not pdftoppm:
+        return None
+    source_path = temporary_root / "source.pdf"
+    source_path.write_bytes(data)
+    output_root = temporary_root / f"page-{page_index + 1}"
+    completed = subprocess.run(
+        [
+            pdftoppm,
+            "-f",
+            str(page_index + 1),
+            "-l",
+            str(page_index + 1),
+            "-singlefile",
+            "-r",
+            "300",
+            "-png",
+            str(source_path),
+            str(output_root),
+        ],
+        check=False,
+        capture_output=True,
+        timeout=120,
+    )
+    image_path = output_root.with_suffix(".png")
+    return (image_path, "poppler") if completed.returncode == 0 and image_path.exists() else None
+
+
+def _run_tesseract(tesseract: str, image_path: Path, *, language: str, psm: int) -> str:
+    completed = subprocess.run(
+        [tesseract, str(image_path), "stdout", "-l", language, "--psm", str(psm)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    return _clean_text(completed.stdout) if completed.returncode == 0 else ""
+
+
+def _rendered_page_is_landscape(image_path: Path) -> bool:
+    """Flag the common pixel-rotated scan shape for orientation-aware OCR."""
+
+    try:
+        from PIL import Image
+
+        with Image.open(image_path) as image:
+            width, height = image.size
+    except (OSError, ValueError):
+        return False
+    return width > height * 1.08
+
+
+def _rendered_page_is_nonprose(
+    image_path: Path, *, allow_sparse_divider: bool = False
+) -> bool:
+    """Recognize nonprose only after OCR has failed to find lexical text.
+
+    Sparse layout alone is not enough: three short prose lines can resemble a
+    divider in pixel-density statistics.  Callers may admit the sparse-divider
+    shape only after both OCR passes returned no alphabetic words.
+    """
+
+    try:
+        from PIL import Image
+
+        with Image.open(image_path) as image:
+            gray = image.convert("L")
+            gray.thumbnail((900, 900))
+            histogram = gray.histogram()
+            total = max(1, sum(histogram))
+            dark_ratio = sum(histogram[:210]) / total
+            pixels = gray.load()
+            width, height = gray.size
+            occupied_rows = [
+                row
+                for row in range(height)
+                if sum(1 for column in range(width) if pixels[column, row] < 180)
+                >= max(2, int(width * 0.001))
+            ]
+    except (OSError, ValueError):
+        return False
+    row_bands = 0
+    previous = -10
+    for row in occupied_rows:
+        if row - previous > 3:
+            row_bands += 1
+        previous = row
+    sparse_divider = dark_ratio < 0.03 and row_bands <= 4
+    return (
+        dark_ratio < 0.002
+        or dark_ratio > 0.35
+        or (allow_sparse_divider and sparse_divider)
+    )
+
+
+def _pdf_page_is_nonprose(data: bytes, page_index: int) -> bool:
+    """Inspect a suspicious page visually without invoking OCR."""
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="auto-zettelkasten-sniff-") as temporary:
+            rendered = _render_pdf_page(data, page_index, Path(temporary))
+            return bool(rendered and _rendered_page_is_nonprose(rendered[0]))
+    except (OSError, RuntimeError):
+        return False
+
+
+def _page_marked_text(pages: list[str]) -> str:
+    return _clean_text(
+        "\n\n".join(f"--- Page {number} ---\n{text}" for number, text in enumerate(pages, start=1))
+    )
+
+
+def _page_text_is_suspicious(text: str, *, repeated_units: set[str] | None = None) -> bool:
+    alphanumeric_count = sum(character.isalnum() for character in text)
+    words = _alphabetic_words(text)
+    if alphanumeric_count < 40 or len(words) < 6:
+        return True
+    normalized = text.casefold()
+    if repeated_units and any(term in normalized for term in _BOILERPLATE_TERMS):
+        page_units = _normalized_pdf_units(text)
+        total_tokens = max(1, len(words))
+        repeated_tokens = sum(len(unit.split()) for unit in page_units if unit in repeated_units)
+        if repeated_tokens / total_tokens >= 0.5:
+            return True
+    return False
+
+
+def _short_ocr_text_is_readable(text: str) -> bool:
+    """Accept a legible short title or divider after OCR without weakening routing."""
+
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not normalized or any(
+        term in normalized.casefold() for term in _BOILERPLATE_TERMS
+    ):
+        return False
+    words = _alphabetic_words(normalized)
+    alphanumeric_count = sum(character.isalnum() for character in normalized)
+    return bool(words and (len(words) >= 2 or alphanumeric_count >= 8))
+
+
+def _alphabetic_words(text: str) -> list[str]:
+    return re.findall(
+        r"[^\W\d_]+(?:['’][^\W\d_]+)*",
+        text,
+        flags=re.UNICODE,
+    )
+
+
+def _normalized_pdf_units(text: str) -> tuple[str, ...]:
+    units: list[str] = []
+    for raw in re.split(r"\n+", text):
+        normalized = re.sub(r"\s+", " ", raw.casefold()).strip()
+        normalized = re.sub(r"\b\d+\b", "#", normalized)
+        if len(_alphabetic_words(normalized)) >= 3:
+            units.append(normalized)
+    return tuple(units)
+
+
+def _repeated_pdf_units(pages: list[str]) -> set[str]:
+    page_occurrences: dict[str, int] = {}
+    for page in pages:
+        for unit in set(_normalized_pdf_units(page)):
+            page_occurrences[unit] = page_occurrences.get(unit, 0) + 1
+    return {unit for unit, count in page_occurrences.items() if count >= 3}
+
+
+def _document_text_analysis(pages: list[str]) -> dict[str, Any]:
+    repeated = _repeated_pdf_units(pages)
+    all_words = [word.casefold() for page in pages for word in _alphabetic_words(page)]
+    total_tokens = max(1, len(all_words))
+    unit_occurrences: dict[str, int] = {}
+    for page in pages:
+        for unit in _normalized_pdf_units(page):
+            if unit in repeated:
+                unit_occurrences[unit] = unit_occurrences.get(unit, 0) + 1
+    dominant_repeated_ratio = max(
+        (len(unit.split()) * count / total_tokens for unit, count in unit_occurrences.items()),
+        default=0.0,
+    )
+    stripped_words = 0
+    lexical_paragraphs = 0
+    for page in pages:
+        for raw in re.split(r"\n\s*\n|\n", page):
+            normalized = re.sub(r"\s+", " ", raw.casefold()).strip()
+            normalized_numberless = re.sub(r"\b\d+\b", "#", normalized)
+            words = _alphabetic_words(raw)
+            if normalized_numberless not in repeated or len(words) > 30:
+                stripped_words += len(words)
+            if len(words) >= 6 and len({word.casefold() for word in words}) >= 4:
+                lexical_paragraphs += 1
+    minimum_words = max(200, 40 * len(pages))
+    document_suspicious = (
+        stripped_words < minimum_words
+        or dominant_repeated_ratio >= 0.5
+        or lexical_paragraphs == 0
+    )
+    return {
+        "minimum_word_count": minimum_words,
+        "stripped_word_count": stripped_words,
+        "dominant_repeated_ratio": round(dominant_repeated_ratio, 6),
+        "lexical_paragraph_count": lexical_paragraphs,
+        "document_suspicious": document_suspicious,
+    }
+
+
+def _adequacy_with_metrics(adequacy: ContentAdequacy, extra: Mapping[str, Any]) -> ContentAdequacy:
+    metrics = dict(adequacy.metrics or {})
+    metrics.update(extra)
+    return ContentAdequacy(
+        classification=adequacy.classification,
+        source_scope=adequacy.source_scope,
+        coverage_gate=adequacy.coverage_gate,
+        reason=adequacy.reason,
+        abstract=adequacy.abstract,
+        paywall_markers=adequacy.paywall_markers,
+        access_markers=adequacy.access_markers,
+        metrics=metrics,
     )
 
 

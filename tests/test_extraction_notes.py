@@ -45,7 +45,7 @@ def test_blank_pdf_is_classified_for_vision_or_exhaustion() -> None:
 
 def test_readable_pdf_extracts_text() -> None:
     result = extract_bytes(
-        _minimal_pdf("Readable synthetic PDF content " * 8),
+        _minimal_pdf("Readable synthetic PDF content " * 55),
         media_type="application/pdf",
         filename="readable.pdf",
     )
@@ -234,13 +234,13 @@ def test_atomic_note_validator_requires_lay_explanation_of_statistical_findings(
         render_atomic_note(frontmatter, copied)
     ).errors
 
-    unexplained = dict(analysis)
-    unexplained["plain_english_interpretation"] = "The treatment result was higher."
-    errors = validate_atomic_note(render_atomic_note(frontmatter, unexplained)).errors
-    assert "missing_plain_english_component:magnitude" in errors
-    assert "missing_plain_english_component:reference-point" in errors
-    assert "missing_plain_english_component:uncertainty" in errors
-    assert "missing_plain_english_component:practical-meaning" in errors
+    fluent = dict(analysis)
+    fluent["plain_english_interpretation"] = (
+        "The treated group had a higher measured outcome than the comparison group. The source reports a difference "
+        "of 12 per 100, with a plausible range of 4 to 20 per 100 under its model. That is meaningful within this "
+        "study, but it does not automatically describe people or settings outside the sample."
+    )
+    assert validate_atomic_note(render_atomic_note(frontmatter, fluent)).passed
 
 
 def test_qualitative_note_can_explain_absent_statistics_without_forced_labels() -> None:

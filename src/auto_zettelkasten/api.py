@@ -15,6 +15,7 @@ from .literature import run_literature_map as run_profile_literature_map
 from .migration import migrate_workspace
 from .models import (
     ArtifactManifest,
+    ExtractionPolicy,
     LiteratureMapReport,
     LiteratureMapRequest,
     LiteratureMappingPolicy,
@@ -27,6 +28,7 @@ from .models import (
 from .obsidian import export_obsidian
 from .pipeline import (
     _RunProgress,
+    _analytical_profile_source_ids,
     _apply_reader_policy,
     all_workspace_note_rows,
     rebuild_map,
@@ -58,6 +60,7 @@ __all__ = [
     "ARTIFACT_SCHEMA_VERSION",
     "ENGINE_VERSION",
     "ArtifactManifest",
+    "ExtractionPolicy",
     "MapRequest",
     "ProcessingPolicy",
     "NavigationPolicy",
@@ -105,12 +108,37 @@ def doctor(workspace: Path | str, *, client: ZoteroClient | None = None) -> Stat
     checks["pdf_extraction"] = {
         "status": "available" if importlib.util.find_spec("pypdf") else "missing",
         "tool": "pypdf",
+        "pdfium_available": importlib.util.find_spec("pypdfium2") is not None,
+        "poppler_fallback": shutil.which("pdftoppm") or "",
     }
     tesseract = shutil.which("tesseract")
+    extraction = (
+        config.get("extraction", {})
+        if isinstance(config.get("extraction", {}), Mapping)
+        else {}
+    )
+    extraction_error = ""
+    try:
+        extraction_policy = ExtractionPolicy.from_dict(extraction)
+    except ValueError as exc:
+        extraction_policy = ExtractionPolicy()
+        extraction_error = str(exc)
+    renderer_available = bool(
+        importlib.util.find_spec("pypdfium2") or shutil.which("pdftoppm")
+    )
     checks["ocr"] = {
-        "status": "available" if tesseract and importlib.util.find_spec("pypdf") else "missing",
-        "tool": "pypdf_embedded_images+tesseract",
+        "status": (
+            "invalid_configuration"
+            if extraction_error
+            else "available"
+            if tesseract and renderer_available
+            else "missing"
+        ),
+        "tool": "pdfium_300dpi+tesseract",
         "path": tesseract or "",
+        "mode": extraction_policy.ocr,
+        "languages": list(extraction_policy.languages),
+        "reason": extraction_error,
         "wired_to_pipeline": True,
     }
     privacy = config.get("privacy", {}) if isinstance(config.get("privacy", {}), Mapping) else {}
@@ -686,12 +714,20 @@ def build_map(
             note_rows = [row for row in note_rows if str(row.get("note_id") or "") in allowed_note_ids]
     else:
         selected_source_set = workspace_source_set(root, note_rows, run_id=run_id)
+    extraction_config = (
+        config.get("extraction", {})
+        if isinstance(config.get("extraction", {}), Mapping)
+        else {}
+    )
     map_request = MapRequest(
         workspace=root,
         provider=provider,
         model=model,
         allow_cloud=allow_cloud,
         question=question,
+        extraction_version=str(extraction_config.get("version") or "2"),
+        prompt_version=str(config.get("prompt_version") or "8"),
+        extraction_policy=ExtractionPolicy.from_dict(extraction_config),
         processing=ProcessingPolicy.from_dict(
             config.get("processing") if isinstance(config.get("processing"), Mapping) else {}
         ),
@@ -726,12 +762,20 @@ def build_map(
     except Exception:
         progress.finish("partial")
         raise
+    analytical_source_ids = _analytical_profile_source_ids(
+        result.get("profiles", []) or []
+    )
     literature_summary = {
         "status": "partial" if result.get("partial_reason") else "completed",
         "profile_count": len(result.get("profiles", []) or []),
         "profile_valid_count": int((result.get("profile_result", {}) or {}).get("valid_count", 0) or 0),
         "profile_excluded_count": int((result.get("profile_result", {}) or {}).get("excluded_count", 0) or 0),
-        "unclustered_count": len(result["cluster_map"].get("unclustered_sources", []) or []),
+        "unclustered_count": sum(
+            1
+            for row in result["cluster_map"].get("unclustered_sources", []) or []
+            if isinstance(row, Mapping)
+            and str(row.get("source_id") or "") in analytical_source_ids
+        ),
         "cluster_count": len(result["cluster_map"].get("clusters", []) or []),
         "mapped_gap_count": sum(
             1

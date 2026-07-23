@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import re
 import threading
 import time
 from collections import defaultdict
@@ -18,7 +19,6 @@ from .extraction import (
     classify_metadata_only,
     extract_bytes,
     extract_path,
-    ocr_pdf_bytes,
 )
 from .files import (
     append_jsonl,
@@ -1080,7 +1080,6 @@ def run_pipeline(
 def _apply_reader_policy(reader: ReaderProvider, policy: ProcessingPolicy) -> None:
     for attribute, value in (
         ("request_deadline", policy.request_deadline_seconds),
-        ("max_output_tokens", policy.synthesis_output_tokens),
         ("chunk_output_tokens", policy.chunk_output_tokens),
         ("direct_read_fraction", policy.context_window_fraction),
     ):
@@ -2124,6 +2123,16 @@ def _build_profiles_for_map(
                         profile = existing
                         checkpoint_hit = 1
                         mechanically_upgraded = True
+            if profile is not None and reasoner is not None and analytical:
+                cached_context = dict(getattr(profile, "context", {}) or {})
+                if bool(cached_context.get("lazy_reprofile_required")):
+                    # A contract-fallback profile is a progress-preserving placeholder,
+                    # not a successful profile checkpoint. Once a reasoner is available,
+                    # retry from the committed note instead of mechanically blessing the
+                    # omnibus support-unknown anchor under a newer prompt version.
+                    profile = None
+                    checkpoint_hit = 0
+                    mechanically_upgraded = False
             if profile is None:
                 if reasoner is not None and analytical:
                     reserve_provider_call()
@@ -2211,13 +2220,11 @@ def _build_profiles_for_map(
             # exact profile-checkpoint hit.
             profile.excluded_from_synthesis = False
             profile.exclusion_reason = ""
-        stored_context = dict(getattr(profile, "context", {}) or {})
-        stored_route = str(stored_context.get("profile_generation_route") or "")
-        if stored_route in {
-            "deterministic",
-            "mechanical_legacy_upgrade",
-            "mechanical_reasoner_contract_fallback",
-        }:
+        if analytical:
+            # This is a zero-call committed-note normalization for every
+            # analytical route. It binds source-controlled coverage and keeps
+            # existing reasoner anchors intact; it is not a second semantic
+            # verification pass.
             profile, _ = augment_profile_from_committed_note(
                 profile,
                 text,
@@ -2844,10 +2851,30 @@ def _prepare_item(
     try:
         if progress is not None:
             progress.update(index, status="active", phase="reading_document")
+        extraction_metrics = dict(content.get("coverage_metrics", {}) or {})
+        reader_metadata = {
+            **item_data(item),
+            "_source_context": {
+                "source_file": str(content.get("source_file") or ""),
+                "route": str(content.get("content_route") or ""),
+                "media_type": str(content.get("media_type") or ""),
+                "source_scope": source_scope,
+                "page_count": int(extraction_metrics.get("page_count", 0) or 0),
+                "embedded_text_page_count": int(
+                    extraction_metrics.get("embedded_text_page_count", 0) or 0
+                ),
+                "ocr_page_count": int(
+                    extraction_metrics.get("ocr_page_count", 0) or 0
+                ),
+                "unresolved_pages": list(
+                    extraction_metrics.get("unresolved_pages", []) or []
+                ),
+            },
+        }
         analysis, reader_route, reader_reason = _read_document(
             reader,
             str(content["text"]),
-            item_data(item),
+            reader_metadata,
             None,
             request=request,
             checkpoint_root=checkpoint_root,
@@ -2993,8 +3020,11 @@ def _acquire_content(
     vision: VisionProvider | None,
 ) -> dict[str, Any] | None:
     key = item_key(item)
+    parent_data = item_data(item)
     targets: list[Mapping[str, Any]] = [item]
     candidates: list[dict[str, Any]] = []
+    primary_pdf_attempted = False
+    failed_primary_pdf: dict[str, Any] | None = None
     try:
         children = client.children(key)
         targets.extend(children)
@@ -3029,6 +3059,21 @@ def _acquire_content(
             effective_media_type = str(
                 (fulltext or {}).get("contentType") or media_type or "text/html"
             )
+            if effective_media_type == "application/pdf":
+                marked_text = _indexed_pdf_text_with_page_markers(text, fulltext)
+                if marked_text is None:
+                    base["attempts"].append(
+                        _attempt(
+                            base,
+                            "zotero_fulltext",
+                            "failed",
+                            f"{target_key}:indexed_pdf_missing_page_boundaries",
+                            input_hash=sha256_text(text),
+                        )
+                    )
+                    text = ""
+                else:
+                    text = marked_text
             if _indexed_page_coverage_incomplete(fulltext) or (
                 effective_media_type == "application/pdf"
                 and not _indexed_pdf_complete(fulltext)
@@ -3042,7 +3087,7 @@ def _acquire_content(
                         input_hash=sha256_text(text),
                     )
                 )
-            else:
+            elif text:
                 adequacy = classify_content_adequacy(
                     text,
                     media_type=effective_media_type,
@@ -3059,6 +3104,12 @@ def _acquire_content(
                     source_file=f"zotero://select/library/items/{target_key}",
                     content_route="zotero_fulltext",
                     media_type=effective_media_type,
+                    rank_override=_attachment_candidate_rank(
+                        data,
+                        parent_data,
+                        media_type=effective_media_type,
+                        actual_file=False,
+                    ),
                 )
                 candidates.append(candidate)
                 base["attempts"].append(
@@ -3081,7 +3132,26 @@ def _acquire_content(
             )
         local = _local_attachment_path(data)
         if local:
-            extracted = extract_path(local)
+            extraction_path = local
+            local_media_type = _target_media_type(data)
+            local_primary_pdf = _is_primary_pdf_attachment(
+                data, parent_data, local_media_type
+            )
+            primary_pdf_attempted = primary_pdf_attempted or local_primary_pdf
+            if local.suffix.lower() == ".pdf" or local_media_type == "application/pdf":
+                custody_path = (
+                    workspace
+                    / "01_custody"
+                    / "files"
+                    / f"{safe_filename(target_key)}{local.suffix.lower() or '.pdf'}"
+                )
+                atomic_write_bytes(custody_path, local.read_bytes())
+                extraction_path = custody_path
+            extracted = extract_path(
+                extraction_path,
+                ocr_mode=request.extraction_policy.ocr,
+                ocr_languages=request.extraction_policy.languages,
+            )
             base["attempts"].append(
                 _attempt(
                     base,
@@ -3089,81 +3159,37 @@ def _acquire_content(
                     "succeeded" if extracted.status == "succeeded" else "failed",
                     extracted.reason or "extracted",
                     input_hash=sha256_file(local),
-                    output_path=str(local),
+                    output_path=str(extraction_path),
                 )
             )
             if extracted.status == "succeeded":
-                candidates.append(
-                    _content_candidate(
-                        extracted.adequacy
-                        or classify_content_adequacy(
-                            extracted.text,
-                            media_type=extracted.media_type,
-                            page_count=extracted.page_count,
-                        ),
-                        text=extracted.text,
-                        content_hash=sha256_file(local),
-                        source_file=str(local),
-                        content_route=extracted.route,
+                local_candidate = _content_candidate(
+                    extracted.adequacy
+                    or classify_content_adequacy(
+                        extracted.text,
                         media_type=extracted.media_type,
-                    )
+                        page_count=extracted.page_count,
+                    ),
+                    text=extracted.text,
+                    content_hash=sha256_file(local),
+                    source_file=str(extraction_path),
+                    content_route=extracted.route,
+                    media_type=extracted.media_type,
+                    rank_override=_attachment_candidate_rank(
+                        data,
+                        parent_data,
+                        media_type=extracted.media_type,
+                        actual_file=True,
+                    ),
                 )
-            if extracted.status != "succeeded" and local.suffix.lower() == ".pdf":
-                document = local.read_bytes()
-            else:
-                document = b""
-            if document:
-                ocr = ocr_pdf_bytes(document)
-                base["attempts"].append(
-                    _attempt(
-                        base,
-                        ocr.route,
-                        "succeeded" if ocr.status == "succeeded" else "failed",
-                        ocr.reason or "ocr_extracted",
-                        input_hash=sha256_bytes(document),
-                        output_path=str(local),
-                    )
+                local_candidate["actual_primary_pdf"] = local_primary_pdf
+                candidates.append(local_candidate)
+            elif local_primary_pdf:
+                failed_primary_pdf = _failed_pdf_candidate(
+                    extracted,
+                    content_hash=sha256_file(local),
+                    source_file=str(extraction_path),
                 )
-                if ocr.status == "succeeded":
-                    candidates.append(
-                        _content_candidate(
-                            ocr.adequacy
-                            or classify_content_adequacy(
-                                ocr.text,
-                                media_type="application/pdf",
-                                page_count=ocr.page_count,
-                            ),
-                            text=ocr.text,
-                            content_hash=sha256_bytes(document),
-                            source_file=str(local),
-                            content_route=ocr.route,
-                            media_type="application/pdf",
-                        )
-                    )
-                if vision is not None:
-                    visual = _vision_content(
-                        base,
-                        vision,
-                        request,
-                        document,
-                        "application/pdf",
-                        item_data(item),
-                        str(local),
-                    )
-                    if visual:
-                        candidates.append(
-                            {
-                                **visual,
-                                "source_scope": "full_document",
-                                "source_coverage": {
-                                    "coverage_gate": "passed",
-                                    "reason": "document_vision",
-                                },
-                                "coverage_reason": "document_vision",
-                                "coverage_metrics": {},
-                                "rank": 95,
-                            }
-                        )
         if target is item and str(data.get("itemType", "")) != "attachment":
             continue
         try:
@@ -3189,6 +3215,10 @@ def _acquire_content(
             )
             continue
         document, media_type = file_result
+        downloaded_primary_pdf = _is_primary_pdf_attachment(
+            data, parent_data, media_type
+        )
+        primary_pdf_attempted = primary_pdf_attempted or downloaded_primary_pdf
         extension = (
             mimetypes.guess_extension(media_type)
             or Path(str(data.get("filename") or "")).suffix
@@ -3202,7 +3232,11 @@ def _acquire_content(
         )
         atomic_write_bytes(custody_path, document)
         extracted = extract_bytes(
-            document, media_type=media_type, filename=custody_path.name
+            document,
+            media_type=media_type,
+            filename=custody_path.name,
+            ocr_mode=request.extraction_policy.ocr,
+            ocr_languages=request.extraction_policy.languages,
         )
         document_hash = sha256_bytes(document)
         base["attempts"].append(
@@ -3216,73 +3250,76 @@ def _acquire_content(
             )
         )
         if extracted.status == "succeeded":
-            candidates.append(
-                _content_candidate(
-                    extracted.adequacy
-                    or classify_content_adequacy(
-                        extracted.text,
-                        media_type=extracted.media_type,
-                        page_count=extracted.page_count,
-                    ),
-                    text=extracted.text,
-                    content_hash=document_hash,
-                    source_file=str(custody_path),
-                    content_route=extracted.route,
+            downloaded_candidate = _content_candidate(
+                extracted.adequacy
+                or classify_content_adequacy(
+                    extracted.text,
                     media_type=extracted.media_type,
-                )
+                    page_count=extracted.page_count,
+                ),
+                text=extracted.text,
+                content_hash=document_hash,
+                source_file=str(custody_path),
+                content_route=extracted.route,
+                media_type=extracted.media_type,
+                rank_override=_attachment_candidate_rank(
+                    data,
+                    parent_data,
+                    media_type=extracted.media_type,
+                    actual_file=True,
+                ),
             )
-        if extracted.status != "succeeded" and media_type == "application/pdf":
-            ocr = ocr_pdf_bytes(document)
-            base["attempts"].append(
-                _attempt(
-                    base,
-                    ocr.route,
-                    "succeeded" if ocr.status == "succeeded" else "failed",
-                    ocr.reason or "ocr_extracted",
-                    input_hash=document_hash,
-                    output_path=str(custody_path),
-                )
+            downloaded_candidate["actual_primary_pdf"] = downloaded_primary_pdf
+            candidates.append(downloaded_candidate)
+        elif downloaded_primary_pdf:
+            failed_primary_pdf = _failed_pdf_candidate(
+                extracted,
+                content_hash=document_hash,
+                source_file=str(custody_path),
             )
-            if ocr.status == "succeeded":
-                candidates.append(
-                    _content_candidate(
-                        ocr.adequacy
-                        or classify_content_adequacy(
-                            ocr.text, media_type=media_type, page_count=ocr.page_count
-                        ),
-                        text=ocr.text,
-                        content_hash=document_hash,
-                        source_file=str(custody_path),
-                        content_route=ocr.route,
-                        media_type=media_type,
-                    )
+    if primary_pdf_attempted:
+        actual_primary = [
+            row for row in candidates if row.get("actual_primary_pdf") is True
+        ]
+        if actual_primary:
+            candidates = actual_primary
+        elif failed_primary_pdf is not None:
+            abstract_candidates = [
+                row
+                for row in candidates
+                if str(row.get("source_scope") or "") == "abstract_only"
+                and str(row.get("text") or "").strip()
+            ]
+            if abstract_candidates:
+                best_abstract = max(
+                    abstract_candidates, key=lambda row: len(str(row.get("text") or ""))
                 )
-            if vision is not None:
-                visual = _vision_content(
-                    base,
-                    vision,
-                    request,
-                    document,
-                    media_type,
-                    item_data(item),
-                    str(custody_path),
+                abstract_text = str(best_abstract.get("text") or "").strip()
+                failed_primary_pdf.update(
+                    {
+                        "text": abstract_text,
+                        "abstract_text": abstract_text,
+                        "source_scope": "abstract_only",
+                        "source_coverage": {
+                            **dict(best_abstract.get("source_coverage", {}) or {}),
+                            "coverage_gate": "limited",
+                            "source_scope": "abstract_only",
+                            "reason": "primary_pdf_unreadable_abstract_available",
+                        },
+                        "coverage_reason": "primary_pdf_unreadable_abstract_available",
+                    }
                 )
-                if visual:
-                    candidates.append(
-                        {
-                            **visual,
-                            "source_scope": "full_document",
-                            "source_coverage": {
-                                "coverage_gate": "passed",
-                                "reason": "document_vision",
-                            },
-                            "coverage_reason": "document_vision",
-                            "coverage_metrics": {},
-                            "rank": 95,
-                        }
-                    )
+            return failed_primary_pdf
     if candidates:
-        return max(candidates, key=lambda row: int(row.get("rank", 0)))
+        return max(
+            candidates,
+            key=lambda row: (
+                int(row.get("rank", 0)),
+                len(str(row.get("text") or "")),
+                str(row.get("content_route") or ""),
+                str(row.get("source_file") or ""),
+            ),
+        )
     metadata = item_data(item)
     adequacy = classify_metadata_only(metadata)
     metadata_hash = sha256_text(
@@ -3315,6 +3352,7 @@ def _content_candidate(
     source_file: str,
     content_route: str,
     media_type: str,
+    rank_override: int | None = None,
 ) -> dict[str, Any]:
     scope = (
         "abstract_only"
@@ -3330,6 +3368,8 @@ def _content_candidate(
         if scope == "abstract_only"
         else 10
     )
+    if rank_override is not None and adequacy.is_full_publication:
+        rank = rank_override
     usable_text = (
         adequacy.abstract if scope == "abstract_only" and adequacy.abstract else text
     )
@@ -3346,6 +3386,177 @@ def _content_candidate(
         "coverage_metrics": dict(adequacy.metrics or {}),
         "rank": rank,
     }
+
+
+_SUPPLEMENTARY_ATTACHMENT_RE = re.compile(
+    r"\b(?:supplement(?:ary)?|supporting\s+(?:information|material)|appendix|"
+    r"data\s*set|dataset|codebook|replication\s+(?:data|files?)|tables?\s+only|"
+    r"figures?\s+only)\b",
+    flags=re.IGNORECASE,
+)
+
+_NONARTICLE_ATTACHMENT_RE = re.compile(
+    r"\b(?:cover\s+letter|response\s+to\s+(?:the\s+)?reviewers?|author\s+response|"
+    r"rebuttal|editorial\s+decision|decision\s+letter|reviewer\s+comments?|"
+    r"copyright\s+(?:form|transfer)|licen[cs]e\s+agreement|certificate|"
+    r"graphical\s+abstract|highlights?)\b",
+    flags=re.IGNORECASE,
+)
+
+_PRIMARY_ATTACHMENT_RE = re.compile(
+    r"\b(?:full\s*text(?:\s+pdf)?|accepted\s+manuscript|author\s+manuscript|"
+    r"main\s+(?:article|document)|published\s+version|journal\s+article)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _attachment_candidate_rank(
+    attachment: Mapping[str, Any],
+    parent: Mapping[str, Any],
+    *,
+    media_type: str,
+    actual_file: bool,
+) -> int | None:
+    """Rank primary PDFs above indexed text without selecting supplements."""
+
+    if media_type != "application/pdf":
+        return None
+    label = " ".join(
+        str(attachment.get(field) or "")
+        for field in ("title", "filename", "attachmentPath")
+    )
+    if _SUPPLEMENTARY_ATTACHMENT_RE.search(label):
+        return 60 if actual_file else 50
+    if _NONARTICLE_ATTACHMENT_RE.search(label):
+        return 40 if actual_file else 35
+
+    parent_title = _selection_terms(str(parent.get("title") or ""))
+    attachment_title = _selection_terms(label)
+    matched_title_terms = parent_title & attachment_title
+    title_match = bool(
+        parent_title
+        and attachment_title
+        and (
+            len(matched_title_terms) >= 2
+            or (
+                len(parent_title) <= 2
+                and len(matched_title_terms) == len(parent_title)
+            )
+            or len(matched_title_terms) / len(parent_title) >= 0.3
+        )
+    )
+    generic_primary_label = bool(_PRIMARY_ATTACHMENT_RE.search(label))
+
+    parent_doi = str(parent.get("DOI") or parent.get("doi") or "").strip().casefold()
+    attachment_doi = str(
+        attachment.get("DOI") or attachment.get("doi") or ""
+    ).strip().casefold()
+    doi_match = bool(parent_doi and attachment_doi and parent_doi == attachment_doi)
+    doi_mismatch = bool(parent_doi and attachment_doi and not doi_match)
+
+    # Any actual non-supplementary, non-administrative PDF outranks its indexed
+    # representation. Sparse Zotero attachment metadata is common (for example,
+    # title ``PDF`` plus an opaque publisher filename), so absence of a title or
+    # DOI match is not evidence that the attachment is secondary. Positive
+    # evidence still raises the primary file above other actual PDF candidates.
+    positive_primary_evidence = title_match or generic_primary_label or doi_match
+    rank = 125 if actual_file and positive_primary_evidence else 110 if actual_file else 100
+    if parent_title and attachment_title:
+        overlap = len(matched_title_terms) / len(parent_title)
+        rank += min(10, round(overlap * 10))
+
+    if doi_match:
+        rank += 6
+    elif doi_mismatch:
+        rank -= 15
+    return rank
+
+
+def _is_primary_pdf_attachment(
+    attachment: Mapping[str, Any], parent: Mapping[str, Any], media_type: str
+) -> bool:
+    rank = _attachment_candidate_rank(
+        attachment, parent, media_type=media_type, actual_file=True
+    )
+    return rank is not None and rank >= 100
+
+
+def _failed_pdf_candidate(
+    extracted: Any, *, content_hash: str, source_file: str
+) -> dict[str, Any]:
+    adequacy = extracted.adequacy
+    prior_coverage = adequacy.to_dict() if adequacy is not None else {}
+    metrics = dict(prior_coverage.get("metrics", {}) or {})
+    if extracted.page_count and not metrics.get("page_count"):
+        metrics["page_count"] = int(extracted.page_count)
+    # An extraction-level failure overrides any earlier density-only pass.
+    # Keeping a stale `passed` gate here makes the honest limited note fail its
+    # own schema validation and incorrectly exhausts the Zotero item.
+    coverage = {
+        "classification": "metadata_only",
+        "source_scope": "metadata_only",
+        "coverage_gate": "failed",
+        "reason": str(extracted.reason or "pdf_extraction_failed"),
+        "abstract": "",
+        "paywall_markers": [],
+        "access_markers": [],
+        "metrics": metrics,
+    }
+    return {
+        "text": "",
+        "abstract_text": "",
+        "content_hash": content_hash,
+        "source_file": source_file,
+        "content_route": str(extracted.route or "pdf_extraction"),
+        "media_type": "application/pdf",
+        "source_scope": "metadata_only",
+        "source_coverage": coverage,
+        "coverage_reason": str(extracted.reason or "pdf_extraction_failed"),
+        "coverage_metrics": metrics,
+        "rank": 0,
+    }
+
+
+def _selection_terms(value: str) -> set[str]:
+    ignored = {
+        "attachment",
+        "download",
+        "file",
+        "full",
+        "pdf",
+        "text",
+        "the",
+        "and",
+        "for",
+        "with",
+    }
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", value.casefold())
+        if len(token) > 2 and token not in ignored
+    }
+
+
+def _indexed_pdf_text_with_page_markers(
+    text: str, fulltext: Mapping[str, Any] | None
+) -> str | None:
+    """Return a page-addressable Zotero fallback or reject ambiguous indexing."""
+
+    if not _indexed_pdf_complete(fulltext):
+        return None
+    total = int((fulltext or {}).get("totalPages", 0) or 0)
+    marker_numbers = [
+        int(value) for value in re.findall(r"---\s*Page\s+(\d+)\s*---", text)
+    ]
+    if marker_numbers == list(range(1, total + 1)):
+        return text
+    pages = re.split(r"\f+", text)
+    if len(pages) != total:
+        return None
+    return "\n\n".join(
+        f"--- Page {index} ---\n{page.strip()}"
+        for index, page in enumerate(pages, start=1)
+    ).strip()
 
 
 def _target_media_type(data: Mapping[str, Any]) -> str:
@@ -3596,6 +3807,11 @@ def _fingerprint(
         "metadata_hash": _prompt_metadata_hash(item),
         "chunking_version": CHUNKING_VERSION,
         "content_classifier_version": CONTENT_CLASSIFIER_VERSION,
+        "extraction_policy_hash": sha256_text(
+            json.dumps(
+                request.to_dict().get("extraction_policy", {}), sort_keys=True
+            )
+        ),
         "processing_policy_hash": sha256_text(
             json.dumps(request.to_dict().get("processing", {}), sort_keys=True)
         ),
@@ -3915,7 +4131,7 @@ def _read_document(
         "document_hash": document_hash,
         "provider": str(getattr(reader, "name", "unknown")),
         "model": str(getattr(reader, "model", "unknown")),
-        "prompt_version": request.prompt_version if request else "2",
+        "prompt_version": request.prompt_version if request else "8",
         "chunking_version": CHUNKING_VERSION,
         "content_classifier_version": CONTENT_CLASSIFIER_VERSION,
         "question_hash": sha256_text(question or ""),

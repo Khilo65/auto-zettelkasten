@@ -1680,9 +1680,11 @@ def test_organizational_thread_narrows_noncausal_effect_language() -> None:
 
     thread = result["evidence_threads"][0]
     assert result["status"] == "reasoned"
-    assert thread["summary"].startswith("The cited sources report that")
-    assert "does not by itself establish causation" in thread["summary"]
-    assert "mediation design increases settlement durability" in thread["summary"]
+    assert thread["summary"].startswith(
+        "The cited sources report a positive association between mediation design and settlement durability."
+    )
+    assert "does not establish a causal effect" in thread["summary"]
+    assert "mediation design increases settlement durability" not in thread["summary"]
     assert not _human_prose_errors(thread["summary"])
     assert thread["causal_language_narrowed"] is True
 

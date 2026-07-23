@@ -1828,7 +1828,10 @@ def test_human_facing_cluster_and_gap_titles_keep_normal_descriptive_labels() ->
     }
     gap = {
         "gap_id": "gap-stable-agent-id",
-        "title": "Causal mechanisms linking inclusion of women and civil society to ceasefire durability",
+        "title": (
+            "Measurement inconsistency in conflict intensity operationalization blocks synthesis "
+            "of mediation success effect sizes"
+        ),
     }
 
     assert "…" not in cluster_display_title(cluster)
@@ -2272,7 +2275,7 @@ def test_coverage_repair_recovers_supported_family_and_replays_without_calls(
     assert replay_packet["synthesis_checkpoint_hit_count"] == 2
 
 
-def test_deepseek_coverage_audit_uses_one_full_packet_and_one_residual_component() -> (
+def test_deepseek_coverage_audit_uses_one_full_packet_then_all_residual_components() -> (
     None
 ):
     rows = normalize_evidence_profiles(
@@ -2304,7 +2307,7 @@ def test_deepseek_coverage_audit_uses_one_full_packet_and_one_residual_component
         ),
     )
 
-    assert len(plan) == 2
+    assert len(plan) == 1 + len(plan[0]["candidate_components"])
     assert plan[0]["mode"] == "collection"
     assert plan[0]["key"] == "collection--coverage-audit"
     assert set(plan[0]["focus_source_ids"]) == {
@@ -2317,9 +2320,19 @@ def test_deepseek_coverage_audit_uses_one_full_packet_and_one_residual_component
         for component in plan[0]["candidate_components"]
         for source_id in component["focus_source_ids"]
     } == {row["source_id"] for row in rows}
-    assert plan[1]["mode"] == "semantic_component"
-    assert plan[1]["key"].startswith("collection--coverage-residual-")
-    assert len(plan[1]["source_ids"]) >= 2
+    assert all(row["mode"] == "semantic_component" for row in plan[1:])
+    assert all(
+        row["key"].startswith("collection--coverage-residual-")
+        for row in plan[1:]
+    )
+    assert all(len(row["source_ids"]) >= 2 for row in plan[1:])
+    assert {
+        tuple(row["source_ids"]) for row in plan[1:]
+    } == {
+        tuple(row["source_ids"])
+        for row in plan[0]["candidate_components"]
+        if len(row["source_ids"]) >= 2
+    }
 
 
 def test_deepseek_coverage_fit_ignores_machine_only_profile_bulk() -> None:
@@ -2486,6 +2499,35 @@ def test_component_proposal_shards_union_same_conversation_members() -> None:
     assert {row["source_id"] for row in proposals[0]["supporting_evidence"]} == {
         "track-a",
         "track-b",
+    }
+
+
+def test_later_same_id_coverage_correction_can_remove_weak_members() -> None:
+    initial = {
+        "proposal_id": "internationalized-civil-war",
+        "label": "Internationalized Civil-War Mediation",
+        "semantic_identity": "internationalized civil war mediation",
+        "source_ids": ["kane", "hellmuller", "unrelated"],
+        "source_roles": {"kane": "core", "hellmuller": "core", "unrelated": "core"},
+        "supporting_evidence": [],
+        "propositions": [],
+        "family_relations": [],
+    }
+    corrected = {
+        **initial,
+        "source_ids": ["kane", "hellmuller"],
+        "source_roles": {"kane": "core", "hellmuller": "core"},
+    }
+
+    proposals = literature._cluster_proposals_from_responses(
+        [{"clusters": [initial]}, {"clusters": [corrected]}]
+    )
+
+    assert len(proposals) == 1
+    assert proposals[0]["source_ids"] == ["kane", "hellmuller"]
+    assert proposals[0]["source_roles"] == {
+        "kane": "core",
+        "hellmuller": "core",
     }
 
 

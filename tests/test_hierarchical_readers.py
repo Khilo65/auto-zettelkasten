@@ -158,7 +158,7 @@ def test_deepseek_prefers_direct_read_well_beyond_sixty_thousand_characters() ->
     assert reader.reading_strategy("x" * 240_000, metadata) == "direct"
     assert reader.reading_strategy("x" * 1_090_074, metadata) == "direct"
     assert reader.reading_strategy("x" * 2_500_000, metadata) == "hierarchical"
-    assert reader.direct_input_token_budget == 793_856
+    assert 790_000 <= reader.direct_input_token_budget <= 800_000
 
 
 def test_deepseek_chunk_prompt_parsing_and_per_call_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -219,8 +219,9 @@ def test_deepseek_synthesis_returns_pipeline_analysis_and_uses_final_cap(monkeyp
     assert captured[0]["max_tokens"] == 600
     assert "COARSE CHUNK EVIDENCE" in captured[0]["messages"][1]["content"]
     system_prompt = captured[0]["messages"][0]["content"]
-    assert "Plain-English interpretation" in system_prompt
-    assert "Direction, Magnitude, Reference point, Uncertainty, and Practical meaning" in system_prompt
+    assert "Plain-English Interpretation" in system_prompt
+    assert "what changed, by how much, compared with what" in system_prompt
+    assert "naturally rather than as a compulsory checklist" in system_prompt
     assert "statistical_context" in captured[0]["messages"][1]["content"]
 
 

@@ -9,6 +9,7 @@ from .models import (
     CURRENT_ARTIFACT_SCHEMA_VERSION,
     CURRENT_ENGINE_VERSION,
     ArtifactManifest,
+    ExtractionPolicy,
     LiteratureMappingPolicy,
     NavigationPolicy,
     ProcessingPolicy,
@@ -97,8 +98,12 @@ def initialize(workspace: Path | str, *, overwrite: bool = False) -> ArtifactMan
                 "provider": "deepseek",
                 "model": "deepseek-v4-flash",
                 "privacy": {"allow_cloud": False},
-                "extraction": {"version": "1", "ocr": "auto", "vision": "configured_only"},
-                "prompt_version": "2",
+                "extraction": {
+                    "version": "2",
+                    **ExtractionPolicy().to_dict(),
+                    "vision": "configured_only",
+                },
+                "prompt_version": "8",
                 "parallel": 4,
                 "processing": {
                     "direct_read_char_limit": 120000,

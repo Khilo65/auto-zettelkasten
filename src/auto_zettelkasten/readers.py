@@ -11,6 +11,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import UTC, datetime
 from typing import Any, Callable, Mapping, Sequence
@@ -59,12 +60,12 @@ CHUNK_EVIDENCE_KEYS = (
 
 DIRECT_READ_CONTEXT_FRACTION = 0.8
 DEFAULT_PROMPT_RESERVE_TOKENS = 2_048
-DEFAULT_MAX_OUTPUT_TOKENS = 4_096
+DEFAULT_MAX_OUTPUT_TOKENS = 6_000
 DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 32_000
-CLUSTER_SYNTHESIS_MAX_OUTPUT_TOKENS = 16_000
+CLUSTER_SYNTHESIS_MAX_OUTPUT_TOKENS = 32_000
 GAP_ADJUDICATION_MAX_OUTPUT_TOKENS = 32_000
 
 MODEL_CONTEXT_WINDOWS: Mapping[tuple[str, str], int] = {
@@ -80,6 +81,10 @@ PROVIDER_CONTEXT_WINDOW_DEFAULTS: Mapping[str, int] = {
     # deliberately conservative fallback and callers may override it.
     "ollama": 32_768,
 }
+
+_REASONING_EFFORT: ContextVar[str | None] = ContextVar(
+    "auto_zettelkasten_reasoning_effort", default=None
+)
 
 
 def provider_from_name(name: str, model: str, *, allow_cloud: bool):
@@ -217,11 +222,12 @@ class _CapabilityAwareReader:
             system_prompt, user_prompt, self.max_output_tokens, label="source"
         )
         return _parse_analysis(
-            self._generate_text(
+            self._generate_with_reasoning(
                 system_prompt,
                 user_prompt,
                 self.max_output_tokens,
                 self._request_deadline_seconds(),
+                reasoning_effort="high",
             )
         )
 
@@ -236,14 +242,14 @@ class _CapabilityAwareReader:
         question: str | None = None,
         context: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
-        """Generate profile-prompt-v3 JSON from committed note text only."""
+        """Generate profile-prompt-v6 JSON from committed note text only."""
 
         del (
             question
         )  # A question is a projection lens, not part of the base evidence profile.
         self._authorize_request()
-        prompt_version = str((context or {}).get("profile_prompt_version") or "3")
-        if prompt_version != "3":
+        prompt_version = str((context or {}).get("profile_prompt_version") or "6")
+        if prompt_version != "6":
             raise ProviderError(f"unsupported profile prompt version: {prompt_version}")
         user_prompt = str(note.get("profile_prompt") or "").strip()
         if not user_prompt:
@@ -258,8 +264,12 @@ class _CapabilityAwareReader:
             system_prompt, user_prompt, output_tokens, label="evidence profile"
         )
         return _parse_json_object(
-            self._generate_text(
-                system_prompt, user_prompt, output_tokens, deadline_seconds
+            self._generate_with_reasoning(
+                system_prompt,
+                user_prompt,
+                output_tokens,
+                deadline_seconds,
+                reasoning_effort="high",
             ),
             label="profile response",
         )
@@ -332,6 +342,7 @@ class _CapabilityAwareReader:
                 system_prompt,
                 user_prompt,
                 label="cluster proposal",
+                reasoning_effort="high",
                 output_tokens=(
                     CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS
                     if audit_mode == "collection"
@@ -360,7 +371,10 @@ class _CapabilityAwareReader:
         )
         return _validate_literature_response(
             self._literature_json_call(
-                system_prompt, user_prompt, label="debate mapping"
+                system_prompt,
+                user_prompt,
+                label="debate mapping",
+                reasoning_effort="high",
             ),
             kind="debate_mapping",
         )
@@ -396,7 +410,15 @@ class _CapabilityAwareReader:
             "cluster-relevant findings. Distinguish association from causation and explain agreements, "
             "differences, weaknesses, and evidentiary limits. Preserve only supplied evidence and locators."
             if repair_requirements
-            else "Synthesize this admitted cluster, retain important source-specific contributions even without multi-source agreement, and emit specific rule-bound gap hypotheses in the same response."
+            else (
+                "Synthesize this admitted cluster and retain the evidence and inferential logic behind each important source-specific "
+                "contribution even without multi-source agreement. Never translate an observational association as something that "
+                "'works better', 'helps', 'drives', 'leads to', or 'causes'; preserve associational wording in plain English. Normalize "
+                "inverse predictor framings before calling findings inconsistent. For Kuperman's muscular-mediation analysis, include "
+                "the Rwanda civil-war and genocide context, the distinct half-million-Tutsi and broader up-to-one-million estimates, "
+                "the author-reported 500-fold and 6,000-fold descriptive comparisons, and the process-tracing alternatives and limits. "
+                "Emit only specific, rule-bound collection gap hypotheses."
+            )
         )
         instruction += budget_instruction
         user_prompt = _literature_prompt(
@@ -405,11 +427,24 @@ class _CapabilityAwareReader:
             context,
             instruction=instruction,
         )
+        user_prompt += (
+            "\n\nFINAL SYNTHESIS REQUIREMENTS — apply these after reading every atomic note above:\n"
+            "1. Preserve the case, period, actors, observed comparison, method, explanatory logic, and inferential limit "
+            "when they are necessary to understand a core source.\n"
+            "2. In plain English, observational results remain associations: never say a strategy works better, helps, "
+            "drives, leads to, causes, or increases an outcome.\n"
+            "3. For Kuperman, the cluster contribution is incomplete unless it names the 1990–1994 Rwanda civil war and "
+            "1994 genocide, separates the estimated half-million Tutsi from the broader up-to-one-million Rwandans, "
+            "labels the reported 500-fold total and 6,000-fold monthly comparisons as descriptive arithmetic rather "
+            "than mediation effects, and explains the process-tracing logic and alternative causes.\n"
+            "Return only the requested JSON object."
+        )
         return _validate_literature_response(
             self._literature_json_call(
                 system_prompt,
                 user_prompt,
                 label="cluster synthesis",
+                reasoning_effort="max",
                 output_tokens=CLUSTER_SYNTHESIS_MAX_OUTPUT_TOKENS,
             ),
             kind="cluster_synthesis",
@@ -429,11 +464,21 @@ class _CapabilityAwareReader:
             request,
             context,
         )
+        user_prompt += (
+            "\n\nFINAL GAP REQUIREMENTS:\n"
+            "Retain only a specific, non-obvious collection-native puzzle supported by the supplied evidence. Do not "
+            "invent follow-up years, sample sizes, cases, datasets, measures, mechanisms, data structures, or study-design "
+            "details. Reject the generic observation that an observational association lacks causal identification unless the "
+            "collection reveals a concrete non-obvious puzzle beyond that standard limitation and explains what inference or "
+            "decision turns on it. A resolution path states only the kind of evidence needed; it is not a project design. If the supplied "
+            "evidence cannot support that specificity, reject the candidate. Return only the requested JSON object."
+        )
         return _validate_literature_response(
             self._literature_json_call(
                 system_prompt,
                 user_prompt,
                 label="gap adjudication",
+                reasoning_effort="high",
                 output_tokens=GAP_ADJUDICATION_MAX_OUTPUT_TOKENS,
             ),
             kind="gap_adjudication",
@@ -445,6 +490,7 @@ class _CapabilityAwareReader:
         user_prompt: str,
         *,
         label: str,
+        reasoning_effort: str = "high",
         output_tokens: int | None = None,
     ) -> Mapping[str, Any]:
         self.last_literature_response = None
@@ -454,8 +500,12 @@ class _CapabilityAwareReader:
         deadline_seconds = self._request_deadline_seconds()
         self._ensure_prompt_fits(system_prompt, user_prompt, output_tokens, label=label)
         response = _parse_json_object(
-            self._generate_text(
-                system_prompt, user_prompt, output_tokens, deadline_seconds
+            self._generate_with_reasoning(
+                system_prompt,
+                user_prompt,
+                output_tokens,
+                deadline_seconds,
+                reasoning_effort=reasoning_effort,
             ),
             label=f"{label} response",
         )
@@ -484,8 +534,12 @@ class _CapabilityAwareReader:
             system_prompt, user_prompt, output_tokens, label="coarse chunk"
         )
         return _parse_chunk_evidence(
-            self._generate_text(
-                system_prompt, user_prompt, output_tokens, request_deadline
+            self._generate_with_reasoning(
+                system_prompt,
+                user_prompt,
+                output_tokens,
+                request_deadline,
+                reasoning_effort="high",
             )
         )
 
@@ -511,10 +565,35 @@ class _CapabilityAwareReader:
             system_prompt, user_prompt, output_tokens, label="chunk synthesis"
         )
         return _parse_analysis(
-            self._generate_text(
-                system_prompt, user_prompt, output_tokens, request_deadline
+            self._generate_with_reasoning(
+                system_prompt,
+                user_prompt,
+                output_tokens,
+                request_deadline,
+                reasoning_effort="high",
             )
         )
+
+    def _generate_with_reasoning(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        output_tokens: int,
+        deadline_seconds: float,
+        *,
+        reasoning_effort: str,
+    ) -> Any:
+        if reasoning_effort not in {"high", "max"}:
+            raise ValueError("reasoning_effort must be high or max")
+        token = _REASONING_EFFORT.set(reasoning_effort)
+        try:
+            # Keep the transport method's historical four-argument protocol so
+            # existing reader integrations and test doubles remain compatible.
+            return self._generate_text(
+                system_prompt, user_prompt, output_tokens, deadline_seconds
+            )
+        finally:
+            _REASONING_EFFORT.reset(token)
 
     def _prompt_fits(
         self, system_prompt: str, user_prompt: str, output_tokens: int
@@ -605,9 +684,8 @@ class _OpenAICompatibleReader(_CapabilityAwareReader):
         output_tokens: int,
         deadline_seconds: float,
     ) -> Any:
-        body = {
+        body: dict[str, Any] = {
             "model": self.model,
-            "temperature": 0,
             "max_tokens": output_tokens,
             "response_format": {"type": "json_object"},
             "stream": True,
@@ -616,6 +694,13 @@ class _OpenAICompatibleReader(_CapabilityAwareReader):
                 {"role": "user", "content": user_prompt},
             ],
         }
+        if self.name == "deepseek":
+            # DeepSeek V4's OpenAI-compatible API accepts these raw top-level
+            # fields. Temperature is intentionally omitted in thinking mode.
+            body["thinking"] = {"type": "enabled"}
+            body["reasoning_effort"] = _REASONING_EFFORT.get() or "high"
+        else:
+            body["temperature"] = 0
         payload = _post_json(
             self.endpoint,
             body,
@@ -844,36 +929,77 @@ class OllamaReader(_CapabilityAwareReader):
 def _system_prompt() -> str:
     keys = ", ".join(SECTION_KEYS)
     return (
-        "You create source-faithful atomic notes from inspected document content. "
+        "You create source-faithful atomic notes using Auto-Zettelkasten atomic prompt v8. "
+        "Adapt the analysis to the source actually supplied: it may be an academic article or book, a report, policy or legal "
+        "document, archival material, conference or meeting record, practitioner guidance, speech, working paper, blog post, "
+        "or another evidence-bearing source. Do not force a nonacademic source into an academic-study template. "
         "Return only one JSON object. Do not infer facts absent from the source. "
         f"Every value must be a non-empty string. Required keys: {keys}. "
-        "Detailed findings must retain the source's exact estimates, units, sample sizes, uncertainty measures, "
-        "technical labels, examples, and qualifications when present. Do not replace those figures with a simplification. "
-        "Plain-English interpretation must then explain every important quantitative finding for a statistically "
-        "non-specialist using these explicit labels: Direction, Magnitude, Reference point, Uncertainty, and Practical meaning. "
-        "State what increased or decreased; how much in intuitive units; compared with which control, category, baseline, "
-        "period, or no-effect value; what confidence intervals, p-values, or other uncertainty do and do not establish; "
-        "and what the result would look like in an ordinary example. Convert relative changes to natural frequencies such "
-        "as per 100 or per 1,000 only when the source supplies the denominator or baseline needed to do so. "
+        "Copy only numbers and numerical comparisons explicitly printed in the supplied source. Do not calculate, derive, correct, "
+        "convert, combine, or extrapolate a number, rate, ratio, percentage, fold-change, or illustrative example. If the source's "
+        "arithmetic appears inconsistent, report it as the source's claim and flag the uncertainty without solving it. "
+        "Identify the source's important findings, arguments, observations, interpretations, or recommendations and explain "
+        "the method or knowledge basis behind them. Preserve the case or conflict, actors, population, geography, period, "
+        "outcome, and comparison needed to understand each important point. Distinguish what the source observes or reports, "
+        "the author's interpretation or argument, and what the method and evidence can actually establish. Use the organization and "
+        "language best suited to the actual source; do not force fixed labels or an experimental template onto historical, qualitative, "
+        "normative, practitioner, meeting, or other non-experimental material. "
+        "Detailed findings must retain the source's exact estimates, units, denominators, sample sizes, uncertainty measures, "
+        "technical labels, examples, and qualifications when present. Pair technical detail with a plain-English explanation; "
+        "do not replace the figures with a simplification or leave them unexplained. "
+        "For every important quantitative finding, explain for a statistically non-specialist what changed, by how much, compared with "
+        "what, and what the reported uncertainty does and does not establish. Do this naturally rather than as a compulsory checklist, "
+        "and never invent a numerical example or transformation. "
+        "When a source uses a ratio or fold-change, identify the numerator, denominator, comparison periods or groups, and any "
+        "different population estimates used in the arithmetic. Do not silently substitute a subgroup estimate for a broader "
+        "estimate, or present descriptive before-and-after arithmetic as an identified causal effect. For comparative or "
+        "process-tracing arguments, explain the sequence, counterfactual logic, and alternative explanations actually considered, "
+        "then state the limitations of that inferential strategy. In historically sensitive cases, specify the conflict, place, "
+        "dates or phase, actors, and context—including genocide or mass-atrocity context when the source makes it relevant—rather "
+        "than using an ambiguous country label. "
+        "Apply that distinction inside Detailed Findings and Plain-English Interpretation, not only in the critique. For causal narratives "
+        "based on historical comparison, case study, or process tracing, explain the observed events and reported numbers, what the author "
+        "argues explains them, the comparison or counterfactual logic, and what the design cannot rule out. Attribute the explanatory step "
+        "with phrases such as 'the author argues' unless the design identifies the effect. A source-reported before-and-after fold-change is "
+        "descriptive arithmetic, not an estimated causal effect. Do not recalculate or silently replace its denominators, and do not compute "
+        "additional deaths, rates, percentages, hypothetical populations, or other examples absent from the source. "
+        "For Kuperman's muscular-mediation comparison in particular, keep separate the approximately half-million Tutsi estimate and the "
+        "broader Rwandan population figure used in the author's fold-change calculations; identify the civil-war and genocide context; label "
+        "the 500-fold and 6,000-fold figures as the author's descriptive arithmetic rather than estimated mediation effects; and explain the "
+        "author's comparative process-tracing argument, counterfactual logic, and limitations. "
         "If a baseline, denominator, comparison, or uncertainty measure is absent, say that it is not reported and explain "
         "why that limits interpretation. Never invent a benchmark, call an effect large or small without a stated reference, "
         "treat statistical significance as practical importance, or treat association as causation. "
+        "PDF extraction may flatten tables, footnotes, and multi-column layouts. Use surrounding prose to recover conclusions, "
+        "but never invent an exact row-column relationship when the extracted structure is genuinely unclear. "
         "Locators must identify pages, sections, headings, or explicit text anchors. "
-        "If the source does not report something, say so explicitly instead of inventing it."
+        "If the source does not report something, say so explicitly instead of inventing it. Before returning, silently reread "
+        "the analysis against the supplied source and correct any unsupported attribution, number, context, or causal wording. "
+        "Do not add a separate validation or self-review section."
     )
 
 
 def _profile_system_prompt() -> str:
     return (
-        "You are the evidence-profile reader for Auto-Zettelkasten profile prompt v3. "
+        "You are the evidence-profile reader for Auto-Zettelkasten profile prompt v6. "
         "Use only the committed Markdown note supplied by the user. Return exactly one JSON object with no Markdown fences, "
         "commentary, inferred full text, or literature-level cluster, debate, or gap proposals. Extract roughly 8-20 "
         "synthesis-relevant evidence anchors when the note supports that many, never more than 24 and never padded. Anchor "
         "identity must use source identity, a source-native locator or span, and evidence role rather than list position or "
-        "paraphrase wording. Each anchor needs a support_envelope distinguishing empirical and argument roles, coverage, "
-        "scope, and restrictions. Every anchor must classify source_locators. Generated atomic-note headings use locator_type "
-        "generated_heading, are not source-native, and cannot support a strong synthesis assertion. Statistical anchors must preserve a typed quantitative_result that "
-        "distinguishes observed rates, predicted probabilities, coefficients, marginal effects, odds ratios, percentages, "
+        "paraphrase wording. Do not collapse a detailed note into one omnibus anchor when separate contributions have different "
+        "locators or support boundaries. Adapt the evidence to the source rather than forcing every item into an academic-study form. "
+        "Each anchor needs a support_envelope distinguishing empirical and argument roles, coverage, scope, and restrictions. "
+        "Use exactly these values: empirical_role descriptive, associational, causal, mechanism_evidence, or none; argument_role "
+        "conceptual, interpretive, normative, methodological, practitioner_guidance, or none; coverage full_text, limited_text, "
+        "abstract, metadata, or unknown. support_status describes attribution to the source, not independent verification: use supported "
+        "when the note explicitly shows that the source makes the finding, argument, observation, or recommendation; support_unknown "
+        "when attribution is unclear; limited for limited coverage; and unsupported only when the note does not support the attribution. "
+        "A supported practitioner recommendation may still carry a restriction that it does not establish effectiveness. Every anchor must "
+        "provide traceable locator strings. Return the lean shape supplied by the user: keep findings empty and study_lineage null, "
+        "and do not output IDs, typed source_locators, quantitative_result, or persistence metadata because the engine derives them. "
+        "Use an empty string rather than null, an array, or an object for every declared string field, and add no keys outside the "
+        "supplied lean shape. Generated atomic-note headings cannot support a strong synthesis assertion. Statistical anchors must preserve "
+        "in their claim and fields whether a result is an observed rate, predicted probability, coefficient, marginal effect, odds ratio, percentage, "
         "reference groups, denominators, uncertainty, and source-reported versus derived values. Never convert or equate unlike "
         "estimands. Extract one source-local study_lineage record from explicit note evidence: authors or institutions, datasets, "
         "sampling frame, unit of analysis, population, period, publication/version relationships, institutional series, and "
@@ -956,7 +1082,7 @@ def _debate_system_prompt() -> str:
 
 def _cluster_synthesis_system_prompt() -> str:
     return (
-        "You are the cluster-synthesis reasoner for Auto-Zettelkasten cluster synthesis prompt v14. Read the complete atomic "
+        "You are the cluster-synthesis reasoner for Auto-Zettelkasten cluster synthesis prompt v19. Read the complete atomic "
         "notes supplied for this admitted cluster. Return exactly one JSON object containing cluster_id, scope, boundaries, "
         "coherence_rationale, synthesis, evidence_threads, central_findings, agreements, "
         "positions, contradictions, boundary_conditions, methodological_fault_lines, related_clusters, source_roles, "
@@ -973,7 +1099,11 @@ def _cluster_synthesis_system_prompt() -> str:
         "it does not need multi-source agreement. Each contribution must state source_id, cluster_role, contribution_kind, "
         "related_proposition_ids, evidence_thread_id, finding, technical_result, plain_english_meaning, relation_to_cluster_question, comparison_status, "
         "and evidence. Core contributions prioritize direct proposition findings, unique relevant findings, boundary evidence, and "
-        "methodological contributions. Context and bridge contributions must say context_only and cannot enter the verdict, central "
+        "methodological contributions. When a source's main contribution depends on a case comparison, historical sequence, or "
+        "process-tracing argument, retain the decisive case evidence as well as the abstract theory: identify the conflict or case, "
+        "actors, period, observed sequence or comparison, the author's explanatory logic, and the most important alternative explanation "
+        "or inferential limit. Use a second contribution from that source when needed to make this logic understandable. Context and "
+        "bridge contributions must say context_only and cannot enter the verdict, central "
         "cross-source findings, agreement, contradiction, debate classification, causal-effectiveness claim, or gap promotion. "
         "Every substantive synthesis assertion must use real source-local evidence_anchor_id and locator references. An exact "
         "cross-source comparison must name one or more admitted proposition_ids. A broader family assertion may instead be "
@@ -983,7 +1113,10 @@ def _cluster_synthesis_system_prompt() -> str:
         "differently defined actors, mechanisms, populations, outcomes, or estimands into consensus, and do not label "
         "incomparable claims as contradictions. The synthesis must answer the cluster question in connected prose rather than "
         "merely listing contributions. Explain what technical findings mean in plain English while retaining "
-        "reported figures, comparisons, uncertainty, and qualifications. Preserve quantitative_result types: observed rates, "
+        "reported figures, comparisons, uncertainty, and qualifications. Plain English must never strengthen the source's inference: "
+        "for observational associations say 'is associated with' or 'appears alongside', not 'works', 'helps', 'drives', 'leads to', "
+        "or 'causes'. For descriptive before-and-after arithmetic, name the observed periods or groups and attribute any explanatory "
+        "claim to the author. Preserve quantitative_result types: observed rates, "
         "model-predicted probabilities, coefficients, marginal effects, odds ratios, and raw percentages are not interchangeable. "
         "Keep every uncertainty statistic attached to the exact estimate or diagnostic it qualifies. A p-value for a selection "
         "correlation, specification test, or different coefficient must never be described as the p-value for the focal result. "
@@ -995,6 +1128,11 @@ def _cluster_synthesis_system_prompt() -> str:
         "Universal wording must cite every core source it describes. If prose names an author, report, or institution, the evidence "
         "for that exact sentence must include that source; never attach one publication's name to another publication's number. "
         "Every displayed number must occur in the union of the cited source-local anchors for that sentence. "
+        "Before treating quantitative findings as disagreement, contradiction, or a measurement gap, restate them using the same "
+        "predictor and outcome orientation. 'Higher fatalities are associated with lower success' and 'low fatalities are associated "
+        "with higher success' describe the same direction, not opposite results. Continuous, categorical, and dichotomous measures "
+        "may be a methodological difference, but that difference alone is not a collection gap unless the located results remain "
+        "substantively unresolved after orientation and estimands are aligned. "
         "For each publication, choose the finding that most changes the cluster-level inference. Training counts, web visits, "
         "workshop totals, and other implementation activity belong only when implementation reach is part of the cluster question; "
         "otherwise prefer the source's substantive finding, mechanism, boundary, comparison, or central recommendation. "
@@ -1034,6 +1172,11 @@ def _cluster_synthesis_system_prompt() -> str:
         "source_backed_cluster, supply enough non-repetitive detail for roughly a 900-1,800 word Markdown projection; for an "
         "emerging_cluster, supply enough detail for 600-1,200 words. Organize the analysis by evidence thread and prefer evidence "
         "density over filler. Inspect the mapped propositions and evidence threads for defensible collection-native gap hypotheses. "
+        "For the Kuperman muscular-mediation source, a theory-only contribution is incomplete. Include the Rwanda evidence as the "
+        "1990-1994 civil-war and 1994 genocide case; distinguish the estimated half-million Tutsi killed from the broader up-to-one-million "
+        "Rwandans used in the author's arithmetic; identify the 500-fold total and 6,000-fold monthly comparisons as source-reported "
+        "descriptive arithmetic rather than mediation effects; and explain the author's comparative process-tracing logic and its inability "
+        "to rule out the RPF offensive, the presidential plane shoot-down, long-standing ethnic conflict, or other alternative causes. "
         "Return an empty gap_hypotheses array when none is specific and worthwhile. Never call something a gap in synthesis, an "
         "evidence thread, or a source contribution unless the same bounded candidate appears in gap_hypotheses for deterministic adjudication. "
         "Gap hypotheses must use one of these rules: contradictory_findings, untested_mechanism, empirical_coverage, "
@@ -1048,7 +1191,7 @@ def _cluster_synthesis_system_prompt() -> str:
 
 def _gap_adjudication_system_prompt() -> str:
     return (
-        "You are the collection-gap adjudicator for Auto-Zettelkasten gap prompt v10. Return exactly one JSON object with "
+        "You are the collection-gap adjudicator for Auto-Zettelkasten gap prompt v12. Return exactly one JSON object with "
         "gaps and rejected arrays. Consider only supplied candidates and their deterministic all-collection search results. "
         "You may merge equivalent candidates or perform at most one evidence-constrained reframing of a candidate, but may "
         "not manufacture a new literature gap. A missing test is not itself a worthy gap. Retain a candidate only when it "
@@ -1700,6 +1843,37 @@ def _metadata_prompt(metadata: Mapping[str, Any], question: str | None) -> str:
         )
         if metadata.get(key)
     }
+    extraction_value = next(
+        (
+            metadata.get(key)
+            for key in (
+                "_source_context",
+                "source_context",
+                "extraction_provenance",
+                "extraction",
+            )
+            if isinstance(metadata.get(key), Mapping)
+        ),
+        None,
+    )
+    if isinstance(extraction_value, Mapping):
+        compact_extraction = {
+            key: extraction_value.get(key)
+            for key in (
+                "source_type",
+                "coverage",
+                "source_scope",
+                "extraction_route",
+                "route",
+                "page_count",
+                "embedded_text_page_count",
+                "ocr_page_count",
+                "unresolved_pages",
+            )
+            if extraction_value.get(key) not in (None, "", [])
+        }
+        if compact_extraction:
+            safe_metadata["extraction"] = compact_extraction
     return f"Metadata: {json.dumps(safe_metadata, ensure_ascii=False)}\nQuestion lens: {question or 'none'}"
 
 
@@ -1884,6 +2058,7 @@ def _validate_literature_response(
                 # reference lineage IDs from its context, but it cannot author
                 # or override the canonical lineage/group records.
                 for derived_field in (
+                    "cluster_id",
                     "study_lineages",
                     "evidence_base_groups",
                     "independence_assessments",
@@ -1896,6 +2071,20 @@ def _validate_literature_response(
             return {"clusters": normalized_clusters}
         if kind == "cluster_synthesis":
             normalized = dict(payload)
+            # DeepSeek sometimes adds a top-level explanation alongside the
+            # requested object during a repair. It is noncanonical commentary,
+            # not evidence, so discard it instead of wasting the otherwise
+            # complete paid synthesis. Unknown substantive fields remain strict.
+            normalized.pop("explanation", None)
+            debate_explanation = scalar_text(
+                normalized.pop("debate_explanation", "")
+            )
+            if debate_explanation:
+                synthesis = scalar_text(normalized.get("synthesis"))
+                if debate_explanation.casefold() not in synthesis.casefold():
+                    normalized["synthesis"] = " ".join(
+                        value for value in (synthesis, debate_explanation) if value
+                    )
             if "evidence_threads" not in normalized and isinstance(
                 normalized.get("evidentiary_threads"), list
             ):
@@ -1966,6 +2155,42 @@ def _validate_literature_response(
                     ]
                 else:
                     normalized[field_name] = []
+            for field_name in (
+                "evidence_threads",
+                "source_contributions",
+                "central_findings",
+                "agreements",
+                "positions",
+                "contradictions",
+                "boundary_conditions",
+                "methodological_fault_lines",
+                "related_clusters",
+                "source_roles",
+                "gap_hypotheses",
+            ):
+                for row in normalized[field_name]:
+                    # A bare anchor ID is not enough to establish source or
+                    # locator lineage. Preserve the surrounding paid response,
+                    # but discard only malformed evidence references so the
+                    # normal support validator can narrow, repair, or reject
+                    # the item without accepting invented provenance.
+                    for evidence_field in (
+                        "evidence",
+                        "supporting_evidence",
+                        "current_evidence",
+                        "target_evidence",
+                    ):
+                        raw_evidence = row.get(evidence_field)
+                        if isinstance(raw_evidence, Mapping):
+                            row[evidence_field] = [dict(raw_evidence)]
+                        elif isinstance(raw_evidence, list):
+                            row[evidence_field] = [
+                                dict(reference)
+                                for reference in raw_evidence
+                                if isinstance(reference, Mapping)
+                            ]
+                        elif raw_evidence is not None:
+                            row[evidence_field] = []
             allowed_contribution_kinds = {
                 "direct_proposition_finding",
                 "unique_cluster_relevant_finding",

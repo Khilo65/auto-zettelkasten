@@ -17,7 +17,13 @@ from .api import (
     resume_map,
     run_map,
 )
-from .models import LiteratureMappingPolicy, MapRequest, NavigationPolicy, ProcessingPolicy
+from .models import (
+    ExtractionPolicy,
+    LiteratureMappingPolicy,
+    MapRequest,
+    NavigationPolicy,
+    ProcessingPolicy,
+)
 from .migration import migrate_workspace
 from .workspace import load_config
 
@@ -60,6 +66,13 @@ def build_parser() -> argparse.ArgumentParser:
     map_parser.add_argument("--parallel", type=int, default=None)
     map_parser.add_argument("--limit", type=int, default=None)
     map_parser.add_argument("--run-id", default="")
+    map_parser.add_argument("--ocr", choices=("auto", "off", "required"), default=None)
+    map_parser.add_argument(
+        "--ocr-language",
+        action="append",
+        default=None,
+        help="Tesseract language code; repeat for additional installed languages.",
+    )
     map_parser.add_argument("--direct-read-char-limit", type=int, default=None)
     map_parser.add_argument("--chunk-char-limit", type=int, default=None)
     map_parser.add_argument("--max-total-chunks", type=int, default=None)
@@ -131,6 +144,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             provider = args.provider or configured_provider
             configured_model = str(config.get("model") or "") if provider == configured_provider else ""
             model = args.model or configured_model or DEFAULT_MODELS.get(provider, "")
+            extraction_config = (
+                config.get("extraction", {})
+                if isinstance(config.get("extraction", {}), dict)
+                else {}
+            )
             request = MapRequest(
                 workspace=args.workspace,
                 scope=args.scope or str(config.get("scope") or "library"),
@@ -141,6 +159,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 allow_cloud=args.allow_cloud is True,
                 parallel=args.parallel if args.parallel is not None else int(config.get("parallel", 4)),
                 limit=args.limit if args.limit is not None else 0,
+                extraction_version=str(extraction_config.get("version") or "2"),
+                prompt_version=str(config.get("prompt_version") or "8"),
+                extraction_policy=_extraction_policy(args, config),
                 processing=_processing_policy(args, config),
                 literature_policy=_literature_policy(args, config),
                 navigation_policy=_navigation_policy(args, config),
@@ -256,6 +277,21 @@ def _processing_policy(args: argparse.Namespace, config: dict[str, Any]) -> Proc
     payload = {field: getattr(defaults, field) for field in defaults.__dataclass_fields__}
     payload.update({key: value for key, value in values.items() if value is not None})
     return ProcessingPolicy.from_dict(payload)
+
+
+def _extraction_policy(
+    args: argparse.Namespace, config: dict[str, Any]
+) -> ExtractionPolicy:
+    configured = (
+        config.get("extraction", {})
+        if isinstance(config.get("extraction", {}), dict)
+        else {}
+    )
+    defaults = ExtractionPolicy.from_dict(configured)
+    return ExtractionPolicy(
+        ocr=args.ocr if args.ocr is not None else defaults.ocr,
+        languages=tuple(args.ocr_language or defaults.languages),
+    )
 
 
 def _add_literature_policy_arguments(parser: argparse.ArgumentParser) -> None:

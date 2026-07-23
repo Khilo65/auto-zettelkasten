@@ -208,6 +208,7 @@ def test_builtin_cluster_proposal_ignores_model_authored_independence_fields() -
         {
             "clusters": [
                 {
+                    "cluster_id": "model-authored-cluster-id",
                     "proposal_id": "proposal-1",
                     "label": "Comparable mediation findings",
                     "semantic_identity": "mediation-findings",
@@ -233,6 +234,7 @@ def test_builtin_cluster_proposal_ignores_model_authored_independence_fields() -
     )
 
     proposal = normalized["clusters"][0]
+    assert proposal.get("cluster_id", "") == ""
     assert proposal["study_lineages"] == []
     assert proposal["evidence_base_groups"] == []
     assert proposal["independence_assessments"] == []
@@ -292,6 +294,10 @@ def test_builtin_cluster_synthesis_normalizes_provider_contribution_labels() -> 
     normalized = _validate_literature_response(
         {
             "cluster_id": "cluster-1",
+            "synthesis": "The sources address one bounded research problem.",
+            "debate_explanation": (
+                "They examine different propositions, so no strict debate is established."
+            ),
             "source_contributions": [
                 {
                     "contribution_id": "contribution-1",
@@ -319,6 +325,7 @@ def test_builtin_cluster_synthesis_normalizes_provider_contribution_labels() -> 
     )
 
     contribution = normalized["source_contributions"][0]
+    assert "no strict debate is established" in normalized["synthesis"]
     assert contribution["contribution_kind"] == "unique_cluster_relevant_finding"
     assert contribution["comparison_status"] == "single_source"
 
@@ -367,6 +374,30 @@ def test_builtin_cluster_synthesis_normalizes_optional_contribution_shapes() -> 
     ]
 
 
+def test_builtin_cluster_synthesis_drops_bare_anchor_ids_without_losing_response() -> None:
+    normalized = _validate_literature_response(
+        {
+            "cluster_id": "cluster-1",
+            "evidence_threads": [
+                {
+                    "thread_id": "thread-1",
+                    "title": "Implementation guidance",
+                    "question": "What do the documents recommend?",
+                    "summary": "The documents offer implementation guidance.",
+                    "plain_english_meaning": "They explain what practitioners should do.",
+                    "relationship": "Complementary guidance.",
+                    "source_ids": ["source-a"],
+                    "proposition_ids": [],
+                    "evidence": ["anchor-a"],
+                }
+            ],
+        },
+        kind="cluster_synthesis",
+    )
+
+    assert normalized["evidence_threads"][0]["evidence"] == []
+
+
 def test_builtin_cluster_synthesis_accepts_known_evidentiary_threads_alias() -> None:
     normalized = _validate_literature_response(
         {
@@ -392,6 +423,25 @@ def test_builtin_cluster_synthesis_accepts_known_evidentiary_threads_alias() -> 
 
     assert len(normalized["evidence_threads"]) == 1
     assert normalized["evidence_threads"][0]["thread_id"] == "thread-1"
+
+
+def test_builtin_cluster_synthesis_discards_noncanonical_repair_explanation() -> None:
+    normalized = _validate_literature_response(
+        {
+            "cluster_id": "cluster-1",
+            "explanation": "I corrected the fields requested by the validator.",
+        },
+        kind="cluster_synthesis",
+    )
+
+    assert normalized["cluster_id"] == "cluster-1"
+    assert "explanation" not in normalized
+
+    with pytest.raises(ProviderError, match="unknown cluster synthesis fields"):
+        _validate_literature_response(
+            {"cluster_id": "cluster-1", "invented_substantive_field": "value"},
+            kind="cluster_synthesis",
+        )
 
 
 class _SourceOnlyDeepSeek:
@@ -425,7 +475,7 @@ class _ExplicitReasoner:
         context: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
         self.profile_calls += 1
-        assert context and context["profile_prompt_version"] == "3"
+        assert context and context["profile_prompt_version"] == "6"
         return _profile_response(str(note["committed_note"]), "explicit-profile")
 
     def propose_clusters(
@@ -494,7 +544,7 @@ class _ContractInvalidReasoner(_ExplicitReasoner):
         response = _profile_response(
             str(note["committed_note"]), "contract-invalid-profile"
         )
-        response["concepts"] = "not-a-list"
+        response["unexpected_profile_field"] = "not allowed"
         return response
 
 
@@ -790,7 +840,7 @@ def test_one_profile_failure_does_not_discard_other_results_and_resume_retries_o
     assert not list(failure_dir.glob("*.yml"))
 
 
-def test_contract_invalid_profile_uses_conservative_checkpointed_fallback(
+def test_contract_invalid_profile_fallback_is_retried_when_reasoner_is_available(
     tmp_path: Path,
     sample_items,
 ) -> None:
@@ -818,7 +868,7 @@ def test_contract_invalid_profile_uses_conservative_checkpointed_fallback(
     )
     assert profile.context["lazy_reprofile_required"] is True
 
-    replay_reasoner = _ContractInvalidReasoner()
+    replay_reasoner = _RecoveringReasoner()
     replay = build_map(
         tmp_path,
         run_id="profile-contract-fallback-replay",
@@ -829,7 +879,10 @@ def test_contract_invalid_profile_uses_conservative_checkpointed_fallback(
     )
 
     assert replay.status == "built"
-    assert replay_reasoner.profile_calls == 0
+    assert replay_reasoner.profile_calls == 1
+    recovered = _only_profile(tmp_path)
+    assert recovered.excluded_from_synthesis is False
+    assert recovered.context.get("lazy_reprofile_required") is not True
 
 
 def test_resume_keeps_frozen_source_set_identity_when_an_exhausted_source_recovers(
@@ -922,7 +975,7 @@ def test_current_mechanical_profile_reuses_unchanged_inspected_source_content(
     )
     profile.validity.update(
         {
-            "profile_prompt_version": "3",
+            "profile_prompt_version": "6",
             "classifier_version": "3",
             "algorithm_version": "4",
             "legacy_profile_upgraded_mechanically": True,
@@ -1150,11 +1203,11 @@ def test_builtin_profile_prompt_v3_requires_typed_lineage_locators_and_quantitat
     assert (
         reader.profile_source(
             {"profile_prompt": "committed note only"},
-            context={"profile_prompt_version": "3"},
+            context={"profile_prompt_version": "6"},
         )
         == {}
     )
-    assert "profile prompt v3" in captured["system"]
+    assert "profile prompt v6" in captured["system"]
     assert "source_locators" in captured["system"]
     assert "quantitative_result" in captured["system"]
     assert "study_lineage" in captured["system"]
@@ -1399,7 +1452,7 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
     assert output_caps["collection-clustering"] == 32_000
     assert reader.map_debates([], request) == {"assessments": []}
     synthesis = reader.synthesize_cluster([], request)
-    assert output_caps["cluster-synthesis"] == 16_000
+    assert output_caps["cluster-synthesis"] == 32_000
     assert synthesis["cluster_id"] == "cluster-1"
     assert synthesis["boundaries"] == [
         "Temporal: 2000-2020",
@@ -1418,7 +1471,7 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
     ]
     assert synthesis["agreements"] == []
     assert synthesis["source_contributions"][0]["comparison_status"] == "single_source"
-    assert "cluster synthesis prompt v14" in system_prompts["cluster-synthesis"]
+    assert "cluster synthesis prompt v19" in system_prompts["cluster-synthesis"]
     assert "whether mediation happens" in system_prompts["cluster-synthesis"]
     assert "selection correlation" in system_prompts["cluster-synthesis"]
     assert "below 7,500 output tokens" in system_prompts["cluster-synthesis"]
@@ -1428,6 +1481,8 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
     )
     assert "context_only" in system_prompts["cluster-synthesis"]
     assert "model-predicted probabilities" in system_prompts["cluster-synthesis"]
+    assert "FINAL SYNTHESIS REQUIREMENTS" in prompts["cluster-synthesis"]
+    assert "never say a strategy works better" in prompts["cluster-synthesis"]
     reader.synthesize_cluster(
         [],
         request,
@@ -1507,6 +1562,12 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
         not in prompts["collection-gap"]
     )
     assert output_caps["collection-gap"] == 32_000
+    assert "FINAL GAP REQUIREMENTS" in prompts["collection-gap"]
+    assert "Do not invent follow-up years" in prompts["collection-gap"]
+    assert (
+        "generic observation that an observational association lacks causal identification"
+        in prompts["collection-gap"]
+    )
     assert calls == [
         "collection-clustering",
         "collection-clustering",

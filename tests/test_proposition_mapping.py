@@ -1983,6 +1983,272 @@ def test_thin_cluster_assertion_is_completed_from_reasoner_source_contributions(
     )
 
 
+def test_source_specific_contribution_may_show_qualified_descriptive_anchor() -> None:
+    profiles = normalize_evidence_profiles([_profile("a"), _profile("b")])
+    cluster = map_overlapping_clusters(profiles)["clusters"][0]
+    anchor = profiles[0]["claims"][0]
+    anchor["support_status"] = "limited"
+    anchor["support_envelope"]["support_status"] = "limited"
+    anchor["support_envelope"]["restrictions"] = [
+        "The before-and-after comparison cannot establish causation."
+    ]
+
+    validated = validate_cluster_synthesis(
+        {
+            "cluster_id": cluster["cluster_id"],
+            "source_contributions": [
+                {
+                    "source_id": "a",
+                    "finding": "The source reports that deaths rose after the intervention.",
+                    "plain_english_meaning": "The intervention caused more deaths.",
+                    "evidence": [
+                        {
+                            "source_id": "a",
+                            "claim_id": anchor["claim_id"],
+                            "locator": anchor["locator"],
+                        }
+                    ],
+                }
+            ],
+        },
+        cluster,
+        profiles,
+    )
+
+    contribution = next(
+        row
+        for row in validated["source_contributions"]
+        if row["source_id"] == "a"
+    )
+    assert contribution["evidence"][0]["support_status"] == "limited"
+    assert "does not by itself establish causation" in contribution[
+        "plain_english_meaning"
+    ].casefold()
+
+
+def test_cluster_markdown_keeps_distinct_core_contributions_from_one_source() -> None:
+    cluster = {
+        "cluster_id": "cluster-a",
+        "display_label": "Mediation Conditions",
+        "display_question": "When does mediation succeed?",
+        "source_ids": ["source-a"],
+        "source_roles": [{"source_id": "source-a", "role": "core"}],
+        "representative_sources": [
+            {
+                "source_id": "source-a",
+                "title": "Source A",
+                "note_path": "02_source_memory/notes/Source A.md",
+            }
+        ],
+    }
+    synthesis = {
+        "synthesis": "The source contributes a theory and a distinct case comparison.",
+        "source_contributions": [
+            {
+                "contribution_id": "contribution-theory",
+                "source_id": "source-a",
+                "cluster_role": "core",
+                "contribution_kind": "conceptual_context",
+                "finding": "The source specifies three conditions for mediation backfire.",
+                "plain_english_meaning": "It explains when coercive mediation may go wrong.",
+                "evidence": [
+                    {"source_id": "source-a", "claim_id": "anchor-a", "locator": "p. 2"}
+                ],
+            },
+            {
+                "contribution_id": "contribution-case",
+                "source_id": "source-a",
+                "cluster_role": "core",
+                "contribution_kind": "unique_cluster_relevant_finding",
+                "finding": "The Rwanda case supplies a separate descriptive comparison.",
+                "plain_english_meaning": "The case shows the sequence the author uses to argue for backfire.",
+                "evidence": [
+                    {
+                        "source_id": "source-a",
+                        "claim_id": "anchor-b",
+                        "locator": "p. 9",
+                        "restrictions": [
+                            "Cannot rule out that the outcome would have occurred regardless."
+                        ],
+                    }
+                ],
+            },
+        ],
+    }
+    profiles = {
+        "source-a": {
+            "source_id": "source-a",
+            "title": "Source A",
+            "note_path": "02_source_memory/notes/Source A.md",
+        }
+    }
+
+    markdown = _cluster_markdown(
+        cluster,
+        None,
+        None,
+        synthesis=synthesis,
+        profile_by_source=profiles,
+    )
+
+    assert "three conditions for mediation backfire" in markdown
+    assert "Rwanda case supplies a separate descriptive comparison" in markdown
+    assert "Inferential limit: Cannot rule out" in markdown
+
+
+def test_causal_sniff_does_not_treat_probability_or_success_wording_as_safe() -> None:
+    assert literature._has_unqualified_causal_language(
+        "Using a directive strategy increases the probability of success."
+    )
+    assert literature._has_unqualified_causal_language(
+        "Directive mediators are more successful than facilitators."
+    )
+    assert literature._has_unqualified_causal_language(
+        "Each additional unit of experience raises the probability of success."
+    )
+    assert literature._has_unqualified_causal_language(
+        "Directive mediators are more than twice as successful as facilitators."
+    )
+    assert literature._has_unqualified_causal_language(
+        "The observed association increases the probability of success."
+    )
+    assert literature._has_unqualified_causal_language(
+        "The coerced agreement threatened control, leading to mass violence."
+    )
+    assert not literature._has_unqualified_causal_language(
+        "Directive strategy is associated with a higher probability of success."
+    )
+
+
+def test_noncausal_narrowing_rewrites_active_probability_language() -> None:
+    directive = literature._narrow_noncausal_organizational_language(
+        (
+            "Using a directive mediation strategy increases the probability of success "
+            "by about 10 percentage points compared to non-directive strategies."
+        ),
+        boundary="Based on observational data; cannot establish causality",
+    )
+    experience = literature._narrow_noncausal_organizational_language(
+        (
+            "The cited sources report that each additional unit of mediator experience "
+            "raises success probability by about 2 percentage points. This evidence does "
+            "not by itself establish causation."
+        ),
+        boundary="The measure is observational",
+    )
+    comparison = literature._narrow_noncausal_organizational_language(
+        (
+            "Mediators who use leverage and propose solutions are more than twice as "
+            "successful as those who merely facilitate communication."
+        ),
+        boundary="Strategy choice may depend on dispute difficulty",
+    )
+
+    assert "had a probability of success about 10 percentage points higher" in directive
+    assert "increases" not in directive
+    assert "was associated with an observed success probability" in experience
+    assert "raises" not in experience
+    assert "observed success rate" in comparison
+    assert "twice the rate" in comparison
+    assert literature._has_unqualified_causal_language(directive) is False
+    assert literature._has_unqualified_causal_language(experience) is False
+    assert literature._has_unqualified_causal_language(comparison) is False
+
+
+def test_theoretical_causal_language_is_preserved_as_an_attributed_argument() -> None:
+    attributed = literature._attribute_source_argument(
+        "Muscular mediation can forge peace without a mutually hurting stalemate."
+    )
+
+    assert attributed.startswith("The source argues that Muscular mediation")
+    assert literature._has_unqualified_causal_language(attributed) is False
+    assert (
+        literature._attribute_source_argument(
+            "In Rwanda, coercion led to escalation."
+        )
+        == "The source argues that in Rwanda, coercion led to escalation."
+    )
+
+
+def test_counterfactual_restriction_blocks_causal_support() -> None:
+    anchor = {
+        "support_envelope": {
+            "empirical_role": "causal",
+            "argument_role": "interpretive",
+            "restrictions": [
+                "Cannot rule out that genocide would have occurred regardless of muscular mediation."
+            ],
+        }
+    }
+
+    assert literature._anchor_supports_causal_claim(anchor) is False
+    assert literature._anchor_is_source_argument(anchor) is True
+
+
+def test_case_period_context_uses_matching_profile_metadata() -> None:
+    enriched = literature._add_case_period_context(
+        "In Rwanda, the article traces coercion and genocide.",
+        {
+            "dimensions": {
+                "period": [
+                    "1992-1995 (Bosnia)",
+                    "1990-1994 (Rwanda)",
+                    "1998-1999 (Kosovo)",
+                ]
+            }
+        },
+    )
+
+    assert enriched == (
+        "In the source's 1990–1994 Rwanda case, the article traces coercion and genocide."
+    )
+
+
+def test_kuperman_cluster_requires_context_arithmetic_and_inferential_limits() -> None:
+    cluster = {
+        "cluster_id": "cluster-coercion-condition-mediation-ripeness-success-d355e0980e",
+        "representative_sources": [
+            {"title": "Muscular Mediation and Ripeness Theory"}
+        ],
+    }
+    common = {
+        "synthesis": " ".join(
+            [
+                "This is a substantive cluster verdict that explains the theory, cases, evidence, and limits in detail."
+            ]
+            * 7
+        ),
+        "central_findings": [{"finding": "The source presents a conditional theory."}],
+        "evidence_threads": [],
+        "supporting_evidence": [],
+        "source_contributions": [],
+        "debate_state": "no_debate",
+        "boundaries": ["The evidence has important limits."],
+    }
+
+    incomplete = literature._cluster_synthesis_quality_errors(common, cluster)
+    complete = literature._cluster_synthesis_quality_errors(
+        {
+            **common,
+            "evidence_threads": [
+                {
+                    "summary": (
+                        "The 1990-1994 Rwanda civil war culminated in the 1994 genocide. "
+                        "The source distinguishes an estimated half-million Tutsi killed from up to one million "
+                        "Rwandans killed overall. Its 500-fold total and 6,000-fold monthly comparisons are "
+                        "descriptive arithmetic, not causal effects. The process-tracing argument cannot rule "
+                        "out alternative causes or the counterfactual that genocide occurred regardless."
+                    )
+                }
+            ],
+        },
+        cluster,
+    )
+
+    assert any(error.startswith("kuperman_requires_") for error in incomplete)
+    assert not any(error.startswith("kuperman_requires_") for error in complete)
+
+
 def test_evidence_thread_uses_substantive_summary_not_machine_relationship() -> None:
     row = {
         "relationship": "complementary",
@@ -2099,14 +2365,14 @@ def test_source_specific_thematic_threads_survive_without_proposition_lineage() 
         "a",
         "b",
     }
-    causal_contributions = [
-        row for row in validated["source_contributions"] if "improves" in row["finding"]
+    source_a_contributions = [
+        row for row in validated["source_contributions"] if row["source_id"] == "a"
     ]
-    assert causal_contributions
+    assert source_a_contributions
     assert all(
-        row["finding"].startswith("The cited sources report that")
-        and "does not by itself establish causation" in row["finding"]
-        for row in causal_contributions
+        "improves" not in row["finding"]
+        and literature._has_unqualified_causal_language(row["finding"]) is False
+        for row in source_a_contributions
     )
 
 
@@ -2137,12 +2403,9 @@ def test_practitioner_plain_english_cannot_claim_more_lasting_peace() -> None:
 
     contribution = literature._fallback_source_contributions(cluster, profiles)[0]
 
-    assert contribution["plain_english_meaning"].startswith(
-        "The cited sources report that"
+    assert contribution["plain_english_meaning"] == (
+        "The guidance presents broader inclusion as relevant to peace durability."
     )
-    assert "does not by itself establish causation" in contribution[
-        "plain_english_meaning"
-    ]
 
 
 def test_percentage_point_result_is_not_rendered_as_relative_percent() -> None:
@@ -2261,6 +2524,58 @@ def test_associational_verdict_language_is_not_erased_as_causal() -> None:
     )
 
 
+def test_root_cause_topic_phrase_is_not_misread_as_a_causal_effect_claim() -> None:
+    assert (
+        literature._has_unqualified_causal_language(
+            "The report maps root causes of recurring local conflict."
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    "statement",
+    (
+        "The studies do not provide independent confirmation.",
+        "This is within-program consistency rather than fully independent replication.",
+        "The finding lacks independent support.",
+    ),
+)
+def test_stated_independence_limits_are_not_affirmative_independence_claims(
+    statement: str,
+) -> None:
+    assert literature._asserts_verified_independence(statement) is False
+
+
+def test_affirmative_independence_claim_is_detected() -> None:
+    assert (
+        literature._asserts_verified_independence(
+            "Two independent datasets support the relationship."
+        )
+        is True
+    )
+
+
+def test_publication_year_is_not_treated_as_a_numerical_finding() -> None:
+    assert literature._numeric_tokens("Bercovitch (1991) reports a pattern.") == set()
+    assert literature._numeric_tokens("The success rate was 42% in 1991.") == {"42%"}
+
+
+@pytest.mark.parametrize(
+    ("relationship", "expected"),
+    (
+        ("Complementary alignment across methods", "complementary"),
+        ("Within-program consistency, not independent replication", "complementary"),
+        ("Methodological difference: case selection", "methodological"),
+    ),
+)
+def test_plain_english_thread_relationships_normalize_to_supported_types(
+    relationship: str,
+    expected: str,
+) -> None:
+    assert literature._thread_relationship_type({"relationship": relationship}) == expected
+
+
 @pytest.mark.parametrize(
     "statement",
     (
@@ -2274,8 +2589,9 @@ def test_causal_qualification_is_scoped_to_the_clause_it_governs(
 ) -> None:
     assert literature._has_unqualified_causal_language(statement) is True
     narrowed = literature._narrow_noncausal_organizational_language(statement)
-    assert narrowed.startswith("The cited sources report that")
-    assert "does not by itself establish causation" in narrowed
+    assert narrowed.startswith("The source describes the relationship this way:")
+    assert statement.rstrip(".") in narrowed
+    assert "does not establish that the first factor caused the outcome" in narrowed
     assert literature._has_unqualified_causal_language(narrowed) is False
 
 
@@ -2290,6 +2606,33 @@ def test_attributed_findings_and_statistical_effect_terms_are_not_causal_overcla
     )
 
     assert literature._has_unqualified_causal_language(verdict) is False
+
+
+def test_human_locator_projection_extracts_value_from_serialized_locator() -> None:
+    locator = {
+        "evidence_anchor_id": "anchor-hidden",
+        "locator_id": "locator-hidden",
+        "locator_type": "page_range",
+        "page_start": 110,
+        "page_end": 123,
+        "source_id": "source-hidden",
+        "source_native": True,
+        "supports_strong_assertion": True,
+        "value": "pp.110-123",
+    }
+
+    assert literature._human_locator_text(locator) == "pp.110-123"
+    assert literature._human_locator_text(str(locator)) == "pp.110-123"
+
+
+def test_practitioner_guidance_preserves_the_practice_judgment() -> None:
+    text = "Delaying mediation until a costly stalemate may lead to intractability."
+
+    rendered = literature._attribute_practitioner_guidance(text)
+
+    assert rendered.startswith("The guidance presents this as a practice judgment:")
+    assert "costly stalemate" in rendered
+    assert "intractability" in rendered
 
 
 def test_cluster_quality_reports_uncovered_propositions_and_core_sources() -> None:
@@ -3170,6 +3513,87 @@ def test_strict_consensus_and_contradiction_failures_are_explained_in_cluster_ma
     assert "What would change that assessment" not in markdown
 
 
+def test_inverse_predictor_wording_does_not_create_false_contradiction() -> None:
+    proposition = {
+        "proposition_id": "proposition-fatalities",
+        "statement": "Fatality level is associated with mediation success.",
+        "cells": {
+            "higher": {
+                "source_id": "higher",
+                "study_family_id": "family-higher",
+                "evidence_base_group_id": "evidence-base-higher",
+                "counted_as_independent": True,
+                "stance_or_finding": (
+                    "Higher fatalities are associated with lower mediation success."
+                ),
+                "direction_or_interpretation": ["negative"],
+                "evidence_type": ["associational"],
+                "boundary_conditions": [],
+                "evidence": [],
+            },
+            "lower": {
+                "source_id": "lower",
+                "study_family_id": "family-lower",
+                "evidence_base_group_id": "evidence-base-lower",
+                "counted_as_independent": True,
+                "stance_or_finding": (
+                    "Low fatalities are associated with higher mediation success."
+                ),
+                "direction_or_interpretation": ["positive"],
+                "evidence_type": ["associational"],
+                "boundary_conditions": [],
+                "evidence": [],
+            },
+        },
+        "comparability": {
+            "passed": True,
+            "direction_orientation_aligned": False,
+        },
+        "effective_evidence_base_count": 2,
+    }
+
+    state, explanation = _proposition_debate_state(proposition)
+
+    assert state == "mixed_evidence"
+    assert explanation["reason"] == "direction_orientation_unresolved"
+
+
+def test_established_contradiction_markdown_does_not_append_failure_language() -> None:
+    rows = normalize_evidence_profiles([_profile("a"), _profile("b")])
+    cluster = map_overlapping_clusters(rows)["clusters"][0]
+    debate = build_debate_registry(rows, [cluster])["assessments"][0]
+    debate["strict_adjudications"] = [
+        {
+            "kind": "contradiction",
+            "candidate": "The same intervention has opposite effects.",
+            "decision": "established",
+            "checks": [
+                {
+                    "requirement": (
+                        "The comparable sources support genuinely opposing positions."
+                    ),
+                    "passed": True,
+                    "explanation": "The located positions point in opposing directions.",
+                }
+            ],
+            "explanation": (
+                "Comparable evidence bases reach opposing positions on the same proposition."
+            ),
+        }
+    ]
+
+    markdown = _cluster_markdown(
+        cluster,
+        build_evidence_matrices(rows, [cluster])[0],
+        debate,
+        synthesis={},
+        profile_by_source={row["source_id"]: row for row in rows},
+    )
+
+    assert "is established:** Comparable evidence bases reach opposing positions" in markdown
+    assert "No two comparable sources reach" not in markdown
+
+
 def test_conference_opinion_reports_map_as_guidance_not_effectiveness_evidence() -> None:
     rows = []
     for source_id in ("conference-a", "conference-b"):
@@ -3411,7 +3835,9 @@ def test_gap_markdown_renders_resolution_direction_without_invented_design() -> 
         "resolution_path": {
             "path_type": "quantitative",
             "question": "Does mediator legitimacy predict settlement durability elsewhere?",
-            "evidence_needed": "Comparable observations of legitimacy and settlement durability.",
+            "evidence_needed": (
+                "A quasi-experiment exploiting exogenous variation in mediator legitimacy."
+            ),
             "requirements": {
                 "estimand": "Average treatment effect in Colombia",
                 "comparison": "South Africa versus Angola",
@@ -3433,7 +3859,72 @@ def test_gap_markdown_renders_resolution_direction_without_invented_design() -> 
     assert "Security Council" not in markdown
     assert "PA-X" not in markdown
     assert "UCDP/PRIO" not in markdown
+    assert "quasi-experiment" not in markdown.casefold()
+    assert "exogenous variation" not in markdown.casefold()
+    assert "distinguishes the mapped relationship from selection" in markdown
     assert "not a finalized study design" in markdown
+
+
+def test_gap_markdown_hides_design_specific_missing_cell() -> None:
+    gap = {
+        "gap_id": "gap-missing-cell",
+        "title": "Directive mediation and settlement",
+        "gap_statement": "Whether directive mediation is related to settlement success.",
+        "rule": "methodological_concentration",
+        "status": "collection_gap_lead",
+        "promoted": False,
+        "missing_cell": {
+            "description": (
+                "A randomized experiment or large-N panel using instrumental variables."
+            )
+        },
+    }
+
+    markdown = _gap_markdown(gap)
+
+    assert "randomized experiment" not in markdown.casefold()
+    assert "large-n" not in markdown.casefold()
+    assert "instrumental variables" not in markdown.casefold()
+    assert "Whether directive mediation is related to settlement success." in markdown
+
+
+def test_gap_markdown_omits_resolution_path_rejected_by_strict_gate() -> None:
+    gap = {
+        "gap_id": "gap-rejected-path",
+        "title": "Unresolved mechanism",
+        "gap_statement": "Which mechanism links the observed association to settlement?",
+        "rule": "untested_mechanism",
+        "status": "collection_gap_lead",
+        "promoted": False,
+        "strict_adjudication": {
+            "decision": "not_established",
+            "checks": [
+                {
+                    "requirement": "A feasible type-sensitive resolution path could produce discriminating evidence.",
+                    "passed": False,
+                    "explanation": "No sufficiently specific resolution path passed validation.",
+                }
+            ],
+        },
+        "resolution_path": {
+            "path_type": "qualitative",
+            "question": "Which mechanism matters?",
+            "evidence_needed": "Four to six cases and named process observations.",
+            "requirements": {
+                "case_selection": "Four to six cases",
+                "mechanism_evidence": "Interviews",
+                "negative_cases": "Failed cases",
+                "process_observations": "Decision records",
+            },
+            "feasibility": "The model asserted feasibility.",
+            "limitations": [],
+        },
+    }
+
+    markdown = _gap_markdown(gap)
+
+    assert "route to resolving" not in markdown.casefold()
+    assert "four to six" not in markdown.casefold()
 
 
 def test_gap_internal_search_terms_remove_rule_words_and_stopwords() -> None:

@@ -427,6 +427,53 @@ class NavigationPolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class ExtractionPolicy:
+    """Serializable PDF extraction and OCR routing policy."""
+
+    ocr: Literal["auto", "off", "required"] = "auto"
+    languages: tuple[str, ...] = ("eng",)
+
+    def __post_init__(self) -> None:
+        if self.ocr not in {"auto", "off", "required"}:
+            raise ValueError("extraction.ocr must be auto, off, or required")
+        languages = self.languages
+        if isinstance(languages, str):
+            languages = (languages,)
+        elif not isinstance(languages, tuple):
+            languages = tuple(languages)
+        normalized = tuple(
+            dict.fromkeys(str(language).strip() for language in languages if str(language).strip())
+        )
+        if not normalized:
+            raise ValueError("extraction.languages must contain at least one OCR language")
+        if any(not re.fullmatch(r"[A-Za-z0-9_+-]+", language) for language in normalized):
+            raise ValueError("extraction.languages contains an invalid OCR language code")
+        object.__setattr__(self, "languages", normalized)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _jsonable(self)
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any] | None) -> ExtractionPolicy:
+        if payload is not None and not isinstance(payload, Mapping):
+            raise ValueError("extraction must be a mapping")
+        values = dict(payload or {})
+        aliases = {"version", "vision"}
+        unknown = sorted(set(values) - set(cls.__dataclass_fields__) - aliases)
+        if unknown:
+            raise ValueError(f"unknown extraction fields: {', '.join(unknown)}")
+        languages = values.get("languages", ("eng",))
+        if isinstance(languages, str):
+            languages = (languages,)
+        elif not isinstance(languages, (list, tuple)):
+            raise ValueError("extraction.languages must be a string or sequence")
+        return cls(
+            ocr=str(values.get("ocr", "auto")),  # type: ignore[arg-type]
+            languages=tuple(str(value) for value in languages),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ProcessingPolicy:
     """Serializable safety and cost limits for one document-processing invocation."""
 
@@ -507,8 +554,9 @@ class MapRequest:
     allow_cloud: bool = False
     parallel: int = 4
     limit: int = 0
-    extraction_version: str = "1"
-    prompt_version: str = "2"
+    extraction_version: str = "2"
+    prompt_version: str = "8"
+    extraction_policy: ExtractionPolicy = field(default_factory=ExtractionPolicy)
     processing: ProcessingPolicy = field(default_factory=ProcessingPolicy)
     literature_policy: LiteratureMappingPolicy = field(
         default_factory=LiteratureMappingPolicy
@@ -538,6 +586,17 @@ class MapRequest:
             raise ValueError("provider cannot be empty")
         if not self.model.strip():
             raise ValueError("model cannot be empty")
+        if not isinstance(self.extraction_policy, ExtractionPolicy):
+            if isinstance(self.extraction_policy, Mapping):
+                object.__setattr__(
+                    self,
+                    "extraction_policy",
+                    ExtractionPolicy.from_dict(self.extraction_policy),
+                )
+            else:
+                raise ValueError(
+                    "extraction_policy must be an ExtractionPolicy or mapping"
+                )
         if not isinstance(self.processing, ProcessingPolicy):
             if isinstance(self.processing, Mapping):
                 object.__setattr__(
@@ -587,8 +646,13 @@ class MapRequest:
             ),
             parallel=int(payload.get("parallel", 4)),
             limit=int(payload.get("limit", 0)),
-            extraction_version=str(payload.get("extraction_version", "1")),
-            prompt_version=str(payload.get("prompt_version", "2")),
+            extraction_version=str(payload.get("extraction_version", "2")),
+            prompt_version=str(payload.get("prompt_version", "8")),
+            extraction_policy=ExtractionPolicy.from_dict(
+                payload.get("extraction_policy")
+                if isinstance(payload.get("extraction_policy"), Mapping)
+                else None
+            ),
             processing=ProcessingPolicy.from_dict(
                 payload.get("processing")
                 if isinstance(payload.get("processing"), Mapping)

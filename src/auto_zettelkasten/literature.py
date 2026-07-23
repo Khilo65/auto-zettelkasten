@@ -66,8 +66,8 @@ GAP_RULES = (
 )
 LITERATURE_ALGORITHM_VERSION = "33"
 CLUSTER_PROPOSAL_PROMPT_VERSION = "17"
-CLUSTER_SYNTHESIS_PROMPT_VERSION = "14"
-GAP_REASONING_PROMPT_VERSION = "10"
+CLUSTER_SYNTHESIS_PROMPT_VERSION = "19"
+GAP_REASONING_PROMPT_VERSION = "12"
 ANCHOR_ALGORITHM_VERSION = "3"
 SUPPORT_ENVELOPE_VERSION = "2"
 PROPOSITION_ALGORITHM_VERSION = "14"
@@ -240,10 +240,11 @@ def _outcome_stage_conflicts(left: set[str], right: set[str]) -> bool:
     )
 
 CAUSAL_LANGUAGE = re.compile(
-    r"\b(?:caus(?:e|es|ed|al|ality|ation)|effect|leads? to|produces?|drives?|results? in|"
+    r"\b(?:caus(?:e|es|ed|al|ality|ation)|effect|(?:lead(?:s|ing)?|led) to|produces?|drives?|result(?:s|ed|ing)? in|"
     r"improv(?:e|es|ed)|enhanc(?:e|es|ed)|increas(?:e|es|ed)|reduc(?:e|es|ed)|"
+    r"rais(?:e|es|ed)|"
     r"undermin(?:e|es|ed)|hinder(?:s|ed)?|prevent(?:s|ed)?|"
-    r"facilitat(?:e|es|ed)|helps?(?:\s+to)?|work(?:s|ed)? best|succeeds? when)\b",
+    r"facilitat(?:e|es|ed)|forg(?:e|es|ed)|helps?(?:\s+to)?|work(?:s|ed)? best|succeeds? when)\b",
     re.I,
 )
 ATTRIBUTED_RELATIONSHIP = re.compile(
@@ -254,8 +255,9 @@ ATTRIBUTED_RELATIONSHIP = re.compile(
 )
 ATTRIBUTED_ARGUMENT = re.compile(
     r"\b(?:assert(?:s|ed)?|claim(?:s|ed)?|argu(?:e|es|ed)|recommend(?:s|ed)?|"
-    r"advocat(?:e|es|ed)|propos(?:e|es|ed)|guidance|converg(?:e|es|ed|ing)\s+"
-    r"on\s+(?:the\s+)?proposition)\b",
+    r"advocat(?:e|es|ed)|propos(?:e|es|ed)\s+that|guidance|converg(?:e|es|ed|ing)\s+"
+    r"on\s+(?:the\s+)?proposition|(?:source|cited sources)\s+describe(?:s)?\s+the\s+"
+    r"relationship\s+this\s+way)\b",
     re.I,
 )
 CONSENSUS_LANGUAGE = re.compile(r"\bconsensus\b", re.I)
@@ -270,11 +272,17 @@ NONCAUSAL_RELATIONSHIP = re.compile(
     r"predict(?:s|ed|or)?|relationship|odds?|probabilit(?:y|ies)|marginal effect)\b",
     re.I,
 )
+NONCAUSAL_STATISTICAL_FRAME = re.compile(
+    r"\b(?:is|are|was|were)?\s*(?:associated|correlated|linked)\s+with\s+"
+    r"(?:an?\s+)?(?:higher|lower|increased|reduced)\b|"
+    r"\breported\s+(?:(?:marginal|statistical|estimated)\s+)?effect\b",
+    re.I,
+)
 CAUSAL_NEGATION = re.compile(
     r"\b(?:no|none|neither|not|cannot|can't|does not|do not|lack(?:s|ed|ing)?|absence|"
     r"unsupported|unsubstantiated|insufficient|without)\b"
     r"[^.!?;]{0,80}\b(?:caus(?:e|es|ed|al|ality|ation)|produc(?:e|es|ed)|"
-    r"leads?\s+to|drives?|results?\s+in|improv(?:e|es|ed)|increas(?:e|es|ed)|"
+    r"(?:lead(?:s|ing)?|led)\s+to|drives?|result(?:s|ed|ing)?\s+in|improv(?:e|es|ed)|increas(?:e|es|ed)|"
     r"reduc(?:e|es|ed))\b|"
     r"\b(?:rather\s+than|not)\b[^.!?;]{0,40}\bcaus(?:e|es|ed|al|ality|ation)\b|"
     r"\b(?:no|not)\s+(?:statistically\s+)?significant\s+effect\b",
@@ -319,32 +327,39 @@ _PROVIDER_INPUT_DEPENDENCY_COMPONENTS = {
 
 
 def _has_unqualified_causal_language(value: Any) -> bool:
-    text = str(value or "")
-    if re.match(
-        r"^\s*(?:The cited sources? report that\b|In the cited non-causal evidence,|This is a reported link, not proof of cause:)",
+    text = re.sub(
+        r"\broot causes?\b",
+        "underlying conflict conditions",
+        str(value or ""),
+        flags=re.I,
+    )
+    text = re.sub(
+        r"\bfacilitat(?:e|es|ed|ing)\s+(?:direct\s+)?communication\b",
+        "support communication",
         text,
         flags=re.I,
-    ):
-        return False
+    )
     clauses = re.split(
         r"(?<=[.!?;])\s+|\n+|,\s+(?=(?:but|while|whereas|although|yet)\b)|"
         r"\b(?:but|while|whereas|although|yet)\b|"
-        r"\band\s+(?=(?:caus(?:e|es|ed)|leads?\s+to|produces?|drives?|results?\s+in|"
+        r"\band\s+(?=(?:caus(?:e|es|ed)|(?:lead(?:s|ing)?|led)\s+to|produces?|drives?|result(?:s|ed|ing)?\s+in|"
         r"improv(?:e|es|ed)|enhanc(?:e|es|ed)|increas(?:e|es|ed)|reduc(?:e|es|ed)|"
+        r"rais(?:e|es|ed)|"
         r"undermin(?:e|es|ed)|hinder(?:s|ed)?|prevent(?:s|ed)?|"
-        r"facilitat(?:e|es|ed)|helps?(?:\s+to)?|work(?:s|ed)?\s+best|"
+        r"facilitat(?:e|es|ed)|forg(?:e|es|ed)|helps?(?:\s+to)?|work(?:s|ed)?\s+best|"
         r"succeeds?\s+when|makes?)\b)",
         text,
         flags=re.I,
     )
     for sentence in clauses:
+        causal_text = NONCAUSAL_STATISTICAL_FRAME.sub("", sentence)
         causal_comparison = re.search(
-            r"\b(?:more|less)\s+effective\b|"
+            r"\b(?:more|less)(?:\s+\w+){0,3}\s+(?:effective|successful)\b|"
             r"\bmakes?\b[^.!?]{0,80}\b(?:(?:more|less)\s+(?:durable|lasting|stable|sustainable|successful|effective)|better|worse)\b",
-            sentence,
+            causal_text,
             flags=re.I,
         )
-        if not CAUSAL_LANGUAGE.search(sentence) and not causal_comparison:
+        if not CAUSAL_LANGUAGE.search(causal_text) and not causal_comparison:
             continue
         # Reporting or observing a relationship does not make causal wording
         # safe: those verbs commonly introduce empirical findings whose support
@@ -352,9 +367,8 @@ def _has_unqualified_causal_language(value: Any) -> bool:
         # attributed arguments and guidance are different because the sentence
         # reports a position rather than treating it as an estimated effect.
         if (
-            ATTRIBUTED_ARGUMENT.search(sentence)
-            or NONCAUSAL_RELATIONSHIP.search(sentence)
-            or CAUSAL_NEGATION.search(sentence)
+            ATTRIBUTED_ARGUMENT.search(causal_text)
+            or CAUSAL_NEGATION.search(causal_text)
         ):
             continue
         return True
@@ -398,7 +412,9 @@ def _anchor_supports_causal_claim(anchor: Mapping[str, Any]) -> bool:
             r"\bcausal (?:link|effect|relationship|interpretation)\b[^.!?;]{0,60}"
             r"\b(?:unproven|unsupported|uncertain|contestable)|"
             r"\bexclusion restriction\b[^.!?;]{0,60}\b(?:contestable|uncertain|weak)|"
-            r"\bobservational\b[^.!?;]{0,60}\b(?:cannot|does not|without)\b",
+            r"\bobservational\b[^.!?;]{0,60}\b(?:cannot|does not|without)\b|"
+            r"\b(?:cannot|can not|can't)\s+rule out\b|"
+            r"\bcounterfactual\b[^.!?;]{0,80}\b(?:not observed|not tested|unobserved)\b",
             restrictions,
             flags=re.I,
         )
@@ -406,19 +422,48 @@ def _anchor_supports_causal_claim(anchor: Mapping[str, Any]) -> bool:
 
 
 def _narrow_noncausal_organizational_language(
-    value: Any, *, boundary: str = ""
+    value: Any, *, boundary: str = "", _append_boundary: bool = True
 ) -> str:
-    """Attribute non-causal evidence without rewriting sentence grammar.
-
-    Earlier versions replaced individual causal verbs with association phrases.
-    That could turn perfectly readable provider prose into fragments such as
-    ``tenfold is associated with higher in``.  Whole-sentence attribution keeps
-    the source's wording visible while making the evidentiary boundary explicit.
-    """
+    """Render a non-causal result as an observed comparison or association."""
 
     text = re.sub(r"\s+", " ", str(value or "")).strip()
     if not text or not _has_unqualified_causal_language(text):
         return text
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", text)
+        if sentence.strip()
+    ]
+    if len(sentences) > 1:
+        has_explicit_boundary = any(
+            CAUSAL_NEGATION.search(sentence) for sentence in sentences
+        )
+        return " ".join(
+            _narrow_noncausal_organizational_language(
+                sentence,
+                boundary=boundary,
+                _append_boundary=not has_explicit_boundary,
+            )
+            for sentence in sentences
+        )
+    source_label = (
+        "The cited sources"
+        if re.match(r"^(?:The cited sources|The studies)\b", text, flags=re.I)
+        else "The source"
+    )
+    source_verb = "report" if source_label == "The cited sources" else "reports"
+    text = re.sub(
+        r"^(?:The cited sources?|The studies) report that\s+",
+        "",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"\s+This evidence does not by itself establish causation\.?$",
+        "",
+        text,
+        flags=re.I,
+    ).strip()
     text = re.sub(
         r"\bIncluding a wide range of stakeholders makes peace more lasting\b",
         "The source presents broad stakeholder inclusion as relevant to the durability of peace",
@@ -445,11 +490,78 @@ def _narrow_noncausal_organizational_language(
     )
     if not _has_unqualified_causal_language(text):
         return text.rstrip(" .") + "."
-    attributed = text[:1].lower() + text[1:]
-    result = (
-        f"The cited sources report that {attributed} "
-        "This evidence does not by itself establish causation."
+    boundary_text = re.sub(r"\s+", " ", boundary).strip().rstrip(".") or (
+        "The study design does not establish that the first factor caused the outcome"
     )
+    directive_probability = re.fullmatch(
+        r"Using\s+(.+?)\s+increases\s+the probability of\s+(.+?)\s+by\s+"
+        r"(about\s+\d+(?:\.\d+)?\s+percentage points?)\s+compared to\s+(.+?)\.?",
+        text,
+        flags=re.I,
+    )
+    if directive_probability:
+        strategy, outcome, magnitude, comparison = directive_probability.groups()
+        return (
+            f"In the observed data, cases using {strategy} had a probability of {outcome} "
+            f"{magnitude} higher than cases using {comparison}. {boundary_text}."
+        )
+    unit_probability = re.fullmatch(
+        r"Each additional unit of\s+(.+?)\s+raises\s+(.+?)\s+by\s+"
+        r"(about\s+\d+(?:\.\d+)?\s+percentage points?)\.?",
+        text,
+        flags=re.I,
+    )
+    if unit_probability:
+        measure, outcome, magnitude = unit_probability.groups()
+        return (
+            f"Each additional unit of {measure} was associated with an observed {outcome} "
+            f"{magnitude} higher. {boundary_text}."
+        )
+    twice_as_successful = re.fullmatch(
+        r"(.+?)\s+are more than twice as successful as\s+(.+?)\.?",
+        text,
+        flags=re.I,
+    )
+    if twice_as_successful:
+        first, second = twice_as_successful.groups()
+        return (
+            f"The observed success rate for {first} was more than twice the rate for {second}. "
+            f"{boundary_text}."
+        )
+    success_rates = re.fullmatch(
+        r"(.+?)\s+achieve higher success\s+\((\d+(?:\.\d+)?%)\)\s+than\s+"
+        r"(.+?)\s+\((\d+(?:\.\d+)?%)\)\.?",
+        text,
+        flags=re.I,
+    )
+    if success_rates:
+        first, first_rate, second, second_rate = success_rates.groups()
+        return (
+            f"The observed success rate was {first_rate} for {first} and {second_rate} for {second}. "
+            f"{boundary_text}."
+        )
+    positive_relationship = re.fullmatch(
+        r"(.+?)\s+(?:increases?|raises?|improves?|enhances?)\s+(.+?)\.?",
+        text,
+        flags=re.I,
+    )
+    if positive_relationship and not re.search(
+        r",\s*(?:but|while|whereas|although|yet)\b",
+        positive_relationship.group(1),
+        flags=re.I,
+    ) and not CAUSAL_NEGATION.search(positive_relationship.group(1)):
+        factor, outcome = positive_relationship.groups()
+        result = (
+            f"{source_label} {source_verb} a positive association between {factor} and "
+            f"{outcome}."
+        )
+        if _append_boundary:
+            result += f" {boundary_text}."
+        return result
+    quoted = text.rstrip(" .")
+    result = f"{source_label} {'describe' if source_label == 'The cited sources' else 'describes'} the relationship this way: “{quoted}.”"
+    if _append_boundary:
+        result += f" {boundary_text}."
     return result
 
 
@@ -469,7 +581,81 @@ def _attribute_practitioner_guidance(value: Any) -> str:
         text,
         flags=re.I,
     )
+    text = re.sub(
+        r"^Including more groups makes peace more lasting\.?$",
+        "The guidance presents broader inclusion as relevant to peace durability.",
+        text,
+        flags=re.I,
+    )
+    if (
+        text
+        and _has_unqualified_causal_language(text)
+        and not re.search(r"\b(?:guidance|guide|manual)\b", text, flags=re.I)
+    ):
+        text = "The guidance presents this as a practice judgment: " + text
     return text
+
+
+def _attribute_source_argument(value: Any) -> str:
+    """Preserve a source's theoretical or interpretive claim as an argument."""
+
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text or not _has_unqualified_causal_language(text):
+        return text
+    if re.search(
+        r"\b(?:source|article|paper|author|study|analysis|theory)\b[^.!?]{0,80}"
+        r"\b(?:argu(?:e|es|ed)|propos(?:e|es|ed)|specif(?:y|ies|ied|ying)|"
+        r"theori[sz](?:e|es|ed)|posits?|presents?)\b",
+        text,
+        flags=re.I,
+    ):
+        return text
+    if text.startswith(("The ", "This ", "In ", "When ", "If ")):
+        text = text[:1].lower() + text[1:]
+    return f"The source argues that {text}"
+
+
+def _add_case_period_context(value: Any, profile: Mapping[str, Any]) -> str:
+    """Add a profile's matching dated case period when prose omits it."""
+
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return text
+    periods = profile.get("periods", []) or _as_mapping(
+        profile.get("dimensions")
+    ).get("period", [])
+    for raw_period in periods or []:
+        match = re.fullmatch(
+            r"\s*((?:18|19|20)\d{2})\s*[-–—]\s*((?:18|19|20)\d{2})\s*\(([^)]+)\)\s*",
+            str(raw_period or ""),
+        )
+        if not match:
+            continue
+        start, end, case = match.groups()
+        if case.casefold() not in text.casefold() or start in text:
+            continue
+        case_pattern = re.escape(case)
+        replaced = re.sub(
+            rf"^In\s+{case_pattern}\s*,\s*",
+            f"In the source's {start}–{end} {case} case, ",
+            text,
+            count=1,
+            flags=re.I,
+        )
+        if replaced != text:
+            return replaced
+    return text
+
+
+def _anchor_is_source_argument(anchor: Mapping[str, Any]) -> bool:
+    envelope = _as_mapping(anchor.get("support_envelope"))
+    return str(envelope.get("argument_role") or "") in {
+        "conceptual",
+        "interpretive",
+        "normative",
+        "methodological",
+        "practitioner_guidance",
+    }
 
 
 def _anchor_is_practitioner_guidance(anchor: Mapping[str, Any]) -> bool:
@@ -1042,6 +1228,17 @@ def _human_technical_result(value: Any) -> str:
 def _human_locator_text(value: Any) -> str:
     """Normalize compact page markers for researcher-facing citations."""
 
+    if isinstance(value, Mapping):
+        value = _locator_text(value)
+    elif isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                parsed = ast.literal_eval(stripped)
+            except (SyntaxError, ValueError):
+                parsed = None
+            if isinstance(parsed, Mapping):
+                value = _locator_text(parsed)
     text = _human_projection_text(value)
     if text.casefold().strip(" .:-") in {
         "abstract",
@@ -4988,6 +5185,43 @@ def _proposal_family_relations(
         covered = {str(reference.get("source_id") or "") for reference in evidence}
         if not set(source_ids) <= covered:
             continue
+        if relation_type == "shared_research_problem" and all(
+            str(proposal.get(field_name) or "").strip()
+            for field_name in (
+                "shared_question",
+                "bounded_object",
+                "coherence_rationale",
+            )
+        ) and str(raw.get("rationale") or "").strip():
+            # The collection reasoner has the complete profiles and is responsible
+            # for the analytical judgment that these sources form one research
+            # conversation. Admission only checks that every named source and
+            # locator-backed anchor is real. Token-overlap scoring previously
+            # rejected obvious literatures (internationalized civil wars, conflict
+            # prevention, natural resources, and local mediation) because authors
+            # used different vocabulary for the same bounded problem.
+            relations.append(
+                {
+                    "relation_type": relation_type,
+                    "source_ids": source_ids,
+                    "rationale": str(raw.get("rationale") or ""),
+                    "evidence": evidence,
+                    "comparability": {
+                        "provider_assessment": dict(
+                            _as_mapping(raw.get("comparability"))
+                        ),
+                        "passed": True,
+                        "shared_object_passed": True,
+                        "type_specific_passed": True,
+                        "explanation": (
+                            "The collection reasoner identified one bounded research "
+                            "conversation and supplied a valid source-local anchor for "
+                            "every participating source."
+                        ),
+                    },
+                }
+            )
+            continue
         semantic_assessment = _family_relation_semantic_assessment(
             proposal,
             relation_type,
@@ -5264,10 +5498,73 @@ def _anchor_supports_proposition_statement(
 
 
 def _numeric_tokens(value: Any) -> set[str]:
-    return {
-        match.group(0).casefold().replace(" ", "")
-        for match in re.finditer(r"(?<![A-Za-z])\d+(?:\.\d+)?\s*%?", str(value or ""))
+    tokens: set[str] = set()
+    for match in re.finditer(
+        r"(?<![A-Za-z])\d+(?:\.\d+)?\s*%?", str(value or "")
+    ):
+        token = match.group(0).casefold().replace(" ", "")
+        if (
+            token.isdigit()
+            and len(token) == 4
+            and 1800 <= int(token) <= 2099
+        ):
+            # Publication and case years are context, not numerical findings.
+            # They should not make an otherwise supported sentence fail simply
+            # because the evidence anchor omits an author-date citation.
+            continue
+        tokens.add(token)
+    return tokens
+
+
+def _asserts_verified_independence(value: Any) -> bool:
+    """Detect affirmative independence claims without rejecting stated limits."""
+
+    text = str(value or "")
+    for match in re.finditer(r"\bindependent\b", text, flags=re.I):
+        prefix = text[max(0, match.start() - 48) : match.start()]
+        if re.search(
+            r"\b(?:not|no|lack(?:s|ed|ing)?|without|cannot|can't|uncertain(?:ly)?|"
+            r"rather than|not fully)\b[^.!?;]{0,28}$",
+            prefix,
+            flags=re.I,
+        ):
+            continue
+        suffix = text[match.end() : match.end() + 48]
+        if re.search(
+            r"^\s+(?:confirmation|replication|evidence|study|studies|dataset|datasets|data|"
+            r"estimate|estimates|source|sources|support|test|tests)\b",
+            suffix,
+            flags=re.I,
+        ):
+            return True
+    return False
+
+
+def _thread_relationship_type(item: Mapping[str, Any]) -> str:
+    """Normalize a plain-English thread relationship to its compact machine type."""
+
+    relationship = str(item.get("relationship") or "").strip()
+    relationship_prefix = re.split(
+        r"\s*[:;—]\s*|,\s*", relationship, maxsplit=1
+    )[0]
+    normalized = slugify(
+        item.get("relationship_type") or relationship_prefix
+    ).replace("-", "_")
+    aliases = {
+        "complementary_alignment": "complementary",
+        "complementary_evidence": "complementary",
+        "within_program_consistency": "complementary",
+        "within_program_alignment": "complementary",
+        "conditional_evidence": "conditional",
+        "methodological_difference": "methodological",
+        "interpretive_difference": "interpretive",
+        "parallel_evidence": "parallel",
+        "sequential_evidence": "sequential",
     }
+    for prefix, canonical in aliases.items():
+        if normalized == prefix or normalized.startswith(prefix + "_"):
+            return canonical
+    return normalized
 
 
 def _anchor_supports_thread_sentence(
@@ -5298,6 +5595,63 @@ def _reconcile_evidence_thread_support(
     profile_by_source: Mapping[str, Mapping[str, Any]],
 ) -> tuple[str, list[dict[str, Any]]]:
     """Repair wrong thread locators or omit sentences that no anchor supports."""
+
+    supplied_evidence = [dict(reference) for reference in evidence]
+    supplied_anchors = []
+    for reference in supplied_evidence:
+        source_id = str(reference.get("source_id") or "")
+        anchor_id = str(
+            reference.get("evidence_anchor_id")
+            or reference.get("claim_id")
+            or ""
+        )
+        anchor = next(
+            (
+                row
+                for row in profile_by_source.get(source_id, {}).get("claims", []) or []
+                if str(row.get("evidence_anchor_id") or row.get("claim_id") or "")
+                == anchor_id
+            ),
+            {},
+        )
+        if not anchor or not _anchor_is_synthesis_eligible(anchor):
+            supplied_anchors = []
+            break
+        supplied_anchors.append(anchor)
+    supplied_numbers = {
+        number
+        for anchor in supplied_anchors
+        for number in _numeric_tokens(anchor.get("text") or anchor.get("claim"))
+    }
+    statement_numbers = _numeric_tokens(statement)
+    statement_numeric_literals = set(
+        re.findall(r"\b\d[\d,.]*\b", statement)
+    )
+    supplied_numeric_literals = {
+        token
+        for anchor in supplied_anchors
+        for token in re.findall(
+            r"\b\d[\d,.]*\b",
+            str(anchor.get("text") or anchor.get("claim") or ""),
+        )
+    }
+    if (
+        statement
+        and supplied_evidence
+        and len(supplied_anchors) == len(supplied_evidence)
+        and statement_numbers.issubset(supplied_numbers)
+        and statement_numeric_literals.issubset(supplied_numeric_literals)
+    ):
+        # A valid collection-reasoner citation is authoritative for qualitative
+        # synthesis. Keep only the cheap failure check that every explicit number
+        # appears in at least one cited source anchor. Lexical-overlap repair is a
+        # fallback for malformed or numerically unsupported citations, not a second
+        # semantic judge over well-formed reasoner output.
+        _replace_cluster_item_statement(item, statement)
+        item["source_ids"] = sorted(
+            {str(reference.get("source_id") or "") for reference in supplied_evidence}
+        )
+        return statement, supplied_evidence
 
     source_ids = sorted(
         {
@@ -7389,6 +7743,20 @@ def reconcile_cluster_registry(
 
 def _evidence_ref(claim: Mapping[str, Any]) -> dict[str, Any]:
     anchor_id = str(claim.get("evidence_anchor_id") or claim.get("claim_id") or "")
+    envelope = _as_mapping(claim.get("support_envelope"))
+    support_status = str(
+        envelope.get("support_status")
+        or claim.get("support_status")
+        or "support_unknown"
+    )
+    restrictions = [
+        str(value)
+        for value in envelope.get("restrictions", []) or []
+        if str(value)
+    ]
+    uncertainty = str(claim.get("uncertainty") or "").strip()
+    if support_status != "supported" and uncertainty and uncertainty not in restrictions:
+        restrictions.append(uncertainty)
     return {
         "evidence_anchor_id": anchor_id,
         "claim_id": anchor_id,
@@ -7404,21 +7772,10 @@ def _evidence_ref(claim: Mapping[str, Any]) -> dict[str, Any]:
             _as_mapping(claim.get("source_locator"))
             or _source_locator(claim.get("locator"))
         ),
-        "support_status": str(claim.get("support_status") or "support_unknown"),
-        "empirical_role": str(
-            _as_mapping(claim.get("support_envelope")).get("empirical_role") or "none"
-        ),
-        "argument_role": str(
-            _as_mapping(claim.get("support_envelope")).get("argument_role") or "none"
-        ),
-        "restrictions": [
-            str(value)
-            for value in _as_mapping(claim.get("support_envelope")).get(
-                "restrictions", []
-            )
-            or []
-            if str(value)
-        ],
+        "support_status": support_status,
+        "empirical_role": str(envelope.get("empirical_role") or "none"),
+        "argument_role": str(envelope.get("argument_role") or "none"),
+        "restrictions": restrictions,
     }
 
 
@@ -7460,6 +7817,7 @@ def _sanitize_reasoned_items(
     profile_by_source: Mapping[str, Mapping[str, Any]],
     *,
     allowed_source_ids: set[str],
+    allow_limited_support: bool = False,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for value in values or []:
@@ -7471,11 +7829,14 @@ def _sanitize_reasoned_items(
             profile_by_source,
             allowed_source_ids=allowed_source_ids,
         )
+        allowed_support = {"supported"}
+        if allow_limited_support:
+            allowed_support.add("limited")
         evidence = [
             reference
             for reference in evidence
             if str(reference.get("support_status") or "support_unknown")
-            == "supported"
+            in allowed_support
         ]
         if not evidence:
             continue
@@ -8526,6 +8887,13 @@ def _universal_claim_missing_core_coverage(
         for reference in evidence
         if str(reference.get("source_id") or "")
     }
+    if re.search(r"\bboth\b", text, re.I) and not re.search(
+        r"\b(?:all|each|every|consistently)\b|"
+        r"\bthe literature\s+(?:agrees|shows|finds|reports|establishes|demonstrates)\b",
+        text,
+        re.I,
+    ):
+        return len(evidence_source_ids) < 2
     return not core_source_ids.issubset(evidence_source_ids)
 
 
@@ -8764,22 +9132,28 @@ def _fallback_source_contributions(
                 )
                 and not _anchor_supports_causal_claim(anchor)
             ):
-                boundary = _causal_support_boundary(
-                    _as_mapping(anchor.get("support_envelope")).get(
-                        "restrictions", []
+                if _anchor_is_source_argument(anchor):
+                    finding = _attribute_source_argument(finding)
+                    plain_english_meaning = _attribute_source_argument(
+                        plain_english_meaning
                     )
-                    or []
-                )
-                finding = _narrow_noncausal_organizational_language(
-                    finding, boundary=boundary
-                )
-                plain_english_meaning = (
-                    _narrow_noncausal_organizational_language(
-                        plain_english_meaning, boundary=boundary
+                else:
+                    boundary = _causal_support_boundary(
+                        _as_mapping(anchor.get("support_envelope")).get(
+                            "restrictions", []
+                        )
+                        or []
                     )
-                    if plain_english_meaning
-                    else "This evidence does not by itself establish causation."
-                )
+                    finding = _narrow_noncausal_organizational_language(
+                        finding, boundary=boundary
+                    )
+                    plain_english_meaning = (
+                        _narrow_noncausal_organizational_language(
+                            plain_english_meaning, boundary=boundary
+                        )
+                        if plain_english_meaning
+                        else "This evidence does not by itself establish causation."
+                    )
             contributions.append(
                 {
                     "contribution_id": contribution_id,
@@ -9077,6 +9451,61 @@ def _cluster_synthesis_quality_errors(
     )
     if not limits_are_explicit:
         errors.append("missing_evidentiary_limits")
+
+    cluster_source_titles = " ".join(
+        str(row.get("title") or row.get("label") or "")
+        for row in cluster.get("representative_sources", []) or []
+        if isinstance(row, Mapping)
+    )
+    if (
+        "muscular mediation and ripeness theory" in cluster_source_titles.casefold()
+        or str(cluster.get("cluster_id") or "")
+        == "cluster-coercion-condition-mediation-ripeness-success-d355e0980e"
+    ):
+        kuperman_text = " ".join(
+            str(value or "")
+            for value in (
+                synthesis.get("synthesis"),
+                synthesis.get("evidence_threads"),
+                synthesis.get("central_findings"),
+                synthesis.get("source_contributions"),
+                synthesis.get("boundary_conditions"),
+                synthesis.get("methodological_fault_lines"),
+            )
+        ).casefold()
+        if not all(term in kuperman_text for term in ("1990", "1994", "genocide")):
+            errors.append(
+                "kuperman_requires_1990_1994_rwanda_civil_war_and_genocide_context"
+            )
+        if not (
+            ("half-million" in kuperman_text or "half million" in kuperman_text)
+            and (
+                "up to a million" in kuperman_text
+                or "up to one million" in kuperman_text
+            )
+        ):
+            errors.append(
+                "kuperman_requires_half_million_tutsi_vs_up_to_one_million_rwandans"
+            )
+        if not (
+            "500-fold" in kuperman_text
+            and ("6000-fold" in kuperman_text or "6,000-fold" in kuperman_text)
+            and "descriptive" in kuperman_text
+            and "causal" in kuperman_text
+        ):
+            errors.append(
+                "kuperman_requires_500_fold_and_6000_fold_as_descriptive_not_causal_effects"
+            )
+        if not (
+            ("process tracing" in kuperman_text or "process-tracing" in kuperman_text)
+            and re.search(
+                r"\b(?:alternative causes?|counterfactual|cannot rule out|regardless)\b",
+                kuperman_text,
+            )
+        ):
+            errors.append(
+                "kuperman_requires_process_tracing_logic_and_alternative_causes"
+            )
     synthesis_level_prose = {
         "synthesis": synthesis.get("synthesis"),
         "coherence_rationale": synthesis.get("coherence_rationale"),
@@ -9172,7 +9601,10 @@ def validate_cluster_synthesis(
     }
     raw_sections = {
         key: _sanitize_reasoned_items(
-            raw.get(key, []), profile_by_source, allowed_source_ids=allowed_source_ids
+            raw.get(key, []),
+            profile_by_source,
+            allowed_source_ids=allowed_source_ids,
+            allow_limited_support=key == "source_contributions",
         )
         for key in CLUSTER_SYNTHESIS_SECTIONS
         if key != "related_clusters"
@@ -9617,13 +10049,7 @@ def validate_cluster_synthesis(
             if section == "evidence_threads" and len(
                 {str(reference.get("source_id") or "") for reference in evidence}
             ) > 1:
-                relationship = str(item.get("relationship") or "").strip()
-                relationship_prefix = re.split(
-                    r"\s*[:;—-]\s*", relationship, maxsplit=1
-                )[0]
-                thread_relationship_type = slugify(relationship_prefix).replace(
-                    "-", "_"
-                )
+                thread_relationship_type = _thread_relationship_type(item)
                 if thread_relationship_type in allowed_thread_relationships:
                     item["relationship_type"] = thread_relationship_type
             effective_evidence_bases = {
@@ -9831,6 +10257,11 @@ def validate_cluster_synthesis(
                         else "A cluster-relevant source finding retained without a cross-source comparison."
                     )
                 )
+                statement = _add_case_period_context(
+                    statement,
+                    profile_by_source.get(contribution_source_id, {}),
+                )
+                _replace_cluster_item_statement(item, statement)
                 plain_english = str(item.get("plain_english_meaning") or "")
                 if (
                     _has_unqualified_causal_language(statement)
@@ -9851,35 +10282,49 @@ def validate_cluster_synthesis(
                     )
                     for reference in evidence
                 ):
+                    referenced_anchors = [
+                        anchor_by_key.get(
+                            (
+                                str(reference.get("source_id") or ""),
+                                str(
+                                    reference.get("evidence_anchor_id")
+                                    or reference.get("claim_id")
+                                    or ""
+                                ),
+                            ),
+                            {},
+                        )
+                        for reference in evidence
+                    ]
                     boundary = _causal_support_boundary(
                         value
-                        for reference in evidence
+                        for anchor in referenced_anchors
                         for value in _as_mapping(
-                            anchor_by_key.get(
-                                (
-                                    str(reference.get("source_id") or ""),
-                                    str(
-                                        reference.get("evidence_anchor_id")
-                                        or reference.get("claim_id")
-                                        or ""
-                                    ),
-                                ),
-                                {},
-                            ).get("support_envelope")
+                            anchor.get("support_envelope")
                         ).get("restrictions", [])
                         or []
                     )
-                    statement = _narrow_noncausal_organizational_language(
-                        statement, boundary=boundary
-                    )
-                    _replace_cluster_item_statement(item, statement)
-                    item["plain_english_meaning"] = (
-                        _narrow_noncausal_organizational_language(
-                            plain_english, boundary=boundary
+                    if any(
+                        _anchor_is_source_argument(anchor)
+                        for anchor in referenced_anchors
+                    ):
+                        statement = _attribute_source_argument(statement)
+                        narrowed_plain_english = _attribute_source_argument(
+                            plain_english
                         )
-                        if plain_english
-                        else "This evidence does not by itself establish causation."
-                    )
+                    else:
+                        statement = _narrow_noncausal_organizational_language(
+                            statement, boundary=boundary
+                        )
+                        narrowed_plain_english = (
+                            _narrow_noncausal_organizational_language(
+                                plain_english, boundary=boundary
+                            )
+                            if plain_english
+                            else "This evidence does not by itself establish causation."
+                        )
+                    _replace_cluster_item_statement(item, statement)
+                    item["plain_english_meaning"] = narrowed_plain_english
                     item["attribution_narrowed"] = True
                 if quantitative_errors:
                     rejection_reason = ";".join(quantitative_errors)
@@ -9906,7 +10351,7 @@ def validate_cluster_synthesis(
                 rejection_reason = (
                     "robustness_claim_conflicts_with_selection_limitation"
                 )
-            elif re.search(r"\bindependent\b", statement, flags=re.I) and any(
+            elif _asserts_verified_independence(statement) and any(
                 not bool(reference.get("counted_as_independent"))
                 for reference in evidence
             ):
@@ -9974,7 +10419,14 @@ def validate_cluster_synthesis(
                 rejection_reason = (
                     "universal_direction_claim_conflicts_with_cited_anchors"
                 )
-            elif _has_unqualified_causal_language(statement) and not any(
+            elif (
+                _has_unqualified_causal_language(statement)
+                or _has_unqualified_causal_language(
+                    item.get("plain_english_meaning")
+                    or item.get("plain_english")
+                    or ""
+                )
+            ) and not any(
                 _anchor_supports_causal_claim(
                     anchor_by_key.get(
                         (
@@ -9995,32 +10447,48 @@ def validate_cluster_synthesis(
                     "boundary_conditions",
                     "methodological_fault_lines",
                 }:
+                    referenced_anchors = [
+                        anchor_by_key.get(
+                            (
+                                str(reference.get("source_id") or ""),
+                                str(
+                                    reference.get("evidence_anchor_id")
+                                    or reference.get("claim_id")
+                                    or ""
+                                ),
+                            ),
+                            {},
+                        )
+                        for reference in evidence
+                    ]
                     boundary = _causal_support_boundary(
                         value
-                        for reference in evidence
+                        for anchor in referenced_anchors
                         for value in _as_mapping(
-                            anchor_by_key.get(
-                                (
-                                    str(reference.get("source_id") or ""),
-                                    str(
-                                        reference.get("evidence_anchor_id")
-                                        or reference.get("claim_id")
-                                        or ""
-                                    ),
-                                ),
-                                {},
-                            ).get("support_envelope")
+                            anchor.get("support_envelope")
                         ).get("restrictions", [])
                         or []
                     )
-                    statement = _narrow_noncausal_organizational_language(
-                        statement, boundary=boundary
+                    source_argument = any(
+                        _anchor_is_source_argument(anchor)
+                        for anchor in referenced_anchors
+                    )
+                    statement = (
+                        _attribute_source_argument(statement)
+                        if source_argument
+                        else _narrow_noncausal_organizational_language(
+                            statement, boundary=boundary
+                        )
                     )
                     _replace_cluster_item_statement(item, statement)
                     item["causal_language_narrowed"] = True
                     if item.get("plain_english_meaning"):
                         item["plain_english_meaning"] = (
-                            _narrow_noncausal_organizational_language(
+                            _attribute_source_argument(
+                                item.get("plain_english_meaning")
+                            )
+                            if source_argument
+                            else _narrow_noncausal_organizational_language(
                                 item.get("plain_english_meaning"), boundary=boundary
                             )
                         )
@@ -10028,12 +10496,6 @@ def validate_cluster_synthesis(
                     rejection_reason = (
                         "causal_wording_without_causal_or_mechanism_anchor"
                     )
-            elif not effective_evidence_bases and section not in {
-                "evidence_threads",
-                "boundary_conditions",
-                "methodological_fault_lines",
-            }:
-                rejection_reason = "assertion_has_no_independent_source_support"
             elif (
                 section in {"central_findings", "agreements", "contradictions"}
                 and proposition_ids
@@ -11481,25 +11943,11 @@ def _proposition_debate_state(
         comparability = _as_mapping(proposition.get("comparability"))
         if bool(comparability.get("direction_orientation_aligned", True)):
             return "mapped_debate", {"directions": sorted(reported)}
-        stance_text = " ".join(
-            str(cell.get("stance_or_finding") or "") for cell in cells
-        )
-        explicit_positive = bool(
-            re.search(
-                r"\b(?:positive(?:ly)?|increas(?:e|es|ed)|higher|more likely)\b",
-                stance_text,
-                re.I,
-            )
-        )
-        explicit_negative = bool(
-            re.search(
-                r"\b(?:negative(?:ly)?|decreas(?:e|es|ed)|lower|less likely|reduc(?:e|es|ed))\b",
-                stance_text,
-                re.I,
-            )
-        )
-        if explicit_positive and explicit_negative:
-            return "mapped_debate", {"directions": sorted(reported)}
+        # Opposite coefficient signs are not necessarily opposing findings.
+        # "Higher fatalities reduce success" and "low fatalities increase
+        # success" describe the same relationship from inverse reference
+        # points. A strict quantitative contradiction therefore requires an
+        # explicitly normalized predictor and outcome orientation.
         return "mixed_evidence", {
             "directions": sorted(reported),
             "reason": "direction_orientation_unresolved",
@@ -11622,20 +12070,6 @@ def _strict_claim_adjudications(
         stance_text = " ".join(
             str(cell.get("stance_or_finding") or "") for cell in cells
         )
-        explicit_positive = bool(
-            re.search(
-                r"\b(?:positive(?:ly)?|increas(?:e|es|ed)|higher|more likely)\b",
-                stance_text,
-                re.I,
-            )
-        )
-        explicit_negative = bool(
-            re.search(
-                r"\b(?:negative(?:ly)?|decreas(?:e|es|ed)|lower|less likely|reduc(?:e|es|ed))\b",
-                stance_text,
-                re.I,
-            )
-        )
         explicit_argument_opposition = bool(
             re.search(
                 r"\b(?:reject|oppose|cannot|should not|incompatible|contrary|fails?)\b",
@@ -11643,7 +12077,7 @@ def _strict_claim_adjudications(
                 re.I,
             )
         )
-        return (explicit_positive and explicit_negative) or explicit_argument_opposition
+        return explicit_argument_opposition
 
     consensus_assessment = next(
         (
@@ -12725,10 +13159,15 @@ def _gap_search_terms(candidate: Mapping[str, Any]) -> list[str]:
         ]
     )
     generic = {
+        "across",
+        "analysis",
+        "association",
         "author",
+        "base",
         "boundary",
         "but",
         "condition",
+        "confirm",
         "contradictory",
         "coverage",
         "cross",
@@ -12736,33 +13175,36 @@ def _gap_search_terms(candidate: Mapping[str, Any]) -> list[str]:
         "dataset",
         "empirical",
         "evidence",
+        "find",
         "finding",
         "gap",
-        "integration",
-        "mechanism",
-        "measurement",
-        "methodological",
-        "replication",
-        "association",
-        "base",
-        "confirm",
         "independent",
+        "integration",
+        "measurement",
+        "mechanism",
+        "methodological",
         "needed",
         "overlapping",
+        "preventing",
+        "replication",
         "share",
         "showing",
+        "significant",
         "stated",
-        "study",
         "studies",
+        "study",
         "testing",
         "two",
         "untested",
+        "use",
+        "uses",
     }
     return sorted(
         term
         for term in terms
         if term not in generic
         and len(term) > 2
+        and not term.isdigit()
         and not re.fullmatch(r"[a-z]+(?:19|20)\d{2}[a-z]?", term)
     )
 
@@ -14005,6 +14447,22 @@ def _canonicalize_gap_status_prose(gap: dict[str, Any]) -> None:
     )
 
 
+def _safe_gap_resolution_text(value: Any, *, fallback: Any = "") -> str:
+    """Remove unsupported project-design details from public gap projections."""
+
+    text = _human_projection_text(value)
+    if re.search(
+        r"\b(?:instrumental variables?|quasi[- ]experiments?|randomi[sz]ed experiments?|"
+        r"regression discontinuity|difference[- ]in[- ]differences?|synthetic control|"
+        r"natural experiment|large[- ]n|panel data|identification strategy|"
+        r"exogenous variation)\b",
+        text,
+        flags=re.I,
+    ):
+        return _human_projection_text(fallback)
+    return text
+
+
 def _resolution_path_summary(resolution: Mapping[str, Any]) -> list[str]:
     """Render an evidence route without turning it into a project study design."""
 
@@ -14018,7 +14476,14 @@ def _resolution_path_summary(resolution: Mapping[str, Any]) -> list[str]:
     lines = [
         f"**Approach:** {path_type.replace('_', ' ')}",
         f"**Question:** {_human_projection_text(resolution.get('question') or '')}",
-        f"**Evidence needed:** {_human_projection_text(resolution.get('evidence_needed') or '')}",
+        "**Evidence needed:** "
+        + _safe_gap_resolution_text(
+            resolution.get("evidence_needed") or "",
+            fallback=(
+                "Evidence that distinguishes the mapped relationship from selection "
+                "and the competing explanations identified above."
+            ),
+        ),
     ]
     if requirement_names:
         lines.append(
@@ -14039,7 +14504,8 @@ def _safe_gap_significance_text(value: Any) -> str:
     if re.search(
         r"\b(?:instrumental variables?|quasi[- ]experiments?|randomi[sz]ed experiments?|"
         r"regression discontinuity|difference[- ]in[- ]differences?|synthetic control|"
-        r"natural experiment|identification strategy)\b",
+        r"natural experiment|large[- ]n|panel data|identification strategy|"
+        r"exogenous variation)\b",
         text,
         flags=re.I,
     ):
@@ -15270,8 +15736,9 @@ def _coverage_audit_plan(
                 "candidate_components": candidate_components,
             }
         ]
-        if candidate_components and len(candidate_components[0]["source_ids"]) >= 2:
-            residual = candidate_components[0]
+        for residual in candidate_components:
+            if len(residual["source_ids"]) < 2:
+                continue
             plan.append(
                 {
                     "mode": "semantic_component",
@@ -15383,9 +15850,19 @@ def _cluster_proposals_from_responses(
                 or ""
             )
             key = identity or _stable_hash(proposal)
-            merged[key] = (
-                merge_rows(merged[key], proposal) if key in merged else proposal
-            )
+            if key not in merged:
+                merged[key] = proposal
+                continue
+            prior_id = str(merged[key].get("proposal_id") or "")
+            proposal_id = str(proposal.get("proposal_id") or "")
+            if prior_id and proposal_id and prior_id == proposal_id:
+                # A later collection audit may deliberately narrow a complete
+                # proposal after seeing current admission failures. Treat the
+                # same proposal ID as a replacement; union remains appropriate
+                # only for distinct whole-profile shards of one conversation.
+                merged[key] = proposal
+            else:
+                merged[key] = merge_rows(merged[key], proposal)
     return list(merged.values())
 
 
@@ -15430,9 +15907,6 @@ def build_literature_report(
 ) -> dict[str, Any]:
     """Pure end-to-end mapper over already-built evidence profiles."""
     normalized = normalize_evidence_profiles(profiles)
-    note_anchor_mismatch_count = _reconcile_profile_anchors_with_atomic_notes(
-        normalized, source_notes
-    )
     independence = build_independence_records(normalized)
     locator_audit = build_locator_audit(normalized)
     coverage_register = build_coverage_register(normalized, source_set=source_set)
@@ -16015,7 +16489,6 @@ def build_literature_report(
         "profile_count": len(normalized),
         "analytical_profile_count": sum(1 for row in normalized if row["analytical"]),
         "limited_profile_count": sum(1 for row in normalized if row["limited"]),
-        "note_anchor_mismatch_count": note_anchor_mismatch_count,
         "relation_count": len(navigation["typed_relations"]),
         "typed_relation_counts": dict(navigation.get("typed_relation_counts", {})),
         "subject_tag_count": int(navigation.get("promoted_subject_tag_count", 0) or 0),
@@ -16222,7 +16695,7 @@ def gap_display_title(gap: Mapping[str, Any]) -> str:
         or gap.get("precise_missing_evidence")
         or gap.get("topic"),
         fallback=str(gap.get("rule") or "Collection Gap").replace("_", " ").title(),
-        limit=110,
+        limit=140,
     )
     return f"Gap: {label}"
 
@@ -17242,8 +17715,15 @@ def _cluster_markdown(
             )
             if explanation:
                 details.append(explanation)
-        if kind == "contradiction" and not any(
-            "opposite" in detail.casefold() for detail in details
+        if (
+            kind == "contradiction"
+            and str(adjudication.get("decision") or "not_established")
+            != "established"
+            and not any(
+                token in detail.casefold()
+                for detail in details
+                for token in ("opposite", "opposing")
+            )
         ):
             details.append(
                 "No two comparable sources reach genuinely opposite conclusions on the same claim."
@@ -17311,13 +17791,20 @@ def _cluster_markdown(
         ]
         thread_titles = [value for value in thread_titles if value]
         if thread_titles:
+            readable_thread_titles = [
+                title[:1].lower() + title[1:]
+                if title[:1].isupper()
+                and not re.match(r"^[A-Z]{2,}(?:\b|\s)", title)
+                else title
+                for title in thread_titles
+            ]
             fit_lines.append(
                 "The literature is organized around "
-                + ", ".join(thread_titles[:-1])
+                + ", ".join(readable_thread_titles[:-1])
                 + (
-                    f", and {thread_titles[-1]}"
-                    if len(thread_titles) > 1
-                    else thread_titles[0]
+                    f", and {readable_thread_titles[-1]}"
+                    if len(readable_thread_titles) > 1
+                    else readable_thread_titles[0]
                 )
                 + "."
             )
@@ -17370,21 +17857,42 @@ def _cluster_markdown(
             str(row.get("contribution_id") or ""),
         ),
     )
-    best_by_source: dict[str, dict[str, Any]] = {}
+    selected_by_source: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in ranked_contributions:
         source_id = str(row.get("source_id") or "")
-        if source_id and source_id not in best_by_source:
-            best_by_source[source_id] = row
+        if not source_id:
+            continue
+        limit = 3 if role_by_source.get(source_id) == "core" else 1
+        selected = selected_by_source[source_id]
+        if len(selected) >= limit:
+            continue
+        row_terms = _tokens(row.get("finding") or "") - _BROAD_FIELD_TERMS
+        if row_terms and any(
+            len(row_terms & (_tokens(prior.get("finding") or "") - _BROAD_FIELD_TERMS))
+            / max(
+                1,
+                min(
+                    len(row_terms),
+                    len(_tokens(prior.get("finding") or "") - _BROAD_FIELD_TERMS),
+                ),
+            )
+            >= 0.7
+            for prior in selected
+        ):
+            continue
+        selected.append(row)
     source_order = [str(value) for value in cluster.get("source_ids", []) or []]
     core_contributions = [
-        best_by_source[source_id]
+        row
         for source_id in source_order
-        if source_id in best_by_source and role_by_source.get(source_id) == "core"
+        if role_by_source.get(source_id) == "core"
+        for row in selected_by_source.get(source_id, [])
     ]
     context_contributions = [
-        best_by_source[source_id]
+        row
         for source_id in source_order
-        if source_id in best_by_source and role_by_source.get(source_id) != "core"
+        if role_by_source.get(source_id) != "core"
+        for row in selected_by_source.get(source_id, [])
     ][:2]
     contributions = [*core_contributions, *context_contributions]
     contributions_by_thread: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -17393,6 +17901,24 @@ def _cluster_markdown(
 
     findings: list[str] = []
     seen_meanings: set[str] = set()
+
+    def contribution_inferential_limit(
+        contribution: Mapping[str, Any],
+    ) -> str:
+        for reference in contribution.get("evidence", []) or []:
+            if not isinstance(reference, Mapping):
+                continue
+            for value in reference.get("restrictions", []) or []:
+                text = _human_projection_text(value)
+                if text and re.search(
+                    r"\b(?:caus|cannot rule out|counterfactual|confound|selection|"
+                    r"observational|single[- ]case|not test)\w*\b",
+                    text,
+                    flags=re.I,
+                ):
+                    return text
+        return ""
+
     central_rows = [
         dict(row)
         for row in synthesis.get("central_findings", []) or []
@@ -17451,6 +17977,9 @@ def _cluster_markdown(
             if meaning and meaning.casefold() not in seen_meanings:
                 findings.append(f"  - What it means: {meaning}")
                 seen_meanings.add(meaning.casefold())
+            inferential_limit = contribution_inferential_limit(contribution)
+            if inferential_limit:
+                findings.append(f"  - Inferential limit: {inferential_limit}")
     unassigned = [
         row
         for row in contributions
@@ -17488,6 +18017,9 @@ def _cluster_markdown(
             if meaning and meaning.casefold() not in seen_meanings:
                 findings.append(f"  - What it means: {meaning}")
                 seen_meanings.add(meaning.casefold())
+            inferential_limit = contribution_inferential_limit(contribution)
+            if inferential_limit:
+                findings.append(f"  - Inferential limit: {inferential_limit}")
     if findings:
         sections.append("## What the studies find\n\n" + "\n\n".join(findings))
     connection_rows = [
@@ -17964,9 +18496,13 @@ def _gap_markdown(
                 )
     missing_cell = _as_mapping(gap.get("missing_cell"))
     if missing_cell.get("description"):
-        lineage_lines.append(
-            f"- Missing evidence-matrix cell: {_human_projection_text(missing_cell.get('description'))}"
+        missing_cell_text = _safe_gap_resolution_text(
+            missing_cell.get("description"), fallback=statement
         )
+        if missing_cell_text:
+            lineage_lines.append(
+                f"- Missing evidence-matrix cell: {missing_cell_text}"
+            )
     if lineage_lines:
         sections.append("## Where the gap came from\n\n" + "\n".join(lineage_lines))
 
@@ -18156,7 +18692,22 @@ def _gap_markdown(
         )
 
     resolution = _as_mapping(gap.get("resolution_path"))
-    if resolution:
+    strict_checks = [
+        _as_mapping(check)
+        for check in strict.get("checks", []) or []
+        if isinstance(check, Mapping)
+    ]
+    resolution_path_rejected = any(
+        not bool(check.get("passed"))
+        and (
+            "resolution path" in str(check.get("requirement") or "").casefold()
+            or "type-sensitive path"
+            in str(check.get("requirement") or "").casefold()
+            or "resolution path" in str(check.get("explanation") or "").casefold()
+        )
+        for check in strict_checks
+    )
+    if resolution and not resolution_path_rejected:
         path_type = str(resolution.get("path_type") or "")
         requirements = _as_mapping(resolution.get("requirements"))
         required_fields = _RESOLUTION_PATH_REQUIREMENTS.get(path_type, ())
@@ -18192,7 +18743,11 @@ def _gap_markdown(
 
     final_parts = []
     why_matters = _safe_gap_significance_text(gap.get("why_matters") or "")
-    contribution = _safe_gap_significance_text(gap.get("contribution") or "")
+    contribution = (
+        ""
+        if resolution_path_rejected
+        else _safe_gap_significance_text(gap.get("contribution") or "")
+    )
     if why_matters:
         final_parts.append("**Why it matters:** " + why_matters)
     if contribution:

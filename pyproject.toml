@@ -20,8 +20,10 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
+  "Pillow>=10.0",
   "PyYAML>=6.0",
   "pypdf>=4.0",
+  "pypdfium2>=5.4",
 ]
 
 [project.scripts]

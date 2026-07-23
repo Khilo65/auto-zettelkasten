@@ -82,6 +82,18 @@ notes instead of empty analytical templates. Their statuses are
 `fulltext_available`. They remain searchable and linkable, but cannot form
 canonical clusters or support candidate gaps.
 
+For PDF sources, the mapper prefers the actual primary Zotero attachment and
+preserves page markers throughout extraction. Born-digital pages use `pypdf`.
+A lightweight text sniff sends only suspicious pages to PDFium rendering plus
+Tesseract OCR, with one orientation-aware retry; good embedded-text pages are
+never discarded. Poppler is a fallback when PDFium is unavailable. Extraction
+provenance records the page count, embedded-text pages, OCR pages, unresolved
+pages, and route in machine metadata. A visibly textual page that remains
+unreadable produces a limited note rather than a falsely complete analysis.
+Tables may be flattened when their labels, values, and surrounding explanation
+remain readable; the note prompt asks the reader to use that context without
+inventing row-column relationships.
+
 Original Zotero tags and their normalized forms remain provenance. The graph
 projection derives conservative, typed subject tags from existing profile
 fields, such as `mechanism/mediator-legitimacy`, `outcome/mediation-success`,
@@ -158,6 +170,16 @@ contradiction. Descriptive or associational anchors cannot
 support causal wording. Generated atomic-note headings cannot serve as strong source
 locators, and quantitative prose must pass arithmetic and estimand checks. Anchor IDs remain hidden from human Markdown unless a
 machine-readable link requires them.
+
+Atomic-note generation uses the complete page-preserving source text and asks
+the reader to adapt to the actual source type, including academic studies,
+books, reports, legal or policy documents, archival records, conference notes,
+meeting records, speeches, practitioner guidance, and web publications. The
+prompt requires source-specific context, method or knowledge basis, technical
+detail plus plain-English meaning, and a distinction between observation,
+author interpretation, and what the source can establish. DeepSeek runs atomic
+notes with high reasoning and cluster synthesis with maximum reasoning. Paid
+calls are checkpointed; replaying an unchanged completed run reuses them.
 
 Independent gap notes are canonical. Each visible gap explains how cluster
 analysis generated it, the exact missing relationship or evidence-matrix cell,

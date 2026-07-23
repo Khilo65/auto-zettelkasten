@@ -29,7 +29,7 @@ from .notes import (
 PROFILE_SCHEMA_VERSION = "1.2"
 PROFILE_SIDECAR_VERSION = "1"
 PROFILE_CHECKPOINT_VERSION = "1"
-PROFILE_PROMPT_VERSION = "3"
+PROFILE_PROMPT_VERSION = "6"
 PROFILE_CLASSIFIER_VERSION = "3"
 PROFILE_ALGORITHM_VERSION = "4"
 COMMITTED_NOTE_ANCHOR_AUGMENTATION_VERSION = "8"
@@ -368,29 +368,78 @@ profile_fingerprint = profile_dependency_fingerprint
 def build_profile_prompt(note_text: str) -> str:
     """Build a compact prompt containing only committed Markdown note content."""
 
-    profile_class, finding_class = _model_classes()
-    anchor_class, envelope_class = _anchor_classes()
-    profile_shape = _dataclass_shape(profile_class)
-    finding_shape = _dataclass_shape(finding_class)
-    anchor_shape = _dataclass_shape(anchor_class)
-    envelope_shape = _dataclass_shape(envelope_class)
-    extension_shapes = _profile_extension_shapes()
     committed_note = _committed_note_text(note_text)
+    response_shape = {
+        "profile_schema": "evidence_profile",
+        "source_role": "string",
+        "research_questions": ["string"],
+        "concepts": ["string"],
+        "theories": ["string"],
+        "mechanisms": ["string"],
+        "methods": ["string"],
+        "cases": ["string"],
+        "datasets": ["string"],
+        "data": ["string"],
+        "geography": ["string"],
+        "periods": ["string"],
+        "populations": ["string"],
+        "outcomes": ["string"],
+        "measures": ["string"],
+        "limitations": ["string"],
+        "boundaries": ["string"],
+        "gaps": ["string"],
+        "future_research": ["string"],
+        "findings": [],
+        "study_lineage": None,
+        "evidence_anchors": [
+            {
+                "claim": "one bounded finding, argument, observation, or recommendation",
+                "finding_type": "string",
+                "direction": "string",
+                "magnitude": "string",
+                "comparison": "string",
+                "conditions": ["string"],
+                "plain_english_meaning": "string",
+                "uncertainty": "string",
+                "locator": "source-native page, table, figure, chapter, or heading",
+                "locators": ["string"],
+                "qualifiers": ["string"],
+                "support_envelope": {
+                    "empirical_role": "allowed enum",
+                    "argument_role": "allowed enum",
+                    "coverage": "allowed enum",
+                    "scope": {"dimension": ["string"]},
+                    "restrictions": ["string"],
+                    "support_status": "allowed enum",
+                },
+            }
+        ],
+    }
     return (
         "Create one source-faithful evidence profile from the committed Markdown note below. "
         "Use only this note; do not reread, request, or infer from source full text. Return exactly one JSON object with no fences or commentary. "
-        f"Profile keys and value kinds: {json.dumps(profile_shape, sort_keys=True, separators=(',', ':'))}. "
-        f"Each findings item must use: {json.dumps(finding_shape, sort_keys=True, separators=(',', ':'))}. "
-        f"Each evidence_anchors item must use: {json.dumps(anchor_shape, sort_keys=True, separators=(',', ':'))}. "
-        f"Each support_envelope must use: {json.dumps(envelope_shape, sort_keys=True, separators=(',', ':'))}. "
-        f"Typed v1.2 extension shapes: {json.dumps(extension_shapes, sort_keys=True, separators=(',', ':'))}. "
+        f"Return only this lean analytical shape: {json.dumps(response_shape, sort_keys=True, separators=(',', ':'))}. "
+        "Use only these support_envelope values: empirical_role is descriptive, associational, causal, "
+        "mechanism_evidence, or none; argument_role is conceptual, interpretive, normative, methodological, "
+        "practitioner_guidance, or none; coverage is full_text, limited_text, abstract, metadata, or unknown; "
+        "support_status describes source attribution, not whether the source proves the claim: use supported when the committed note "
+        "explicitly reports that the source makes the finding, argument, observation, or recommendation; support_unknown when the note "
+        "does not let you tell; limited for limited-source coverage; and unsupported only when the note itself does not support attributing "
+        "the statement to the source. A practitioner recommendation can therefore be supported while its restrictions say that it does "
+        "not establish effectiveness. Use none when a role does not apply. "
+        "profile_schema must be evidence_profile. Keep findings empty and study_lineage null. Do not output IDs, source_locators, "
+        "quantitative_result, coverage, validity, context, features, provider, model, dependency hashes, note_status, or any key absent "
+        "from the lean shape; the engine derives those records after the call. Every declared string field must contain a string; use "
+        "an empty string rather than null, an array, or an object. "
         "For an analytical full-document note, request 8-20 synthesis-relevant evidence anchors when the note supports that many; "
-        "24 is a hard maximum. Do not pad or invent anchors. Keep substantive findings and anchors only for analytical full-document notes. "
-        "Every substantive anchor needs at least one typed source_locators record and a support_envelope. A page, page range, "
-        "table, figure, chapter, source-native heading, paragraph, or source quote span may support a strong assertion. A generated "
-        "atomic-note heading such as Detailed Findings (1) must use locator_type generated_heading, is not source-native, and must "
-        "set supports_strong_assertion false. "
-        "Statistical anchors also need a typed quantitative_result and a plain-English meaning. Preserve whether a number is an "
+        "24 is a hard maximum. Do not pad, invent, or collapse an entire detailed note into one omnibus anchor. Adapt the anchors to the "
+        "source: studies may supply findings or mechanisms; theoretical or interpretive work may supply arguments; institutional, meeting, "
+        "conference, policy, practitioner, or web sources may supply observations, recommendations, commitments, or documented practice. "
+        "Keep distinct synthesis-relevant contributions separate when they have different locators or support boundaries. Keep substantive "
+        "findings and anchors only for analytical full-document notes. "
+        "Every substantive anchor needs a traceable locator string and a support_envelope. A page, page range, table, figure, chapter, "
+        "or source-native heading may be used. Do not use a generated atomic-note heading such as Detailed Findings (1) as the locator. "
+        "Statistical anchors also need a plain-English meaning. Preserve whether a number is an "
         "observed rate, model-predicted probability, coefficient, marginal effect, odds ratio, raw percentage, or other estimand; "
         "do not transform or equate them. Extract one source-local study_lineage record, including authors, institutions, datasets, "
         "sampling frame, unit of analysis, population, period, publication relationships, institutional series, and overlap signals "
@@ -486,7 +535,37 @@ def _normalize_reasoner_profile_payload(
     """
 
     normalized = dict(payload)
+    normalized.pop("note_status", None)
+    normalized["profile_schema"] = "evidence_profile"
     normalized["profile_schema_version"] = PROFILE_SCHEMA_VERSION
+    for field_name in (
+        "research_questions",
+        "concepts",
+        "theories",
+        "mechanisms",
+        "methods",
+        "cases",
+        "datasets",
+        "data",
+        "geography",
+        "periods",
+        "populations",
+        "outcomes",
+        "measures",
+        "limitations",
+        "boundaries",
+        "gaps",
+        "future_research",
+    ):
+        normalized[field_name] = _normalize_reasoner_string_list(
+            normalized.get(field_name)
+        )
+    # Findings mirror anchors in the current profile model. Keeping only the
+    # bounded anchors avoids duplicate contract surfaces and loses no content.
+    normalized["findings"] = []
+    # Stable lineage is derived from controlled note metadata and explicit note
+    # sections after the call; the model need not reproduce that persistence type.
+    normalized["study_lineage"] = None
     raw_anchors = normalized.get("evidence_anchors")
     if not isinstance(raw_anchors, list):
         return normalized
@@ -496,6 +575,33 @@ def _normalize_reasoner_profile_payload(
             anchors.append(raw_anchor)
             continue
         anchor = dict(raw_anchor)
+        for field_name in ("conditions", "qualifiers"):
+            anchor[field_name] = _normalize_reasoner_string_list(
+                anchor.get(field_name)
+            )
+        raw_legacy_locators = anchor.get("locators")
+        locator_objects: list[Mapping[str, Any]] = []
+        locator_values: list[str] = []
+        if isinstance(raw_legacy_locators, str):
+            locator_values = [raw_legacy_locators] if raw_legacy_locators else []
+        elif isinstance(raw_legacy_locators, Mapping):
+            locator_objects.append(raw_legacy_locators)
+            locator_value = str(raw_legacy_locators.get("value") or "").strip()
+            if locator_value:
+                locator_values.append(locator_value)
+        elif isinstance(raw_legacy_locators, list):
+            for raw_locator in raw_legacy_locators:
+                if isinstance(raw_locator, str) and raw_locator:
+                    locator_values.append(raw_locator)
+                elif isinstance(raw_locator, Mapping):
+                    locator_objects.append(raw_locator)
+                    locator_value = str(raw_locator.get("value") or "").strip()
+                    if locator_value:
+                        locator_values.append(locator_value)
+        if raw_legacy_locators is not None:
+            anchor["locators"] = list(dict.fromkeys(locator_values))
+        if isinstance(anchor.get("locator"), Mapping):
+            anchor["locator"] = str(anchor["locator"].get("value") or "")
         raw_envelope = anchor.get("support_envelope")
         if not isinstance(raw_envelope, Mapping):
             anchors.append(anchor)
@@ -508,9 +614,84 @@ def _normalize_reasoner_profile_payload(
                 for key, value in raw_scope.items()
             }
         anchor["support_envelope"] = envelope
+        # Typed locators and quantitative records are deterministically derived
+        # from these strings and finding fields after controlled metadata is bound.
+        anchor.pop("source_locators", None)
+        anchor.pop("quantitative_result", None)
         anchors.append(anchor)
     normalized["evidence_anchors"] = anchors
     return normalized
+
+
+def _normalize_reasoner_string_list(value: Any) -> list[str] | Any:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, list) and all(
+        not isinstance(item, (Mapping, list, tuple, set)) for item in value
+    ):
+        return [str(item) for item in value if str(item).strip()]
+    return value
+
+
+def _normalize_reasoner_finding_payload(value: Any) -> Any:
+    if not isinstance(value, Mapping):
+        return value
+    finding = dict(value)
+    # quantitative_result belongs to the evidence anchor contract, not the
+    # legacy finding mirror. Dropping this duplicate loses no evidence.
+    finding.pop("quantitative_result", None)
+    for field_name in (
+        "claim",
+        "finding_type",
+        "direction",
+        "magnitude",
+        "comparison",
+        "plain_english_meaning",
+        "population",
+        "outcome",
+        "estimate",
+        "uncertainty",
+        "evidence",
+        "locator",
+        "confidence",
+    ):
+        if finding.get(field_name) is None:
+            finding[field_name] = ""
+    if finding.get("finding_id") is None:
+        finding["finding_id"] = ""
+    if finding.get("claim_id") is None:
+        finding.pop("claim_id", None)
+    return finding
+
+
+def _normalize_reasoner_locator_payload(value: Any) -> Any:
+    if not isinstance(value, Mapping):
+        return value
+    locator = dict(value)
+    raw_type = slugify(str(locator.get("locator_type") or "unknown")).replace(
+        "-", "_"
+    )
+    type_aliases = {
+        "pages": "page_range",
+        "page_range": "page_range",
+        "page": "page",
+        "table": "table",
+        "figure": "figure",
+        "chapter": "chapter",
+        "heading": "source_heading",
+        "section": "source_heading",
+        "source_heading": "source_heading",
+        "paragraph": "paragraph",
+        "quote": "quote_span",
+        "quote_span": "quote_span",
+        "generated_heading": "generated_heading",
+        "unknown": "unknown",
+    }
+    if raw_type in type_aliases:
+        locator["locator_type"] = type_aliases[raw_type]
+    return locator
 
 
 def _normalize_reasoner_scope_value(value: Any) -> Any:
@@ -572,6 +753,25 @@ def augment_profile_from_committed_note(
         for anchor in payload.get("evidence_anchors", []) or []
         if isinstance(anchor, Mapping)
     ]
+    # A current reasoner profile already contains the source-selected evidence
+    # units needed for synthesis. Adding broad, mechanically generated section
+    # summaries on top of a complete 8+ anchor profile duplicates evidence and
+    # can make an otherwise valid source fail because the mechanical summary has
+    # no independent plain-English gloss. Mechanical augmentation remains useful
+    # for legacy or genuinely sparse profiles only.
+    reasoned_profile_complete = (
+        len(existing_anchors) >= 8
+        and str(provider).casefold() not in {"deterministic", "mechanical"}
+    )
+    if reasoned_profile_complete:
+        validity.update(
+            committed_note_anchor_augmentation_version=COMMITTED_NOTE_ANCHOR_AUGMENTATION_VERSION,
+            committed_note_anchor_count_before=len(existing_anchors),
+            committed_note_anchor_count_after=len(existing_anchors),
+            committed_note_anchor_count_added=0,
+        )
+        payload["validity"] = validity
+        return profile_from_dict(payload), True
     generated_anchors = [
         dict(anchor)
         for anchor in generated.get("evidence_anchors", []) or []
@@ -887,6 +1087,7 @@ def _enrich_profile_v12_records(
     note_locator_matches = _dedupe(
         [match.group(0) for match in _TRACEABLE_LOCATOR.finditer(note_locator_text)]
     )
+    full_document = _is_analytical_full_document(frontmatter)
     if (
         "study_lineage" in profile_fields
         and not payload.get("study_lineage")
@@ -906,6 +1107,18 @@ def _enrich_profile_v12_records(
             continue
         anchor = dict(raw_anchor)
         anchor_id = str(anchor.get("evidence_anchor_id") or "")
+        envelope = dict(anchor.get("support_envelope") or {})
+        prior_envelope = dict(envelope)
+        if full_document:
+            envelope["coverage"] = "full_text"
+            if (
+                str(envelope.get("support_status") or "") == "unsupported"
+                and str(envelope.get("argument_role") or "none") != "none"
+            ):
+                envelope["support_status"] = "supported"
+        if envelope != prior_envelope:
+            anchor["support_envelope"] = envelope
+            anchor["revision_hash"] = ""
         current_locator = str(anchor.get("locator") or "").strip()
         unsafe_v5_aggregate = bool(
             prior_augmentation_version == "5"
@@ -1118,7 +1331,7 @@ def validate_profile(
             else:
                 errors.append(f"anchor_{index}:typed_quantitative_result_required")
     if substantive and not anchors:
-        warnings.append("analytical_profile_has_no_substantive_anchors")
+        errors.append("analytical_profile_requires_substantive_anchor")
     return ProfileValidation(
         passed=not errors,
         errors=tuple(errors),
@@ -2500,6 +2713,22 @@ def _apply_controlled_profile_metadata(
             or bool(_STATISTICAL_FIGURE.search(str(candidate.get("magnitude") or "")))
             or bool(_STATISTICAL_FIGURE.search(str(candidate.get("uncertainty") or "")))
         )
+        envelope = dict(candidate.get("support_envelope") or {})
+        if _is_analytical_full_document(frontmatter):
+            # Coverage belongs to the selected source representation and is
+            # controlled by note lineage, not by the profile model. A model
+            # previously labelled many full PDFs as limited_text and thereby
+            # erased whole thematic literatures during cluster admission.
+            envelope["coverage"] = "full_text"
+            if (
+                str(envelope.get("support_status") or "") == "unsupported"
+                and str(envelope.get("argument_role") or "none") != "none"
+            ):
+                # Argumentative, normative, interpretive, and practitioner
+                # anchors establish what the source says. Their restrictions
+                # still determine what that statement cannot prove.
+                envelope["support_status"] = "supported"
+            candidate["support_envelope"] = envelope
         if "source_locators" in anchor_fields:
             supplied_locators = candidate.get("source_locators")
             if not isinstance(supplied_locators, list) or not supplied_locators:

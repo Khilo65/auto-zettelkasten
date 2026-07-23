@@ -48,7 +48,7 @@ from auto_zettelkasten.profiles import (
 
 def test_profile_versions_are_explicit() -> None:
     assert PROFILE_SCHEMA_VERSION == "1.2"
-    assert PROFILE_PROMPT_VERSION == profiles.profile_prompt_version == "3"
+    assert PROFILE_PROMPT_VERSION == profiles.profile_prompt_version == "6"
     assert PROFILE_CLASSIFIER_VERSION == profiles.profile_classifier_version == "3"
     assert PROFILE_ALGORITHM_VERSION == profiles.profile_algorithm_version == "4"
     assert ANCHOR_ALGORITHM_VERSION == SUPPORT_ENVELOPE_VERSION == "1"
@@ -114,6 +114,46 @@ def test_committed_note_anchor_augmentation_repairs_a_sparse_profile_once() -> N
     )
     assert replay_changed is False
     assert profile_to_dict(replayed) == profile_to_dict(augmented)
+
+
+def test_complete_reasoner_profile_is_not_padded_with_mechanical_summary_anchors() -> None:
+    note = _analytical_note()
+    payload = profile_to_dict(deterministic_profile(note))
+    template = payload["evidence_anchors"][0]
+    anchors = []
+    for index in range(8):
+        anchor = copy.deepcopy(template)
+        anchor.update(
+            evidence_anchor_id="",
+            revision_hash="",
+            claim=f"Reasoner-selected contribution {index + 1} about participation and trust.",
+            locator=f"p. {14 + index}",
+            locators=[f"p. {14 + index}"],
+            source_locators=[],
+        )
+        anchor["support_envelope"] = {
+            **anchor["support_envelope"],
+            "coverage": "limited_text",
+        }
+        anchors.append(anchor)
+    payload["evidence_anchors"] = anchors
+    payload["validity"].pop("committed_note_anchor_augmentation_version", None)
+
+    augmented, changed = augment_profile_from_committed_note(
+        profile_from_dict(payload),
+        note,
+        source_set_id="source-set-1",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+    )
+
+    assert changed is True
+    assert len(augmented.evidence_anchors) == 8
+    assert augmented.validity["committed_note_anchor_count_added"] == 0
+    assert all(
+        anchor.support_envelope.coverage == "full_text"
+        for anchor in augmented.evidence_anchors
+    )
 
 
 def test_committed_note_augmentation_downgrades_ambiguous_mechanical_composites() -> (
@@ -358,7 +398,7 @@ def test_analytical_note_is_extracted_and_validated_from_committed_markdown() ->
         "coverage_gate": "passed",
         "full_document": True,
     }
-    assert profile.validity["profile_prompt_version"] == "3"
+    assert profile.validity["profile_prompt_version"] == "6"
     assert profile.validity["classifier_version"] == "3"
     assert profile.validity["algorithm_version"] == "4"
     assert profile.research_questions
@@ -647,7 +687,7 @@ def test_profile_fingerprint_includes_every_declared_dependency() -> None:
     payload = profile_dependency_payload(note, **kwargs)
 
     assert payload["note_semantic_hash"] == shared_semantic_note_hash(note)
-    assert payload["profile_prompt_version"] == "3"
+    assert payload["profile_prompt_version"] == "6"
     assert payload["classifier_version"] == "3"
     assert payload["algorithm_version"] == "4"
     assert payload["profile_schema_version"] == "1.2"
@@ -672,7 +712,7 @@ def test_profile_fingerprint_includes_every_declared_dependency() -> None:
         note, **{**kwargs, "policy": {"max_profile_calls": 21}}
     )
     assert baseline != profile_dependency_fingerprint(
-        note, **kwargs, profile_prompt_version="4"
+        note, **kwargs, profile_prompt_version="7"
     )
     assert baseline != profile_dependency_fingerprint(
         note, **kwargs, profile_classifier_version="4"
@@ -956,6 +996,7 @@ def test_optional_reasoner_receives_only_committed_note_without_graph_projection
     )
 
     assert result.findings == deterministic.findings
+    assert result.evidence_anchors
     assert result.provider == "deepseek"
     assert result.model == "deepseek-v4-flash"
     assert result.dependency_hash == profile_dependency_fingerprint(
@@ -970,11 +1011,17 @@ def test_optional_reasoner_receives_only_committed_note_without_graph_projection
     assert "8-20 synthesis-relevant evidence anchors" in prompts[0]
     assert "24 is a hard maximum" in prompts[0]
     assert "support_envelope" in prompts[0]
-    assert "SourceLocator" in prompts[0]
-    assert "QuantitativeResult" in prompts[0]
-    assert "StudyLineage" in prompts[0]
-    assert "Detailed Findings (1) must use locator_type generated_heading" in prompts[0]
-    assert "is not source-native" in prompts[0]
+    assert "empirical_role is descriptive, associational, causal" in prompts[0]
+    assert "argument_role is conceptual, interpretive, normative" in prompts[0]
+    assert "support_status describes source attribution" in prompts[0]
+    assert "practitioner recommendation can therefore be supported" in prompts[0]
+    assert "profile_schema must be evidence_profile" in prompts[0]
+    assert "do not pad, invent, or collapse an entire detailed note into one omnibus anchor" in prompts[0].casefold()
+    assert "conference, policy, practitioner, or web sources" in prompts[0]
+    assert "keep findings empty and study_lineage null" in prompts[0].casefold()
+    assert "do not output ids, source_locators" in prompts[0].casefold()
+    assert "the engine derives those records after the call" in prompts[0]
+    assert "do not use a generated atomic-note heading" in prompts[0].casefold()
     assert "observed rate" in prompts[0]
     assert "do not reread" in prompts[0].casefold()
     assert "## Graph Links" not in prompts[0]
@@ -1022,6 +1069,47 @@ def test_live_reasoner_normalizes_scalar_anchor_scope_without_weakening_sidecars
         profile_from_dict(persisted_shape_error)
 
 
+def test_live_reasoner_normalizes_only_unambiguous_profile_shape_aliases() -> None:
+    note = _analytical_note()
+    proposed = profile_to_dict(deterministic_profile(note))
+    proposed["profile_schema"] = "profile"
+    proposed["profile_schema_version"] = "provider-invented"
+    proposed["note_status"] = "analytical_atomic_note"
+    proposed["geography"] = "Rwanda"
+    proposed["boundaries"] = "The source is descriptive."
+    proposed["findings"][0]["direction"] = None
+    proposed["findings"][0]["quantitative_result"] = {"duplicate": True}
+    proposed["evidence_anchors"][0]["source_locators"][0]["locator_type"] = "pages"
+    proposed["evidence_anchors"][0]["locators"] = [
+        {
+            "locator_type": "pages",
+            "value": "pp. 13-14",
+            "source_native": True,
+            "supports_strong_assertion": True,
+        }
+    ]
+    proposed["evidence_anchors"][0]["quantitative_result"] = {
+        "provenance": "reported"
+    }
+
+    result = build_evidence_profile(
+        note,
+        source_set_id="source-set-reasoner",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        reasoner_method=lambda _prompt: proposed,
+    )
+
+    assert result.profile_schema == "evidence_profile"
+    assert result.geography == ["Rwanda"]
+    assert result.boundaries == ["The source is descriptive."]
+    assert result.findings == []
+    assert result.evidence_anchors[0].source_locators
+    assert "pp. 13-14" in result.evidence_anchors[0].locators
+    assert result.evidence_anchors[0].quantitative_result is not None
+    assert result.evidence_anchors[0].quantitative_result.provenance == "source_reported"
+
+
 def test_committed_note_controls_profile_status_scope_and_identity() -> None:
     note = _analytical_note()
     proposed = profile_to_dict(deterministic_profile(note))
@@ -1043,6 +1131,41 @@ def test_committed_note_controls_profile_status_scope_and_identity() -> None:
     assert result.coverage["full_document"] is True
 
 
+def test_committed_note_controls_anchor_coverage_and_practitioner_attribution() -> None:
+    note = _analytical_note()
+    proposed = profile_to_dict(deterministic_profile(note))
+    envelope = proposed["evidence_anchors"][0]["support_envelope"]
+    envelope.update(
+        empirical_role="none",
+        argument_role="practitioner_guidance",
+        coverage="limited_text",
+        support_status="unsupported",
+        restrictions=["The recommendation is not an effectiveness evaluation."],
+    )
+
+    result = build_evidence_profile(note, reasoner_method=lambda _prompt: proposed)
+    controlled = result.evidence_anchors[0].support_envelope
+
+    assert controlled.coverage == "full_text"
+    assert controlled.support_status == "supported"
+    assert controlled.argument_role == "practitioner_guidance"
+    assert controlled.restrictions == [
+        "The recommendation is not an effectiveness evaluation."
+    ]
+
+
+def test_reasoner_cannot_return_an_empty_full_document_profile() -> None:
+    note = _analytical_note()
+    proposed = profile_to_dict(deterministic_profile(note))
+    proposed["findings"] = []
+    proposed["evidence_anchors"] = []
+
+    with pytest.raises(
+        ProfileParseError, match="analytical_profile_requires_substantive_anchor"
+    ):
+        build_evidence_profile(note, reasoner_method=lambda _prompt: proposed)
+
+
 def test_reasoner_profile_omits_only_findings_without_required_support() -> None:
     note = _analytical_note()
     proposed = profile_to_dict(deterministic_profile(note))
@@ -1058,9 +1181,9 @@ def test_reasoner_profile_omits_only_findings_without_required_support() -> None
 
     result = build_evidence_profile(note, reasoner_method=lambda prompt: proposed)
 
-    assert len(result.findings) == 1
+    assert result.findings == []
     assert len(result.evidence_anchors) == 1
-    assert result.validity["omitted_untraceable_or_uninterpreted_finding_count"] == 1
+    assert result.validity["omitted_untraceable_or_uninterpreted_finding_count"] == 0
 
 
 def _analytical_note() -> str:

@@ -420,7 +420,7 @@ def test_question_is_only_a_projection_lens_but_metadata_and_reader_remain_in_fi
     assert third_reader.calls == 0
 
 
-def test_prompt_v2_replaces_prompt_v1_note_instead_of_reusing_it(
+def test_current_prompt_replaces_prompt_v1_note_instead_of_reusing_it(
     tmp_path: Path, sample_items
 ) -> None:
     first_reader = FakeReader()
@@ -444,7 +444,7 @@ def test_prompt_v2_replaces_prompt_v1_note_instead_of_reusing_it(
     assert second_reader.calls == 1
     note = tmp_path / second.items[0]["note_path"]
     frontmatter, body = parse_atomic_note(note.read_text())
-    assert frontmatter["prompt_version"] == "2"
+    assert frontmatter["prompt_version"] == "8"
     assert "## Plain-English Interpretation" in body
 
 
@@ -554,7 +554,9 @@ def test_synthetic_library_covers_readable_scanned_and_missing_sources(
         def fulltext(self, item_key):
             if item_key == "READABLE1PDF":
                 return {
-                    "content": "Readable inspected synthetic source. " * 120,
+                    "content": "\f".join(
+                        ["Readable inspected synthetic source. " * 12] * 10
+                    ),
                     "contentType": "application/pdf",
                     "indexedPages": 10,
                     "totalPages": 10,
@@ -580,7 +582,8 @@ def test_synthetic_library_covers_readable_scanned_and_missing_sources(
     attempts = (
         tmp_path / "01_custody" / "read_attempts" / "synthetic-release-gate.jsonl"
     ).read_text()
-    assert '"route": "local_ocr"' in attempts
+    assert '"route": "pypdf_text"' in attempts
+    assert "pdf_error" in attempts
     assert "metadata_only" in attempts
 
 
@@ -727,11 +730,17 @@ def test_status_reports_terminal_and_literature_counts(
     assert status.counts["cluster_count"] == 0
     assert status.counts["gap_candidate_count"] == 0
 
-    build_map(tmp_path, run_id="status-run", source_set=report.source_set, resume=True)
+    manifest = build_map(
+        tmp_path, run_id="status-run", source_set=report.source_set, resume=True
+    )
     rebuilt_status = get_status(tmp_path, "status-run")
     assert rebuilt_status.counts["inventory_count"] == 2
     assert rebuilt_status.counts["validated_note_count"] == 2
     assert rebuilt_status.counts["terminal_count"] == 2
+    assert (
+        manifest.metadata["literature_map"]["unclustered_count"]
+        == rebuilt_status.counts["unclustered_count"]
+    )
 
 
 def test_build_map_reconstructs_progress_for_legacy_source_set_without_rows(
