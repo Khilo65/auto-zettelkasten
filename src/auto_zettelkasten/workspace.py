@@ -172,6 +172,7 @@ def assert_compatible(workspace: Path | str) -> None:
         (1, 7),
         (1, 8),
         (1, 9),
+        (1, 10),
     }
     current = _parse_schema_version(CURRENT_ARTIFACT_SCHEMA_VERSION, field="current artifact schema")
     if manifest_version not in supported:

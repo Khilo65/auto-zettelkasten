@@ -8,6 +8,7 @@ from auto_zettelkasten.files import read_yaml, write_yaml
 from auto_zettelkasten.migration import (
     DEBATE_FAMILY_MIGRATION_ID,
     GAP_QUALITY_MIGRATION_ID,
+    MANAGED_GRAPH_MIGRATION_ID,
     MIGRATION_ID,
     NAVIGATION_MIGRATION_ID,
     PROPOSITION_ANCHOR_MIGRATION_ID,
@@ -17,6 +18,7 @@ from auto_zettelkasten.migration import (
     migrate_debate_family_schema,
     migrate_gap_quality_schema,
     migrate_literature_map,
+    migrate_managed_graph_schema,
     migrate_navigation_projection_schema,
     migrate_proposition_anchor_schema,
     migrate_review_status,
@@ -205,6 +207,64 @@ def test_schema_1_8_thematic_cluster_migration_retires_only_mutable_markdown(
     assert regenerated.read_bytes() == b"# New thematic map\n"
     assert all(path.read_bytes() == content for path, content in preserved.items())
 
+
+def test_schema_1_9_managed_graph_migration_only_rewrites_versions(
+    tmp_path: Path,
+) -> None:
+    initialize(tmp_path)
+    version_paths = (
+        tmp_path / "auto-zettelkasten.yml",
+        tmp_path / "11_state" / "workspace_manifest.yml",
+    )
+    for path in version_paths:
+        payload = read_yaml(path)
+        payload.update(engine_version="0.10.0", artifact_schema_version="1.9")
+        write_yaml(path, payload)
+
+    preserved_paths = (
+        tmp_path / "01_custody" / "files" / "source.pdf",
+        tmp_path / "02_source_memory" / "notes" / "Source.md",
+        tmp_path / "02_source_memory" / "profiles" / "note-source.yml",
+        tmp_path / "03_literature_synthesis" / "maps" / "map-1" / "manifest.yml",
+    )
+    for path, content in zip(
+        preserved_paths,
+        (b"source", b"# Source\n", b"profile: {}\n", b"map_id: map-1\n"),
+        strict=True,
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    preserved = {path: path.read_bytes() for path in preserved_paths}
+
+    dry_run = migrate_managed_graph_schema(tmp_path, dry_run=True)
+
+    assert dry_run["status"] == "dry_run"
+    assert {row["source"] for row in dry_run["rewritten_files"]} == {
+        "auto-zettelkasten.yml",
+        "11_state/workspace_manifest.yml",
+    }
+    assert all(path.read_bytes() == content for path, content in preserved.items())
+    assert read_yaml(version_paths[0])["artifact_schema_version"] == "1.9"
+    assert not (
+        tmp_path / "11_state" / "migrations" / f"{MANAGED_GRAPH_MIGRATION_ID}.yml"
+    ).exists()
+
+    first = migrate_managed_graph_schema(tmp_path)
+    second = migrate_managed_graph_schema(tmp_path)
+
+    assert first["status"] == "migrated"
+    assert second["status"] == "already_migrated"
+    assert first["provider_calls"] == 0
+    assert first["source_documents_reread"] == 0
+    assert first["source_notes_rewritten"] == 0
+    assert first["profile_files_rewritten"] == 0
+    assert all(path.read_bytes() == content for path, content in preserved.items())
+    for path in version_paths:
+        payload = read_yaml(path)
+        assert payload["engine_version"] == "0.11.0"
+        assert payload["artifact_schema_version"] == "1.10"
+
+
 def test_literature_migration_dry_run_is_non_mutating(tmp_path: Path) -> None:
     initialize(tmp_path)
     for path in (
@@ -313,7 +373,7 @@ Automated structure checks passed. No substantive human verification was perform
     assert "human_review" not in cleaned
     assert "Automated Validation" not in cleaned
     assert "The substantive analysis remains unchanged." in cleaned
-    assert read_yaml(tmp_path / "auto-zettelkasten.yml")["artifact_schema_version"] == "1.9"
+    assert read_yaml(tmp_path / "auto-zettelkasten.yml")["artifact_schema_version"] == "1.10"
     aliases = review_hash_aliases(tmp_path)
     assert aliases["note-legacy"]["legacy_semantic_hash"]
     assert aliases["note-legacy"]["semantic_hash"]
@@ -362,8 +422,8 @@ Keep these bytes exactly.
 
     assert result["provider_calls"] == 0
     assert note_path.read_bytes() == before
-    assert read_yaml(tmp_path / "auto-zettelkasten.yml")["artifact_schema_version"] == "1.9"
-    assert read_yaml(tmp_path / "11_state" / "workspace_manifest.yml")["artifact_schema_version"] == "1.9"
+    assert read_yaml(tmp_path / "auto-zettelkasten.yml")["artifact_schema_version"] == "1.10"
+    assert read_yaml(tmp_path / "11_state" / "workspace_manifest.yml")["artifact_schema_version"] == "1.10"
 
 
 def test_schema_1_4_to_1_5_dry_run_is_fully_non_mutating(tmp_path: Path, monkeypatch) -> None:
@@ -463,10 +523,10 @@ def test_schema_1_4_to_1_5_apply_is_local_byte_preserving_and_idempotent(
     assert first["proposition_anchors"]["profile_upgrade"] == "lazy_on_read"
     assert first["proposition_anchors"]["archived_files"] == []
     assert marker.is_file()
-    assert read_yaml(tmp_path / "auto-zettelkasten.yml")["engine_version"] == "0.10.0"
-    assert read_yaml(tmp_path / "auto-zettelkasten.yml")["artifact_schema_version"] == "1.9"
-    assert read_yaml(tmp_path / "11_state" / "workspace_manifest.yml")["engine_version"] == "0.10.0"
-    assert read_yaml(tmp_path / "11_state" / "workspace_manifest.yml")["artifact_schema_version"] == "1.9"
+    assert read_yaml(tmp_path / "auto-zettelkasten.yml")["engine_version"] == "0.11.0"
+    assert read_yaml(tmp_path / "auto-zettelkasten.yml")["artifact_schema_version"] == "1.10"
+    assert read_yaml(tmp_path / "11_state" / "workspace_manifest.yml")["engine_version"] == "0.11.0"
+    assert read_yaml(tmp_path / "11_state" / "workspace_manifest.yml")["artifact_schema_version"] == "1.10"
     assert all(path.read_bytes() == content for path, content in preserved.items())
     assert second["proposition_anchors"]["status"] == "already_migrated"
     assert second["navigation"]["status"] == "already_migrated"

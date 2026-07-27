@@ -56,6 +56,14 @@ THEMATIC_CLUSTER_TARGET_ENGINE_VERSION = "0.10.0"
 
 THEMATIC_CLUSTER_TARGET_ARTIFACT_SCHEMA_VERSION = "1.9"
 
+MANAGED_GRAPH_MIGRATION_ID = "auto-zettelkasten-0.11-managed-graph-markers"
+
+MANAGED_GRAPH_MIGRATION_VERSION = "1"
+
+MANAGED_GRAPH_TARGET_ENGINE_VERSION = "0.11.0"
+
+MANAGED_GRAPH_TARGET_ARTIFACT_SCHEMA_VERSION = "1.10"
+
 _MARKER_FIELDS = {
     "migration_id",
     "migration_version",
@@ -120,6 +128,20 @@ _RESEARCHER_GRADE_MARKER_FIELDS = set(_NAVIGATION_MARKER_FIELDS)
 _DEBATE_FAMILY_MARKER_FIELDS = set(_NAVIGATION_MARKER_FIELDS)
 
 _THEMATIC_CLUSTER_MARKER_FIELDS = set(_NAVIGATION_MARKER_FIELDS)
+
+_MANAGED_GRAPH_MARKER_FIELDS = {
+    "migration_id",
+    "migration_version",
+    "status",
+    "target_engine_version",
+    "target_artifact_schema_version",
+    "rewritten_files",
+    "provider_calls",
+    "source_documents_reread",
+    "source_notes_rewritten",
+    "profile_files_rewritten",
+    "completed_at",
+}
 
 _REVIEW_FIELDS = {"human_review", "review_status", "source_faithfulness_review"}
 _VERSION_FILE_RELATIVES = ("auto-zettelkasten.yml", "11_state/workspace_manifest.yml")
@@ -250,6 +272,13 @@ def migrate_workspace(workspace: Path | str, *, dry_run: bool = False) -> dict[s
         and not (root / "11_state" / "migrations" / f"{THEMATIC_CLUSTER_MIGRATION_ID}.yml").is_file()
         else migrate_thematic_cluster_schema(workspace, dry_run=dry_run)
     )
+    managed_graph = (
+        _managed_graph_not_applicable(dry_run=dry_run, reason="schema_1.10_or_newer")
+        if starting_schema is not None
+        and starting_schema >= (1, 10)
+        and not (root / "11_state" / "migrations" / f"{MANAGED_GRAPH_MIGRATION_ID}.yml").is_file()
+        else migrate_managed_graph_schema(workspace, dry_run=dry_run)
+    )
     return {
         "status": "dry_run" if dry_run else "completed",
         "dry_run": dry_run,
@@ -263,6 +292,7 @@ def migrate_workspace(workspace: Path | str, *, dry_run: bool = False) -> dict[s
             researcher_grade,
             debate_family,
             thematic_clusters,
+            managed_graph,
         ],
         "literature_map": legacy,
         "review_status": review,
@@ -272,6 +302,7 @@ def migrate_workspace(workspace: Path | str, *, dry_run: bool = False) -> dict[s
         "researcher_grade": researcher_grade,
         "debate_family": debate_family,
         "thematic_clusters": thematic_clusters,
+        "managed_graph": managed_graph,
     }
 
 
@@ -960,6 +991,119 @@ def migrate_thematic_cluster_schema(
         raise
     return {"dry_run": False, **payload, "status": "migrated", "marker": str(marker)}
 
+
+def migrate_managed_graph_schema(
+    workspace: Path | str,
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Advance workspace versions to schema 1.10 without rewriting research artifacts."""
+
+    root = resolve_workspace(workspace)
+    marker = root / "11_state" / "migrations" / f"{MANAGED_GRAPH_MIGRATION_ID}.yml"
+    if marker.is_file():
+        payload = read_yaml(marker, {})
+        _validate_managed_graph_marker(payload)
+        schema = _workspace_schema_version(root)
+        target = _parse_schema_version(
+            MANAGED_GRAPH_TARGET_ARTIFACT_SCHEMA_VERSION,
+            field="managed-graph artifact schema",
+        )
+        if schema is None or schema < target:
+            raise ValueError("completed managed-graph migration marker disagrees with workspace schema")
+        return {
+            "dry_run": dry_run,
+            **dict(payload),
+            "status": "already_migrated",
+            "marker": str(marker),
+        }
+
+    schema_version = _workspace_schema_version(root)
+    if schema_version is None:
+        return _managed_graph_not_applicable(
+            dry_run=dry_run,
+            reason="workspace_version_files_absent",
+        )
+    target_schema = _parse_schema_version(
+        MANAGED_GRAPH_TARGET_ARTIFACT_SCHEMA_VERSION,
+        field="managed-graph artifact schema",
+    )
+    if schema_version > target_schema:
+        actual = ".".join(str(value) for value in schema_version)
+        raise ValueError(
+            f"workspace artifact schema {actual} is newer than migration target "
+            f"{MANAGED_GRAPH_TARGET_ARTIFACT_SCHEMA_VERSION}"
+        )
+    if schema_version >= target_schema:
+        return _managed_graph_not_applicable(
+            dry_run=dry_run,
+            reason="schema_1.10_or_newer",
+        )
+    if schema_version < (1, 9) and not dry_run:
+        raise ValueError("managed-graph migration requires the schema-1.9 migration first")
+
+    changes: list[tuple[Path, str, str]] = []
+    for relative in _VERSION_FILE_RELATIVES:
+        path = root / relative
+        original = path.read_text(encoding="utf-8")
+        value = yaml.safe_load(original)
+        if not isinstance(value, Mapping):
+            raise ValueError(f"workspace version file must be a mapping: {path}")
+        updated = dict(value)
+        updated["engine_version"] = MANAGED_GRAPH_TARGET_ENGINE_VERSION
+        updated["artifact_schema_version"] = MANAGED_GRAPH_TARGET_ARTIFACT_SCHEMA_VERSION
+        cleaned = yaml.safe_dump(updated, sort_keys=False, allow_unicode=True, width=10_000)
+        if cleaned != original:
+            changes.append((path, original, cleaned))
+
+    rewritten_files = [
+        {
+            "source": str(path.relative_to(root)),
+            "before_sha256": sha256_text(original),
+            "after_sha256": sha256_text(cleaned),
+        }
+        for path, original, cleaned in changes
+    ]
+    safety = {
+        "target_engine_version": MANAGED_GRAPH_TARGET_ENGINE_VERSION,
+        "target_artifact_schema_version": MANAGED_GRAPH_TARGET_ARTIFACT_SCHEMA_VERSION,
+        "rewritten_files": rewritten_files,
+        "provider_calls": 0,
+        "source_documents_reread": 0,
+        "source_notes_rewritten": 0,
+        "profile_files_rewritten": 0,
+    }
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "dry_run": True,
+            "migration_id": MANAGED_GRAPH_MIGRATION_ID,
+            **safety,
+        }
+
+    written: list[tuple[Path, str]] = []
+    try:
+        for path, original, cleaned in changes:
+            atomic_write_text(path, cleaned)
+            written.append((path, original))
+        for row in rewritten_files:
+            if sha256_file(root / str(row["source"])) != row["after_sha256"]:
+                raise RuntimeError(f"migration target checksum mismatch: {row['source']}")
+        payload = {
+            "migration_id": MANAGED_GRAPH_MIGRATION_ID,
+            "migration_version": MANAGED_GRAPH_MIGRATION_VERSION,
+            "status": "completed",
+            **safety,
+            "completed_at": now_iso(),
+        }
+        write_yaml(marker, payload)
+    except Exception:
+        for path, original in reversed(written):
+            atomic_write_text(path, original)
+        raise
+    return {"dry_run": False, **payload, "status": "migrated", "marker": str(marker)}
+
+
 def migrate_review_status(workspace: Path | str, *, dry_run: bool = False) -> dict[str, Any]:
     """Remove generated review-status material and record safe profile-hash aliases."""
 
@@ -1308,6 +1452,23 @@ def _thematic_cluster_not_applicable(*, dry_run: bool, reason: str) -> dict[str,
         "analytical_identity_changes": 0,
     }
 
+
+def _managed_graph_not_applicable(*, dry_run: bool, reason: str) -> dict[str, Any]:
+    return {
+        "status": "not_applicable",
+        "dry_run": dry_run,
+        "migration_id": MANAGED_GRAPH_MIGRATION_ID,
+        "reason": reason,
+        "target_engine_version": MANAGED_GRAPH_TARGET_ENGINE_VERSION,
+        "target_artifact_schema_version": MANAGED_GRAPH_TARGET_ARTIFACT_SCHEMA_VERSION,
+        "rewritten_files": [],
+        "provider_calls": 0,
+        "source_documents_reread": 0,
+        "source_notes_rewritten": 0,
+        "profile_files_rewritten": 0,
+    }
+
+
 def _validate_navigation_marker(root: Path, value: Any) -> None:
     if not isinstance(value, Mapping):
         raise ValueError("navigation migration marker must be a mapping")
@@ -1509,6 +1670,57 @@ def _validate_thematic_cluster_marker(root: Path, value: Any) -> None:
         if str(row.get("source") or "") not in _VERSION_FILE_RELATIVES:
             raise ValueError("malformed thematic-cluster migration rewritten-file source")
 
+
+def _validate_managed_graph_marker(value: Any) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError("managed-graph migration marker must be a mapping")
+    unknown = sorted(set(value) - _MANAGED_GRAPH_MARKER_FIELDS)
+    missing = sorted(_MANAGED_GRAPH_MARKER_FIELDS - set(value))
+    if unknown or missing:
+        detail = (
+            f"unknown fields: {', '.join(unknown)}"
+            if unknown
+            else f"missing fields: {', '.join(missing)}"
+        )
+        raise ValueError(f"malformed managed-graph migration marker: {detail}")
+    zero_fields = (
+        "provider_calls",
+        "source_documents_reread",
+        "source_notes_rewritten",
+        "profile_files_rewritten",
+    )
+    if (
+        value.get("migration_id") != MANAGED_GRAPH_MIGRATION_ID
+        or str(value.get("migration_version")) != MANAGED_GRAPH_MIGRATION_VERSION
+        or value.get("status") != "completed"
+        or value.get("target_engine_version") != MANAGED_GRAPH_TARGET_ENGINE_VERSION
+        or value.get("target_artifact_schema_version")
+        != MANAGED_GRAPH_TARGET_ARTIFACT_SCHEMA_VERSION
+        or any(type(value.get(field)) is not int or value.get(field) != 0 for field in zero_fields)
+        or not isinstance(value.get("completed_at"), str)
+        or not str(value.get("completed_at") or "").strip()
+    ):
+        raise ValueError("malformed managed-graph migration marker")
+    rewritten_files = value.get("rewritten_files")
+    if not isinstance(rewritten_files, list):
+        raise ValueError("malformed managed-graph migration rewritten-file list")
+    sources: set[str] = set()
+    for row in rewritten_files:
+        if not isinstance(row, Mapping) or set(row) != {
+            "source",
+            "before_sha256",
+            "after_sha256",
+        }:
+            raise ValueError("malformed managed-graph migration rewritten-file record")
+        source = str(row.get("source") or "")
+        if source not in _VERSION_FILE_RELATIVES or source in sources or not all(
+            re.fullmatch(r"[0-9a-f]{64}", str(row.get(field) or ""))
+            for field in ("before_sha256", "after_sha256")
+        ):
+            raise ValueError("malformed managed-graph migration rewritten-file record")
+        sources.add(source)
+
+
 def _validate_proposition_anchor_marker(value: Any) -> None:
     if not isinstance(value, Mapping):
         raise ValueError("proposition-anchor migration marker must be a mapping")
@@ -1625,6 +1837,10 @@ def _validate_existing_markers(root: Path) -> None:
         (
             THEMATIC_CLUSTER_MIGRATION_ID,
             lambda value: _validate_thematic_cluster_marker(root, value),
+        ),
+        (
+            MANAGED_GRAPH_MIGRATION_ID,
+            _validate_managed_graph_marker,
         ),
     )
     for migration_id, validate in marker_validators:

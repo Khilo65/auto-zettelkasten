@@ -36,13 +36,15 @@ from .files import (
 )
 from .indexes import (
     accepted_tags_by_note,
+    build_source_catalogue,
     commit_tag_reviews,
     update_source_set_map,
-    write_source_index,
     write_source_set,
 )
-from .navigation import build_typed_source_relations, rank_human_related_links
+from .navigation import build_typed_source_relations
 from .literature import (
+    _CheckpointedReasonerCalls,
+    build_navigation_projection,
     build_literature_map,
     cluster_display_title,
     cluster_note_stem,
@@ -99,6 +101,16 @@ from .profiles import (
     save_profile,
     validate_profile,
     write_profile_checkpoint,
+)
+from .relationships import (
+    candidate_rows,
+    canonical_pair,
+    persist_relationship_registry,
+    projected_related_links,
+    relationship_decision_key,
+    RELATIONSHIP_PROMPT_VERSION,
+    stable_hash,
+    validate_decisions,
 )
 from .readers import SECTION_KEYS, provider_from_name
 from .workspace import (
@@ -1240,6 +1252,876 @@ def _existing_source_set_paths(
     )
 
 
+def _workspace_graph_inputs(
+    workspace: Path,
+    current_profiles: Sequence[Any],
+) -> tuple[list[dict[str, Any]], list[Any]]:
+    note_rows = all_workspace_note_rows(workspace)
+    current_by_source = {
+        str(profile_to_dict(profile).get("source_id") or ""): profile
+        for profile in current_profiles
+    }
+    current_by_note = {
+        str(profile_to_dict(profile).get("note_id") or ""): profile
+        for profile in current_profiles
+    }
+    profiles: list[Any] = []
+    seen: set[tuple[str, str]] = set()
+    for row in note_rows:
+        source_id = str(row.get("source_id") or "")
+        note_id = str(row.get("note_id") or "")
+        profile = current_by_source.get(source_id) or current_by_note.get(note_id)
+        if profile is None:
+            sidecar = profile_sidecar_path(
+                workspace / "02_source_memory" / "profiles", note_id
+            )
+            if sidecar.is_file():
+                try:
+                    profile = load_profile_sidecar(sidecar)
+                except (OSError, ValueError, TypeError):
+                    profile = None
+        if profile is None or (source_id, note_id) in seen:
+            continue
+        seen.add((source_id, note_id))
+        profiles.append(profile)
+    return note_rows, profiles
+
+
+def _cluster_catalogue_rows(workspace: Path) -> list[dict[str, Any]]:
+    payload = read_yaml(
+        workspace / "03_literature_synthesis" / "cluster_registry.yml", {}
+    ) or {}
+    rows = payload.get("clusters", []) if isinstance(payload, Mapping) else []
+    result = []
+    for row in rows:
+        if not isinstance(row, Mapping) or not row.get("cluster_id"):
+            continue
+        result.append(
+            {
+                "cluster_id": str(row.get("cluster_id") or ""),
+                "title": str(
+                    row.get("display_label")
+                    or row.get("label")
+                    or row.get("semantic_identity")
+                    or ""
+                ),
+                "shared_question": str(
+                    row.get("display_question")
+                    or row.get("shared_question")
+                    or ""
+                ),
+                "bounded_scope": str(row.get("bounded_object") or ""),
+                "core_source_ids": list(row.get("core_source_ids", []) or []),
+                "neighboring_cluster_ids": [
+                    str(value)
+                    for value in row.get("related_cluster_ids", []) or []
+                    if str(value)
+                ],
+                "refresh_pending": bool(row.get("refresh_pending")),
+            }
+        )
+    return sorted(result, key=lambda row: row["cluster_id"])
+
+
+def _cluster_membership_relations(
+    clusters: Sequence[Mapping[str, Any]],
+    profiles: Sequence[Any],
+) -> list[dict[str, Any]]:
+    note_id_by_source = {
+        str(row.get("source_id") or ""): str(row.get("note_id") or "")
+        for row in (profile_to_dict(profile) for profile in profiles)
+        if row.get("source_id")
+    }
+    relations = []
+    for cluster in clusters:
+        cluster_id = str(cluster.get("cluster_id") or "")
+        source_ids = (
+            cluster.get("source_ids")
+            or cluster.get("core_source_ids")
+            or []
+        )
+        for source_id in sorted(str(value) for value in source_ids if str(value)):
+            note_id = note_id_by_source.get(source_id, "")
+            relations.extend(
+                [
+                    {
+                        "relation_id": (
+                            "cluster-member-"
+                            + stable_hash([source_id, cluster_id])[:16]
+                        ),
+                        "source_kind": "source",
+                        "source_id": source_id,
+                        "source_note_id": note_id,
+                        "target_kind": "cluster",
+                        "target_cluster_id": cluster_id,
+                        "relation_type": "cluster_member",
+                        "provenance": "admitted_cluster_registry",
+                        "active": True,
+                    },
+                    {
+                        "relation_id": (
+                            "cluster-has-member-"
+                            + stable_hash([cluster_id, source_id])[:16]
+                        ),
+                        "source_kind": "cluster",
+                        "source_id": cluster_id,
+                        "target_kind": "source",
+                        "target_source_id": source_id,
+                        "target_note_id": note_id,
+                        "relation_type": "has_member",
+                        "provenance": "admitted_cluster_registry",
+                        "active": True,
+                    },
+                ]
+            )
+    return relations
+
+
+def _run_relationship_reasoning(
+    workspace: Path,
+    *,
+    profiles: Sequence[Any],
+    source_set: Mapping[str, Any],
+    catalogue: Mapping[str, Any],
+    reasoner: LiteratureReasoner | None,
+    reasoner_calls: _CheckpointedReasonerCalls | None,
+    request: LiteratureMapRequest,
+) -> dict[str, Any]:
+    selector = getattr(reasoner, "select_relationship_candidates", None)
+    adjudicator = getattr(reasoner, "adjudicate_relationships", None)
+    if (
+        reasoner_calls is None
+        or not callable(selector)
+        or not callable(adjudicator)
+    ):
+        return {
+            "accepted": [],
+            "no_relationship": [],
+            "parked": [],
+            "cluster_candidates": [],
+            "selected_profile_hashes": {},
+            "reconciled_catalogue_revision": "",
+        }
+    profile_by_source = {
+        str(profile_to_dict(profile).get("source_id") or ""): profile
+        for profile in profiles
+        if profile_to_dict(profile).get("source_id")
+        and not profile_to_dict(profile).get("excluded_from_synthesis")
+    }
+    if len(profile_by_source) < 2:
+        return {
+            "accepted": [],
+            "no_relationship": [],
+            "parked": [],
+            "cluster_candidates": [],
+            "selected_profile_hashes": {},
+            "reconciled_catalogue_revision": "",
+        }
+    catalogue_payload = read_yaml(Path(str(catalogue["catalogue_path"])), {}) or {}
+    entries = [
+        dict(row)
+        for row in catalogue_payload.get("sources", []) or []
+        if isinstance(row, Mapping) and row.get("source_id")
+    ]
+    shards = [
+        dict(row)
+        for row in catalogue_payload.get("shards", []) or []
+        if isinstance(row, Mapping) and row.get("literature_id")
+    ]
+    cluster_catalogue = _cluster_catalogue_rows(workspace)
+    registry = read_yaml(
+        workspace / "02_source_memory" / "indexes" / "typed_links.yml", {}
+    ) or {}
+    existing_links = [
+        dict(row)
+        for row in (
+            registry.get("links", []) if isinstance(registry, Mapping) else []
+        )
+        if isinstance(row, Mapping)
+    ]
+    decided_pair_keys = {
+        str(row.get("decision_key") or "")
+        for row in (
+            registry.get("pair_decisions", [])
+            if isinstance(registry, Mapping)
+            else []
+        )
+        if isinstance(row, Mapping) and row.get("decision_key")
+    }
+    relationship_provider = str(getattr(reasoner, "name", "") or request.provider)
+    relationship_model = str(getattr(reasoner, "model", "") or request.model)
+    state_path = (
+        workspace
+        / "02_source_memory"
+        / "indexes"
+        / "relationship_selection_state.yml"
+    )
+    state = read_yaml(state_path, {}) or {}
+    prior_hashes = (
+        dict(state.get("profile_hashes", {}) or {})
+        if isinstance(state, Mapping)
+        else {}
+    )
+    current_hashes = {
+        source_id: stable_hash(profile_to_dict(profile))
+        for source_id, profile in profile_by_source.items()
+    }
+    catalogue_revision = str(
+        catalogue.get("routing_revision_hash")
+        or catalogue.get("revision_hash")
+        or ""
+    )
+    reconciliation = (
+        str(source_set.get("source_set_type") or "")
+        == "auto_zettelkasten_workspace"
+        and str(state.get("reconciled_catalogue_revision") or "")
+        != catalogue_revision
+    )
+    focus_ids = sorted(
+        source_id
+        for source_id, profile_hash in current_hashes.items()
+        if reconciliation or str(prior_hashes.get(source_id) or "") != profile_hash
+    )
+    if not focus_ids:
+        return {
+            "accepted": [],
+            "no_relationship": [],
+            "parked": [],
+            "cluster_candidates": [],
+            "selected_profile_hashes": {},
+            "reconciled_catalogue_revision": "",
+        }
+    candidates: list[dict[str, Any]] = []
+    parked: list[dict[str, Any]] = []
+    incomplete_source_ids: set[str] = set()
+    shard_selector = getattr(reasoner, "select_relationship_shards", None)
+    for start in range(0, len(focus_ids), 8):
+        batch_ids = focus_ids[start : start + 8]
+        batch_profiles = [profile_by_source[source_id] for source_id in batch_ids]
+        selected_shard_ids: set[str] = set()
+        if len(entries) > 250 and callable(shard_selector):
+            try:
+                shard_response = reasoner_calls(
+                    "relationship_shard_selection",
+                    f"batch-{stable_hash(batch_ids)[:16]}",
+                    "select_relationship_shards",
+                    batch_profiles,
+                    {
+                        "catalogue_revision": catalogue_revision,
+                        "shards": shards,
+                        "cluster_catalogue": cluster_catalogue,
+                        "existing_neighbors": _relationship_neighbors(
+                            batch_ids, existing_links
+                        ),
+                    },
+                )
+                allowed_shards = {
+                    str(row.get("shard_id") or "") for row in shards
+                }
+                selected_shard_ids.update(
+                    str(value)
+                    for value in shard_response.get("shard_ids", []) or []
+                    if str(value) in allowed_shards
+                )
+            except Exception as exc:
+                parked.append(
+                    {
+                        "source_ids": batch_ids,
+                        "reason": "relationship_shard_selection_failure",
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    }
+                )
+        if len(entries) > 250:
+            selected_shard_ids.update(
+                str(row.get("shard_id") or "")
+                for row in shards
+                if set(str(value) for value in row.get("source_ids", []) or [])
+                & set(batch_ids)
+            )
+        selected_source_ids = {
+            str(value)
+            for row in shards
+            if str(row.get("shard_id") or "") in selected_shard_ids
+            for value in row.get("source_ids", []) or []
+            if str(value)
+        }
+        selected_entries = (
+            [
+                row
+                for row in entries
+                if str(row.get("source_id") or "") in selected_source_ids
+            ]
+            if len(entries) > 250 and selected_source_ids
+            else entries
+        )
+        try:
+            response = reasoner_calls(
+                "relationship_candidate_selection",
+                f"batch-{stable_hash(batch_ids)[:16]}",
+                "select_relationship_candidates",
+                batch_profiles,
+                {
+                    "catalogue_revision": catalogue_revision,
+                    "catalogue_entries": selected_entries,
+                    "cluster_catalogue": cluster_catalogue,
+                    "existing_neighbors": _relationship_neighbors(
+                        batch_ids, existing_links
+                    ),
+                },
+            )
+        except Exception as exc:
+            incomplete_source_ids.update(batch_ids)
+            parked.append(
+                {
+                    "source_ids": batch_ids,
+                    "reason": "relationship_candidate_selection_failure",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            )
+            continue
+        valid, invalid = candidate_rows(
+            response,
+            focus_source_ids=batch_ids,
+            available_source_ids=list(profile_by_source),
+            available_cluster_ids=[
+                str(row["cluster_id"]) for row in cluster_catalogue
+            ],
+        )
+        candidates.extend(valid)
+        parked.extend(invalid)
+        for source_id in batch_ids:
+            for link in existing_links:
+                left = str(link.get("source_id") or "")
+                right = str(link.get("target_source_id") or "")
+                if str(link.get("relation_type") or "") not in {
+                    "supports",
+                    "undermines",
+                    "qualifies",
+                    "extends",
+                    "complements",
+                    "rival_explanation",
+                    "boundary_contrast",
+                    "methodological_fault_line",
+                    "sequential_relationship",
+                    "interpretive_or_normative_disagreement",
+                }:
+                    continue
+                target_id = right if left == source_id else left if right == source_id else ""
+                if target_id in profile_by_source:
+                    candidates.append(
+                        {
+                            "source_id": source_id,
+                            "target_kind": "source",
+                            "target_id": target_id,
+                            "why_relevant": "Existing accepted relationship requires review after profile change.",
+                            "comparison_unit": str(
+                                link.get("comparison_unit") or ""
+                            ),
+                            "likely_relation_type": str(
+                                link.get("relation_type") or ""
+                            ),
+                            "requested_evidence_depth": "profile",
+                            "confidence": 1.0,
+                        }
+                    )
+    source_candidates = {
+        canonical_pair(
+            str(row.get("source_id") or ""),
+            str(row.get("target_id") or ""),
+        ): row
+        for row in candidates
+        if row.get("target_kind") == "source"
+        and row.get("source_id") in profile_by_source
+        and row.get("target_id") in profile_by_source
+    }
+    cluster_candidates = [
+        dict(row)
+        for row in candidates
+        if row.get("target_kind") == "cluster"
+    ]
+    accepted: list[dict[str, Any]] = []
+    no_relationship: list[dict[str, Any]] = []
+    needs_context: list[dict[str, Any]] = []
+    pair_rows = [
+        (pair, row)
+        for pair, row in sorted(source_candidates.items())
+        if relationship_decision_key(
+            pair[0],
+            pair[1],
+            current_hashes[pair[0]],
+            current_hashes[pair[1]],
+            provider=relationship_provider,
+            model=relationship_model,
+        )
+        not in decided_pair_keys
+    ]
+    for start in range(0, len(pair_rows), 8):
+        packet = pair_rows[start : start + 8]
+        pairs = [pair for pair, _ in packet]
+        packet_source_ids = sorted({value for pair in pairs for value in pair})
+        packet_profiles = [
+            profile_by_source[source_id] for source_id in packet_source_ids
+        ]
+        try:
+            response = reasoner_calls(
+                "relationship_adjudication",
+                f"pairs-{stable_hash(pairs)[:16]}",
+                "adjudicate_relationships",
+                packet_profiles,
+                {
+                    "pairs": [
+                        {
+                            "source_id": pair[0],
+                            "target_source_id": pair[1],
+                            "candidate_reason": row.get("why_relevant", ""),
+                            "comparison_unit": row.get("comparison_unit", ""),
+                        }
+                        for pair, row in packet
+                    ]
+                },
+            )
+        except Exception as exc:
+            incomplete_source_ids.update(packet_source_ids)
+            parked.extend(
+                {
+                    "source_id": pair[0],
+                    "target_source_id": pair[1],
+                    "reason": "relationship_adjudication_failure",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+                for pair in pairs
+            )
+            continue
+        result = validate_decisions(
+            response, offered_pairs=pairs, profiles=packet_profiles
+        )
+        for key in ("accepted", "no_relationship"):
+            for row in result[key]:
+                row.update(
+                    provider=relationship_provider,
+                    model=relationship_model,
+                    prompt_version=RELATIONSHIP_PROMPT_VERSION,
+                )
+        accepted.extend(result["accepted"])
+        no_relationship.extend(result["no_relationship"])
+        needs_context.extend(result["needs_more_context"])
+        parked.extend(result["parked"])
+        decided = {
+            canonical_pair(
+                str(row.get("source_id") or ""),
+                str(row.get("target_source_id") or ""),
+            )
+            for key in ("accepted", "no_relationship", "needs_more_context")
+            for row in result[key]
+        }
+        needs_context.extend(
+            {
+                "source_id": pair[0],
+                "target_source_id": pair[1],
+                "reason": "missing_or_malformed_pair_decision",
+                "requested_context": ["atomic_note"],
+            }
+            for pair in pairs
+            if pair not in decided
+        )
+    for start in range(0, len(needs_context), 8):
+        unresolved = needs_context[start : start + 8]
+        pairs = [
+            canonical_pair(
+                str(row["source_id"]), str(row["target_source_id"])
+            )
+            for row in unresolved
+        ]
+        packet_source_ids = sorted({value for pair in pairs for value in pair})
+        packet_profiles = [
+            profile_by_source[source_id] for source_id in packet_source_ids
+        ]
+        try:
+            response = reasoner_calls(
+                "relationship_escalation",
+                f"pairs-{stable_hash(pairs)[:16]}",
+                "adjudicate_relationships",
+                packet_profiles,
+                {
+                    "pairs": unresolved,
+                    "atomic_notes": _relationship_atomic_notes(
+                        workspace, packet_profiles
+                    ),
+                    "focused_escalation": True,
+                },
+            )
+        except Exception as exc:
+            incomplete_source_ids.update(packet_source_ids)
+            parked.extend(
+                {
+                    **row,
+                    "reason": "relationship_escalation_failure",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+                for row in unresolved
+            )
+            continue
+        result = validate_decisions(
+            response, offered_pairs=pairs, profiles=packet_profiles
+        )
+        for key in ("accepted", "no_relationship"):
+            for row in result[key]:
+                row.update(
+                    provider=relationship_provider,
+                    model=relationship_model,
+                    prompt_version=RELATIONSHIP_PROMPT_VERSION,
+                )
+        accepted.extend(result["accepted"])
+        no_relationship.extend(result["no_relationship"])
+        parked.extend(result["parked"])
+        parked.extend(
+            {
+                **row,
+                "reason": "needs_more_context_after_single_escalation",
+            }
+            for row in result["needs_more_context"]
+        )
+    return {
+        "accepted": accepted,
+        "no_relationship": no_relationship,
+        "parked": parked,
+        "cluster_candidates": cluster_candidates,
+        "selected_profile_hashes": {
+            source_id: current_hashes[source_id]
+            for source_id in focus_ids
+            if source_id not in incomplete_source_ids
+        },
+        "reconciled_catalogue_revision": (
+            catalogue_revision if reconciliation else ""
+        ),
+        "state_path": str(state_path),
+    }
+
+
+def _relationship_neighbors(
+    source_ids: Sequence[str], relations: Sequence[Mapping[str, Any]]
+) -> list[dict[str, Any]]:
+    focus = set(source_ids)
+    return [
+        dict(row)
+        for row in relations
+        if str(row.get("source_id") or "") in focus
+        or str(row.get("target_source_id") or "") in focus
+    ]
+
+
+def _relationship_atomic_notes(
+    workspace: Path, profiles: Sequence[Any]
+) -> list[dict[str, str]]:
+    notes = []
+    for profile in profiles:
+        row = profile_to_dict(profile)
+        context = (
+            row.get("context")
+            if isinstance(row.get("context"), Mapping)
+            else {}
+        )
+        path = workspace / str(context.get("note_path") or "")
+        if not path.is_file():
+            continue
+        notes.append(
+            {
+                "source_id": str(row.get("source_id") or ""),
+                "note_id": str(row.get("note_id") or ""),
+                "atomic_note": internal_note_text(path),
+            }
+        )
+    return notes
+
+
+def _commit_relationship_selection_state(
+    workspace: Path,
+    result: Mapping[str, Any],
+    *,
+    catalogue_revision: str,
+) -> Path | None:
+    selected = dict(result.get("selected_profile_hashes", {}) or {})
+    reconciled = str(result.get("reconciled_catalogue_revision") or "")
+    if not selected and not reconciled:
+        return None
+    path = Path(
+        str(
+            result.get("state_path")
+            or workspace
+            / "02_source_memory"
+            / "indexes"
+            / "relationship_selection_state.yml"
+        )
+    )
+    existing = read_yaml(path, {}) or {}
+    profile_hashes = dict(existing.get("profile_hashes", {}) or {})
+    profile_hashes.update(selected)
+    payload = {
+        "state_schema_version": "1",
+        "profile_hashes": dict(sorted(profile_hashes.items())),
+        "reconciled_catalogue_revision": reconciled
+        or str(existing.get("reconciled_catalogue_revision") or ""),
+        "catalogue_revision": catalogue_revision,
+    }
+    if existing != payload:
+        write_yaml(path, payload)
+    return path
+
+
+def _write_relationship_run_ledger(
+    workspace: Path, run_id: str, result: Mapping[str, Any]
+) -> Path:
+    path = (
+        run_directory(workspace, run_id)
+        / "literature"
+        / "relationships"
+        / "parked.yml"
+    )
+    payload = {
+        "ledger_schema_version": "1",
+        "parked": [
+            dict(row)
+            for row in result.get("parked", []) or []
+            if isinstance(row, Mapping)
+        ],
+        "accepted_relation_ids": sorted(
+            str(row.get("relation_id") or "")
+            for row in result.get("accepted", []) or []
+            if isinstance(row, Mapping) and row.get("relation_id")
+        ),
+        "no_relationship_count": len(
+            result.get("no_relationship", []) or []
+        ),
+        "cluster_candidates": [
+            dict(row)
+            for row in result.get("cluster_candidates", []) or []
+            if isinstance(row, Mapping)
+        ],
+    }
+    existing = read_yaml(path, {}) or {}
+    if existing != payload:
+        write_yaml(path, payload)
+    return path
+
+
+def _existing_gap_projection(
+    frontmatter: Mapping[str, Any], body: str
+) -> list[dict[str, str]]:
+    gap_ids = [str(value) for value in frontmatter.get("gaps", []) or []]
+    wikilinks = [str(value) for value in frontmatter.get("gap_links", []) or []]
+    rows = []
+    for index, gap_id in enumerate(gap_ids):
+        wikilink = wikilinks[index] if index < len(wikilinks) else f"[[{gap_id}]]"
+        relation_type = "gap"
+        target = wikilink.split("|", 1)[0].removeprefix("[[")
+        match = re.search(
+            rf"^-\s+([^:]+):\s+{re.escape(wikilink)}\s*$|"
+            rf"^-\s+([^:]+):\s+\[\[{re.escape(target)}(?:\|[^\]]+)?\]\]\s*$",
+            body,
+            flags=re.MULTILINE,
+        )
+        if match:
+            relation_type = str(match.group(1) or match.group(2) or "gap")
+        rows.append(
+            {
+                "gap_id": gap_id,
+                "relation_type": relation_type,
+                "wikilink": wikilink,
+            }
+        )
+    return rows
+
+
+def _project_atomic_graph(
+    workspace: Path,
+    *,
+    note_rows: Sequence[Mapping[str, Any]],
+    profiles: Sequence[Any],
+    relations: Sequence[Mapping[str, Any]],
+    navigation: Mapping[str, Any],
+    navigation_policy: Any,
+    clusters: Sequence[Mapping[str, Any]] = (),
+    gaps: Sequence[Mapping[str, Any]] = (),
+    cluster_scope_note_ids: Sequence[str] = (),
+) -> list[Path]:
+    profile_rows = [
+        dict(profile) if isinstance(profile, Mapping) else profile_to_dict(profile)
+        for profile in profiles
+    ]
+    note_stem_by_id = {
+        str(row.get("note_id") or ""): Path(str(row.get("note_path") or "")).stem
+        for row in note_rows
+    }
+    subject_tags_by_note: dict[str, list[str]] = defaultdict(list)
+    for assignment in navigation.get("assignments", []) or []:
+        if not isinstance(assignment, Mapping) or not assignment.get("visible"):
+            continue
+        note_id = str(assignment.get("note_id") or "")
+        tag = str(assignment.get("canonical_tag") or "")
+        if note_id and tag and tag not in subject_tags_by_note[note_id]:
+            subject_tags_by_note[note_id].append(tag)
+    cluster_by_id = {
+        str(row.get("cluster_id") or ""): dict(row)
+        for row in clusters
+        if row.get("cluster_id")
+    }
+    clusters_by_note: dict[str, list[str]] = defaultdict(list)
+    for cluster_id, cluster in cluster_by_id.items():
+        for note_id in cluster.get("note_ids", []) or []:
+            clusters_by_note[str(note_id)].append(cluster_id)
+    gap_by_id = {
+        str(row.get("gap_id") or ""): dict(row)
+        for row in gaps
+        if row.get("gap_id")
+    }
+    note_id_by_source = {
+        str(row.get("source_id") or ""): str(row.get("note_id") or "")
+        for row in note_rows
+        if row.get("source_id") and row.get("note_id")
+    }
+    gaps_by_note: dict[str, list[dict[str, str]]] = defaultdict(list)
+
+    def add_gap(source_id: Any, gap_id: str, relation_type: str) -> None:
+        note_id = note_id_by_source.get(str(source_id or ""))
+        row = {"gap_id": gap_id, "relation_type": relation_type}
+        if note_id and row not in gaps_by_note[note_id]:
+            gaps_by_note[note_id].append(row)
+
+    for gap in gaps:
+        gap_id = str(gap.get("gap_id") or "")
+        for evidence in gap.get("supporting_evidence", []) or []:
+            add_gap(evidence.get("source_id"), gap_id, "supports_gap_rule")
+        for evidence in gap.get("countervailing_evidence", []) or []:
+            add_gap(
+                evidence.get("source_id"), gap_id, "countervailing_gap_evidence"
+            )
+    explicit_scope = set(cluster_scope_note_ids)
+    paths: list[Path] = []
+    for row in note_rows:
+        path = workspace / str(row.get("note_path") or "")
+        if not path.is_file():
+            continue
+        note_id = str(row.get("note_id") or "")
+        source_id = str(row.get("source_id") or "")
+        related_links = [
+            {
+                "note_id": str(link.get("target_note_id") or ""),
+                "relation_type": str(
+                    link.get("primary_relation_type") or "semantic_similarity"
+                ),
+                "reason": str(link.get("reason") or ""),
+                "target_stem": note_stem_by_id.get(
+                    str(link.get("target_note_id") or ""),
+                    str(link.get("target_note_id") or ""),
+                ),
+            }
+            for link in projected_related_links(
+                source_id,
+                profile_rows,
+                relations,
+                max_inferred_links=int(
+                    getattr(
+                        navigation_policy,
+                        "max_inferred_related_note_links",
+                        8,
+                    )
+                ),
+            )
+            if link.get("target_note_id")
+        ]
+        current = read_note(path)
+        front = current["frontmatter"]
+        if note_id in explicit_scope:
+            cluster_ids = sorted(clusters_by_note.get(note_id, []))
+            cluster_wikilinks = {
+                cluster_id: (
+                    f"[[{cluster_note_stem(cluster_by_id[cluster_id])}|"
+                    f"{cluster_display_title(cluster_by_id[cluster_id])}]]"
+                )
+                for cluster_id in cluster_ids
+                if cluster_id in cluster_by_id
+            }
+            note_gap_links = [
+                {
+                    **link,
+                    "wikilink": (
+                        f"[[{gap_note_stem(gap_by_id[link['gap_id']])}|"
+                        f"{gap_display_title(gap_by_id[link['gap_id']])}]]"
+                    ),
+                }
+                for link in sorted(
+                    gaps_by_note.get(note_id, []),
+                    key=lambda value: (
+                        value["gap_id"],
+                        value["relation_type"],
+                    ),
+                )
+                if link["gap_id"] in gap_by_id
+            ]
+            tags = sorted(subject_tags_by_note.get(note_id, []))
+        else:
+            cluster_ids = [str(value) for value in front.get("clusters", []) or []]
+            cluster_links = [
+                str(value) for value in front.get("cluster_links", []) or []
+            ]
+            cluster_wikilinks = {
+                cluster_id: (
+                    cluster_links[index]
+                    if index < len(cluster_links)
+                    else f"[[{cluster_id}]]"
+                )
+                for index, cluster_id in enumerate(cluster_ids)
+            }
+            note_gap_links = _existing_gap_projection(
+                front, str(current.get("body") or "")
+            )
+            tags = list(front.get("tags", []) or [])
+        gap_ids = sorted({link["gap_id"] for link in note_gap_links})
+        gap_wikilinks = {
+            link["gap_id"]: str(link["wikilink"]) for link in note_gap_links
+        }
+        update_note_graph(
+            path,
+            {
+                "related_notes": [
+                    {
+                        "note_id": link["note_id"],
+                        "relation_type": link["relation_type"],
+                        "reason": link.get("reason", ""),
+                        "wikilink": f"[[{link['target_stem']}]]",
+                    }
+                    for link in related_links
+                ],
+                "clusters": cluster_ids,
+                "cluster_links": [
+                    cluster_wikilinks[cluster_id]
+                    for cluster_id in cluster_ids
+                    if cluster_id in cluster_wikilinks
+                ],
+                "gaps": gap_ids,
+                "gap_links": [
+                    gap_wikilinks[gap_id]
+                    for gap_id in gap_ids
+                    if gap_id in gap_wikilinks
+                ],
+                "tags": tags,
+                "engine_version": ENGINE_VERSION,
+                "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+                "updated_at": now_iso(),
+            },
+            related_links,
+            cluster_ids,
+            note_gap_links,
+            cluster_wikilinks,
+        )
+        paths.append(path)
+    return paths
+
+
 def rebuild_map(
     workspace: Path,
     *,
@@ -1267,26 +2149,32 @@ def rebuild_map(
             max_inferred_links_per_source=effective_request.navigation_policy.max_inferred_related_note_links,
         )
         typed = {
-            "path": str(workspace / "02_source_memory" / "indexes" / "typed_links.yml"),
-            "compatibility_path": str(
-                workspace / "02_source_memory" / "indexes" / "typed_note_links.yml"
-            ),
-            "links": relations,
-            "link_count": len(relations),
+            **persist_relationship_registry(
+                workspace,
+                structural_relations=relations,
+            )
         }
-        typed_payload = {
-            "updated_at": now_iso(),
-            "relations": relations,
-            "links": relations,
-        }
-        write_yaml(Path(typed["path"]), typed_payload)
-        write_yaml(Path(typed["compatibility_path"]), typed_payload)
-        note_paths = [
-            workspace / str(row["note_path"])
-            for row in note_rows
-            if row.get("note_path") and (workspace / str(row["note_path"])).is_file()
-        ]
-        source_index = write_source_index(workspace, note_paths)
+        workspace_note_rows, workspace_profiles = _workspace_graph_inputs(
+            workspace, []
+        )
+        graph_profiles: Sequence[Any] = (
+            workspace_profiles or workspace_note_rows
+        )
+        note_paths = _project_atomic_graph(
+            workspace,
+            note_rows=workspace_note_rows,
+            profiles=graph_profiles,
+            relations=typed.get("links", []) or [],
+            navigation={"typed_relations": relations, "assignments": []},
+            navigation_policy=effective_request.navigation_policy,
+        )
+        catalogue = build_source_catalogue(
+            workspace,
+            workspace_profiles,
+            workspace_note_rows,
+            _cluster_catalogue_rows(workspace),
+        )
+        source_index = Path(catalogue["master_index_path"])
         if progress is not None:
             progress.set_stage("reporting")
         return {
@@ -1319,6 +2207,11 @@ def rebuild_map(
                 Path(typed["path"]),
                 Path(typed["compatibility_path"]),
                 source_index,
+                Path(catalogue["catalogue_path"]),
+                Path(catalogue["cluster_catalogue_path"]),
+                Path(catalogue["cluster_index_path"]),
+                *(Path(path) for path in catalogue.get("shard_paths", []) or []),
+                *note_paths,
             ],
         }
     migration = migrate_workspace(workspace)
@@ -1377,14 +2270,6 @@ def rebuild_map(
             literature_provider_call_count=int(profile_result["provider_calls"]),
             literature_failure_count=int(profile_result["failure_count"]),
         )
-    typed = {
-        "path": str(workspace / "02_source_memory" / "indexes" / "typed_links.yml"),
-        "compatibility_path": str(
-            workspace / "02_source_memory" / "indexes" / "typed_note_links.yml"
-        ),
-        "links": [],
-        "link_count": 0,
-    }
     base_literature_request = LiteratureMapRequest(
         workspace=workspace,
         source_set_id=str(source_set.get("source_set_id") or ""),
@@ -1396,6 +2281,108 @@ def rebuild_map(
         allow_cloud=effective_request.allow_cloud,
         literature_policy=effective_request.literature_policy,
     )
+    reasoner_calls = (
+        _CheckpointedReasonerCalls(
+            workspace,
+            run_id,
+            reasoner,
+            base_literature_request,
+            stage_callback=(
+                progress.set_stage if progress is not None else None
+            ),
+        )
+        if reasoner is not None
+        else None
+    )
+    workspace_note_rows, workspace_profiles = _workspace_graph_inputs(
+        workspace, profiles
+    )
+    existing_clusters = _cluster_catalogue_rows(workspace)
+    navigation = build_navigation_projection(
+        workspace,
+        workspace_profiles,
+        workspace_note_rows,
+        navigation_policy=effective_request.navigation_policy,
+    )
+    persist_relationship_registry(
+        workspace,
+        structural_relations=navigation.get("typed_relations", []) or [],
+        preserve_unmentioned_structural=True,
+    )
+    catalogue = build_source_catalogue(
+        workspace,
+        workspace_profiles,
+        workspace_note_rows,
+        existing_clusters,
+    )
+    try:
+        relationship_result = _run_relationship_reasoning(
+            workspace,
+            profiles=workspace_profiles,
+            source_set=source_set,
+            catalogue=catalogue,
+            reasoner=reasoner,
+            reasoner_calls=reasoner_calls,
+            request=base_literature_request,
+        )
+    except Exception as exc:
+        relationship_result = {
+            "accepted": [],
+            "no_relationship": [],
+            "parked": [
+                {
+                    "reason": "relationship_stage_failure",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "retry_on_resume": True,
+                }
+            ],
+            "cluster_candidates": [],
+            "selected_profile_hashes": {},
+            "reconciled_catalogue_revision": "",
+        }
+    relationship_ledger_path = _write_relationship_run_ledger(
+        workspace, run_id, relationship_result
+    )
+    typed = persist_relationship_registry(
+        workspace,
+        structural_relations=navigation.get("typed_relations", []) or [],
+        accepted_relations=relationship_result.get("accepted", []) or [],
+        no_relationship_decisions=relationship_result.get(
+            "no_relationship", []
+        )
+        or [],
+        parked_rows=relationship_result.get("parked", []) or [],
+    )
+    graph_note_paths = _project_atomic_graph(
+        workspace,
+        note_rows=workspace_note_rows,
+        profiles=workspace_profiles,
+        relations=typed.get("links", []) or [],
+        navigation=navigation,
+        navigation_policy=effective_request.navigation_policy,
+    )
+    selection_state_path = _commit_relationship_selection_state(
+        workspace,
+        relationship_result,
+        catalogue_revision=str(
+            catalogue.get("routing_revision_hash")
+            or catalogue.get("revision_hash")
+            or ""
+        ),
+    )
+    graph_paths = [
+        Path(typed["path"]),
+        Path(typed["compatibility_path"]),
+        Path(catalogue["catalogue_path"]),
+        Path(catalogue["master_index_path"]),
+        Path(catalogue["cluster_catalogue_path"]),
+        Path(catalogue["cluster_index_path"]),
+        *(Path(path) for path in catalogue.get("shard_paths", []) or []),
+        relationship_ledger_path,
+        *graph_note_paths,
+        *([selection_state_path] if selection_state_path is not None else []),
+    ]
     try:
         cluster_map, gap_map, packet, paths = build_literature_map(
             workspace,
@@ -1409,17 +2396,43 @@ def rebuild_map(
             reasoner=reasoner,
             stage_callback=(progress.set_stage if progress is not None else None),
             navigation_policy=effective_request.navigation_policy,
+            reasoner_calls=reasoner_calls,
+            accepted_relationships=typed.get("links", []) or [],
+            relationship_candidates=relationship_result.get(
+                "cluster_candidates", []
+            )
+            or [],
         )
     except Exception as exc:
         reason = f"literature_synthesis_partial:{type(exc).__name__}:{exc}"
         if profile_partial_reason:
             reason = f"{profile_partial_reason};{reason}"
+        synthesis_calls = int(
+            getattr(reasoner_calls, "provider_calls", 0) or 0
+        )
+        synthesis_hits = int(
+            getattr(reasoner_calls, "checkpoint_hits", 0) or 0
+        )
+        synthesis_failures = int(
+            getattr(reasoner_calls, "failures", 0) or 0
+        )
         if progress is not None:
             progress.update_literature(
-                literature_failure_count=int(
-                    progress.literature.get("literature_failure_count", 0) or 0
+                synthesis_call_count=synthesis_calls,
+                synthesis_checkpoint_hit_count=synthesis_hits,
+                synthesis_failure_count=synthesis_failures,
+                literature_provider_call_count=int(
+                    profile_result.get("provider_calls", 0) or 0
                 )
-                + 1
+                + synthesis_calls,
+                checkpoint_hit_count=int(
+                    profile_result.get("checkpoint_hits", 0) or 0
+                )
+                + synthesis_hits,
+                literature_failure_count=int(
+                    profile_result.get("failure_count", 0) or 0
+                )
+                + synthesis_failures,
             )
         return {
             "source_set": dict(source_set),
@@ -1434,7 +2447,13 @@ def rebuild_map(
                 "gap_candidates": [],
                 "novelty_claimed": False,
             },
-            "literature_packet": {"status": "partial", "reason": reason},
+            "literature_packet": {
+                "status": "partial",
+                "reason": reason,
+                "synthesis_call_count": synthesis_calls,
+                "synthesis_checkpoint_hit_count": synthesis_hits,
+                "synthesis_failure_count": synthesis_failures,
+            },
             "typed_links": typed,
             "profiles": profiles,
             "profile_result": {
@@ -1443,8 +2462,7 @@ def rebuild_map(
             "migration": migration,
             "partial_reason": reason,
             "paths": [
-                Path(typed["path"]),
-                Path(typed["compatibility_path"]),
+                *graph_paths,
                 *profile_result["paths"],
                 *_existing_source_set_paths(workspace, source_set),
             ],
@@ -1459,16 +2477,37 @@ def rebuild_map(
         for row in navigation.get("typed_relations", []) or []
         if isinstance(row, Mapping)
     ]
-    typed = {
-        "path": str(workspace / "02_source_memory" / "indexes" / "typed_links.yml"),
-        "compatibility_path": str(
-            workspace / "02_source_memory" / "indexes" / "typed_note_links.yml"
-        ),
-        "links": navigation_relations,
-        "link_count": len(navigation_relations),
-        "relation_counts": dict(navigation.get("typed_relation_counts", {}) or {}),
-        "graph_projection_hash": str(navigation.get("graph_projection_hash") or ""),
+    combined_structural = {
+        str(
+            row.get("relation_id")
+            or row.get("link_id")
+            or stable_hash(row)
+        ): dict(row)
+        for row in [
+            *(navigation.get("typed_relations", []) or []),
+            *(
+                build_navigation_projection(
+                    workspace,
+                    workspace_profiles,
+                    workspace_note_rows,
+                    navigation_policy=effective_request.navigation_policy,
+                ).get("typed_relations", [])
+                or []
+            ),
+            *_cluster_membership_relations(
+                [
+                    *existing_clusters,
+                    *(cluster_map.get("clusters", []) or []),
+                ],
+                workspace_profiles,
+            ),
+        ]
+        if isinstance(row, Mapping)
     }
+    typed = persist_relationship_registry(
+        workspace,
+        structural_relations=combined_structural.values(),
+    )
     profile_packet_paths = [
         path
         for path in profile_result["paths"]
@@ -1584,165 +2623,111 @@ def rebuild_map(
             active_gap_packet="",
             active_synthesis_packet="",
         )
-    profile_rows_for_links = [profile_to_dict(profile) for profile in profiles]
-    related: dict[str, list[dict[str, Any]]] = {}
-    for profile in profile_rows_for_links:
-        source_id = str(profile.get("source_id") or "")
-        note_id = str(profile.get("note_id") or "")
-        if not source_id or not note_id:
-            continue
-        related[note_id] = [
-            {
-                "note_id": str(link.get("target_note_id") or ""),
-                "relation_type": str(
-                    link.get("primary_relation_type") or "semantic_similarity"
-                ),
-                "reason": str(link.get("reason") or ""),
-            }
-            for link in rank_human_related_links(
-                source_id,
-                profile_rows_for_links,
-                navigation_relations,
-                max_inferred_links=effective_request.navigation_policy.max_inferred_related_note_links,
-            )
-            if link.get("target_note_id")
-        ]
-    subject_tags_by_note: dict[str, list[str]] = defaultdict(list)
-    for assignment in navigation.get("assignments", []) or []:
-        if not isinstance(assignment, Mapping) or not assignment.get("visible"):
-            continue
-        note_id = str(assignment.get("note_id") or "")
-        canonical_tag = str(assignment.get("canonical_tag") or "")
-        if (
-            note_id
-            and canonical_tag
-            and canonical_tag not in subject_tags_by_note[note_id]
-        ):
-            subject_tags_by_note[note_id].append(canonical_tag)
-    clusters_by_note: dict[str, list[str]] = {}
-    cluster_by_id = {
-        str(cluster["cluster_id"]): cluster for cluster in cluster_map["clusters"]
-    }
-    for cluster in cluster_by_id.values():
-        for note_id in cluster.get("note_ids", []):
-            clusters_by_note.setdefault(str(note_id), []).append(
-                str(cluster["cluster_id"])
-            )
-    gap_by_id = {
-        str(gap["gap_id"]): gap
-        for gap in gap_map.get("gap_candidates", []) or []
-        if gap.get("gap_id")
-    }
-    note_id_by_source = {
-        str(row["source_id"]): str(row["note_id"])
+    current_note_ids = [
+        str(row.get("note_id") or "")
         for row in note_rows
-        if row.get("source_id") and row.get("note_id")
-    }
-    gaps_by_note: dict[str, list[dict[str, str]]] = {}
-
-    def add_gap_relation(source_id: Any, gap_id: str, relation_type: str) -> None:
-        note_id = note_id_by_source.get(str(source_id or ""))
-        if not note_id:
-            return
-        relation = {"gap_id": gap_id, "relation_type": relation_type}
-        if relation not in gaps_by_note.setdefault(note_id, []):
-            gaps_by_note[note_id].append(relation)
-
-    for gap in gap_map.get("gap_candidates", []) or []:
-        gap_id = str(gap.get("gap_id") or "")
-        if not gap_id:
-            continue
-        for evidence in gap.get("supporting_evidence", []) or []:
-            add_gap_relation(evidence.get("source_id"), gap_id, "supports_gap_rule")
-        for evidence in gap.get("countervailing_evidence", []) or []:
-            add_gap_relation(
-                evidence.get("source_id"), gap_id, "countervailing_gap_evidence"
-            )
-        for warning in gap.get("warnings", []) or []:
-            if warning.get("warning") == "possible_counterevidence_requires_full_text":
-                add_gap_relation(
-                    warning.get("source_id"), gap_id, str(warning["warning"])
-                )
-    note_stem_by_id = {
-        str(row["note_id"]): Path(str(row["note_path"])).stem for row in note_rows
-    }
-    note_paths: list[Path] = []
-    for row in note_rows:
-        path = workspace / str(row["note_path"])
-        if not path.exists():
-            continue
-        related_links = [
-            {
-                **link,
-                "target_stem": note_stem_by_id.get(
-                    str(link["note_id"]), str(link["note_id"])
-                ),
-            }
-            for link in sorted(
-                related.get(str(row["note_id"]), []),
-                key=lambda value: (value["note_id"], value["relation_type"]),
-            )
+        if row.get("note_id")
+    ]
+    catalogue_clusters = {
+        str(cluster.get("cluster_id") or ""): dict(cluster)
+        for cluster in [
+            *existing_clusters,
+            *(cluster_map.get("clusters", []) or []),
         ]
-        cluster_ids = sorted(clusters_by_note.get(str(row["note_id"]), []))
-        note_gap_links = sorted(
-            gaps_by_note.get(str(row["note_id"]), []),
-            key=lambda value: (value["gap_id"], value["relation_type"]),
-        )
-        note_gap_links = [
-            {
-                **link,
-                "wikilink": (
-                    f"[[{gap_note_stem(gap_by_id[link['gap_id']])}|{gap_display_title(gap_by_id[link['gap_id']])}]]"
-                ),
-            }
-            for link in note_gap_links
-            if link["gap_id"] in gap_by_id
-        ]
-        gap_ids = sorted({link["gap_id"] for link in note_gap_links})
-        cluster_wikilinks = {
-            cluster_id: (
-                f"[[{cluster_note_stem(cluster_by_id[cluster_id])}|{cluster_display_title(cluster_by_id[cluster_id])}]]"
+        if isinstance(cluster, Mapping) and cluster.get("cluster_id")
+    }
+    catalogue = build_source_catalogue(
+        workspace,
+        workspace_profiles,
+        workspace_note_rows,
+        catalogue_clusters.values(),
+    )
+    if str(source_set.get("source_set_type") or "") == "auto_zettelkasten_workspace":
+        try:
+            post_cluster_relationships = _run_relationship_reasoning(
+                workspace,
+                profiles=workspace_profiles,
+                source_set=source_set,
+                catalogue=catalogue,
+                reasoner=reasoner,
+                reasoner_calls=reasoner_calls,
+                request=base_literature_request,
             )
-            for cluster_id in cluster_ids
-            if cluster_id in cluster_by_id
-        }
-        gap_wikilinks = {
-            link["gap_id"]: str(link["wikilink"]) for link in note_gap_links
-        }
-        update_note_graph(
-            path,
-            {
-                "related_notes": [
+        except Exception as exc:
+            post_cluster_relationships = {
+                "accepted": [],
+                "no_relationship": [],
+                "parked": [
                     {
-                        "note_id": link["note_id"],
-                        "relation_type": link["relation_type"],
-                        "reason": link.get("reason", ""),
-                        "wikilink": f"[[{link['target_stem']}]]",
+                        "reason": "post_cluster_relationship_stage_failure",
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
                     }
-                    for link in related_links
                 ],
-                "clusters": cluster_ids,
-                "cluster_links": [
-                    cluster_wikilinks[cluster_id]
-                    for cluster_id in cluster_ids
-                    if cluster_id in cluster_wikilinks
-                ],
-                "gaps": gap_ids,
-                "gap_links": [gap_wikilinks[gap_id] for gap_id in gap_ids],
-                "tags": sorted(
-                    subject_tags_by_note.get(str(row.get("note_id") or ""), [])
-                ),
-                "engine_version": ENGINE_VERSION,
-                "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
-                "updated_at": now_iso(),
-            },
-            related_links,
-            cluster_ids,
-            note_gap_links,
-            cluster_wikilinks,
+                "cluster_candidates": [],
+                "selected_profile_hashes": {},
+                "reconciled_catalogue_revision": "",
+            }
+        relationship_result = {
+            "accepted": [
+                *(relationship_result.get("accepted", []) or []),
+                *(post_cluster_relationships.get("accepted", []) or []),
+            ],
+            "no_relationship": [
+                *(relationship_result.get("no_relationship", []) or []),
+                *(post_cluster_relationships.get("no_relationship", []) or []),
+            ],
+            "parked": [
+                *(relationship_result.get("parked", []) or []),
+                *(post_cluster_relationships.get("parked", []) or []),
+            ],
+            "cluster_candidates": [
+                *(relationship_result.get("cluster_candidates", []) or []),
+                *(post_cluster_relationships.get("cluster_candidates", []) or []),
+            ],
+        }
+        relationship_ledger_path = _write_relationship_run_ledger(
+            workspace, run_id, relationship_result
         )
-        note_paths.append(path)
-    source_index = write_source_index(workspace, note_paths)
+        typed = persist_relationship_registry(
+            workspace,
+            structural_relations=combined_structural.values(),
+            accepted_relations=post_cluster_relationships.get("accepted", [])
+            or [],
+            no_relationship_decisions=post_cluster_relationships.get(
+                "no_relationship", []
+            )
+            or [],
+        )
+        post_state_path = _commit_relationship_selection_state(
+            workspace,
+            post_cluster_relationships,
+            catalogue_revision=str(
+                catalogue.get("routing_revision_hash")
+                or catalogue.get("revision_hash")
+                or ""
+            ),
+        )
+        if post_state_path is not None and post_state_path not in graph_paths:
+            graph_paths.append(post_state_path)
+        catalogue = build_source_catalogue(
+            workspace,
+            workspace_profiles,
+            workspace_note_rows,
+            catalogue_clusters.values(),
+        )
+    note_paths = _project_atomic_graph(
+        workspace,
+        note_rows=workspace_note_rows,
+        profiles=workspace_profiles,
+        relations=typed.get("links", []) or [],
+        navigation=navigation,
+        navigation_policy=effective_request.navigation_policy,
+        clusters=cluster_map.get("clusters", []) or [],
+        gaps=gap_map.get("gap_candidates", []) or [],
+        cluster_scope_note_ids=current_note_ids,
+    )
+    source_index = Path(catalogue["master_index_path"])
     source_set = update_source_set_map(
         workspace, source_set, cluster_map["clusters"], gap_map["gap_candidates"]
     )
@@ -1768,6 +2753,25 @@ def rebuild_map(
         source_set=source_set,
         request=effective_request,
     )
+    result_paths = list(
+        dict.fromkeys(
+            [
+                *graph_paths,
+                Path(typed["path"]),
+                Path(typed["compatibility_path"]),
+                source_index,
+                Path(catalogue["catalogue_path"]),
+                Path(catalogue["cluster_catalogue_path"]),
+                Path(catalogue["cluster_index_path"]),
+                *(Path(path) for path in catalogue.get("shard_paths", []) or []),
+                *note_paths,
+                *profile_result["paths"],
+                *paths,
+                Path(source_set["path"]),
+                Path(source_set.get("latest_path", source_set["path"])),
+            ]
+        )
+    )
     result = {
         "source_set": source_set,
         "cluster_map": cluster_map,
@@ -1779,15 +2783,7 @@ def rebuild_map(
             key: value for key, value in profile_result.items() if key != "profiles"
         },
         "migration": migration,
-        "paths": [
-            Path(typed["path"]),
-            Path(typed["compatibility_path"]),
-            source_index,
-            *profile_result["paths"],
-            *paths,
-            Path(source_set["path"]),
-            Path(source_set.get("latest_path", source_set["path"])),
-        ],
+        "paths": result_paths,
     }
     partial_reasons = [
         reason

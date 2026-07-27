@@ -15,6 +15,7 @@ from auto_zettelkasten.models import (
     LiteratureMappingPolicy,
     MapRequest,
 )
+from auto_zettelkasten.notes import read_note
 from auto_zettelkasten.ports import LiteratureReasoner
 from auto_zettelkasten.profiles import (
     deterministic_profile,
@@ -32,6 +33,7 @@ from auto_zettelkasten.readers import (
     ProviderError,
     _parse_json_object,
     _validate_literature_response,
+    _validate_relationship_response,
 )
 
 from conftest import SECTION_KEYS, FakeReader, FakeZotero
@@ -80,6 +82,18 @@ def test_literature_json_parser_recovers_one_object_wrapped_in_provider_prose() 
             '{"gaps": []}\n{"rejected": []}',
             label="gap adjudication response",
         )
+
+
+def test_relationship_response_accepts_bare_lists_and_preserves_malformed_rows() -> None:
+    assert _parse_json_object(
+        '[{"source_id": "a"}, "malformed"]',
+        label="relationship candidate response",
+        list_key="candidates",
+    ) == {"candidates": [{"source_id": "a"}, "malformed"]}
+    assert _validate_relationship_response(
+        {"decisions": [{"source_id": "a"}, "malformed"]},
+        kind="relationship_adjudication",
+    ) == {"decisions": [{"source_id": "a"}, "malformed"]}
 
 
 def test_builtin_gap_response_normalizes_optional_model_shape_errors_per_candidate() -> (
@@ -526,6 +540,99 @@ class _ConcurrentReasoner(_ExplicitReasoner):
                 self.active_calls -= 1
 
 
+class _RelationshipThenClusterFailureReasoner(_ExplicitReasoner):
+    def select_relationship_candidates(
+        self,
+        profiles: Sequence[EvidenceProfile],
+        request: LiteratureMapRequest,
+        *,
+        context: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        left, right = profiles[:2]
+        return {
+            "candidates": [
+                {
+                    "source_id": left.source_id,
+                    "target_kind": "source",
+                    "target_id": right.source_id,
+                    "why_relevant": "Both sources address the same bounded institutional proposition.",
+                    "comparison_unit": "institutional proposition",
+                    "confidence": 0.9,
+                }
+            ]
+        }
+
+    def adjudicate_relationships(
+        self,
+        profiles: Sequence[EvidenceProfile],
+        request: LiteratureMapRequest,
+        *,
+        context: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        by_source = {profile.source_id: profile for profile in profiles}
+        assert context
+        return {
+            "decisions": [
+                {
+                    "source_id": pair["source_id"],
+                    "target_source_id": pair["target_source_id"],
+                    "status": "accepted",
+                    "relation_type": "complements",
+                    "comparison_unit": "institutional proposition",
+                    "reason": "The sources provide complementary evidence for the same bounded institutional proposition.",
+                    "source_evidence_anchor_id": by_source[
+                        pair["source_id"]
+                    ].evidence_anchors[0].evidence_anchor_id,
+                    "target_evidence_anchor_id": by_source[
+                        pair["target_source_id"]
+                    ].evidence_anchors[0].evidence_anchor_id,
+                    "qualifiers": [],
+                    "confidence": 0.9,
+                }
+                for pair in context["pairs"]
+            ]
+        }
+
+    def propose_clusters(
+        self,
+        profiles: Sequence[EvidenceProfile],
+        request: LiteratureMapRequest,
+        *,
+        context: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        assert context and any(
+            row.get("relation_type") == "complements"
+            for row in context["accepted_relationships"]
+        )
+        raise RuntimeError("cluster provider unavailable")
+
+
+class _ReplayableRelationshipReasoner(_RelationshipThenClusterFailureReasoner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.candidate_calls = 0
+        self.adjudication_calls = 0
+        self.cluster_calls = 0
+
+    def select_relationship_candidates(self, *args: Any, **kwargs: Any) -> Mapping[str, Any]:
+        self.candidate_calls += 1
+        return super().select_relationship_candidates(*args, **kwargs)
+
+    def adjudicate_relationships(self, *args: Any, **kwargs: Any) -> Mapping[str, Any]:
+        self.adjudication_calls += 1
+        return super().adjudicate_relationships(*args, **kwargs)
+
+    def propose_clusters(
+        self,
+        profiles: Sequence[EvidenceProfile],
+        request: LiteratureMapRequest,
+        *,
+        context: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        self.cluster_calls += 1
+        return {}
+
+
 class _RecoveringReasoner(_ExplicitReasoner):
     def __init__(self, fail_keys: set[str] | None = None) -> None:
         super().__init__()
@@ -652,6 +759,98 @@ def test_build_map_constructs_configured_builtin_reasoner(
         progress["checkpoint_hit_count"]
         == profile_hits + progress["synthesis_checkpoint_hit_count"]
     )
+
+
+def test_cluster_failure_keeps_committed_reciprocal_atomic_relationships(
+    tmp_path: Path,
+    sample_items,
+) -> None:
+    report = run_map(
+        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        client=FakeZotero(sample_items),
+        reader=FakeReader(),
+        literature_reasoner=_RelationshipThenClusterFailureReasoner(),
+        run_id="relationship-before-cluster-failure",
+    )
+
+    assert report.status == "partial"
+    assert any(
+        "cluster provider unavailable" in str(row.get("reason") or "")
+        for row in report.errors
+    )
+    assert report.literature_map["synthesis_call_count"] == 3
+    assert report.literature_map["synthesis_failure_count"] == 1
+    registry = yaml.safe_load(
+        (
+            tmp_path / "02_source_memory" / "indexes" / "typed_links.yml"
+        ).read_text()
+    )
+    substantive = [
+        row for row in registry["links"] if row["relation_type"] == "complements"
+    ]
+    assert len(substantive) == 1
+    note_paths = sorted(
+        (tmp_path / "02_source_memory" / "notes").glob("*.md")
+    )
+    assert len(note_paths) == 2
+    for path in note_paths:
+        note = read_note(path)
+        assert {
+            row["relation_type"] for row in note["frontmatter"]["related_notes"]
+        } >= {"complements"}
+        assert "<!-- auto-zettelkasten:graph:start -->" in path.read_text()
+
+
+def test_unchanged_workspace_replay_makes_no_new_relationship_or_cluster_calls(
+    tmp_path: Path,
+    sample_items,
+) -> None:
+    source_report = run_map(
+        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        client=FakeZotero(sample_items),
+        reader=FakeReader(),
+        run_id="relationship-replay-sources",
+    )
+    reasoner = _ReplayableRelationshipReasoner()
+    first = build_map(
+        tmp_path,
+        run_id="relationship-replay",
+        provider="ollama",
+        model="fake-1",
+        reasoner=reasoner,
+    )
+    assert first.status == "built"
+    before_calls = (
+        reasoner.profile_calls,
+        reasoner.candidate_calls,
+        reasoner.adjudication_calls,
+        reasoner.cluster_calls,
+    )
+    before_notes = {
+        path: path.read_bytes()
+        for path in (tmp_path / "02_source_memory" / "notes").glob("*.md")
+    }
+
+    replay = build_map(
+        tmp_path,
+        run_id="relationship-replay",
+        provider="ollama",
+        model="fake-1",
+        reasoner=reasoner,
+        resume=True,
+    )
+
+    assert replay.status == "built"
+    assert (
+        reasoner.profile_calls,
+        reasoner.candidate_calls,
+        reasoner.adjudication_calls,
+        reasoner.cluster_calls,
+    ) == before_calls
+    assert {
+        path: path.read_bytes() for path in before_notes
+    } == before_notes
+    assert source_report.validated_note_count == len(before_notes)
 
 
 def test_reasoner_replay_reuses_same_provider_profiles_created_by_deterministic_route(

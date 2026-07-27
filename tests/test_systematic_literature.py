@@ -29,6 +29,7 @@ from auto_zettelkasten.literature import (
     search_and_validate_gaps,
 )
 from auto_zettelkasten.models import (
+    CURRENT_ENGINE_VERSION,
     EvidenceAnchor,
     EvidenceProfile,
     LiteratureMapReport,
@@ -1603,7 +1604,7 @@ def test_compatibility_entry_accepts_current_rows_writes_all_outputs_and_has_no_
     }
     assert gap_map["gap_candidates"] == []
     assert gap_map["status"] == "complete_no_qualifying_gaps"
-    assert packet["mapper_version"] == "0.10.0"
+    assert packet["mapper_version"] == CURRENT_ENGINE_VERSION
     assert all(path.exists() for path in paths)
     assert not stale_neighborhood.exists()
     manifest = yaml.safe_load(
@@ -3152,7 +3153,21 @@ def test_partial_remap_preserves_the_last_published_cluster_markdown(
 
     assert second_map["cluster_syntheses"][cluster_id]["status"] == "partial"
     assert packet["status"] == "partial"
-    assert path.read_text() == published
+    pending = path.read_text()
+    assert "<!-- auto-zettelkasten:cluster-refresh:start -->" in pending
+    assert "This note preserves the last validated synthesis" in pending
+    assert "The two independent studies report a compatible association" in pending
+    build_literature_map(
+        tmp_path,
+        source_set=source_set,
+        notes=[],
+        profiles=rows,
+        question=None,
+        run_id="quality-ratchet-partial-replay",
+        reasoner=partial_reasoner,
+    )
+    assert path.read_text() == pending
+    assert published.split("---", 2)[-1].strip() in pending
 
 
 def test_cluster_projection_explains_machine_assessments_and_failed_gap_gates() -> None:

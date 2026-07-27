@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from auto_zettelkasten.notes import parse_atomic_note, semantic_note_hash, source_obsidian_tags, update_note_graph
 
 
@@ -65,6 +67,8 @@ def test_graph_update_is_idempotent(tmp_path: Path) -> None:
     assert frontmatter["tags"] == ["shared-topic"]
     assert frontmatter["cluster_links"] == ["[[cluster-a]]"]
     assert frontmatter["gap_links"] == ["[[gap-a]]"]
+    assert "<!-- auto-zettelkasten:graph:start -->" in body
+    assert "<!-- auto-zettelkasten:graph:end -->" in body
     assert "- supports_gap_rule: [[gap-a]]" in body
 
 
@@ -108,3 +112,50 @@ def test_graph_update_repairs_wrapped_yaml_link_once_without_timestamp_churn(tmp
     assert "[[A Long Source Title]]" in repaired.split("\n---\n", 1)[0]
     assert "updated_at: original" in repaired
     assert update_note_graph(path, updates, related, []) is False
+
+
+def test_graph_update_migrates_only_the_legacy_graph_section(tmp_path: Path) -> None:
+    path = tmp_path / "note.md"
+    legacy = _note().replace(
+        "Substantive claim.\n",
+        "Substantive claim.\n\n"
+        "## Graph Links\n\n"
+        "- same_concept: [[Old Target]]\n\n"
+        "## Researcher Relationships\n\n"
+        "- My interpretation must survive.\n",
+    )
+    path.write_text(legacy, encoding="utf-8")
+    before_hash = semantic_note_hash(legacy)
+    related = [
+        {
+            "note_id": "note-2",
+            "relation_type": "supports",
+            "target_stem": "New Target",
+        }
+    ]
+
+    assert update_note_graph(path, {"related_notes": []}, related, []) is True
+    migrated = path.read_text(encoding="utf-8")
+    assert semantic_note_hash(migrated) == before_hash
+    assert "- same_concept: [[Old Target]]" not in migrated
+    assert "- supports: [[New Target]]" in migrated
+    assert "## Researcher Relationships\n\n- My interpretation must survive." in migrated
+    assert migrated.count("<!-- auto-zettelkasten:graph:start -->") == 1
+    assert migrated.count("<!-- auto-zettelkasten:graph:end -->") == 1
+
+    first = path.read_bytes()
+    assert update_note_graph(path, {"related_notes": []}, related, []) is False
+    assert path.read_bytes() == first
+
+
+def test_graph_update_rejects_semantic_frontmatter_changes_before_write(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "note.md"
+    path.write_text(_note(), encoding="utf-8")
+    before = path.read_bytes()
+
+    with pytest.raises(ValueError, match="graph projection changed semantic note content"):
+        update_note_graph(path, {"source_id": "different-source"}, [], [])
+
+    assert path.read_bytes() == before

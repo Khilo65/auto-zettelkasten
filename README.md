@@ -7,8 +7,8 @@ candidate-gap records, and an Obsidian-ready vault projection.
 It is a standalone, file-first Python package. It does not require Research OS,
 does not read `zotero.sqlite`, and never writes to Zotero.
 
-> **Release status:** v0.10 is an alpha-quality CLI and Python API using artifact
-> schema 1.9 and evidence-profile schema 1.2. Mapped gaps are claims about the
+> **Release status:** v0.11 is an alpha-quality CLI and Python API using artifact
+> schema 1.10 and evidence-profile schema 1.2. Mapped gaps are claims about the
 > frozen collection only, never literature-wide novelty claims.
 
 ## What it produces
@@ -25,6 +25,9 @@ workspace/
 │   ├── profiles/
 │   └── indexes/
 │       ├── source_sets/
+│       ├── by_literature/
+│       ├── source_catalogue.yml
+│       ├── cluster_catalogue.yml
 │       ├── tag_proposals.yml
 │       ├── subject_tag_registry.yml
 │       ├── subject_tag_assignments.yml
@@ -100,6 +103,15 @@ fields, such as `mechanism/mediator-legitimacy`, `outcome/mediation-success`,
 and `case/syria`. Only mechanical variants are reconciled automatically;
 uncertain synonyms remain audit proposals. Structural values such as source
 status or note type remain YAML properties and are not written as subject tags.
+
+The source catalogue provides compact title, author, thesis, method, and facet
+entries for model-led relationship discovery without loading every full note.
+Substantive links are adjudicated from two-sided evidence anchors and stored in
+the canonical typed-link registry. Models return relationship records only;
+local code projects reciprocal, explained links into explicit managed graph
+blocks in both atomic notes. Graph projection is committed before cluster
+synthesis, leaves the source-analysis semantic hash unchanged, and is
+provider-call-free on an unchanged replay.
 
 A `topic_neighborhood` is promoted only when at least two effective analytical
 evidence bases share a discriminative typed subject tag. Single-source facets stay
@@ -450,14 +462,18 @@ notes, evidence profiles, cluster/gap identities, or the underlying collection
 map. Research OS may use the lens for downstream ranking without mutating the
 base map.
 
-Artifact schemas 1.0-1.9 and evidence-profile schemas 1.0-1.2 remain readable.
+Artifact schemas 1.0-1.10 and evidence-profile schemas 1.0-1.2 remain readable.
 The idempotent schema-1.9 migration retires the standalone Literature Neighborhoods Markdown projection, archives superseded current cluster and gap
 projections, preserves historical maps, profiles, analytical identities, and
 atomic-note bytes, and makes no model or Zotero call. Existing schema-1.5
 proposition anchors remain valid; unsupported legacy anchors cannot establish
 strong synthesis until they are lazily reprofiled.
+The schema-1.10 migration updates managed artifact version markers only.
+Legacy unmarked `## Graph Links` sections are converted to bounded
+`auto-zettelkasten:graph` markers on their next graph projection; source prose,
+profiles, and human-authored sections are not rewritten.
 
-## Scope deliberately deferred from v0.10
+## Scope deliberately deferred from v0.11
 
 - direct `zotero.sqlite` ingestion;
 - Zotero writes or collection synchronization;

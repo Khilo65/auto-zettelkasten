@@ -664,7 +664,7 @@ def test_literature_request_and_report_are_serializable(tmp_path: Path) -> None:
     assert legacy_count_report.proposition_count == 3
     assert legacy_count_report.topic_neighborhood_count == 5
 
-def test_all_report_models_default_to_engine_0_9_schema_1_8(tmp_path: Path) -> None:
+def test_all_report_models_default_to_current_versions(tmp_path: Path) -> None:
     run_report = RunReport(status="ok", workspace=tmp_path, run_id="run-1")
     reports = (
         ArtifactManifest(status="ok", workspace=tmp_path),
@@ -673,7 +673,7 @@ def test_all_report_models_default_to_engine_0_9_schema_1_8(tmp_path: Path) -> N
         LiteratureMapReport(status="ok"),
     )
     assert {(report.engine_version, report.artifact_schema_version) for report in reports} == {
-        ("0.10.0", "1.9")
+        ("0.11.0", "1.10")
     }
     assert run_report.literature_map == {}
     assert run_report.literature_report == {}

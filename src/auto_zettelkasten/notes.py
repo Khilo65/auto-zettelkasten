@@ -82,6 +82,9 @@ REVIEW_STATUS_FRONTMATTER_FIELDS = frozenset(
     {"human_review", "review_status", "source_faithfulness_review"}
 )
 REVIEW_STATUS_HEADINGS = ("Automated Validation", "Source-Faithfulness Review")
+GRAPH_HEADING = "## Graph Links"
+GRAPH_START_MARKER = "<!-- auto-zettelkasten:graph:start -->"
+GRAPH_END_MARKER = "<!-- auto-zettelkasten:graph:end -->"
 NOTE_METADATA_SCHEMA_VERSION = "1"
 REQUIRED_LIMITED_FRONTMATTER = (REQUIRED_FRONTMATTER - {"reader_provider", "reader_model"}) | {
     "source_scope",
@@ -550,7 +553,61 @@ def strip_review_status_material(text: str, *, update_versions: bool = False) ->
 
 def _strip_generated_note_sections(body: str) -> str:
     body = _strip_review_status_sections(body)
-    return re.sub(r"\n*## Graph Links\s*\n.*\Z", "", body, flags=re.DOTALL).rstrip()
+    section = _graph_section(body)
+    managed = _managed_graph_block(body)
+    if section and managed and section.start() <= managed.start() < section.end():
+        section_content = body[section.start("content") : section.end()]
+        managed_offset = managed.start() - section.start("content")
+        remaining = (
+            section_content[:managed_offset]
+            + section_content[managed.end() - section.start("content") :]
+        )
+        if remaining.strip():
+            return _without_markdown_span(body, managed.start(), managed.end()).rstrip()
+        return _without_markdown_span(body, section.start(), section.end()).rstrip()
+    if managed:
+        return _without_markdown_span(body, managed.start(), managed.end()).rstrip()
+    if section:
+        return _without_markdown_span(body, section.start(), section.end()).rstrip()
+    return body.rstrip()
+
+
+def _graph_section(body: str) -> re.Match[str] | None:
+    return re.search(
+        rf"^{re.escape(GRAPH_HEADING)}[ \t]*$\n?(?P<content>.*?)(?=^## |\Z)",
+        body,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+
+
+def _managed_graph_block(body: str) -> re.Match[str] | None:
+    return re.search(
+        rf"^{re.escape(GRAPH_START_MARKER)}[ \t]*$\n?.*?"
+        rf"^{re.escape(GRAPH_END_MARKER)}[ \t]*$",
+        body,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+
+
+def _without_markdown_span(body: str, start: int, end: int) -> str:
+    prefix = body[:start].rstrip("\n")
+    suffix = body[end:].lstrip("\n")
+    if prefix and suffix:
+        return f"{prefix}\n\n{suffix}"
+    return prefix or suffix
+
+
+def _project_graph_block(body: str, graph_block: str) -> str:
+    managed = _managed_graph_block(body)
+    if managed:
+        return f"{body[:managed.start()]}{graph_block}{body[managed.end():]}"
+    graph_section = f"{GRAPH_HEADING}\n\n{graph_block}"
+    section = _graph_section(body)
+    if section:
+        prefix = body[: section.start()].rstrip("\n")
+        suffix = body[section.end() :].lstrip("\n")
+        return "\n\n".join(part for part in (prefix, graph_section, suffix) if part)
+    return f"{body.rstrip()}\n\n{graph_section}"
 
 
 def _strip_review_status_sections(body: str) -> str:
@@ -595,11 +652,13 @@ def update_note_graph(
     note = read_note(path)
     frontmatter = dict(note["frontmatter"])
     body = str(note["body"])
+    before_semantic_hash = semantic_note_hash(
+        f"---\n{_dump_frontmatter(frontmatter)}\n---\n{body}"
+    )
     for field in REVIEW_STATUS_FRONTMATTER_FIELDS:
         frontmatter.pop(field, None)
     body = _strip_review_status_sections(body).rstrip() + "\n"
-    body_without_graph = re.sub(r"\n*## Graph Links\s*\n.*\Z", "", body, flags=re.DOTALL).rstrip()
-    graph_lines = ["", "", "## Graph Links", ""]
+    graph_lines: list[str] = []
     for link in related_links:
         reason = str(link.get("reason") or "").strip()
         suffix = f" — {reason}" if reason else ""
@@ -615,11 +674,20 @@ def update_note_graph(
     desired_updates = dict(updates)
     desired_updated_at = desired_updates.pop("updated_at", None)
     unchanged_frontmatter = all(frontmatter.get(key) == value for key, value in desired_updates.items())
-    graph_text = "\n".join(graph_lines)
-    desired_body = f"{body_without_graph}{graph_text}\n"
+    graph_block = (
+        f"{GRAPH_START_MARKER}\n"
+        f"{'\n'.join(graph_lines)}\n"
+        f"{GRAPH_END_MARKER}"
+    )
+    desired_body = _project_graph_block(body, graph_block).rstrip() + "\n"
     projected_frontmatter = {**frontmatter, **desired_updates}
     if not unchanged_frontmatter and desired_updated_at is not None:
         projected_frontmatter["updated_at"] = desired_updated_at
+    after_semantic_hash = semantic_note_hash(
+        f"---\n{_dump_frontmatter(projected_frontmatter)}\n---\n{desired_body}"
+    )
+    if after_semantic_hash != before_semantic_hash:
+        raise ValueError("graph projection changed semantic note content")
     workspace = _workspace_for_note(path)
     rendered_frontmatter = (
         public_note_frontmatter(projected_frontmatter)

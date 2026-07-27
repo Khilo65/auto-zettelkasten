@@ -67,6 +67,7 @@ LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 32_000
 CLUSTER_SYNTHESIS_MAX_OUTPUT_TOKENS = 32_000
 GAP_ADJUDICATION_MAX_OUTPUT_TOKENS = 32_000
+RELATIONSHIP_MAX_OUTPUT_TOKENS = 12_000
 
 MODEL_CONTEXT_WINDOWS: Mapping[tuple[str, str], int] = {
     ("deepseek", "deepseek-v4-flash"): 1_000_000,
@@ -272,6 +273,72 @@ class _CapabilityAwareReader:
                 reasoning_effort="high",
             ),
             label="profile response",
+        )
+
+    def select_relationship_shards(
+        self,
+        profiles: Sequence[EvidenceProfile],
+        request: LiteratureMapRequest,
+        *,
+        context: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        """Select bounded catalogue shards without deciding source relationships."""
+
+        self._authorize_request()
+        return _validate_relationship_response(
+            self._literature_json_call(
+                _relationship_shard_system_prompt(),
+                _relationship_prompt(profiles, request, context),
+                label="relationship shard selection",
+                reasoning_effort="high",
+                output_tokens=RELATIONSHIP_MAX_OUTPUT_TOKENS,
+                list_key="shard_ids",
+            ),
+            kind="shard_selection",
+        )
+
+    def select_relationship_candidates(
+        self,
+        profiles: Sequence[EvidenceProfile],
+        request: LiteratureMapRequest,
+        *,
+        context: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        """Select intellectually consequential source or cluster comparisons."""
+
+        self._authorize_request()
+        return _validate_relationship_response(
+            self._literature_json_call(
+                _relationship_candidate_system_prompt(),
+                _relationship_prompt(profiles, request, context),
+                label="relationship candidate selection",
+                reasoning_effort="high",
+                output_tokens=RELATIONSHIP_MAX_OUTPUT_TOKENS,
+                list_key="candidates",
+            ),
+            kind="candidate_selection",
+        )
+
+    def adjudicate_relationships(
+        self,
+        profiles: Sequence[EvidenceProfile],
+        request: LiteratureMapRequest,
+        *,
+        context: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        """Classify supplied pairs from two-sided evidence without editing notes."""
+
+        self._authorize_request()
+        return _validate_relationship_response(
+            self._literature_json_call(
+                _relationship_adjudication_system_prompt(),
+                _relationship_prompt(profiles, request, context),
+                label="relationship adjudication",
+                reasoning_effort="max",
+                output_tokens=RELATIONSHIP_MAX_OUTPUT_TOKENS,
+                list_key="decisions",
+            ),
+            kind="relationship_adjudication",
         )
 
     def propose_clusters(
@@ -492,6 +559,7 @@ class _CapabilityAwareReader:
         label: str,
         reasoning_effort: str = "high",
         output_tokens: int | None = None,
+        list_key: str | None = None,
     ) -> Mapping[str, Any]:
         self.last_literature_response = None
         output_tokens = max(
@@ -508,6 +576,7 @@ class _CapabilityAwareReader:
                 reasoning_effort=reasoning_effort,
             ),
             label=f"{label} response",
+            list_key=list_key,
         )
         self.last_literature_response = response
         return response
@@ -1009,6 +1078,50 @@ def _profile_system_prompt() -> str:
     )
 
 
+def _relationship_shard_system_prompt() -> str:
+    return (
+        "You route relationship discovery for Auto-Zettelkasten relationship prompt v1. "
+        "Return exactly one JSON object with a shard_ids array containing only IDs from the supplied shard directory. "
+        "Select the smallest set of literature shards needed to find genuinely relevant works for every focus source. "
+        "Use the focus thesis, method, facets, existing graph neighbors, and cluster summaries. Include a neighboring "
+        "literature when a source plausibly bridges fields. Do not classify relationships and do not infer that shared "
+        "keywords, methods, cases, or collections make two works intellectually related."
+    )
+
+
+def _relationship_candidate_system_prompt() -> str:
+    return (
+        "You select source comparisons for Auto-Zettelkasten relationship prompt v1. Return exactly one JSON object with "
+        "a candidates array. Each row must contain source_id, target_kind, target_id, why_relevant, comparison_unit, "
+        "likely_relation_type, requested_evidence_depth, and confidence. target_kind is source or cluster. "
+        "requested_evidence_depth is profile, atomic_note, or source_passage. confidence is a number from 0 to 1. "
+        "Select no more than twelve candidates per focus source and return none when none is worthwhile. Choose works "
+        "that may support, undermine, qualify, extend, complement, offer a rival explanation, expose a boundary or "
+        "methodological fault line, form a sequence, or express an interpretive disagreement. Shared vocabulary, method, "
+        "case, tag, or collection alone is only a retrieval clue. Use only supplied IDs and do not classify the final "
+        "relationship."
+    )
+
+
+def _relationship_adjudication_system_prompt() -> str:
+    return (
+        "You adjudicate source relationships for Auto-Zettelkasten relationship prompt v1. Return exactly one JSON object "
+        "with a decisions array containing one row per supplied pair. Each row must contain source_id, target_source_id, "
+        "status, relation_type, comparison_unit, reason, source_evidence_anchor_id, target_evidence_anchor_id, qualifiers, "
+        "confidence, and requested_context. status is accepted, no_relationship, or needs_more_context. relation_type for "
+        "accepted rows is supports, undermines, qualifies, extends, complements, rival_explanation, boundary_contrast, "
+        "methodological_fault_line, sequential_relationship, or interpretive_or_normative_disagreement; otherwise use an "
+        "empty string. qualifiers and requested_context are arrays of strings, confidence is 0 to 1. Compare the actual "
+        "claims, findings, arguments, mechanisms, outcomes, methods, and boundaries represented by the supplied evidence. "
+        "An accepted relationship requires a real anchor from each source and a plain-language reason explaining the "
+        "intellectual connection. Do not convert association into causation. A shared topic, method, case, dataset, outcome, "
+        "tag, or citation alone is no_relationship. Limited sources cannot establish a substantive relationship unless the "
+        "supplied limited evidence itself contains both the relevant claim and its boundary. Ask for more context only when "
+        "the supplied profiles leave a consequential comparison genuinely ambiguous. Never invent IDs, anchors, locators, "
+        "claims, profile hashes, relation IDs, provenance, timestamps, or Markdown."
+    )
+
+
 def _cluster_proposal_system_prompt() -> str:
     return (
         "You are the collection-clustering reasoner for Auto-Zettelkasten cluster prompt v17. "
@@ -1486,6 +1599,25 @@ def _gap_adjudication_prompt(
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
 
 
+def _relationship_prompt(
+    profiles: Sequence[EvidenceProfile],
+    request: LiteratureMapRequest,
+    context: Mapping[str, Any] | None,
+) -> str:
+    payload = {
+        "request": {
+            "source_set_id": str(getattr(request, "source_set_id", "") or ""),
+            "provider": str(getattr(request, "provider", "") or ""),
+            "model": str(getattr(request, "model", "") or ""),
+        },
+        "focus_profiles": [
+            _evidence_profile_payload(profile) for profile in profiles
+        ],
+        "context": dict(context or {}),
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+
+
 def _literature_prompt(
     profiles: Sequence[EvidenceProfile],
     request: LiteratureMapRequest,
@@ -1940,9 +2072,13 @@ def _parse_chunk_evidence(value: Any) -> Mapping[str, Any]:
     return _parse_required_mapping(value, CHUNK_EVIDENCE_KEYS, label="chunk response")
 
 
-def _parse_json_object(value: Any, *, label: str) -> dict[str, Any]:
+def _parse_json_object(
+    value: Any, *, label: str, list_key: str | None = None
+) -> dict[str, Any]:
     if isinstance(value, Mapping):
         return dict(value)
+    if isinstance(value, list) and list_key:
+        return {list_key: value}
     text = str(value).strip()
     fenced = re.match(
         r"^```(?:json)?\s*(.*?)\s*```$", text, flags=re.DOTALL | re.IGNORECASE
@@ -1970,6 +2106,8 @@ def _parse_json_object(value: Any, *, label: str) -> dict[str, Any]:
         if len(recovered) != 1:
             raise ProviderError(f"{label} was not valid JSON") from exc
         payload = recovered[0]
+    if isinstance(payload, list) and list_key:
+        return {list_key: payload}
     if not isinstance(payload, dict):
         raise ProviderError(f"{label} must be a JSON object")
     return payload
@@ -2517,6 +2655,29 @@ def _validate_literature_response(
             f"invalid {kind.replace('_', ' ')} response: {exc}"
         ) from exc
     raise ProviderError(f"unsupported literature response kind: {kind}")
+
+
+def _validate_relationship_response(
+    payload: Mapping[str, Any], *, kind: str
+) -> dict[str, Any]:
+    """Normalize harmless wrappers while leaving row-level judgment local."""
+
+    if kind == "shard_selection":
+        values = payload.get("shard_ids", [])
+        if not isinstance(values, list):
+            raise ProviderError("relationship shard response must contain a shard_ids list")
+        return {
+            "shard_ids": [
+                str(value).strip() for value in values if str(value).strip()
+            ]
+        }
+    key = "candidates" if kind == "candidate_selection" else "decisions"
+    values = payload.get(key)
+    if values is None and kind == "relationship_adjudication":
+        values = payload.get("relationships")
+    if not isinstance(values, list):
+        raise ProviderError(f"{kind.replace('_', ' ')} response must contain a {key} list")
+    return {key: [dict(value) if isinstance(value, Mapping) else value for value in values]}
 
 
 def _cluster_boundary_text(value: Any) -> str:

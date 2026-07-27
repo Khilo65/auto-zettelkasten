@@ -24,7 +24,11 @@ from .files import (
     write_yaml,
 )
 
-from .models import FAMILY_RELATION_TYPES
+from .models import (
+    CURRENT_ARTIFACT_SCHEMA_VERSION,
+    CURRENT_ENGINE_VERSION,
+    FAMILY_RELATION_TYPES,
+)
 from .notes import source_note_semantic_components
 
 from .navigation import (
@@ -68,6 +72,7 @@ LITERATURE_ALGORITHM_VERSION = "33"
 CLUSTER_PROPOSAL_PROMPT_VERSION = "17"
 CLUSTER_SYNTHESIS_PROMPT_VERSION = "19"
 GAP_REASONING_PROMPT_VERSION = "12"
+RELATIONSHIP_PROMPT_VERSION = "1"
 ANCHOR_ALGORITHM_VERSION = "3"
 SUPPORT_ENVELOPE_VERSION = "2"
 PROPOSITION_ALGORITHM_VERSION = "14"
@@ -1802,6 +1807,10 @@ def _synthesis_stage_prompt_version(stage: str) -> str:
         "cluster_proposal": CLUSTER_PROPOSAL_PROMPT_VERSION,
         "cluster_synthesis": CLUSTER_SYNTHESIS_PROMPT_VERSION,
         "gap_adjudication": GAP_REASONING_PROMPT_VERSION,
+        "relationship_shard_selection": RELATIONSHIP_PROMPT_VERSION,
+        "relationship_candidate_selection": RELATIONSHIP_PROMPT_VERSION,
+        "relationship_adjudication": RELATIONSHIP_PROMPT_VERSION,
+        "relationship_escalation": RELATIONSHIP_PROMPT_VERSION,
     }.get(stage, LITERATURE_ALGORITHM_VERSION)
 
 
@@ -1814,6 +1823,21 @@ def _revalidate_raw_synthesis_response(
         "cluster_synthesis": "cluster_synthesis",
         "gap_adjudication": "gap_adjudication",
     }.get(stage)
+    relationship_kind = {
+        "relationship_shard_selection": "shard_selection",
+        "relationship_candidate_selection": "candidate_selection",
+        "relationship_adjudication": "relationship_adjudication",
+        "relationship_escalation": "relationship_adjudication",
+    }.get(stage)
+    if relationship_kind is not None:
+        from .readers import _validate_relationship_response
+
+        try:
+            return _validate_relationship_response(
+                raw_response, kind=relationship_kind
+            )
+        except (TypeError, ValueError, RuntimeError):
+            return None
     if kind is None:
         return None
     # Keep provider transport independent from the collection mapper while
@@ -14730,6 +14754,81 @@ def _navigation_profile_rows(
     return hydrated
 
 
+def build_navigation_projection(
+    workspace: Path | None,
+    profiles: Sequence[Any],
+    source_notes: Sequence[Mapping[str, Any]],
+    *,
+    navigation_policy: Any = None,
+    propositions: Sequence[Mapping[str, Any]] = (),
+) -> dict[str, Any]:
+    """Build the provider-free atomic navigation graph for committed profiles."""
+
+    hydrated_notes = (
+        _source_notes_with_custody_relations(workspace, source_notes)
+        if workspace is not None
+        else [dict(row) for row in source_notes]
+    )
+    navigation_profiles = _navigation_profile_rows(
+        [_as_mapping(profile) for profile in profiles],
+        hydrated_notes,
+    )
+    if bool(_policy_value(navigation_policy, "subject_tags_enabled", True)):
+        return build_navigation_graph(
+            navigation_profiles,
+            propositions=propositions,
+            max_candidates_per_source=int(
+                _policy_value(
+                    navigation_policy, "max_candidate_tags_per_source", 24
+                )
+            ),
+            max_visible_tags_per_source=int(
+                _policy_value(navigation_policy, "max_visible_tags_per_source", 8)
+            ),
+            max_inferred_links_per_source=int(
+                _policy_value(
+                    navigation_policy, "max_inferred_related_note_links", 8
+                )
+            ),
+            minimum_neighborhood_sources=int(
+                _policy_value(navigation_policy, "min_sources_per_neighborhood", 2)
+            ),
+        )
+    typed_relations = build_typed_source_relations(
+        navigation_profiles,
+        propositions=propositions,
+        max_inferred_links_per_source=int(
+            _policy_value(
+                navigation_policy, "max_inferred_related_note_links", 8
+            )
+        ),
+    )
+    return {
+        "tag_reconciliation_version": "1",
+        "navigation_relation_version": "1",
+        "neighborhood_promotion_version": "1",
+        "subject_tags": [],
+        "assignments": [],
+        "candidates": [],
+        "rejected_candidates": [],
+        "candidate_count": 0,
+        "promoted_subject_tag_count": 0,
+        "rejected_generic_tag_count": 0,
+        "unconfirmed_zotero_tag_count": 0,
+        "topic_neighborhoods": [],
+        "singleton_facets": [],
+        "promoted_neighborhood_count": 0,
+        "singleton_facet_count": 0,
+        "typed_relations": typed_relations,
+        "typed_relation_counts": dict(
+            Counter(str(row.get("relation_type") or "") for row in typed_relations)
+        ),
+        "graph_projection_hash": _stable_hash(
+            {"typed_relations": typed_relations, "subject_tags_enabled": False}
+        ),
+    }
+
+
 def _source_notes_with_custody_relations(
     workspace: Path,
     source_notes: Sequence[Mapping[str, Any]],
@@ -15904,6 +16003,8 @@ def build_literature_report(
     source_notes: Sequence[Mapping[str, Any]] = (),
     navigation_policy: Any = None,
     source_set: Mapping[str, Any] | None = None,
+    accepted_relationships: Sequence[Mapping[str, Any]] = (),
+    relationship_candidates: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """Pure end-to-end mapper over already-built evidence profiles."""
     normalized = normalize_evidence_profiles(profiles)
@@ -15939,6 +16040,17 @@ def build_literature_report(
                 "study_lineages": independence["study_lineages"],
                 "evidence_base_groups": independence["evidence_base_groups"],
                 "independence_assessments": independence["independence_assessments"],
+                "accepted_relationships": [
+                    dict(row)
+                    for row in accepted_relationships
+                    if isinstance(row, Mapping) and bool(row.get("active", True))
+                ],
+                "relationship_cluster_candidates": [
+                    dict(row)
+                    for row in relationship_candidates
+                    if isinstance(row, Mapping)
+                    and row.get("target_kind") == "cluster"
+                ],
             },
         )
         if len(analytical_families) >= 2
@@ -16020,6 +16132,17 @@ def build_literature_report(
                 "study_lineages": independence["study_lineages"],
                 "evidence_base_groups": independence["evidence_base_groups"],
                 "independence_assessments": independence["independence_assessments"],
+                "accepted_relationships": [
+                    dict(row)
+                    for row in accepted_relationships
+                    if isinstance(row, Mapping) and bool(row.get("active", True))
+                ],
+                "relationship_cluster_candidates": [
+                    dict(row)
+                    for row in relationship_candidates
+                    if isinstance(row, Mapping)
+                    and row.get("target_kind") == "cluster"
+                ],
             },
         )
         preserved_repair_responses: list[Mapping[str, Any]] = []
@@ -16250,6 +16373,44 @@ def build_literature_report(
                 validated_synthesis = repaired_synthesis
             else:
                 validated_synthesis["repair_attempted"] = True
+        prior_cluster = next(
+            (
+                dict(row)
+                for row in (previous_registry or {}).get("clusters", []) or []
+                if isinstance(row, Mapping)
+                and str(row.get("cluster_id") or "") == cluster_id
+            ),
+            None,
+        )
+        if (
+            validated_synthesis.get("status") == "partial"
+            and prior_cluster is not None
+        ):
+            pending_source_ids = sorted(
+                set(cluster.get("source_ids", []) or [])
+                ^ set(prior_cluster.get("source_ids", []) or [])
+            )
+            cluster.update(
+                refresh_pending=True,
+                last_good_revision_hash=str(
+                    prior_cluster.get("revision_hash") or ""
+                ),
+                pending_revision_hash=str(cluster.get("revision_hash") or ""),
+                refresh_pending_source_ids=pending_source_ids,
+            )
+            validated_synthesis.update(
+                refresh_pending=True,
+                last_good_revision_hash=str(
+                    prior_cluster.get("revision_hash") or ""
+                ),
+                refresh_pending_source_ids=pending_source_ids,
+            )
+        else:
+            cluster.pop("last_good_revision_hash", None)
+            cluster.pop("pending_revision_hash", None)
+            cluster.pop("refresh_pending_source_ids", None)
+            cluster["refresh_pending"] = False
+            validated_synthesis["refresh_pending"] = False
         cluster_syntheses[cluster_id] = validated_synthesis
     quantitative_comparisons = _quantitative_comparison_records(cluster_syntheses)
     _notify_stage(stage_callback, "debate_mapping", active_cluster="")
@@ -16358,55 +16519,13 @@ def build_literature_report(
     navigation_profiles = _navigation_profile_rows(
         [_as_mapping(profile) for profile in profiles], source_notes
     )
-    if bool(_policy_value(navigation_policy, "subject_tags_enabled", True)):
-        navigation = build_navigation_graph(
-            navigation_profiles,
-            propositions=mapped_propositions,
-            max_candidates_per_source=int(
-                _policy_value(navigation_policy, "max_candidate_tags_per_source", 24)
-            ),
-            max_visible_tags_per_source=int(
-                _policy_value(navigation_policy, "max_visible_tags_per_source", 8)
-            ),
-            max_inferred_links_per_source=int(
-                _policy_value(navigation_policy, "max_inferred_related_note_links", 8)
-            ),
-            minimum_neighborhood_sources=int(
-                _policy_value(navigation_policy, "min_sources_per_neighborhood", 2)
-            ),
-        )
-    else:
-        typed_relations = build_typed_source_relations(
-            navigation_profiles,
-            propositions=mapped_propositions,
-            max_inferred_links_per_source=int(
-                _policy_value(navigation_policy, "max_inferred_related_note_links", 8)
-            ),
-        )
-        navigation = {
-            "tag_reconciliation_version": "1",
-            "navigation_relation_version": "1",
-            "neighborhood_promotion_version": "1",
-            "subject_tags": [],
-            "assignments": [],
-            "candidates": [],
-            "rejected_candidates": [],
-            "candidate_count": 0,
-            "promoted_subject_tag_count": 0,
-            "rejected_generic_tag_count": 0,
-            "unconfirmed_zotero_tag_count": 0,
-            "topic_neighborhoods": [],
-            "singleton_facets": [],
-            "promoted_neighborhood_count": 0,
-            "singleton_facet_count": 0,
-            "typed_relations": typed_relations,
-            "typed_relation_counts": dict(
-                Counter(str(row.get("relation_type") or "") for row in typed_relations)
-            ),
-            "graph_projection_hash": _stable_hash(
-                {"typed_relations": typed_relations, "subject_tags_enabled": False}
-            ),
-        }
+    navigation = build_navigation_projection(
+        None,
+        profiles,
+        source_notes,
+        navigation_policy=navigation_policy,
+        propositions=mapped_propositions,
+    )
     _project_navigation_onto_map(
         navigation,
         navigation_profiles,
@@ -16484,7 +16603,7 @@ def build_literature_report(
         if str(row.get("source_id") or "") in analytical_source_ids
     )
     manifest = {
-        "mapper_version": "0.10.0",
+        "mapper_version": CURRENT_ENGINE_VERSION,
         "algorithm_version": LITERATURE_ALGORITHM_VERSION,
         "profile_count": len(normalized),
         "analytical_profile_count": sum(1 for row in normalized if row["analytical"]),
@@ -16593,7 +16712,7 @@ def build_literature_report(
     }
     packet = {
         "packet_kind": "literature_map",
-        "mapper_version": "0.10.0",
+        "mapper_version": CURRENT_ENGINE_VERSION,
         "algorithm_version": LITERATURE_ALGORITHM_VERSION,
         "cluster_ids": [row["cluster_id"] for row in registry["clusters"]],
         "gap_ids": [row["gap_id"] for row in gaps],
@@ -16760,6 +16879,48 @@ def _write_markdown_with_quality_ratchet(
         return False
     atomic_write_text(path, text)
     return True
+
+
+_REFRESH_PENDING_START = "<!-- auto-zettelkasten:cluster-refresh:start -->"
+_REFRESH_PENDING_END = "<!-- auto-zettelkasten:cluster-refresh:end -->"
+
+
+def _mark_cluster_refresh_pending(
+    path: Path, cluster: Mapping[str, Any]
+) -> None:
+    if not path.is_file():
+        return
+    text = path.read_text(encoding="utf-8")
+    pending_ids = ", ".join(
+        str(value)
+        for value in cluster.get("refresh_pending_source_ids", []) or []
+        if str(value)
+    )
+    pending_detail = (
+        f" Changed sources awaiting incorporation: {pending_ids}."
+        if pending_ids
+        else ""
+    )
+    warning = (
+        f"{_REFRESH_PENDING_START}\n"
+        "> [!warning] Cluster refresh pending\n"
+        "> This note preserves the last validated synthesis while a newer "
+        f"cluster revision awaits successful validation.{pending_detail}\n"
+        f"{_REFRESH_PENDING_END}"
+    )
+    cleaned = re.sub(
+        rf"\n*{re.escape(_REFRESH_PENDING_START)}.*?"
+        rf"{re.escape(_REFRESH_PENDING_END)}\n*",
+        "\n\n",
+        text,
+        flags=re.DOTALL,
+    ).rstrip()
+    if cleaned.startswith("---\n") and (end := cleaned.find("\n---\n", 4)) >= 0:
+        desired = f"{cleaned[:end + 5]}\n\n{warning}\n{cleaned[end + 5:].lstrip()}"
+    else:
+        desired = f"{warning}\n\n{cleaned}\n"
+    if desired != text:
+        atomic_write_text(path, desired)
 
 
 def _obsidian_note_link(row: Mapping[str, Any]) -> str:
@@ -20038,11 +20199,16 @@ def persist_literature_report(
         (subject_tag_assignments_path, tag_assignments_payload),
         (compatibility_subject_tag_assignments_path, tag_assignments_payload),
         (typed_relations_path, typed_relations_payload),
-        (compatibility_typed_links_path, typed_relations_payload),
-        (compatibility_typed_note_links_path, typed_relations_payload),
         (navigation_audit_path, navigation_audit_payload),
     ):
         write_yaml(path, payload)
+    from .relationships import persist_relationship_registry
+
+    persist_relationship_registry(
+        workspace,
+        structural_relations=navigation.get("typed_relations", []),
+        preserve_unmentioned_structural=True,
+    )
     write_yaml(
         proposition_path,
         {"updated_at": generated_at, "propositions": report.get("propositions", [])},
@@ -20280,6 +20446,8 @@ def persist_literature_report(
                     },
                 ),
             )
+        elif cluster.get("refresh_pending"):
+            _mark_cluster_refresh_pending(path, cluster)
         question_text = _cluster_display_question(cluster, synthesis)
         verdict_text = _cluster_answer_excerpt(
             synthesis, cluster=cluster, max_threads=2, character_limit=550
@@ -20604,6 +20772,8 @@ def persist_literature_report(
                     },
                 ),
             )
+        elif cluster.get("refresh_pending"):
+            _mark_cluster_refresh_pending(canonical_cluster_path, cluster)
         question_text = _cluster_display_question(cluster, synthesis)
         verdict_text = _cluster_answer_excerpt(
             synthesis, cluster=cluster, max_threads=2, character_limit=550
@@ -20716,8 +20886,8 @@ def persist_literature_report(
             "run_id": run_id,
             "source_set_id": source_set.get("source_set_id", ""),
             "source_set_dependency_hash": source_set.get("dependency_hash", ""),
-            "engine_version": "0.10.0",
-            "artifact_schema_version": "1.9",
+            "engine_version": CURRENT_ENGINE_VERSION,
+            "artifact_schema_version": CURRENT_ARTIFACT_SCHEMA_VERSION,
             **dict(manifest),
             "artifacts": canonical_artifacts,
         },
@@ -20762,8 +20932,8 @@ def persist_literature_report(
         {
             "updated_at": generated_at,
             "map_id": map_id,
-            "engine_version": "0.10.0",
-            "artifact_schema_version": "1.9",
+            "engine_version": CURRENT_ENGINE_VERSION,
+            "artifact_schema_version": CURRENT_ARTIFACT_SCHEMA_VERSION,
             **dict(manifest),
             "artifacts": artifact_names,
         },
@@ -20795,6 +20965,9 @@ def build_literature_map(
     reasoner: Any = None,
     stage_callback: Any = None,
     navigation_policy: Any = None,
+    reasoner_calls: Any = None,
+    accepted_relationships: Sequence[Mapping[str, Any]] = (),
+    relationship_candidates: Sequence[Mapping[str, Any]] = (),
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], list[Path]]:
     """Compatibility entry point for current pipeline callers."""
     request_values = _as_mapping(request) if request is not None else {}
@@ -20807,7 +20980,7 @@ def build_literature_map(
     )
     map_id = stable_literature_map_id(source_set, effective_question)
     previous_registry = _load_map_cluster_registry(workspace, map_id)
-    reasoner_calls = (
+    reasoner_calls = reasoner_calls or (
         _CheckpointedReasonerCalls(
             workspace,
             effective_run_id,
@@ -20833,6 +21006,8 @@ def build_literature_map(
         source_notes=navigation_source_notes,
         navigation_policy=navigation_policy,
         source_set=source_set,
+        accepted_relationships=accepted_relationships,
+        relationship_candidates=relationship_candidates,
     )
     if reasoner_calls is not None:
         report["manifest"].update(

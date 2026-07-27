@@ -55,6 +55,16 @@ def export_obsidian(
     source_index = root / "02_source_memory" / "indexes" / "INDEX.md"
     if source_index.exists():
         projections.append((source_index, Path("Indexes") / "Source Index.md"))
+    source_cluster_index = root / "02_source_memory" / "indexes" / "CLUSTERS.md"
+    if source_cluster_index.exists():
+        projections.append(
+            (source_cluster_index, Path("Indexes") / "CLUSTERS.md")
+        )
+    literature_indexes = root / "02_source_memory" / "indexes" / "by_literature"
+    projections.extend(
+        (path, Path("Indexes") / "by_literature" / path.name)
+        for path in sorted(literature_indexes.glob("*.md"))
+    )
     latest_map = _latest_canonical_map(root / "03_literature_synthesis" / "maps")
     cluster_root = (
         latest_map / "clusters"
