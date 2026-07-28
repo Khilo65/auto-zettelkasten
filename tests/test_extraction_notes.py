@@ -205,6 +205,11 @@ def test_atomic_note_validator_requires_lineage_and_all_sections() -> None:
     assert "source_coverage_gate_not_passed" in validate_atomic_note(limited_coverage).errors
     untraceable = text.replace("Grounded locators; see page 1.", "N/A")
     assert "untraceable_locators" in validate_atomic_note(untraceable).errors
+    web_locator = text.replace(
+        "Grounded locators; see page 1.",
+        'https://example.org/report, heading "Findings"',
+    )
+    assert "untraceable_locators" not in validate_atomic_note(web_locator).errors
 
 
 def test_atomic_note_validator_requires_lay_explanation_of_statistical_findings() -> None:

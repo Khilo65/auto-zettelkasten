@@ -89,6 +89,7 @@ def build_parser() -> argparse.ArgumentParser:
     resume_parser = commands.add_parser("resume", help="Resume an interrupted or partially terminal run.")
     resume_parser.add_argument("--workspace", type=Path, required=True)
     resume_parser.add_argument("--run-id", required=True)
+    resume_parser.add_argument("--retry-terminal-literature", action="store_true")
 
     status_parser = commands.add_parser("status", help="Show workspace or run status.")
     status_parser.add_argument("--workspace", type=Path, required=True)
@@ -104,6 +105,7 @@ def build_parser() -> argparse.ArgumentParser:
     build_parser_command.add_argument("--model", default=None)
     build_parser_command.add_argument("--allow-cloud", action="store_true", default=None)
     build_parser_command.add_argument("--resume", action="store_true")
+    build_parser_command.add_argument("--retry-terminal-literature", action="store_true")
     _add_literature_policy_arguments(build_parser_command)
     _add_navigation_policy_arguments(build_parser_command)
 
@@ -160,7 +162,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 parallel=args.parallel if args.parallel is not None else int(config.get("parallel", 4)),
                 limit=args.limit if args.limit is not None else 0,
                 extraction_version=str(extraction_config.get("version") or "2"),
-                prompt_version=str(config.get("prompt_version") or "8"),
+                prompt_version=str(config.get("prompt_version") or "9"),
                 extraction_policy=_extraction_policy(args, config),
                 processing=_processing_policy(args, config),
                 literature_policy=_literature_policy(args, config),
@@ -168,7 +170,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             result = run_map(request, run_id=args.run_id or None).to_dict()
         elif args.command == "resume":
-            result = resume_map(args.workspace, args.run_id).to_dict()
+            result = resume_map(
+                args.workspace,
+                args.run_id,
+                retry_terminal_failures=args.retry_terminal_literature,
+            ).to_dict()
         elif args.command == "status":
             report = get_status(args.workspace, args.run_id or None)
             result = report.to_dict()
@@ -192,6 +198,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 literature_policy=_literature_policy(args, config),
                 navigation_policy=_navigation_policy(args, config),
                 resume=args.resume,
+                retry_terminal_failures=args.retry_terminal_literature,
             ).to_dict()
         elif args.command == "migrate":
             result = migrate_workspace(args.workspace, dry_run=args.dry_run)

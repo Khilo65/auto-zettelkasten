@@ -56,6 +56,7 @@ REQUIRED_FRONTMATTER = {
 
 ANALYTICAL_NOTE_STATUSES = {"analytical_atomic_note", "verified_atomic_note"}
 LIMITED_NOTE_STATUSES = {
+    "partial_document_atomic_note",
     "abstract_only_atomic_note",
     "metadata_only_source_note",
     "fulltext_available",
@@ -92,11 +93,19 @@ REQUIRED_LIMITED_FRONTMATTER = (REQUIRED_FRONTMATTER - {"reader_provider", "read
 }
 _TRACEABLE_LOCATOR = re.compile(
     r"(?:\b(?:p{1,2}\.?|pages?|paragraphs?)\s*\d+(?:\s*[-\u2013\u2014]\s*\d+)?\b|"
+    r"https?://[^\s>)\]}]+|"
+    r"\b(?:section|heading)\s+[\"“']?[A-Za-z0-9][^\"”';,()]{1,100}|"
     r"\b(?:abstract|introduction|background|literature review|methods?|methodology|data|results?|findings?|"
     r"discussion|conclusions?|limitations?|appendix)\b|\b(?:table|figure)\s*\d+[a-z]?\b)",
     flags=re.IGNORECASE,
 )
 _LIMITED_NOTE_SPEC = {
+    "partial_document_atomic_note": {
+        "scope": "partial_document",
+        "gates": {"limited"},
+        "primary_heading": "Available-content Findings",
+        "secondary_heading": "Coverage Limitation",
+    },
     "abstract_only_atomic_note": {
         "scope": "abstract_only",
         "gates": {"limited"},
@@ -235,6 +244,9 @@ def public_note_frontmatter(frontmatter: Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(creators, Sequence) and not isinstance(creators, (str, bytes)):
         for creator in creators:
             if isinstance(creator, Mapping):
+                creator_type = str(creator.get("creatorType") or "").strip()
+                if creator_type and creator_type not in {"author", "bookAuthor"}:
+                    continue
                 name = " ".join(
                     str(creator.get(key) or "").strip()
                     for key in ("firstName", "lastName")
@@ -247,6 +259,7 @@ def public_note_frontmatter(frontmatter: Mapping[str, Any]) -> dict[str, Any]:
     coverage = {
         "analytical_atomic_note": "full text",
         "verified_atomic_note": "full text",
+        "partial_document_atomic_note": "partial document",
         "abstract_only_atomic_note": "abstract only",
         "metadata_only_source_note": "metadata only",
         "fulltext_available": "full text available; analysis pending",
@@ -341,6 +354,9 @@ def render_limited_note(frontmatter: Mapping[str, Any], content: Mapping[str, An
     ).strip()
     if not secondary:
         secondary = {
+            "partial_document_atomic_note": _partial_coverage_limitation(
+                frontmatter
+            ),
             "abstract_only_atomic_note": "Only the abstract was available. Do not treat this note as evidence from the full publication.",
             "metadata_only_source_note": "No abstract or full publication text was available. This note records bibliographic metadata only.",
             "fulltext_available": "Full text is available, but no analytical atomic note has been produced from it yet.",
@@ -392,6 +408,37 @@ def validate_limited_note(text: str) -> NoteValidation:
         for heading in (spec["primary_heading"], spec["secondary_heading"]):
             if not _section_text(body, str(heading)):
                 errors.append(f"missing_section:{slugify(str(heading))}")
+        if status == "partial_document_atomic_note":
+            primary = _section_text(body, "Available-content Findings")
+            limitation = _section_text(body, "Coverage Limitation")
+            metrics = _coverage_metrics(frontmatter)
+            unresolved = _positive_page_numbers(metrics.get("unresolved_pages"))
+            recovered = _positive_page_numbers(metrics.get("recovered_pages"))
+            ratio = metrics.get("recovered_page_ratio")
+            bounded_excerpt = (
+                metrics.get("bibliographic_scope")
+                == "bounded_attachment_excerpt"
+                and metrics.get("missing_scope") == "remainder_of_parent_work"
+            )
+            if not unresolved:
+                if not bounded_excerpt:
+                    errors.append("partial_document_unresolved_pages_required")
+            if not recovered:
+                errors.append("partial_document_recovered_pages_required")
+            try:
+                valid_ratio = ratio is not None and 0 < float(ratio) < 1
+            except (TypeError, ValueError):
+                valid_ratio = False
+            if not valid_ratio and not bounded_excerpt:
+                errors.append("partial_document_recovered_page_ratio_invalid")
+            if primary and not _TRACEABLE_LOCATOR.search(primary):
+                errors.append("partial_document_findings_require_locator")
+            if bounded_excerpt and "remaining parent work" not in limitation.casefold():
+                errors.append("partial_document_missing_parent_scope_not_disclosed")
+            elif unresolved and not all(
+                re.search(rf"\b{page}\b", limitation) for page in unresolved
+            ):
+                errors.append("partial_document_missing_pages_not_disclosed")
     if any(_section_text(body, heading) for _, heading in SECTION_HEADINGS):
         errors.append("analytical_sections_not_allowed_in_limited_note")
     return NoteValidation(passed=not errors, errors=errors, warnings=warnings)
@@ -413,6 +460,7 @@ def write_atomic_note(workspace: Path, frontmatter: Mapping[str, Any], analysis:
     notes_dir = workspace / "02_source_memory" / "notes"
     notes_dir.mkdir(parents=True, exist_ok=True)
     candidate = _note_candidate(notes_dir, frontmatter)
+    _assert_source_note_safe_to_replace(workspace, candidate)
     text = render_atomic_note(frontmatter, analysis)
     validation = validate_atomic_note(text)
     if not validation.passed:
@@ -425,8 +473,11 @@ def write_atomic_note(workspace: Path, frontmatter: Mapping[str, Any], analysis:
     text = render_atomic_note(committed, analysis)
     final_validation = validate_atomic_note(text)
     if final_validation.passed:
-        _write_note_metadata(workspace, candidate, committed)
-        atomic_write_text(candidate, _public_note_text(text, committed))
+        public_text = _public_note_text(text, committed)
+        atomic_write_text(candidate, public_text)
+        _write_note_metadata(
+            workspace, candidate, committed, machine_text=public_text
+        )
     return candidate, final_validation
 
 
@@ -438,6 +489,7 @@ def write_limited_note(
     notes_dir = workspace / "02_source_memory" / "notes"
     notes_dir.mkdir(parents=True, exist_ok=True)
     candidate = _note_candidate(notes_dir, frontmatter)
+    _assert_source_note_safe_to_replace(workspace, candidate)
     text = render_limited_note(frontmatter, content)
     validation = validate_limited_note(text)
     if validation.passed:
@@ -448,8 +500,11 @@ def write_limited_note(
         text = render_limited_note(committed, content)
         validation = validate_limited_note(text)
         if validation.passed:
-            _write_note_metadata(workspace, candidate, committed)
-            atomic_write_text(candidate, _public_note_text(text, committed))
+            public_text = _public_note_text(text, committed)
+            atomic_write_text(candidate, public_text)
+            _write_note_metadata(
+                workspace, candidate, committed, machine_text=public_text
+            )
     return candidate, validation
 
 
@@ -501,6 +556,18 @@ def semantic_note_hash(text: str) -> str:
     semantic_frontmatter, semantic_body = source_note_semantic_components(text)
     canonical = json.dumps(semantic_frontmatter, sort_keys=True, ensure_ascii=False, default=str)
     return sha256_text(f"{canonical}\n---\n{semantic_body}\n")
+
+
+def source_note_preservation_hash(text: str) -> str:
+    """Hash user-editable content while excluding the owned graph block."""
+
+    frontmatter, body = parse_atomic_note(text)
+    body = _strip_generated_note_sections(body)
+    return sha256_text(
+        json.dumps(frontmatter, sort_keys=True, ensure_ascii=False, default=str)
+        + "\n---\n"
+        + body
+    )
 
 
 def source_note_semantic_components(text: str) -> tuple[dict[str, Any], str]:
@@ -567,8 +634,6 @@ def _strip_generated_note_sections(body: str) -> str:
         return _without_markdown_span(body, section.start(), section.end()).rstrip()
     if managed:
         return _without_markdown_span(body, managed.start(), managed.end()).rstrip()
-    if section:
-        return _without_markdown_span(body, section.start(), section.end()).rstrip()
     return body.rstrip()
 
 
@@ -598,16 +663,24 @@ def _without_markdown_span(body: str, start: int, end: int) -> str:
 
 
 def _project_graph_block(body: str, graph_block: str) -> str:
+    start_count = body.count(GRAPH_START_MARKER)
+    end_count = body.count(GRAPH_END_MARKER)
+    if (start_count, end_count) not in {(0, 0), (1, 1)}:
+        raise ValueError("ambiguous_managed_graph_block")
     managed = _managed_graph_block(body)
+    if start_count == 1 and managed is None:
+        raise ValueError("ambiguous_managed_graph_block")
     if managed:
         return f"{body[:managed.start()]}{graph_block}{body[managed.end():]}"
-    graph_section = f"{GRAPH_HEADING}\n\n{graph_block}"
     section = _graph_section(body)
     if section:
-        prefix = body[: section.start()].rstrip("\n")
-        suffix = body[section.end() :].lstrip("\n")
-        return "\n\n".join(part for part in (prefix, graph_section, suffix) if part)
-    return f"{body.rstrip()}\n\n{graph_section}"
+        separator = "" if body[: section.end()].endswith("\n\n") else "\n"
+        return (
+            f"{body[:section.end()]}{separator}{graph_block}\n"
+            f"{body[section.end():]}"
+        )
+    separator = "" if not body or body.endswith("\n\n") else "\n\n"
+    return f"{body}{separator}{GRAPH_HEADING}\n\n{graph_block}\n"
 
 
 def _strip_review_status_sections(body: str) -> str:
@@ -651,57 +724,88 @@ def update_note_graph(
     text = path.read_text(encoding="utf-8")
     note = read_note(path)
     frontmatter = dict(note["frontmatter"])
-    body = str(note["body"])
-    before_semantic_hash = semantic_note_hash(
-        f"---\n{_dump_frontmatter(frontmatter)}\n---\n{body}"
-    )
+    projected_frontmatter, body = parse_atomic_note(text)
+    unexpected_updates = sorted(set(updates) - NON_SOURCE_FRONTMATTER_FIELDS)
+    if unexpected_updates:
+        raise ValueError("graph projection changed semantic note content")
     for field in REVIEW_STATUS_FRONTMATTER_FIELDS:
         frontmatter.pop(field, None)
-    body = _strip_review_status_sections(body).rstrip() + "\n"
-    graph_lines: list[str] = []
+    relationship_lines: list[str] = []
     for link in related_links:
         reason = str(link.get("reason") or "").strip()
         suffix = f" — {reason}" if reason else ""
-        graph_lines.append(f"- {link['relation_type']}: [[{link['target_stem']}]]{suffix}")
+        relation_id = str(link.get("relation_id") or "").strip()
+        identity = f" <!-- relation_id: {relation_id} -->" if relation_id else ""
+        relationship_lines.append(
+            f"- {link['relation_type']}: [[{link['target_stem']}]]{suffix}{identity}"
+        )
     cluster_wikilinks = cluster_wikilinks or {}
+    cluster_lines: list[str] = []
     for cluster_id in cluster_ids:
-        graph_lines.append(f"- cluster: {cluster_wikilinks.get(cluster_id, f'[[{cluster_id}]]')}")
+        cluster_lines.append(
+            f"- member of: {cluster_wikilinks.get(cluster_id, f'[[{cluster_id}]]')}"
+        )
+    gap_lines: list[str] = []
     for gap_link in gap_links:
         wikilink = str(gap_link.get("wikilink") or f"[[{gap_link['gap_id']}]]")
-        graph_lines.append(f"- {gap_link['relation_type']}: {wikilink}")
+        gap_lines.append(f"- {gap_link['relation_type']}: {wikilink}")
+    graph_lines: list[str] = []
+    if relationship_lines:
+        graph_lines.extend(("### Relationships", "", *relationship_lines))
+    if cluster_lines:
+        graph_lines.extend(
+            (*([""] if graph_lines else []), "### Clusters", "", *cluster_lines)
+        )
+    if gap_lines:
+        graph_lines.extend(
+            (*([""] if graph_lines else []), "### Gaps", "", *gap_lines)
+        )
     if not related_links and not cluster_ids and not gap_links:
         graph_lines.append("No committed typed links or canonical clusters yet.")
     desired_updates = dict(updates)
     desired_updated_at = desired_updates.pop("updated_at", None)
-    unchanged_frontmatter = all(frontmatter.get(key) == value for key, value in desired_updates.items())
+    if "tags" in desired_updates:
+        desired_updates["tags"] = sorted(
+            {
+                str(value)
+                for values in (
+                    frontmatter.get("tags", []) or [],
+                    projected_frontmatter.get("tags", []) or [],
+                    desired_updates.get("tags", []) or [],
+                )
+                for value in values
+                if str(value)
+            }
+        )
+    unchanged_frontmatter = all(
+        frontmatter.get(key) == value for key, value in desired_updates.items()
+    )
     graph_block = (
-        f"{GRAPH_START_MARKER}\n"
-        f"{'\n'.join(graph_lines)}\n"
-        f"{GRAPH_END_MARKER}"
+        GRAPH_START_MARKER
+        + "\n"
+        + "\n".join(graph_lines)
+        + "\n"
+        + GRAPH_END_MARKER
     )
-    desired_body = _project_graph_block(body, graph_block).rstrip() + "\n"
+    desired_body = _project_graph_block(body, graph_block)
     projected_frontmatter = {**frontmatter, **desired_updates}
-    if not unchanged_frontmatter and desired_updated_at is not None:
+    if (
+        (not unchanged_frontmatter or body != desired_body)
+        and desired_updated_at is not None
+    ):
         projected_frontmatter["updated_at"] = desired_updated_at
-    after_semantic_hash = semantic_note_hash(
-        f"---\n{_dump_frontmatter(projected_frontmatter)}\n---\n{desired_body}"
-    )
-    if after_semantic_hash != before_semantic_hash:
-        raise ValueError("graph projection changed semantic note content")
     workspace = _workspace_for_note(path)
-    rendered_frontmatter = (
-        public_note_frontmatter(projected_frontmatter)
-        if workspace is not None
-        else projected_frontmatter
-    )
-    yaml_text = _dump_frontmatter(rendered_frontmatter)
     frontmatter_end = text.find("\n---\n", 4)
-    existing_yaml_text = text[4:frontmatter_end] if frontmatter_end >= 0 else ""
-    if unchanged_frontmatter and body == desired_body and existing_yaml_text == yaml_text:
+    if frontmatter_end < 0:
+        raise ValueError("atomic note requires YAML frontmatter")
+    desired_text = f"{text[:frontmatter_end + 5]}{desired_body}"
+    if semantic_note_hash(text) != semantic_note_hash(desired_text):
+        raise ValueError("graph projection changed semantic note content")
+    if text == desired_text and (unchanged_frontmatter or workspace is None):
         return False
+    atomic_write_text(path, desired_text)
     if workspace is not None:
         _write_note_metadata(workspace, path, projected_frontmatter)
-    atomic_write_text(path, f"---\n{yaml_text}\n---\n{desired_body}")
     return True
 
 
@@ -720,18 +824,41 @@ def _write_note_metadata(
     workspace: Path,
     note_path: Path,
     frontmatter: Mapping[str, Any],
+    *,
+    machine_text: str | None = None,
 ) -> None:
     note_id = str(frontmatter.get("note_id") or "")
     if not note_id:
         raise ValueError("note metadata requires note_id")
-    write_yaml(
-        _note_metadata_path(workspace, note_id),
-        {
-            "metadata_schema_version": NOTE_METADATA_SCHEMA_VERSION,
-            "note_path": str(note_path.resolve().relative_to(workspace.resolve())),
-            "frontmatter": dict(frontmatter),
-        },
+    path = _note_metadata_path(workspace, note_id)
+    existing = read_yaml(path, {}) or {}
+    payload = {
+        **(dict(existing) if isinstance(existing, Mapping) else {}),
+        "metadata_schema_version": NOTE_METADATA_SCHEMA_VERSION,
+        "note_path": str(note_path.resolve().relative_to(workspace.resolve())),
+        "frontmatter": dict(frontmatter),
+    }
+    if machine_text is not None:
+        payload["machine_preservation_hash"] = source_note_preservation_hash(
+            machine_text
+        )
+    write_yaml(path, payload)
+
+
+def _assert_source_note_safe_to_replace(workspace: Path, path: Path) -> None:
+    if not path.is_file():
+        return
+    text = path.read_text(encoding="utf-8")
+    projected, _ = parse_atomic_note(text)
+    note_id = str(projected.get("note_id") or "")
+    payload = (
+        read_yaml(_note_metadata_path(workspace, note_id), {}) or {}
+        if note_id
+        else {}
     )
+    expected = str(payload.get("machine_preservation_hash") or "")
+    if not expected or source_note_preservation_hash(text) != expected:
+        raise ValueError("existing_source_note_has_unmanaged_changes")
 
 
 def _read_note_metadata(
@@ -744,7 +871,21 @@ def _read_note_metadata(
         return dict(projected_frontmatter)
     payload = read_yaml(_note_metadata_path(workspace, note_id), {}) or {}
     stored = payload.get("frontmatter") if isinstance(payload, Mapping) else None
-    return dict(stored) if isinstance(stored, Mapping) else dict(projected_frontmatter)
+    if not isinstance(stored, Mapping):
+        return dict(projected_frontmatter)
+    merged = {**dict(projected_frontmatter), **dict(stored)}
+    merged["tags"] = sorted(
+        {
+            str(value)
+            for values in (
+                projected_frontmatter.get("tags", []) or [],
+                stored.get("tags", []) or [],
+            )
+            for value in values
+            if str(value)
+        }
+    )
+    return merged
 
 
 def _public_note_text(text: str, frontmatter: Mapping[str, Any]) -> str:
@@ -813,6 +954,14 @@ def _limited_primary_content(
     frontmatter: Mapping[str, Any],
     payload: Mapping[str, Any],
 ) -> str:
+    if status == "partial_document_atomic_note":
+        return str(
+            payload.get("available_content_findings")
+            or payload.get("available_findings")
+            or payload.get("available_summary")
+            or payload.get("available_content")
+            or ""
+        ).strip()
     if status == "abstract_only_atomic_note":
         return str(
             payload.get("abstract")
@@ -841,3 +990,44 @@ def _limited_primary_content(
         if value not in (None, "", [], {}):
             rows.append(f"- {field}: {value}")
     return "\n".join(rows)
+
+
+def _coverage_metrics(frontmatter: Mapping[str, Any]) -> Mapping[str, Any]:
+    direct = frontmatter.get("coverage_metrics")
+    if isinstance(direct, Mapping):
+        return direct
+    coverage = frontmatter.get("source_coverage")
+    if isinstance(coverage, Mapping) and isinstance(coverage.get("metrics"), Mapping):
+        return coverage["metrics"]
+    return {}
+
+
+def _positive_page_numbers(value: Any) -> tuple[int, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return ()
+    pages: list[int] = []
+    for raw in value:
+        try:
+            page = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if page > 0 and page not in pages:
+            pages.append(page)
+    return tuple(pages)
+
+
+def _partial_coverage_limitation(frontmatter: Mapping[str, Any]) -> str:
+    metrics = _coverage_metrics(frontmatter)
+    recovered = _positive_page_numbers(metrics.get("recovered_pages"))
+    unresolved = _positive_page_numbers(metrics.get("unresolved_pages"))
+    recovered_text = _page_list(recovered) if recovered else "not recorded"
+    unresolved_text = _page_list(unresolved) if unresolved else "not recorded"
+    return (
+        f"Recovered PDF pages: {recovered_text}. Missing or unresolved PDF pages: "
+        f"{unresolved_text}. Claims in this note are restricted to the recovered "
+        "pages and must not be treated as findings from the complete document."
+    )
+
+
+def _page_list(pages: Sequence[int]) -> str:
+    return ", ".join(str(page) for page in pages)

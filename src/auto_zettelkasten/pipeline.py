@@ -20,6 +20,13 @@ from .extraction import (
     extract_bytes,
     extract_path,
 )
+from .fidelity import (
+    ATOMIC_FIDELITY_VERSION,
+    analyze_atomic_fidelity,
+    apply_atomic_replacements,
+    source_passages_for_risks,
+    validate_atomic_replacements,
+)
 from .files import (
     append_jsonl,
     atomic_write_bytes,
@@ -44,6 +51,9 @@ from .indexes import (
 from .navigation import build_typed_source_relations
 from .literature import (
     _CheckpointedReasonerCalls,
+    _preserve_last_valid_clusters_on_refresh_failure,
+    _reasoner_context_char_budget,
+    _reasoner_packet_chars,
     build_navigation_projection,
     build_literature_map,
     cluster_display_title,
@@ -55,6 +65,8 @@ from .literature import (
 from .migration import migrate_workspace, review_hash_aliases
 from .models import (
     ArtifactManifest,
+    EvidenceAnchor,
+    EvidenceProfile,
     LiteratureMapRequest,
     MapRequest,
     ProcessingPolicy,
@@ -110,7 +122,9 @@ from .relationships import (
     relationship_decision_key,
     RELATIONSHIP_PROMPT_VERSION,
     stable_hash,
+    validate_bridge_shard_pairs,
     validate_decisions,
+    validate_verifications,
 )
 from .readers import SECTION_KEYS, provider_from_name
 from .workspace import (
@@ -150,6 +164,84 @@ class DocumentPartialError(RuntimeError):
         self.reason = reason
         self.completed_chunks = completed_chunks
         self.total_chunks = total_chunks
+
+
+class AtomicFidelityError(RuntimeError):
+    pass
+
+
+class _ProfileProviderBudget:
+    """Persist the cumulative profile and fidelity provider-call ceiling."""
+
+    def __init__(self, path: Path, max_calls: int) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+        usage = read_yaml(path, {}) or {}
+        persisted_max = int(usage.get("max_calls", 0) or 0)
+        self.max_calls = min(max_calls, persisted_max) if persisted_max else max_calls
+        self.attempts = [
+            dict(row)
+            for row in usage.get("attempts", []) or []
+            if isinstance(row, Mapping)
+        ]
+        self.cumulative_calls = len(self.attempts)
+        self.new_calls = 0
+        self._write()
+
+    def reserve(self, stage: str, key: str, fingerprint: str) -> str:
+        with self._lock:
+            if self.cumulative_calls >= self.max_calls:
+                raise RuntimeError("literature_profile_call_budget_reached")
+            attempt_number = 1 + sum(
+                1
+                for row in self.attempts
+                if row.get("stage") == stage
+                and row.get("key") == key
+                and row.get("fingerprint") == fingerprint
+            )
+            attempt_id = stable_hash(
+                {
+                    "stage": stage,
+                    "key": key,
+                    "fingerprint": fingerprint,
+                    "attempt": attempt_number,
+                }
+            )
+            self.attempts.append(
+                {
+                    "attempt_id": attempt_id,
+                    "stage": stage,
+                    "key": key,
+                    "fingerprint": fingerprint,
+                    "attempt": attempt_number,
+                    "status": "started",
+                    "started_at": now_iso(),
+                }
+            )
+            self.cumulative_calls += 1
+            self.new_calls += 1
+            self._write()
+            return attempt_id
+
+    def finish(self, attempt_id: str, *, status: str) -> None:
+        with self._lock:
+            for row in self.attempts:
+                if row.get("attempt_id") == attempt_id:
+                    row["status"] = status
+                    row["finished_at"] = now_iso()
+                    break
+            self._write()
+
+    def _write(self) -> None:
+        write_yaml(
+            self.path,
+            {
+                "usage_schema_version": "2",
+                "max_calls": self.max_calls,
+                "provider_call_count": self.cumulative_calls,
+                "attempts": self.attempts,
+            },
+        )
 
 
 class DocumentCoverageLimitError(RuntimeError):
@@ -667,6 +759,10 @@ def run_pipeline(
         )
 
     progress = _RunProgress(run_dir / "progress.yml", run_id, items, resume=resume)
+    profile_budget = _ProfileProviderBudget(
+        run_dir / "literature" / "profiles" / "provider_usage.yml",
+        request.literature_policy.max_profile_calls,
+    )
     progress.set_stage("frozen_inventory")
     progress.set_stage("source_processing")
     prepared: list[dict[str, Any]] = []
@@ -728,6 +824,7 @@ def run_pipeline(
                 reader,
                 vision,
                 progress,
+                profile_budget,
             ): index
             for index, item in pending
         }
@@ -792,6 +889,7 @@ def run_pipeline(
         external_discovery=external_discovery,
         progress=progress,
         resume=resume,
+        profile_budget=profile_budget,
     )
     # The v0.4 map is already scoped to this run's frozen source set, so every
     # generated cluster and gap belongs to the run without a second heuristic filter.
@@ -1389,6 +1487,8 @@ def _run_relationship_reasoning(
 ) -> dict[str, Any]:
     selector = getattr(reasoner, "select_relationship_candidates", None)
     adjudicator = getattr(reasoner, "adjudicate_relationships", None)
+    verifier = getattr(reasoner, "verify_relationships", None)
+    bridge_selector = getattr(reasoner, "select_relationship_bridge_shards", None)
     if (
         reasoner_calls is None
         or not callable(selector)
@@ -1419,10 +1519,34 @@ def _run_relationship_reasoning(
         }
     catalogue_payload = read_yaml(Path(str(catalogue["catalogue_path"])), {}) or {}
     entries = [
-        dict(row)
+        _compact_relationship_catalogue_entry(row)
         for row in catalogue_payload.get("sources", []) or []
         if isinstance(row, Mapping) and row.get("source_id")
     ]
+    entry_by_source = {
+        str(row["source_id"]): row for row in entries if row.get("source_id")
+    }
+    eligible_entries = [
+        row
+        for row in entries
+        if str(row.get("source_id") or "") in profile_by_source
+    ]
+    relationship_profile_by_source = {
+        source_id: _relationship_evidence_projection(
+            profile,
+            entry_by_source.get(source_id, {}),
+            include_anchors=True,
+        )
+        for source_id, profile in profile_by_source.items()
+    }
+    relationship_index_profile_by_source = {
+        source_id: _relationship_evidence_projection(
+            profile,
+            entry_by_source.get(source_id, {}),
+            include_anchors=False,
+        )
+        for source_id, profile in profile_by_source.items()
+    }
     shards = [
         dict(row)
         for row in catalogue_payload.get("shards", []) or []
@@ -1439,6 +1563,13 @@ def _run_relationship_reasoning(
         )
         if isinstance(row, Mapping)
     ]
+    existing_relations = [
+        dict(row)
+        for row in (
+            registry.get("relations", []) if isinstance(registry, Mapping) else []
+        )
+        if isinstance(row, Mapping)
+    ]
     decided_pair_keys = {
         str(row.get("decision_key") or "")
         for row in (
@@ -1450,6 +1581,17 @@ def _run_relationship_reasoning(
     }
     relationship_provider = str(getattr(reasoner, "name", "") or request.provider)
     relationship_model = str(getattr(reasoner, "model", "") or request.model)
+    selection_identity = stable_hash(
+        {
+            "provider": relationship_provider,
+            "model": relationship_model,
+            "prompt_version": RELATIONSHIP_PROMPT_VERSION,
+            "candidate_capability": callable(selector),
+            "adjudication_capability": callable(adjudicator),
+            "verification_capability": callable(verifier),
+            "bridge_capability": callable(bridge_selector),
+        }
+    )
     state_path = (
         workspace
         / "02_source_memory"
@@ -1471,18 +1613,33 @@ def _run_relationship_reasoning(
         or catalogue.get("revision_hash")
         or ""
     )
-    reconciliation = (
-        str(source_set.get("source_set_type") or "")
-        == "auto_zettelkasten_workspace"
-        and str(state.get("reconciled_catalogue_revision") or "")
-        != catalogue_revision
+    prior_catalogue_revision = str(
+        state.get("reconciled_catalogue_revision")
+        or state.get("catalogue_revision")
+        or ""
     )
+    prior_selection_identity = str(state.get("selection_identity") or "")
+    catalogue_changed = bool(
+        prior_catalogue_revision
+        and prior_catalogue_revision != catalogue_revision
+    )
+    identity_changed = bool(
+        prior_selection_identity
+        and prior_selection_identity != selection_identity
+    )
+    home_shard_by_source = {
+        str(source_id): str(row.get("shard_id") or "")
+        for row in shards
+        for source_id in row.get("source_ids", []) or []
+        if str(source_id)
+    }
     focus_ids = sorted(
         source_id
         for source_id, profile_hash in current_hashes.items()
-        if reconciliation or str(prior_hashes.get(source_id) or "") != profile_hash
+        if identity_changed
+        or str(prior_hashes.get(source_id) or "") != profile_hash
     )
-    if not focus_ids:
+    if not focus_ids and not catalogue_changed:
         return {
             "accepted": [],
             "no_relationship": [],
@@ -1490,40 +1647,84 @@ def _run_relationship_reasoning(
             "cluster_candidates": [],
             "selected_profile_hashes": {},
             "reconciled_catalogue_revision": "",
+            "selection_identity": selection_identity,
+            "state_path": str(state_path),
         }
     candidates: list[dict[str, Any]] = []
     parked: list[dict[str, Any]] = []
     incomplete_source_ids: set[str] = set()
-    shard_selector = getattr(reasoner, "select_relationship_shards", None)
-    for start in range(0, len(focus_ids), 8):
-        batch_ids = focus_ids[start : start + 8]
-        batch_profiles = [profile_by_source[source_id] for source_id in batch_ids]
+    catalogue_char_budget = _reasoner_context_char_budget(reasoner, request)
+    catalogue_requires_routing = len(eligible_entries) > 64 or len(
+        json.dumps(
+            eligible_entries,
+            sort_keys=True,
+            ensure_ascii=False,
+            default=str,
+        )
+    ) > catalogue_char_budget
+    routing_cards = [
+        {
+            **dict(row.get("routing_card") or {}),
+            "shard_id": str(row.get("shard_id") or ""),
+            "literature_id": str(row.get("literature_id") or ""),
+        }
+        for row in shards
+    ]
+    batch_size = 25 if catalogue_requires_routing else 12
+    focus_ids.sort(key=lambda value: (home_shard_by_source.get(value, ""), value))
+    focus_groups: dict[str, list[str]] = defaultdict(list)
+    for source_id in focus_ids:
+        focus_groups[home_shard_by_source.get(source_id, "unrouted")].append(
+            source_id
+        )
+    focus_batches = [
+        source_ids[start : start + batch_size]
+        for _shard_id, source_ids in sorted(focus_groups.items())
+        for start in range(0, len(source_ids), batch_size)
+    ]
+    for batch_ids in focus_batches:
+        batch_profiles = [
+            relationship_index_profile_by_source[source_id]
+            for source_id in batch_ids
+        ]
         selected_shard_ids: set[str] = set()
-        if len(entries) > 250 and callable(shard_selector):
+        if catalogue_requires_routing:
+            home_shard_ids = {
+                str(row.get("shard_id") or "")
+                for row in shards
+                if set(str(value) for value in row.get("source_ids", []) or [])
+                & set(batch_ids)
+            }
             try:
-                shard_response = reasoner_calls(
+                routing_response = reasoner_calls(
                     "relationship_shard_selection",
                     f"batch-{stable_hash(batch_ids)[:16]}",
                     "select_relationship_shards",
                     batch_profiles,
                     {
                         "catalogue_revision": catalogue_revision,
-                        "shards": shards,
+                        "routing_cards": routing_cards,
+                        "shards": routing_cards,
+                        "home_shard_ids": sorted(home_shard_ids),
                         "cluster_catalogue": cluster_catalogue,
                         "existing_neighbors": _relationship_neighbors(
                             batch_ids, existing_links
                         ),
                     },
                 )
-                allowed_shards = {
-                    str(row.get("shard_id") or "") for row in shards
+                available_shard_ids = {
+                    str(row.get("shard_id") or "")
+                    for row in shards
+                    if str(row.get("shard_id") or "")
                 }
-                selected_shard_ids.update(
+                selected_shard_ids = {
                     str(value)
-                    for value in shard_response.get("shard_ids", []) or []
-                    if str(value) in allowed_shards
-                )
+                    for value in routing_response.get("shard_ids", []) or []
+                    if str(value) in available_shard_ids
+                }
+                selected_shard_ids.update(home_shard_ids)
             except Exception as exc:
+                incomplete_source_ids.update(batch_ids)
                 parked.append(
                     {
                         "source_ids": batch_ids,
@@ -1532,13 +1733,7 @@ def _run_relationship_reasoning(
                         "error": str(exc),
                     }
                 )
-        if len(entries) > 250:
-            selected_shard_ids.update(
-                str(row.get("shard_id") or "")
-                for row in shards
-                if set(str(value) for value in row.get("source_ids", []) or [])
-                & set(batch_ids)
-            )
+                continue
         selected_source_ids = {
             str(value)
             for row in shards
@@ -1549,26 +1744,43 @@ def _run_relationship_reasoning(
         selected_entries = (
             [
                 row
-                for row in entries
+                for row in eligible_entries
                 if str(row.get("source_id") or "") in selected_source_ids
+                and str(row.get("source_id") or "") not in set(batch_ids)
             ]
-            if len(entries) > 250 and selected_source_ids
-            else entries
+            if catalogue_requires_routing and selected_source_ids
+            else eligible_entries
         )
+        candidate_context = {
+            "catalogue_revision": catalogue_revision,
+            "catalogue_entries": selected_entries,
+            "cluster_catalogue": cluster_catalogue,
+            "existing_neighbors": _relationship_neighbors(
+                batch_ids, existing_links
+            ),
+        }
+        if (
+            _reasoner_packet_chars(
+                [profile_to_dict(profile) for profile in batch_profiles],
+                candidate_context,
+            )
+            > catalogue_char_budget
+        ):
+            incomplete_source_ids.update(batch_ids)
+            parked.append(
+                {
+                    "source_ids": batch_ids,
+                    "reason": "relationship_catalogue_partition_exceeds_context_budget",
+                }
+            )
+            continue
         try:
             response = reasoner_calls(
                 "relationship_candidate_selection",
                 f"batch-{stable_hash(batch_ids)[:16]}",
                 "select_relationship_candidates",
                 batch_profiles,
-                {
-                    "catalogue_revision": catalogue_revision,
-                    "catalogue_entries": selected_entries,
-                    "cluster_catalogue": cluster_catalogue,
-                    "existing_neighbors": _relationship_neighbors(
-                        batch_ids, existing_links
-                    ),
-                },
+                candidate_context,
             )
         except Exception as exc:
             incomplete_source_ids.update(batch_ids)
@@ -1588,6 +1800,7 @@ def _run_relationship_reasoning(
             available_cluster_ids=[
                 str(row["cluster_id"]) for row in cluster_catalogue
             ],
+            max_per_source=3,
         )
         candidates.extend(valid)
         parked.extend(invalid)
@@ -1626,6 +1839,146 @@ def _run_relationship_reasoning(
                             "confidence": 1.0,
                         }
                     )
+    for link in existing_relations:
+        if str(link.get("decision_status") or "") != "legacy_unverified":
+            continue
+        left = str(link.get("source_id") or "")
+        right = str(link.get("target_source_id") or "")
+        if left in profile_by_source and right in profile_by_source:
+            candidates.append(
+                {
+                    "source_id": left,
+                    "target_kind": "source",
+                    "target_id": right,
+                    "why_relevant": "Legacy machine relationship requires prompt-v2 verification.",
+                    "comparison_unit": str(link.get("comparison_unit") or ""),
+                    "likely_relation_type": str(link.get("relation_type") or ""),
+                    "requested_evidence_depth": "profile",
+                    "confidence": 1.0,
+                }
+            )
+
+    literature_ids = {
+        str(row.get("literature_id") or "") for row in routing_cards
+    }
+    if len(literature_ids) >= 2:
+        if not callable(bridge_selector):
+            parked.append(
+                {
+                    "reason": "relationship_bridge_discovery_unavailable",
+                    "verification_status": "not_attempted",
+                }
+            )
+        else:
+            try:
+                bridge_response = reasoner_calls(
+                    "relationship_bridge_shard_selection",
+                    f"catalogue-{catalogue_revision[:16]}",
+                    "select_relationship_bridge_shards",
+                    [],
+                    {
+                        "catalogue_revision": catalogue_revision,
+                        "routing_cards": routing_cards,
+                        "discovery_mode": "cross_literature_bridge",
+                    },
+                )
+                bridge_pairs, bridge_pair_errors = validate_bridge_shard_pairs(
+                    bridge_response,
+                    available_shards=shards,
+                )
+                parked.extend(bridge_pair_errors)
+            except Exception as exc:
+                bridge_pairs = []
+                parked.append(
+                    {
+                        "reason": "relationship_bridge_shard_selection_failure",
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    }
+                )
+            shard_by_id = {
+                str(row.get("shard_id") or ""): row for row in shards
+            }
+            # The bridge stage reserves six calls total: one routing call and
+            # at most five selected-pair candidate calls.
+            for pair in bridge_pairs[:5]:
+                pair_packet = [pair]
+                selected_shard_ids = {
+                    str(pair[field])
+                    for pair in pair_packet
+                    for field in ("left_shard_id", "right_shard_id")
+                }
+                selected_source_ids = {
+                    str(source_id)
+                    for shard_id in selected_shard_ids
+                    for source_id in shard_by_id.get(shard_id, {}).get(
+                        "source_ids", []
+                    )
+                    if str(source_id) in profile_by_source
+                }
+                selected_entries = [
+                    row
+                    for row in eligible_entries
+                    if str(row.get("source_id") or "") in selected_source_ids
+                ]
+                if len(selected_entries) < 2:
+                    continue
+                try:
+                    response = reasoner_calls(
+                        "relationship_bridge_candidate_selection",
+                        f"pairs-{stable_hash(pair_packet)[:16]}",
+                        "select_relationship_candidates",
+                        [],
+                        {
+                            "catalogue_revision": catalogue_revision,
+                            "catalogue_entries": selected_entries,
+                            "shard_pairs": pair_packet,
+                            "discovery_mode": "cross_literature_bridge",
+                            "max_candidates_per_shard_pair": 8,
+                        },
+                    )
+                except Exception as exc:
+                    incomplete_source_ids.update(selected_source_ids)
+                    parked.append(
+                        {
+                            "source_ids": sorted(selected_source_ids),
+                            "reason": "relationship_bridge_candidate_selection_failure",
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                        }
+                    )
+                    continue
+                valid, invalid = candidate_rows(
+                    response,
+                    focus_source_ids=sorted(selected_source_ids),
+                    available_source_ids=list(profile_by_source),
+                    max_per_source=3,
+                )
+                parked.extend(invalid)
+                bridge_counts: dict[tuple[str, str], int] = {}
+                for row in valid:
+                    pair_identity = _bridge_candidate_shard_pair(
+                        row,
+                        pair_packet,
+                        shard_by_id,
+                    )
+                    if pair_identity is None:
+                        parked.append(
+                            {
+                                **row,
+                                "reason": "candidate_not_crossing_selected_shard_pair",
+                            }
+                        )
+                        continue
+                    if bridge_counts.get(pair_identity, 0) >= 8:
+                        parked.append(
+                            {**row, "reason": "bridge_candidate_limit_reached"}
+                        )
+                        continue
+                    bridge_counts[pair_identity] = (
+                        bridge_counts.get(pair_identity, 0) + 1
+                    )
+                    candidates.append(row)
     source_candidates = {
         canonical_pair(
             str(row.get("source_id") or ""),
@@ -1641,8 +1994,8 @@ def _run_relationship_reasoning(
         for row in candidates
         if row.get("target_kind") == "cluster"
     ]
-    accepted: list[dict[str, Any]] = []
-    no_relationship: list[dict[str, Any]] = []
+    tentative_accepted: list[dict[str, Any]] = []
+    tentative_no_relationship: list[dict[str, Any]] = []
     needs_context: list[dict[str, Any]] = []
     pair_rows = [
         (pair, row)
@@ -1657,11 +2010,35 @@ def _run_relationship_reasoning(
         )
         not in decided_pair_keys
     ]
-    for start in range(0, len(pair_rows), 8):
-        packet = pair_rows[start : start + 8]
+    def adjudication_context(
+        packet: Sequence[tuple[tuple[str, str], Mapping[str, Any]]],
+    ) -> dict[str, Any]:
+        return {
+            "pairs": [
+                {
+                    "source_id": pair[0],
+                    "target_source_id": pair[1],
+                    "candidate_reason": row.get("why_relevant", ""),
+                    "comparison_unit": row.get("comparison_unit", ""),
+                }
+                for pair, row in packet
+            ]
+        }
+
+    for packet in _pack_relationship_rows(
+        pair_rows,
+        pair_for=lambda row: row[0],
+        profile_by_source=relationship_profile_by_source,
+        context_for=adjudication_context,
+        max_chars=catalogue_char_budget,
+    ):
         pairs = [pair for pair, _ in packet]
         packet_source_ids = sorted({value for pair in pairs for value in pair})
-        packet_profiles = [
+        provider_profiles = [
+            relationship_profile_by_source[source_id]
+            for source_id in packet_source_ids
+        ]
+        validation_profiles = [
             profile_by_source[source_id] for source_id in packet_source_ids
         ]
         try:
@@ -1669,18 +2046,8 @@ def _run_relationship_reasoning(
                 "relationship_adjudication",
                 f"pairs-{stable_hash(pairs)[:16]}",
                 "adjudicate_relationships",
-                packet_profiles,
-                {
-                    "pairs": [
-                        {
-                            "source_id": pair[0],
-                            "target_source_id": pair[1],
-                            "candidate_reason": row.get("why_relevant", ""),
-                            "comparison_unit": row.get("comparison_unit", ""),
-                        }
-                        for pair, row in packet
-                    ]
-                },
+                provider_profiles,
+                adjudication_context(packet),
             )
         except Exception as exc:
             incomplete_source_ids.update(packet_source_ids)
@@ -1696,7 +2063,7 @@ def _run_relationship_reasoning(
             )
             continue
         result = validate_decisions(
-            response, offered_pairs=pairs, profiles=packet_profiles
+            response, offered_pairs=pairs, profiles=validation_profiles
         )
         for key in ("accepted", "no_relationship"):
             for row in result[key]:
@@ -1705,8 +2072,8 @@ def _run_relationship_reasoning(
                     model=relationship_model,
                     prompt_version=RELATIONSHIP_PROMPT_VERSION,
                 )
-        accepted.extend(result["accepted"])
-        no_relationship.extend(result["no_relationship"])
+        tentative_accepted.extend(result["accepted"])
+        tentative_no_relationship.extend(result["no_relationship"])
         needs_context.extend(result["needs_more_context"])
         parked.extend(result["parked"])
         decided = {
@@ -1727,28 +2094,172 @@ def _run_relationship_reasoning(
             for pair in pairs
             if pair not in decided
         )
-    for start in range(0, len(needs_context), 8):
-        unresolved = needs_context[start : start + 8]
+    parked.extend(
+        {
+            **row,
+            "reason": "adjudication_needs_more_context",
+        }
+        for row in needs_context
+    )
+
+    preliminary = [*tentative_accepted, *tentative_no_relationship]
+    accepted: list[dict[str, Any]] = []
+    no_relationship: list[dict[str, Any]] = []
+    verification_needs_context: list[dict[str, Any]] = []
+    if preliminary and not callable(verifier):
+        parked.extend(
+            {
+                **row,
+                "reason": "relationship_verification_unavailable",
+            }
+            for row in preliminary
+        )
+    def verification_context(
+        packet: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        return {
+            "preliminary_decisions": [
+                _relationship_verification_packet(row) for row in packet
+            ],
+            "independent_verification": True,
+        }
+
+    for packet in _pack_relationship_rows(
+        preliminary,
+        pair_for=lambda row: canonical_pair(
+            str(row.get("source_id") or ""),
+            str(row.get("target_source_id") or ""),
+        ),
+        profile_by_source=relationship_profile_by_source,
+        context_for=verification_context,
+        max_chars=catalogue_char_budget,
+    ):
         pairs = [
             canonical_pair(
-                str(row["source_id"]), str(row["target_source_id"])
+                str(row.get("source_id") or ""),
+                str(row.get("target_source_id") or ""),
+            )
+            for row in packet
+        ]
+        packet_source_ids = sorted({value for pair in pairs for value in pair})
+        provider_profiles = [
+            relationship_profile_by_source[source_id]
+            for source_id in packet_source_ids
+        ]
+        validation_profiles = [
+            profile_by_source[source_id] for source_id in packet_source_ids
+        ]
+        if not callable(verifier):
+            continue
+        try:
+            response = reasoner_calls(
+                "relationship_verification",
+                f"pairs-{stable_hash(pairs)[:16]}",
+                "verify_relationships",
+                provider_profiles,
+                verification_context(packet),
+            )
+        except Exception as exc:
+            incomplete_source_ids.update(packet_source_ids)
+            parked.extend(
+                {
+                    **row,
+                    "reason": "relationship_verification_failure",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+                for row in packet
+            )
+            continue
+        verified = validate_verifications(
+            response,
+            preliminary_decisions=packet,
+            profiles=validation_profiles,
+            verifier_provider=relationship_provider,
+            verifier_model=relationship_model,
+        )
+        for key in ("accepted", "no_relationship"):
+            for row in verified[key]:
+                row.update(
+                    provider=relationship_provider,
+                    model=relationship_model,
+                    prompt_version=RELATIONSHIP_PROMPT_VERSION,
+                )
+        accepted.extend(verified["accepted"])
+        no_relationship.extend(verified["no_relationship"])
+        verification_needs_context.extend(verified["needs_more_context"])
+        parked.extend(verified["parked"])
+        decided = {
+            canonical_pair(
+                str(row.get("source_id") or ""),
+                str(row.get("target_source_id") or ""),
+            )
+            for key in ("accepted", "no_relationship", "needs_more_context")
+            for row in verified[key]
+        }
+        parked.extend(
+            {
+                **row,
+                "reason": "missing_or_malformed_verification",
+            }
+            for row in packet
+            if canonical_pair(
+                str(row.get("source_id") or ""),
+                str(row.get("target_source_id") or ""),
+            )
+            not in decided
+        )
+
+    preliminary_by_pair = {
+        canonical_pair(
+            str(row.get("source_id") or ""),
+            str(row.get("target_source_id") or ""),
+        ): row
+        for row in preliminary
+    }
+    parked.extend(
+        {
+            **row,
+            "reason": "relationship_verification_escalation_capacity_reached",
+        }
+        for row in verification_needs_context[3:]
+    )
+    for unresolved_row in verification_needs_context[:3]:
+        unresolved = [unresolved_row]
+        pairs = [
+            canonical_pair(
+                str(row.get("source_id") or ""),
+                str(row.get("target_source_id") or ""),
             )
             for row in unresolved
         ]
+        packet = [
+            preliminary_by_pair[pair]
+            for pair in pairs
+            if pair in preliminary_by_pair
+        ]
         packet_source_ids = sorted({value for pair in pairs for value in pair})
-        packet_profiles = [
+        provider_profiles = [
+            relationship_profile_by_source[source_id]
+            for source_id in packet_source_ids
+        ]
+        validation_profiles = [
             profile_by_source[source_id] for source_id in packet_source_ids
         ]
         try:
             response = reasoner_calls(
-                "relationship_escalation",
+                "relationship_verification_escalation",
                 f"pairs-{stable_hash(pairs)[:16]}",
-                "adjudicate_relationships",
-                packet_profiles,
+                "verify_relationships",
+                provider_profiles,
                 {
-                    "pairs": unresolved,
-                    "atomic_notes": _relationship_atomic_notes(
-                        workspace, packet_profiles
+                    "preliminary_decisions": [
+                        _relationship_verification_packet(row) for row in packet
+                    ],
+                    "atomic_note_passages": _relationship_atomic_note_passages(
+                        workspace,
+                        validation_profiles,
+                        packet,
                     ),
                     "focused_escalation": True,
                 },
@@ -1758,32 +2269,36 @@ def _run_relationship_reasoning(
             parked.extend(
                 {
                     **row,
-                    "reason": "relationship_escalation_failure",
+                    "reason": "relationship_verification_escalation_failure",
                     "error_type": type(exc).__name__,
                     "error": str(exc),
                 }
                 for row in unresolved
             )
             continue
-        result = validate_decisions(
-            response, offered_pairs=pairs, profiles=packet_profiles
+        verified = validate_verifications(
+            response,
+            preliminary_decisions=packet,
+            profiles=validation_profiles,
+            verifier_provider=relationship_provider,
+            verifier_model=relationship_model,
         )
         for key in ("accepted", "no_relationship"):
-            for row in result[key]:
+            for row in verified[key]:
                 row.update(
                     provider=relationship_provider,
                     model=relationship_model,
                     prompt_version=RELATIONSHIP_PROMPT_VERSION,
                 )
-        accepted.extend(result["accepted"])
-        no_relationship.extend(result["no_relationship"])
-        parked.extend(result["parked"])
+        accepted.extend(verified["accepted"])
+        no_relationship.extend(verified["no_relationship"])
+        parked.extend(verified["parked"])
         parked.extend(
             {
                 **row,
-                "reason": "needs_more_context_after_single_escalation",
+                "reason": "needs_more_context_after_single_verification_escalation",
             }
-            for row in result["needs_more_context"]
+            for row in verified["needs_more_context"]
         )
     return {
         "accepted": accepted,
@@ -1796,8 +2311,11 @@ def _run_relationship_reasoning(
             if source_id not in incomplete_source_ids
         },
         "reconciled_catalogue_revision": (
-            catalogue_revision if reconciliation else ""
+            catalogue_revision
+            if catalogue_changed or identity_changed
+            else ""
         ),
+        "selection_identity": selection_identity,
         "state_path": str(state_path),
     }
 
@@ -1814,10 +2332,206 @@ def _relationship_neighbors(
     ]
 
 
-def _relationship_atomic_notes(
-    workspace: Path, profiles: Sequence[Any]
-) -> list[dict[str, str]]:
-    notes = []
+def _bridge_candidate_shard_pair(
+    candidate: Mapping[str, Any],
+    offered_pairs: Sequence[Mapping[str, Any]],
+    shard_by_id: Mapping[str, Mapping[str, Any]],
+) -> tuple[str, str] | None:
+    source_id = str(candidate.get("source_id") or "")
+    target_id = str(candidate.get("target_id") or "")
+    for pair in offered_pairs:
+        left_id = str(pair.get("left_shard_id") or "")
+        right_id = str(pair.get("right_shard_id") or "")
+        left_sources = {
+            str(value)
+            for value in shard_by_id.get(left_id, {}).get("source_ids", []) or []
+        }
+        right_sources = {
+            str(value)
+            for value in shard_by_id.get(right_id, {}).get("source_ids", []) or []
+        }
+        if (
+            source_id in left_sources
+            and target_id in right_sources
+        ) or (
+            source_id in right_sources
+            and target_id in left_sources
+        ):
+            return canonical_pair(left_id, right_id)
+    return None
+
+
+def _relationship_verification_packet(
+    row: Mapping[str, Any],
+) -> dict[str, Any]:
+    source_evidence = (
+        row.get("source_evidence")
+        if isinstance(row.get("source_evidence"), Mapping)
+        else {}
+    )
+    target_evidence = (
+        row.get("target_evidence")
+        if isinstance(row.get("target_evidence"), Mapping)
+        else {}
+    )
+    return {
+        "source_id": str(row.get("source_id") or ""),
+        "target_source_id": str(row.get("target_source_id") or ""),
+        "status": str(row.get("decision_status") or row.get("status") or ""),
+        "relation_type": str(row.get("relation_type") or ""),
+        "comparison_unit": str(row.get("comparison_unit") or ""),
+        "reason": str(row.get("reason") or ""),
+        "source_evidence_anchor_id": str(
+            row.get("source_evidence_anchor_id")
+            or source_evidence.get("evidence_anchor_id")
+            or ""
+        ),
+        "target_evidence_anchor_id": str(
+            row.get("target_evidence_anchor_id")
+            or target_evidence.get("evidence_anchor_id")
+            or ""
+        ),
+        "qualifiers": list(row.get("qualifiers", []) or []),
+        "confidence": row.get("confidence"),
+    }
+
+
+def _relationship_evidence_projection(
+    profile: Any,
+    catalogue_entry: Mapping[str, Any],
+    *,
+    include_anchors: bool,
+) -> EvidenceProfile:
+    row = profile_to_dict(profile)
+    anchors = row.get("evidence_anchors") or row.get("claims") or []
+    compact_anchors = [
+        EvidenceAnchor.from_dict(anchor)
+        for anchor in anchors
+        if isinstance(anchor, Mapping)
+        and (anchor.get("evidence_anchor_id") or anchor.get("claim_id"))
+    ][:3]
+    return EvidenceProfile(
+        source_id=str(row.get("source_id") or ""),
+        note_id=str(row.get("note_id") or ""),
+        context={
+            "title": str(
+                catalogue_entry.get("title")
+                or row.get("title")
+                or ""
+            ),
+            "catalogue_entry": dict(catalogue_entry),
+        },
+        evidence_anchors=(
+            compact_anchors if include_anchors else []
+        ),
+    )
+
+
+def _compact_relationship_catalogue_entry(
+    entry: Mapping[str, Any],
+) -> dict[str, Any]:
+    def text(field: str, limit: int) -> str:
+        return " ".join(str(entry.get(field) or "").split())[:limit]
+
+    raw_facets_by_type = (
+        entry.get("facets_by_type")
+        if isinstance(entry.get("facets_by_type"), Mapping)
+        else {}
+    )
+    facets_by_type = {
+        facet_type: [
+            " ".join(str(value).split())[:120]
+            for value in raw_facets_by_type.get(facet_type, [])[:2]
+            if str(value).strip()
+        ]
+        for facet_type in (
+            "mechanism",
+            "outcome",
+            "case",
+            "population",
+            "period",
+            "dataset",
+        )
+    }
+    return {
+        "source_id": text("source_id", 80),
+        "zotero_key": text("zotero_key", 32),
+        "title": text("title", 240),
+        "author": text("author", 120),
+        "year": text("year", 16),
+        "thesis": text("thesis", 360),
+        "method": text("method", 220),
+        "source_scope": text("source_scope", 60),
+        "evidence_coverage": text("evidence_coverage", 60),
+        "facets": [
+            " ".join(str(value).split())[:120]
+            for value in entry.get("facets", [])[:6]
+            if str(value).strip()
+        ],
+        "facets_by_type": {
+            key: value for key, value in facets_by_type.items() if value
+        },
+        "collections": [
+            " ".join(str(value).split())[:120]
+            for value in entry.get("collections", [])[:2]
+            if str(value).strip()
+        ],
+    }
+
+
+def _pack_relationship_rows(
+    rows: Sequence[Any],
+    *,
+    pair_for: Any,
+    profile_by_source: Mapping[str, Any],
+    context_for: Any,
+    max_chars: int,
+    max_rows: int = 16,
+) -> list[list[Any]]:
+    packets: list[list[Any]] = []
+    current: list[Any] = []
+    for row in rows:
+        candidate = [*current, row]
+        pairs = [pair_for(value) for value in candidate]
+        source_ids = sorted({source_id for pair in pairs for source_id in pair})
+        profiles = [
+            (
+                dict(profile_by_source[source_id])
+                if isinstance(profile_by_source[source_id], Mapping)
+                else profile_to_dict(profile_by_source[source_id])
+            )
+            for source_id in source_ids
+            if source_id in profile_by_source
+        ]
+        if current and (
+            len(candidate) > max_rows
+            or _reasoner_packet_chars(profiles, context_for(candidate))
+            > max_chars
+        ):
+            packets.append(current)
+            current = [row]
+        else:
+            current = candidate
+    if current:
+        packets.append(current)
+    return packets
+
+
+def _relationship_atomic_note_passages(
+    workspace: Path,
+    profiles: Sequence[Any],
+    decisions: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    requested_anchor_ids = {
+        str(value)
+        for decision in decisions
+        for value in (
+            decision.get("source_evidence_anchor_id"),
+            decision.get("target_evidence_anchor_id"),
+        )
+        if str(value or "")
+    }
+    passages = []
     for profile in profiles:
         row = profile_to_dict(profile)
         context = (
@@ -1828,14 +2542,52 @@ def _relationship_atomic_notes(
         path = workspace / str(context.get("note_path") or "")
         if not path.is_file():
             continue
-        notes.append(
+        body = internal_note_text(path)
+        section_text = "\n\n".join(
+            value
+            for heading in (
+                "Thesis",
+                "Method and Research Design",
+                "Detailed Findings",
+                "What This Source Can Support",
+                "What This Source Cannot Support",
+            )
+            if (value := _note_section(body, heading))
+        )[:6_000]
+        anchor_rows = [
+            {
+                "evidence_anchor_id": str(
+                    anchor.get("evidence_anchor_id")
+                    or anchor.get("claim_id")
+                    or ""
+                ),
+                "claim": str(
+                    anchor.get("claim")
+                    or anchor.get("text")
+                    or ""
+                )[:1_200],
+                "locator": str(anchor.get("locator") or "")[:240],
+            }
+            for anchor in (
+                row.get("evidence_anchors") or row.get("claims") or []
+            )
+            if isinstance(anchor, Mapping)
+            and str(
+                anchor.get("evidence_anchor_id")
+                or anchor.get("claim_id")
+                or ""
+            )
+            in requested_anchor_ids
+        ]
+        passages.append(
             {
                 "source_id": str(row.get("source_id") or ""),
                 "note_id": str(row.get("note_id") or ""),
-                "atomic_note": internal_note_text(path),
+                "passage": section_text,
+                "selected_anchors": anchor_rows,
             }
         )
-    return notes
+    return passages
 
 
 def _commit_relationship_selection_state(
@@ -1846,7 +2598,8 @@ def _commit_relationship_selection_state(
 ) -> Path | None:
     selected = dict(result.get("selected_profile_hashes", {}) or {})
     reconciled = str(result.get("reconciled_catalogue_revision") or "")
-    if not selected and not reconciled:
+    selection_identity = str(result.get("selection_identity") or "")
+    if not selected and not reconciled and not selection_identity:
         return None
     path = Path(
         str(
@@ -1861,11 +2614,13 @@ def _commit_relationship_selection_state(
     profile_hashes = dict(existing.get("profile_hashes", {}) or {})
     profile_hashes.update(selected)
     payload = {
-        "state_schema_version": "1",
+        "state_schema_version": "2",
         "profile_hashes": dict(sorted(profile_hashes.items())),
         "reconciled_catalogue_revision": reconciled
         or str(existing.get("reconciled_catalogue_revision") or ""),
         "catalogue_revision": catalogue_revision,
+        "selection_identity": selection_identity
+        or str(existing.get("selection_identity") or ""),
     }
     if existing != payload:
         write_yaml(path, payload)
@@ -1881,31 +2636,181 @@ def _write_relationship_run_ledger(
         / "relationships"
         / "parked.yml"
     )
-    payload = {
-        "ledger_schema_version": "1",
-        "parked": [
-            dict(row)
-            for row in result.get("parked", []) or []
-            if isinstance(row, Mapping)
-        ],
-        "accepted_relation_ids": sorted(
-            str(row.get("relation_id") or "")
-            for row in result.get("accepted", []) or []
-            if isinstance(row, Mapping) and row.get("relation_id")
-        ),
-        "no_relationship_count": len(
-            result.get("no_relationship", []) or []
-        ),
-        "cluster_candidates": [
-            dict(row)
-            for row in result.get("cluster_candidates", []) or []
-            if isinstance(row, Mapping)
-        ],
-    }
     existing = read_yaml(path, {}) or {}
+    registry = read_yaml(
+        workspace / "02_source_memory" / "indexes" / "typed_links.yml", {}
+    ) or {}
+    events = {
+        str(row.get("event_id") or ""): dict(row)
+        for row in existing.get("events", []) or []
+        if isinstance(row, Mapping) and row.get("event_id")
+    }
+
+    def merge_event(event_type: str, row: Mapping[str, Any]) -> None:
+        payload = dict(row)
+        if event_type == "no_relationship" and not payload.get("decision_key"):
+            payload["decision_key"] = relationship_decision_key(
+                str(payload.get("source_id") or ""),
+                str(payload.get("target_source_id") or ""),
+                str(payload.get("source_profile_hash") or ""),
+                str(payload.get("target_profile_hash") or ""),
+                provider=str(payload.get("provider") or ""),
+                model=str(payload.get("model") or ""),
+                prompt_version=str(
+                    payload.get("prompt_version") or RELATIONSHIP_PROMPT_VERSION
+                ),
+            )
+        event_id = _relationship_event_id(event_type, payload)
+        prior = events.get(event_id, {})
+        history = {
+            stable_hash(value): dict(value)
+            for value in prior.get("payload_history", []) or []
+            if isinstance(value, Mapping)
+        }
+        prior_payload = prior.get("payload")
+        if isinstance(prior_payload, Mapping):
+            history[stable_hash(prior_payload)] = dict(prior_payload)
+        history[stable_hash(payload)] = payload
+        events[event_id] = {
+            "event_id": event_id,
+            "event_type": event_type,
+            "payload": payload,
+            "payload_history": [history[key] for key in sorted(history)],
+        }
+
+    if not events:
+        for row in existing.get("parked", []) or []:
+            if isinstance(row, Mapping):
+                merge_event("parked", row)
+        for row in existing.get("cluster_candidates", []) or []:
+            if isinstance(row, Mapping):
+                merge_event("cluster_candidate", row)
+        for relation_id in existing.get("accepted_relation_ids", []) or []:
+            if str(relation_id):
+                merge_event("accepted", {"relation_id": str(relation_id)})
+        for decision_key in existing.get("no_relationship_decision_keys", []) or []:
+            if str(decision_key):
+                merge_event(
+                    "no_relationship", {"decision_key": str(decision_key)}
+                )
+
+    for event_type, field_name in (
+        ("accepted", "accepted"),
+        ("no_relationship", "no_relationship"),
+        ("parked", "parked"),
+        ("cluster_candidate", "cluster_candidates"),
+    ):
+        for row in result.get(field_name, []) or []:
+            if isinstance(row, Mapping):
+                merge_event(event_type, row)
+    for row in registry.get("pair_decisions", []) or []:
+        if isinstance(row, Mapping) and row.get("status") == "no_relationship":
+            merge_event("no_relationship", row)
+    for row in registry.get("relations", []) or []:
+        if (
+            isinstance(row, Mapping)
+            and str(row.get("decision_status") or "") == "retired"
+        ):
+            merge_event("retired", row)
+
+    event_rows = [events[key] for key in sorted(events)]
+
+    def event_payload(event: Mapping[str, Any]) -> Mapping[str, Any]:
+        payload = event.get("payload")
+        return payload if isinstance(payload, Mapping) else {}
+
+    accepted_relation_ids = sorted(
+        {
+            str(event_payload(event).get("relation_id") or "")
+            for event in event_rows
+            if event.get("event_type") == "accepted"
+            and event_payload(event).get("relation_id")
+        }
+    )
+    no_relationship_keys = sorted(
+        {
+            str(event_payload(event).get("decision_key") or "")
+            for event in event_rows
+            if event.get("event_type") == "no_relationship"
+            and event_payload(event).get("decision_key")
+        }
+    )
+    parked = [
+        dict(event_payload(event))
+        for event in event_rows
+        if event.get("event_type") == "parked"
+    ]
+    cluster_candidates = [
+        dict(event_payload(event))
+        for event in event_rows
+        if event.get("event_type") == "cluster_candidate"
+    ]
+    prior_count = int(existing.get("no_relationship_count", 0) or 0)
+    prior_identified = len(existing.get("no_relationship_decision_keys", []) or [])
+    legacy_unidentified = int(
+        existing.get(
+            "legacy_unidentified_no_relationship_count",
+            max(0, prior_count - prior_identified),
+        )
+        or 0
+    )
+    payload = {
+        "ledger_schema_version": "2",
+        "events": event_rows,
+        "parked": parked,
+        "accepted_relation_ids": accepted_relation_ids,
+        "no_relationship_decision_keys": no_relationship_keys,
+        "legacy_unidentified_no_relationship_count": legacy_unidentified,
+        "no_relationship_count": legacy_unidentified + len(no_relationship_keys),
+        "cluster_candidates": cluster_candidates,
+    }
     if existing != payload:
         write_yaml(path, payload)
     return path
+
+
+def _relationship_event_id(event_type: str, row: Mapping[str, Any]) -> str:
+    pair = sorted(
+        str(value)
+        for value in (
+            row.get("source_id"),
+            row.get("target_source_id") or row.get("target_id"),
+        )
+        if str(value or "")
+    )
+    reason = str(
+        row.get("reason_code")
+        or row.get("rejection_reason")
+        or row.get("reason")
+        or row.get("status")
+        or ""
+    )
+    return stable_hash(
+        {
+            "event_type": event_type,
+            "pair": pair,
+            "source_ids": sorted(
+                str(value)
+                for value in row.get("source_ids", []) or []
+                if str(value)
+            ),
+            "target_kind": str(row.get("target_kind") or ""),
+            "relation_id": str(row.get("relation_id") or ""),
+            "decision_key": str(row.get("decision_key") or ""),
+            "provider": str(row.get("provider") or ""),
+            "model": str(row.get("model") or ""),
+            "prompt_version": str(row.get("prompt_version") or ""),
+            "source_profile_hash": str(row.get("source_profile_hash") or ""),
+            "target_profile_hash": str(row.get("target_profile_hash") or ""),
+            "status": str(
+                row.get("verification_status")
+                or row.get("decision_status")
+                or row.get("status")
+                or ""
+            ),
+            "reason_code": reason.split(":", 1)[0].strip().replace(" ", "_"),
+        }
+    )
 
 
 def _existing_gap_projection(
@@ -2009,6 +2914,7 @@ def _project_atomic_graph(
         source_id = str(row.get("source_id") or "")
         related_links = [
             {
+                "relation_id": str(link.get("relation_id") or ""),
                 "note_id": str(link.get("target_note_id") or ""),
                 "relation_type": str(
                     link.get("primary_relation_type") or "semantic_similarity"
@@ -2084,11 +2990,13 @@ def _project_atomic_graph(
         gap_wikilinks = {
             link["gap_id"]: str(link["wikilink"]) for link in note_gap_links
         }
-        update_note_graph(
-            path,
-            {
+        try:
+            update_note_graph(
+                path,
+                {
                 "related_notes": [
                     {
+                        "relation_id": link.get("relation_id", ""),
                         "note_id": link["note_id"],
                         "relation_type": link["relation_type"],
                         "reason": link.get("reason", ""),
@@ -2112,14 +3020,96 @@ def _project_atomic_graph(
                 "engine_version": ENGINE_VERSION,
                 "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
                 "updated_at": now_iso(),
-            },
-            related_links,
-            cluster_ids,
-            note_gap_links,
-            cluster_wikilinks,
+                },
+                related_links,
+                cluster_ids,
+                note_gap_links,
+                cluster_wikilinks,
+            )
+        except ValueError as exc:
+            _park_projection_failure(
+                workspace,
+                artifact_kind="atomic_note",
+                artifact_id=note_id,
+                path=path,
+                reason=str(exc),
+            )
+            continue
+        _resolve_projection_failure(
+            workspace, artifact_kind="atomic_note", artifact_id=note_id
         )
         paths.append(path)
     return paths
+
+
+def _park_projection_failure(
+    workspace: Path,
+    *,
+    artifact_kind: str,
+    artifact_id: str,
+    path: Path,
+    reason: str,
+) -> None:
+    ledger_path = workspace / "11_state" / "projection_failures.yml"
+    existing = read_yaml(ledger_path, {}) or {}
+    failures = {
+        str(row.get("event_id") or ""): dict(row)
+        for row in existing.get("failures", []) or []
+        if isinstance(row, Mapping) and row.get("event_id")
+    }
+    event = {
+        "artifact_kind": artifact_kind,
+        "artifact_id": artifact_id,
+        "path": str(path),
+        "content_hash": sha256_file(path) if path.is_file() else "",
+        "reason": reason,
+    }
+    event_id = stable_hash(event)
+    failures[event_id] = {"event_id": event_id, **event}
+    write_yaml(
+        ledger_path,
+        {
+            "projection_failure_schema_version": "1",
+            "failures": [failures[key] for key in sorted(failures)],
+            "resolved_failures": list(existing.get("resolved_failures", []) or []),
+        },
+    )
+
+
+def _resolve_projection_failure(
+    workspace: Path, *, artifact_kind: str, artifact_id: str
+) -> None:
+    ledger_path = workspace / "11_state" / "projection_failures.yml"
+    existing = read_yaml(ledger_path, {}) or {}
+    active = [
+        dict(row)
+        for row in existing.get("failures", []) or []
+        if isinstance(row, Mapping)
+    ]
+    resolved_now = [
+        row
+        for row in active
+        if row.get("artifact_kind") == artifact_kind
+        and row.get("artifact_id") == artifact_id
+    ]
+    if not resolved_now:
+        return
+    active = [row for row in active if row not in resolved_now]
+    resolved = {
+        str(row.get("event_id") or ""): dict(row)
+        for row in existing.get("resolved_failures", []) or []
+        if isinstance(row, Mapping) and row.get("event_id")
+    }
+    for row in resolved_now:
+        resolved[str(row["event_id"])] = {**row, "resolved_at": now_iso()}
+    write_yaml(
+        ledger_path,
+        {
+            "projection_failure_schema_version": "1",
+            "failures": active,
+            "resolved_failures": [resolved[key] for key in sorted(resolved)],
+        },
+    )
 
 
 def rebuild_map(
@@ -2136,6 +3126,7 @@ def rebuild_map(
     external_discovery: ExternalDiscoveryProvider | None = None,
     progress: _RunProgress | None = None,
     resume: bool = False,
+    profile_budget: _ProfileProviderBudget | None = None,
 ) -> dict[str, Any]:
     del (
         external_discovery
@@ -2215,6 +3206,14 @@ def rebuild_map(
             ],
         }
     migration = migrate_workspace(workspace)
+    if profile_budget is None:
+        profile_budget = _ProfileProviderBudget(
+            run_directory(workspace, run_id)
+            / "literature"
+            / "profiles"
+            / "provider_usage.yml",
+            effective_request.literature_policy.max_profile_calls,
+        )
     try:
         profile_result = _build_profiles_for_map(
             workspace,
@@ -2225,6 +3224,7 @@ def rebuild_map(
             reasoner=reasoner,
             progress=progress,
             resume=resume,
+            profile_budget=profile_budget,
         )
     except Exception as exc:
         reason = f"literature_profiling_partial:{type(exc).__name__}:{exc}"
@@ -2290,6 +3290,7 @@ def rebuild_map(
             stage_callback=(
                 progress.set_stage if progress is not None else None
             ),
+            retry_terminal_failures=effective_request.retry_terminal_failures,
         )
         if reasoner is not None
         else None
@@ -2402,12 +3403,26 @@ def rebuild_map(
                 "cluster_candidates", []
             )
             or [],
+            catalogue_shards=(
+                read_yaml(Path(str(catalogue["catalogue_path"])), {}) or {}
+            ).get("shards", [])
+            or [],
         )
     except Exception as exc:
         reason = f"literature_synthesis_partial:{type(exc).__name__}:{exc}"
         if profile_partial_reason:
             reason = f"{profile_partial_reason};{reason}"
+        preserved_clusters, refresh_paths = (
+            _preserve_last_valid_clusters_on_refresh_failure(
+                workspace,
+                stable_literature_map_id(source_set),
+                reason,
+            )
+        )
         synthesis_calls = int(
+            getattr(reasoner_calls, "cumulative_provider_calls", 0) or 0
+        )
+        synthesis_new_calls = int(
             getattr(reasoner_calls, "provider_calls", 0) or 0
         )
         synthesis_hits = int(
@@ -2419,6 +3434,7 @@ def rebuild_map(
         if progress is not None:
             progress.update_literature(
                 synthesis_call_count=synthesis_calls,
+                synthesis_new_call_count=synthesis_new_calls,
                 synthesis_checkpoint_hit_count=synthesis_hits,
                 synthesis_failure_count=synthesis_failures,
                 literature_provider_call_count=int(
@@ -2438,9 +3454,10 @@ def rebuild_map(
             "source_set": dict(source_set),
             "cluster_map": {
                 "status": "partial",
-                "clusters": [],
+                "clusters": preserved_clusters,
                 "relations": [],
                 "unclustered_sources": [],
+                "refresh_pending_cluster_count": len(preserved_clusters),
             },
             "gap_map": {
                 "status": "partial",
@@ -2451,6 +3468,7 @@ def rebuild_map(
                 "status": "partial",
                 "reason": reason,
                 "synthesis_call_count": synthesis_calls,
+                "synthesis_new_call_count": synthesis_new_calls,
                 "synthesis_checkpoint_hit_count": synthesis_hits,
                 "synthesis_failure_count": synthesis_failures,
             },
@@ -2465,6 +3483,7 @@ def rebuild_map(
                 *graph_paths,
                 *profile_result["paths"],
                 *_existing_source_set_paths(workspace, source_set),
+                *refresh_paths,
             ],
         }
     navigation = (
@@ -2805,6 +3824,7 @@ def _build_profiles_for_map(
     reasoner: LiteratureReasoner | None,
     progress: _RunProgress | None,
     resume: bool,
+    profile_budget: _ProfileProviderBudget,
 ) -> dict[str, Any]:
     del (
         resume
@@ -2823,17 +3843,14 @@ def _build_profiles_for_map(
     valid_count = 0
     excluded_count = 0
     started = time.monotonic()
-    provider_lock = threading.Lock()
-
-    def reserve_provider_call() -> None:
+    def reserve_provider_call(key: str, fingerprint: str) -> str:
         nonlocal provider_calls
-        with provider_lock:
-            if provider_calls >= request.literature_policy.max_profile_calls:
-                raise RuntimeError("literature_profile_call_budget_reached")
-            provider_calls += 1
-            current = provider_calls
+        attempt_id = profile_budget.reserve("profile_source", key, fingerprint)
+        provider_calls += 1
+        current = provider_calls
         if progress is not None:
             progress.update_literature(literature_provider_call_count=current)
+        return attempt_id
 
     def build_one(index: int, row: Mapping[str, Any]) -> dict[str, Any]:
         if (
@@ -2852,6 +3869,12 @@ def _build_profiles_for_map(
             }
         text = internal_note_text(path)
         note_id = str(row.get("note_id") or "")
+        failure_path = (
+            literature_state
+            / "profile_failures"
+            / f"{slugify(note_id, fallback='profile')}.yml"
+        )
+        prior_profile_failure = read_yaml(failure_path, {}) or {}
         note_status = str(row.get("note_status") or "")
         terminal_status = str(row.get("terminal_status") or "")
         analytical = (
@@ -2870,6 +3893,8 @@ def _build_profiles_for_map(
             model=request.model,
             policy=profile_policy,
         )
+        reasoner_attempt_fingerprint = fingerprint
+        profile_contract_fallback = False
         profile = load_profile_checkpoint(literature_state, note_id, fingerprint)
         checkpoint_hit = 0
         mechanically_upgraded = False
@@ -3122,35 +4147,68 @@ def _build_profiles_for_map(
                         mechanically_upgraded = True
             if profile is not None and reasoner is not None and analytical:
                 cached_context = dict(getattr(profile, "context", {}) or {})
-                if bool(cached_context.get("lazy_reprofile_required")):
+                cached_retryable = bool(
+                    cached_context.get("lazy_reprofile_required")
+                )
+                cached_terminal = bool(
+                    cached_context.get("profile_retry_terminal")
+                )
+                if cached_retryable or cached_terminal:
                     # A contract-fallback profile is a progress-preserving placeholder,
                     # not a successful profile checkpoint. Once a reasoner is available,
                     # retry from the committed note instead of mechanically blessing the
                     # omnibus support-unknown anchor under a newer prompt version.
-                    profile = None
-                    checkpoint_hit = 0
-                    mechanically_upgraded = False
+                    terminal_retry = bool(
+                        isinstance(prior_profile_failure, Mapping)
+                        and prior_profile_failure.get("fingerprint")
+                        == reasoner_attempt_fingerprint
+                        and prior_profile_failure.get("terminal")
+                    )
+                    profile_contract_fallback = True
+                    if (
+                        cached_retryable
+                        and not terminal_retry
+                        or request.retry_terminal_failures
+                    ):
+                        profile = None
+                        checkpoint_hit = 0
+                        mechanically_upgraded = False
+                        profile_contract_fallback = False
             if profile is None:
                 if reasoner is not None and analytical:
-                    reserve_provider_call()
+                    profile_attempt_id = reserve_provider_call(
+                        note_id, reasoner_attempt_fingerprint
+                    )
 
                     def reasoner_method(
                         prompt: str, *, _row: Mapping[str, Any] = row, _text: str = text
                     ) -> Any:
-                        return reasoner.profile_source(
-                            {
-                                **dict(_row),
-                                "committed_note": _text,
-                                "profile_prompt": prompt,
-                            },
-                            question=None,
-                            context={
-                                "source_set_id": source_set.get("source_set_id", ""),
-                                "profile_prompt_version": PROFILE_PROMPT_VERSION,
-                                "profile_generation_route": profile_route,
-                                "reasoner_identity": reasoner_identity,
-                            },
+                        try:
+                            response = reasoner.profile_source(
+                                {
+                                    **dict(_row),
+                                    "committed_note": _text,
+                                    "profile_prompt": prompt,
+                                },
+                                question=None,
+                                context={
+                                    "source_set_id": source_set.get(
+                                        "source_set_id", ""
+                                    ),
+                                    "profile_prompt_version": PROFILE_PROMPT_VERSION,
+                                    "profile_generation_route": profile_route,
+                                    "reasoner_identity": reasoner_identity,
+                                },
+                            )
+                        except Exception:
+                            profile_budget.finish(
+                                profile_attempt_id, status="failed"
+                            )
+                            raise
+                        profile_budget.finish(
+                            profile_attempt_id, status="completed"
                         )
+                        return response
                 else:
                     reasoner_method = None
                 try:
@@ -3199,9 +4257,42 @@ def _build_profiles_for_map(
                         profile_generation_route=profile_route,
                         reasoner_identity=reasoner_identity,
                         profile_fallback_reason=f"{type(exc).__name__}: {exc}",
-                        lazy_reprofile_required=True,
+                    )
+                    prior_attempt_count = (
+                        int(prior_profile_failure.get("attempt_count", 0) or 0)
+                        if isinstance(prior_profile_failure, Mapping)
+                        and prior_profile_failure.get("fingerprint")
+                        == reasoner_attempt_fingerprint
+                        else 0
+                    )
+                    attempt_count = prior_attempt_count + 1
+                    terminal = attempt_count >= 2
+                    fallback_context.update(
+                        lazy_reprofile_required=not terminal,
+                        profile_retry_terminal=terminal,
                     )
                     profile.context = fallback_context
+                    profile_contract_fallback = True
+                    write_yaml(
+                        failure_path,
+                        {
+                            "failure_schema_version": "2",
+                            "status": "terminal" if terminal else "retryable",
+                            "note_id": note_id,
+                            "source_id": str(row.get("source_id") or ""),
+                            "zotero_item_key": str(
+                                row.get("zotero_item_key") or ""
+                            ),
+                            "fingerprint": reasoner_attempt_fingerprint,
+                            "failure_class": "contract",
+                            "attempt_count": attempt_count,
+                            "terminal": terminal,
+                            "retry_on_resume": not terminal,
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                            "updated_at": now_iso(),
+                        },
+                    )
         note_valid = bool(row.get("validation_passed", True))
         prior_exclusion_reason = str(getattr(profile, "exclusion_reason", "") or "")
         if (
@@ -3307,12 +4398,7 @@ def _build_profiles_for_map(
             / "profile_calls"
             / f"{slugify(note_id, fallback='profile')}.yml"
         )
-        failure_path = (
-            literature_state
-            / "profile_failures"
-            / f"{slugify(note_id, fallback='profile')}.yml"
-        )
-        if failure_path.exists():
+        if failure_path.exists() and not profile_contract_fallback:
             failure_path.unlink()
         return {
             "index": index,
@@ -3321,7 +4407,8 @@ def _build_profiles_for_map(
                 candidate
                 for candidate in (profile_path, checkpoint_path)
                 if candidate.exists()
-            ],
+            ]
+            + ([failure_path] if failure_path.exists() else []),
             "checkpoint_hit": checkpoint_hit,
             "failure": 0,
             "excluded": bool(getattr(profile, "excluded_from_synthesis", False))
@@ -3411,6 +4498,8 @@ def _build_profiles_for_map(
         "excluded_count": excluded_count,
         "checkpoint_hits": checkpoint_hits,
         "provider_calls": provider_calls,
+        "cumulative_provider_calls": profile_budget.cumulative_calls,
+        "provider_call_limit": profile_budget.max_calls,
         "failure_count": failures,
         "failures": failure_records,
         "profile_packet_count": int(packet_result["packet_count"]),
@@ -3629,6 +4718,7 @@ def all_workspace_note_rows(workspace: Path) -> list[dict[str, Any]]:
             "fulltext_available",
             "abstract_only_atomic_note",
             "metadata_only_source_note",
+            "partial_document_atomic_note",
         }:
             continue
         if not frontmatter.get("note_id") or not frontmatter.get("source_id"):
@@ -3700,6 +4790,7 @@ def _prepare_item(
     reader: ReaderProvider,
     vision: VisionProvider | None,
     progress: _RunProgress | None = None,
+    profile_budget: _ProfileProviderBudget | None = None,
 ) -> dict[str, Any]:
     key = item_key(item)
     base = {
@@ -3824,7 +4915,7 @@ def _prepare_item(
         base["analysis"] = content["analysis"]
         return base
     source_scope = str(content.get("source_scope") or "full_document")
-    if source_scope != "full_document":
+    if source_scope not in {"full_document", "partial_document"}:
         note_status = {
             "abstract_only": "abstract_only_atomic_note",
             "metadata_only": "metadata_only_source_note",
@@ -3863,6 +4954,27 @@ def _prepare_item(
                 ),
                 "unresolved_pages": list(
                     extraction_metrics.get("unresolved_pages", []) or []
+                ),
+                "recovered_pages": list(
+                    extraction_metrics.get("recovered_pages", []) or []
+                ),
+                "recovered_page_ratio": extraction_metrics.get(
+                    "recovered_page_ratio"
+                ),
+                "content_kind": str(
+                    extraction_metrics.get("content_kind") or ""
+                ),
+                "ordinal_to_printed_page": dict(
+                    extraction_metrics.get("ordinal_to_printed_page", {}) or {}
+                ),
+                "heading_spans": list(
+                    extraction_metrics.get("heading_spans", []) or []
+                ),
+                "table_spans": list(
+                    extraction_metrics.get("table_spans", []) or []
+                ),
+                "figure_spans": list(
+                    extraction_metrics.get("figure_spans", []) or []
                 ),
             },
         }
@@ -3922,8 +5034,184 @@ def _prepare_item(
             output_path="pending_atomic_note",
         )
     )
+    if source_scope == "partial_document":
+        base.update(
+            terminal_status="limited_note",
+            note_status="partial_document_atomic_note",
+            limited_analysis=_limited_analysis(
+                {**content, "analysis": dict(analysis)},
+                item,
+            ),
+            reason=str(content.get("coverage_reason") or source_scope),
+        )
+        return base
+    try:
+        analysis = _verify_atomic_fidelity(
+            reader,
+            analysis,
+            source_text=str(content["text"]),
+            source_scope=source_scope,
+            coverage_metrics=extraction_metrics,
+            checkpoint_root=checkpoint_root,
+            request=request,
+            progress=progress,
+            profile_budget=profile_budget,
+        )
+    except AtomicFidelityError as exc:
+        base["attempts"].append(
+            _attempt(base, "atomic_fidelity", "failed", str(exc))
+        )
+        base["reason"] = str(exc)
+        return base
     base["analysis"] = dict(analysis)
     return base
+
+
+def _verify_atomic_fidelity(
+    reader: ReaderProvider,
+    analysis: Mapping[str, Any],
+    *,
+    source_text: str,
+    source_scope: str,
+    coverage_metrics: Mapping[str, Any],
+    checkpoint_root: Path,
+    request: MapRequest,
+    progress: _RunProgress | None,
+    profile_budget: _ProfileProviderBudget | None = None,
+) -> dict[str, Any]:
+    risks = analyze_atomic_fidelity(analysis, source_text, coverage_metrics)
+    if not risks:
+        return dict(analysis)
+    identity = {
+        "analysis_hash": sha256_text(
+            json.dumps(
+                dict(analysis),
+                sort_keys=True,
+                ensure_ascii=False,
+                default=str,
+            )
+        ),
+        "source_hash": sha256_text(source_text),
+        "coverage_hash": sha256_text(
+            json.dumps(
+                dict(coverage_metrics),
+                sort_keys=True,
+                ensure_ascii=False,
+                default=str,
+            )
+        ),
+        "provider": str(getattr(reader, "name", "")),
+        "model": str(getattr(reader, "model", "")),
+        "prompt_version": request.prompt_version,
+        "fidelity_version": ATOMIC_FIDELITY_VERSION,
+    }
+    checkpoint_path = checkpoint_root / "atomic_fidelity.yml"
+    checkpoint = read_yaml(checkpoint_path, {}) or {}
+    if checkpoint.get("identity") == identity:
+        if checkpoint.get("status") == "completed" and isinstance(
+            checkpoint.get("analysis"), Mapping
+        ):
+            patched = dict(checkpoint["analysis"])
+            if not analyze_atomic_fidelity(patched, source_text, coverage_metrics):
+                return patched
+        raise AtomicFidelityError(
+            str(checkpoint.get("reason") or "atomic_fidelity_review_required")
+        )
+    verifier = getattr(reader, "verify_atomic_claims", None)
+    if not callable(verifier):
+        reason = "atomic_fidelity_verification_unavailable"
+        write_yaml(
+            checkpoint_path,
+            {
+                "identity": identity,
+                "status": "failed",
+                "reason": reason,
+                "risks": risks,
+                "updated_at": now_iso(),
+            },
+        )
+        raise AtomicFidelityError(reason)
+    context = {
+        "risks": risks,
+        "source_passages": source_passages_for_risks(
+            source_text,
+            risks,
+            page_map=dict(
+                coverage_metrics.get("ordinal_to_printed_page", {}) or {}
+            ),
+        ),
+        "source_scope": source_scope,
+        "page_map": dict(
+            coverage_metrics.get("ordinal_to_printed_page", {}) or {}
+        ),
+    }
+    diagnostics: dict[str, Any] = {}
+    attempt_id = ""
+    try:
+        if profile_budget is not None:
+            attempt_id = profile_budget.reserve(
+                "atomic_fidelity",
+                str(checkpoint_root.name),
+                sha256_text(
+                    json.dumps(identity, sort_keys=True, ensure_ascii=False)
+                ),
+            )
+        if progress is not None:
+            progress.record_source_provider_call()
+        response = verifier(dict(analysis), context=context)
+        if attempt_id:
+            profile_budget.finish(attempt_id, status="completed")
+        if not isinstance(response, Mapping):
+            raise ValueError("atomic fidelity verifier must return a mapping")
+        diagnostics["response"] = dict(response)
+        replacements = validate_atomic_replacements(
+            analysis,
+            response,
+            allowed_risk_ids=[str(row["risk_id"]) for row in risks],
+            discard_invalid=True,
+        )
+        diagnostics["replacements"] = replacements
+        patched = apply_atomic_replacements(
+            analysis,
+            replacements,
+            allowed_risk_ids=[str(row["risk_id"]) for row in risks],
+        )
+        remaining = analyze_atomic_fidelity(
+            patched,
+            source_text,
+            coverage_metrics,
+        )
+        diagnostics["remaining_risks"] = remaining
+        if remaining:
+            raise ValueError("atomic_fidelity_risks_unresolved")
+    except Exception as exc:
+        if attempt_id:
+            profile_budget.finish(attempt_id, status="failed")
+        reason = f"atomic_fidelity_review_required:{type(exc).__name__}:{exc}"
+        write_yaml(
+            checkpoint_path,
+            {
+                "identity": identity,
+                "status": "failed",
+                "reason": reason,
+                "risks": risks,
+                **diagnostics,
+                "updated_at": now_iso(),
+            },
+        )
+        raise AtomicFidelityError(reason) from exc
+    write_yaml(
+        checkpoint_path,
+        {
+            "identity": identity,
+            "status": "completed",
+            "risk_ids": [str(row["risk_id"]) for row in risks],
+            "replacements": replacements,
+            "analysis": patched,
+            "updated_at": now_iso(),
+        },
+    )
+    return patched
 
 
 def _write_frozen_content(checkpoint_root: Path, content: Mapping[str, Any]) -> None:
@@ -3993,6 +5281,46 @@ def _limited_analysis(
         f"Coverage classification: {scope}. Reason: {reason}. "
         "Methods, evidence, detailed findings, qualifications, and limitations require the complete document."
     )
+    if scope == "partial_document":
+        analysis = content.get("analysis")
+        analysis = dict(analysis) if isinstance(analysis, Mapping) else {}
+        metrics = dict(content.get("coverage_metrics", {}) or {})
+        recovered = ", ".join(
+            str(page) for page in metrics.get("recovered_pages", []) or []
+        )
+        unresolved = ", ".join(
+            str(page) for page in metrics.get("unresolved_pages", []) or []
+        )
+        missing_scope = (
+            "remaining parent work (page range unavailable from the supplied attachment)"
+            if metrics.get("missing_scope") == "remainder_of_parent_work"
+            else ""
+        )
+        findings = "\n".join(
+            [
+                "The following points describe only the recovered pages.",
+                f"- Available-content argument: {analysis.get('thesis') or 'Not established from the recovered pages.'}",
+                f"- Available-content knowledge basis: {analysis.get('method_and_research_design') or 'Not established from the recovered pages.'}",
+                f"- Available-content findings: {analysis.get('detailed_findings') or 'No substantive finding was recoverable.'}",
+                f"- Available-content limitations: {analysis.get('limitations') or 'Not established from the recovered pages.'}",
+                f"- Locators within the recovered content: {analysis.get('locators') or 'No traceable locator was recovered.'}",
+            ]
+        )
+        missing_disclosure = (
+            f"Missing or unresolved scope: {missing_scope}. "
+            if missing_scope
+            else f"Missing or unresolved PDF pages: {unresolved or 'none recorded'}. "
+        )
+        return {
+            "available_content_findings": findings,
+            "scope_limitation": (
+                f"Recovered PDF pages: {recovered or 'none recorded'}. "
+                f"{missing_disclosure}"
+                "This is not a complete-document analysis; absent sections and the "
+                "source's complete argument, findings, method, and limitations are "
+                "not inferred."
+            ),
+        }
     if scope in {"abstract", "abstract_only"}:
         return {"abstract": available, "scope_limitation": limitation}
     if scope == "fulltext_available":
@@ -4106,6 +5434,11 @@ def _acquire_content(
                         actual_file=False,
                     ),
                 )
+                candidate = _apply_bibliographic_scope(
+                    candidate,
+                    parent_data,
+                    data,
+                )
                 candidates.append(candidate)
                 base["attempts"].append(
                     _attempt(
@@ -4176,6 +5509,11 @@ def _acquire_content(
                         media_type=extracted.media_type,
                         actual_file=True,
                     ),
+                )
+                local_candidate = _apply_bibliographic_scope(
+                    local_candidate,
+                    parent_data,
+                    data,
                 )
                 local_candidate["actual_primary_pdf"] = local_primary_pdf
                 candidates.append(local_candidate)
@@ -4263,6 +5601,11 @@ def _acquire_content(
                     media_type=extracted.media_type,
                     actual_file=True,
                 ),
+            )
+            downloaded_candidate = _apply_bibliographic_scope(
+                downloaded_candidate,
+                parent_data,
+                data,
             )
             downloaded_candidate["actual_primary_pdf"] = downloaded_primary_pdf
             candidates.append(downloaded_candidate)
@@ -4361,6 +5704,8 @@ def _content_candidate(
         if adequacy.is_full_publication
         else 40
         if scope == "abstract_only"
+        else 60
+        if scope == "partial_document"
         else 10
     )
     if rank_override is not None and adequacy.is_full_publication:
@@ -4381,6 +5726,75 @@ def _content_candidate(
         "coverage_metrics": dict(adequacy.metrics or {}),
         "rank": rank,
     }
+
+
+_BOUNDED_ATTACHMENT_RE = re.compile(
+    r"\b(?:chapter\s+(?:\d+|[ivxlcdm]+)|introduction|appendix|excerpt|"
+    r"foreword|preface)\b",
+    flags=re.IGNORECASE,
+)
+_GENERIC_ATTACHMENT_LABEL_RE = re.compile(
+    r"^(?:pdf|full\s*text|attachment|download(?:_file)?(?:\.pdf)?)$",
+    flags=re.IGNORECASE,
+)
+
+
+def _apply_bibliographic_scope(
+    candidate: Mapping[str, Any],
+    parent: Mapping[str, Any],
+    attachment: Mapping[str, Any],
+) -> dict[str, Any]:
+    row = dict(candidate)
+    if (
+        row.get("source_scope") != "full_document"
+        or str(parent.get("itemType") or "") not in {"book", "thesis", "report"}
+    ):
+        return row
+    label = str(
+        attachment.get("title")
+        or attachment.get("filename")
+        or ""
+    ).strip()
+    meaningful_label = label and not _GENERIC_ATTACHMENT_LABEL_RE.fullmatch(label)
+    first_page = str(row.get("text") or "")[:2_000]
+    bounded_match = (
+        _BOUNDED_ATTACHMENT_RE.search(label) if meaningful_label else None
+    ) or re.search(
+        r"(?im)^(?:--- Page 1 ---\s*)?(?:chapter\s+(?:\d+|[ivxlcdm]+)"
+        r"(?:\s*[:.-]\s*|\s+)|introduction\s*$|appendix\s+[a-z0-9]+)",
+        first_page,
+    )
+    if not bounded_match:
+        return row
+    coverage = dict(row.get("source_coverage", {}) or {})
+    metrics = dict(row.get("coverage_metrics", {}) or {})
+    page_count = int(metrics.get("page_count", 0) or 0)
+    metrics.update(
+        {
+            "bibliographic_scope": "bounded_attachment_excerpt",
+            "missing_scope": "remainder_of_parent_work",
+            "recovered_pages": list(
+                metrics.get("recovered_pages", []) or range(1, page_count + 1)
+            ),
+        }
+    )
+    coverage.update(
+        {
+            "source_scope": "partial_document",
+            "coverage_gate": "limited",
+            "reason": "bounded_attachment_excerpt",
+            "metrics": metrics,
+        }
+    )
+    row.update(
+        source_scope="partial_document",
+        source_coverage=coverage,
+        coverage_reason="bounded_attachment_excerpt",
+        coverage_metrics=metrics,
+        bounded_source_object=str(bounded_match.group(0)).strip(),
+        rank=70,
+    )
+    return row
 
 
 _SUPPLEMENTARY_ATTACHMENT_RE = re.compile(
@@ -5126,7 +6540,7 @@ def _read_document(
         "document_hash": document_hash,
         "provider": str(getattr(reader, "name", "unknown")),
         "model": str(getattr(reader, "model", "unknown")),
-        "prompt_version": request.prompt_version if request else "8",
+        "prompt_version": request.prompt_version if request else "9",
         "chunking_version": CHUNKING_VERSION,
         "content_classifier_version": CONTENT_CLASSIFIER_VERSION,
         "question_hash": sha256_text(question or ""),

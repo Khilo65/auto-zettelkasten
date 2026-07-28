@@ -54,6 +54,8 @@ _SIDECAR_FIELDS = frozenset({"profile_schema_version", "profile"})
 _CHECKPOINT_FIELDS = frozenset({"checkpoint_schema_version", "fingerprint", "profile"})
 _TRACEABLE_LOCATOR = re.compile(
     r"(?:\b(?:(?:p{1,2}\.\s*|p{1,2}\s+|pages?\s+|paragraphs?\s+)\d+(?:\s*[-\u2013\u2014]\s*\d+)?)\b|"
+    r"https?://[^\s>)\]}]+|"
+    r"\b(?:section|heading)\s+[\"“']?[A-Za-z0-9][^\"”';,()]{1,100}|"
     r"\b(?:abstract|introduction|background|literature review|methods?|methodology|data|results?|findings?|"
     r"discussion|conclusions?|limitations?|appendix)\b|\b(?:table|figure)\s*\d+[a-z]?\b)",
     flags=re.IGNORECASE,
@@ -1868,6 +1870,7 @@ def _limited_reason(
     if supplied:
         return supplied
     defaults = {
+        "partial_document_atomic_note": "Partial-document context; substantive claims are restricted to recovered pages and excluded from synthesis.",
         "abstract_only_atomic_note": "Abstract-only context; the full publication was not profiled and no substantive finding is supported.",
         "metadata_only_source_note": "Metadata-only context; no source text supports substantive findings.",
         "fulltext_available": "Full text is available but no committed analytical note supports substantive findings yet.",

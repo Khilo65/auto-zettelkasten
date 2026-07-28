@@ -7,8 +7,8 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
-CURRENT_ENGINE_VERSION = "0.11.0"
-CURRENT_ARTIFACT_SCHEMA_VERSION = "1.10"
+CURRENT_ENGINE_VERSION = "0.12.0"
+CURRENT_ARTIFACT_SCHEMA_VERSION = "1.11"
 CURRENT_PROFILE_SCHEMA_VERSION = "1.2"
 
 
@@ -555,7 +555,8 @@ class MapRequest:
     parallel: int = 4
     limit: int = 0
     extraction_version: str = "2"
-    prompt_version: str = "8"
+    prompt_version: str = "9"
+    retry_terminal_failures: bool = False
     extraction_policy: ExtractionPolicy = field(default_factory=ExtractionPolicy)
     processing: ProcessingPolicy = field(default_factory=ProcessingPolicy)
     literature_policy: LiteratureMappingPolicy = field(
@@ -566,6 +567,9 @@ class MapRequest:
     def __post_init__(self) -> None:
         object.__setattr__(self, "workspace", Path(self.workspace).expanduser())
         _require_bool(self.allow_cloud, field="allow_cloud")
+        _require_bool(
+            self.retry_terminal_failures, field="retry_terminal_failures"
+        )
         if self.model == "deepseek-v4-flash" and self.provider in {"ollama", "gemini"}:
             object.__setattr__(
                 self,
@@ -647,7 +651,11 @@ class MapRequest:
             parallel=int(payload.get("parallel", 4)),
             limit=int(payload.get("limit", 0)),
             extraction_version=str(payload.get("extraction_version", "2")),
-            prompt_version=str(payload.get("prompt_version", "8")),
+            prompt_version=str(payload.get("prompt_version", "9")),
+            retry_terminal_failures=_strict_bool(
+                payload.get("retry_terminal_failures", False),
+                field="retry_terminal_failures",
+            ),
             extraction_policy=ExtractionPolicy.from_dict(
                 payload.get("extraction_policy")
                 if isinstance(payload.get("extraction_policy"), Mapping)

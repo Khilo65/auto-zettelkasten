@@ -673,7 +673,7 @@ def test_all_report_models_default_to_current_versions(tmp_path: Path) -> None:
         LiteratureMapReport(status="ok"),
     )
     assert {(report.engine_version, report.artifact_schema_version) for report in reports} == {
-        ("0.11.0", "1.10")
+        ("0.12.0", "1.11")
     }
     assert run_report.literature_map == {}
     assert run_report.literature_report == {}

@@ -453,7 +453,7 @@ def test_current_prompt_replaces_prompt_v1_note_instead_of_reusing_it(
     note = tmp_path / second.items[0]["note_path"]
     frontmatter = read_note(note)["frontmatter"]
     _, body = parse_atomic_note(note.read_text())
-    assert frontmatter["prompt_version"] == "8"
+    assert frontmatter["prompt_version"] == "9"
     assert "## Plain-English Interpretation" in body
 
 

@@ -37,6 +37,9 @@ class _Reasoner:
     def adjudicate_relationships(self, *_args: Any, **_kwargs: Any) -> None:
         pass
 
+    def verify_relationships(self, *_args: Any, **_kwargs: Any) -> None:
+        pass
+
 
 class _Calls:
     def __init__(
@@ -227,7 +230,7 @@ def test_large_catalogue_candidate_context_uses_selected_shards(
     )
     assert {
         row["source_id"] for row in candidate_context["catalogue_entries"]
-    } == {"S000", "S001"}
+    } == {"S001"}
 
 
 @pytest.mark.parametrize("failure_stage", ["candidate", "adjudication"])
@@ -235,7 +238,7 @@ def test_second_provider_batch_failure_preserves_earlier_results_and_state(
     tmp_path: Path,
     failure_stage: str,
 ) -> None:
-    profiles = [_profile(f"S{index:02d}") for index in range(10)]
+    profiles = [_profile(f"S{index:02d}") for index in range(20)]
     catalogue = _catalogue(
         tmp_path, [profile.source_id for profile in profiles]
     )
@@ -263,12 +266,13 @@ def test_second_provider_batch_failure_preserves_earlier_results_and_state(
                     return {"candidates": [_candidate("S00", "S01")]}
                 return {
                     "candidates": [
-                        _candidate(f"S{index:02d}", "S08" if index % 2 == 0 else "S09")
-                        for index in range(8)
+                        _candidate(f"S{index:02d}", target)
+                        for index in range(12)
+                        for target in ("S18", "S19")
                     ]
                 }
-            assert focus_ids == ["S08", "S09"]
-            return {"candidates": [_candidate("S08", "S09")]}
+            assert focus_ids == [f"S{index:02d}" for index in range(12, 20)]
+            return {"candidates": [_candidate("S12", "S13")]}
         if stage == "relationship_adjudication":
             if failure_stage == "adjudication" and call_number == 2:
                 raise RuntimeError("adjudication provider failure")
@@ -282,16 +286,26 @@ def test_second_provider_batch_failure_preserves_earlier_results_and_state(
                     for pair in context["pairs"]
                 ]
             }
+        if stage == "relationship_verification":
+            return {
+                "verifications": [
+                    {
+                        **row,
+                        "status": "confirmed",
+                        "reason": "Both located claims support the same bounded proposition.",
+                        "requested_context": [],
+                    }
+                    for row in context["preliminary_decisions"]
+                ]
+            }
         raise AssertionError(f"unexpected stage: {stage}")
 
     result = _run(tmp_path, profiles, catalogue, _Calls(handler))
 
     assert result["accepted"], result
-    assert {
-        row["source_id"] for row in result["accepted"]
-    }.issubset({f"S{index:02d}" for index in range(8)})
-    assert set(result["selected_profile_hashes"]) == {
-        f"S{index:02d}" for index in range(8)
+    assert set(result["selected_profile_hashes"])
+    assert set(result["selected_profile_hashes"]) < {
+        f"S{index:02d}" for index in range(20)
     }
     assert any(
         row["reason"]

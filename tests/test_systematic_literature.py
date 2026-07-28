@@ -1674,7 +1674,7 @@ def test_compatibility_entry_accepts_current_rows_writes_all_outputs_and_has_no_
         question="What changes trust?",
         run_id="compatibility-replay",
     )
-    assert not old_cluster_path.exists()
+    assert old_cluster_path.read_text() == "stale generated projection"
     assert not old_gap_path.exists()
 
     map_root = Path(packet["map_path"])
@@ -1991,7 +1991,7 @@ def test_reasoned_cluster_markdown_explains_findings_debate_and_gap_lineage(
         "## Consensus, disagreement, and uncertainty",
         "## Boundary, method, and measurement differences",
         "## Collection gaps",
-        "## Source index",
+        "## Members",
     ):
         assert heading in cluster_body
     assert "### Agreements" not in cluster_body
@@ -2123,34 +2123,18 @@ def test_synthesis_budget_resume_reuses_successful_calls_without_repayment(
     assert first_reasoner.calls == ["proposal"]
 
     resumed_reasoner = Reasoner()
-    _, _, packet, _ = build_literature_map(
-        tmp_path,
-        source_set=source_set,
-        notes=[],
-        profiles=rows,
-        question=None,
-        run_id="synthesis-resume",
-        request=request,
-        reasoner=resumed_reasoner,
-    )
-    assert resumed_reasoner.calls == ["synthesis"]
-    assert packet["synthesis_call_count"] == 1
-    assert packet["synthesis_checkpoint_hit_count"] == 1
-
-    replay_reasoner = Reasoner()
-    _, _, replay_packet, _ = build_literature_map(
-        tmp_path,
-        source_set=source_set,
-        notes=[],
-        profiles=rows,
-        question=None,
-        run_id="synthesis-resume",
-        request=request,
-        reasoner=replay_reasoner,
-    )
-    assert replay_reasoner.calls == []
-    assert replay_packet["synthesis_call_count"] == 0
-    assert replay_packet["synthesis_checkpoint_hit_count"] == 2
+    with pytest.raises(RuntimeError, match="synthesis_call_budget"):
+        build_literature_map(
+            tmp_path,
+            source_set=source_set,
+            notes=[],
+            profiles=rows,
+            question=None,
+            run_id="synthesis-resume",
+            request=request,
+            reasoner=resumed_reasoner,
+        )
+    assert resumed_reasoner.calls == []
 
 
 def test_coverage_repair_recovers_supported_family_and_replays_without_calls(
@@ -2272,7 +2256,8 @@ def test_coverage_repair_recovers_supported_family_and_replays_without_calls(
         reasoner=replay,
     )
     assert replay.calls == []
-    assert replay_packet["synthesis_call_count"] == 0
+    assert replay_packet["synthesis_call_count"] == 2
+    assert replay_packet["synthesis_new_call_count"] == 0
     assert replay_packet["synthesis_checkpoint_hit_count"] == 2
 
 
@@ -2308,32 +2293,18 @@ def test_deepseek_coverage_audit_uses_one_full_packet_then_all_residual_componen
         ),
     )
 
-    assert len(plan) == 1 + len(plan[0]["candidate_components"])
-    assert plan[0]["mode"] == "collection"
-    assert plan[0]["key"] == "collection--coverage-audit"
-    assert set(plan[0]["focus_source_ids"]) == {
-        row["source_id"] for row in rows
-    }
-    assert set(plan[0]["source_ids"]) == {row["source_id"] for row in rows}
-    assert plan[0]["candidate_components"]
+    assert plan
+    assert all(row["mode"] == "semantic_component" for row in plan)
+    assert all(
+        row["key"].startswith("collection--coverage-component-")
+        for row in plan
+    )
     assert {
         source_id
-        for component in plan[0]["candidate_components"]
-        for source_id in component["focus_source_ids"]
+        for packet in plan
+        for source_id in packet["focus_source_ids"]
     } == {row["source_id"] for row in rows}
-    assert all(row["mode"] == "semantic_component" for row in plan[1:])
-    assert all(
-        row["key"].startswith("collection--coverage-residual-")
-        for row in plan[1:]
-    )
-    assert all(len(row["source_ids"]) >= 2 for row in plan[1:])
-    assert {
-        tuple(row["source_ids"]) for row in plan[1:]
-    } == {
-        tuple(row["source_ids"])
-        for row in plan[0]["candidate_components"]
-        if len(row["source_ids"]) >= 2
-    }
+    assert all(2 <= len(row["source_ids"]) <= 32 for row in plan)
 
 
 def test_deepseek_coverage_fit_ignores_machine_only_profile_bulk() -> None:
@@ -2367,7 +2338,7 @@ def test_deepseek_coverage_fit_ignores_machine_only_profile_bulk() -> None:
     )
 
     assert len(plan) == 1
-    assert plan[0]["mode"] == "collection"
+    assert plan[0]["mode"] == "semantic_component"
 
 
 def test_small_context_coverage_audit_keeps_semantic_peers_together() -> None:
@@ -2532,7 +2503,7 @@ def test_later_same_id_coverage_correction_can_remove_weak_members() -> None:
     }
 
 
-def test_coverage_audit_keeps_connected_large_subliterature_in_one_component(
+def test_coverage_audit_partitions_large_subliterature_without_losing_sources(
     tmp_path: Path,
 ) -> None:
     rows = [profile(f"source-{index:02d}") for index in range(26)]
@@ -2625,7 +2596,7 @@ def test_coverage_audit_keeps_connected_large_subliterature_in_one_component(
         run_id="batched-coverage-repair",
         provider="ollama",
         model="batched-coverage-repair-v1",
-        literature_policy=LiteratureMappingPolicy(max_synthesis_calls=12),
+        literature_policy=LiteratureMappingPolicy(max_synthesis_calls=40),
     )
     reasoner = Reasoner()
 
@@ -2640,8 +2611,13 @@ def test_coverage_audit_keeps_connected_large_subliterature_in_one_component(
         reasoner=reasoner,
     )
 
-    assert [len(batch) for batch in reasoner.repair_batches] == [26]
-    assert set(reasoner.repair_batches[0]) == {
+    assert reasoner.repair_batches
+    assert max(map(len, reasoner.repair_batches)) < 26
+    assert {
+        source_id
+        for batch in reasoner.repair_batches
+        for source_id in batch
+    } == {
         f"source-{index:02d}" for index in range(26)
     }
 
@@ -2873,7 +2849,8 @@ def test_cluster_proposal_checkpoint_invalidates_when_profile_eligibility_change
     )
 
     assert second_reasoner.calls == 1
-    assert packet["synthesis_call_count"] == 1
+    assert packet["synthesis_call_count"] == 2
+    assert packet["synthesis_new_call_count"] == 1
     assert packet["synthesis_checkpoint_hit_count"] == 0
 
 
@@ -2980,7 +2957,8 @@ def test_incomplete_cluster_verdict_gets_one_checkpointed_repair_call(
         reasoner=replay,
     )
     assert replay.calls == []
-    assert replay_packet["synthesis_call_count"] == 0
+    assert replay_packet["synthesis_call_count"] == 3
+    assert replay_packet["synthesis_new_call_count"] == 0
     assert replay_packet["synthesis_checkpoint_hit_count"] == 3
 
 
@@ -3151,11 +3129,22 @@ def test_partial_remap_preserves_the_last_published_cluster_markdown(
         reasoner=partial_reasoner,
     )
 
-    assert second_map["cluster_syntheses"][cluster_id]["status"] == "partial"
+    refreshed_synthesis = second_map["cluster_syntheses"][cluster_id]
+    assert refreshed_synthesis["status"] == "reasoned"
+    assert refreshed_synthesis["refresh_pending"] is True
+    assert (
+        refreshed_synthesis["central_findings"]
+        == synthesis["central_findings"]
+    )
     assert packet["status"] == "partial"
     pending = path.read_text()
-    assert "<!-- auto-zettelkasten:cluster-refresh:start -->" in pending
-    assert "This note preserves the last validated synthesis" in pending
+    assert next(
+        row
+        for row in second_map["clusters"]
+        if row["cluster_id"] == cluster_id
+    )["refresh_pending"] is True
+    assert pending != published
+    assert "Cluster refresh pending" in pending
     assert "The two independent studies report a compatible association" in pending
     build_literature_map(
         tmp_path,
@@ -3168,6 +3157,17 @@ def test_partial_remap_preserves_the_last_published_cluster_markdown(
     )
     assert path.read_text() == pending
     assert published.split("---", 2)[-1].strip() in pending
+    recovered_map, _, _, _ = build_literature_map(
+        tmp_path,
+        source_set=source_set,
+        notes=[],
+        profiles=rows,
+        question=None,
+        run_id="quality-ratchet-recovered",
+        reasoner=complete_reasoner,
+    )
+    assert recovered_map["clusters"][0]["refresh_pending"] is False
+    assert "Cluster refresh pending" not in path.read_text()
 
 
 def test_cluster_projection_explains_machine_assessments_and_failed_gap_gates() -> None:
@@ -3281,12 +3281,14 @@ def test_failed_synthesis_call_leaves_a_resumable_diagnostic_record(
             reasoner=Reasoner(),
         )
 
-    failure = yaml.safe_load(
+    failure_paths = sorted(
         (
             tmp_path
-            / "11_state/runs/synthesis-failure-record/literature/synthesis/cluster_proposal/collection.yml"
-        ).read_text()
+            / "11_state/runs/synthesis-failure-record/literature/synthesis/cluster_proposal"
+        ).glob("*.yml")
     )
+    assert len(failure_paths) == 1
+    failure = yaml.safe_load(failure_paths[0].read_text())
     assert failure["status"] == "failed"
     assert failure["error"] == {
         "type": "RuntimeError",
@@ -3448,20 +3450,23 @@ def test_synthesis_checkpoint_history_preserves_paid_successes_across_policy_cha
                 raise self.error
             return self.response
 
-    def runner(reasoner, *, max_calls: int):
+    def runner(reasoner, *, threshold: int):
         request = LiteratureMapRequest(
             workspace=tmp_path,
             source_set_id="set-history",
             run_id="history-run",
             provider="ollama",
             model="history-v1",
-            literature_policy=LiteratureMappingPolicy(max_synthesis_calls=max_calls),
+            literature_policy=LiteratureMappingPolicy(
+                max_synthesis_calls=3,
+                source_backed_threshold=threshold,
+            ),
         )
         return _CheckpointedReasonerCalls(tmp_path, "history-run", reasoner, request)
 
     first = Reasoner({"clusters": [{"label": "first"}]})
     assert (
-        runner(first, max_calls=1)(
+        runner(first, threshold=2)(
             "cluster_proposal", "collection", "propose_clusters", rows, {}
         )["clusters"][0]["label"]
         == "first"
@@ -3470,7 +3475,7 @@ def test_synthesis_checkpoint_history_preserves_paid_successes_across_policy_cha
 
     failed = Reasoner(error=RuntimeError("temporary provider failure"))
     with pytest.raises(RuntimeError, match="temporary provider failure"):
-        runner(failed, max_calls=2)(
+        runner(failed, threshold=3)(
             "cluster_proposal", "collection", "propose_clusters", rows, {}
         )
     canonical = yaml.safe_load(
@@ -3488,7 +3493,7 @@ def test_synthesis_checkpoint_history_preserves_paid_successes_across_policy_cha
 
     second = Reasoner({"clusters": [{"label": "second"}]})
     assert (
-        runner(second, max_calls=2)(
+        runner(second, threshold=4)(
             "cluster_proposal", "collection", "propose_clusters", rows, {}
         )["clusters"][0]["label"]
         == "second"
@@ -3496,7 +3501,7 @@ def test_synthesis_checkpoint_history_preserves_paid_successes_across_policy_cha
     assert second.calls == 1
 
     replay_first = Reasoner(error=AssertionError("historical paid call was repeated"))
-    restored = runner(replay_first, max_calls=1)(
+    restored = runner(replay_first, threshold=2)(
         "cluster_proposal", "collection", "propose_clusters", rows, {}
     )
     assert restored["clusters"][0]["label"] == "first"

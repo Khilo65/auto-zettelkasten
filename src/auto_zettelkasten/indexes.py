@@ -11,8 +11,9 @@ from typing import Any, Mapping, Sequence
 from .files import atomic_write_text, now_iso, read_yaml, sha256_text, slugify, write_yaml
 from .notes import read_note
 
-SOURCE_CATALOGUE_SCHEMA_VERSION = "1"
+SOURCE_CATALOGUE_SCHEMA_VERSION = "2"
 SOURCE_CATALOGUE_SHARD_MAX_CHARS = 36_000
+SOURCE_CATALOGUE_ROUTING_CARD_MAX_CHARS = 1_500
 
 TYPED_RELATIONS = {
     "cites",
@@ -250,7 +251,6 @@ def write_source_set(
         "frozen_inventory": True,
         "refresh_requires_new_run": True,
         "stale": False,
-        "updated_at": now_iso(),
         "rows": [
             {
                 "inventory_index": index,
@@ -264,9 +264,24 @@ def write_source_set(
         ],
     }
     path = workspace / "02_source_memory" / "indexes" / "source_sets" / f"{source_set_id}.yml"
-    write_yaml(path, payload)
+    existing = read_yaml(path, {}) or {}
+    existing_without_timestamp = dict(existing)
+    existing_without_timestamp.pop("updated_at", None)
+    payload["updated_at"] = (
+        str(existing.get("updated_at") or "")
+        if existing_without_timestamp == payload
+        else now_iso()
+    )
+    if existing != payload:
+        write_yaml(path, payload)
     latest_path = workspace / "02_source_memory" / "indexes" / "source_sets" / f"{source_set_alias}.yml"
-    write_yaml(latest_path, {**payload, "latest_snapshot_id": source_set_id, "latest_snapshot_path": str(path)})
+    latest_payload = {
+        **payload,
+        "latest_snapshot_id": source_set_id,
+        "latest_snapshot_path": str(path),
+    }
+    if (read_yaml(latest_path, {}) or {}) != latest_payload:
+        write_yaml(latest_path, latest_payload)
     payload["path"] = str(path)
     payload["latest_path"] = str(latest_path)
     return payload
@@ -276,14 +291,30 @@ def update_source_set_map(workspace: Path, source_set: Mapping[str, Any], cluste
     payload = dict(source_set)
     payload["cluster_ids"] = sorted(str(row.get("cluster_id")) for row in clusters if row.get("cluster_id"))
     payload["gap_ids"] = sorted(str(row.get("gap_id")) for row in gaps if row.get("gap_id"))
-    payload["updated_at"] = now_iso()
     payload.pop("path", None)
     payload.pop("latest_path", None)
     path = workspace / "02_source_memory" / "indexes" / "source_sets" / f"{payload['source_set_id']}.yml"
-    write_yaml(path, payload)
+    existing = read_yaml(path, {}) or {}
+    existing_without_timestamp = dict(existing)
+    existing_without_timestamp.pop("updated_at", None)
+    payload_without_timestamp = dict(payload)
+    payload_without_timestamp.pop("updated_at", None)
+    payload["updated_at"] = (
+        str(existing.get("updated_at") or "")
+        if existing_without_timestamp == payload_without_timestamp
+        else now_iso()
+    )
+    if existing != payload:
+        write_yaml(path, payload)
     alias = str(payload.get("source_set_alias") or payload["source_set_id"])
     latest_path = workspace / "02_source_memory" / "indexes" / "source_sets" / f"{alias}.yml"
-    write_yaml(latest_path, {**payload, "latest_snapshot_id": payload["source_set_id"], "latest_snapshot_path": str(path)})
+    latest_payload = {
+        **payload,
+        "latest_snapshot_id": payload["source_set_id"],
+        "latest_snapshot_path": str(path),
+    }
+    if (read_yaml(latest_path, {}) or {}) != latest_payload:
+        write_yaml(latest_path, latest_payload)
     payload["path"] = str(path)
     payload["latest_path"] = str(latest_path)
     return payload
@@ -378,6 +409,11 @@ def build_source_catalogue(
             if entry["source_id"] in literature["source_ids"]
             or entry["note_id"] in literature["note_ids"]
         )
+        entry["collections"] = sorted(
+            str(literature["title"])
+            for literature in literatures
+            if literature["literature_id"] in entry["literature_ids"]
+        )
 
     entry_by_identity = {
         (entry["source_id"], entry["note_id"]): entry for entry in entries
@@ -421,6 +457,12 @@ def build_source_catalogue(
             )
             revision_hash = sha256_text(body)
             text = f"{body}\nCatalogue revision: `{revision_hash}`\n"
+            routing_card = _catalogue_shard_routing_card(
+                shard_id=stem,
+                title=heading,
+                scope=str(literature["scope"]),
+                entries=chunk_entries,
+            )
             shard_specs.append(
                 {
                     "literature_id": literature["literature_id"],
@@ -439,6 +481,7 @@ def build_source_catalogue(
                         for row in chunk_entries
                         if row.get("note_id")
                     ],
+                    "routing_card": routing_card,
                     "revision_hash": revision_hash,
                     "text": text,
                 }
@@ -473,6 +516,7 @@ def build_source_catalogue(
                     "source_count",
                     "source_ids",
                     "note_ids",
+                    "routing_card",
                     "revision_hash",
                 )
             }
@@ -486,6 +530,14 @@ def build_source_catalogue(
     )
     routing_payload = {
         **semantic_payload,
+        "clusters": [
+            {
+                key: value
+                for key, value in cluster.items()
+                if key != "refresh_pending"
+            }
+            for cluster in compact_clusters
+        ],
         "sources": [
             {
                 key: value
@@ -812,11 +864,87 @@ def _meaningful_catalogue_chunks(
     return chunks
 
 
+def _catalogue_shard_routing_card(
+    *,
+    shard_id: str,
+    title: str,
+    scope: str,
+    entries: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Return a hard-bounded semantic card for probabilistic shard routing."""
+
+    facet_counts = Counter(
+        _compact_catalogue_text(value, 60)
+        for entry in entries
+        for value in [
+            *(entry.get("facets", []) or []),
+            *(
+                facet
+                for values in (
+                    entry.get("facets_by_type")
+                    if isinstance(entry.get("facets_by_type"), Mapping)
+                    else {}
+                ).values()
+                for facet in (values or [])
+            ),
+        ]
+        if _compact_catalogue_text(value, 60)
+    )
+    thesis_snippets: list[str] = []
+    for entry in entries:
+        thesis = _compact_catalogue_text(entry.get("thesis"), 180)
+        if thesis and thesis.casefold() not in {
+            value.casefold() for value in thesis_snippets
+        }:
+            thesis_snippets.append(thesis)
+        if len(thesis_snippets) == 5:
+            break
+    card: dict[str, Any] = {
+        "shard_id": str(shard_id),
+        "title": _compact_catalogue_text(title, 180),
+        "scope": _compact_catalogue_text(scope, 280),
+        "source_count": len(entries),
+        "dominant_facets": [
+            value
+            for value, _count in sorted(
+                facet_counts.items(),
+                key=lambda item: (-item[1], item[0].casefold()),
+            )[:6]
+        ],
+        "representative_theses": thesis_snippets,
+    }
+    while (
+        len(
+            json.dumps(
+                card,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        > SOURCE_CATALOGUE_ROUTING_CARD_MAX_CHARS
+    ):
+        if len(card["representative_theses"]) > 1:
+            card["representative_theses"].pop()
+        elif card["dominant_facets"]:
+            card["dominant_facets"].pop()
+        elif len(card["scope"]) > 80:
+            card["scope"] = _compact_catalogue_text(card["scope"], len(card["scope"]) - 40)
+        elif len(card["title"]) > 80:
+            card["title"] = _compact_catalogue_text(card["title"], len(card["title"]) - 40)
+        else:
+            break
+    return card
+
+
 def _catalogue_entry(profile: Mapping[str, Any], note: Mapping[str, Any]) -> dict[str, Any]:
     creators = note.get("creators", []) or []
     author_names = []
     for creator in creators if isinstance(creators, Sequence) and not isinstance(creators, (str, bytes)) else []:
         if isinstance(creator, Mapping):
+            creator_type = str(creator.get("creatorType") or "").strip()
+            if creator_type and creator_type not in {"author", "bookAuthor"}:
+                continue
             name = str(creator.get("lastName") or creator.get("name") or "").strip()
         else:
             name = str(creator).strip()
@@ -842,6 +970,44 @@ def _catalogue_entry(profile: Mapping[str, Any], note: Mapping[str, Any]) -> dic
         note.get("method") or (methods[0] if methods else "Not specified"),
         220,
     )
+    context = (
+        profile.get("context")
+        if isinstance(profile.get("context"), Mapping)
+        else {}
+    )
+    source_scope = _compact_catalogue_text(
+        profile.get("source_scope")
+        or context.get("source_scope")
+        or note.get("source_scope")
+        or "unknown",
+        60,
+    )
+    coverage_values = {
+        str(envelope.get("coverage") or "")
+        for anchor in profile.get("evidence_anchors", []) or []
+        if isinstance(anchor, Mapping)
+        for envelope in [anchor.get("support_envelope")]
+        if isinstance(envelope, Mapping) and envelope.get("coverage")
+    }
+    evidence_coverage = next(
+        (
+            value
+            for value in ("full_text", "limited_text", "abstract", "metadata", "unknown")
+            if value in coverage_values
+        ),
+        "unknown",
+    )
+    facets_by_type = {
+        facet_type: _bounded_profile_values(profile, fields)
+        for facet_type, fields in (
+            ("mechanism", ("mechanisms", "mechanism")),
+            ("outcome", ("outcomes", "outcome")),
+            ("case", ("cases", "case", "geography")),
+            ("population", ("populations", "population")),
+            ("period", ("periods", "period")),
+            ("dataset", ("datasets", "dataset", "data")),
+        )
+    }
     facets: list[str] = []
     for field in ("concepts", "mechanisms", "outcomes", "cases"):
         for value in profile.get(field, []) or []:
@@ -872,18 +1038,62 @@ def _catalogue_entry(profile: Mapping[str, Any], note: Mapping[str, Any]) -> dic
         if profile
         else ""
     )
+    source_id = str(profile.get("source_id") or note.get("source_id") or "")
+    zotero_key = str(note.get("zotero_item_key") or "").strip().upper()
+    if not zotero_key and source_id.startswith("source-zotero-"):
+        zotero_key = source_id.removeprefix("source-zotero-").upper()
     return {
-        "source_id": str(profile.get("source_id") or note.get("source_id") or ""),
+        "source_id": source_id,
+        "zotero_key": zotero_key,
         "note_id": str(profile.get("note_id") or note.get("note_id") or ""),
         "title": _compact_catalogue_text(note.get("title") or "Untitled", 240),
         "author": author,
         "year": year_match.group(0) if year_match else "n.d.",
         "thesis": thesis or "Not specified.",
         "method": method or "Not specified.",
+        "source_scope": source_scope or "unknown",
+        "evidence_coverage": evidence_coverage,
         "facets": facets,
+        "facets_by_type": {
+            key: value for key, value in facets_by_type.items() if value
+        },
         "note_link": note_link,
         "profile_hash": profile_hash,
     }
+
+
+def _bounded_profile_values(
+    profile: Mapping[str, Any],
+    fields: Sequence[str],
+    *,
+    max_values: int = 2,
+) -> list[str]:
+    result: list[str] = []
+    for field in fields:
+        raw = profile.get(field)
+        values = (
+            raw
+            if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes))
+            else [raw]
+        )
+        for value in values:
+            if isinstance(value, Mapping):
+                value = next(
+                    (
+                        value.get(key)
+                        for key in ("label", "name", "value", "text")
+                        if value.get(key)
+                    ),
+                    "",
+                )
+            cleaned = _compact_catalogue_text(value, 80)
+            if cleaned and cleaned.casefold() not in {
+                item.casefold() for item in result
+            }:
+                result.append(cleaned)
+            if len(result) >= max_values:
+                return result
+    return result
 
 
 def _compact_catalogue_text(value: Any, limit: int) -> str:

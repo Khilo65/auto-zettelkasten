@@ -4,7 +4,14 @@ from pathlib import Path
 
 import pytest
 
-from auto_zettelkasten.notes import parse_atomic_note, semantic_note_hash, source_obsidian_tags, update_note_graph
+from auto_zettelkasten.notes import (
+    _assert_source_note_safe_to_replace,
+    _write_note_metadata,
+    parse_atomic_note,
+    semantic_note_hash,
+    source_obsidian_tags,
+    update_note_graph,
+)
 
 
 def _note() -> str:
@@ -28,7 +35,11 @@ def test_semantic_hash_ignores_generated_graph_projection() -> None:
         "clusters:\n- cluster-a\ncluster_links:\n- '[[cluster-a]]'\ngaps:\n- gap-a\ngap_links:\n- '[[gap-a]]'\n"
         "tags:\n- auto-zettelkasten/source\n",
     ).replace(
-        "Substantive claim.\n", "Substantive claim.\n\n## Graph Links\n\n- cluster: [[cluster-a]]\n"
+        "Substantive claim.\n",
+        "Substantive claim.\n\n## Graph Links\n\n"
+        "<!-- auto-zettelkasten:graph:start -->\n"
+        "- cluster: [[cluster-a]]\n"
+        "<!-- auto-zettelkasten:graph:end -->\n",
     )
     assert semantic_note_hash(before) == semantic_note_hash(after)
 
@@ -64,9 +75,8 @@ def test_graph_update_is_idempotent(tmp_path: Path) -> None:
     assert update_note_graph(path, {**updates, "updated_at": "second-update"}, [], ["cluster-a"], gap_links) is False
     assert path.read_bytes() == first
     frontmatter, body = parse_atomic_note(first.decode())
-    assert frontmatter["tags"] == ["shared-topic"]
-    assert frontmatter["cluster_links"] == ["[[cluster-a]]"]
-    assert frontmatter["gap_links"] == ["[[gap-a]]"]
+    assert frontmatter["clusters"] == []
+    assert "tags" not in frontmatter
     assert "<!-- auto-zettelkasten:graph:start -->" in body
     assert "<!-- auto-zettelkasten:graph:end -->" in body
     assert "- supports_gap_rule: [[gap-a]]" in body
@@ -85,7 +95,8 @@ def test_graph_frontmatter_does_not_wrap_long_obsidian_wikilinks(tmp_path: Path)
         [],
     )
     frontmatter_text = path.read_text().split("\n---\n", 1)[0]
-    assert wikilink in frontmatter_text
+    assert wikilink not in frontmatter_text
+    assert wikilink in path.read_text().split("## Graph Links", 1)[1]
 
 
 def test_graph_update_repairs_wrapped_yaml_link_once_without_timestamp_churn(tmp_path: Path) -> None:
@@ -109,7 +120,8 @@ def test_graph_update_repairs_wrapped_yaml_link_once_without_timestamp_churn(tmp
     }
     assert update_note_graph(path, updates, related, []) is True
     repaired = path.read_text()
-    assert "[[A Long Source Title]]" in repaired.split("\n---\n", 1)[0]
+    assert "'[[A Long\n    Source Title]]'" in repaired.split("\n---\n", 1)[0]
+    assert "[[A Long Source Title]]" in repaired.split("## Graph Links", 1)[1]
     assert "updated_at: original" in repaired
     assert update_note_graph(path, updates, related, []) is False
 
@@ -137,7 +149,7 @@ def test_graph_update_migrates_only_the_legacy_graph_section(tmp_path: Path) -> 
     assert update_note_graph(path, {"related_notes": []}, related, []) is True
     migrated = path.read_text(encoding="utf-8")
     assert semantic_note_hash(migrated) == before_hash
-    assert "- same_concept: [[Old Target]]" not in migrated
+    assert "- same_concept: [[Old Target]]" in migrated
     assert "- supports: [[New Target]]" in migrated
     assert "## Researcher Relationships\n\n- My interpretation must survive." in migrated
     assert migrated.count("<!-- auto-zettelkasten:graph:start -->") == 1
@@ -159,3 +171,67 @@ def test_graph_update_rejects_semantic_frontmatter_changes_before_write(
         update_note_graph(path, {"source_id": "different-source"}, [], [])
 
     assert path.read_bytes() == before
+
+
+def test_graph_update_rejects_ambiguous_managed_markers_without_write(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "note.md"
+    path.write_text(
+        _note()
+        + "\n<!-- auto-zettelkasten:graph:start -->\n"
+        + "<!-- auto-zettelkasten:graph:start -->\n"
+        + "<!-- auto-zettelkasten:graph:end -->\n",
+        encoding="utf-8",
+    )
+    before = path.read_bytes()
+
+    with pytest.raises(ValueError, match="ambiguous_managed_graph_block"):
+        update_note_graph(path, {"related_notes": []}, [], [])
+
+    assert path.read_bytes() == before
+
+
+def test_relation_id_is_rendered_without_rewriting_frontmatter(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "note.md"
+    original = _note()
+    path.write_text(original, encoding="utf-8")
+
+    update_note_graph(
+        path,
+        {"related_notes": []},
+        [
+            {
+                "relation_id": "relation-shared",
+                "relation_type": "supports",
+                "target_stem": "Target",
+            }
+        ],
+        [],
+    )
+
+    updated = path.read_text()
+    assert updated.split("\n---\n", 1)[0] == original.split("\n---\n", 1)[0]
+    assert "<!-- relation_id: relation-shared -->" in updated
+
+
+def test_changed_source_note_with_human_content_is_not_replaceable(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path
+    path = workspace / "02_source_memory" / "notes" / "note.md"
+    path.parent.mkdir(parents=True)
+    original = _note()
+    path.write_text(original, encoding="utf-8")
+    _write_note_metadata(
+        workspace,
+        path,
+        {"note_id": "note-1", "source_id": "source-1"},
+        machine_text=original,
+    )
+    path.write_text(original + "\nHuman annotation.\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unmanaged_changes"):
+        _assert_source_note_safe_to_replace(workspace, path)

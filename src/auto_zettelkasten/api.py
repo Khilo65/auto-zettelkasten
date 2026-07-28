@@ -282,6 +282,7 @@ def resume_map(
     workspace: Path | str,
     run_id: str,
     *,
+    retry_terminal_failures: bool = False,
     client: ZoteroClient | None = None,
     reader: ReaderProvider | None = None,
     vision: VisionProvider | None = None,
@@ -299,6 +300,7 @@ def resume_map(
             errors=[{"reason": "run_request_not_found"}],
         )
     payload["workspace"] = str(root)
+    payload["retry_terminal_failures"] = retry_terminal_failures
     return run_map(
         MapRequest.from_dict(payload),
         client=client,
@@ -666,6 +668,7 @@ def build_map(
     reasoner: LiteratureReasoner | None = None,
     external_discovery: ExternalDiscoveryProvider | None = None,
     resume: bool = False,
+    retry_terminal_failures: bool = False,
 ) -> ArtifactManifest:
     del controller  # synthesis consumes validated notes and accepted typed-link evidence only
     if not isinstance(allow_cloud, bool):
@@ -726,7 +729,8 @@ def build_map(
         allow_cloud=allow_cloud,
         question=question,
         extraction_version=str(extraction_config.get("version") or "2"),
-        prompt_version=str(config.get("prompt_version") or "8"),
+        prompt_version=str(config.get("prompt_version") or "9"),
+        retry_terminal_failures=retry_terminal_failures,
         extraction_policy=ExtractionPolicy.from_dict(extraction_config),
         processing=ProcessingPolicy.from_dict(
             config.get("processing") if isinstance(config.get("processing"), Mapping) else {}

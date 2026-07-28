@@ -32,10 +32,10 @@ def _completion(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def test_atomic_prompt_v8_is_source_adaptive_and_inference_aware() -> None:
+def test_atomic_prompt_v9_is_source_adaptive_and_inference_aware() -> None:
     prompt = _system_prompt()
 
-    assert "atomic prompt v8" in prompt
+    assert "atomic prompt v9" in prompt
     assert "blog post" in prompt
     assert "conference or meeting record" in prompt
     assert "findings, arguments, observations, interpretations, or recommendations" in prompt
@@ -83,6 +83,23 @@ def test_source_prompt_includes_only_compact_extraction_context() -> None:
     assert '"page_count": 12' in prompt
     assert '"ocr_page_count": 2' in prompt
     assert "internal_fingerprint" not in prompt
+
+
+def test_partial_source_prompt_prohibits_complete_document_inference() -> None:
+    prompt = _source_prompt(
+        "--- Page 1 ---\nAvailable evidence.",
+        {
+            "title": "A partial source",
+            "_source_context": {
+                "source_scope": "partial_document",
+                "unresolved_pages": [2],
+            },
+        },
+        None,
+    )
+
+    assert "PARTIAL-SOURCE RULE" in prompt
+    assert "do not infer the complete thesis" in prompt
 
 
 def test_cluster_prompt_preserves_inference_and_case_evidence() -> None:

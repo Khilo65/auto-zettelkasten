@@ -1280,8 +1280,10 @@ def _with_generated_graph(note: str) -> str:
     return (
         f"---\n{yaml_text}\n---\n{body.rstrip()}\n\n"
         "## Graph Links\n\n"
+        "<!-- auto-zettelkasten:graph:start -->\n"
         "- related: [[Generated Note]]\n"
         "- cluster: [[cluster-generated]]\n"
+        "<!-- auto-zettelkasten:graph:end -->\n"
     )
 
 

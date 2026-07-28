@@ -151,6 +151,48 @@ def test_build_source_catalogue_is_byte_stable_and_rewrites_only_changed_shard(t
     assert "INDEX.md" in changed_names
 
 
+def test_refresh_pending_does_not_invalidate_relationship_routing(
+    tmp_path: Path,
+) -> None:
+    source_id = "source-zotero-abcd1234"
+    _source_set(tmp_path, "lit", "Literature", [source_id], ["n1"])
+    profile = {
+        "source_id": source_id,
+        "note_id": "n1",
+        "concepts": ["mediation"],
+    }
+    note = _note(
+        source_id,
+        "n1",
+        "Mediation study",
+        "Author",
+        "A compact thesis.",
+    )
+    cluster = {
+        "cluster_id": "cluster-a",
+        "source_ids": [source_id],
+        "shared_question": "What changes mediation outcomes?",
+    }
+
+    first = build_source_catalogue(
+        tmp_path,
+        [profile],
+        [note],
+        [{**cluster, "refresh_pending": False}],
+    )
+    second = build_source_catalogue(
+        tmp_path,
+        [profile],
+        [note],
+        [{**cluster, "refresh_pending": True}],
+    )
+    catalogue = yaml.safe_load(Path(second["catalogue_path"]).read_text())
+
+    assert second["revision_hash"] != first["revision_hash"]
+    assert second["routing_revision_hash"] == first["routing_revision_hash"]
+    assert catalogue["sources"][0]["zotero_key"] == "ABCD1234"
+
+
 def test_large_catalogue_uses_bounded_unique_shards_and_prunes_stale_files(
     tmp_path: Path,
 ) -> None:

@@ -9,7 +9,8 @@ from .files import now_iso, read_yaml, sha256_text, write_yaml
 from .navigation import TYPED_SOURCE_RELATIONS, rank_human_related_links
 
 
-RELATIONSHIP_PROMPT_VERSION = "1"
+RELATIONSHIP_PROMPT_VERSION = "2"
+RELATIONSHIP_REGISTRY_SCHEMA_VERSION = "3"
 SUBSTANTIVE_RELATION_TYPES = frozenset(
     {
         "supports",
@@ -39,6 +40,7 @@ RECIPROCAL_RELATION_TYPES = {
 _LIMITED_STATUSES = {
     "abstract_only_atomic_note",
     "metadata_only_source_note",
+    "partial_document_atomic_note",
     "fulltext_available",
     "limited",
     "limited_context_only",
@@ -190,6 +192,75 @@ def candidate_rows(
     return accepted, parked
 
 
+def validate_bridge_shard_pairs(
+    response: Mapping[str, Any],
+    *,
+    available_shards: Sequence[Mapping[str, Any]],
+    max_pairs: int = 12,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Validate bounded cross-literature routing without making semantic judgments."""
+
+    by_id = {
+        str(row.get("shard_id") or ""): dict(row)
+        for row in available_shards
+        if isinstance(row, Mapping) and row.get("shard_id")
+    }
+    accepted: list[dict[str, Any]] = []
+    parked: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for index, raw in enumerate(response.get("shard_pairs", []) or []):
+        if not isinstance(raw, Mapping):
+            parked.append({"row_index": index, "reason": "shard_pair_not_mapping"})
+            continue
+        row = dict(raw)
+        left = str(row.get("left_shard_id") or "").strip()
+        right = str(row.get("right_shard_id") or "").strip()
+        pair = canonical_pair(left, right)
+        confidence = _confidence(row.get("confidence"))
+        reason = str(row.get("reason") or "").strip()
+        reasons: list[str] = []
+        if not left or not right or left == right:
+            reasons.append("invalid_shard_pair")
+        if left not in by_id or right not in by_id:
+            reasons.append("shard_not_in_context")
+        if (
+            left in by_id
+            and right in by_id
+            and str(by_id[left].get("literature_id") or "")
+            == str(by_id[right].get("literature_id") or "")
+        ):
+            reasons.append("same_literature_shard_pair")
+        if pair in seen:
+            reasons.append("duplicate_shard_pair")
+        seen.add(pair)
+        if confidence is None:
+            reasons.append("invalid_confidence")
+        if len(reason.split()) < 5:
+            reasons.append("bridge_reason_too_vague")
+        if len(accepted) >= max_pairs:
+            reasons.append("bridge_shard_pair_limit_reached")
+        if reasons:
+            parked.append(
+                {
+                    "row_index": index,
+                    "left_shard_id": left,
+                    "right_shard_id": right,
+                    "reason": ",".join(reasons),
+                    "raw": row,
+                }
+            )
+            continue
+        accepted.append(
+            {
+                "left_shard_id": left,
+                "right_shard_id": right,
+                "reason": reason,
+                "confidence": confidence,
+            }
+        )
+    return accepted, parked
+
+
 def validate_decisions(
     response: Mapping[str, Any],
     *,
@@ -255,6 +326,8 @@ def validate_decisions(
                     "target_source_id": target_id,
                     "reason": str(row.get("reason") or "").strip(),
                     "confidence": confidence,
+                    "decision_status": "no_relationship",
+                    "verification_status": "pending",
                     **hashes,
                 }
             )
@@ -269,6 +342,8 @@ def validate_decisions(
                     ),
                     "reason": str(row.get("reason") or "").strip(),
                     "confidence": confidence,
+                    "decision_status": "needs_more_context",
+                    "verification_status": "pending",
                     **hashes,
                 }
             )
@@ -363,6 +438,7 @@ def validate_decisions(
                 "qualifiers": _string_list(row.get("qualifiers")),
                 "confidence": confidence,
                 "provenance": "probabilistic_relationship_adjudication",
+                "verification_status": "pending",
                 "model": str(row.get("model") or ""),
                 "inferred": True,
                 "strength": 110,
@@ -373,6 +449,170 @@ def validate_decisions(
         )
     return {
         "accepted": accepted,
+        "no_relationship": no_relationship,
+        "needs_more_context": needs_more_context,
+        "parked": parked,
+    }
+
+
+def validate_verifications(
+    response: Mapping[str, Any],
+    *,
+    preliminary_decisions: Sequence[Mapping[str, Any]],
+    profiles: Sequence[Any],
+    verifier_provider: str = "",
+    verifier_model: str = "",
+    prompt_version: str = RELATIONSHIP_PROMPT_VERSION,
+) -> dict[str, list[dict[str, Any]]]:
+    """Validate independent relationship verification against the offered decisions."""
+
+    preliminary_by_pair: dict[tuple[str, str], dict[str, Any]] = {}
+    for raw in preliminary_decisions:
+        source_id = str(raw.get("source_id") or "")
+        target_id = str(raw.get("target_source_id") or raw.get("target_id") or "")
+        if source_id and target_id and source_id != target_id:
+            preliminary_by_pair[canonical_pair(source_id, target_id)] = dict(raw)
+
+    confirmed: list[dict[str, Any]] = []
+    corrected: list[dict[str, Any]] = []
+    no_relationship: list[dict[str, Any]] = []
+    needs_more_context: list[dict[str, Any]] = []
+    parked: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    values = response.get("verifications")
+    if values is None:
+        values = response.get("decisions", [])
+    for index, raw in enumerate(values or []):
+        if not isinstance(raw, Mapping):
+            parked.append({"row_index": index, "reason": "verification_not_mapping"})
+            continue
+        row = dict(raw)
+        source_id = str(row.get("source_id") or "").strip()
+        target_id = str(
+            row.get("target_source_id") or row.get("target_id") or ""
+        ).strip()
+        pair = canonical_pair(source_id, target_id)
+        preliminary = preliminary_by_pair.get(pair)
+        status = str(row.get("status") or "").strip()
+        reasons: list[str] = []
+        if preliminary is None:
+            reasons.append("pair_not_offered_for_verification")
+        if not source_id or not target_id or source_id == target_id:
+            reasons.append("invalid_pair")
+        if pair in seen:
+            reasons.append("duplicate_pair_verification")
+        seen.add(pair)
+        if status not in {
+            "confirmed",
+            "corrected",
+            "no_relationship",
+            "needs_more_context",
+        }:
+            reasons.append("unsupported_verification_status")
+        if reasons:
+            parked.append(
+                {
+                    "row_index": index,
+                    "source_id": source_id,
+                    "target_source_id": target_id,
+                    "reason": ",".join(reasons),
+                    "raw": row,
+                }
+            )
+            continue
+
+        assert preliminary is not None
+        preliminary_status = str(
+            preliminary.get("decision_status")
+            or preliminary.get("status")
+            or ("accepted" if preliminary.get("relation_type") else "")
+        )
+        preliminary_relation_type = str(
+            preliminary.get("relation_type") or ""
+        )
+        lineage = {
+            "verification_status": status,
+            "preliminary_decision_hash": stable_hash(preliminary),
+            "preliminary_status": preliminary_status,
+            "preliminary_relation_type": preliminary_relation_type,
+            "preliminary_reason": str(preliminary.get("reason") or ""),
+            "verifier_provider": verifier_provider,
+            "verifier_model": verifier_model,
+            "verification_prompt_version": str(prompt_version),
+            "prompt_version": str(prompt_version),
+        }
+        if status == "confirmed" and (
+            preliminary_status not in {"accepted", "confirmed", "corrected"}
+            or source_id != str(preliminary.get("source_id") or "")
+            or target_id
+            != str(
+                preliminary.get("target_source_id")
+                or preliminary.get("target_id")
+                or ""
+            )
+            or str(row.get("relation_type") or "") != preliminary_relation_type
+        ):
+            parked.append(
+                {
+                    "row_index": index,
+                    "source_id": source_id,
+                    "target_source_id": target_id,
+                    "reason": "confirmed_decision_does_not_match_preliminary",
+                    "raw": row,
+                }
+            )
+            continue
+
+        normalized_status = (
+            "accepted"
+            if status in {"confirmed", "corrected"}
+            else status
+        )
+        validated = validate_decisions(
+            {
+                "decisions": [
+                    {
+                        **row,
+                        "status": normalized_status,
+                        "model": verifier_model,
+                    }
+                ]
+            },
+            offered_pairs=[pair],
+            profiles=profiles,
+        )
+        if validated["parked"]:
+            parked.extend(
+                {
+                    **dict(value),
+                    "reason": "verification_invalid:"
+                    + str(value.get("reason") or ""),
+                }
+                for value in validated["parked"]
+            )
+            continue
+        if status in {"confirmed", "corrected"}:
+            relation = dict(validated["accepted"][0])
+            relation.update(
+                lineage,
+                provenance="probabilistic_relationship_verification",
+                model=verifier_model,
+                active=True,
+                decision_status="accepted",
+            )
+            (confirmed if status == "confirmed" else corrected).append(relation)
+        elif status == "no_relationship":
+            decision = dict(validated["no_relationship"][0])
+            decision.update(lineage, decision_status="no_relationship")
+            no_relationship.append(decision)
+        else:
+            decision = dict(validated["needs_more_context"][0])
+            decision.update(lineage)
+            needs_more_context.append(decision)
+    return {
+        "confirmed": confirmed,
+        "corrected": corrected,
+        "accepted": [*confirmed, *corrected],
         "no_relationship": no_relationship,
         "needs_more_context": needs_more_context,
         "parked": parked,
@@ -398,6 +638,45 @@ def persist_relationship_registry(
         if isinstance(existing, Mapping)
         else []
     )
+    existing_schema = (
+        str(existing.get("registry_schema_version") or "")
+        if isinstance(existing, Mapping)
+        else ""
+    )
+    migrated_rows: list[dict[str, Any]] = []
+    for raw in existing_rows:
+        if not isinstance(raw, Mapping):
+            continue
+        row = dict(raw)
+        if (
+            existing_schema != RELATIONSHIP_REGISTRY_SCHEMA_VERSION
+            and _machine_substantive(row)
+            and bool(row.get("active", True))
+            and not _verified_machine_relation(row)
+        ):
+            row.update(
+                active=False,
+                decision_status="legacy_unverified",
+                verification_status="legacy_unverified",
+                retirement_reason="relationship_prompt_v2_requires_verification",
+            )
+        migrated_rows.append(row)
+    existing_rows = migrated_rows
+    verified_accepted_relations = [
+        dict(row)
+        for row in accepted_relations
+        if isinstance(row, Mapping)
+        and (
+            _verified_machine_relation(row)
+            or str(row.get("provenance") or "").startswith("human")
+        )
+    ]
+    verified_no_relationship_decisions = [
+        dict(row)
+        for row in no_relationship_decisions
+        if isinstance(row, Mapping)
+        and str(row.get("verification_status") or "") == "no_relationship"
+    ]
     retained = [
         dict(row)
         for row in existing_rows
@@ -421,7 +700,7 @@ def persist_relationship_registry(
         )
         rows_by_id[identity] = row
 
-    for decision in no_relationship_decisions:
+    for decision in verified_no_relationship_decisions:
         pair = canonical_pair(
             str(decision.get("source_id") or ""),
             str(decision.get("target_source_id") or ""),
@@ -429,23 +708,17 @@ def persist_relationship_registry(
         for row in rows_by_id.values():
             if not _same_pair(row, pair) or not _machine_substantive(row):
                 continue
-            prior_hashes = {
-                str(row.get("source_profile_hash") or ""),
-                str(row.get("target_profile_hash") or ""),
-            }
-            current_hashes = {
-                str(decision.get("source_profile_hash") or ""),
-                str(decision.get("target_profile_hash") or ""),
-            }
-            if prior_hashes == current_hashes:
-                continue
             row.update(
                 active=False,
                 decision_status="retired",
                 retirement_reason="successfully_readjudicated_no_relationship",
+                retirement_decision_hash=str(
+                    decision.get("preliminary_decision_hash")
+                    or stable_hash(decision)
+                ),
             )
 
-    for accepted in accepted_relations:
+    for accepted in verified_accepted_relations:
         row = dict(accepted)
         pair = canonical_pair(
             str(row.get("source_id") or ""),
@@ -474,7 +747,15 @@ def persist_relationship_registry(
             str(row.get("relation_id") or row.get("link_id") or ""),
         ),
     )
-    links = [row for row in relations if bool(row.get("active", True))]
+    links = [
+        row
+        for row in relations
+        if bool(row.get("active", True))
+        and (
+            not _machine_substantive(row)
+            or _verified_machine_relation(row)
+        )
+    ]
     prior_decisions = (
         list(existing.get("pair_decisions", []) or [])
         if isinstance(existing, Mapping)
@@ -486,8 +767,8 @@ def persist_relationship_registry(
         if isinstance(row, Mapping)
     }
     for status, decisions in (
-        ("accepted", accepted_relations),
-        ("no_relationship", no_relationship_decisions),
+        ("accepted", verified_accepted_relations),
+        ("no_relationship", verified_no_relationship_decisions),
     ):
         for row in decisions:
             decision_key = relationship_decision_key(
@@ -518,9 +799,21 @@ def persist_relationship_registry(
                 "prompt_version": str(
                     row.get("prompt_version") or RELATIONSHIP_PROMPT_VERSION
                 ),
+                "verification_status": str(
+                    row.get("verification_status") or ""
+                ),
+                "preliminary_decision_hash": str(
+                    row.get("preliminary_decision_hash") or ""
+                ),
+                "verifier_provider": str(row.get("verifier_provider") or ""),
+                "verifier_model": str(row.get("verifier_model") or ""),
+                "verification_prompt_version": str(
+                    row.get("verification_prompt_version")
+                    or RELATIONSHIP_PROMPT_VERSION
+                ),
             }
     semantic = {
-        "registry_schema_version": "2",
+        "registry_schema_version": RELATIONSHIP_REGISTRY_SCHEMA_VERSION,
         "relations": relations,
         "links": links,
         "pair_decisions": [
@@ -588,6 +881,8 @@ def projected_related_links(
     for row in active:
         if str(row.get("relation_type") or "") not in SUBSTANTIVE_RELATION_TYPES:
             continue
+        if _machine_substantive(row) and not _verified_machine_relation(row):
+            continue
         left = str(row.get("source_id") or "")
         right = str(row.get("target_source_id") or "")
         if source_id == left:
@@ -608,6 +903,9 @@ def projected_related_links(
             continue
         substantive.append(
             {
+                "relation_id": str(
+                    row.get("relation_id") or row.get("link_id") or ""
+                ),
                 "target_source_id": target,
                 "target_note_id": str(by_source[target].get("note_id") or ""),
                 "target_title": str(by_source[target].get("title") or target),
@@ -763,7 +1061,18 @@ def _machine_substantive(row: Mapping[str, Any]) -> bool:
     return bool(
         str(row.get("relation_type") or "") in SUBSTANTIVE_RELATION_TYPES
         and str(row.get("provenance") or "")
-        == "probabilistic_relationship_adjudication"
+        in {
+            "probabilistic_relationship_adjudication",
+            "probabilistic_relationship_verification",
+        }
+    )
+
+
+def _verified_machine_relation(row: Mapping[str, Any]) -> bool:
+    return bool(
+        _machine_substantive(row)
+        and str(row.get("verification_status") or "")
+        in {"confirmed", "corrected"}
     )
 
 

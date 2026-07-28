@@ -8,7 +8,7 @@ It is a standalone, file-first Python package. It does not require Research OS,
 does not read `zotero.sqlite`, and never writes to Zotero.
 
 > **Release status:** v0.11 is an alpha-quality CLI and Python API using artifact
-> schema 1.10 and evidence-profile schema 1.2. Mapped gaps are claims about the
+> schema 1.11 and evidence-profile schema 1.2. Mapped gaps are claims about the
 > frozen collection only, never literature-wide novelty claims.
 
 ## What it produces
@@ -462,13 +462,14 @@ notes, evidence profiles, cluster/gap identities, or the underlying collection
 map. Research OS may use the lens for downstream ranking without mutating the
 base map.
 
-Artifact schemas 1.0-1.10 and evidence-profile schemas 1.0-1.2 remain readable.
+Artifact schemas 1.0-1.11 and evidence-profile schemas 1.0-1.2 remain readable.
 The idempotent schema-1.9 migration retires the standalone Literature Neighborhoods Markdown projection, archives superseded current cluster and gap
 projections, preserves historical maps, profiles, analytical identities, and
 atomic-note bytes, and makes no model or Zotero call. Existing schema-1.5
 proposition anchors remain valid; unsupported legacy anchors cannot establish
 strong synthesis until they are lazily reprofiled.
-The schema-1.10 migration updates managed artifact version markers only.
+The schema-1.11 migration updates managed artifact version markers and lazily
+deactivates unverified v0.11 machine relationships without rewriting notes.
 Legacy unmarked `## Graph Links` sections are converted to bounded
 `auto-zettelkasten:graph` markers on their next graph projection; source prose,
 profiles, and human-authored sections are not rewritten.

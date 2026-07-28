@@ -14,12 +14,15 @@ from pathlib import Path
 from typing import Any, Literal, Mapping
 
 
-SourceScope = Literal["full_document", "abstract_only", "metadata_only"]
+SourceScope = Literal[
+    "full_document", "partial_document", "abstract_only", "metadata_only"
+]
 CoverageGate = Literal["passed", "limited", "failed"]
 
 
 class ContentAdequacyClass(str, Enum):
     FULL_PDF_TEXT = "full_pdf_text"
+    PARTIAL_PDF_TEXT = "partial_pdf_text"
     FULL_TEXT_DOCUMENT = "full_text_document"
     FULL_ARTICLE_HTML = "full_article_html"
     CLEAN_FULL_ARTICLE_HTML = "full_article_html"
@@ -125,6 +128,10 @@ class _HTMLTextExtractor(HTMLParser):
         self.article_depth = 0
         self._abstract_containers: list[str] = []
         self.has_article_container = False
+        self.paragraph_count = 0
+        self.article_paragraph_count = 0
+        self.heading_count = 0
+        self.article_heading_count = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
@@ -139,6 +146,14 @@ class _HTMLTextExtractor(HTMLParser):
         if tag in {"article", "main"}:
             self.article_depth += 1
             self.has_article_container = True
+        if tag == "p":
+            self.paragraph_count += 1
+            if self.article_depth:
+                self.article_paragraph_count += 1
+        if tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+            self.heading_count += 1
+            if self.article_depth:
+                self.article_heading_count += 1
         identity = f"{attributes.get('id', '')} {attributes.get('class', '')}".casefold()
         if "abstract" in identity:
             self._abstract_containers.append(tag)
@@ -182,7 +197,12 @@ def classify_pdf_text(
     marker_numbers = [int(number) for number, _section in page_matches]
     page_sections = [section for _number, section in page_matches]
     content_text = _clean_text("\n\n".join(page_sections)) if page_sections else cleaned
-    metrics = _coverage_metrics(content_text, page_count=page_count, coverage_metadata=coverage_metadata)
+    coverage_metadata = coverage_metadata or {}
+    metrics = _coverage_metrics(
+        content_text,
+        page_count=page_count,
+        coverage_metadata=coverage_metadata,
+    )
     nonempty_page_count = sum(len(_clean_text(section)) >= 20 for section in page_sections)
     covered_page_ratio = len(set(marker_numbers)) / page_count if page_count > 0 and page_sections else None
     nonempty_page_ratio = nonempty_page_count / page_count if page_count > 0 and page_sections else None
@@ -196,6 +216,71 @@ def classify_pdf_text(
             "page_markers_in_order": markers_in_order,
         }
     )
+    unresolved_pages = tuple(
+        sorted(
+            {
+                value
+                for raw in coverage_metadata.get("unresolved_pages", ()) or ()
+                if (value := _positive_int(raw)) is not None
+            }
+        )
+    )
+    page_routes = tuple(
+        str(value) for value in coverage_metadata.get("page_routes", ()) or ()
+    )
+    if page_routes and len(page_routes) == page_count:
+        recovered_pages = tuple(
+            index
+            for index, route in enumerate(page_routes, start=1)
+            if route != "unresolved"
+        )
+        recovered_text_pages = tuple(
+            index
+            for index, route in enumerate(page_routes, start=1)
+            if route not in {"unresolved", "nonprose_or_blank"}
+        )
+    else:
+        recovered_pages = tuple(
+            number for number in marker_numbers if number not in unresolved_pages
+        )
+        recovered_text_pages = tuple(
+            int(number)
+            for number, section in page_matches
+            if int(number) not in unresolved_pages
+            and len(_clean_text(section)) >= 20
+        )
+    recovered_page_ratio = (
+        len(set(recovered_pages)) / page_count if page_count > 0 else None
+    )
+    printed_page_map = _printed_page_map(
+        page_count,
+        coverage_metadata.get("ordinal_to_printed_page"),
+    )
+    spans = _document_spans(page_matches, printed_page_map)
+    bibliography = _bibliography_only_analysis(content_text)
+    metrics.update(
+        {
+            "unresolved_pages": unresolved_pages,
+            "recovered_pages": recovered_pages,
+            "recovered_text_pages": recovered_text_pages,
+            "recovered_page_ratio": recovered_page_ratio,
+            "ordinal_to_printed_page": printed_page_map,
+            "heading_spans": spans["heading_spans"],
+            "table_spans": spans["table_spans"],
+            "figure_spans": spans["figure_spans"],
+            **bibliography,
+        }
+    )
+    for key in (
+        "embedded_text_page_count",
+        "ocr_page_count",
+        "extraction_route",
+        "page_routes",
+        "orientation_retry_pages",
+        "repeated_boilerplate_ratio",
+    ):
+        if key in coverage_metadata:
+            metrics[key] = coverage_metadata[key]
     # A blank cover or divider still has full page coverage. Coverage therefore
     # follows the ordered markers, while substantive-text checks happen at the
     # document level.
@@ -209,16 +294,43 @@ def classify_pdf_text(
     minimum_word_count = max(200, 40 * page_count)
     metrics["minimum_word_count"] = minimum_word_count
     metrics["word_density_passed"] = metrics["word_count"] >= minimum_word_count
+    if bibliography["bibliography_only"]:
+        metrics["content_kind"] = "bibliography_only"
+        return ContentAdequacy(
+            classification=ContentAdequacyClass.METADATA_ONLY,
+            source_scope="metadata_only",
+            coverage_gate="failed",
+            reason="bibliography_only_attachment",
+            metrics=metrics,
+        )
+    metrics["content_kind"] = "document_text"
     if (
         metrics["char_count"] >= 80
         and metrics["word_density_passed"]
         and page_coverage_passed
+        and not unresolved_pages
     ):
         return ContentAdequacy(
             classification=ContentAdequacyClass.FULL_PDF_TEXT,
             source_scope="full_document",
             coverage_gate="passed",
             reason="pdf_text_extracted",
+            metrics=metrics,
+        )
+    if (
+        metrics["char_count"] >= 80
+        and metrics["word_density_passed"]
+        and page_coverage_passed
+        and unresolved_pages
+        and recovered_page_ratio is not None
+        and recovered_page_ratio >= 0.8
+        and len(set(recovered_text_pages)) >= 2
+    ):
+        return ContentAdequacy(
+            classification=ContentAdequacyClass.PARTIAL_PDF_TEXT,
+            source_scope="partial_document",
+            coverage_gate="limited",
+            reason="partial_pdf_text_extracted",
             metrics=metrics,
         )
     return ContentAdequacy(
@@ -277,27 +389,62 @@ def classify_html_content(
     section_count = sum(bool(re.search(rf"\b{re.escape(marker)}\b", article_text, flags=re.IGNORECASE)) for marker in _ARTICLE_SECTION_MARKERS)
     article_char_count = len(article_text)
     article_word_count = len(re.findall(r"\b\w+\b", article_text, flags=re.UNICODE))
-    paragraph_count = len(re.findall(r"<p\b", raw_html, flags=re.IGNORECASE))
-    full_article_evidence = parser.has_article_container and article_word_count >= 1_500 and section_count >= 2
+    paragraph_count = parser.paragraph_count
+    visible_block_count = sum(
+        len(re.findall(r"\b\w+\b", line, flags=re.UNICODE)) >= 5
+        for line in visible.splitlines()
+        if line.strip()
+    )
+    structured_block_count = paragraph_count + parser.heading_count
+    strong_article_body = (
+        parser.has_article_container
+        and article_word_count >= 300
+        and parser.article_paragraph_count >= 2
+    )
+    strong_visible_body = (
+        metrics["word_count"] >= 500
+        and max(structured_block_count, visible_block_count) >= 4
+    )
+    full_article_evidence = strong_article_body or strong_visible_body
+    abstract_word_count = len(re.findall(r"\b\w+\b", abstract, flags=re.UNICODE))
+    abstract_dominates = bool(
+        abstract
+        and (
+            not article_word_count
+            or article_word_count <= max(120, int(abstract_word_count * 1.5))
+        )
+    )
+    enclosing_paywall = bool(paywall_markers) and (
+        not full_article_evidence or abstract_dominates
+    )
     metrics.update(
         {
             "article_char_count": article_char_count,
             "article_word_count": article_word_count,
             "paragraph_count": paragraph_count,
+            "article_paragraph_count": parser.article_paragraph_count,
+            "heading_count": parser.heading_count,
+            "article_heading_count": parser.article_heading_count,
+            "visible_block_count": visible_block_count,
             "article_section_count": section_count,
             "has_article_container": parser.has_article_container,
+            "strong_article_body": strong_article_body,
+            "strong_visible_body": strong_visible_body,
+            "enclosing_paywall": enclosing_paywall,
             "abstract_char_count": len(abstract),
             "paywall_marker_count": len(paywall_markers),
             "access_marker_count": len(access_markers),
         }
     )
-    if full_article_evidence and not paywall_markers and not (abstract and access_markers):
+    if full_article_evidence and not enclosing_paywall:
         return ContentAdequacy(
             classification=ContentAdequacyClass.FULL_ARTICLE_HTML,
             source_scope="full_document",
             coverage_gate="passed",
             reason="clean_full_article_html",
             abstract=abstract,
+            paywall_markers=paywall_markers,
+            access_markers=access_markers,
             metrics=metrics,
         )
     if abstract or paywall_markers or access_markers:
@@ -476,6 +623,10 @@ def _extract_pdf(
                 media_type="application/pdf",
             )
         embedded_pages = [_clean_text(page.extract_text() or "") for page in reader.pages]
+        try:
+            page_labels = tuple(str(value) for value in reader.page_labels)
+        except (AttributeError, TypeError, ValueError):
+            page_labels = ()
     except Exception as exc:
         return ExtractionResult(
             status="failed",
@@ -550,14 +701,21 @@ def _extract_pdf(
         "page_routes": tuple(page_routes),
         "orientation_retry_pages": tuple(orientation_retries),
         "repeated_boilerplate_ratio": embedded_analysis["dominant_repeated_ratio"],
+        "ordinal_to_printed_page": {
+            str(index): label
+            for index, label in enumerate(page_labels, start=1)
+            if label
+        },
     }
-    adequacy = classify_pdf_text(text, page_count=page_count)
-    adequacy = _adequacy_with_metrics(adequacy, extra_metrics)
+    adequacy = classify_pdf_text(
+        text,
+        page_count=page_count,
+        coverage_metadata=extra_metrics,
+    )
     required_ocr_missing = ocr_mode == "required" and bool(suspicious_pages) and ocr_unavailable
     failed = (
-        not adequacy.is_full_publication
+        adequacy.coverage_gate == "failed"
         or final_analysis["document_suspicious"]
-        or bool(unresolved_pages)
         or required_ocr_missing
     )
     if failed:
@@ -568,6 +726,8 @@ def _extract_pdf(
             reason=(
                 "required_ocr_unavailable"
                 if required_ocr_missing
+                else "bibliography_only_attachment"
+                if adequacy.reason == "bibliography_only_attachment"
                 else "unresolved_textual_pages"
                 if unresolved_pages
                 else "empty_or_scanned_pdf"
@@ -580,6 +740,7 @@ def _extract_pdf(
         status="succeeded",
         text=text,
         route=extraction_route,
+        reason=adequacy.reason if adequacy.source_scope == "partial_document" else "",
         media_type="application/pdf",
         page_count=page_count,
         adequacy=adequacy,
@@ -874,6 +1035,113 @@ def _adequacy_with_metrics(adequacy: ContentAdequacy, extra: Mapping[str, Any]) 
         access_markers=adequacy.access_markers,
         metrics=metrics,
     )
+
+
+def _positive_int(value: Any) -> int | None:
+    try:
+        converted = int(value)
+    except (TypeError, ValueError):
+        return None
+    return converted if converted > 0 else None
+
+
+def _printed_page_map(page_count: int, value: Any) -> dict[str, str]:
+    supplied = value if isinstance(value, Mapping) else {}
+    return {
+        str(index): str(supplied.get(str(index)) or supplied.get(index) or index)
+        for index in range(1, page_count + 1)
+    }
+
+
+def _document_spans(
+    page_matches: list[tuple[str, str]],
+    printed_page_map: Mapping[str, str],
+) -> dict[str, tuple[dict[str, Any], ...]]:
+    headings: list[dict[str, Any]] = []
+    tables: list[dict[str, Any]] = []
+    figures: list[dict[str, Any]] = []
+    known_heading = re.compile(
+        r"^(?:abstract|introduction|background|literature review|methods?|"
+        r"methodology|data|results?|findings?|discussion|conclusions?|"
+        r"limitations?|references|bibliography|works cited|appendix)\b",
+        flags=re.IGNORECASE,
+    )
+    numbered_heading = re.compile(
+        r"^(?:\d+(?:\.\d+){0,3}|[IVXLCDM]+)\.?\s+[A-Z][^\n]{2,120}$"
+    )
+    object_heading = re.compile(
+        r"^(?P<kind>table|figure)\s+(?P<label>[A-Z0-9]+(?:\.[A-Z0-9]+)*)"
+        r"(?:\s*[:.-]\s*|\s+).{0,140}$",
+        flags=re.IGNORECASE,
+    )
+    for raw_number, section in page_matches:
+        page = int(raw_number)
+        for raw_line in section.splitlines():
+            line = re.sub(r"\s+", " ", raw_line).strip()
+            if not line or len(line) > 180:
+                continue
+            span = {
+                "label": line,
+                "page_ordinal": page,
+                "printed_page": str(printed_page_map.get(str(page)) or page),
+            }
+            object_match = object_heading.match(line)
+            if object_match:
+                target = (
+                    tables
+                    if object_match.group("kind").casefold() == "table"
+                    else figures
+                )
+                target.append(span)
+            elif known_heading.match(line) or numbered_heading.match(line):
+                headings.append(span)
+            if len(headings) + len(tables) + len(figures) >= 512:
+                break
+    return {
+        "heading_spans": tuple(headings),
+        "table_spans": tuple(tables),
+        "figure_spans": tuple(figures),
+    }
+
+
+def _bibliography_only_analysis(text: str) -> dict[str, Any]:
+    heading = re.search(
+        r"(?im)^\s*(?:references|bibliography|works cited)\s*$",
+        text,
+    )
+    total_words = len(_alphabetic_words(text))
+    if not heading or total_words < 800:
+        return {
+            "bibliography_only": False,
+            "bibliography_reference_count": 0,
+            "bibliography_word_ratio": 0.0,
+            "pre_bibliography_word_count": total_words,
+        }
+    before = text[: heading.start()]
+    after = text[heading.end() :]
+    before_words = len(_alphabetic_words(before))
+    after_words = len(_alphabetic_words(after))
+    reference_count = sum(
+        bool(
+            re.search(r"\b(?:18|19|20)\d{2}[a-z]?\b", line)
+            or re.search(r"\bdoi\s*:", line, flags=re.IGNORECASE)
+            or re.search(r"https?://", line)
+        )
+        for line in after.splitlines()
+        if line.strip()
+    )
+    bibliography_word_ratio = after_words / max(1, total_words)
+    bibliography_only = (
+        reference_count >= 20
+        and bibliography_word_ratio >= 0.75
+        and before_words <= max(400, int(total_words * 0.08))
+    )
+    return {
+        "bibliography_only": bibliography_only,
+        "bibliography_reference_count": reference_count,
+        "bibliography_word_ratio": round(bibliography_word_ratio, 6),
+        "pre_bibliography_word_count": before_words,
+    }
 
 
 def _text_result(

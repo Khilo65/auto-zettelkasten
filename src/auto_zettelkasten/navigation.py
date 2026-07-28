@@ -1102,6 +1102,7 @@ def _profile_is_analytical(profile: Mapping[str, Any]) -> bool:
         return bool(profile.get("analytical"))
     status = str(profile.get("note_status") or profile.get("profile_status") or profile.get("status") or "analytical")
     return status.casefold() not in {
+        "partial_document_atomic_note",
         "abstract_only_atomic_note",
         "metadata_only_source_note",
         "fulltext_available",
@@ -1378,6 +1379,7 @@ def rank_human_related_links(
         profile = by_source[target]
         rendered.append(
             {
+                "relation_id": str(primary.get("relation_id") or ""),
                 "target_source_id": target,
                 "target_note_id": str(profile.get("note_id") or ""),
                 "target_title": str(profile.get("title") or target),

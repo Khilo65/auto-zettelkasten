@@ -8,6 +8,7 @@ from typing import Any, Mapping, Sequence
 import pytest
 import yaml
 
+from auto_zettelkasten import readers as reader_module
 from auto_zettelkasten.api import build_map, get_status, resume_map, run_map
 from auto_zettelkasten.models import (
     EvidenceProfile,
@@ -499,7 +500,7 @@ class _ExplicitReasoner:
         *,
         context: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
-        return {}
+        return {"clusters": []}
 
     def map_debates(
         self,
@@ -508,7 +509,7 @@ class _ExplicitReasoner:
         *,
         context: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
-        return {}
+        return {"assessments": []}
 
     def detect_gaps(
         self,
@@ -517,7 +518,7 @@ class _ExplicitReasoner:
         *,
         context: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
-        return {}
+        return {"gaps": []}
 
 
 class _ConcurrentReasoner(_ExplicitReasoner):
@@ -593,6 +594,26 @@ class _RelationshipThenClusterFailureReasoner(_ExplicitReasoner):
             ]
         }
 
+    def verify_relationships(
+        self,
+        profiles: Sequence[EvidenceProfile],
+        request: LiteratureMapRequest,
+        *,
+        context: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        assert context
+        return {
+            "verifications": [
+                {
+                    **row,
+                    "status": "confirmed",
+                    "reason": "Both located claims support the same bounded proposition.",
+                    "requested_context": [],
+                }
+                for row in context["preliminary_decisions"]
+            ]
+        }
+
     def propose_clusters(
         self,
         profiles: Sequence[EvidenceProfile],
@@ -630,7 +651,7 @@ class _ReplayableRelationshipReasoner(_RelationshipThenClusterFailureReasoner):
         context: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
         self.cluster_calls += 1
-        return {}
+        return {"clusters": []}
 
 
 class _RecoveringReasoner(_ExplicitReasoner):
@@ -778,7 +799,7 @@ def test_cluster_failure_keeps_committed_reciprocal_atomic_relationships(
         "cluster provider unavailable" in str(row.get("reason") or "")
         for row in report.errors
     )
-    assert report.literature_map["synthesis_call_count"] == 3
+    assert report.literature_map["synthesis_call_count"] == 4
     assert report.literature_map["synthesis_failure_count"] == 1
     registry = yaml.safe_load(
         (
@@ -1488,6 +1509,7 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
     prompts: dict[str, str] = {}
     system_prompts: dict[str, str] = {}
     output_caps: dict[str, int] = {}
+    reasoning_efforts: dict[str, str | None] = {}
 
     def generate(self, system_prompt, user_prompt, output_tokens, deadline_seconds):
         route = next(key for key in responses if key in system_prompt)
@@ -1495,6 +1517,7 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
         prompts[route] = user_prompt
         system_prompts[route] = system_prompt
         output_caps[route] = output_tokens
+        reasoning_efforts[route] = reader_module._REASONING_EFFORT.get()
         return responses[route]
 
     monkeypatch.setattr(DeepSeekReader, "_generate_text", generate)
@@ -1604,7 +1627,8 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
         "unused-detail-must-not-enter-clustering-packet"
         not in prompts["collection-clustering"]
     )
-    assert output_caps["collection-clustering"] == 32_000
+    assert output_caps["collection-clustering"] == 16_000
+    assert reasoning_efforts["collection-clustering"] == "medium"
     unrelated_profile = {
         **normalized_profile,
         "source_id": "source-unrelated",
@@ -1648,7 +1672,7 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
         "collection-clustering"
     ]
     assert "coverage_candidate_components" in prompts["collection-clustering"]
-    assert output_caps["collection-clustering"] == 32_000
+    assert output_caps["collection-clustering"] == 16_000
     assert reader.map_debates([], request) == {"assessments": []}
     synthesis = reader.synthesize_cluster([], request)
     assert output_caps["cluster-synthesis"] == 32_000

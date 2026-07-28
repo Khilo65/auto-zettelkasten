@@ -9,6 +9,7 @@ from auto_zettelkasten.relationships import (
     persist_relationship_registry,
     projected_related_links,
     validate_decisions,
+    validate_verifications,
 )
 
 
@@ -58,6 +59,33 @@ def _decision(
         "confidence": 0.9,
         "model": "test-model",
     }
+
+
+def _verified_relations(
+    decisions: list[dict[str, Any]],
+    profiles: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    verifications = [
+        {
+            **decision,
+            "status": "confirmed",
+            "source_evidence_anchor_id": decision["source_evidence"][
+                "evidence_anchor_id"
+            ],
+            "target_evidence_anchor_id": decision["target_evidence"][
+                "evidence_anchor_id"
+            ],
+            "requested_context": [],
+        }
+        for decision in decisions
+    ]
+    return validate_verifications(
+        {"verifications": verifications},
+        preliminary_decisions=decisions,
+        profiles=profiles,
+        verifier_provider="test-provider",
+        verifier_model="test-model",
+    )["accepted"]
 
 
 def test_candidate_and_decision_validation_isolates_bad_rows() -> None:
@@ -159,7 +187,8 @@ def test_registry_is_idempotent_preserves_substance_and_repairs_compatibility(
         offered_pairs=[("A", "B")],
         profiles=profiles,
     )["accepted"]
-    accepted[0].update(provider="test-provider", prompt_version="1")
+    accepted = _verified_relations(accepted, profiles)
+    accepted[0].update(provider="test-provider", prompt_version="2")
     old_structural = {
         "relation_id": "structural-old",
         "source_id": "A",
@@ -221,6 +250,7 @@ def test_projection_uses_reciprocal_relationship_type() -> None:
         offered_pairs=[("A", "B")],
         profiles=profiles,
     )["accepted"]
+    relation = _verified_relations(relation, profiles)
 
     from_a = projected_related_links(
         "A", profiles, relation, max_inferred_links=0

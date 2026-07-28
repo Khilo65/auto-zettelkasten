@@ -64,6 +64,14 @@ MANAGED_GRAPH_TARGET_ENGINE_VERSION = "0.11.0"
 
 MANAGED_GRAPH_TARGET_ARTIFACT_SCHEMA_VERSION = "1.10"
 
+VERIFIED_GRAPH_MIGRATION_ID = "auto-zettelkasten-0.12-verified-relationship-graph"
+
+VERIFIED_GRAPH_MIGRATION_VERSION = "1"
+
+VERIFIED_GRAPH_TARGET_ENGINE_VERSION = "0.12.0"
+
+VERIFIED_GRAPH_TARGET_ARTIFACT_SCHEMA_VERSION = "1.11"
+
 _MARKER_FIELDS = {
     "migration_id",
     "migration_version",
@@ -143,8 +151,28 @@ _MANAGED_GRAPH_MARKER_FIELDS = {
     "completed_at",
 }
 
+_VERIFIED_GRAPH_MARKER_FIELDS = {
+    "migration_id",
+    "migration_version",
+    "status",
+    "target_engine_version",
+    "target_artifact_schema_version",
+    "rewritten_files",
+    "provider_calls",
+    "source_documents_reread",
+    "source_notes_rewritten",
+    "profile_files_rewritten",
+    "legacy_relationships_deactivated",
+    "human_relationships_preserved",
+    "completed_at",
+}
+
 _REVIEW_FIELDS = {"human_review", "review_status", "source_faithfulness_review"}
 _VERSION_FILE_RELATIVES = ("auto-zettelkasten.yml", "11_state/workspace_manifest.yml")
+_RELATIONSHIP_REGISTRY_RELATIVES = (
+    "02_source_memory/indexes/typed_links.yml",
+    "02_source_memory/indexes/typed_note_links.yml",
+)
 
 
 def migrate_literature_map(workspace: Path | str, *, dry_run: bool = False) -> dict[str, Any]:
@@ -279,6 +307,15 @@ def migrate_workspace(workspace: Path | str, *, dry_run: bool = False) -> dict[s
         and not (root / "11_state" / "migrations" / f"{MANAGED_GRAPH_MIGRATION_ID}.yml").is_file()
         else migrate_managed_graph_schema(workspace, dry_run=dry_run)
     )
+    verified_graph = (
+        _verified_graph_not_applicable(dry_run=dry_run, reason="schema_1.11_or_newer")
+        if starting_schema is not None
+        and starting_schema >= (1, 11)
+        and not (
+            root / "11_state" / "migrations" / f"{VERIFIED_GRAPH_MIGRATION_ID}.yml"
+        ).is_file()
+        else migrate_verified_relationship_graph_schema(workspace, dry_run=dry_run)
+    )
     return {
         "status": "dry_run" if dry_run else "completed",
         "dry_run": dry_run,
@@ -293,6 +330,7 @@ def migrate_workspace(workspace: Path | str, *, dry_run: bool = False) -> dict[s
             debate_family,
             thematic_clusters,
             managed_graph,
+            verified_graph,
         ],
         "literature_map": legacy,
         "review_status": review,
@@ -303,6 +341,7 @@ def migrate_workspace(workspace: Path | str, *, dry_run: bool = False) -> dict[s
         "debate_family": debate_family,
         "thematic_clusters": thematic_clusters,
         "managed_graph": managed_graph,
+        "verified_graph": verified_graph,
     }
 
 
@@ -1104,6 +1143,221 @@ def migrate_managed_graph_schema(
     return {"dry_run": False, **payload, "status": "migrated", "marker": str(marker)}
 
 
+def migrate_verified_relationship_graph_schema(
+    workspace: Path | str,
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Advance to schema 1.11 and quarantine unverified machine relationships."""
+
+    root = resolve_workspace(workspace)
+    marker = root / "11_state" / "migrations" / f"{VERIFIED_GRAPH_MIGRATION_ID}.yml"
+    if marker.is_file():
+        payload = read_yaml(marker, {})
+        _validate_verified_graph_marker(payload)
+        schema = _workspace_schema_version(root)
+        target = _parse_schema_version(
+            VERIFIED_GRAPH_TARGET_ARTIFACT_SCHEMA_VERSION,
+            field="verified-graph artifact schema",
+        )
+        if schema is None or schema < target:
+            raise ValueError(
+                "completed verified-graph migration marker disagrees with workspace schema"
+            )
+        return {
+            "dry_run": dry_run,
+            **dict(payload),
+            "status": "already_migrated",
+            "marker": str(marker),
+        }
+
+    schema_version = _workspace_schema_version(root)
+    if schema_version is None:
+        return _verified_graph_not_applicable(
+            dry_run=dry_run,
+            reason="workspace_version_files_absent",
+        )
+    target_schema = _parse_schema_version(
+        VERIFIED_GRAPH_TARGET_ARTIFACT_SCHEMA_VERSION,
+        field="verified-graph artifact schema",
+    )
+    if schema_version > target_schema:
+        actual = ".".join(str(value) for value in schema_version)
+        raise ValueError(
+            f"workspace artifact schema {actual} is newer than migration target "
+            f"{VERIFIED_GRAPH_TARGET_ARTIFACT_SCHEMA_VERSION}"
+        )
+    if schema_version >= target_schema:
+        return _verified_graph_not_applicable(
+            dry_run=dry_run,
+            reason="schema_1.11_or_newer",
+        )
+    if schema_version < (1, 10) and not dry_run:
+        raise ValueError(
+            "verified-relationship-graph migration requires the schema-1.10 migration first"
+        )
+
+    changes: list[tuple[Path, str | None, str]] = []
+    for relative in _VERSION_FILE_RELATIVES:
+        path = root / relative
+        original = path.read_text(encoding="utf-8")
+        value = yaml.safe_load(original)
+        if not isinstance(value, Mapping):
+            raise ValueError(f"workspace version file must be a mapping: {path}")
+        updated = dict(value)
+        updated["engine_version"] = VERIFIED_GRAPH_TARGET_ENGINE_VERSION
+        updated["artifact_schema_version"] = (
+            VERIFIED_GRAPH_TARGET_ARTIFACT_SCHEMA_VERSION
+        )
+        cleaned = yaml.safe_dump(
+            updated,
+            sort_keys=False,
+            allow_unicode=True,
+            width=10_000,
+        )
+        if cleaned != original:
+            changes.append((path, original, cleaned))
+
+    registry_changes, deactivated, human_preserved = _verified_registry_changes(root)
+    changes.extend(registry_changes)
+    rewritten_files = [
+        {
+            "source": str(path.relative_to(root)),
+            "before_sha256": sha256_text(original or ""),
+            "after_sha256": sha256_text(cleaned),
+        }
+        for path, original, cleaned in changes
+    ]
+    safety = {
+        "target_engine_version": VERIFIED_GRAPH_TARGET_ENGINE_VERSION,
+        "target_artifact_schema_version": (
+            VERIFIED_GRAPH_TARGET_ARTIFACT_SCHEMA_VERSION
+        ),
+        "rewritten_files": rewritten_files,
+        "provider_calls": 0,
+        "source_documents_reread": 0,
+        "source_notes_rewritten": 0,
+        "profile_files_rewritten": 0,
+        "legacy_relationships_deactivated": deactivated,
+        "human_relationships_preserved": human_preserved,
+    }
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "dry_run": True,
+            "migration_id": VERIFIED_GRAPH_MIGRATION_ID,
+            **safety,
+        }
+
+    written: list[tuple[Path, str | None]] = []
+    try:
+        for path, original, cleaned in changes:
+            atomic_write_text(path, cleaned)
+            written.append((path, original))
+        for row in rewritten_files:
+            if sha256_file(root / str(row["source"])) != row["after_sha256"]:
+                raise RuntimeError(
+                    f"migration target checksum mismatch: {row['source']}"
+                )
+        payload = {
+            "migration_id": VERIFIED_GRAPH_MIGRATION_ID,
+            "migration_version": VERIFIED_GRAPH_MIGRATION_VERSION,
+            "status": "completed",
+            **safety,
+            "completed_at": now_iso(),
+        }
+        write_yaml(marker, payload)
+    except Exception:
+        for path, original in reversed(written):
+            if original is None:
+                path.unlink(missing_ok=True)
+            else:
+                atomic_write_text(path, original)
+        raise
+    return {"dry_run": False, **payload, "status": "migrated", "marker": str(marker)}
+
+
+def _verified_registry_changes(
+    root: Path,
+) -> tuple[list[tuple[Path, str | None, str]], int, int]:
+    from .relationships import SUBSTANTIVE_RELATION_TYPES, stable_hash
+
+    primary, compatibility = (
+        root / relative for relative in _RELATIONSHIP_REGISTRY_RELATIVES
+    )
+    source = primary if primary.is_file() else compatibility
+    if not source.is_file():
+        return [], 0, 0
+    existing = read_yaml(source, {})
+    if not isinstance(existing, Mapping):
+        raise ValueError(f"relationship registry must be a mapping: {source}")
+    try:
+        registry_schema = int(str(existing.get("registry_schema_version") or "0"))
+    except ValueError as exc:
+        raise ValueError(
+            "relationship registry schema version must be an integer"
+        ) from exc
+    if registry_schema >= 3:
+        return [], 0, 0
+
+    relations: list[dict[str, Any]] = []
+    deactivated = 0
+    human_preserved = 0
+    raw_relations = existing.get("relations") or existing.get("links") or []
+    if not isinstance(raw_relations, list):
+        raise ValueError("relationship registry relations must be a list")
+    for value in raw_relations:
+        if not isinstance(value, Mapping):
+            raise ValueError("relationship registry rows must be mappings")
+        row = dict(value)
+        provenance = str(row.get("provenance") or "")
+        human_authored = provenance.startswith("human")
+        if human_authored:
+            human_preserved += 1
+        elif str(row.get("relation_type") or "") in SUBSTANTIVE_RELATION_TYPES:
+            row["active"] = False
+            row["decision_status"] = "legacy_unverified"
+            deactivated += 1
+        relations.append(row)
+
+    links = [row for row in relations if bool(row.get("active", True))]
+    pair_decisions = list(existing.get("pair_decisions", []) or [])
+    semantic = {
+        "registry_schema_version": "3",
+        "relations": relations,
+        "links": links,
+        "pair_decisions": pair_decisions,
+    }
+    migrated = {
+        **dict(existing),
+        "updated_at": now_iso(),
+        **semantic,
+        "revision_hash": stable_hash(semantic),
+        "graph_projection_hash": stable_hash(links),
+        "relation_counts": _active_relation_counts(links),
+    }
+    cleaned = yaml.safe_dump(
+        migrated,
+        sort_keys=False,
+        allow_unicode=True,
+        width=10_000,
+    )
+    changes: list[tuple[Path, str | None, str]] = []
+    for path in (primary, compatibility):
+        original = path.read_text(encoding="utf-8") if path.is_file() else None
+        if cleaned != original:
+            changes.append((path, original, cleaned))
+    return changes, deactivated, human_preserved
+
+
+def _active_relation_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        relation_type = str(row.get("relation_type") or "")
+        counts[relation_type] = counts.get(relation_type, 0) + 1
+    return dict(sorted(counts.items()))
+
+
 def migrate_review_status(workspace: Path | str, *, dry_run: bool = False) -> dict[str, Any]:
     """Remove generated review-status material and record safe profile-hash aliases."""
 
@@ -1469,6 +1723,26 @@ def _managed_graph_not_applicable(*, dry_run: bool, reason: str) -> dict[str, An
     }
 
 
+def _verified_graph_not_applicable(*, dry_run: bool, reason: str) -> dict[str, Any]:
+    return {
+        "status": "not_applicable",
+        "dry_run": dry_run,
+        "migration_id": VERIFIED_GRAPH_MIGRATION_ID,
+        "reason": reason,
+        "target_engine_version": VERIFIED_GRAPH_TARGET_ENGINE_VERSION,
+        "target_artifact_schema_version": (
+            VERIFIED_GRAPH_TARGET_ARTIFACT_SCHEMA_VERSION
+        ),
+        "rewritten_files": [],
+        "provider_calls": 0,
+        "source_documents_reread": 0,
+        "source_notes_rewritten": 0,
+        "profile_files_rewritten": 0,
+        "legacy_relationships_deactivated": 0,
+        "human_relationships_preserved": 0,
+    }
+
+
 def _validate_navigation_marker(root: Path, value: Any) -> None:
     if not isinstance(value, Mapping):
         raise ValueError("navigation migration marker must be a mapping")
@@ -1721,6 +1995,75 @@ def _validate_managed_graph_marker(value: Any) -> None:
         sources.add(source)
 
 
+def _validate_verified_graph_marker(value: Any) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError("verified-graph migration marker must be a mapping")
+    unknown = sorted(set(value) - _VERIFIED_GRAPH_MARKER_FIELDS)
+    missing = sorted(_VERIFIED_GRAPH_MARKER_FIELDS - set(value))
+    if unknown or missing:
+        detail = (
+            f"unknown fields: {', '.join(unknown)}"
+            if unknown
+            else f"missing fields: {', '.join(missing)}"
+        )
+        raise ValueError(f"malformed verified-graph migration marker: {detail}")
+    zero_fields = (
+        "provider_calls",
+        "source_documents_reread",
+        "source_notes_rewritten",
+        "profile_files_rewritten",
+    )
+    count_fields = (
+        "legacy_relationships_deactivated",
+        "human_relationships_preserved",
+    )
+    if (
+        value.get("migration_id") != VERIFIED_GRAPH_MIGRATION_ID
+        or str(value.get("migration_version")) != VERIFIED_GRAPH_MIGRATION_VERSION
+        or value.get("status") != "completed"
+        or value.get("target_engine_version") != VERIFIED_GRAPH_TARGET_ENGINE_VERSION
+        or value.get("target_artifact_schema_version")
+        != VERIFIED_GRAPH_TARGET_ARTIFACT_SCHEMA_VERSION
+        or any(
+            type(value.get(field)) is not int or value.get(field) != 0
+            for field in zero_fields
+        )
+        or any(
+            type(value.get(field)) is not int or value.get(field) < 0
+            for field in count_fields
+        )
+        or not isinstance(value.get("completed_at"), str)
+        or not str(value.get("completed_at") or "").strip()
+    ):
+        raise ValueError("malformed verified-graph migration marker")
+    rewritten_files = value.get("rewritten_files")
+    if not isinstance(rewritten_files, list):
+        raise ValueError("malformed verified-graph migration rewritten-file list")
+    allowed_sources = {
+        *_VERSION_FILE_RELATIVES,
+        *_RELATIONSHIP_REGISTRY_RELATIVES,
+    }
+    sources: set[str] = set()
+    for row in rewritten_files:
+        if not isinstance(row, Mapping) or set(row) != {
+            "source",
+            "before_sha256",
+            "after_sha256",
+        }:
+            raise ValueError("malformed verified-graph migration rewritten-file record")
+        source = str(row.get("source") or "")
+        if (
+            source not in allowed_sources
+            or source in sources
+            or not all(
+                re.fullmatch(r"[0-9a-f]{64}", str(row.get(field) or ""))
+                for field in ("before_sha256", "after_sha256")
+            )
+        ):
+            raise ValueError("malformed verified-graph migration rewritten-file record")
+        sources.add(source)
+
+
 def _validate_proposition_anchor_marker(value: Any) -> None:
     if not isinstance(value, Mapping):
         raise ValueError("proposition-anchor migration marker must be a mapping")
@@ -1841,6 +2184,10 @@ def _validate_existing_markers(root: Path) -> None:
         (
             MANAGED_GRAPH_MIGRATION_ID,
             _validate_managed_graph_marker,
+        ),
+        (
+            VERIFIED_GRAPH_MIGRATION_ID,
+            _validate_verified_graph_marker,
         ),
     )
     for migration_id, validate in marker_validators:

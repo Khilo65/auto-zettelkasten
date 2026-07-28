@@ -16,6 +16,7 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import UTC, datetime
 from typing import Any, Callable, Mapping, Sequence
 
+from .fidelity import ANALYSIS_SECTION_KEYS, validate_atomic_replacements
 from .files import require_loopback_http_url
 from .models import (
     ClusterProposal,
@@ -64,10 +65,11 @@ DEFAULT_MAX_OUTPUT_TOKENS = 6_000
 DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
-CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 32_000
+CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 16_000
 CLUSTER_SYNTHESIS_MAX_OUTPUT_TOKENS = 32_000
 GAP_ADJUDICATION_MAX_OUTPUT_TOKENS = 32_000
 RELATIONSHIP_MAX_OUTPUT_TOKENS = 12_000
+ATOMIC_FIDELITY_MAX_OUTPUT_TOKENS = 8_000
 
 MODEL_CONTEXT_WINDOWS: Mapping[tuple[str, str], int] = {
     ("deepseek", "deepseek-v4-flash"): 1_000_000,
@@ -232,6 +234,55 @@ class _CapabilityAwareReader:
             )
         )
 
+    def verify_atomic_claims(
+        self,
+        analysis: Mapping[str, Any],
+        *,
+        context: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        """Return bounded replacements for locally flagged atomic-note claims."""
+
+        risks = [
+            dict(row)
+            for row in (context or {}).get("risks", []) or []
+            if isinstance(row, Mapping) and str(row.get("risk_id") or "").strip()
+        ]
+        if not risks:
+            return {"replacements": []}
+        self._authorize_request()
+        system_prompt = _atomic_fidelity_system_prompt()
+        user_prompt = _atomic_fidelity_prompt(analysis, context or {}, risks)
+        output_tokens = max(self.max_output_tokens, ATOMIC_FIDELITY_MAX_OUTPUT_TOKENS)
+        deadline_seconds = self._request_deadline_seconds()
+        self._ensure_prompt_fits(
+            system_prompt,
+            user_prompt,
+            output_tokens,
+            label="atomic fidelity verification",
+        )
+        payload = _parse_json_object(
+            self._generate_with_reasoning(
+                system_prompt,
+                user_prompt,
+                output_tokens,
+                deadline_seconds,
+                reasoning_effort="high",
+            ),
+            label="atomic fidelity verification response",
+        )
+        try:
+            replacements = validate_atomic_replacements(
+                analysis,
+                payload,
+                allowed_risk_ids=[
+                    str(row["risk_id"]) for row in risks
+                ],
+                discard_invalid=True,
+            )
+        except ValueError as exc:
+            raise ProviderError(f"invalid atomic fidelity response: {exc}") from exc
+        return {"replacements": replacements}
+
     @property
     def profile_reasoner_identity(self) -> str:
         return f"{type(self).__module__}.{type(self).__qualname__}:{self.name}:{self.model}"
@@ -297,6 +348,28 @@ class _CapabilityAwareReader:
             kind="shard_selection",
         )
 
+    def select_relationship_bridge_shards(
+        self,
+        profiles: Sequence[EvidenceProfile],
+        request: LiteratureMapRequest,
+        *,
+        context: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        """Select a bounded set of cross-literature shard pairs."""
+
+        self._authorize_request()
+        return _validate_relationship_response(
+            self._literature_json_call(
+                _relationship_bridge_shard_system_prompt(),
+                _relationship_prompt(profiles, request, context),
+                label="relationship bridge shard selection",
+                reasoning_effort="high",
+                output_tokens=RELATIONSHIP_MAX_OUTPUT_TOKENS,
+                list_key="shard_pairs",
+            ),
+            kind="shard_pair_selection",
+        )
+
     def select_relationship_candidates(
         self,
         profiles: Sequence[EvidenceProfile],
@@ -339,6 +412,28 @@ class _CapabilityAwareReader:
                 list_key="decisions",
             ),
             kind="relationship_adjudication",
+        )
+
+    def verify_relationships(
+        self,
+        profiles: Sequence[EvidenceProfile],
+        request: LiteratureMapRequest,
+        *,
+        context: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        """Independently verify tentative relationship decisions."""
+
+        self._authorize_request()
+        return _validate_relationship_response(
+            self._literature_json_call(
+                _relationship_verification_system_prompt(),
+                _relationship_prompt(profiles, request, context),
+                label="relationship verification",
+                reasoning_effort="max",
+                output_tokens=RELATIONSHIP_MAX_OUTPUT_TOKENS,
+                list_key="verifications",
+            ),
+            kind="relationship_verification",
         )
 
     def propose_clusters(
@@ -409,7 +504,7 @@ class _CapabilityAwareReader:
                 system_prompt,
                 user_prompt,
                 label="cluster proposal",
-                reasoning_effort="high",
+                reasoning_effort="medium",
                 output_tokens=(
                     CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS
                     if audit_mode == "collection"
@@ -495,15 +590,13 @@ class _CapabilityAwareReader:
             instruction=instruction,
         )
         user_prompt += (
-            "\n\nFINAL SYNTHESIS REQUIREMENTS — apply these after reading every atomic note above:\n"
+            "\n\nFINAL SYNTHESIS REQUIREMENTS — apply these after reading every supplied evidence profile:\n"
             "1. Preserve the case, period, actors, observed comparison, method, explanatory logic, and inferential limit "
             "when they are necessary to understand a core source.\n"
             "2. In plain English, observational results remain associations: never say a strategy works better, helps, "
             "drives, leads to, causes, or increases an outcome.\n"
-            "3. For Kuperman, the cluster contribution is incomplete unless it names the 1990–1994 Rwanda civil war and "
-            "1994 genocide, separates the estimated half-million Tutsi from the broader up-to-one-million Rwandans, "
-            "labels the reported 500-fold total and 6,000-fold monthly comparisons as descriptive arithmetic rather "
-            "than mediation effects, and explains the process-tracing logic and alternative causes.\n"
+            "3. Preserve source-specific cases, periods, quantitative distinctions, process-tracing logic, alternatives, "
+            "and inferential limits whenever the supplied evidence makes them necessary to understand a core contribution.\n"
             "Return only the requested JSON object."
         )
         return _validate_literature_response(
@@ -652,8 +745,8 @@ class _CapabilityAwareReader:
         *,
         reasoning_effort: str,
     ) -> Any:
-        if reasoning_effort not in {"high", "max"}:
-            raise ValueError("reasoning_effort must be high or max")
+        if reasoning_effort not in {"medium", "high", "max"}:
+            raise ValueError("reasoning_effort must be medium, high, or max")
         token = _REASONING_EFFORT.set(reasoning_effort)
         try:
             # Keep the transport method's historical four-argument protocol so
@@ -998,7 +1091,7 @@ class OllamaReader(_CapabilityAwareReader):
 def _system_prompt() -> str:
     keys = ", ".join(SECTION_KEYS)
     return (
-        "You create source-faithful atomic notes using Auto-Zettelkasten atomic prompt v8. "
+        "You create source-faithful atomic notes using Auto-Zettelkasten atomic prompt v9. "
         "Adapt the analysis to the source actually supplied: it may be an academic article or book, a report, policy or legal "
         "document, archival material, conference or meeting record, practitioner guidance, speech, working paper, blog post, "
         "or another evidence-bearing source. Do not force a nonacademic source into an academic-study template. "
@@ -1048,6 +1141,77 @@ def _system_prompt() -> str:
     )
 
 
+def _atomic_fidelity_system_prompt() -> str:
+    return (
+        "You verify only locally flagged claims in an Auto-Zettelkasten atomic "
+        "analysis. Return exactly one JSON object containing only a replacements "
+        "array. Each replacement must contain exactly section_key, original, "
+        "replacement, evidence_locator, and risk_ids. Use only the supplied section "
+        "keys and risk IDs. Copy original exactly from the supplied analysis, and "
+        "replace only the smallest unique sentence or clause needed to correct a "
+        "locator, unsupported number, attribution, or causal overstatement. Preserve "
+        "supported meaning and qualifiers. A locator correction must distinguish PDF "
+        "ordinal pages from printed page labels when supplied. Never rewrite a whole "
+        "note, add Markdown headings, introduce a number absent from the original or "
+        "the evidence locator, infer missing text, or repair an unflagged passage. "
+        "Return an empty replacements array when the supplied evidence does not "
+        "support a safe correction."
+    )
+
+
+def _atomic_fidelity_prompt(
+    analysis: Mapping[str, Any],
+    context: Mapping[str, Any],
+    risks: Sequence[Mapping[str, Any]],
+) -> str:
+    compact_analysis = {
+        key: str(analysis.get(key) or "")
+        for key in ANALYSIS_SECTION_KEYS
+        if str(analysis.get(key) or "").strip()
+    }
+    compact_risks = [
+        {
+            key: row.get(key)
+            for key in (
+                "risk_id",
+                "kind",
+                "section_key",
+                "claim",
+                "locator",
+                "reason",
+                "details",
+            )
+            if row.get(key) not in (None, "", [], {})
+        }
+        for row in risks[:24]
+    ]
+    passages = []
+    remaining_chars = 36_000
+    for raw in (context.get("source_passages", []) or [])[:12]:
+        if not isinstance(raw, Mapping) or remaining_chars <= 0:
+            continue
+        text = str(raw.get("text") or "")[: min(6_000, remaining_chars)]
+        if not text.strip():
+            continue
+        passages.append(
+            {
+                "locator": str(raw.get("locator") or ""),
+                "text": text,
+            }
+        )
+        remaining_chars -= len(text)
+    envelope = {
+        "analysis": compact_analysis,
+        "risks": compact_risks,
+        "source_passages": passages,
+        "source_scope": str(context.get("source_scope") or ""),
+        "page_map": dict(context.get("page_map") or {})
+        if isinstance(context.get("page_map"), Mapping)
+        else {},
+    }
+    return json.dumps(envelope, ensure_ascii=False, sort_keys=True)
+
+
 def _profile_system_prompt() -> str:
     return (
         "You are the evidence-profile reader for Auto-Zettelkasten profile prompt v6. "
@@ -1080,7 +1244,7 @@ def _profile_system_prompt() -> str:
 
 def _relationship_shard_system_prompt() -> str:
     return (
-        "You route relationship discovery for Auto-Zettelkasten relationship prompt v1. "
+        "You route relationship discovery for Auto-Zettelkasten relationship prompt v2. "
         "Return exactly one JSON object with a shard_ids array containing only IDs from the supplied shard directory. "
         "Select the smallest set of literature shards needed to find genuinely relevant works for every focus source. "
         "Use the focus thesis, method, facets, existing graph neighbors, and cluster summaries. Include a neighboring "
@@ -1089,9 +1253,21 @@ def _relationship_shard_system_prompt() -> str:
     )
 
 
+def _relationship_bridge_shard_system_prompt() -> str:
+    return (
+        "You route cross-literature bridge discovery for Auto-Zettelkasten relationship prompt v2. "
+        "Return exactly one JSON object with a shard_pairs array of objects. Each object must contain "
+        "left_shard_id, right_shard_id, reason, and confidence. Use only IDs from the supplied routing cards, "
+        "put different IDs in each pair, and select no more than twelve pairs. Select a pair only when the compact "
+        "theses, methods, scopes, or facets indicate a plausible intellectual bridge across literatures. Shared "
+        "vocabulary alone is insufficient. Do not classify source relationships, manufacture source pairs, or ask "
+        "for full notes. Return an empty array when no cross-literature comparison is worthwhile."
+    )
+
+
 def _relationship_candidate_system_prompt() -> str:
     return (
-        "You select source comparisons for Auto-Zettelkasten relationship prompt v1. Return exactly one JSON object with "
+        "You select source comparisons for Auto-Zettelkasten relationship prompt v2. Return exactly one JSON object with "
         "a candidates array. Each row must contain source_id, target_kind, target_id, why_relevant, comparison_unit, "
         "likely_relation_type, requested_evidence_depth, and confidence. target_kind is source or cluster. "
         "requested_evidence_depth is profile, atomic_note, or source_passage. confidence is a number from 0 to 1. "
@@ -1105,7 +1281,7 @@ def _relationship_candidate_system_prompt() -> str:
 
 def _relationship_adjudication_system_prompt() -> str:
     return (
-        "You adjudicate source relationships for Auto-Zettelkasten relationship prompt v1. Return exactly one JSON object "
+        "You adjudicate source relationships for Auto-Zettelkasten relationship prompt v2. Return exactly one JSON object "
         "with a decisions array containing one row per supplied pair. Each row must contain source_id, target_source_id, "
         "status, relation_type, comparison_unit, reason, source_evidence_anchor_id, target_evidence_anchor_id, qualifiers, "
         "confidence, and requested_context. status is accepted, no_relationship, or needs_more_context. relation_type for "
@@ -1119,6 +1295,26 @@ def _relationship_adjudication_system_prompt() -> str:
         "supplied limited evidence itself contains both the relevant claim and its boundary. Ask for more context only when "
         "the supplied profiles leave a consequential comparison genuinely ambiguous. Never invent IDs, anchors, locators, "
         "claims, profile hashes, relation IDs, provenance, timestamps, or Markdown."
+    )
+
+
+def _relationship_verification_system_prompt() -> str:
+    return (
+        "You independently verify tentative source-relationship decisions for Auto-Zettelkasten relationship prompt v2. "
+        "Return exactly one JSON object with a verifications array containing one row per supplied preliminary decision. "
+        "Treat the preliminary decision as a claim to audit, not as evidence. Each row must contain source_id, "
+        "target_source_id, status, relation_type, comparison_unit, reason, source_evidence_anchor_id, "
+        "target_evidence_anchor_id, qualifiers, confidence, and requested_context. status is confirmed, corrected, "
+        "no_relationship, or needs_more_context. Confirmed means the supplied anchors independently establish the same "
+        "direction and relation type. Corrected means a substantive relationship exists but its direction, type, reason, "
+        "or anchors must change. For confirmed and corrected rows, use one real supplied anchor from each source and one "
+        "of: supports, undermines, qualifies, extends, complements, rival_explanation, boundary_contrast, "
+        "methodological_fault_line, sequential_relationship, or interpretive_or_normative_disagreement. For other "
+        "statuses use an empty relation_type and empty anchor IDs. Compare exact constructs, populations, outcomes, "
+        "periods, methods, causal scope, and source attribution. Reject pooled evidence attributed to a subgroup, "
+        "invented lineage, strawman qualification, and causal upgrades. Shared topic, case, method, dataset, citation, "
+        "or vocabulary alone is no_relationship. Ask for more context only when the supplied profiles cannot resolve a "
+        "consequential ambiguity. Never invent IDs, evidence, locators, provenance, timestamps, or Markdown."
     )
 
 
@@ -1195,8 +1391,8 @@ def _debate_system_prompt() -> str:
 
 def _cluster_synthesis_system_prompt() -> str:
     return (
-        "You are the cluster-synthesis reasoner for Auto-Zettelkasten cluster synthesis prompt v19. Read the complete atomic "
-        "notes supplied for this admitted cluster. Return exactly one JSON object containing cluster_id, scope, boundaries, "
+        "You are the cluster-synthesis reasoner for Auto-Zettelkasten cluster synthesis prompt v19. Read the bounded evidence "
+        "profiles and verified relationships supplied for this admitted cluster. Return exactly one JSON object containing cluster_id, scope, boundaries, "
         "coherence_rationale, synthesis, evidence_threads, central_findings, agreements, "
         "positions, contradictions, boundary_conditions, methodological_fault_lines, related_clusters, source_roles, "
         "source_contributions, supporting_evidence, synthesis_assertions, debate_state, gap_hypotheses, evidence_base_groups, "
@@ -2010,8 +2206,19 @@ def _metadata_prompt(metadata: Mapping[str, Any], question: str | None) -> str:
 
 
 def _source_prompt(text: str, metadata: Mapping[str, Any], question: str | None) -> str:
+    context = metadata.get("_source_context")
+    partial_rule = ""
+    if isinstance(context, Mapping) and context.get("source_scope") == "partial_document":
+        partial_rule = (
+            "\n\nPARTIAL-SOURCE RULE: The supplied text omits pages listed in the "
+            "extraction metadata. Describe only the available pages, qualify every "
+            "source-level argument or finding as available-content evidence, and do "
+            "not infer the complete thesis, findings, method, or limitations of the "
+            "missing document sections."
+        )
     return (
-        f"{_metadata_prompt(metadata, question)}\n\nINSPECTED SOURCE CONTENT:\n{text}"
+        f"{_metadata_prompt(metadata, question)}{partial_rule}"
+        f"\n\nINSPECTED SOURCE CONTENT:\n{text}"
     )
 
 
@@ -2671,10 +2878,30 @@ def _validate_relationship_response(
                 str(value).strip() for value in values if str(value).strip()
             ]
         }
-    key = "candidates" if kind == "candidate_selection" else "decisions"
+    if kind == "shard_pair_selection":
+        values = payload.get("shard_pairs")
+        if not isinstance(values, list):
+            raise ProviderError(
+                "relationship bridge shard response must contain a shard_pairs list"
+            )
+        return {
+            "shard_pairs": [
+                dict(value) if isinstance(value, Mapping) else value
+                for value in values
+            ]
+        }
+    key = (
+        "candidates"
+        if kind == "candidate_selection"
+        else "verifications"
+        if kind == "relationship_verification"
+        else "decisions"
+    )
     values = payload.get(key)
     if values is None and kind == "relationship_adjudication":
         values = payload.get("relationships")
+    if values is None and kind == "relationship_verification":
+        values = payload.get("decisions")
     if not isinstance(values, list):
         raise ProviderError(f"{kind.replace('_', ' ')} response must contain a {key} list")
     return {key: [dict(value) if isinstance(value, Mapping) else value for value in values]}
