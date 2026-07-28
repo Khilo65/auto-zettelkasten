@@ -51,9 +51,8 @@ def test_atomic_prompt_v9_is_source_adaptive_and_inference_aware() -> None:
     assert "Do not recalculate" in prompt
     assert "hypothetical populations" in prompt
     assert "descriptive arithmetic, not an estimated causal effect" in prompt
-    assert "approximately half-million Tutsi estimate" in prompt
-    assert "civil-war and genocide context" in prompt
-    assert "500-fold and 6,000-fold" in prompt
+    assert "approximately half-million Tutsi estimate" not in prompt
+    assert "500-fold and 6,000-fold" not in prompt
     assert "Observed sequence:" not in prompt
     assert "PDF extraction may flatten tables" in prompt
     assert "never invent an exact row-column relationship" in prompt
@@ -105,13 +104,13 @@ def test_partial_source_prompt_prohibits_complete_document_inference() -> None:
 def test_cluster_prompt_preserves_inference_and_case_evidence() -> None:
     prompt = _cluster_synthesis_system_prompt()
 
-    assert "cluster synthesis prompt v19" in prompt
+    assert "cluster synthesis prompt v21" in prompt
     assert "same predictor and outcome orientation" in prompt
     assert "describe the same direction, not opposite results" in prompt
-    assert "theory-only contribution is incomplete" in prompt
-    assert "1990-1994 civil-war and 1994 genocide" in prompt
-    assert "500-fold total and 6,000-fold monthly" in prompt
-    assert "descriptive arithmetic rather than mediation effects" in prompt
+    assert "retain the decisive case evidence" in prompt
+    assert "identify the conflict or case" in prompt
+    assert "descriptive before-and-after arithmetic" in prompt
+    assert "Kuperman" not in prompt
 
 
 def test_gap_prompt_rejects_invented_resolution_details() -> None:

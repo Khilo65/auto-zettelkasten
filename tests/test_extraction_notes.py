@@ -39,7 +39,7 @@ def test_text_and_html_extraction_are_source_only() -> None:
     assert "Synthetic source" in html.text
 
 
-def test_blank_pdf_is_classified_for_vision_or_exhaustion() -> None:
+def test_blank_pdf_is_classified_for_vision_or_review_parking() -> None:
     result = extract_bytes(_minimal_pdf(""), media_type="application/pdf", filename="scan.pdf")
     assert result.status == "failed"
     assert result.route == "pypdf_text"
@@ -204,7 +204,9 @@ def test_atomic_note_validator_requires_lineage_and_all_sections() -> None:
     limited_coverage = text.replace("gate: passed", "gate: limited")
     assert "source_coverage_gate_not_passed" in validate_atomic_note(limited_coverage).errors
     untraceable = text.replace("Grounded locators; see page 1.", "N/A")
-    assert "untraceable_locators" in validate_atomic_note(untraceable).errors
+    untraceable_validation = validate_atomic_note(untraceable)
+    assert untraceable_validation.passed
+    assert "untraceable_locators" in untraceable_validation.warnings
     web_locator = text.replace(
         "Grounded locators; see page 1.",
         'https://example.org/report, heading "Findings"',
@@ -238,9 +240,12 @@ def test_atomic_note_validator_requires_lay_explanation_of_statistical_findings(
 
     copied = dict(analysis)
     copied["plain_english_interpretation"] = copied["detailed_findings"]
-    assert "plain_english_interpretation_repeats_detailed_findings" in validate_atomic_note(
-        render_atomic_note(frontmatter, copied)
-    ).errors
+    copied_validation = validate_atomic_note(render_atomic_note(frontmatter, copied))
+    assert copied_validation.passed
+    assert (
+        "plain_english_interpretation_repeats_detailed_findings"
+        in copied_validation.warnings
+    )
 
     fluent = dict(analysis)
     fluent["plain_english_interpretation"] = (

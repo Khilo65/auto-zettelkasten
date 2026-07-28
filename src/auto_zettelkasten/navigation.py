@@ -1096,6 +1096,8 @@ def build_typed_source_relations(
 
 
 def _profile_is_analytical(profile: Mapping[str, Any]) -> bool:
+    if "evidence_eligibility" in profile:
+        return profile.get("evidence_eligibility") == "substantive_bounded"
     if profile.get("excluded_from_synthesis"):
         return False
     if profile.get("analytical") is not None:

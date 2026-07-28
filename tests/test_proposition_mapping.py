@@ -139,7 +139,9 @@ def test_coverage_repair_uses_normalized_anchor_eligibility() -> None:
     ]
 
     normalized[0]["claims"][0]["support_envelope"]["support_status"] = "support_unknown"
-    assert literature._coverage_repair_source_ids(clustered, normalized) == []
+    assert literature._coverage_repair_source_ids(clustered, normalized) == [
+        "unclustered"
+    ]
 
 
 def test_thematic_cluster_admits_one_bounded_subliterature_without_exact_proposition() -> (
@@ -2204,7 +2206,7 @@ def test_case_period_context_uses_matching_profile_metadata() -> None:
     )
 
 
-def test_kuperman_cluster_requires_context_arithmetic_and_inferential_limits() -> None:
+def test_cluster_quality_checks_do_not_embed_source_specific_cases() -> None:
     cluster = {
         "cluster_id": "cluster-coercion-condition-mediation-ripeness-success-d355e0980e",
         "representative_sources": [
@@ -2227,26 +2229,7 @@ def test_kuperman_cluster_requires_context_arithmetic_and_inferential_limits() -
     }
 
     incomplete = literature._cluster_synthesis_quality_errors(common, cluster)
-    complete = literature._cluster_synthesis_quality_errors(
-        {
-            **common,
-            "evidence_threads": [
-                {
-                    "summary": (
-                        "The 1990-1994 Rwanda civil war culminated in the 1994 genocide. "
-                        "The source distinguishes an estimated half-million Tutsi killed from up to one million "
-                        "Rwandans killed overall. Its 500-fold total and 6,000-fold monthly comparisons are "
-                        "descriptive arithmetic, not causal effects. The process-tracing argument cannot rule "
-                        "out alternative causes or the counterfactual that genocide occurred regardless."
-                    )
-                }
-            ],
-        },
-        cluster,
-    )
-
-    assert any(error.startswith("kuperman_requires_") for error in incomplete)
-    assert not any(error.startswith("kuperman_requires_") for error in complete)
+    assert not any(error.startswith("kuperman_requires_") for error in incomplete)
 
 
 def test_evidence_thread_uses_substantive_summary_not_machine_relationship() -> None:

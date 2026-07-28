@@ -69,6 +69,7 @@ Target release versions:
 
 - engine `0.13.0`;
 - artifact schema `1.12`;
+- evidence-profile schema `1.3`;
 - relationship registry schema `4`;
 - source catalogue schema `3`; and
 - run-ledger schema remains `2` unless implementation reveals a genuinely
@@ -141,6 +142,8 @@ Zotero read-only inventory and collection tree
 extraction and scope assessment
     ↓
 one source-reading call
+    ↓
+canonical SourceAnalysisBundle
     ├── atomic analysis
     ├── compact profile
     ├── evidence anchors
@@ -149,7 +152,7 @@ one source-reading call
     ↓
 local advisory diagnostics
     ↓
-atomic-note and profile commit
+source-owned bundle commit and deterministic projections
     ↓
 deterministic collection indexes and catalogue
     ↓
@@ -157,7 +160,9 @@ model-led relationship candidate discovery
     ↓
 bounded relationship job packets
     ↓
-one complete adjudication per candidate pair
+provider batches containing independent pair jobs
+    ↓
+one complete decision record per candidate pair
     ↓
 canonical registry commit
     ↓
@@ -174,8 +179,8 @@ There are four ownership boundaries:
 
 | Artifact | Semantic owner | Writer |
 |---|---|---|
-| Atomic analysis | Source-reading model | Initial local renderer only |
-| Compact profile and literature positions | Source-reading model | Structured artifact writer |
+| SourceAnalysisBundle | Source-reading model | Source-owned structured artifact writer |
+| Atomic note, profile, and literature positions | SourceAnalysisBundle | Deterministic projectors |
 | Relationship and cluster decisions | Relationship or cluster reasoner | Canonical registries |
 | Markdown links and managed blocks | Canonical registries | Deterministic local projector |
 
@@ -184,14 +189,17 @@ atomic-analysis sections.
 
 ## 5. Workstream A — One-shot atomic generation
 
-### 5.1 One model call, one structured result
+### 5.1 One model call, one source-owned bundle
 
 Replace the separate atomic-note, profile, and fidelity-verifier path with one
-source-reading contract. For an ordinary source, one DeepSeek call returns:
+source-reading contract. For an ordinary source, one DeepSeek call returns a
+canonical `SourceAnalysisBundle`:
 
 ```json
 {
+  "bundle_schema_version": "1",
   "source_identity": {},
+  "observed_bibliographic_identity": {},
   "scope_assessment": {},
   "analysis_sections": {},
   "compact_profile": {},
@@ -202,21 +210,72 @@ source-reading contract. For an ordinary source, one DeepSeek call returns:
 }
 ```
 
-The local pipeline validates the envelope, stores the structured components,
-and renders the note. It does not ask another model to reproduce or patch the
-note.
+The bundle belongs to the source, not to a collection, source set, map, or
+cluster run. Its semantic fingerprint contains:
+
+- extracted source-content fingerprint;
+- extraction and scope-policy revision;
+- source-reading prompt and bundle-contract version;
+- provider and model identity; and
+- source-reading settings that can affect meaning.
+
+Collection membership, source-set ID, graph revision, cluster revision, and
+Markdown link rendering are excluded. Canonical display title, creators, year,
+and item type are also projection metadata rather than source-analysis
+dependencies. Moving the same source between Zotero collections or correcting
+its Zotero metadata therefore cannot invalidate paid source-reading work.
+
+`source_identity` contains stable Zotero/source/attachment IDs. The model may
+return `observed_bibliographic_identity` from the document body as diagnostic
+evidence, but it is not allowed to overwrite the canonical record. Current
+Zotero parent-item metadata is the default bibliographic authority, with
+source-body discrepancies recorded in the metadata-remediation ledger for
+human correction.
+
+The local pipeline validates the envelope, stores the bundle once, and
+deterministically projects the atomic note, evidence profile, literature
+positions, and acquisition recommendations. It does not ask another model to
+reproduce or patch the note.
+
+Validation is component-isolated:
+
+- a valid atomic analysis publishes even if an optional literature-position or
+  acquisition-recommendation row is malformed;
+- valid anchors and profile fields survive a malformed optional sibling row;
+- malformed optional rows are parked separately with diagnostics; and
+- only an unusable source identity or atomic analysis can park the complete
+  source.
 
 The compact profile must include:
 
 - stable Zotero and source IDs;
-- title, authors, year, and collections;
+- canonical title, authors, and year joined deterministically from the current
+  Zotero/parent metadata projection;
 - one bounded thesis;
 - one bounded method or knowledge-basis statement;
 - source genre and inferential design;
 - evidence scope and coverage;
 - a few discriminating mechanism, outcome, case, population, period, or
   dataset facets; and
-- profile and source fingerprints.
+- bundle and source fingerprints.
+
+Collection membership is joined deterministically from the current Zotero
+snapshot when building indexes or routing context. It is not embedded as
+semantic content in the source-owned bundle.
+
+Every evidence anchor returned by the source-reading model includes:
+
+- source-local anchor ID;
+- compact proposition;
+- approximate locator and support boundary;
+- one or more planning roles such as `thesis`, `method`, `major_finding`,
+  `mechanism`, `limitation`, or `literature_position`; and
+- model-assigned salience priority.
+
+Downstream relationship discovery and cluster planning select the anchor IDs
+relevant to their intellectual task. Local code only loads, caps, and validates
+the selected records; it does not decide which evidence is intellectually
+important.
 
 The master index is not included in this source-reading prompt. Atomic
 generation must interpret the supplied source on its own terms. Library
@@ -281,12 +340,25 @@ same call and does not add a visible note section.
 Use the full recovered source directly when the complete request remains
 safely below the context target.
 
-- Never plan to use more than 50% of the one-million-token model context.
+- Maintain a provider/model capability record containing maximum context,
+  supported output limits, configured timeout, and any endpoint-specific
+  restrictions.
+- Measure or conservatively estimate the complete serialized request before
+  provider submission.
+- Record the effective input estimate, output allowance, timeout, and capability
+  identity in the checkpoint fingerprint.
+- Never plan to use more than 50% of the configured model context.
 - Reserve room for instructions and output.
-- For global 64,000-token outputs, target no more than approximately 430,000
-  input tokens.
+- Use a compact 16,000–32,000 output target when measurement shows that it is
+  sufficient.
+- Allow 64,000 output tokens only when the endpoint supports it and the
+  estimated structured response genuinely needs it.
+- For a one-million-token model with a 64,000-token output, target no more than
+  approximately 430,000 input tokens.
 - For ordinary atomic outputs, use the same conservative total-context rule
   with the actual smaller output allowance.
+- Fail locally before a paid call when the serialized prompt and required
+  output cannot fit the effective capability.
 
 Only genuinely oversized works use hierarchical reading:
 
@@ -334,6 +406,12 @@ substantively support or undermine one another.
 ### 5.6 Publication policy
 
 Rename the visible `exhausted` outcome to `parked_for_review`.
+
+New v0.13 artifacts write `parked_for_review`. Readers and migrations continue
+accepting legacy `exhausted` and normalize it to the new reporting category.
+CLI output, API responses, source-set counts, coverage registers, progress
+reports, and acceptance denominators must switch together; do not leave a
+partial rename with contradictory counts.
 
 Only these gross failures prevent publication:
 
@@ -420,9 +498,27 @@ Examples:
 - an abstract-only record remains context-only because its evidence is
   genuinely limited to the abstract.
 
-`partial_document_atomic_note` remains a terminal completed status, but gains
-an explicit `synthesis_eligible` value derived from substantive recovered
-content. Terminal means processing is complete; it does not mean excluded.
+Use one authoritative `evidence_eligibility` enum throughout notes, profiles,
+source sets, relationship routing, and clusters:
+
+- `substantive_bounded` — recovered evidence may support analysis,
+  relationships, and clusters within its declared scope;
+- `context_only` — metadata, abstract, or other limited material may support
+  navigation but not substantive cross-source claims; and
+- `unavailable` — no usable content is currently available.
+
+Do not add a second `synthesis_eligible` boolean beside the existing
+`excluded_from_synthesis` state. Migrate old state into the enum and remove the
+contradictory field from new artifacts.
+
+`partial_document_atomic_note` remains a terminal completed status and may use
+`substantive_bounded`. Terminal means processing is complete; it does not mean
+excluded.
+
+An evidence-bounded partial note uses the analytical structure—thesis, method
+or knowledge basis, findings, limitations, literature position, and evidence
+anchors—plus a prominent coverage boundary stating what was recovered and
+what remains absent. It does not use the metadata-only limited-note template.
 
 ### 7.2 Classification fixes
 
@@ -502,6 +598,15 @@ but v0.13 implements only recording, matching, and status transitions.
 Use the existing read-only collections endpoint and its `parentCollection`
 field to snapshot the complete collection hierarchy.
 
+One canonical collection-membership snapshot contains:
+
+- every collection key, display name, and parent key;
+- every source's direct collection keys;
+- canonical parent-item metadata for standalone attachment records;
+- item and collection revisions needed to detect rename, move, removal, and
+  multi-collection membership; and
+- a stable snapshot fingerprint.
+
 Generate:
 
 ```text
@@ -539,6 +644,9 @@ Every collection and subcollection index includes:
 A source has one canonical atomic note and profile. Multiple collection indexes
 may reference it without duplicating source artifacts. A source that belongs to
 multiple Zotero collections appears in each relevant index with the same IDs.
+Collection source shards contain direct members. Parent pages navigate to child
+collections and report descendant counts without repeatedly copying every
+descendant source into the parent's shards.
 
 ### 9.2 Compact source entry
 
@@ -609,7 +717,35 @@ use one global discovery call. Its response has separate capacity for:
 - within-literature candidates; and
 - cross-literature bridge candidates.
 
+For the 195-source acceptance corpus, the discovery contract returns at most
+120 model-ranked unresolved pairs, matching twenty adjudication batches of
+approximately six pairs before mandatory-pair budget adjustment. At least 40%
+of the effective inferred-pair slots are reserved for cross-literature bridges.
 Same-collection candidates cannot consume the reserved bridge capacity.
+
+Every candidate includes model-supplied priority, intellectual relevance
+rationale, discovery route, and the compact propositions that should be
+compared. Candidate discovery also names the source-local anchor IDs it wants
+loaded for each side. Local code resolves those IDs into the pair job. For a
+structurally explicit pair that bypasses model discovery, the job starts with
+the source model's highest-priority thesis, method, finding, and
+literature-position anchors; the adjudicator may return `needs_more_context`
+rather than receiving an automatic second call.
+
+Exact matched citations and explicit Zotero relations are mandatory candidates.
+They consume adjudication capacity first. The inferred-pair quota is then:
+
+`min(120, remaining planned adjudication capacity)`
+
+Preflight may reduce the inferred quota or borrow from the shared call reserve
+while remaining below 100 total calls. It never drops a mandatory explicit
+pair or exceeds the hard ceiling. If mandatory pairs alone cannot fit the
+remaining stage plus reserve capacity, the run stops before provider submission
+and reports the unresolved budget conflict.
+
+When capping is required, local code follows the model's rank within the
+within-literature and bridge quotas. It must not rerank candidates using local
+semantic similarity.
 
 For an incremental batch, the discovery call receives the new profiles,
 matched citations, relevant graph memory, and the selected catalogue context.
@@ -629,14 +765,22 @@ Deterministic code may:
 It must not decide that two works support, undermine, qualify, extend, or
 otherwise relate.
 
-### 10.2 Relationship job packet
+Before schema-4 graph migration, the frozen discovery benchmark must achieve
+at least 85% candidate recall on the independently curated 40 bridge pairs.
+Prompt changes, capacity changes, and routing changes rerun this benchmark
+without publishing graph edges.
 
-Every candidate pair becomes a bounded, immutable job packet. The same packet
-can be sent to DeepSeek or inspected by an optional coding-harness agent.
+### 10.2 Pair decision job
+
+Every candidate pair becomes a bounded, immutable pair decision job. This is
+the canonical unit of state, fingerprinting, retry, result storage, and
+registry history. It is not necessarily one provider call. The same job can be
+included in a DeepSeek batch or answered individually by an optional
+coding-harness agent.
 
 ```json
 {
-  "job_id": "relationship-job-...",
+  "pair_job_id": "relationship-job-...",
   "catalogue_revision": "...",
   "pair": {
     "left_source_id": "...",
@@ -654,7 +798,7 @@ can be sent to DeepSeek or inspected by an optional coding-harness agent.
   "graph_context": {},
   "candidate_basis": [],
   "prior_pair_memory": {},
-  "output_contract": "relationship-decision-v3"
+  "output_contract": "relationship-decision-v4"
 }
 ```
 
@@ -667,13 +811,36 @@ another call.
 Packets and results live under the run state so an agent can audit them without
 reconstructing hidden prompt context.
 
-### 10.3 One complete adjudication
+### 10.3 Provider batch packet
+
+The automatic DeepSeek backend groups approximately four to eight unresolved
+pair jobs into one provider request, bounded by measured context size. The
+provider batch is only a transport optimization; every returned row is split
+back into its canonical pair job.
+
+Batch checkpoints store the ordered pair-job IDs, effective provider
+capabilities, serialized-context fingerprint, and returned row IDs under a
+separate `relationship_batches/BATCH_ID/` run-state path. Repacking does not
+change pair-job identity.
+
+- One malformed row parks only that pair.
+- Valid sibling rows commit normally.
+- A failed or truncated provider batch parks its unresolved pair jobs without
+  altering already committed jobs.
+- Resume may repack still-unresolved pair jobs only under the explicit retry
+  policy and cumulative call ceiling.
+- A harness agent may answer one exported pair job without adopting the
+  DeepSeek batching format.
+
+### 10.4 One complete adjudication
 
 Remove the separate v0.12 relationship verifier. One adjudication response is
-the final probabilistic judgment:
+may contain multiple pair rows, but each row is one complete final
+probabilistic judgment:
 
 ```json
 {
+  "pair_job_id": "relationship-job-...",
   "decision": "relationship",
   "pair": {
     "left_source_id": "...",
@@ -712,7 +879,11 @@ registry uniqueness, and projection safety. It does not semantically reinterpret
 the relationship. An invalid row is parked without a retry and without
 discarding valid sibling rows.
 
-### 10.4 Citation is not agreement
+The new single-call adjudication prompt must pass the Schelling–Smith/Stam,
+Carnegie–Hartzell, and McAuliffe–Hampson direction/type regression fixtures
+before any schema-4 machine relationship becomes visible.
+
+### 10.5 Citation is not agreement
 
 The graph distinguishes:
 
@@ -726,7 +897,7 @@ When an important literature-position citation matches an existing note, the
 source-local `Position in the Literature` projection may link to that note
 immediately. A substantive typed relationship appears only after adjudication.
 
-### 10.5 Registry behavior
+### 10.6 Registry behavior
 
 Preserve the strongest v0.12 registry features:
 
@@ -808,6 +979,14 @@ If the work is added later, local projection changes only the target rendering
 inside the managed literature-position region. It does not ask a model to
 rewrite the engagement statement.
 
+The structured engagement record is canonical. Bundle and profile fingerprints
+include its engagement prose and source evidence, but exclude
+`matched_source_id`, target path, and wikilink rendering. Note-preservation
+hashing must normalize or exclude the managed literature block just as it
+already excludes the graph block. Resolving a missing citation therefore
+changes a link projection without invalidating the source analysis or paid
+profile work.
+
 ### 11.3 Atomic-to-cluster reciprocity
 
 An admitted atomic member receives:
@@ -859,6 +1038,8 @@ minimum backend-neutral groundwork:
 - make pending and parked packets discoverable from run state;
 - accept a schema-valid externally produced result through the same registry
   ingestion path; and
+- expose explicit job export and result import commands if a public harness
+  workflow is included; and
 - record `reasoner_backend`, model identity, and provenance.
 
 The practical exchange layout is:
@@ -870,12 +1051,12 @@ The practical exchange layout is:
 └── status.yml
 ```
 
-The built-in DeepSeek backend reads `input.json` and writes `result.json`. An
-optional harness agent may read the same immutable input and write only that
-job's isolated result. On `resume`, the normal ingestion path validates any
-completed result, commits registry events, and projects links. The agent never
-writes a note or canonical registry directly, and ingesting an existing result
-costs no provider call.
+The built-in DeepSeek backend reads the same immutable job data through the
+normal pipeline. An optional harness agent receives an exported `input.json`
+and returns an isolated `result.json`. An explicit import or `resume` ingestion
+path validates the result, commits registry events, and projects links. The
+agent never writes a note or canonical registry directly, and ingesting an
+existing result costs no provider call.
 
 Suitable harness-agent work includes:
 
@@ -889,17 +1070,16 @@ Agents must not directly edit atomic notes, indexes, registries, or clusters.
 They return structured results, and the same local commit/projection path
 applies.
 
-Parallelism is safe only across isolated artifacts:
+DeepSeek source generation keeps the existing worker pool, and read-only
+harness audits may run concurrently. v0.13 does not implement automatic job
+claiming, agent scheduling, competing result writers, or concurrent registry
+commits. Imported results pass through one deterministic commit path, and
+cluster refresh begins only after the relevant relationship revision is
+committed.
 
-- DeepSeek generates separate source records with the existing worker pool.
-- Relationship workers or agents write separate job results.
-- A single deterministic merge commits registry events.
-- Read-only audits may run concurrently.
-- Cluster refresh begins after the relevant relationship revision is committed.
-
-Direct Codex/Claude orchestration, scheduler integration, and automatic agent
-spawning remain later features. The persisted packet protocol prevents that
-later work from requiring another graph redesign.
+Direct Codex/Claude orchestration, scheduler integration, automatic agent
+spawning, and parallel harness claiming remain later features. The persisted
+packet protocol prevents that later work from requiring another graph redesign.
 
 ## 13. Workstream G — Simplified clustering
 
@@ -910,47 +1090,93 @@ proposals and reconciliation with one cluster-planning call.
 
 Input:
 
-- all eligible compact profiles;
+- all eligible compact cluster-planning cards;
 - accepted substantive relationships;
 - important matched literature-position records;
 - collection identities;
 - prior compact cluster summaries when refreshing; and
 - explicit instructions to find mixed-literature debates.
 
+A cluster-planning card is the compact profile plus three to five
+synthesis-relevant, source-specific evidence references. Each reference
+contains an existing `evidence_anchor_id`, a one-sentence proposition, a rough
+locator, and its support boundary. It does not contain the complete atomic note
+or every evidence passage.
+
+The source-reading model has already assigned anchor roles and salience. The
+card builder selects a role-diverse top three to five using those
+model-supplied priorities and a size cap. The cluster planner then names the
+anchor IDs that actually justify each membership. Local code neither invents
+the priorities nor makes the membership judgment.
+
+There are no “global evidence anchors.” The plan is global because one call
+sees the eligible corpus. Every evidence anchor remains owned by one source.
+The planner simply cites those source-local IDs to explain why it placed a work
+in a cluster.
+
 Output:
 
 - cluster ID and concise title;
 - shared question;
-- member source IDs;
-- core source IDs;
-- short membership rationale;
-- neighboring cluster IDs and relationship;
+- members, each containing `source_id`, `role` (`core`, `context`, or
+  `bridge`), `evidence_anchor_ids`, and a concise membership reason;
+- neighboring relationships containing both cluster IDs, the relationship,
+  basis source IDs, and evidence-anchor IDs;
 - unclustered analytical source IDs; and
 - a concise reason for sources intentionally left unclustered.
 
+Example:
+
+```yaml
+members:
+  - source_id: source-a
+    role: core
+    evidence_anchor_ids: [anchor-a-thesis, anchor-a-finding-2]
+    membership_reason: Connects commitment problems to third-party guarantees.
+neighbor_relationships:
+  - left_cluster_id: commitment-problems
+    right_cluster_id: mediation-design
+    relationship: institutional response to the same implementation problem
+    basis_source_ids: [source-a, source-b]
+    evidence_anchor_ids: [anchor-a-finding-2, anchor-b-thesis]
+```
+
 Operational settings:
 
-- conservative input target of approximately 430,000 tokens;
-- no more than half of the one-million-token total context;
-- output allowance up to 64,000 tokens when the configured DeepSeek endpoint
-  supports it;
-- 600-second request timeout;
+- conservative input target derived from the configured context capability
+  (approximately 430,000 tokens when context is one million and output is
+  64,000);
+- no more than half of the configured total context;
+- output estimated from requested cluster and member counts, normally
+  16,000–32,000 and up to 64,000 only when supported and needed;
+- a configured literature-request deadline, with 600 seconds as the preferred
+  value for this acceptance run when the endpoint and client support it;
 - existing two-hour overall literature deadline; and
 - one concise structured response without repeated source summaries.
 
-Provider capability and configured output limit must be checked during
-preflight. Do not silently request 16,000 tokens for a contract known to need
-more output.
+Provider capability, effective output limit, serialized input size, response
+size estimate, and configured deadline must be checked during preflight and
+included in the checkpoint fingerprint. Do not silently request 16,000 tokens
+for a contract known to need more output, and do not assume 64,000 or 600
+seconds when the endpoint cannot honor them.
 
 ### 13.2 Independent cluster synthesis
 
 After the plan:
 
-1. perform only mechanical ID, duplicate-membership, and context checks;
+1. verify mechanically that member IDs exist, cited anchors belong to those
+   members, roles are valid, and neighboring records are reciprocal;
 2. admit the model-selected cluster families;
-3. make one synthesis call per admitted cluster using only member evidence and
-   relevant relationships; and
-4. project membership and neighboring-cluster links locally.
+3. load the full text of the selected member anchors and other directly
+   relevant member evidence only after membership is selected;
+4. make one synthesis call per admitted cluster using that bounded evidence
+   and the relevant relationships; and
+5. project membership and neighboring-cluster links locally.
+
+Local code does not decide whether the cited evidence makes the family
+intellectually coherent. It verifies identity and provenance so the later
+synthesis has actual source evidence rather than membership based only on a
+title or keyword.
 
 The synthesis prompt performs its own same-call review. Remove automatic
 cluster quality-repair calls. An unusable synthesis parks only that cluster.
@@ -1016,12 +1242,22 @@ For a 195-source combined literature run expected to fit the global context:
 | Shared manual/transport reserve | 13 |
 | **Expected ceiling** | **51** |
 
+The twenty planned adjudication calls carry approximately six independent pair
+jobs each. Packing may vary between four and eight jobs according to measured
+context size. Mandatory explicit pairs consume this capacity first; the
+inferred quota shrinks from its maximum of 120, or the stage borrows available
+shared reserve calls, rather than dropping mandatory pairs or exceeding the
+hard ceiling.
+
 The public hard literature-synthesis ceiling remains 100. The lower internal
 target makes the ceiling a safety boundary rather than a spending goal.
 
 Atomic generation remains under the existing 250-call source/profile ceiling,
 but the ledger must clearly count the actual source-reading and hierarchical
 calls. There must be no hidden profile or verifier totals.
+Externally supplied harness results record backend provenance but consume no
+DeepSeek call; any model usage by that harness remains separately identifiable
+rather than being reported as free reasoning.
 
 ### 14.2 Failure behavior
 
@@ -1048,14 +1284,16 @@ Implement the groundwork for later weekly automation:
 - source, attachment, and collection fingerprints;
 - deterministic library diffs;
 - durable `last_processed` state;
-- idempotent processing of new or changed sources;
+- idempotent processing of new, changed, removed, moved, and multi-collection
+  sources;
 - missing-source ledger matching;
 - affected relationship and cluster IDs; and
 - a resumable incremental command.
 
 Incremental batch flow:
 
-1. detect new and changed Zotero records read-only;
+1. detect new, changed, removed, moved, and membership-changed Zotero records
+   read-only;
 2. generate new atomic records in parallel;
 3. commit one stable catalogue revision;
 4. discover new-to-existing and new-to-new candidates;
@@ -1063,6 +1301,21 @@ Incremental batch flow:
 6. project reciprocal links;
 7. refresh affected clusters; and
 8. update the processed inventory only after successful local commits.
+
+A collection rename or move updates only hierarchy and index projections. A
+source removed from Zotero or made unavailable is not silently deleted:
+
+- preserve its canonical note and registry history;
+- mark machine relationships orphaned or inactive through a committed registry
+  event;
+- remove broken managed projections only after that successful commit;
+- retain human-authored content and links; and
+- require an explicit user deletion request before removing source artifacts.
+
+Incremental cluster refresh uses changed source bundles plus compact existing
+cluster context. It does not rerun a whole-library global cluster plan for every
+new Zotero item; a full global plan is reserved for fresh maps, explicit
+reconciliation, or changes affecting a large share of the corpus.
 
 The weekly heartbeat, notifications, document retrieval, and Research OS
 workflow invocation are deferred. Later automation should call the same
@@ -1073,15 +1326,22 @@ idempotent command rather than introduce a second sync implementation.
 ### 16.1 Model and status changes
 
 - Keep `SourceScope.partial_document`.
-- Make partial-document synthesis eligibility independent of source scope.
+- Add the single `evidence_eligibility` enum and remove contradictory new
+  eligibility booleans.
 - Replace visible `exhausted` with `parked_for_review`.
+- Add `SourceAnalysisBundle` schema `1`.
+- Bump the evidence-profile schema from `1.2` to `1.3`.
 - Add structured literature-position and missing-source records.
 - Replace preliminary-plus-verified relationship output with one complete
   relationship-decision record.
 - Preserve custom reasoners through capability detection.
 
-A custom reasoner that cannot return the v0.13 complete relationship record may
-still produce candidates, but those candidates remain parked and invisible.
+A legacy source reader that returns only atomic analysis remains usable through
+capability detection and a conservative local profile projection; it does not
+silently trigger the removed paid profile or fidelity calls. A custom
+relationship reasoner that cannot return the v0.13 complete relationship
+record may still produce candidates, but those candidates remain parked and
+invisible.
 
 ### 16.2 Migration
 
@@ -1089,16 +1349,30 @@ Migration is local, lazy, idempotent, and provider-free.
 
 - Accept v0.11 and v0.12 workspaces.
 - Preserve all old atomic prose.
+- Wrap each compatible v0.12 note/profile pair in a local
+  `legacy_source_analysis_bundle` without a provider call. Its canonical source
+  identity and content/profile hashes replace source-set-dependent ownership.
+- Read profile schema `1.2` through a compatibility adapter and write schema
+  `1.3` only when a new bundle or explicit local migration artifact is
+  committed.
+- If the same source has conflicting legacy profiles across source sets, retain
+  the variants and park bundle unification for review rather than choosing one
+  silently.
 - Preserve human-authored links.
 - Keep v0.12 relationship history.
 - Do not remove a visible v0.12 machine edge until its exact pair is
   successfully re-adjudicated.
-- Mark old machine decisions with their original prompt/model provenance.
+- Mark old machine decisions with their original prompt/model provenance and
+  `legacy_review_pending`.
+- Legacy v0.12 machine edges may remain visibly projected for continuity, but
+  they are excluded from new cluster evidence and schema-4 substantive
+  reasoning until their pair is successfully re-adjudicated. Their audited
+  precision is too low to treat them as trusted cluster support.
 - Recover v0.12 fidelity-parked drafts locally when the stored output is
   structurally usable and about the correct source; retain warnings.
 - Require an explicit new generation only for the two truncated or otherwise
   grossly unusable outputs.
-- Make existing partial-document notes synthesis-eligible when their stored
+- Map existing partial-document notes to `substantive_bounded` when their stored
   evidence supports it; do not regenerate them.
 - Do not backfill `Position in the Literature` for old notes automatically.
   It appears on newly generated or explicitly reprocessed sources.
@@ -1117,7 +1391,32 @@ Migration is local, lazy, idempotent, and provider-free.
 
 Success gate: v0.12 tests remain reproducible before remediation begins.
 
-### Phase 1 — Replace the atomic publication path
+### Phase 1 — Define contracts before changing orchestration
+
+Primary files:
+
+- `src/auto_zettelkasten/models.py`
+- `src/auto_zettelkasten/ports.py`
+- `src/auto_zettelkasten/readers.py`
+- `src/auto_zettelkasten/relationships.py`
+
+Define and fixture-test:
+
+- `SourceAnalysisBundle` and evidence-profile schema `1.3`;
+- canonical Zotero metadata projection versus model-observed identity;
+- evidence-anchor roles and salience;
+- the single evidence-eligibility enum;
+- pair decision jobs versus provider batch packets;
+- the complete schema-4 relationship decision;
+- cluster-planning cards and evidence-referenced member records;
+- provider capability, context, timeout, and output settings; and
+- cumulative call-ledger stage identities.
+
+Success gate: every contract round-trips, legacy capability detection is
+defined, fingerprints exclude source-set and link-rendering state, and no
+provider orchestration changes are merged before these fixtures pass.
+
+### Phase 2 — Replace the atomic publication path
 
 Primary files:
 
@@ -1130,10 +1429,11 @@ Primary files:
 
 Changes:
 
-- implement the unified source-reading contract;
+- implement the source-owned bundle writer and deterministic projections;
 - remove the separate paid profile and fidelity calls from new runs;
 - add genre/design and same-call self-review instructions;
 - remove source-specific global-prompt content;
+- isolate malformed optional bundle components from valid atomic analysis;
 - make diagnostics advisory;
 - add `parked_for_review`; and
 - recover usable v0.12 drafts without provider work.
@@ -1141,7 +1441,7 @@ Changes:
 Success gate: ordinary sources use one call, soft warnings publish, atomic prose
 is never rewritten by a later model stage, and an unchanged replay is call-free.
 
-### Phase 2 — Repair extraction and metadata accounting
+### Phase 3 — Repair extraction and metadata accounting
 
 Primary files:
 
@@ -1152,7 +1452,7 @@ Primary files:
 
 Changes:
 
-- separate coverage from synthesis eligibility;
+- migrate coverage and synthesis state to `evidence_eligibility`;
 - allow evidence-bounded partials and excerpts into synthesis;
 - fix report, chapter, appended-page, HTML, and parent-metadata cases; and
 - write separate Zotero and pipeline remediation ledgers.
@@ -1160,7 +1460,7 @@ Changes:
 Success gate: all four partial-document fixtures are analytically usable where
 appropriate, and every known classification failure is correctly represented.
 
-### Phase 3 — Add literature positions, missing-source memory, and collection indexes
+### Phase 4 — Add literature positions, missing-source memory, and collection indexes
 
 Primary files:
 
@@ -1173,15 +1473,18 @@ Primary files:
 Changes:
 
 - store and render compact literature-position records;
+- join canonical Zotero/parent metadata without invalidating source bundles;
 - match cited works to canonical sources;
 - create the missing-source recommendation ledger;
-- snapshot the complete Zotero collection hierarchy; and
+- snapshot complete collection hierarchy, direct membership, parent metadata,
+  moves, removals, and multi-collection membership;
+- exclude link-only literature rendering from source semantic hashes; and
 - generate a deterministic index for every collection and subcollection.
 
 Success gate: adding one source changes only its canonical artifacts, relevant
 collection shards, root navigation, and any matched literature-position links.
 
-### Phase 4 — Simplify relationship reasoning
+### Phase 5 — Simplify relationship reasoning
 
 Primary files:
 
@@ -1194,9 +1497,12 @@ Primary files:
 Changes:
 
 - improve global and incremental candidate discovery;
-- persist agent-friendly job packets;
-- remove the separate verifier;
+- gate discovery on the 40-pair recall benchmark;
+- persist pair decision jobs and batch four to eight jobs per provider call;
 - add one complete direction-safe decision record;
+- gate schema-4 visibility on the three known direction/type regressions;
+- remove the separate verifier from the active path only after the replacement
+  prompt passes both benchmark gates;
 - ingest DeepSeek or externally produced schema-valid results through one path;
 - preserve negative memory and retirement lineage; and
 - project reciprocal Obsidian wikilinks.
@@ -1204,7 +1510,7 @@ Changes:
 Success gate: direction, type, reason, and evidence cannot be updated
 independently; all visible relationships are reciprocal and source-grounded.
 
-### Phase 5 — Simplify clustering
+### Phase 6 — Simplify clustering
 
 Primary files:
 
@@ -1216,7 +1522,11 @@ Primary files:
 Changes:
 
 - use one global plan below the context threshold;
-- allow a 64,000-token output and 600-second request deadline;
+- include three to five compact source-local evidence references per planning
+  card;
+- require evidence-referenced member and neighbor records;
+- configure output and deadlines from measured provider capabilities, allowing
+  64,000 tokens and 600 seconds only when supported and needed;
 - remove unnecessary proposal/reconciliation/repair loops;
 - synthesize each admitted cluster independently;
 - include partial-document evidence;
@@ -1227,7 +1537,7 @@ Success gate: the 122-profile corpus reaches synthesis without partition
 proposal loops, produces fresh combined clusters, and preserves valid siblings
 when one synthesis fails.
 
-### Phase 6 — Incremental sync groundwork
+### Phase 7 — Incremental sync groundwork
 
 Primary files:
 
@@ -1239,7 +1549,8 @@ Primary files:
 
 Changes:
 
-- add stable inventory and collection diffs;
+- add stable inventory and collection diffs for new, changed, removed, moved,
+  and multi-collection sources;
 - persist last-processed state;
 - resume new-source processing idempotently;
 - connect missing-source matches to candidate discovery; and
@@ -1247,6 +1558,8 @@ Changes:
 
 Success gate: adding a Zotero source and rerunning the incremental command
 creates exactly one canonical note and only affected graph/index/cluster writes.
+Removing or moving a source preserves history and changes only the appropriate
+availability, projection, and index state.
 
 ## 18. Test plan
 
@@ -1254,6 +1567,16 @@ creates exactly one canonical note and only affected graph/index/cluster writes.
 
 - One ordinary source produces analysis, profile, anchors, literature positions,
   and recommendations in one call.
+- The source bundle fingerprint is unchanged when only collection or source-set
+  membership changes.
+- Correcting canonical Zotero/parent title, creator, year, or item type updates
+  projections without another source-reading call.
+- Model-observed bibliographic identity is diagnostic and cannot overwrite the
+  canonical Zotero record.
+- A malformed optional literature or recommendation row does not suppress a
+  valid atomic analysis.
+- A legacy analysis-only reader uses the documented local profile fallback
+  without a hidden paid call.
 - No separate fidelity or profile call occurs.
 - The global prompt contains no source-specific research case.
 - Quantitative observational fixtures use associational wording.
@@ -1269,7 +1592,10 @@ creates exactly one canonical note and only affected graph/index/cluster writes.
 
 ### 18.2 Extraction and metadata
 
-- 39/40, 100/101, and 105/106 page records remain synthesis-eligible.
+- 39/40, 100/101, and 105/106 page records become
+  `partial_document + substantive_bounded`.
+- New artifacts contain one evidence-eligibility enum and no contradictory
+  inclusion/exclusion booleans.
 - A book excerpt is analyzed as an excerpt.
 - `Pathways for Peace` is recognized as a substantive UN report.
 - A bibliography-only attachment remains context-only.
@@ -1286,6 +1612,8 @@ creates exactly one canonical note and only affected graph/index/cluster writes.
 - Exact title/author/year matching works.
 - Ambiguous fuzzy matches remain unresolved.
 - An existing source produces a wikilink without changing engagement prose.
+- Resolving only `matched_source_id` changes the managed literature projection
+  without changing the source bundle or semantic profile hash.
 - A missing work enters the acquisition ledger.
 - Adding that work later resolves the older record and creates a relationship
   candidate without rescanning every source.
@@ -1296,7 +1624,11 @@ creates exactly one canonical note and only affected graph/index/cluster writes.
 - Every Zotero collection and subcollection receives an index.
 - Parent-child links reflect `parentCollection`.
 - Direct and descendant memberships remain distinct.
+- Parent source shards contain direct members rather than duplicated descendant
+  inventories.
 - Multi-collection sources retain one canonical note/profile.
+- Collection renames and moves change navigation without invalidating source
+  analysis.
 - Unchanged index replay is byte-identical.
 - Updating one profile does not rewrite unrelated collection shards.
 - A catalogue under the safe threshold is supplied directly.
@@ -1314,6 +1646,17 @@ creates exactly one canonical note and only affected graph/index/cluster writes.
 - Intellectual lineage is not invented.
 - A relation does not strawman another work.
 - Shared method, case, dataset, or vocabulary alone stays navigation-only.
+- The frozen discovery prompt reaches at least 85% candidate recall on the 40
+  curated bridge pairs before graph migration.
+- The 195-source discovery result respects the 120 inferred-pair ceiling and
+  40% bridge reservation while retaining every exact citation/Zotero relation.
+- Mandatory explicit pairs consume adjudication capacity first; inferred pairs
+  shrink or use the reserve without exceeding 100 calls.
+- Local capping follows model priority rather than local semantic similarity.
+- Candidate discovery names selected anchor IDs and local code only
+  loads/validates them.
+- Four to eight pair jobs may share one provider batch while retaining
+  independent fingerprints, outcomes, and failures.
 - Actor, reference, type, inverse label, proposition, reason, and evidence are
   returned together.
 - A correction replaces the complete record.
@@ -1329,8 +1672,19 @@ creates exactly one canonical note and only affected graph/index/cluster writes.
 ### 18.6 Clusters
 
 - The 122-profile fixture uses one global planning call.
+- Every planning card exposes only three to five compact, source-owned evidence
+  references.
+- Planning-card evidence is selected from source-model roles and salience, not
+  local semantic judgment.
+- Every proposed member cites anchors belonging to that member and states its
+  `core`, `context`, or `bridge` role.
+- Every neighboring-cluster record cites basis sources and their anchors.
 - Preflight allows the intended 64,000-token output when supported.
-- The call receives the configured 600-second deadline.
+- Preflight selects a smaller measured output when sufficient.
+- The call receives a 600-second deadline only when the configured client and
+  endpoint support it.
+- Effective context, output, timeout, and capability identity participate in
+  checkpoint fingerprints.
 - No partition/reconciliation loop occurs below the threshold.
 - Mixed-literature cluster fixtures emerge.
 - Partial-document members contribute only recovered evidence.
@@ -1348,7 +1702,13 @@ creates exactly one canonical note and only affected graph/index/cluster writes.
 - An unchanged terminal item makes zero calls.
 - Explicit retry affects only requested gross failures.
 - DeepSeek and external-agent results use the same ingestion path.
-- Parallel workers cannot interleave registry projection.
+- v0.13 harness support is limited to immutable export, validated import, and
+  provenance; it does not implement automatic claiming or scheduling.
+- Imported results cannot interleave registry projection.
+- Removing a Zotero source preserves its note and registry history, marks
+  machine edges orphaned/inactive, and repairs managed projections.
+- Legacy v0.12 machine edges remain historical/optionally visible but cannot
+  support new cluster claims before schema-4 re-adjudication.
 - An unchanged combined replay makes zero calls and no generated-artifact
   writes.
 
@@ -1375,7 +1735,9 @@ Validate all 195 records for:
 - complete terminal accounting;
 - extraction route and coverage;
 - note structure;
+- source-bundle uniqueness and source-owned fingerprints;
 - profile and anchor integrity;
+- evidence-eligibility consistency;
 - collection and subcollection indexing;
 - missing-source and metadata ledgers;
 - relationship endpoint and anchor resolution;
@@ -1432,6 +1794,8 @@ Require:
 
 - membership relevance at least 90%;
 - core-source coverage at least 90%;
+- 100% of planned member and neighboring-cluster evidence references resolve
+  to the declared source;
 - cluster-claim support at least 95%;
 - zero fabricated debates, contradictions, or consensus;
 - meaningful coverage of the analytical corpus;
@@ -1462,22 +1826,26 @@ retroactively suppress useful atomic notes.
 The remediation is complete when:
 
 1. An ordinary new Zotero source is read once by DeepSeek and produces one
-   source-faithful atomic note, compact profile, evidence set, literature
-   position, and missing-source recommendations.
+   source-owned bundle that projects a source-faithful atomic note, compact
+   profile, evidence set, literature position, and missing-source
+   recommendations.
 2. Soft diagnostics are recorded without a retry or publication veto.
 3. Substantive recovered content remains usable even when one page or the
-   complete parent work is absent.
+   complete parent work is absent, through one consistent evidence-eligibility
+   state.
 4. The canonical source appears in every relevant Zotero collection and
    subcollection index without duplication.
 5. Relationship discovery navigates the appropriate compact catalogue rather
    than loading the complete library blindly.
-6. One complete probabilistic decision defines each intellectual relationship.
+6. Each intellectual relationship has one complete probabilistic pair
+   decision, even when several pair jobs share one provider batch.
 7. The local projector adds reciprocal Obsidian wikilinks to the relevant
    atomic notes without changing their analytical prose.
 8. Important cited works missing from the library become durable acquisition
    recommendations and link automatically when later added.
 9. A corpus fitting the safe context target receives one global cluster plan
-   and independent evidence-grounded cluster syntheses.
+   whose membership cites compact source-local evidence references, followed
+   by independent syntheses using the selected full evidence.
 10. One failed relationship packet or cluster cannot erase valid graph,
     index, note, or cluster state.
 11. An optional coding-harness agent can inspect or answer bounded job packets

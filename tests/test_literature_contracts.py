@@ -599,7 +599,7 @@ def test_evidence_profile_and_finding_are_serializable() -> None:
     )
     payload = profile.to_dict()
     assert payload["profile_schema"] == "evidence_profile"
-    assert payload["profile_schema_version"] == "1.2"
+    assert payload["profile_schema_version"] == "1.3"
     assert payload["findings"] == [finding.to_dict()]
     assert payload["evidence_anchors"][0]["evidence_anchor_id"].startswith("anchor-")
     assert payload["findings"][0]["plain_english_meaning"] == "Participants reported slightly more trust."
@@ -673,7 +673,7 @@ def test_all_report_models_default_to_current_versions(tmp_path: Path) -> None:
         LiteratureMapReport(status="ok"),
     )
     assert {(report.engine_version, report.artifact_schema_version) for report in reports} == {
-        ("0.12.0", "1.11")
+        ("0.13.0", "1.12")
     }
     assert run_report.literature_map == {}
     assert run_report.literature_report == {}

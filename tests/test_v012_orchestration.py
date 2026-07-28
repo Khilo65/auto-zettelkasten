@@ -17,30 +17,6 @@ class _Reasoner:
     name = "test-provider"
     model = "test-model"
 
-    def select_relationship_shards(self, *_args: Any, **_kwargs: Any) -> None:
-        pass
-
-    def select_relationship_bridge_shards(
-        self, *_args: Any, **_kwargs: Any
-    ) -> None:
-        pass
-
-    def select_relationship_candidates(
-        self, *_args: Any, **_kwargs: Any
-    ) -> None:
-        pass
-
-    def adjudicate_relationships(self, *_args: Any, **_kwargs: Any) -> None:
-        pass
-
-    def verify_relationships(self, *_args: Any, **_kwargs: Any) -> None:
-        pass
-
-
-class _NoVerifierReasoner:
-    name = "test-provider"
-    model = "test-model"
-
     def select_relationship_candidates(
         self, *_args: Any, **_kwargs: Any
     ) -> None:
@@ -186,60 +162,35 @@ def _candidate(source_id: str, target_id: str) -> dict[str, Any]:
     }
 
 
-def _adjudications(
-    context: Mapping[str, Any],
-    profiles: Sequence[Any] = (),
-) -> dict[str, Any]:
-    anchor_ids = {
-        str(row["source_id"]): str(row["evidence_anchors"][0]["evidence_anchor_id"])
-        for profile in profiles
-        for row in [
-            dict(profile) if isinstance(profile, Mapping) else profile.to_dict()
-        ]
-    }
+def _decisions(context: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "decisions": [
             {
-                "source_id": pair["source_id"],
-                "target_source_id": pair["target_source_id"],
-                "status": "accepted",
+                "pair_job_id": job["pair_job_id"],
+                "decision": "relationship",
+                "pair": job["pair"],
                 "relation_type": "supports",
-                "comparison_unit": "shared proposition",
+                "actor_source_id": job["pair"]["left_source_id"],
+                "reference_source_id": job["pair"]["right_source_id"],
+                "forward_label": "supports",
+                "inverse_label": "supported by",
+                "comparison_proposition": "shared proposition",
                 "reason": "Both sources independently support the same bounded proposition.",
-                "source_evidence_anchor_id": anchor_ids.get(
-                    str(pair["source_id"]),
-                    f"anchor-{pair['source_id'].lower()}",
-                ),
-                "target_evidence_anchor_id": anchor_ids.get(
-                    str(pair["target_source_id"]),
-                    f"anchor-{pair['target_source_id'].lower()}",
-                ),
-                "qualifiers": [],
-                "confidence": 0.9,
+                "left_evidence_anchor_ids": [
+                    job["selected_evidence"]["left"][0]["evidence_anchor_id"]
+                ],
+                "right_evidence_anchor_ids": [
+                    job["selected_evidence"]["right"][0]["evidence_anchor_id"]
+                ],
+                "confidence": "high",
+                "output_contract": "relationship-decision-v4",
             }
-            for pair in context["pairs"]
+            for job in context["pair_jobs"]
         ]
     }
 
 
-def _verifications(context: Mapping[str, Any]) -> dict[str, Any]:
-    return {
-        "verifications": [
-            {
-                **row,
-                "status": "confirmed",
-                "reason": (
-                    "Both located claims independently establish the same bounded "
-                    "proposition."
-                ),
-                "requested_context": [],
-            }
-            for row in context["preliminary_decisions"]
-        ]
-    }
-
-
-def test_relationships_publish_only_after_independent_verification(
+def test_relationship_decision_v4_publishes_without_a_verification_call(
     tmp_path: Path,
 ) -> None:
     profiles = [_relationship_profile("A"), _relationship_profile("B")]
@@ -253,114 +204,7 @@ def test_relationships_publish_only_after_independent_verification(
         if stage == "relationship_candidate_selection":
             return {"candidates": [_candidate("A", "B")]}
         if stage == "relationship_adjudication":
-            return _adjudications(context, _profiles)
-        if stage == "relationship_verification":
-            return _verifications(context)
-        raise AssertionError(stage)
-
-    result = _run_relationship_reasoning(
-        tmp_path,
-        profiles=profiles,
-        source_set={"source_set_type": "collection"},
-        catalogue=catalogue,
-        reasoner=_Reasoner(),
-        reasoner_calls=_Calls(handler),  # type: ignore[arg-type]
-        request=_request(tmp_path),
-    )
-    assert len(result["accepted"]) == 1, result
-    assert result["accepted"][0]["verification_status"] == "confirmed"
-
-    no_verifier = _run_relationship_reasoning(
-        tmp_path / "without-verifier",
-        profiles=profiles,
-        source_set={"source_set_type": "collection"},
-        catalogue=_catalogue(tmp_path / "without-verifier", profiles),
-        reasoner=_NoVerifierReasoner(),
-        reasoner_calls=_Calls(
-            lambda stage, _profiles, context: (
-                {"candidates": [_candidate("A", "B")]}
-                if stage == "relationship_candidate_selection"
-                else _adjudications(context, _profiles)
-            )
-        ),  # type: ignore[arg-type]
-        request=_request(tmp_path / "without-verifier"),
-    )
-    assert no_verifier["accepted"] == []
-    assert any(
-        row.get("reason") == "relationship_verification_unavailable"
-        for row in no_verifier["parked"]
-    )
-    assert set(no_verifier["selected_profile_hashes"]) == {"A", "B"}
-    assert result["selection_identity"] != no_verifier["selection_identity"]
-
-
-def test_cross_literature_bridge_routing_uses_cards_then_selected_entries(
-    tmp_path: Path,
-) -> None:
-    profiles = [
-        _relationship_profile("A"),
-        _relationship_profile("B"),
-        _relationship_profile("C"),
-        _relationship_profile("D"),
-    ]
-    shards = [
-        {
-            "shard_id": "mediation",
-            "literature_id": "mediation",
-            "source_ids": ["A", "B"],
-            "routing_card": {
-                "shard_id": "mediation",
-                "title": "Mediation",
-                "source_count": 2,
-                "representative_theses": ["Monitoring reduces uncertainty."],
-            },
-        },
-        {
-            "shard_id": "relapse",
-            "literature_id": "relapse",
-            "source_ids": ["C", "D"],
-            "routing_card": {
-                "shard_id": "relapse",
-                "title": "Conflict relapse",
-                "source_count": 2,
-                "representative_theses": ["Commitment problems predict relapse."],
-            },
-        },
-    ]
-    calls: _Calls
-
-    def handler(
-        stage: str,
-        _profiles: Sequence[Any],
-        context: Mapping[str, Any],
-    ) -> Mapping[str, Any]:
-        if stage == "relationship_candidate_selection":
-            return {"candidates": []}
-        if stage == "relationship_bridge_shard_selection":
-            assert "catalogue_entries" not in context
-            return {
-                "shard_pairs": [
-                    {
-                        "left_shard_id": "mediation",
-                        "right_shard_id": "relapse",
-                        "reason": "Their theses identify a plausible commitment mechanism bridge.",
-                        "confidence": 0.9,
-                    }
-                ]
-            }
-        if stage == "relationship_bridge_candidate_selection":
-            assert not _profiles
-            assert {row["source_id"] for row in context["catalogue_entries"]} == {
-                "A",
-                "B",
-                "C",
-                "D",
-            }
-            return {"candidates": [_candidate("A", "C")]}
-        if stage == "relationship_adjudication":
-            return _adjudications(context, _profiles)
-        if stage == "relationship_verification":
-            return _verifications(context)
+            return _decisions(context)
         raise AssertionError(stage)
 
     calls = _Calls(handler)
@@ -368,14 +212,16 @@ def test_cross_literature_bridge_routing_uses_cards_then_selected_entries(
         tmp_path,
         profiles=profiles,
         source_set={"source_set_type": "collection"},
-        catalogue=_catalogue(tmp_path, profiles, shards=shards),
+        catalogue=catalogue,
         reasoner=_Reasoner(),
         reasoner_calls=calls,  # type: ignore[arg-type]
         request=_request(tmp_path),
     )
-    assert [(row["source_id"], row["target_source_id"]) for row in result["accepted"]] == [
-        ("A", "C")
-    ], result
+    assert len(result["accepted"]) == 1, result
+    assert [stage for stage, _profiles, _context in calls.seen] == [
+        "relationship_candidate_selection",
+        "relationship_adjudication",
+    ]
 
 
 def test_cluster_proposals_are_partitioned_and_reconciled_without_profiles(

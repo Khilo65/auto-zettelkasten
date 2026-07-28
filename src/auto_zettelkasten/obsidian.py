@@ -65,6 +65,11 @@ def export_obsidian(
         (path, Path("Indexes") / "by_literature" / path.name)
         for path in sorted(literature_indexes.glob("*.md"))
     )
+    collection_indexes = root / "02_source_memory" / "indexes" / "collections"
+    projections.extend(
+        (path, Path("Indexes") / "collections" / path.relative_to(collection_indexes))
+        for path in sorted(collection_indexes.rglob("*.md"))
+    )
     latest_map = _latest_canonical_map(root / "03_literature_synthesis" / "maps")
     cluster_root = (
         latest_map / "clusters"

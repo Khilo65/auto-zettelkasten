@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import shutil
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from . import ARTIFACT_SCHEMA_VERSION, ENGINE_VERSION
-from .files import now_iso, read_yaml, slugify, write_json, write_yaml
+from .files import now_iso, read_yaml, sha256_text, slugify, write_json, write_yaml
 from .indexes import write_source_set
 from .literature import run_literature_map as run_profile_literature_map
 from .migration import migrate_workspace
@@ -26,6 +28,7 @@ from .models import (
     StatusReport,
 )
 from .obsidian import export_obsidian
+from .notes import source_id_for_item
 from .pipeline import (
     _RunProgress,
     _analytical_profile_source_ids,
@@ -54,7 +57,12 @@ from .workspace import (
     run_directory,
     validate_opaque_id,
 )
-from .zotero import ZoteroLocalClient
+from .zotero import (
+    ZoteroLocalClient,
+    diff_collection_snapshots,
+    normalize_collection_snapshot,
+    scope_collection_snapshot,
+)
 
 __all__ = [
     "ARTIFACT_SCHEMA_VERSION",
@@ -79,6 +87,7 @@ __all__ = [
     "resume_map",
     "run_map",
     "run_literature_map",
+    "sync_zotero",
 ]
 
 
@@ -205,6 +214,23 @@ def inventory(
         if effective_scope == "collection" and not effective_key:
             raise ValueError("selected collection has no key")
     items = [dict(row) for row in client.inventory(effective_scope, effective_key or None)]
+    collections = [
+        dict(row) for row in client.collections() if isinstance(row, Mapping)
+    ]
+    library_items = (
+        items
+        if effective_scope == "library" and not limit
+        else [
+            dict(row)
+            for row in client.inventory("library")
+            if isinstance(row, Mapping)
+        ]
+    )
+    collection_snapshot = normalize_collection_snapshot(
+        collections,
+        library_items,
+        parent_items=_snapshot_parent_items(client, library_items),
+    )
     if effective_key and not collection_name:
         try:
             for collection in client.collections():
@@ -219,6 +245,10 @@ def inventory(
         items = items[:limit]
     inventory_path = root / "01_custody" / "zotero" / "inventory" / f"{slugify(run_id)}.json"
     write_json(inventory_path, items)
+    collection_snapshot_path = (
+        root / "01_custody" / "zotero" / "collection_snapshot.yml"
+    )
+    write_yaml(collection_snapshot_path, collection_snapshot)
     run_dir = run_directory(root, run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
     write_json(run_dir / "inventory.json", items)
@@ -237,8 +267,19 @@ def inventory(
         workspace=root,
         run_id=run_id,
         created_at=now_iso(),
-        artifacts=artifact_rows(root, [inventory_path, run_dir / "inventory.json", Path(source_set["path"])]),
-        metadata={"source_set": source_set},
+        artifacts=artifact_rows(
+            root,
+            [
+                inventory_path,
+                run_dir / "inventory.json",
+                collection_snapshot_path,
+                Path(source_set["path"]),
+            ],
+        ),
+        metadata={
+            "source_set": source_set,
+            "collection_snapshot_fingerprint": collection_snapshot["fingerprint"],
+        },
     )
     write_yaml(run_dir / "inventory_manifest.yml", manifest.to_dict())
     return {
@@ -249,6 +290,7 @@ def inventory(
         "item_count": len(items),
         "items": items,
         "source_set": source_set,
+        "collection_snapshot": collection_snapshot,
         "artifact_manifest": manifest.to_dict(),
     }
 
@@ -275,6 +317,400 @@ def run_map(
         external_discovery=external_discovery,
         run_id=run_id,
         resume=resume,
+    )
+
+
+def sync_zotero(
+    request: MapRequest,
+    *,
+    client: ZoteroClient | None = None,
+    reader: ReaderProvider | None = None,
+    vision: VisionProvider | None = None,
+    controller: ControllerPort | None = None,
+    literature_reasoner: LiteratureReasoner | None = None,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Process a read-only Zotero diff through the ordinary resumable mapper."""
+
+    if request.limit:
+        raise ValueError("incremental sync does not support a partial --limit")
+    root = resolve_workspace(request.workspace)
+    initialize(root)
+    zotero = client or ZoteroLocalClient()
+    effective_scope, effective_collection_key, collection_name = _sync_scope(
+        request,
+        zotero,
+    )
+    collections = [
+        dict(row) for row in zotero.collections() if isinstance(row, Mapping)
+    ]
+    if effective_collection_key and not collection_name:
+        collection_name = next(
+            (
+                str(
+                    (
+                        row.get("data")
+                        if isinstance(row.get("data"), Mapping)
+                        else row
+                    ).get("name")
+                    or ""
+                ).strip()
+                for row in collections
+                if str(
+                    row.get("key")
+                    or (
+                        row.get("data")
+                        if isinstance(row.get("data"), Mapping)
+                        else row
+                    ).get("key")
+                    or ""
+                )
+                == effective_collection_key
+            ),
+            "",
+        )
+    library_items = [
+        dict(row)
+        for row in zotero.inventory("library")
+        if isinstance(row, Mapping)
+    ]
+    scoped_items = (
+        library_items
+        if effective_scope == "library"
+        else [
+            dict(row)
+            for row in zotero.inventory("collection", effective_collection_key)
+            if isinstance(row, Mapping)
+        ]
+    )
+    current_full = normalize_collection_snapshot(
+        collections,
+        library_items,
+        parent_items=_snapshot_parent_items(zotero, library_items),
+    )
+    current = scope_collection_snapshot(
+        current_full,
+        scope=effective_scope,
+        collection_key=effective_collection_key,
+        item_keys=[_zotero_item_key(row) for row in scoped_items],
+    )
+    write_yaml(
+        root / "01_custody" / "zotero" / "collection_snapshot.yml",
+        current_full,
+    )
+    state_path = _processed_snapshot_path(
+        root,
+        effective_scope,
+        effective_collection_key,
+    )
+    previous = read_yaml(state_path, {}) or {}
+    changes = diff_collection_snapshots(previous, current)
+    changed = any(changes.values())
+    effective_run_id = run_id or f"zotero-sync-{current['fingerprint'][:16]}"
+    pending_run = (run_directory(root, effective_run_id) / "inventory.json").is_file()
+    if not changed and previous and not pending_run:
+        return {
+            "status": "unchanged",
+            "run_id": "",
+            "snapshot_fingerprint": current["fingerprint"],
+            "changes": changes,
+            "affected_source_ids": [],
+            "affected_relationship_ids": [],
+            "affected_cluster_ids": [],
+            "provider_call_count": 0,
+            "relationship_discovery_performed": False,
+        }
+
+    changed_keys = {
+        key
+        for name, keys in changes.items()
+        if name.endswith("item_keys")
+        for key in keys
+    }
+    affected_source_ids = sorted(
+        source_id_for_item({"key": key, "data": {"key": key}})
+        for key in changed_keys
+    )
+    prior_relationship_ids, prior_cluster_ids = _affected_graph_ids(
+        root,
+        affected_source_ids,
+    )
+    existing_note_keys = {
+        str(row.get("zotero_item_key") or "").upper()
+        for row in all_workspace_note_rows(root)
+        if row.get("zotero_item_key")
+    }
+    process_keys = {
+        *changes["changed_item_keys"],
+        *(
+            key
+            for key in changes["new_item_keys"]
+            if key.upper() not in existing_note_keys
+        ),
+    }
+    items_by_key = {
+        _zotero_item_key(row).upper(): row
+        for row in scoped_items
+        if _zotero_item_key(row)
+    }
+    processing_items = [
+        items_by_key[key.upper()]
+        for key in sorted(process_keys)
+        if key.upper() in items_by_key
+    ]
+
+    report: RunReport | None = None
+    projection_result: Mapping[str, Any] = {}
+    if processing_items or pending_run:
+        _freeze_incremental_run(
+            root,
+            effective_run_id,
+            request=request,
+            items=processing_items,
+            collection_snapshot=current_full,
+            effective_scope=effective_scope,
+            effective_collection_key=effective_collection_key,
+            collection_name=collection_name,
+            scope_fingerprint=str(current.get("fingerprint") or ""),
+            preserve_existing=pending_run,
+        )
+        report = run_map(
+            request,
+            client=zotero,
+            reader=reader,
+            vision=vision,
+            controller=controller,
+            literature_reasoner=literature_reasoner,
+            run_id=effective_run_id,
+            resume=True,
+        )
+        completed = report.status.startswith("completed")
+        status = "synced" if completed else report.status
+        provider_call_count = report.provider_call_count
+    else:
+        projection_result = _refresh_sync_projections(
+            root,
+            request=request,
+            run_id=effective_run_id,
+            collection_snapshot=current_full,
+        )
+        completed = True
+        status = "synced"
+        provider_call_count = 0
+
+    if completed:
+        write_yaml(
+            state_path,
+            {
+                **current,
+                "processed_run_id": effective_run_id,
+                "processed_at": now_iso(),
+            },
+        )
+    current_relationship_ids, current_cluster_ids = _affected_graph_ids(
+        root,
+        affected_source_ids,
+    )
+    result = {
+        "status": status,
+        "run_id": effective_run_id,
+        "snapshot_fingerprint": current["fingerprint"],
+        "snapshot_scope": current["scope"],
+        "processed_snapshot_path": str(state_path),
+        "changes": changes,
+        "affected_source_ids": affected_source_ids,
+        "processed_item_keys": sorted(process_keys),
+        "affected_relationship_ids": sorted(
+            prior_relationship_ids | current_relationship_ids
+        ),
+        "affected_cluster_ids": sorted(prior_cluster_ids | current_cluster_ids),
+        "provider_call_count": provider_call_count,
+        "relationship_discovery_performed": bool(processing_items or pending_run),
+    }
+    if report is not None:
+        result["report"] = report.to_dict()
+    elif projection_result:
+        result["projection"] = dict(projection_result)
+    return result
+
+
+def _sync_scope(
+    request: MapRequest,
+    zotero: ZoteroClient,
+) -> tuple[str, str, str]:
+    scope = request.scope
+    collection_key = str(request.collection_key or "")
+    collection_name = ""
+    if scope == "selected":
+        selected = zotero.selected_collection()
+        scope = "library" if selected.get("scope") == "library" else "collection"
+        collection_key = str(selected.get("key") or "")
+        collection_name = str(selected.get("name") or "").strip()
+    if scope == "collection" and not collection_key:
+        raise ValueError("collection sync requires a collection key")
+    return scope, collection_key, collection_name
+
+
+def _processed_snapshot_path(
+    root: Path,
+    scope: str,
+    collection_key: str,
+) -> Path:
+    if scope == "library":
+        return root / "11_state" / "zotero" / "last_processed_snapshot.yml"
+    return (
+        root
+        / "11_state"
+        / "zotero"
+        / "processed_snapshots"
+        / f"collection-{slugify(collection_key)}.yml"
+    )
+
+
+def _zotero_item_key(item: Mapping[str, Any]) -> str:
+    data = item.get("data", item)
+    if not isinstance(data, Mapping):
+        data = {}
+    return str(item.get("key") or data.get("key") or "")
+
+
+def _snapshot_parent_items(
+    zotero: ZoteroClient,
+    items: Sequence[Mapping[str, Any]],
+) -> dict[str, Mapping[str, Any]]:
+    parents = {
+        key: item
+        for item in items
+        if (key := _zotero_item_key(item))
+    }
+    lookup = getattr(zotero, "item", None)
+    if not callable(lookup):
+        return parents
+    parent_keys = {
+        str(data.get("parentItem") or "").strip()
+        for item in items
+        if isinstance((data := item.get("data", item)), Mapping)
+    }
+    for parent_key in sorted(parent_keys - parents.keys() - {""}):
+        parent = lookup(parent_key)
+        if isinstance(parent, Mapping):
+            parents[parent_key] = parent
+    return parents
+
+
+def _freeze_incremental_run(
+    root: Path,
+    run_id: str,
+    *,
+    request: MapRequest,
+    items: Sequence[Mapping[str, Any]],
+    collection_snapshot: Mapping[str, Any],
+    effective_scope: str,
+    effective_collection_key: str,
+    collection_name: str,
+    scope_fingerprint: str,
+    preserve_existing: bool,
+) -> None:
+    run_dir = run_directory(root, run_id)
+    frozen_inventory_path = run_dir / "inventory.json"
+    frozen_snapshot_path = run_dir / "collection_snapshot.yml"
+    if preserve_existing:
+        existing = read_yaml(run_dir / "frozen_inventory.yml", {}) or {}
+        if (
+            existing.get("sync_scope_fingerprint")
+            and str(existing.get("sync_scope_fingerprint") or "")
+            != scope_fingerprint
+        ):
+            raise ValueError(
+                "incremental run snapshot changed; use a new run_id for the new Zotero state"
+            )
+        return
+    run_dir.mkdir(parents=True, exist_ok=True)
+    normalized_items = [dict(row) for row in items]
+    write_json(frozen_inventory_path, normalized_items)
+    write_yaml(frozen_snapshot_path, dict(collection_snapshot))
+    write_yaml(
+        run_dir / "frozen_inventory.yml",
+        {
+            "run_id": run_id,
+            "requested_scope": request.scope,
+            "effective_scope": effective_scope,
+            "effective_collection_key": effective_collection_key,
+            "collection_name": collection_name,
+            "inventory_count": len(normalized_items),
+            "inventory_hash": sha256_text(
+                json.dumps(
+                    normalized_items,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    default=str,
+                )
+            ),
+            "frozen_at": now_iso(),
+            "refresh_requires_new_run": True,
+            "incremental_sync": True,
+            "sync_scope_fingerprint": scope_fingerprint,
+        },
+    )
+
+
+def _refresh_sync_projections(
+    root: Path,
+    *,
+    request: MapRequest,
+    run_id: str,
+    collection_snapshot: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    note_rows = all_workspace_note_rows(root)
+    local_request = replace(
+        request,
+        literature_policy=replace(
+            request.literature_policy,
+            synthesis_enabled=False,
+        ),
+    )
+    return rebuild_map(
+        root,
+        source_set=workspace_source_set(root, note_rows, run_id=run_id),
+        note_rows=note_rows,
+        terminal_rows=[],
+        items=[],
+        run_id=run_id,
+        question=request.question,
+        request=local_request,
+        collection_snapshot=collection_snapshot,
+    )
+
+
+def _affected_graph_ids(
+    root: Path,
+    source_ids: Sequence[str],
+) -> tuple[set[str], set[str]]:
+    wanted = set(source_ids)
+    catalogue = read_yaml(
+        root / "02_source_memory" / "indexes" / "source_catalogue.yml",
+        {},
+    ) or {}
+    rows = catalogue.get("sources", []) if isinstance(catalogue, Mapping) else []
+    affected = [
+        row
+        for row in rows
+        if isinstance(row, Mapping)
+        and str(row.get("source_id") or "") in wanted
+    ]
+    return (
+        {
+            str(value)
+            for row in affected
+            for value in row.get("relationship_ids", []) or []
+            if str(value)
+        },
+        {
+            str(value)
+            for row in affected
+            for value in row.get("cluster_ids", []) or []
+            if str(value)
+        },
     )
 
 
@@ -351,7 +787,10 @@ def get_status(workspace: Path | str, run_id: str | None = None) -> StatusReport
         "inventory_count": int(live.get("inventory_count", 0) or 0),
         "validated_note_count": int(live.get("validated_note_count", 0) or 0),
         "limited_note_count": int(live.get("limited_note_count", 0) or 0),
-        "exhausted_count": int(live.get("exhausted_count", 0) or 0),
+        "parked_for_review_count": int(
+            live.get("parked_for_review_count", live.get("exhausted_count", 0))
+            or 0
+        ),
         "partial_count": int(live.get("partial_count", 0) or 0),
         "pending_count": int(live.get("pending_count", 0) or 0),
         "terminal_count": int(live.get("terminal_count", 0) or 0),
@@ -522,10 +961,13 @@ def get_status(workspace: Path | str, run_id: str | None = None) -> StatusReport
             )
             or 0
         ),
-        "coverage_exhausted_count": int(
+        "coverage_parked_for_review_count": int(
             live.get(
-                "coverage_exhausted_count",
-                literature_live.get("coverage_exhausted_count", 0),
+                "coverage_parked_for_review_count",
+                literature_live.get(
+                    "coverage_parked_for_review_count",
+                    literature_live.get("coverage_exhausted_count", 0),
+                ),
             )
             or 0
         ),
@@ -583,7 +1025,7 @@ def get_status(workspace: Path | str, run_id: str | None = None) -> StatusReport
 _SOURCE_PROGRESS_COUNT_FIELDS = (
     "validated_note_count",
     "limited_note_count",
-    "exhausted_count",
+    "parked_for_review_count",
     "partial_count",
     "pending_count",
 )
@@ -617,6 +1059,12 @@ def _progress_items_from_source_set(
         field: int(source_set.get(field, 0) or 0)
         for field in _SOURCE_PROGRESS_COUNT_FIELDS
     }
+    counts["parked_for_review_count"] = int(
+        source_set.get(
+            "parked_for_review_count", source_set.get("exhausted_count", 0)
+        )
+        or 0
+    )
     if any(value < 0 for value in counts.values()):
         raise ValueError("source-set progress counts cannot be negative")
     accounted = sum(counts.values())
@@ -636,7 +1084,7 @@ def _progress_items_from_source_set(
     for field, status in (
         ("validated_note_count", "validated_note"),
         ("limited_note_count", "limited_note"),
-        ("exhausted_count", "exhausted"),
+        ("parked_for_review_count", "parked_for_review"),
         ("partial_count", "partial"),
         ("pending_count", "pending"),
     ):
@@ -739,7 +1187,21 @@ def build_map(
         navigation_policy=navigation,
     )
     if reasoner is not None:
-        _apply_reader_policy(reasoner, map_request.processing)  # type: ignore[arg-type]
+        literature_request_deadline = max(
+            map_request.processing.request_deadline_seconds,
+            min(600.0, policy.literature_deadline_seconds),
+        )
+        _apply_reader_policy(  # type: ignore[arg-type]
+            reasoner,
+            replace(
+                map_request.processing,
+                request_deadline_seconds=literature_request_deadline,
+                document_deadline_seconds=max(
+                    map_request.processing.document_deadline_seconds,
+                    literature_request_deadline,
+                ),
+            ),
+        )
     progress_items = _progress_items_from_source_set(selected_source_set)
     progress = _RunProgress(
         run_directory(root, run_id) / "progress.yml",

@@ -158,7 +158,7 @@ def test_deepseek_prefers_direct_read_well_beyond_sixty_thousand_characters() ->
     assert reader.reading_strategy("x" * 240_000, metadata) == "direct"
     assert reader.reading_strategy("x" * 1_090_074, metadata) == "direct"
     assert reader.reading_strategy("x" * 2_500_000, metadata) == "hierarchical"
-    assert 790_000 <= reader.direct_input_token_budget <= 800_000
+    assert 490_000 <= reader.direct_input_token_budget <= 500_000
 
 
 def test_deepseek_chunk_prompt_parsing_and_per_call_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -251,7 +251,7 @@ def test_gemini_and_ollama_apply_hierarchical_output_caps(
         assert captured[0]["options"]["num_predict"] == 200
 
 
-def test_retry_once_for_429_respects_retry_after_and_absolute_deadline(
+def test_429_is_not_retried_automatically(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     clock = [0.0]
@@ -275,10 +275,11 @@ def test_retry_once_for_429_respects_retry_after_and_absolute_deadline(
     monkeypatch.setattr("auto_zettelkasten.readers.time.sleep", sleep)
     monkeypatch.setattr("auto_zettelkasten.readers.urllib.request.urlopen", urlopen)
 
-    assert _post_json("https://provider.invalid", {}, timeout=5) == {"ok": True}
-    assert attempts[0] == 2
-    assert sleeps == [1.0]
-    assert timeouts == pytest.approx([5.0, 4.0])
+    with pytest.raises(ProviderError, match="HTTP 429"):
+        _post_json("https://provider.invalid", {}, timeout=5)
+    assert attempts[0] == 1
+    assert sleeps == []
+    assert timeouts == pytest.approx([5.0])
 
 
 @pytest.mark.parametrize("status", [400, 401, 403, 404, 422])
@@ -295,7 +296,9 @@ def test_invalid_and_auth_4xx_are_never_retried(monkeypatch: pytest.MonkeyPatch,
     assert attempts[0] == 1
 
 
-def test_network_timeout_is_retried_only_once(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_network_timeout_is_not_retried_automatically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     attempts = [0]
 
     def urlopen(request, timeout):
@@ -305,10 +308,10 @@ def test_network_timeout_is_retried_only_once(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr("auto_zettelkasten.readers.urllib.request.urlopen", urlopen)
     with pytest.raises(ProviderError, match="timed out"):
         _post_json("https://provider.invalid", {}, timeout=5)
-    assert attempts[0] == 2
+    assert attempts[0] == 1
 
 
-def test_5xx_is_retried_once(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_5xx_is_not_retried_automatically(monkeypatch: pytest.MonkeyPatch) -> None:
     attempts = [0]
 
     def urlopen(request, timeout):
@@ -318,11 +321,14 @@ def test_5xx_is_retried_once(monkeypatch: pytest.MonkeyPatch) -> None:
         return _Response({"ok": True})
 
     monkeypatch.setattr("auto_zettelkasten.readers.urllib.request.urlopen", urlopen)
-    assert _post_json("https://provider.invalid", {}, timeout=5) == {"ok": True}
-    assert attempts[0] == 2
+    with pytest.raises(ProviderError, match="HTTP 503"):
+        _post_json("https://provider.invalid", {}, timeout=5)
+    assert attempts[0] == 1
 
 
-def test_non_timeout_network_error_is_retried_once(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_non_timeout_network_error_is_not_retried_automatically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     attempts = [0]
 
     def urlopen(request, timeout):
@@ -332,10 +338,12 @@ def test_non_timeout_network_error_is_retried_once(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr("auto_zettelkasten.readers.urllib.request.urlopen", urlopen)
     with pytest.raises(ProviderError, match="provider unavailable"):
         _post_json("https://provider.invalid", {}, timeout=5)
-    assert attempts[0] == 2
+    assert attempts[0] == 1
 
 
-def test_incomplete_chunked_response_is_retried_once(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_incomplete_chunked_response_is_not_retried_automatically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     attempts = [0]
 
     def urlopen(request, timeout):
@@ -345,8 +353,9 @@ def test_incomplete_chunked_response_is_retried_once(monkeypatch: pytest.MonkeyP
         return _Response({"ok": True})
 
     monkeypatch.setattr("auto_zettelkasten.readers.urllib.request.urlopen", urlopen)
-    assert _post_json("https://provider.invalid", {}, timeout=5) == {"ok": True}
-    assert attempts[0] == 2
+    with pytest.raises(ProviderError, match="connection interrupted"):
+        _post_json("https://provider.invalid", {}, timeout=5)
+    assert attempts[0] == 1
 
 
 def test_retry_after_cannot_exceed_absolute_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -358,7 +367,7 @@ def test_retry_after_cannot_exceed_absolute_deadline(monkeypatch: pytest.MonkeyP
         raise _http_error(503, retry_after="10")
 
     monkeypatch.setattr("auto_zettelkasten.readers.urllib.request.urlopen", urlopen)
-    with pytest.raises(ProviderError, match="deadline exceeded"):
+    with pytest.raises(ProviderError, match="HTTP 503"):
         _post_json("https://provider.invalid", {}, timeout=2)
     assert attempts[0] == 1
 

@@ -54,8 +54,13 @@ REQUIRED_FRONTMATTER = {
     "related_notes",
 }
 
-ANALYTICAL_NOTE_STATUSES = {"analytical_atomic_note", "verified_atomic_note"}
+ANALYTICAL_NOTE_STATUSES = {
+    "analytical_atomic_note",
+    "verified_atomic_note",
+    "partial_document_atomic_note",
+}
 LIMITED_NOTE_STATUSES = {
+    # Legacy v0.12 partial notes keep their limited two-section reader.
     "partial_document_atomic_note",
     "abstract_only_atomic_note",
     "metadata_only_source_note",
@@ -71,6 +76,7 @@ NON_SOURCE_FRONTMATTER_FIELDS = frozenset(
         "gap_links",
         "gaps",
         "human_review",
+        "related",
         "related_notes",
         "review_status",
         "source_faithfulness_review",
@@ -86,6 +92,9 @@ REVIEW_STATUS_HEADINGS = ("Automated Validation", "Source-Faithfulness Review")
 GRAPH_HEADING = "## Graph Links"
 GRAPH_START_MARKER = "<!-- auto-zettelkasten:graph:start -->"
 GRAPH_END_MARKER = "<!-- auto-zettelkasten:graph:end -->"
+LITERATURE_HEADING = "## Position in the Literature"
+LITERATURE_START_MARKER = "<!-- auto-zettelkasten:literature:start -->"
+LITERATURE_END_MARKER = "<!-- auto-zettelkasten:literature:end -->"
 NOTE_METADATA_SCHEMA_VERSION = "1"
 REQUIRED_LIMITED_FRONTMATTER = (REQUIRED_FRONTMATTER - {"reader_provider", "reader_model"}) | {
     "source_scope",
@@ -229,6 +238,15 @@ def render_atomic_note(frontmatter: Mapping[str, Any], analysis: Mapping[str, An
     yaml_text = _dump_frontmatter(frontmatter)
     title = str(frontmatter.get("title") or "Untitled Source")
     lines = ["---", yaml_text, "---", "", f"# {title}", ""]
+    if frontmatter.get("note_status") == "partial_document_atomic_note":
+        lines.extend(
+            [
+                "> [!warning] Coverage boundary",
+                "> "
+                + _partial_coverage_limitation(frontmatter).replace("\n", "\n> "),
+                "",
+            ]
+        )
     for key, heading in SECTION_HEADINGS:
         lines.extend([f"## {heading}", "", str(analysis.get(key, "")).strip(), ""])
     return "\n".join(lines)
@@ -313,10 +331,19 @@ def validate_atomic_note(text: str) -> NoteValidation:
             errors.append(f"invalid_frontmatter_type:{field}")
     if frontmatter.get("note_status") not in ANALYTICAL_NOTE_STATUSES:
         errors.append("invalid_note_status")
-    if frontmatter.get("source_scope") != "full_document":
-        errors.append("source_scope_full_document_required")
-    if _coverage_gate(frontmatter.get("source_coverage")) != "passed":
-        errors.append("source_coverage_gate_not_passed")
+    partial = (
+        frontmatter.get("note_status") == "partial_document_atomic_note"
+    )
+    expected_scope = "partial_document" if partial else "full_document"
+    if frontmatter.get("source_scope") != expected_scope:
+        errors.append(f"source_scope_{expected_scope}_required")
+    allowed_gates = {"limited", "passed"} if partial else {"passed"}
+    if _coverage_gate(frontmatter.get("source_coverage")) not in allowed_gates:
+        errors.append(
+            "source_coverage_gate_not_passed"
+            if not partial
+            else "source_coverage_gate_not_analytically_usable"
+        )
     if not re.fullmatch(r"[0-9a-f]{64}", str(frontmatter.get("inspected_content_hash", ""))):
         errors.append("invalid_inspected_content_hash")
     for _, heading in SECTION_HEADINGS:
@@ -326,7 +353,7 @@ def validate_atomic_note(text: str) -> NoteValidation:
     detailed_findings = _section_text(body, "Detailed Findings")
     plain_english = _section_text(body, "Plain-English Interpretation")
     if plain_english and _normalized_prose(plain_english) == _normalized_prose(detailed_findings):
-        errors.append("plain_english_interpretation_repeats_detailed_findings")
+        warnings.append("plain_english_interpretation_repeats_detailed_findings")
     locator_match = re.search(r"^## Locators\s*$\n+(.*?)(?=^## |\Z)", body, flags=re.MULTILINE | re.DOTALL)
     locator_text = locator_match.group(1).strip().casefold() if locator_match else ""
     weak_locator = any(
@@ -334,7 +361,7 @@ def validate_atomic_note(text: str) -> NoteValidation:
         for marker in ("not supplied", "unavailable", "unknown", "not reported", "n/a", "not applicable")
     )
     if not locator_text or weak_locator or not _TRACEABLE_LOCATOR.search(locator_text):
-        errors.append("untraceable_locators")
+        warnings.append("untraceable_locators")
     return NoteValidation(passed=not errors, errors=errors, warnings=warnings)
 
 
@@ -445,7 +472,12 @@ def validate_limited_note(text: str) -> NoteValidation:
 
 
 def validate_note(text: str) -> NoteValidation:
-    frontmatter, _ = parse_atomic_note(text)
+    frontmatter, body = parse_atomic_note(text)
+    if (
+        frontmatter.get("note_status") == "partial_document_atomic_note"
+        and _section_text(body, "Thesis")
+    ):
+        return validate_atomic_note(text)
     if frontmatter.get("note_status") in LIMITED_NOTE_STATUSES:
         return validate_limited_note(text)
     return validate_atomic_note(text)
@@ -466,7 +498,9 @@ def write_atomic_note(workspace: Path, frontmatter: Mapping[str, Any], analysis:
     if not validation.passed:
         return candidate, validation
     committed = dict(frontmatter)
-    committed["note_status"] = "analytical_atomic_note"
+    committed["note_status"] = str(
+        frontmatter.get("note_status") or "analytical_atomic_note"
+    )
     committed["structural_validation"] = validation.to_dict()
     committed.pop("human_review", None)
     committed["updated_at"] = now_iso()
@@ -620,6 +654,29 @@ def strip_review_status_material(text: str, *, update_versions: bool = False) ->
 
 def _strip_generated_note_sections(body: str) -> str:
     body = _strip_review_status_sections(body)
+    literature = _managed_literature_block(body)
+    if literature:
+        section = re.search(
+            rf"^{re.escape(LITERATURE_HEADING)}[ \t]*$\n?(?P<content>.*?)(?=^## |\Z)",
+            body,
+            flags=re.MULTILINE | re.DOTALL,
+        )
+        if section and section.start() <= literature.start() < section.end():
+            content = body[section.start("content") : section.end()]
+            offset = literature.start() - section.start("content")
+            remaining = (
+                content[:offset]
+                + content[literature.end() - section.start("content") :]
+            )
+            body = _without_markdown_span(
+                body,
+                section.start() if not remaining.strip() else literature.start(),
+                section.end() if not remaining.strip() else literature.end(),
+            )
+        else:
+            body = _without_markdown_span(
+                body, literature.start(), literature.end()
+            )
     section = _graph_section(body)
     managed = _managed_graph_block(body)
     if section and managed and section.start() <= managed.start() < section.end():
@@ -649,6 +706,15 @@ def _managed_graph_block(body: str) -> re.Match[str] | None:
     return re.search(
         rf"^{re.escape(GRAPH_START_MARKER)}[ \t]*$\n?.*?"
         rf"^{re.escape(GRAPH_END_MARKER)}[ \t]*$",
+        body,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+
+
+def _managed_literature_block(body: str) -> re.Match[str] | None:
+    return re.search(
+        rf"^{re.escape(LITERATURE_START_MARKER)}[ \t]*$\n?.*?"
+        rf"^{re.escape(LITERATURE_END_MARKER)}[ \t]*$",
         body,
         flags=re.MULTILINE | re.DOTALL,
     )
@@ -704,13 +770,76 @@ def update_note_frontmatter(path: Path, updates: Mapping[str, Any]) -> None:
     note = read_note(path)
     frontmatter = dict(note["frontmatter"])
     body = str(note["body"])
+    old_title = str(frontmatter.get("title") or "")
     frontmatter.update(dict(updates))
+    new_title = str(frontmatter.get("title") or "")
+    if old_title and new_title and old_title != new_title:
+        body = re.sub(
+            rf"^# {re.escape(old_title)}\s*$",
+            f"# {new_title}",
+            body,
+            count=1,
+            flags=re.MULTILINE,
+        )
     workspace = _workspace_for_note(path)
     if workspace is not None:
         _write_note_metadata(workspace, path, frontmatter)
         frontmatter = public_note_frontmatter(frontmatter)
     yaml_text = _dump_frontmatter(frontmatter)
     atomic_write_text(path, f"---\n{yaml_text}\n---\n{body}")
+
+
+def update_note_literature(
+    path: Path,
+    positions: Sequence[Mapping[str, Any]],
+    matched_wikilinks: Mapping[str, str] | None = None,
+) -> bool:
+    """Project only the owned literature-position block."""
+
+    text = path.read_text(encoding="utf-8")
+    start_count = text.count(LITERATURE_START_MARKER)
+    end_count = text.count(LITERATURE_END_MARKER)
+    if (start_count, end_count) not in {(0, 0), (1, 1)}:
+        raise ValueError("ambiguous_managed_literature_block")
+    _, body = parse_atomic_note(text)
+    managed = _managed_literature_block(body)
+    if start_count == 1 and managed is None:
+        raise ValueError("ambiguous_managed_literature_block")
+    matched_wikilinks = matched_wikilinks or {}
+    lines = []
+    for position in positions:
+        position_id = str(position.get("literature_position_id") or "")
+        author = str(position.get("author") or "").strip()
+        year = str(position.get("year") or "").strip()
+        title = str(position.get("title") or "").strip()
+        label = " ".join(value for value in (author, f"({year})" if year else "") if value)
+        label = label or title or str(position.get("raw_citation") or "Cited work")
+        target = matched_wikilinks.get(position_id)
+        rendered_label = f"[[{target}|{label}]]" if target else label
+        engagement = str(position.get("engagement") or "").strip()
+        locator = str(position.get("locator") or "").strip()
+        locator_text = f" ({locator})" if locator else ""
+        lines.append(f"- **{rendered_label}** — {engagement}{locator_text}")
+    block = "\n".join(
+        [
+            LITERATURE_START_MARKER,
+            *lines,
+            LITERATURE_END_MARKER,
+        ]
+    )
+    if managed:
+        projected_body = f"{body[:managed.start()]}{block}{body[managed.end():]}"
+    else:
+        separator = "" if not body or body.endswith("\n\n") else "\n\n"
+        projected_body = f"{body}{separator}{LITERATURE_HEADING}\n\n{block}\n"
+    projected_frontmatter, _ = parse_atomic_note(text)
+    projected = (
+        f"---\n{_dump_frontmatter(projected_frontmatter)}\n---\n{projected_body}"
+    )
+    if projected == text:
+        return False
+    atomic_write_text(path, projected)
+    return True
 
 
 def update_note_graph(
@@ -849,7 +978,7 @@ def _assert_source_note_safe_to_replace(workspace: Path, path: Path) -> None:
     if not path.is_file():
         return
     text = path.read_text(encoding="utf-8")
-    projected, _ = parse_atomic_note(text)
+    projected, body = parse_atomic_note(text)
     note_id = str(projected.get("note_id") or "")
     payload = (
         read_yaml(_note_metadata_path(workspace, note_id), {}) or {}
@@ -857,8 +986,67 @@ def _assert_source_note_safe_to_replace(workspace: Path, path: Path) -> None:
         else {}
     )
     expected = str(payload.get("machine_preservation_hash") or "")
-    if not expected or source_note_preservation_hash(text) != expected:
+    if (
+        not expected
+        or (
+            source_note_preservation_hash(text) != expected
+            and not _matches_committed_source_bundle(workspace, projected, body, payload)
+        )
+    ):
         raise ValueError("existing_source_note_has_unmanaged_changes")
+
+
+def _matches_committed_source_bundle(
+    workspace: Path,
+    projected_frontmatter: Mapping[str, Any],
+    projected_body: str,
+    metadata: Mapping[str, Any],
+) -> bool:
+    """Recognize old machine prose after additive graph projection."""
+
+    stored_frontmatter = metadata.get("frontmatter")
+    if not isinstance(stored_frontmatter, Mapping):
+        return False
+    source_id = str(
+        projected_frontmatter.get("source_id")
+        or stored_frontmatter.get("source_id")
+        or ""
+    )
+    if not source_id:
+        return False
+    bundle = read_yaml(
+        workspace
+        / "02_source_memory"
+        / "bundles"
+        / f"{safe_filename(source_id)}.yml",
+        {},
+    ) or {}
+    analysis = (
+        bundle.get("bundle", {}).get("analysis_sections")
+        if isinstance(bundle.get("bundle"), Mapping)
+        else None
+    )
+    if not isinstance(analysis, Mapping):
+        return False
+    current_source_fields = {
+        key: value
+        for key, value in projected_frontmatter.items()
+        if key not in NON_SOURCE_FRONTMATTER_FIELDS
+    }
+    expected_projection = public_note_frontmatter(stored_frontmatter)
+    stored_source_fields = {
+        key: value
+        for key, value in expected_projection.items()
+        if key not in NON_SOURCE_FRONTMATTER_FIELDS
+    }
+    if current_source_fields != stored_source_fields:
+        return False
+    _, expected_body = parse_atomic_note(
+        render_atomic_note(stored_frontmatter, analysis)
+    )
+    return _strip_generated_note_sections(projected_body).strip() == (
+        _strip_generated_note_sections(expected_body).strip()
+    )
 
 
 def _read_note_metadata(

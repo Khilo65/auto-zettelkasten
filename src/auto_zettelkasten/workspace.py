@@ -37,6 +37,7 @@ WORKSPACE_DIRECTORIES = (
     "01_custody/files",
     "01_custody/read_attempts",
     "02_source_memory/notes",
+    "02_source_memory/bundles",
     "02_source_memory/profiles",
     "02_source_memory/indexes/source_sets",
     "03_literature_synthesis/maps",
@@ -115,7 +116,7 @@ def initialize(workspace: Path | str, *, overwrite: bool = False) -> ArtifactMan
                     "document_deadline_seconds": 900,
                     "chunk_output_tokens": 900,
                     "synthesis_output_tokens": 3000,
-                    "context_window_fraction": 0.8,
+                    "context_window_fraction": 0.5,
                     "estimated_chars_per_token": 3.5,
                 },
                 "literature_mapping": LiteratureMappingPolicy().to_dict(),
@@ -174,6 +175,7 @@ def assert_compatible(workspace: Path | str) -> None:
             (1, 9),
             (1, 10),
             (1, 11),
+            (1, 12),
         }
     current = _parse_schema_version(CURRENT_ARTIFACT_SCHEMA_VERSION, field="current artifact schema")
     if manifest_version not in supported:

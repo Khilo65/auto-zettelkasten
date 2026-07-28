@@ -26,6 +26,7 @@ class ContentAdequacyClass(str, Enum):
     FULL_TEXT_DOCUMENT = "full_text_document"
     FULL_ARTICLE_HTML = "full_article_html"
     CLEAN_FULL_ARTICLE_HTML = "full_article_html"
+    PARTIAL_ARTICLE_HTML = "partial_article_html"
     ABSTRACT_PAYWALL_HTML = "abstract_paywall_html"
     ABSTRACT_OR_PAYWALL_HTML = "abstract_paywall_html"
     METADATA_ONLY = "metadata_only"
@@ -407,6 +408,18 @@ def classify_html_content(
     )
     full_article_evidence = strong_article_body or strong_visible_body
     abstract_word_count = len(re.findall(r"\b\w+\b", abstract, flags=re.UNICODE))
+    expected_page_match = re.search(
+        r"\((\d{1,4})\s+pages?\)", visible, flags=re.IGNORECASE
+    )
+    expected_page_count = (
+        int(expected_page_match.group(1)) if expected_page_match else 0
+    )
+    partial_jstor_viewer = bool(
+        "jstor" in marker_text
+        and expected_page_count >= 4
+        and article_word_count >= 500
+        and article_word_count < expected_page_count * 250
+    )
     abstract_dominates = bool(
         abstract
         and (
@@ -434,8 +447,21 @@ def classify_html_content(
             "abstract_char_count": len(abstract),
             "paywall_marker_count": len(paywall_markers),
             "access_marker_count": len(access_markers),
+            "expected_page_count": expected_page_count,
+            "partial_jstor_viewer": partial_jstor_viewer,
         }
     )
+    if full_article_evidence and partial_jstor_viewer:
+        return ContentAdequacy(
+            classification=ContentAdequacyClass.PARTIAL_ARTICLE_HTML,
+            source_scope="partial_document",
+            coverage_gate="limited",
+            reason="partial_article_viewer_html",
+            abstract=abstract,
+            paywall_markers=paywall_markers,
+            access_markers=access_markers,
+            metrics=metrics,
+        )
     if full_article_evidence and not enclosing_paywall:
         return ContentAdequacy(
             classification=ContentAdequacyClass.FULL_ARTICLE_HTML,
@@ -1105,10 +1131,13 @@ def _document_spans(
 
 
 def _bibliography_only_analysis(text: str) -> dict[str, Any]:
-    heading = re.search(
-        r"(?im)^\s*(?:references|bibliography|works cited)\s*$",
-        text,
+    headings = list(
+        re.finditer(
+            r"(?im)^\s*(?:references|bibliography|works cited)\s*$",
+            text,
+        )
     )
+    heading = headings[-1] if headings else None
     total_words = len(_alphabetic_words(text))
     if not heading or total_words < 800:
         return {
@@ -1121,6 +1150,21 @@ def _bibliography_only_analysis(text: str) -> dict[str, Any]:
     after = text[heading.end() :]
     before_words = len(_alphabetic_words(before))
     after_words = len(_alphabetic_words(after))
+    cover_followup = after[:200_000]
+    if (
+        heading.start() <= int(len(text) * 0.08)
+        and re.search(r"(?im)^---\s*Page\s+[2-9]\d*\s*---", cover_followup)
+        and re.search(
+            r"(?im)^\s*(?:abstract|introduction|methods?|results?|discussion|conclusions?)\s*$",
+            cover_followup,
+        )
+    ):
+        return {
+            "bibliography_only": False,
+            "bibliography_reference_count": 0,
+            "bibliography_word_ratio": 0.0,
+            "pre_bibliography_word_count": before_words,
+        }
     reference_count = sum(
         bool(
             re.search(r"\b(?:18|19|20)\d{2}[a-z]?\b", line)

@@ -23,14 +23,14 @@ from auto_zettelkasten import (
 from auto_zettelkasten.models import LiteratureMapReport, NavigationPolicy
 
 
-def test_v011_versions_and_navigation_defaults() -> None:
-    assert ENGINE_VERSION == "0.12.0"
-    assert ARTIFACT_SCHEMA_VERSION == "1.11"
+def test_current_versions_and_navigation_defaults() -> None:
+    assert ENGINE_VERSION == "0.13.0"
+    assert ARTIFACT_SCHEMA_VERSION == "1.12"
     assert NavigationPolicy().max_visible_tags_per_source == 6
     assert NavigationPolicy().max_collection_neighborhoods == 20
 
 
-def test_profile_1_2_round_trips_typed_locator_quantitative_result_and_lineage() -> (
+def test_profile_1_3_round_trips_typed_locator_quantitative_result_and_lineage() -> (
     None
 ):
     locator = SourceLocator(
@@ -96,8 +96,8 @@ def test_profile_1_2_round_trips_typed_locator_quantitative_result_and_lineage()
         evidence_anchors=[anchor],
     )
 
-    assert profile.profile_schema_version == "1.2"
-    assert profile.to_dict()["profile_schema_version"] == "1.2"
+    assert profile.profile_schema_version == "1.3"
+    assert profile.to_dict()["profile_schema_version"] == "1.3"
     assert profile.to_dict()["study_lineage"] == lineage.to_dict()
     assert EvidenceAnchor.from_dict(anchor.to_dict()) == anchor
     assert SourceLocator.from_dict(locator.to_dict()) == locator
@@ -240,9 +240,9 @@ def test_coverage_tag_and_neighborhood_contracts_round_trip() -> None:
         ),
         CoverageRecord(
             source_id="source-2",
-            title="Exhausted source",
+            title="Parked source",
             zotero_key="BBBB2222",
-            terminal_state="exhausted",
+            terminal_state="parked_for_review",
             exclusion_reason="No adequate representation was available.",
             attempted_route=["indexed text", "attachment extraction"],
             could_affect_existing_cluster=True,
@@ -254,7 +254,7 @@ def test_coverage_tag_and_neighborhood_contracts_round_trip() -> None:
         counts={
             "validated_note": 1,
             "limited_note": 0,
-            "exhausted": 1,
+            "parked_for_review": 1,
             "partial": 0,
             "pending": 0,
         },
@@ -302,5 +302,5 @@ def test_literature_report_exposes_v08_artifact_counts() -> None:
     assert report.source_contribution_count == 4
     assert report.evidence_base_group_count == 2
     assert report.coverage_record_count == 75
-    assert report.engine_version == "0.12.0"
-    assert report.artifact_schema_version == "1.11"
+    assert report.engine_version == "0.13.0"
+    assert report.artifact_schema_version == "1.12"

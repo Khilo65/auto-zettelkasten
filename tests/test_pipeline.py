@@ -135,7 +135,7 @@ def test_vertical_slice_matches_golden_and_builds_obsidian_graph(
     assert len(list((export_root / "Indexes").glob("Literature Map - *.md"))) == 1
 
 
-def test_missing_attachment_becomes_limited_and_duplicate_is_exhausted(
+def test_missing_attachment_becomes_limited_and_duplicate_is_parked(
     tmp_path: Path, sample_items
 ) -> None:
     items = [sample_items[0], sample_items[0], sample_items[1]]
@@ -149,14 +149,16 @@ def test_missing_attachment_becomes_limited_and_duplicate_is_exhausted(
     assert report.terminal_count == 3
     assert report.validated_note_count == 1
     assert report.limited_note_count == 1
-    assert report.exhausted_count == 1
+    assert report.parked_for_review_count == 1
     reasons = {
-        row["reason"] for row in report.items if row["terminal_status"] == "exhausted"
+        row["reason"]
+        for row in report.items
+        if row["terminal_status"] == "parked_for_review"
     }
     assert reasons == {"duplicate_zotero_item_key"}
     assert [row["terminal_status"] for row in report.source_set["rows"]] == [
         "validated_note",
-        "exhausted",
+        "parked_for_review",
         "limited_note",
     ]
     attempts = (
@@ -407,10 +409,11 @@ def test_question_is_only_a_projection_lens_but_metadata_and_reader_remain_in_fi
         reader=second_reader,
         run_id="question-second",
     )
-    assert second.reused_count == 0
-    assert second_reader.calls == 1
+    assert second.reused_count == 1
+    assert second_reader.calls == 0
     text = (tmp_path / second.items[0]["note_path"]).read_text()
-    assert "None / Changed Metadata Title" in text
+    assert "title: Changed Metadata Title" in text
+    assert "# Changed Metadata Title" in text
 
     third_reader = QuestionReader()
     third = run_map(
@@ -718,7 +721,10 @@ def test_selected_collection_key_and_limit_are_preserved(
         reader=FakeReader(),
         run_id="selected-run",
     )
-    assert client.inventory_calls == [("collection", "ACTUALSELECTED")]
+    assert client.inventory_calls == [
+        ("collection", "ACTUALSELECTED"),
+        ("library", None),
+    ]
     assert report.inventory_count == 1
     assert report.source_set["zotero_collection_key"] == "ACTUALSELECTED"
     assert report.source_set["source_set_type"] == "zotero_collection"
@@ -810,7 +816,7 @@ def test_resumed_progress_ignores_stale_source_counts_inside_literature(
     assert resumed["inventory_count"] == 2
     assert resumed["validated_note_count"] == 1
     assert resumed["limited_note_count"] == 1
-    assert resumed["exhausted_count"] == 0
+    assert resumed["parked_for_review_count"] == 0
     assert resumed["terminal_count"] == 2
     assert "validated_note_count" not in resumed["literature"]
 
@@ -841,7 +847,7 @@ def test_reporting_stage_preserves_75_item_progress_and_partial_is_not_terminal(
     assert payload["inventory_count"] == 75
     assert payload["validated_note_count"] == 60
     assert payload["limited_note_count"] == 10
-    assert payload["exhausted_count"] == 2
+    assert payload["parked_for_review_count"] == 2
     assert payload["partial_count"] == 1
     assert payload["pending_count"] == 2
     assert payload["terminal_count"] == 72

@@ -1,13 +1,14 @@
 """Public package metadata and collection-mapping contracts."""
 
-ENGINE_VERSION = "0.12.0"
-ARTIFACT_SCHEMA_VERSION = "1.11"
+ENGINE_VERSION = "0.13.0"
+ARTIFACT_SCHEMA_VERSION = "1.12"
 __version__ = ENGINE_VERSION
 
 from .models import (  # noqa: E402 - version constants must exist before api imports this module
     ArtifactManifest,
     ClusterSourceContribution,
     ClusterProposal,
+    ClusterPlanningCard,
     ClusterSynthesis,
     CoverageRecord,
     CoverageRegister,
@@ -31,10 +32,17 @@ from .models import (  # noqa: E402 - version constants must exist before api im
     NavigationPolicy,
     NeighborhoodSummary,
     ProcessingPolicy,
+    ProviderCapability,
     QuantitativeComparisonValidation,
     QuantitativeResult,
     ResolutionPath,
     RunReport,
+    LiteraturePosition,
+    MissingSourceRecommendation,
+    RelationshipDecision,
+    RelationshipPairJob,
+    RelationshipProviderBatch,
+    SourceAnalysisBundle,
     SourceLocator,
     StudyLineage,
     SynthesisAssertion,
@@ -60,6 +68,7 @@ __all__ = [
     "ArtifactManifest",
     "ClusterSourceContribution",
     "ClusterProposal",
+    "ClusterPlanningCard",
     "ClusterSynthesis",
     "ClusterSynthesisReasoner",
     "CoverageRecord",
@@ -86,10 +95,17 @@ __all__ = [
     "NavigationPolicy",
     "NeighborhoodSummary",
     "ProcessingPolicy",
+    "ProviderCapability",
     "QuantitativeComparisonValidation",
     "QuantitativeResult",
     "ResolutionPath",
     "RunReport",
+    "LiteraturePosition",
+    "MissingSourceRecommendation",
+    "RelationshipDecision",
+    "RelationshipPairJob",
+    "RelationshipProviderBatch",
+    "SourceAnalysisBundle",
     "SourceLocator",
     "StudyLineage",
     "SynthesisAssertion",

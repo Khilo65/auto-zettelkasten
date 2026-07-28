@@ -5,9 +5,9 @@ from auto_zettelkasten.cli import build_parser
 from auto_zettelkasten.models import MapRequest
 
 
-def test_v012_versions() -> None:
-    assert ENGINE_VERSION == "0.12.0"
-    assert ARTIFACT_SCHEMA_VERSION == "1.11"
+def test_v013_versions() -> None:
+    assert ENGINE_VERSION == "0.13.0"
+    assert ARTIFACT_SCHEMA_VERSION == "1.12"
 
 
 def test_map_request_round_trips_terminal_retry_flag(tmp_path) -> None:

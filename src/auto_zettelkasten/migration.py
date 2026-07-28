@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import shutil
 from pathlib import Path
@@ -7,13 +8,26 @@ from typing import Any, Mapping
 
 import yaml
 
-from .files import atomic_write_text, now_iso, read_yaml, sha256_file, sha256_text, slugify, write_yaml
+from .files import (
+    atomic_write_text,
+    now_iso,
+    read_yaml,
+    safe_filename,
+    sha256_file,
+    sha256_text,
+    slugify,
+    write_yaml,
+)
 from .notes import (
     REVIEW_STATUS_TARGET_ARTIFACT_SCHEMA_VERSION,
     REVIEW_STATUS_TARGET_ENGINE_VERSION,
+    SECTION_HEADINGS,
+    item_data,
+    item_key,
     legacy_semantic_note_hash_v1,
     parse_atomic_note,
     semantic_note_hash,
+    source_id_for_item,
     strip_review_status_material,
 )
 from .models import NavigationPolicy
@@ -71,6 +85,11 @@ VERIFIED_GRAPH_MIGRATION_VERSION = "1"
 VERIFIED_GRAPH_TARGET_ENGINE_VERSION = "0.12.0"
 
 VERIFIED_GRAPH_TARGET_ARTIFACT_SCHEMA_VERSION = "1.11"
+
+V013_MIGRATION_ID = "auto-zettelkasten-0.13-source-bundle-graph"
+V013_MIGRATION_VERSION = "1"
+V013_TARGET_ENGINE_VERSION = "0.13.0"
+V013_TARGET_ARTIFACT_SCHEMA_VERSION = "1.12"
 
 _MARKER_FIELDS = {
     "migration_id",
@@ -164,6 +183,26 @@ _VERIFIED_GRAPH_MARKER_FIELDS = {
     "profile_files_rewritten",
     "legacy_relationships_deactivated",
     "human_relationships_preserved",
+    "completed_at",
+}
+
+_V013_MARKER_FIELDS = {
+    "migration_id",
+    "migration_version",
+    "status",
+    "target_engine_version",
+    "target_artifact_schema_version",
+    "rewritten_files",
+    "provider_calls",
+    "source_documents_reread",
+    "source_notes_rewritten",
+    "profile_files_rewritten",
+    "zotero_calls",
+    "legacy_relationships_pending",
+    "legacy_source_bundles_created",
+    "legacy_source_bundle_conflicts",
+    "fidelity_drafts_recovered",
+    "partial_documents_promoted",
     "completed_at",
 }
 
@@ -316,6 +355,7 @@ def migrate_workspace(workspace: Path | str, *, dry_run: bool = False) -> dict[s
         ).is_file()
         else migrate_verified_relationship_graph_schema(workspace, dry_run=dry_run)
     )
+    v013 = migrate_v013_schema(workspace, dry_run=dry_run)
     return {
         "status": "dry_run" if dry_run else "completed",
         "dry_run": dry_run,
@@ -331,6 +371,7 @@ def migrate_workspace(workspace: Path | str, *, dry_run: bool = False) -> dict[s
             thematic_clusters,
             managed_graph,
             verified_graph,
+            v013,
         ],
         "literature_map": legacy,
         "review_status": review,
@@ -342,6 +383,7 @@ def migrate_workspace(workspace: Path | str, *, dry_run: bool = False) -> dict[s
         "thematic_clusters": thematic_clusters,
         "managed_graph": managed_graph,
         "verified_graph": verified_graph,
+        "v013": v013,
     }
 
 
@@ -1277,6 +1319,641 @@ def migrate_verified_relationship_graph_schema(
     return {"dry_run": False, **payload, "status": "migrated", "marker": str(marker)}
 
 
+def migrate_v013_schema(
+    workspace: Path | str,
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Advance local state to v0.13 without rereading sources or calling providers."""
+
+    root = resolve_workspace(workspace)
+    marker = root / "11_state" / "migrations" / f"{V013_MIGRATION_ID}.yml"
+    if marker.is_file():
+        payload = read_yaml(marker, {})
+        _validate_v013_marker(payload)
+        return {
+            "dry_run": dry_run,
+            **dict(payload),
+            "status": "already_migrated",
+            "marker": str(marker),
+        }
+    schema = _workspace_schema_version(root)
+    if schema is None:
+        return {
+            "status": "not_applicable",
+            "dry_run": dry_run,
+            "migration_id": V013_MIGRATION_ID,
+            "reason": "workspace_version_files_absent",
+            "provider_calls": 0,
+        }
+    target = _parse_schema_version(
+        V013_TARGET_ARTIFACT_SCHEMA_VERSION, field="v0.13 artifact schema"
+    )
+    if schema > target:
+        raise ValueError("workspace is newer than the v0.13 migration target")
+    if schema == target:
+        return {
+            "status": "not_applicable",
+            "dry_run": dry_run,
+            "migration_id": V013_MIGRATION_ID,
+            "reason": "schema_1.12_or_newer",
+            "provider_calls": 0,
+        }
+    if schema < (1, 11) and not dry_run:
+        raise ValueError("v0.13 migration requires the schema-1.11 migration first")
+
+    changes: list[tuple[Path, str | None, str]] = []
+    for relative in _VERSION_FILE_RELATIVES:
+        path = root / relative
+        original = path.read_text(encoding="utf-8")
+        value = yaml.safe_load(original)
+        if not isinstance(value, Mapping):
+            raise ValueError(f"workspace version file must be a mapping: {path}")
+        updated = {
+            **dict(value),
+            "engine_version": V013_TARGET_ENGINE_VERSION,
+            "artifact_schema_version": V013_TARGET_ARTIFACT_SCHEMA_VERSION,
+        }
+        cleaned = yaml.safe_dump(
+            updated, sort_keys=False, allow_unicode=True, width=10_000
+        )
+        if cleaned != original:
+            changes.append((path, original, cleaned))
+
+    bundle_changes, bundle_stats = _legacy_source_bundle_changes(root)
+    changes.extend(bundle_changes)
+
+    legacy_pending = 0
+    for relative in _RELATIONSHIP_REGISTRY_RELATIVES:
+        path = root / relative
+        if not path.is_file():
+            continue
+        original = path.read_text(encoding="utf-8")
+        value = yaml.safe_load(original)
+        if not isinstance(value, Mapping):
+            raise ValueError(f"relationship registry must be a mapping: {path}")
+        relations = []
+        for raw in value.get("relations") or value.get("links") or []:
+            if not isinstance(raw, Mapping):
+                raise ValueError("relationship registry rows must be mappings")
+            row = dict(raw)
+            provenance = str(row.get("provenance") or "")
+            if (
+                not provenance.startswith("human")
+                and str(row.get("relation_type") or "")
+                not in {"", "cites", "cited_by", "zotero_related"}
+            ):
+                row["decision_status"] = "legacy_review_pending"
+                row["cluster_eligible"] = False
+                legacy_pending += 1
+            relations.append(row)
+        updated = {
+            **dict(value),
+            "registry_schema_version": "4",
+            "relations": relations,
+            "links": [row for row in relations if bool(row.get("active", True))],
+            "updated_at": now_iso(),
+        }
+        cleaned = yaml.safe_dump(
+            updated, sort_keys=False, allow_unicode=True, width=10_000
+        )
+        if cleaned != original:
+            changes.append((path, original, cleaned))
+
+    rewritten_files = [
+        {
+            "source": str(path.relative_to(root)),
+            "before_sha256": sha256_text(original or ""),
+            "after_sha256": sha256_text(cleaned),
+        }
+        for path, original, cleaned in changes
+    ]
+    safety = {
+        "target_engine_version": V013_TARGET_ENGINE_VERSION,
+        "target_artifact_schema_version": V013_TARGET_ARTIFACT_SCHEMA_VERSION,
+        "rewritten_files": rewritten_files,
+        "provider_calls": 0,
+        "source_documents_reread": 0,
+        "source_notes_rewritten": 0,
+        "profile_files_rewritten": 0,
+        "zotero_calls": 0,
+        "legacy_relationships_pending": legacy_pending,
+        **bundle_stats,
+    }
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "dry_run": True,
+            "migration_id": V013_MIGRATION_ID,
+            **safety,
+        }
+
+    written: list[tuple[Path, str | None]] = []
+    try:
+        for path, original, cleaned in changes:
+            atomic_write_text(path, cleaned)
+            written.append((path, original))
+        payload = {
+            "migration_id": V013_MIGRATION_ID,
+            "migration_version": V013_MIGRATION_VERSION,
+            "status": "completed",
+            **safety,
+            "completed_at": now_iso(),
+        }
+        write_yaml(marker, payload)
+    except Exception:
+        for path, original in reversed(written):
+            if original is None:
+                path.unlink(missing_ok=True)
+            else:
+                atomic_write_text(path, original)
+        raise
+    return {"dry_run": False, **payload, "status": "migrated", "marker": str(marker)}
+
+
+def _legacy_source_bundle_changes(
+    root: Path,
+) -> tuple[list[tuple[Path, str | None, str]], dict[str, int]]:
+    """Wrap usable v0.12 artifacts without changing notes or profile sidecars."""
+
+    candidates = _legacy_note_profile_candidates(root)
+    draft_candidates = _legacy_fidelity_draft_candidates(root)
+    note_sources = {str(row["source_id"]) for row in candidates}
+    candidates.extend(
+        row
+        for row in draft_candidates
+        if str(row["source_id"]) not in note_sources
+    )
+    by_source: dict[str, list[dict[str, Any]]] = {}
+    for candidate in candidates:
+        source_id = str(candidate["source_id"])
+        canonical = (
+            root
+            / "02_source_memory"
+            / "bundles"
+            / f"{safe_filename(source_id)}.yml"
+        )
+        if canonical.exists():
+            continue
+        by_source.setdefault(source_id, []).append(candidate)
+
+    changes: list[tuple[Path, str | None, str]] = []
+    conflicts: list[dict[str, Any]] = []
+    created = recovered = promoted = 0
+    for source_id in sorted(by_source):
+        unique = {
+            str(row["semantic_fingerprint"]): row
+            for row in by_source[source_id]
+        }
+        variants = [unique[key] for key in sorted(unique)]
+        if len(variants) == 1:
+            candidate = variants[0]
+            target = (
+                root
+                / "02_source_memory"
+                / "bundles"
+                / f"{safe_filename(source_id)}.yml"
+            )
+            _append_yaml_change(changes, target, candidate["sidecar"])
+            created += 1
+            recovered += int(candidate["origin"] == "fidelity_parked_draft")
+            promoted += int(candidate["partial_promoted"])
+            continue
+        variant_rows = []
+        for candidate in variants:
+            fingerprint = str(candidate["semantic_fingerprint"])
+            target = (
+                root
+                / "02_source_memory"
+                / "bundles"
+                / "legacy_variants"
+                / safe_filename(source_id)
+                / f"{fingerprint[:16]}.yml"
+            )
+            _append_yaml_change(changes, target, candidate["sidecar"])
+            variant_rows.append(
+                {
+                    "semantic_fingerprint": fingerprint,
+                    "path": str(target.relative_to(root)),
+                    "origin": candidate["origin"],
+                    "note_path": candidate.get("note_path", ""),
+                    "profile_path": candidate.get("profile_path", ""),
+                }
+            )
+            recovered += int(candidate["origin"] == "fidelity_parked_draft")
+            promoted += int(candidate["partial_promoted"])
+        conflicts.append(
+            {
+                "source_id": source_id,
+                "status": "parked_for_review",
+                "reason": "conflicting_legacy_source_analysis_variants",
+                "variants": variant_rows,
+            }
+        )
+    if conflicts:
+        _append_yaml_change(
+            changes,
+            root
+            / "11_state"
+            / "migrations"
+            / "v013_source_bundle_conflicts.yml",
+            {
+                "conflict_schema_version": "1",
+                "conflicts": conflicts,
+            },
+        )
+    return changes, {
+        "legacy_source_bundles_created": created,
+        "legacy_source_bundle_conflicts": len(conflicts),
+        "fidelity_drafts_recovered": recovered,
+        "partial_documents_promoted": promoted,
+    }
+
+
+def _legacy_note_profile_candidates(root: Path) -> list[dict[str, Any]]:
+    notes_by_id: dict[str, tuple[Path, dict[str, Any], str]] = {}
+    notes_by_source: dict[str, list[tuple[Path, dict[str, Any], str]]] = {}
+    note_root = root / "02_source_memory" / "notes"
+    for path in sorted(note_root.glob("*.md")) if note_root.is_dir() else []:
+        text = path.read_text(encoding="utf-8")
+        frontmatter, _ = parse_atomic_note(text)
+        note_id = str(frontmatter.get("note_id") or "")
+        source_id = str(frontmatter.get("source_id") or "")
+        row = (path, frontmatter, text)
+        if note_id:
+            notes_by_id[note_id] = row
+        if source_id:
+            notes_by_source.setdefault(source_id, []).append(row)
+
+    candidates = []
+    profile_root = root / "02_source_memory" / "profiles"
+    profile_paths = (
+        sorted(profile_root.glob("*.yml")) if profile_root.is_dir() else []
+    )
+    for profile_path in profile_paths:
+        if profile_path.name.endswith(".quality.yml"):
+            continue
+        stored = read_yaml(profile_path, {})
+        if not isinstance(stored, Mapping):
+            continue
+        raw_profile = stored.get("profile", stored)
+        if not isinstance(raw_profile, Mapping):
+            continue
+        profile = dict(raw_profile)
+        note_id = str(profile.get("note_id") or "")
+        source_id = str(profile.get("source_id") or "")
+        note = notes_by_id.get(note_id)
+        if note is None and source_id and len(notes_by_source.get(source_id, [])) == 1:
+            note = notes_by_source[source_id][0]
+        if note is None:
+            continue
+        note_path, frontmatter, text = note
+        source_id = source_id or str(frontmatter.get("source_id") or "")
+        if not source_id:
+            continue
+        bundle = _legacy_bundle_from_note_profile(
+            source_id=source_id,
+            frontmatter=frontmatter,
+            note_text=text,
+            profile=profile,
+        )
+        if bundle is None:
+            continue
+        candidates.append(
+            _legacy_candidate(
+                bundle,
+                source_id=source_id,
+                origin="legacy_note_profile_pair",
+                note_path=str(note_path.relative_to(root)),
+                profile_path=str(profile_path.relative_to(root)),
+                profile_hash=_legacy_profile_hash(profile),
+                note_hash=semantic_note_hash(text),
+                source_content_hash=str(
+                    frontmatter.get("inspected_content_hash") or ""
+                ),
+            )
+        )
+    return candidates
+
+
+def _legacy_fidelity_draft_candidates(root: Path) -> list[dict[str, Any]]:
+    candidates = []
+    run_root = root / "11_state" / "runs"
+    for run_dir in sorted(run_root.iterdir()) if run_root.is_dir() else []:
+        inventory_path = run_dir / "inventory.json"
+        if not inventory_path.is_file():
+            continue
+        try:
+            inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(inventory, list):
+            continue
+        for item in inventory:
+            if not isinstance(item, Mapping) or not item_key(item):
+                continue
+            item_root = run_dir / "items" / safe_filename(item_key(item))
+            fidelity = read_yaml(item_root / "atomic_fidelity.yml", {})
+            frozen = read_yaml(item_root / "frozen_content.yml", {})
+            if (
+                not isinstance(fidelity, Mapping)
+                or str(fidelity.get("status") or "") != "failed"
+                or not isinstance(frozen, Mapping)
+                or not (item_root / "source.txt").is_file()
+            ):
+                continue
+            checkpoint = _legacy_analysis_checkpoint(item_root)
+            if checkpoint is None:
+                continue
+            analysis, identity = checkpoint
+            text_hash = str(frozen.get("text_hash") or "")
+            fidelity_identity = fidelity.get("identity", {})
+            if (
+                not text_hash
+                or not isinstance(fidelity_identity, Mapping)
+                or str(identity.get("document_hash") or "") != text_hash
+                or str(fidelity_identity.get("source_hash") or "") != text_hash
+                or str(fidelity_identity.get("analysis_hash") or "")
+                != _json_hash(analysis)
+            ):
+                continue
+            bundle = _legacy_bundle_from_draft(item, frozen, analysis, fidelity)
+            source_id = source_id_for_item(item)
+            candidates.append(
+                _legacy_candidate(
+                    bundle,
+                    source_id=source_id,
+                    origin="fidelity_parked_draft",
+                    note_path="",
+                    profile_path="",
+                    profile_hash="",
+                    note_hash="",
+                    source_content_hash=text_hash,
+                )
+            )
+    return candidates
+
+
+def _legacy_analysis_checkpoint(
+    item_root: Path,
+) -> tuple[dict[str, Any], Mapping[str, Any]] | None:
+    for name in ("synthesis.yml", "direct.yml"):
+        value = read_yaml(item_root / name, {})
+        if not isinstance(value, Mapping) or not isinstance(
+            value.get("analysis"), Mapping
+        ):
+            continue
+        analysis = {
+            str(key): str(raw)
+            for key, raw in value["analysis"].items()
+            if str(raw).strip()
+        }
+        if all(analysis.get(key) for key, _ in SECTION_HEADINGS):
+            identity = value.get("identity", {})
+            if isinstance(identity, Mapping):
+                return analysis, identity
+    return None
+
+
+def _legacy_bundle_from_note_profile(
+    *,
+    source_id: str,
+    frontmatter: Mapping[str, Any],
+    note_text: str,
+    profile: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    _, body = parse_atomic_note(note_text)
+    analysis = _legacy_note_sections(body)
+    if not analysis:
+        stripped = re.sub(r"^# .*$", "", body, count=1, flags=re.MULTILINE).strip()
+        if not stripped:
+            return None
+        analysis = {"available_content": stripped}
+    profile_coverage = (
+        profile.get("coverage")
+        if isinstance(profile.get("coverage"), Mapping)
+        else {}
+    )
+    scope = str(
+        frontmatter.get("source_scope")
+        or profile_coverage.get("source_scope")
+        or "full_document"
+    )
+    analytical = all(analysis.get(key) for key, _ in SECTION_HEADINGS)
+    legacy_excluded = bool(profile.get("excluded_from_synthesis", False))
+    substantive = analytical and (
+        scope in {"full_document", "partial_document"}
+        or not legacy_excluded
+    )
+    eligibility = "substantive_bounded" if substantive else "context_only"
+    profile_anchors = profile.get("evidence_anchors", [])
+    anchors = (
+        [dict(row) for row in profile_anchors if isinstance(row, Mapping)]
+        if substantive and isinstance(profile_anchors, list)
+        else []
+    )
+    return {
+        "bundle_schema_version": "1",
+        "source_identity": {
+            "source_id": source_id,
+            "zotero_key": str(frontmatter.get("zotero_item_key") or ""),
+        },
+        "observed_bibliographic_identity": {
+            key: frontmatter[key]
+            for key in ("title", "creators", "date", "itemType", "DOI", "doi", "url")
+            if frontmatter.get(key) not in (None, "", [], {})
+        },
+        "scope_assessment": {
+            "source_scope": scope,
+            "evidence_eligibility": eligibility,
+            "source_coverage": frontmatter.get("source_coverage", {}),
+            "coverage_boundary": (
+                "Claims remain bounded to the recovered content."
+                if scope == "partial_document"
+                else ""
+            ),
+        },
+        "analysis_sections": analysis,
+        "compact_profile": _legacy_compact_profile(profile, analysis),
+        "evidence_anchors": anchors,
+        "literature_positions": [],
+        "missing_source_recommendations": [],
+        "self_review": {
+            "migration_origin": "legacy_source_analysis_bundle",
+            "provider_verified": False,
+            "literature_positions_backfilled": False,
+        },
+        "component_diagnostics": [],
+    }
+
+
+def _legacy_bundle_from_draft(
+    item: Mapping[str, Any],
+    frozen: Mapping[str, Any],
+    analysis: Mapping[str, Any],
+    fidelity: Mapping[str, Any],
+) -> dict[str, Any]:
+    data = item_data(item)
+    source_id = source_id_for_item(item)
+    scope = str(frozen.get("source_scope") or "full_document")
+    return {
+        "bundle_schema_version": "1",
+        "source_identity": {
+            "source_id": source_id,
+            "zotero_key": item_key(item),
+        },
+        "observed_bibliographic_identity": {
+            key: data[key]
+            for key in ("title", "creators", "date", "itemType", "DOI", "url")
+            if data.get(key) not in (None, "", [], {})
+        },
+        "scope_assessment": {
+            "source_scope": scope,
+            "evidence_eligibility": (
+                "substantive_bounded"
+                if scope in {"full_document", "partial_document"}
+                else "context_only"
+            ),
+            "source_coverage": frozen.get("source_coverage", ""),
+            "coverage_metrics": frozen.get("coverage_metrics", {}),
+        },
+        "analysis_sections": dict(analysis),
+        "compact_profile": _legacy_compact_profile({}, analysis),
+        "evidence_anchors": [],
+        "literature_positions": [],
+        "missing_source_recommendations": [],
+        "self_review": {
+            "migration_origin": "recovered_fidelity_parked_draft",
+            "provider_verified": False,
+            "advisory_warnings": list(fidelity.get("risks", []) or []),
+            "original_failure_reason": str(fidelity.get("reason") or ""),
+        },
+        "component_diagnostics": [],
+    }
+
+
+def _legacy_note_sections(body: str) -> dict[str, str]:
+    sections = {}
+    for key, heading in SECTION_HEADINGS:
+        match = re.search(
+            rf"^## {re.escape(heading)}\s*$\n+(.*?)(?=^## |\Z)",
+            body,
+            flags=re.MULTILINE | re.DOTALL,
+        )
+        if match and match.group(1).strip():
+            sections[key] = match.group(1).strip()
+    return sections
+
+
+def _legacy_compact_profile(
+    profile: Mapping[str, Any], analysis: Mapping[str, Any]
+) -> dict[str, Any]:
+    return {
+        "thesis": str(analysis.get("thesis") or ""),
+        "method_or_knowledge_basis": str(
+            analysis.get("method_and_research_design") or ""
+        ),
+        "source_genre": str(profile.get("source_role") or ""),
+        "inferential_design": "; ".join(
+            str(value) for value in profile.get("methods", []) or []
+        ),
+        "coverage": dict(profile.get("coverage") or {})
+        if isinstance(profile.get("coverage"), Mapping)
+        else {},
+        **{
+            key: [
+                str(value)
+                for value in profile.get(key, []) or []
+                if str(value).strip()
+            ][:8]
+            for key in (
+                "mechanisms",
+                "outcomes",
+                "cases",
+                "populations",
+                "periods",
+                "datasets",
+            )
+        },
+    }
+
+
+def _legacy_candidate(
+    bundle: Mapping[str, Any],
+    *,
+    source_id: str,
+    origin: str,
+    note_path: str,
+    profile_path: str,
+    profile_hash: str,
+    note_hash: str,
+    source_content_hash: str,
+) -> dict[str, Any]:
+    fingerprint = _json_hash(bundle)
+    sidecar = {
+        "source_analysis_bundle_schema_version": "1",
+        "bundle_origin": "legacy_source_analysis_bundle",
+        "migration_status": (
+            "recovered_fidelity_parked_draft"
+            if origin == "fidelity_parked_draft"
+            else "migrated_legacy_note_profile_pair"
+        ),
+        "semantic_fingerprint": fingerprint,
+        "source_content_hash": source_content_hash,
+        "note_semantic_hash": note_hash,
+        "legacy_profile_semantic_hash": profile_hash,
+        "bundle": dict(bundle),
+    }
+    return {
+        "source_id": source_id,
+        "origin": origin,
+        "semantic_fingerprint": fingerprint,
+        "sidecar": sidecar,
+        "note_path": note_path,
+        "profile_path": profile_path,
+        "partial_promoted": (
+            bundle.get("scope_assessment", {}).get("source_scope")
+            == "partial_document"
+            and bundle.get("scope_assessment", {}).get("evidence_eligibility")
+            == "substantive_bounded"
+        ),
+    }
+
+
+def _legacy_profile_hash(profile: Mapping[str, Any]) -> str:
+    payload = dict(profile)
+    payload.pop("dependency_hash", None)
+    payload.pop("provider", None)
+    payload.pop("model", None)
+    context = payload.get("context")
+    if isinstance(context, Mapping):
+        payload["context"] = {
+            key: value
+            for key, value in context.items()
+            if key != "source_set_id"
+        }
+    return _json_hash(payload)
+
+
+def _json_hash(value: Any) -> str:
+    return sha256_text(
+        json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+    )
+
+
+def _append_yaml_change(
+    changes: list[tuple[Path, str | None, str]],
+    path: Path,
+    payload: Mapping[str, Any],
+) -> None:
+    original = path.read_text(encoding="utf-8") if path.is_file() else None
+    cleaned = yaml.safe_dump(
+        dict(payload), sort_keys=False, allow_unicode=True, width=10_000
+    )
+    if cleaned != original:
+        changes.append((path, original, cleaned))
+
+
 def _verified_registry_changes(
     root: Path,
 ) -> tuple[list[tuple[Path, str | None, str]], int, int]:
@@ -2189,6 +2866,7 @@ def _validate_existing_markers(root: Path) -> None:
             VERIFIED_GRAPH_MIGRATION_ID,
             _validate_verified_graph_marker,
         ),
+        (V013_MIGRATION_ID, _validate_v013_marker),
     )
     for migration_id, validate in marker_validators:
         marker = marker_root / f"{migration_id}.yml"
@@ -2204,6 +2882,41 @@ def _validate_existing_markers(root: Path) -> None:
                 )
                 if schema is None or schema < target:
                     raise ValueError("completed proposition-anchor migration marker disagrees with workspace schema")
+
+
+def _validate_v013_marker(value: Any) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError("v0.13 migration marker must be a mapping")
+    unknown = sorted(set(value) - _V013_MARKER_FIELDS)
+    missing = sorted(_V013_MARKER_FIELDS - set(value))
+    if unknown or missing:
+        raise ValueError(
+            "invalid v0.13 migration marker fields"
+            f"; unknown={','.join(unknown)}; missing={','.join(missing)}"
+        )
+    if (
+        value.get("migration_id") != V013_MIGRATION_ID
+        or str(value.get("migration_version")) != V013_MIGRATION_VERSION
+        or value.get("target_engine_version") != V013_TARGET_ENGINE_VERSION
+        or value.get("target_artifact_schema_version")
+        != V013_TARGET_ARTIFACT_SCHEMA_VERSION
+        or int(value.get("provider_calls", -1)) != 0
+        or int(value.get("source_documents_reread", -1)) != 0
+        or int(value.get("source_notes_rewritten", -1)) != 0
+        or int(value.get("profile_files_rewritten", -1)) != 0
+        or int(value.get("zotero_calls", -1)) != 0
+        or any(
+            int(value.get(field_name, -1)) < 0
+            for field_name in (
+                "legacy_relationships_pending",
+                "legacy_source_bundles_created",
+                "legacy_source_bundle_conflicts",
+                "fidelity_drafts_recovered",
+                "partial_documents_promoted",
+            )
+        )
+    ):
+        raise ValueError("invalid v0.13 migration marker")
 
 
 def _confined_marker_path(root: Path, value: Any, *, label: str) -> Path:

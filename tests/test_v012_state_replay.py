@@ -11,7 +11,6 @@ from auto_zettelkasten.literature import (
     LiteratureSynthesisPartialError,
     _CheckpointedReasonerCalls,
     _preserve_last_valid_clusters_on_refresh_failure,
-    _reasoner_packet_chars,
     _same_provider_inputs,
     cluster_note_stem,
 )
@@ -25,7 +24,6 @@ from auto_zettelkasten.pipeline import (
     _ProfileProviderBudget,
     _compact_relationship_catalogue_entry,
     _commit_relationship_selection_state,
-    _pack_relationship_rows,
     _relationship_event_id,
     _run_relationship_reasoning,
     _write_relationship_run_ledger,
@@ -114,7 +112,7 @@ def test_early_refresh_failure_preserves_clusters_idempotently(
     assert {path: path.read_bytes() for path in replay_paths} == first_bytes
 
 
-def test_relationship_catalogue_projection_omits_graph_payload() -> None:
+def test_relationship_catalogue_projection_keeps_bounded_graph_navigation() -> None:
     projected = _compact_relationship_catalogue_entry(
         {
             "source_id": "source-zotero-abcd1234",
@@ -138,8 +136,8 @@ def test_relationship_catalogue_projection_omits_graph_payload() -> None:
 
     assert projected["zotero_key"] == "ABCD1234"
     assert projected["thesis"] == "A thesis"
-    assert "relationship_ids" not in projected
-    assert "cluster_ids" not in projected
+    assert projected["relationship_ids"] == ["relation-a"] * 12
+    assert projected["cluster_ids"] == ["cluster-a"]
     assert "profile_hash" not in projected
     assert "note_link" not in projected
 
@@ -260,16 +258,12 @@ def test_oversized_cluster_synthesis_is_rejected_before_provider_call(
     assert replay.cumulative_provider_calls == 0
 
 
-def test_interrupted_attempts_count_toward_transport_retry_limit(
+def test_interrupted_attempt_becomes_terminal_without_automatic_retry(
     tmp_path: Path,
 ) -> None:
     reasoner = _CallReasoner(failure=KeyboardInterrupt())
     request = _request(tmp_path, max_calls=3)
 
-    with pytest.raises(KeyboardInterrupt):
-        _CheckpointedReasonerCalls(
-            tmp_path, "run", reasoner, request
-        )("cluster_proposal", "one", "propose_clusters", [], {})
     with pytest.raises(KeyboardInterrupt):
         _CheckpointedReasonerCalls(
             tmp_path, "run", reasoner, request
@@ -284,9 +278,40 @@ def test_interrupted_attempts_count_toward_transport_retry_limit(
         terminal("cluster_proposal", "one", "propose_clusters", [], {})
 
     usage = read_yaml(terminal.usage_path, {})
+    assert reasoner.calls == 1
+    assert usage["provider_call_count"] == 1
+    assert [row["attempt"] for row in usage["attempts"]] == [1]
+
+
+def test_transport_failure_gets_one_checkpointed_resume_retry(
+    tmp_path: Path,
+) -> None:
+    reasoner = _CallReasoner(failure=TimeoutError("provider request timed out"))
+    request = _request(tmp_path, max_calls=3)
+
+    with pytest.raises(TimeoutError):
+        _CheckpointedReasonerCalls(
+            tmp_path, "run", reasoner, request
+        )("cluster_proposal", "one", "propose_clusters", [], {})
+    checkpoint = read_yaml(
+        tmp_path
+        / "11_state"
+        / "runs"
+        / "run"
+        / "literature"
+        / "synthesis"
+        / "cluster_proposal"
+        / "one.yml",
+        {},
+    )
+    assert checkpoint["terminal"] is False
+    assert checkpoint["retry_on_resume"] is True
+
+    reasoner.failure = None
+    resumed = _CheckpointedReasonerCalls(tmp_path, "run", reasoner, request)
+    resumed("cluster_proposal", "one", "propose_clusters", [], {})
     assert reasoner.calls == 2
-    assert usage["provider_call_count"] == 2
-    assert sorted(row["attempt"] for row in usage["attempts"]) == [1, 2]
+    assert resumed.cumulative_provider_calls == 2
 
 
 def test_profile_and_fidelity_share_one_frozen_resume_ceiling(
@@ -423,7 +448,6 @@ def test_cluster_checkpoint_tracks_relationship_inputs() -> None:
         "current_unclustered_sources": "same-unclustered",
         "prior_proposal_identities": "same-prior",
         "accepted_relationships": "old-relationships",
-        "relationship_cluster_candidates": "same-cluster-candidates",
     }
     checkpoint = {
         "dependency_component_hashes": {**components, "context": "old-context"},
@@ -455,7 +479,6 @@ def test_relationship_ledger_is_a_stable_union(tmp_path: Path) -> None:
                 "model": "model",
             }
         ],
-        "cluster_candidates": [{"source_id": "A", "target_id": "cluster-a"}],
     }
     path = _write_relationship_run_ledger(tmp_path, "run", first)
     _write_relationship_run_ledger(tmp_path, "run", {})
@@ -465,10 +488,8 @@ def test_relationship_ledger_is_a_stable_union(tmp_path: Path) -> None:
     assert replay["accepted_relation_ids"] == ["relation-a"]
     assert replay["no_relationship_count"] == 1
     assert replay["parked"] == first["parked"]
-    assert replay["cluster_candidates"] == first["cluster_candidates"]
     assert {row["event_type"] for row in replay["events"]} == {
         "accepted",
-        "cluster_candidate",
         "no_relationship",
         "parked",
     }
@@ -486,15 +507,11 @@ class _RelationshipReasoner:
     def adjudicate_relationships(self, *_args: Any, **_kwargs: Any) -> None:
         return None
 
-    def select_relationship_shards(self, *_args: Any, **_kwargs: Any) -> None:
-        return None
-
-
 class _RelationshipCalls:
-    def __init__(self, *, fail_shards: bool = False) -> None:
-        self.fail_shards = fail_shards
+    run_id = "relationship-run"
+
+    def __init__(self) -> None:
         self.candidate_calls = 0
-        self.bridge_calls = 0
         self.candidate_entry_counts: list[int] = []
         self.candidate_profile_types: list[set[str]] = []
 
@@ -506,22 +523,15 @@ class _RelationshipCalls:
         _profiles: Sequence[Any],
         _context: Mapping[str, Any],
     ) -> Mapping[str, Any]:
-        if stage == "relationship_shard_selection":
-            if self.fail_shards:
-                raise RuntimeError("shard routing failed")
-            return {"shard_ids": list(_context.get("home_shard_ids", []) or [])}
         if stage == "relationship_candidate_selection":
             self.candidate_calls += 1
             self.candidate_profile_types.append(
                 {type(row).__name__ for row in _profiles}
             )
             self.candidate_entry_counts.append(
-                len(_context.get("catalogue_entries", []) or [])
+                len(_context.get("catalogue", []) or [])
             )
             return {"candidates": []}
-        if stage == "relationship_bridge_shard_selection":
-            self.bridge_calls += 1
-            return {"shard_pairs": []}
         return {"decisions": []}
 
 
@@ -578,9 +588,13 @@ def _catalogue(
     }
 
 
-def test_oversized_shard_does_not_mark_large_batch_complete(tmp_path: Path) -> None:
+def test_global_discovery_uses_the_complete_compact_catalogue_when_safe(
+    tmp_path: Path,
+) -> None:
     profiles = [_profile(f"S{index:03d}") for index in range(251)]
     calls = _RelationshipCalls()
+    reasoner = _RelationshipReasoner("model")
+    reasoner.context_window_tokens = 1_000_000
     result = _run_relationship_reasoning(
         tmp_path,
         profiles=profiles,
@@ -590,21 +604,18 @@ def test_oversized_shard_does_not_mark_large_batch_complete(tmp_path: Path) -> N
             [profile.source_id for profile in profiles],
             entry_padding="x" * 1_000,
         ),
-        reasoner=_RelationshipReasoner("model"),
+        reasoner=reasoner,
         reasoner_calls=calls,  # type: ignore[arg-type]
         request=_request(tmp_path),
     )
 
-    assert result["selected_profile_hashes"] == {}
-    assert calls.candidate_calls == 0
-    assert all(
-        row["reason"]
-        == "relationship_catalogue_partition_exceeds_context_budget"
-        for row in result["parked"]
-    )
+    assert len(result["selected_profile_hashes"]) == 251
+    assert calls.candidate_calls == 1
+    assert calls.candidate_entry_counts == [251]
+    assert calls.candidate_profile_types == [{"EvidenceProfile"}]
 
 
-def test_195_source_discovery_never_sends_the_full_catalogue(
+def test_195_source_discovery_uses_one_global_call(
     tmp_path: Path,
 ) -> None:
     profiles = [_profile(f"S{index:03d}") for index in range(195)]
@@ -634,6 +645,8 @@ def test_195_source_discovery_never_sends_the_full_catalogue(
         },
     )
     calls = _RelationshipCalls()
+    reasoner = _RelationshipReasoner("model")
+    reasoner.context_window_tokens = 1_000_000
     result = _run_relationship_reasoning(
         tmp_path,
         profiles=profiles,
@@ -642,75 +655,15 @@ def test_195_source_discovery_never_sends_the_full_catalogue(
             "catalogue_path": str(catalogue_path),
             "routing_revision_hash": "revision",
         },
-        reasoner=_RelationshipReasoner("model"),
+        reasoner=reasoner,
         reasoner_calls=calls,  # type: ignore[arg-type]
         request=_request(tmp_path),
     )
 
     assert len(result["selected_profile_hashes"]) == 195
-    assert calls.candidate_calls == 8
-    assert max(calls.candidate_entry_counts) == 100
+    assert calls.candidate_calls == 1
+    assert calls.candidate_entry_counts == [195]
     assert all(types <= {"EvidenceProfile"} for types in calls.candidate_profile_types)
-
-
-def test_failed_source_shard_routing_leaves_sources_incomplete(
-    tmp_path: Path,
-) -> None:
-    profiles = [_profile(f"S{index:03d}") for index in range(65)]
-    calls = _RelationshipCalls(fail_shards=True)
-    result = _run_relationship_reasoning(
-        tmp_path,
-        profiles=profiles,
-        source_set={"source_set_type": "collection"},
-        catalogue=_catalogue(tmp_path, [profile.source_id for profile in profiles]),
-        reasoner=_RelationshipReasoner("model"),
-        reasoner_calls=calls,  # type: ignore[arg-type]
-        request=_request(tmp_path),
-    )
-
-    assert result["selected_profile_hashes"] == {}
-    assert calls.candidate_calls == 0
-    assert all(
-        row["reason"] == "relationship_shard_selection_failure"
-        for row in result["parked"]
-    )
-
-
-def test_relationship_packets_are_sized_from_complete_provider_payload() -> None:
-    profiles = {
-        f"S{index:02d}": {
-            "source_id": f"S{index:02d}",
-            "evidence_anchors": [{"claim": "x" * 18_000}],
-        }
-        for index in range(20)
-    }
-    rows = [
-        (f"S{index:02d}", f"S{index + 1:02d}")
-        for index in range(0, 20, 2)
-    ]
-
-    packets = _pack_relationship_rows(
-        rows,
-        pair_for=lambda row: row,
-        profile_by_source=profiles,
-        context_for=lambda packet: {"pairs": list(packet)},
-        max_chars=120_000,
-    )
-
-    assert [row for packet in packets for row in packet] == rows
-    assert all(
-        _reasoner_packet_chars(
-            [
-                profiles[source_id]
-                for source_id in sorted(
-                    {source_id for pair in packet for source_id in pair}
-                )
-            ],
-            {"pairs": list(packet)},
-        )
-        <= 120_000
-        for packet in packets
-    )
 
 
 def test_relationship_batch_events_include_affected_source_ids() -> None:
@@ -740,7 +693,9 @@ def test_selection_identity_change_forces_reselection(tmp_path: Path) -> None:
         request=_request(tmp_path),
     )
     _commit_relationship_selection_state(
-        tmp_path, first, catalogue_revision="revision"
+        tmp_path,
+        first,
+        catalogue_revision=first["reconciled_catalogue_revision"],
     )
 
     second_calls = _RelationshipCalls()
@@ -759,15 +714,9 @@ def test_selection_identity_change_forces_reselection(tmp_path: Path) -> None:
     assert first["selection_identity"] != second["selection_identity"]
 
 
-def test_cluster_only_catalogue_change_skips_source_reselection(
+def test_catalogue_content_change_forces_one_global_reselection(
     tmp_path: Path,
 ) -> None:
-    class BridgeReasoner(_RelationshipReasoner):
-        def select_relationship_bridge_shards(
-            self, *_args: Any, **_kwargs: Any
-        ) -> None:
-            return None
-
     profiles = [_profile("A"), _profile("B")]
     catalogue_path = tmp_path / "catalogue.yml"
     write_yaml(
@@ -791,7 +740,7 @@ def test_cluster_only_catalogue_change_skips_source_reselection(
             ],
         },
     )
-    reasoner = BridgeReasoner("model")
+    reasoner = _RelationshipReasoner("model")
     first_calls = _RelationshipCalls()
     first = _run_relationship_reasoning(
         tmp_path,
@@ -808,8 +757,11 @@ def test_cluster_only_catalogue_change_skips_source_reselection(
     _commit_relationship_selection_state(
         tmp_path,
         first,
-        catalogue_revision="revision-one",
+        catalogue_revision=first["reconciled_catalogue_revision"],
     )
+    payload = read_yaml(catalogue_path, {})
+    payload["sources"][0]["title"] = "Changed A"
+    write_yaml(catalogue_path, payload)
 
     second_calls = _RelationshipCalls()
     second = _run_relationship_reasoning(
@@ -825,7 +777,8 @@ def test_cluster_only_catalogue_change_skips_source_reselection(
         request=_request(tmp_path),
     )
 
-    assert second_calls.candidate_calls == 0
-    assert second_calls.bridge_calls == 1
-    assert second["selected_profile_hashes"] == {}
-    assert second["reconciled_catalogue_revision"] == "revision-two"
+    assert second_calls.candidate_calls == 1
+    assert set(second["selected_profile_hashes"]) == {"A", "B"}
+    assert second["reconciled_catalogue_revision"] != first[
+        "reconciled_catalogue_revision"
+    ]

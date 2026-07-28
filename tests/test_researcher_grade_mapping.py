@@ -143,6 +143,14 @@ def test_atomic_note_reconciliation_rejects_a_stale_term_value_pairing() -> None
     assert literature._anchor_is_synthesis_eligible(anchor) is False
 
 
+def test_advisory_support_status_does_not_block_locator_backed_anchor() -> None:
+    normalized = normalize_evidence_profiles([_profile("a")])
+    anchor = normalized[0]["claims"][0]
+    anchor["support_envelope"]["support_status"] = "support_unknown"
+
+    assert literature._anchor_is_synthesis_eligible(anchor) is True
+
+
 def test_atomic_note_reconciliation_accepts_a_matching_value_among_related_figures() -> None:
     raw = _profile("a")
     raw["evidence_anchors"][0].update(
@@ -2325,7 +2333,7 @@ def test_coverage_register_accounts_for_all_75_frozen_items() -> None:
     assert register["counts"] == {
         "validated_note": 65,
         "limited_note": 8,
-        "exhausted": 2,
+        "parked_for_review": 2,
         "partial": 0,
         "pending": 0,
     }
@@ -2333,7 +2341,11 @@ def test_coverage_register_accounts_for_all_75_frozen_items() -> None:
     assert register["status"] == "complete_with_exclusions"
     assert (
         len(
-            [row for row in register["records"] if row["terminal_state"] == "exhausted"]
+            [
+                row
+                for row in register["records"]
+                if row["terminal_state"] == "parked_for_review"
+            ]
         )
         == 2
     )

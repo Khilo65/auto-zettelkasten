@@ -1553,6 +1553,38 @@ def test_registry_infers_split_merge_supersede_and_retire() -> None:
     assert {"split", "merge", "revision", "retire"}.issubset(events)
 
 
+def test_registry_retains_last_valid_map_on_material_coverage_regression() -> None:
+    previous_clusters = [
+        {
+            "cluster_id": f"old-{index}",
+            "semantic_identity": f"topic-{index}",
+            "source_ids": [f"s{index}", f"s{index + 1}"],
+            "revision_hash": f"old-{index}",
+        }
+        for index in range(0, 10, 2)
+    ]
+    registry = reconcile_cluster_registry(
+        [
+            {
+                "cluster_id": "new",
+                "semantic_identity": "narrow-topic",
+                "source_ids": [f"s{index}" for index in range(7)],
+                "revision_hash": "new",
+            }
+        ],
+        {"clusters": previous_clusters},
+    )
+
+    assert {row["cluster_id"] for row in registry["clusters"]} == {
+        row["cluster_id"] for row in previous_clusters
+    }
+    assert all(row["refresh_pending"] for row in registry["clusters"])
+    assert any(
+        row.get("reason") == "cluster_refresh_coverage_collapse"
+        for row in registry["ledger"]
+    )
+
+
 def test_compatibility_entry_accepts_current_rows_writes_all_outputs_and_has_no_generic_gap(
     tmp_path: Path,
 ) -> None:

@@ -6,7 +6,10 @@ from pathlib import Path
 
 import yaml
 
-from auto_zettelkasten.indexes import build_source_catalogue
+from auto_zettelkasten.indexes import (
+    SOURCE_CATALOGUE_SCHEMA_VERSION,
+    build_source_catalogue,
+)
 
 
 @dataclass
@@ -88,9 +91,15 @@ def test_build_source_catalogue_projects_profiles_into_collection_shards(tmp_pat
     )
 
     catalogue = yaml.safe_load(Path(result["catalogue_path"]).read_text(encoding="utf-8"))
+    cluster_catalogue = yaml.safe_load(
+        Path(result["cluster_catalogue_path"]).read_text(encoding="utf-8")
+    )
     assert result["source_count"] == 2
     assert result["literature_count"] == 2
     assert result["shard_count"] == 2
+    assert SOURCE_CATALOGUE_SCHEMA_VERSION == "3"
+    assert catalogue["schema_version"] == "3"
+    assert cluster_catalogue["schema_version"] == "3"
     assert catalogue["revision_hash"] == result["revision_hash"]
     assert {row["title"] for row in catalogue["literatures"]} == {"Mediation", "Conflict relapse"}
     assert all(len(row["facets"]) <= 3 for row in catalogue["sources"])
@@ -104,6 +113,34 @@ def test_build_source_catalogue_projects_profiles_into_collection_shards(tmp_pat
     assert "Fortna 2024 — Mediation and Peace" in shard_text
     assert "Thesis: Monitoring reduces uncertainty." in shard_text
     assert "Method: Comparative case analysis." in shard_text
+
+
+def test_build_source_catalogue_upgrades_schema_two_locally_and_replays_stably(
+    tmp_path: Path,
+) -> None:
+    _source_set(tmp_path, "lit", "Literature", ["s1"], ["n1"])
+    catalogue_path = (
+        tmp_path / "02_source_memory" / "indexes" / "source_catalogue.yml"
+    )
+    catalogue_path.write_text(
+        json.dumps({"schema_version": "2", "sources": []}) + "\n",
+        encoding="utf-8",
+    )
+    profile = {
+        "source_id": "s1",
+        "note_id": "n1",
+        "concepts": ["mediation"],
+    }
+    note = _note("s1", "n1", "Study", "Author", "A compact thesis.")
+
+    upgraded = build_source_catalogue(tmp_path, [profile], [note])
+    upgraded_bytes = catalogue_path.read_bytes()
+    replay = build_source_catalogue(tmp_path, [profile], [note])
+
+    assert yaml.safe_load(upgraded_bytes)["schema_version"] == "3"
+    assert str(catalogue_path) in upgraded["changed_paths"]
+    assert replay["changed_paths"] == []
+    assert catalogue_path.read_bytes() == upgraded_bytes
 
 
 def test_build_source_catalogue_is_byte_stable_and_rewrites_only_changed_shard(tmp_path: Path) -> None:

@@ -11,7 +11,7 @@ from typing import Any, Mapping, Sequence
 from .files import atomic_write_text, now_iso, read_yaml, sha256_text, slugify, write_yaml
 from .notes import read_note
 
-SOURCE_CATALOGUE_SCHEMA_VERSION = "2"
+SOURCE_CATALOGUE_SCHEMA_VERSION = "3"
 SOURCE_CATALOGUE_SHARD_MAX_CHARS = 36_000
 SOURCE_CATALOGUE_ROUTING_CARD_MAX_CHARS = 1_500
 
@@ -218,8 +218,23 @@ def write_source_set(
     dependency_hash = sha256_text(json.dumps(dependency_payload, sort_keys=True, ensure_ascii=False, default=str))
     source_set_id = snapshot_id or f"{source_set_alias}-{dependency_hash[:12]}"
     status_counts = {
-        status: sum(1 for row in terminal_rows if str(row.get("terminal_status", "")) == status)
-        for status in ("validated_note", "limited_note", "exhausted", "partial", "pending")
+        status: sum(
+            1
+            for row in terminal_rows
+            if (
+                "parked_for_review"
+                if str(row.get("terminal_status", "")) == "exhausted"
+                else str(row.get("terminal_status", ""))
+            )
+            == status
+        )
+        for status in (
+            "validated_note",
+            "limited_note",
+            "parked_for_review",
+            "partial",
+            "pending",
+        )
     }
     payload = {
         "source_set_id": source_set_id,
@@ -232,10 +247,12 @@ def write_source_set(
         "collection_name": str(collection_name or "").strip(),
         "upstream_scope": {"kind": f"zotero_{scope}", "id": collection_key or run_id},
         "inventory_count": len(items),
-        "terminal_count": status_counts["validated_note"] + status_counts["limited_note"] + status_counts["exhausted"],
+        "terminal_count": status_counts["validated_note"]
+        + status_counts["limited_note"]
+        + status_counts["parked_for_review"],
         "validated_note_count": status_counts["validated_note"],
         "limited_note_count": status_counts["limited_note"],
-        "exhausted_count": status_counts["exhausted"],
+        "parked_for_review_count": status_counts["parked_for_review"],
         "partial_count": status_counts["partial"],
         "pending_count": status_counts["pending"],
         "source_ids": [str(row.get("source_id")) for row in note_rows],
@@ -339,6 +356,7 @@ def build_source_catalogue(
     profiles: Sequence[Any] | Mapping[str, Any],
     note_rows: Sequence[Mapping[str, Any]],
     clusters: Sequence[Mapping[str, Any]] = (),
+    collection_snapshot: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Project compact, stable source and literature indexes without provider work."""
 
@@ -414,6 +432,39 @@ def build_source_catalogue(
             for literature in literatures
             if literature["literature_id"] in entry["literature_ids"]
         )
+    snapshot_collections = {
+        str(row.get("key")): row
+        for row in (collection_snapshot or {}).get("collections", []) or []
+        if isinstance(row, Mapping) and row.get("key")
+    }
+    snapshot_memberships = {
+        str(row.get("key")).upper(): sorted(
+            str(value)
+            for value in row.get("collection_keys", []) or []
+            if str(value)
+        )
+        for row in (collection_snapshot or {}).get("items", []) or []
+        if isinstance(row, Mapping) and row.get("key")
+    }
+    if collection_snapshot:
+        available_zotero_keys = set(snapshot_memberships)
+        for entry in entries:
+            zotero_key = str(entry.get("zotero_key") or "").upper()
+            collection_keys = snapshot_memberships.get(
+                zotero_key,
+                [],
+            )
+            entry["zotero_availability"] = (
+                "available"
+                if not zotero_key or zotero_key in available_zotero_keys
+                else "unavailable"
+            )
+            entry["collection_keys"] = collection_keys
+            entry["collections"] = sorted(
+                str(snapshot_collections[key].get("name") or key)
+                for key in collection_keys
+                if key in snapshot_collections
+            )
 
     entry_by_identity = {
         (entry["source_id"], entry["note_id"]): entry for entry in entries
@@ -488,6 +539,10 @@ def build_source_catalogue(
             )
 
     compact_clusters = _compact_cluster_catalogue(clusters)
+    collection_projection = _collection_catalogue_projection(
+        entries,
+        collection_snapshot,
+    )
     compact_literatures = [
         {
             "literature_id": row["literature_id"],
@@ -523,6 +578,10 @@ def build_source_catalogue(
             for row in shard_specs
         ],
         "clusters": compact_clusters,
+        "collections": collection_projection["catalogue"],
+        "collection_snapshot_fingerprint": str(
+            (collection_snapshot or {}).get("fingerprint") or ""
+        ),
         "sources": entries,
     }
     revision_hash = sha256_text(
@@ -592,6 +651,10 @@ def build_source_catalogue(
                 + ", ".join(f"`{value}`" for value in cluster_ids)
             )
         master_lines.append("")
+    if collection_projection["catalogue"]:
+        master_lines.extend(["## Zotero Collections", ""])
+        master_lines.extend(collection_projection["tree_lines"])
+        master_lines.append("")
     master_text = "\n".join(master_lines).rstrip() + "\n"
     cluster_semantic = {
         "schema_version": SOURCE_CATALOGUE_SCHEMA_VERSION,
@@ -641,6 +704,10 @@ def build_source_catalogue(
             (workspace / str(shard["path"]), str(shard["text"]))
             for shard in shard_specs
         ),
+        *(
+            (workspace / str(spec["path"]), str(spec["text"]))
+            for spec in collection_projection["files"]
+        ),
         (workspace / "02_source_memory" / "indexes" / "source_catalogue.yml", catalogue_text),
         (workspace / "02_source_memory" / "indexes" / "INDEX.md", master_text),
         (
@@ -663,6 +730,15 @@ def build_source_catalogue(
         if stale.resolve() not in expected_shards:
             stale.unlink()
             changed_paths.append(str(stale))
+    if collection_snapshot is not None:
+        _prune_stale_collection_indexes(
+            workspace,
+            {
+                (workspace / str(spec["path"])).resolve()
+                for spec in collection_projection["files"]
+            },
+            changed_paths,
+        )
 
     return {
         "catalogue_path": str(workspace / "02_source_memory" / "indexes" / "source_catalogue.yml"),
@@ -675,13 +751,295 @@ def build_source_catalogue(
         ),
         "cluster_revision_hash": cluster_revision,
         "shard_paths": [str(workspace / str(row["path"])) for row in shard_specs],
+        "collection_index_paths": [
+            str(workspace / str(row["path"]))
+            for row in collection_projection["files"]
+            if str(row["path"]).endswith("/INDEX.md")
+        ],
+        "collection_shard_paths": [
+            str(workspace / str(row["path"]))
+            for row in collection_projection["files"]
+            if not str(row["path"]).endswith("/INDEX.md")
+        ],
         "revision_hash": revision_hash,
         "routing_revision_hash": routing_revision_hash,
         "source_count": len(entries),
         "literature_count": len(compact_literatures),
         "shard_count": len(shard_specs),
+        "collection_count": len(collection_projection["catalogue"]),
         "changed_paths": changed_paths,
     }
+
+
+def _collection_catalogue_projection(
+    entries: Sequence[Mapping[str, Any]],
+    snapshot: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if not snapshot:
+        return {"catalogue": [], "tree_lines": [], "files": []}
+    collections = {
+        str(row.get("key")): dict(row)
+        for row in snapshot.get("collections", []) or []
+        if isinstance(row, Mapping) and row.get("key")
+    }
+    if not collections:
+        return {"catalogue": [], "tree_lines": [], "files": []}
+
+    directories = {
+        key: _collection_directory_name(key)
+        for key in collections
+    }
+    children: dict[str, list[str]] = defaultdict(list)
+    roots: list[str] = []
+    for key, row in collections.items():
+        parent = str(row.get("parent_key") or "")
+        if parent and parent in collections and parent != key:
+            children[parent].append(key)
+        else:
+            roots.append(key)
+    for values in children.values():
+        values.sort(key=lambda key: (str(collections[key].get("name") or "").casefold(), key))
+    roots.sort(key=lambda key: (str(collections[key].get("name") or "").casefold(), key))
+
+    entries_by_zotero_key = {
+        str(entry.get("zotero_key") or "").upper(): dict(entry)
+        for entry in entries
+        if entry.get("zotero_key")
+    }
+    direct_item_keys: dict[str, set[str]] = defaultdict(set)
+    for item in snapshot.get("items", []) or []:
+        if not isinstance(item, Mapping) or not item.get("key"):
+            continue
+        item_key = str(item["key"]).upper()
+        for collection_key in item.get("collection_keys", []) or []:
+            key = str(collection_key)
+            if key in collections:
+                direct_item_keys[key].add(item_key)
+
+    def nested_item_keys(collection_key: str, trail: frozenset[str] = frozenset()) -> set[str]:
+        if collection_key in trail:
+            return set()
+        nested: set[str] = set()
+        next_trail = trail | {collection_key}
+        for child in children.get(collection_key, []):
+            nested.update(direct_item_keys.get(child, set()))
+            nested.update(nested_item_keys(child, next_trail))
+        return nested
+
+    files: list[dict[str, str]] = []
+    catalogue: list[dict[str, Any]] = []
+    for key in sorted(collections):
+        row = collections[key]
+        name = str(row.get("name") or key)
+        direct_keys = sorted(direct_item_keys.get(key, set()))
+        direct_entries = sorted(
+            (
+                entries_by_zotero_key[item_key]
+                for item_key in direct_keys
+                if item_key in entries_by_zotero_key
+            ),
+            key=lambda entry: (
+                str(entry.get("author") or "").casefold(),
+                str(entry.get("year") or ""),
+                str(entry.get("title") or "").casefold(),
+                str(entry.get("source_id") or ""),
+            ),
+        )
+        descendant_keys = nested_item_keys(key)
+        direct_source_ids = [
+            str(entry.get("source_id") or entry.get("note_id") or "")
+            for entry in direct_entries
+        ]
+        clusters = sorted(
+            {
+                str(cluster_id)
+                for entry in direct_entries
+                for cluster_id in entry.get("cluster_ids", []) or []
+                if str(cluster_id)
+            }
+        )
+        chunks = _meaningful_catalogue_chunks(direct_entries) if direct_entries else []
+        shard_links: list[str] = []
+        shard_revision_payload: list[str] = []
+        collection_dir = directories[key]
+        for number, (_label, chunk_entries) in enumerate(chunks, start=1):
+            filename = f"sources-{number:03d}.md"
+            shard_path = (
+                f"02_source_memory/indexes/collections/{collection_dir}/{filename}"
+            )
+            rendered = "".join(_render_catalogue_source(entry) for entry in chunk_entries)
+            rendered_or_empty = rendered or "No processed direct sources yet.\n"
+            shard_body = (
+                f"# {name} — Direct sources {number}\n\n"
+                f"Collection key: `{key}`\n\n"
+                f"{rendered_or_empty}"
+            )
+            shard_revision = sha256_text(shard_body)
+            files.append(
+                {
+                    "path": shard_path,
+                    "text": f"{shard_body}\nCatalogue revision: `{shard_revision}`\n",
+                }
+            )
+            shard_links.append(
+                f"- [[{Path(filename).stem}|Direct sources {number}]] — {len(chunk_entries)} sources"
+            )
+            shard_revision_payload.append(shard_revision)
+
+        status_counts = _collection_status_counts(direct_entries)
+        missing_count = sum(
+            1 for item_key in direct_keys if item_key not in entries_by_zotero_key
+        )
+        parent_key = str(row.get("parent_key") or "")
+        semantic = {
+            "key": key,
+            "name": name,
+            "parent_key": parent_key,
+            "child_keys": children.get(key, []),
+            "direct_source_count": len(direct_keys),
+            "descendant_source_count": len(descendant_keys),
+            "direct_source_ids": direct_source_ids,
+            "missing_source_count": missing_count,
+            "status_counts": status_counts,
+            "cluster_ids": clusters,
+            "shard_revisions": shard_revision_payload,
+        }
+        revision = sha256_text(
+            json.dumps(
+                semantic,
+                sort_keys=True,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+        index_lines = [
+            f"# {name}",
+            "",
+            f"- Collection key: `{key}`",
+            f"- Direct sources: {len(direct_keys)}",
+            f"- Descendant sources: {len(descendant_keys)}",
+            "- Membership: shards list direct members only; inherited members remain in child collections.",
+            f"- Processed: {status_counts['processed']}",
+            f"- Context-only: {status_counts['context_only']}",
+            f"- Partial documents: {status_counts['partial']}",
+            f"- Parked for review: {status_counts['parked_for_review']}",
+            f"- Missing atomic notes: {missing_count}",
+        ]
+        if parent_key in collections:
+            index_lines.append(
+                f"- Parent: [[../{directories[parent_key]}/INDEX|{collections[parent_key].get('name') or parent_key}]]"
+            )
+        if children.get(key):
+            index_lines.extend(["", "## Child collections", ""])
+            index_lines.extend(
+                f"- [[../{directories[child]}/INDEX|{collections[child].get('name') or child}]]"
+                for child in children[key]
+            )
+        index_lines.extend(["", "## Direct source shards", ""])
+        index_lines.extend(shard_links or ["No processed direct sources yet."])
+        if clusters:
+            index_lines.extend(
+                [
+                    "",
+                    "## Relevant clusters",
+                    "",
+                    *(
+                        f"- [[../../CLUSTERS|{cluster_id}]]"
+                        for cluster_id in clusters
+                    ),
+                ]
+            )
+        index_lines.extend(["", f"Catalogue revision: `{revision}`", ""])
+        index_path = (
+            f"02_source_memory/indexes/collections/{collection_dir}/INDEX.md"
+        )
+        files.append({"path": index_path, "text": "\n".join(index_lines)})
+        catalogue.append(
+            {
+                **semantic,
+                "path": index_path,
+                "revision_hash": revision,
+            }
+        )
+
+    tree_lines: list[str] = []
+    visited: set[str] = set()
+
+    def add_tree(collection_key: str, depth: int) -> None:
+        if collection_key in visited:
+            return
+        visited.add(collection_key)
+        row = collections[collection_key]
+        tree_lines.append(
+            f"{'  ' * depth}- [[collections/{directories[collection_key]}/INDEX|{row.get('name') or collection_key}]]"
+        )
+        for child_key in children.get(collection_key, []):
+            add_tree(child_key, depth + 1)
+
+    for root in roots:
+        add_tree(root, 0)
+    for key in sorted(collections):
+        add_tree(key, 0)
+    return {
+        "catalogue": catalogue,
+        "tree_lines": tree_lines,
+        "files": files,
+    }
+
+
+def _collection_status_counts(
+    entries: Sequence[Mapping[str, Any]],
+) -> dict[str, int]:
+    counts = {
+        "processed": len(entries),
+        "context_only": 0,
+        "partial": 0,
+        "parked_for_review": 0,
+    }
+    for entry in entries:
+        eligibility = str(entry.get("evidence_eligibility") or "")
+        coverage = str(entry.get("evidence_coverage") or "")
+        scope = str(entry.get("source_scope") or "")
+        status = str(entry.get("note_status") or "")
+        if eligibility == "context_only" or coverage in {"abstract", "metadata"}:
+            counts["context_only"] += 1
+        if scope == "partial_document":
+            counts["partial"] += 1
+        if status in {"parked_for_review", "exhausted"}:
+            counts["parked_for_review"] += 1
+    return counts
+
+
+def _collection_directory_name(key: str) -> str:
+    return (
+        key
+        if re.fullmatch(r"[A-Za-z0-9_-]+", key)
+        else f"collection-{sha256_text(key)[:12]}"
+    )
+
+
+def _prune_stale_collection_indexes(
+    workspace: Path,
+    expected: set[Path],
+    changed_paths: list[str],
+) -> None:
+    root = workspace / "02_source_memory" / "indexes" / "collections"
+    if not root.is_dir():
+        return
+    for directory in sorted(path for path in root.iterdir() if path.is_dir()):
+        for stale in sorted(
+            [
+                directory / "INDEX.md",
+                *directory.glob("sources-*.md"),
+            ]
+        ):
+            if stale.is_file() and stale.resolve() not in expected:
+                stale.unlink()
+                changed_paths.append(str(stale))
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
 
 
 def _catalogue_profile_rows(profiles: Sequence[Any] | Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -997,6 +1355,12 @@ def _catalogue_entry(profile: Mapping[str, Any], note: Mapping[str, Any]) -> dic
         ),
         "unknown",
     )
+    evidence_eligibility = _compact_catalogue_text(
+        profile.get("evidence_eligibility")
+        or context.get("evidence_eligibility")
+        or note.get("evidence_eligibility"),
+        40,
+    )
     facets_by_type = {
         facet_type: _bounded_profile_values(profile, fields)
         for facet_type, fields in (
@@ -1053,6 +1417,11 @@ def _catalogue_entry(profile: Mapping[str, Any], note: Mapping[str, Any]) -> dic
         "method": method or "Not specified.",
         "source_scope": source_scope or "unknown",
         "evidence_coverage": evidence_coverage,
+        "evidence_eligibility": evidence_eligibility or "unavailable",
+        "note_status": _compact_catalogue_text(
+            note.get("note_status") or note.get("terminal_status"),
+            40,
+        ),
         "facets": facets,
         "facets_by_type": {
             key: value for key, value in facets_by_type.items() if value

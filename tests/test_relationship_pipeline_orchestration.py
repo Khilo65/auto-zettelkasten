@@ -3,74 +3,76 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-import pytest
-
-from auto_zettelkasten.files import write_yaml
+from auto_zettelkasten.files import read_yaml, write_yaml
 from auto_zettelkasten.models import (
     EvidenceAnchor,
     EvidenceProfile,
     LiteratureMapRequest,
-)
-from auto_zettelkasten.pipeline import (
-    _cluster_membership_relations,
-    _run_relationship_reasoning,
 )
 from auto_zettelkasten.profiles import profile_to_dict
 from auto_zettelkasten.relationships import (
     relationship_decision_key,
     stable_hash,
 )
+from auto_zettelkasten.pipeline import (
+    _cluster_membership_relations,
+    _commit_relationship_selection_state,
+    _ranked_relationship_candidates,
+    _run_relationship_reasoning,
+)
 
 
 class _Reasoner:
     name = "test-provider"
     model = "test-model"
+    capabilities = {"capability_identity": "test-capabilities"}
 
-    def select_relationship_shards(self, *_args: Any, **_kwargs: Any) -> None:
-        pass
-
-    def select_relationship_candidates(
-        self, *_args: Any, **_kwargs: Any
-    ) -> None:
+    def select_relationship_candidates(self, *_args: Any, **_kwargs: Any) -> None:
         pass
 
     def adjudicate_relationships(self, *_args: Any, **_kwargs: Any) -> None:
         pass
 
-    def verify_relationships(self, *_args: Any, **_kwargs: Any) -> None:
+
+class _RoutedReasoner(_Reasoner):
+    context_window_tokens = 35_000
+
+    def select_relationship_shards(self, *_args: Any, **_kwargs: Any) -> None:
         pass
 
 
 class _Calls:
+    run_id = "relationship-run"
+
     def __init__(
         self,
         handler: Callable[
-            [str, Sequence[Any], Mapping[str, Any]],
-            Mapping[str, Any],
+            [str, Sequence[Any], Mapping[str, Any]], Mapping[str, Any]
         ],
     ) -> None:
         self.handler = handler
-        self.seen: list[tuple[str, Mapping[str, Any]]] = []
+        self.seen: list[tuple[str, str, Mapping[str, Any]]] = []
 
     def __call__(
         self,
         stage: str,
-        _key: str,
+        key: str,
         _method_name: str,
         profiles: Sequence[Any],
         context: Mapping[str, Any],
     ) -> Mapping[str, Any]:
-        self.seen.append((stage, context))
+        self.seen.append((stage, key, context))
         return self.handler(stage, profiles, context)
 
 
-def _profile(source_id: str) -> EvidenceProfile:
+def _profile(source_id: str, *, collection: str = "") -> EvidenceProfile:
     return EvidenceProfile(
         source_id=source_id,
         note_id=f"note-{source_id.lower()}",
         context={
             "note_status": "analytical_atomic_note",
             "title": f"Source {source_id}",
+            "collections": [collection] if collection else [],
         },
         evidence_anchors=[
             EvidenceAnchor(
@@ -87,37 +89,59 @@ def _profile(source_id: str) -> EvidenceProfile:
     )
 
 
-def _candidate(source_id: str, target_id: str) -> dict[str, Any]:
-    return {
-        "source_id": source_id,
-        "target_kind": "source",
-        "target_id": target_id,
-        "why_relevant": "The sources address the same substantive proposition.",
-        "confidence": 0.9,
-    }
-
-
-def _accepted_decision(
+def _candidate(
     source_id: str,
     target_id: str,
-    anchors: Mapping[str, str],
+    *,
+    rank: int = 1,
+    cross_literature: bool = False,
 ) -> dict[str, Any]:
     return {
         "source_id": source_id,
-        "target_source_id": target_id,
-        "status": "accepted",
+        "target_id": target_id,
+        "why_relevant": "The sources address the same substantive proposition.",
+        "rank": rank,
+        "cross_literature": cross_literature,
+    }
+
+
+def _decision(
+    job: Mapping[str, Any],
+    *,
+    malformed: bool = False,
+) -> dict[str, Any]:
+    pair = dict(job["pair"])
+    left = str(pair["left_source_id"])
+    right = str(pair["right_source_id"])
+    left_anchor_id = str(
+        job["selected_evidence"]["left"][0]["evidence_anchor_id"]
+    )
+    right_anchor_id = str(
+        job["selected_evidence"]["right"][0]["evidence_anchor_id"]
+    )
+    return {
+        "pair_job_id": job["pair_job_id"],
+        "decision": "relationship",
+        "pair": pair,
         "relation_type": "supports",
-        "source_evidence_anchor_id": anchors[source_id],
-        "target_evidence_anchor_id": anchors[target_id],
-        "comparison_unit": "shared proposition",
-        "reason": "Both sources independently support the same substantive proposition.",
-        "confidence": 0.9,
+        "actor_source_id": left,
+        "reference_source_id": right,
+        "forward_label": "supports",
+        "inverse_label": "supported by",
+        "comparison_proposition": "The works support the same bounded proposition.",
+        "reason": "Both sources independently support the proposition.",
+        "left_evidence_anchor_ids": [
+            "unknown-anchor" if malformed else left_anchor_id
+        ],
+        "right_evidence_anchor_ids": [right_anchor_id],
+        "confidence": "high",
+        "output_contract": "relationship-decision-v4",
     }
 
 
 def _catalogue(
     workspace: Path,
-    source_ids: Sequence[str],
+    profiles: Sequence[EvidenceProfile],
     *,
     shards: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
@@ -126,16 +150,17 @@ def _catalogue(
         path,
         {
             "sources": [
-                {"source_id": source_id, "title": f"Source {source_id}"}
-                for source_id in source_ids
+                {
+                    "source_id": profile.source_id,
+                    "title": f"Source {profile.source_id}",
+                    "collections": list(profile.context.get("collections", [])),
+                }
+                for profile in profiles
             ],
             "shards": list(shards),
         },
     )
-    return {
-        "catalogue_path": str(path),
-        "routing_revision_hash": "catalogue-revision",
-    }
+    return {"catalogue_path": str(path)}
 
 
 def _request(workspace: Path) -> LiteratureMapRequest:
@@ -148,181 +173,438 @@ def _request(workspace: Path) -> LiteratureMapRequest:
 
 def _run(
     workspace: Path,
-    profiles: Sequence[Any],
-    catalogue: Mapping[str, Any],
+    profiles: Sequence[EvidenceProfile],
     calls: _Calls,
+    *,
+    reasoner: _Reasoner | None = None,
+    catalogue: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     return _run_relationship_reasoning(
         workspace,
         profiles=profiles,
         source_set={"source_set_type": "collection"},
-        catalogue=catalogue,
-        reasoner=_Reasoner(),
+        catalogue=catalogue or _catalogue(workspace, profiles),
+        reasoner=reasoner or _Reasoner(),
         reasoner_calls=calls,  # type: ignore[arg-type]
         request=_request(workspace),
     )
 
 
-def test_large_catalogue_candidate_context_uses_selected_shards(
+def test_global_discovery_creates_immutable_pair_job(
     tmp_path: Path,
 ) -> None:
-    profiles = [_profile(f"S{index:03d}") for index in range(251)]
-    catalogue = _catalogue(
-        tmp_path,
-        [profile.source_id for profile in profiles],
-        shards=[
-            {
-                "literature_id": "lit-a",
-                "shard_id": "shard-a",
-                "source_ids": ["S000", "S001"],
-            },
-            {
-                "literature_id": "lit-b",
-                "shard_id": "shard-b",
-                "source_ids": [
-                    profile.source_id for profile in profiles[2:]
-                ],
-            },
-        ],
+    profiles = [_profile("A"), _profile("B")]
+
+    def handler(
+        stage: str,
+        provider_profiles: Sequence[Any],
+        context: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if stage == "relationship_candidate_selection":
+            assert context["discovery_mode"] == "global"
+            assert {profile.source_id for profile in provider_profiles} == {"A", "B"}
+            assert all(profile.evidence_anchors for profile in provider_profiles)
+            assert context["max_inferred_pairs"] == 120
+            assert context["reserved_bridge_fraction"] == 0.4
+            assert "existing_graph_neighbors" in context
+            assert "literature_positions" in context
+            assert "cluster_summaries" in context
+            return {"candidates": [_candidate("A", "B")]}
+        assert stage == "relationship_adjudication"
+        jobs = context["pair_jobs"]
+        assert len(jobs) == 1
+        assert jobs[0]["output_contract"] == "relationship-decision-v4"
+        return {"decisions": [_decision(jobs[0])]}
+
+    calls = _Calls(handler)
+    result = _run(tmp_path, profiles, calls)
+
+    assert [stage for stage, _key, _context in calls.seen] == [
+        "relationship_candidate_selection",
+        "relationship_adjudication",
+    ]
+    assert len(result["accepted"]) == 1
+    assert result["pair_job_count"] == 1
+    job_path = next(
+        (
+            tmp_path
+            / "11_state"
+            / "runs"
+            / calls.run_id
+            / "relationship_jobs"
+        ).glob("*/input.json")
     )
-    state_path = (
-        tmp_path
-        / "02_source_memory"
-        / "indexes"
-        / "relationship_selection_state.yml"
-    )
-    profile_hashes = {
-        profile.source_id: stable_hash(profile_to_dict(profile))
-        for profile in profiles
+    before = job_path.read_bytes()
+
+    replay_calls = _Calls(handler)
+    replay = _run(tmp_path, profiles, replay_calls)
+
+    assert [
+        stage for stage, _key, _context in replay_calls.seen
+    ] == ["relationship_candidate_selection"]
+    assert replay["provider_batch_count"] == 0
+    assert job_path.read_bytes() == before
+
+
+def test_candidate_cap_reserves_bridge_slots_and_keeps_model_rank() -> None:
+    source_ids = {f"W{index}" for index in range(11)} | {
+        f"B{index}" for index in range(11)
     }
-    profile_hashes["S000"] = "stale"
-    write_yaml(state_path, {"profile_hashes": profile_hashes})
+    entries = {
+        source_id: {
+            "source_id": source_id,
+            "collections": ["within" if source_id.startswith("W") else source_id],
+        }
+        for source_id in source_ids
+    }
+    response = {
+        "candidates": [
+            _candidate("W0", f"W{index}", rank=index)
+            for index in range(1, 11)
+        ]
+        + [
+            _candidate("B0", f"B{index}", rank=index, cross_literature=True)
+            for index in range(1, 11)
+        ]
+    }
+
+    selected = _ranked_relationship_candidates(
+        response,
+        available_source_ids=source_ids,
+        entry_by_source=entries,
+        excluded_pairs=set(),
+        maximum=10,
+        bridge_fraction=0.4,
+    )
+
+    assert [(row["source_id"], row["target_id"]) for row in selected] == [
+        ("B0", "B1"),
+        ("B0", "B2"),
+        ("B0", "B3"),
+        ("B0", "B4"),
+        ("W0", "W1"),
+        ("W0", "W2"),
+        ("W0", "W3"),
+        ("W0", "W4"),
+        ("W0", "W5"),
+        ("W0", "W6"),
+    ]
+
+
+def test_pair_jobs_are_bounded_into_six_row_transport_batches(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile("A"), *[_profile(f"S{index:02d}") for index in range(13)]]
+    candidates = [
+        _candidate("A", f"S{index:02d}", rank=index + 1)
+        for index in range(13)
+    ]
+    batch_sizes: list[int] = []
 
     def handler(
         stage: str,
         _profiles: Sequence[Any],
         context: Mapping[str, Any],
     ) -> Mapping[str, Any]:
-        if stage == "relationship_shard_selection":
-            return {"shard_ids": ["shard-a"]}
         if stage == "relationship_candidate_selection":
-            return {"candidates": [_candidate("S000", "S001")]}
-        return {
-            "decisions": [
-                {
-                    "source_id": pair["source_id"],
-                    "target_source_id": pair["target_source_id"],
-                    "status": "no_relationship",
-                    "reason": "The apparent overlap is not substantively meaningful.",
-                    "confidence": 0.9,
-                }
-                for pair in context["pairs"]
-            ]
-        }
+            return {"candidates": candidates}
+        jobs = context["pair_jobs"]
+        batch_sizes.append(len(jobs))
+        return {"decisions": [_decision(job) for job in jobs]}
 
-    calls = _Calls(handler)
-    _run(tmp_path, profiles, catalogue, calls)
+    result = _run(tmp_path, profiles, _Calls(handler))
 
-    candidate_context = next(
-        context
-        for stage, context in calls.seen
-        if stage == "relationship_candidate_selection"
+    assert batch_sizes == [6, 6, 1]
+    assert result["provider_batch_count"] == 3
+    assert result["pair_job_count"] == 13
+    assert len(result["accepted"]) == 13
+    batch_files = list(
+        (
+            tmp_path
+            / "11_state"
+            / "runs"
+            / _Calls.run_id
+            / "relationship_batches"
+        ).glob("*/batch.yml")
     )
+    assert len(batch_files) == 3
     assert {
-        row["source_id"] for row in candidate_context["catalogue_entries"]
-    } == {"S001"}
+        read_yaml(path)["status"] for path in batch_files
+    } == {"completed"}
 
 
-@pytest.mark.parametrize("failure_stage", ["candidate", "adjudication"])
-def test_second_provider_batch_failure_preserves_earlier_results_and_state(
+def test_malformed_decision_parks_only_its_pair(
     tmp_path: Path,
-    failure_stage: str,
 ) -> None:
-    profiles = [_profile(f"S{index:02d}") for index in range(20)]
-    catalogue = _catalogue(
-        tmp_path, [profile.source_id for profile in profiles]
-    )
-    anchors = {
-        profile.source_id: profile_to_dict(profile)["evidence_anchors"][0][
-            "evidence_anchor_id"
-        ]
-        for profile in profiles
-    }
-    stage_counts: dict[str, int] = {}
+    profiles = [_profile("A"), _profile("B"), _profile("C")]
 
     def handler(
         stage: str,
-        batch_profiles: Sequence[Any],
+        _profiles: Sequence[Any],
         context: Mapping[str, Any],
     ) -> Mapping[str, Any]:
-        stage_counts[stage] = stage_counts.get(stage, 0) + 1
-        call_number = stage_counts[stage]
         if stage == "relationship_candidate_selection":
-            if failure_stage == "candidate" and call_number == 2:
-                raise RuntimeError("candidate provider failure")
-            focus_ids = [profile.source_id for profile in batch_profiles]
-            if call_number == 1:
-                if failure_stage == "candidate":
-                    return {"candidates": [_candidate("S00", "S01")]}
-                return {
-                    "candidates": [
-                        _candidate(f"S{index:02d}", target)
-                        for index in range(12)
-                        for target in ("S18", "S19")
-                    ]
-                }
-            assert focus_ids == [f"S{index:02d}" for index in range(12, 20)]
-            return {"candidates": [_candidate("S12", "S13")]}
-        if stage == "relationship_adjudication":
-            if failure_stage == "adjudication" and call_number == 2:
-                raise RuntimeError("adjudication provider failure")
             return {
-                "decisions": [
-                    _accepted_decision(
-                        str(pair["source_id"]),
-                        str(pair["target_source_id"]),
-                        anchors,
-                    )
-                    for pair in context["pairs"]
+                "candidates": [
+                    _candidate("A", "B"),
+                    _candidate("A", "C", rank=2),
                 ]
             }
-        if stage == "relationship_verification":
-            return {
-                "verifications": [
-                    {
-                        **row,
-                        "status": "confirmed",
-                        "reason": "Both located claims support the same bounded proposition.",
-                        "requested_context": [],
-                    }
-                    for row in context["preliminary_decisions"]
-                ]
-            }
-        raise AssertionError(f"unexpected stage: {stage}")
+        jobs = context["pair_jobs"]
+        return {
+            "decisions": [
+                _decision(jobs[0]),
+                _decision(jobs[1], malformed=True),
+            ]
+        }
 
-    result = _run(tmp_path, profiles, catalogue, _Calls(handler))
+    result = _run(tmp_path, profiles, _Calls(handler))
 
-    assert result["accepted"], result
-    assert set(result["selected_profile_hashes"])
-    assert set(result["selected_profile_hashes"]) < {
-        f"S{index:02d}" for index in range(20)
-    }
-    assert any(
-        row["reason"]
-        == (
-            "relationship_candidate_selection_failure"
-            if failure_stage == "candidate"
-            else "relationship_adjudication_failure"
-        )
-        for row in result["parked"]
+    assert len(result["accepted"]) == 1
+    assert len(result["parked"]) == 1
+    assert result["parked"][0]["reason"] == "left_anchor_not_owned_by_left_source"
+    parked_job_id = result["parked"][0]["pair_job_id"]
+    parked_status = read_yaml(
+        tmp_path
+        / "11_state"
+        / "runs"
+        / _Calls.run_id
+        / "relationship_jobs"
+        / parked_job_id
+        / "status.yml"
     )
+    assert parked_status["status"] == "parked_for_review"
 
 
-def test_matching_pair_decision_suppresses_redundant_adjudication(
+def test_failed_batch_preserves_sibling_batches_and_job_status(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile("A"), *[_profile(f"S{index:02d}") for index in range(13)]]
+    call_number = 0
+
+    def handler(
+        stage: str,
+        _profiles: Sequence[Any],
+        context: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        nonlocal call_number
+        if stage == "relationship_candidate_selection":
+            return {
+                "candidates": [
+                    _candidate("A", f"S{index:02d}", rank=index + 1)
+                    for index in range(13)
+                ]
+            }
+        call_number += 1
+        if call_number == 2:
+            raise RuntimeError("provider batch failed")
+        return {"decisions": [_decision(job) for job in context["pair_jobs"]]}
+
+    result = _run(tmp_path, profiles, _Calls(handler))
+
+    assert len(result["accepted"]) == 7
+    statuses = [
+        read_yaml(path)
+        for path in (
+            tmp_path
+            / "11_state"
+            / "runs"
+            / _Calls.run_id
+            / "relationship_jobs"
+        ).glob("*/status.yml")
+    ]
+    assert sum(row["status"] == "completed" for row in statuses) == 7
+    assert sum(row["status"] == "parked_for_review" for row in statuses) == 6
+
+
+def test_committed_selection_state_makes_unchanged_replay_call_free(
     tmp_path: Path,
 ) -> None:
     profiles = [_profile("A"), _profile("B")]
-    catalogue = _catalogue(tmp_path, ["A", "B"])
+
+    def first_handler(
+        stage: str,
+        _profiles: Sequence[Any],
+        context: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if stage == "relationship_candidate_selection":
+            return {"candidates": [_candidate("A", "B")]}
+        return {"decisions": [_decision(context["pair_jobs"][0])]}
+
+    first = _run(tmp_path, profiles, _Calls(first_handler))
+    _commit_relationship_selection_state(
+        tmp_path,
+        first,
+        catalogue_revision="different-public-catalogue-revision",
+    )
+    replay_calls = _Calls(
+        lambda stage, _profiles, _context: (_ for _ in ()).throw(
+            AssertionError(f"unexpected replay call: {stage}")
+        )
+    )
+
+    replay = _run(tmp_path, profiles, replay_calls)
+
+    assert replay_calls.seen == []
+    assert replay["pair_job_count"] == 0
+    assert replay["provider_batch_count"] == 0
+
+
+def test_large_catalogue_routes_to_selected_shards_before_discovery(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile(f"S{index:03d}") for index in range(40)]
+    shards = [
+        {
+            "shard_id": "shard-selected",
+            "literature_id": "selected",
+            "source_ids": ["S000", "S001"],
+            "routing_card": {
+                "title": "Selected literature",
+                "representative_theses": ["A relevant argument."],
+            },
+        },
+        {
+            "shard_id": "shard-other",
+            "literature_id": "other",
+            "source_ids": [f"S{index:03d}" for index in range(2, 40)],
+            "routing_card": {
+                "title": "Other literature",
+                "representative_theses": ["Other arguments."],
+            },
+        },
+    ]
+    catalogue = _catalogue(tmp_path, profiles, shards=shards)
+
+    def handler(
+        stage: str,
+        provider_profiles: Sequence[Any],
+        context: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if stage == "relationship_shard_selection":
+            assert {profile.source_id for profile in provider_profiles} == {
+                f"S{index:03d}" for index in range(40)
+            }
+            assert all(not profile.evidence_anchors for profile in provider_profiles)
+            return {"shard_ids": ["shard-selected"]}
+        if stage == "relationship_candidate_selection":
+            assert context["discovery_mode"] == "routed_shards"
+            assert {
+                row["source_id"] for row in context["catalogue"]
+            } == {"S000", "S001"}
+            assert {
+                profile.source_id for profile in provider_profiles
+            } == {"S000", "S001"}
+            assert all(profile.evidence_anchors for profile in provider_profiles)
+            return {"candidates": [_candidate("S000", "S001")]}
+        return {"decisions": [_decision(context["pair_jobs"][0])]}
+
+    calls = _Calls(handler)
+    result = _run(
+        tmp_path,
+        profiles,
+        calls,
+        reasoner=_RoutedReasoner(),
+        catalogue=catalogue,
+    )
+
+    assert [stage for stage, _key, _context in calls.seen] == [
+        "relationship_shard_selection",
+        "relationship_candidate_selection",
+        "relationship_adjudication",
+    ]
+    assert len(result["accepted"]) == 1
+
+
+def test_pair_batches_split_on_measured_context_size(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile("A"), *[_profile(f"S{index}") for index in range(5)]]
+    for profile in profiles:
+        profile.evidence_anchors = [
+            EvidenceAnchor(
+                evidence_anchor_id=f"large-anchor-{profile.source_id}",
+                source_id=profile.source_id,
+                claim=f"Claim for {profile.source_id}. " + "evidence " * 180,
+                locator="p. 10",
+                support_envelope={
+                    "support_status": "supported",
+                    "coverage": "full_text",
+                },
+            )
+        ]
+    reasoner = _RoutedReasoner()
+    reasoner.context_window_tokens = 10_000
+    batch_sizes: list[int] = []
+
+    def handler(
+        stage: str,
+        _profiles: Sequence[Any],
+        context: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if stage == "relationship_candidate_selection":
+            return {
+                "candidates": [
+                    _candidate("A", f"S{index}", rank=index + 1)
+                    for index in range(5)
+                ]
+            }
+        jobs = context["pair_jobs"]
+        batch_sizes.append(len(jobs))
+        return {"decisions": [_decision(job) for job in jobs]}
+
+    result = _run(
+        tmp_path,
+        profiles,
+        _Calls(handler),
+        reasoner=reasoner,
+    )
+
+    assert len(batch_sizes) > 1
+    assert sum(batch_sizes) == 5
+    assert len(result["accepted"]) == 5
+
+
+def test_mandatory_pairs_fail_preflight_before_any_provider_call(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile("A"), *[_profile(f"S{index}") for index in range(7)]]
+    write_yaml(
+        tmp_path / "02_source_memory" / "indexes" / "typed_links.yml",
+        {
+            "relations": [
+                {
+                    "relation_id": f"explicit-{index}",
+                    "source_id": "A",
+                    "target_source_id": f"S{index}",
+                    "relation_type": "zotero_related",
+                    "active": True,
+                }
+                for index in range(7)
+            ]
+        },
+    )
+    calls = _Calls(
+        lambda stage, _profiles, _context: (_ for _ in ()).throw(
+            AssertionError(f"unexpected provider call: {stage}")
+        )
+    )
+    calls.max_calls = 1
+    calls.cumulative_provider_calls = 0
+
+    result = _run(tmp_path, profiles, calls)
+
+    assert calls.seen == []
+    assert len(result["parked"]) == 7
+    assert {
+        row["reason"] for row in result["parked"]
+    } == {"mandatory_relationship_budget_conflict"}
+
+
+def test_unchanged_negative_pair_memory_skips_readjudication(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile("A"), _profile("B")]
     decision_key = relationship_decision_key(
         "A",
         "B",
@@ -333,7 +615,16 @@ def test_matching_pair_decision_suppresses_redundant_adjudication(
     )
     write_yaml(
         tmp_path / "02_source_memory" / "indexes" / "typed_links.yml",
-        {"links": [], "pair_decisions": [{"decision_key": decision_key}]},
+        {
+            "pair_decisions": [
+                {
+                    "decision_key": decision_key,
+                    "source_id": "A",
+                    "target_source_id": "B",
+                    "status": "no_relationship",
+                }
+            ]
+        },
     )
 
     def handler(
@@ -341,20 +632,18 @@ def test_matching_pair_decision_suppresses_redundant_adjudication(
         _profiles: Sequence[Any],
         _context: Mapping[str, Any],
     ) -> Mapping[str, Any]:
-        if stage == "relationship_candidate_selection":
-            return {"candidates": [_candidate("A", "B")]}
-        raise AssertionError("matching pair decision should skip adjudication")
+        assert stage == "relationship_candidate_selection"
+        return {"candidates": [_candidate("A", "B")]}
 
     calls = _Calls(handler)
-    result = _run(tmp_path, profiles, catalogue, calls)
+    result = _run(tmp_path, profiles, calls)
 
+    assert [stage for stage, _key, _context in calls.seen] == [
+        "relationship_candidate_selection"
+    ]
+    assert result["pair_job_count"] == 0
     assert result["accepted"] == []
     assert result["no_relationship"] == []
-    assert set(result["selected_profile_hashes"]) == {"A", "B"}
-    assert [
-        stage for stage, _context in calls.seen
-        if stage == "relationship_adjudication"
-    ] == []
 
 
 def test_cluster_membership_relations_are_reciprocal() -> None:
@@ -376,56 +665,3 @@ def test_cluster_membership_relations_are_reciprocal() -> None:
     )
     assert member["source_id"] == reciprocal["target_source_id"] == "A"
     assert member["target_cluster_id"] == reciprocal["source_id"] == "cluster-one"
-
-
-def test_cluster_candidate_is_retained_for_cluster_proposal_context(
-    tmp_path: Path,
-) -> None:
-    profiles = [_profile("A"), _profile("B")]
-    catalogue = _catalogue(tmp_path, ["A", "B"])
-    write_yaml(
-        tmp_path / "03_literature_synthesis" / "cluster_registry.yml",
-        {
-            "clusters": [
-                {
-                    "cluster_id": "cluster-one",
-                    "label": "Existing debate",
-                    "core_source_ids": ["B"],
-                }
-            ]
-        },
-    )
-
-    def handler(
-        stage: str,
-        _profiles: Sequence[Any],
-        _context: Mapping[str, Any],
-    ) -> Mapping[str, Any]:
-        assert stage == "relationship_candidate_selection"
-        return {
-            "candidates": [
-                {
-                    "source_id": "A",
-                    "target_kind": "cluster",
-                    "target_id": "cluster-one",
-                    "why_relevant": "The source directly addresses the existing debate.",
-                    "comparison_unit": "debate boundary",
-                    "confidence": 0.9,
-                }
-            ]
-        }
-
-    result = _run(tmp_path, profiles, catalogue, _Calls(handler))
-
-    assert result["cluster_candidates"] == [
-        {
-            "source_id": "A",
-            "target_kind": "cluster",
-            "target_id": "cluster-one",
-            "why_relevant": "The source directly addresses the existing debate.",
-            "comparison_unit": "debate boundary",
-            "likely_relation_type": "",
-            "requested_evidence_depth": "profile",
-            "confidence": 0.9,
-        }
-    ]

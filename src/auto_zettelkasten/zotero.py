@@ -7,9 +7,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
-from .files import require_loopback_http_url
+from .files import require_loopback_http_url, sha256_text
 
 
 class ZoteroError(RuntimeError):
@@ -120,6 +120,21 @@ class ZoteroLocalClient:
         quoted = urllib.parse.quote(item_key, safe="")
         return self._paginate(f"users/{self.library_id}/items/{quoted}/children")
 
+    def item(self, item_key: str) -> Mapping[str, Any] | None:
+        """Return one Zotero item without making the client port stricter."""
+
+        quoted = urllib.parse.quote(item_key, safe="")
+        try:
+            payload, _ = self._request(f"users/{self.library_id}/items/{quoted}")
+        except ZoteroError as exc:
+            if "HTTP 404" in str(exc):
+                return None
+            raise
+        value = json.loads(payload.decode("utf-8") or "{}")
+        if not isinstance(value, dict):
+            raise ZoteroError(f"expected an item object for {item_key}")
+        return value
+
     def fulltext(self, item_key: str) -> Mapping[str, Any] | None:
         quoted = urllib.parse.quote(item_key, safe="")
         try:
@@ -207,6 +222,251 @@ class ZoteroLocalClient:
             raise ZoteroError(f"HTTP {exc.code} from Zotero: {detail}") from exc
         except urllib.error.URLError as exc:
             raise ZoteroError(f"cannot reach Zotero at {self.base_url}: {exc.reason}") from exc
+
+
+def normalize_collection_snapshot(
+    collections: Sequence[Mapping[str, Any]],
+    items: Sequence[Mapping[str, Any]],
+    *,
+    parent_items: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Normalize a complete read-only Zotero inventory into stable diffable state."""
+
+    normalized_collections: list[dict[str, Any]] = []
+    for raw in collections:
+        data = raw.get("data", raw)
+        if not isinstance(data, Mapping):
+            data = {}
+        key = str(raw.get("key") or data.get("key") or "").strip()
+        if not key:
+            continue
+        semantic = {
+            "key": key,
+            "name": str(data.get("name") or "").strip(),
+            "parent_key": str(data.get("parentCollection") or "").strip(),
+            "version": _stable_revision(raw, data),
+        }
+        normalized_collections.append(
+            {
+                **semantic,
+                "fingerprint": _stable_fingerprint(semantic),
+            }
+        )
+    normalized_collections.sort(key=lambda row: row["key"])
+
+    parents = parent_items or {}
+    normalized_items: list[dict[str, Any]] = []
+    for raw in items:
+        data = raw.get("data", raw)
+        if not isinstance(data, Mapping):
+            data = {}
+        key = str(raw.get("key") or data.get("key") or "").strip()
+        if not key:
+            continue
+        collection_keys = sorted(
+            {
+                str(value).strip()
+                for value in data.get("collections", []) or []
+                if str(value).strip()
+            }
+        )
+        parent_key = str(data.get("parentItem") or "").strip()
+        parent_raw = parents.get(parent_key, {}) if parent_key else {}
+        parent_metadata = _parent_metadata(parent_raw) if parent_raw else {}
+        content = {
+            key_name: _stable_value(value)
+            for key_name, value in data.items()
+            if key_name != "collections"
+        }
+        semantic = {
+            "key": key,
+            "version": _stable_revision(raw, data),
+            "item_type": str(data.get("itemType") or "").strip(),
+            "parent_item_key": parent_key,
+            "collection_keys": collection_keys,
+            "content_fingerprint": _stable_fingerprint(
+                {
+                    "content": content,
+                    "parent_metadata": parent_metadata,
+                }
+            ),
+            "parent_metadata": parent_metadata,
+        }
+        normalized_items.append(
+            {
+                **semantic,
+                "fingerprint": _stable_fingerprint(semantic),
+            }
+        )
+    normalized_items.sort(key=lambda row: row["key"])
+
+    semantic_snapshot = {
+        "schema_version": "1",
+        "collections": normalized_collections,
+        "items": normalized_items,
+    }
+    return {
+        **semantic_snapshot,
+        "fingerprint": _stable_fingerprint(semantic_snapshot),
+    }
+
+
+def diff_collection_snapshots(
+    previous: Mapping[str, Any] | None,
+    current: Mapping[str, Any],
+) -> dict[str, list[str]]:
+    """Return stable Zotero item, membership, rename, and move changes."""
+
+    previous = previous or {}
+    old_items = _rows_by_key(previous.get("items"))
+    new_items = _rows_by_key(current.get("items"))
+    old_collections = _rows_by_key(previous.get("collections"))
+    new_collections = _rows_by_key(current.get("collections"))
+    shared_items = sorted(old_items.keys() & new_items.keys())
+    shared_collections = sorted(old_collections.keys() & new_collections.keys())
+    return {
+        "new_item_keys": sorted(new_items.keys() - old_items.keys()),
+        "changed_item_keys": [
+            key
+            for key in shared_items
+            if old_items[key].get("content_fingerprint")
+            != new_items[key].get("content_fingerprint")
+        ],
+        "removed_item_keys": sorted(old_items.keys() - new_items.keys()),
+        "membership_changed_item_keys": [
+            key
+            for key in shared_items
+            if list(old_items[key].get("collection_keys") or [])
+            != list(new_items[key].get("collection_keys") or [])
+        ],
+        "new_collection_keys": sorted(new_collections.keys() - old_collections.keys()),
+        "removed_collection_keys": sorted(old_collections.keys() - new_collections.keys()),
+        "renamed_collection_keys": [
+            key
+            for key in shared_collections
+            if str(old_collections[key].get("name") or "")
+            != str(new_collections[key].get("name") or "")
+        ],
+        "moved_collection_keys": [
+            key
+            for key in shared_collections
+            if str(old_collections[key].get("parent_key") or "")
+            != str(new_collections[key].get("parent_key") or "")
+        ],
+    }
+
+
+def scope_collection_snapshot(
+    snapshot: Mapping[str, Any],
+    *,
+    scope: str,
+    collection_key: str = "",
+    item_keys: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Return the portion whose successful processing a sync may acknowledge."""
+
+    if scope not in {"library", "collection"}:
+        raise ValueError("snapshot scope must be library or collection")
+    if scope == "collection" and not collection_key:
+        raise ValueError("collection snapshot scope requires collection_key")
+    if scope == "library":
+        collections = [
+            dict(row)
+            for row in snapshot.get("collections", []) or []
+            if isinstance(row, Mapping)
+        ]
+        items = [
+            dict(row)
+            for row in snapshot.get("items", []) or []
+            if isinstance(row, Mapping)
+        ]
+    else:
+        by_collection = _rows_by_key(snapshot.get("collections"))
+        relevant_collection_keys: set[str] = set()
+        current_key = collection_key
+        while current_key and current_key not in relevant_collection_keys:
+            relevant_collection_keys.add(current_key)
+            current = by_collection.get(current_key, {})
+            current_key = str(current.get("parent_key") or "")
+        collections = [
+            dict(by_collection[key])
+            for key in sorted(relevant_collection_keys)
+            if key in by_collection
+        ]
+        wanted_items = {str(value).upper() for value in item_keys if str(value)}
+        items = [
+            dict(row)
+            for row in snapshot.get("items", []) or []
+            if isinstance(row, Mapping)
+            and str(row.get("key") or "").upper() in wanted_items
+        ]
+    semantic = {
+        "schema_version": str(snapshot.get("schema_version") or "1"),
+        "scope": {
+            "kind": scope,
+            "collection_key": collection_key if scope == "collection" else "",
+        },
+        "collections": collections,
+        "items": items,
+    }
+    return {**semantic, "fingerprint": _stable_fingerprint(semantic)}
+
+
+def _stable_revision(raw: Mapping[str, Any], data: Mapping[str, Any]) -> int | str:
+    value = raw.get("version", data.get("version", ""))
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return str(value or "")
+
+
+def _stable_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _stable_value(item)
+            for key, item in sorted(value.items(), key=lambda row: str(row[0]))
+        }
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return [_stable_value(item) for item in value]
+    return value if value is None or isinstance(value, (str, int, float, bool)) else str(value)
+
+
+def _stable_fingerprint(value: Mapping[str, Any]) -> str:
+    return sha256_text(
+        json.dumps(
+            _stable_value(value),
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    )
+
+
+def _parent_metadata(raw: Mapping[str, Any]) -> dict[str, Any]:
+    data = raw.get("data", raw)
+    if not isinstance(data, Mapping):
+        data = {}
+    return {
+        "key": str(raw.get("key") or data.get("key") or ""),
+        "version": _stable_revision(raw, data),
+        "item_type": str(data.get("itemType") or ""),
+        "title": str(data.get("title") or ""),
+        "creators": _stable_value(data.get("creators", []) or []),
+        "date": str(data.get("date") or ""),
+        "publication_title": str(data.get("publicationTitle") or ""),
+        "publisher": str(data.get("publisher") or ""),
+        "doi": str(data.get("DOI") or ""),
+        "isbn": str(data.get("ISBN") or ""),
+    }
+
+
+def _rows_by_key(value: Any) -> dict[str, Mapping[str, Any]]:
+    rows = value if isinstance(value, Sequence) and not isinstance(value, (str, bytes)) else []
+    return {
+        str(row.get("key")): row
+        for row in rows
+        if isinstance(row, Mapping) and row.get("key")
+    }
 
 
 def _integer_header(headers: Mapping[str, str], name: str) -> int | None:

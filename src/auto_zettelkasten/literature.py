@@ -30,6 +30,7 @@ from .models import (
     FAMILY_RELATION_TYPES,
 )
 from .notes import source_note_semantic_components
+from .relationships import RELATIONSHIP_PROMPT_VERSION
 
 from .navigation import (
     build_navigation_graph,
@@ -68,11 +69,11 @@ GAP_RULES = (
     "cross_cluster_integration",
     "author_stated_gap",
 )
-LITERATURE_ALGORITHM_VERSION = "33"
+LITERATURE_ALGORITHM_VERSION = "35"
+CLUSTER_PLAN_PROMPT_VERSION = "2"
 CLUSTER_PROPOSAL_PROMPT_VERSION = "17"
-CLUSTER_SYNTHESIS_PROMPT_VERSION = "19"
+CLUSTER_SYNTHESIS_PROMPT_VERSION = "21"
 GAP_REASONING_PROMPT_VERSION = "12"
-RELATIONSHIP_PROMPT_VERSION = "1"
 ANCHOR_ALGORITHM_VERSION = "3"
 SUPPORT_ENVELOPE_VERSION = "2"
 PROPOSITION_ALGORITHM_VERSION = "14"
@@ -1306,6 +1307,8 @@ _SYNTHESIS_STAGE_ALLOCATIONS = {
 }
 _SYNTHESIS_STAGE_ORDER = tuple(_SYNTHESIS_STAGE_ALLOCATIONS)
 _SYNTHESIS_SHARED_RESERVE = 13
+_GLOBAL_CLUSTER_PLAN_CARD_LIMIT = 120
+_SHARDED_CLUSTER_PLAN_CARD_LIMIT = 24
 
 
 class _CheckpointedReasonerCalls:
@@ -1386,8 +1389,16 @@ class _CheckpointedReasonerCalls:
         packet_chars = _reasoner_packet_chars(
             provider_profiles, enriched_context
         )
-        context_char_budget = _reasoner_context_char_budget(
-            self.reasoner, self.request
+        context_char_budget = (
+            int(enriched_context.get("cluster_plan_settings", {}).get(
+                "input_char_budget", 0
+            ))
+            if stage == "cluster_plan"
+            and isinstance(enriched_context.get("cluster_plan_settings"), Mapping)
+            else _reasoner_context_char_budget(self.reasoner, self.request)
+        )
+        reasoner_capabilities = _as_mapping(
+            getattr(self.reasoner, "capabilities", {})
         )
         dependency = {
             "stage": stage,
@@ -1395,6 +1406,7 @@ class _CheckpointedReasonerCalls:
             "method": method_name,
             "provider": str(getattr(self.reasoner, "name", "")),
             "model": str(getattr(self.reasoner, "model", "")),
+            "reasoner_capabilities": reasoner_capabilities,
             "source_set_id": str(_as_mapping(self.request).get("source_set_id") or ""),
             "profile_dependencies": [
                 {
@@ -1727,10 +1739,14 @@ class _CheckpointedReasonerCalls:
             raise LiteratureSynthesisPartialError(
                 f"literature_provider_context_budget_exceeded:{stage}:{key}"
             )
-        if durable_attempt_count >= 2 and durable_attempt_count > int(
+        if (
+            durable_attempt_count >= 1
+            and not self.retry_terminal_failures
+            and durable_attempt_count > int(
             prior_failure.get("attempt_count", 0)
             if isinstance(prior_failure, Mapping)
             else 0
+            )
         ):
             write_yaml(
                 failure_path
@@ -1752,7 +1768,7 @@ class _CheckpointedReasonerCalls:
                     "error": {
                         "type": "InterruptedProviderAttempts",
                         "message": (
-                            "two paid attempts ended before a reusable "
+                            "a paid attempt ended before a reusable "
                             "checkpoint was written"
                         ),
                     },
@@ -2168,6 +2184,7 @@ def _legacy_synthesis_usage(root: Path, *, max_calls: int) -> dict[str, Any]:
 
 def _synthesis_stage_prompt_version(stage: str) -> str:
     return {
+        "cluster_plan": CLUSTER_PLAN_PROMPT_VERSION,
         "cluster_proposal": CLUSTER_PROPOSAL_PROMPT_VERSION,
         "cluster_reconciliation": CLUSTER_PROPOSAL_PROMPT_VERSION,
         "cluster_synthesis": CLUSTER_SYNTHESIS_PROMPT_VERSION,
@@ -2197,6 +2214,12 @@ def _synthesis_stage_budget_group(stage: str, key: str = "") -> str:
         return "relationship_escalation"
     if stage in {"cluster_proposal", "cluster_synthesis"} and "repair" in key:
         return "cluster_repair"
+    if stage == "cluster_plan":
+        return (
+            "cluster_reconciliation"
+            if key in {"collection", "bridge"}
+            else "cluster_proposal"
+        )
     return {
         "relationship_adjudication": "relationship_adjudication",
         "relationship_verification": "relationship_verification",
@@ -2212,6 +2235,7 @@ def _revalidate_raw_synthesis_response(
     raw_response: Mapping[str, Any],
 ) -> dict[str, Any] | None:
     kind = {
+        "cluster_plan": "cluster_plan",
         "cluster_proposal": "cluster_proposal",
         "cluster_reconciliation": "cluster_proposal",
         "cluster_synthesis": "cluster_synthesis",
@@ -2271,6 +2295,7 @@ def _same_provider_inputs(
     # richer local context gained projection-only records.
     if (
         stage not in {
+            "cluster_plan",
             "cluster_proposal",
             "cluster_reconciliation",
             "gap_adjudication",
@@ -2289,6 +2314,15 @@ def _same_provider_inputs(
         return False
     visible_context_components = (
         (
+            "accepted_relationships",
+            "literature_positions",
+            "collection_identity",
+            "cluster_plan_mode",
+            "catalogue_shard_ids",
+            "existing_family_ids",
+        )
+        if stage == "cluster_plan"
+        else (
             "propositions",
             "relations",
             "topic_neighborhoods",
@@ -2635,6 +2669,13 @@ def _policy_value(policy: Any, names: str | Sequence[str], default: Any) -> Any:
         if name in values and values[name] is not None:
             return values[name]
     return default
+
+
+def _nonnegative_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _stable_hash(value: Any) -> str:
@@ -3284,6 +3325,16 @@ def _normalize_claims(
                     or "; ".join(_flatten_values(item.get("conditions")))
                 ),
                 "mechanism_tested": item.get("mechanism_tested"),
+                "planning_roles": sorted(
+                    {
+                        str(value).strip()
+                        for value in item.get("planning_roles", []) or []
+                        if str(value).strip()
+                    }
+                ),
+                "salience_priority": _nonnegative_int(
+                    item.get("salience_priority")
+                ),
                 "addresses_gap": item.get("addresses_gap", False),
                 "gap_rule": str(item.get("gap_rule") or ""),
                 "answer_status": str(item.get("answer_status") or ""),
@@ -3932,6 +3983,15 @@ def normalize_evidence_profiles(profiles: Sequence[Any]) -> list[dict[str, Any]]
             or "analytical"
         ).casefold()
         coverage_status = str(coverage.get("status", "")).casefold()
+        supplied_evidence_eligibility = str(
+            raw.get("evidence_eligibility") or ""
+        ).casefold()
+        evidence_eligibility = (
+            supplied_evidence_eligibility
+            if supplied_evidence_eligibility
+            in {"substantive_bounded", "context_only", "unavailable"}
+            else ""
+        )
         validity_status = str(
             (raw.get("validity") or {}).get("status", "")
             if isinstance(raw.get("validity"), Mapping)
@@ -3946,12 +4006,18 @@ def normalize_evidence_profiles(profiles: Sequence[Any]) -> list[dict[str, Any]]
             "limited",
             "failed",
         }
+        analytical_default = (
+            evidence_eligibility == "substantive_bounded"
+            if evidence_eligibility
+            else status in ANALYTICAL_STATUSES
+        )
         analytical = (
-            bool(raw.get("analytical", status in ANALYTICAL_STATUSES))
+            bool(raw.get("analytical", analytical_default))
             and status not in LIMITED_STATUSES
             and not excluded
             and not invalid
             and not limited_coverage
+            and evidence_eligibility not in {"context_only", "unavailable"}
         )
         claims = _normalize_claims(raw, source_id, family_id)
         metadata_date = str(
@@ -4107,6 +4173,10 @@ def normalize_evidence_profiles(profiles: Sequence[Any]) -> list[dict[str, Any]]
                     raw.get("zotero_item_key") or context.get("zotero_item_key") or ""
                 ),
                 "note_status": status,
+                "evidence_eligibility": (
+                    evidence_eligibility
+                    or ("substantive_bounded" if analytical else "context_only")
+                ),
                 "analytical": analytical,
                 "limited": not analytical,
                 "exclusion_reason": (
@@ -4121,6 +4191,17 @@ def normalize_evidence_profiles(profiles: Sequence[Any]) -> list[dict[str, Any]]
                 "bibliographic_identity_explanation": identity_explanation,
                 "semantic_topic_scores": topic_scores,
                 "semantic_topic_labels": topic_labels,
+                "authors": _flatten_values(
+                    raw.get("authors")
+                    or raw.get("creators")
+                    or context_metadata.get("authors")
+                    or context_metadata.get("creators")
+                ),
+                "year": str(
+                    raw.get("year")
+                    or context_metadata.get("year")
+                    or metadata_date
+                ),
                 "dimensions": dimensions,
                 "claims": claims,
                 "evidence_anchors": claims,
@@ -4153,6 +4234,11 @@ def normalize_evidence_profiles(profiles: Sequence[Any]) -> list[dict[str, Any]]
                 ),
                 "note_hash": str(raw.get("note_hash") or ""),
                 "date": str(raw.get("date") or context.get("date") or ""),
+                "literature_positions": [
+                    _as_mapping(row)
+                    for row in raw.get("literature_positions", []) or []
+                    if isinstance(row, Mapping)
+                ],
                 "search_tokens": sorted(_tokens(search_values)),
             }
         )
@@ -4364,19 +4450,19 @@ def _anchor_scope_values(anchor: Mapping[str, Any], key: str) -> list[str]:
 
 def _anchor_is_synthesis_eligible(anchor: Mapping[str, Any]) -> bool:
     envelope = _as_mapping(anchor.get("support_envelope"))
+    if anchor.get("note_numeric_pairing_valid") is False:
+        return False
     return bool(
         anchor.get("locator_complete")
-        and str(envelope.get("coverage") or "unknown") == "full_text"
+        and str(envelope.get("coverage") or "unknown")
+        in {"full_text", "limited_text"}
         and str(
-            envelope.get("support_status")
-            or anchor.get("support_status")
-            or "support_unknown"
-        )
-        == "supported"
-        and (
-            str(envelope.get("empirical_role") or "none") in EMPIRICAL_SUPPORT_ROLES
-            or str(envelope.get("argument_role") or "none") in ARGUMENT_SUPPORT_ROLES
-        )
+            anchor.get("proposition")
+            or anchor.get("finding")
+            or anchor.get("claim")
+            or anchor.get("text")
+            or ""
+        ).strip()
     )
 
 
@@ -5290,6 +5376,44 @@ def _proposal_membership_evidence(
     choose the best synthesis-eligible canonical anchor whose content and
     source-level semantic profile both address the bounded cluster topic.
     """
+
+    if str(proposal.get("formation_route") or "") == "global_cluster_plan":
+        selected = _resolve_reasoner_evidence(
+            proposal.get("supporting_evidence", []) or [],
+            profile_by_source,
+            allowed_source_ids=set(core_source_ids),
+        )
+        covered = {
+            str(reference.get("source_id") or "")
+            for reference in selected
+            if _reference_is_synthesis_eligible(
+                reference,
+                profile_by_source.get(
+                    str(reference.get("source_id") or ""), {}
+                ),
+            )
+        }
+        source_assessments = [
+            {
+                "source_id": source_id,
+                "passed": source_id in covered,
+                "reason": (
+                    "model_selected_source_owned_anchor"
+                    if source_id in covered
+                    else "missing_source_owned_anchor"
+                ),
+            }
+            for source_id in core_source_ids
+        ]
+        return selected, {
+            "passed": len(covered) >= 2,
+            "source_assessments": source_assessments,
+            "excluded_core_source_ids": sorted(set(core_source_ids) - covered),
+            "explanation": (
+                "Global planning membership retains the model judgment after "
+                "source and anchor ownership validation."
+            ),
+        }
 
     family_terms = (
         _tokens(
@@ -8027,6 +8151,35 @@ def reconcile_cluster_registry(
     previous_payload = dict(previous_registry or {})
     previous = [dict(row) for row in previous_payload.get("clusters", []) or []]
     current = [dict(row) for row in clusters]
+    previous_sources = {
+        str(source_id)
+        for row in previous
+        for source_id in row.get("source_ids", []) or []
+        if str(source_id)
+    }
+    current_sources = {
+        str(source_id)
+        for row in current
+        for source_id in row.get("source_ids", []) or []
+        if str(source_id)
+    }
+    coverage_collapse = bool(
+        previous_sources
+        and len(current_sources) * 4 < len(previous_sources) * 3
+    )
+    if coverage_collapse:
+        current = [
+            {
+                **row,
+                "refresh_pending": True,
+                "refresh_pending_source_ids": sorted(
+                    str(value)
+                    for value in row.get("source_ids", []) or []
+                    if str(value)
+                ),
+            }
+            for row in previous
+        ]
     old_by_identity: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in previous:
         identity = _canonical_phrase(
@@ -8053,6 +8206,15 @@ def reconcile_cluster_registry(
     ledger: list[dict[str, Any]] = [
         dict(row) for row in previous_payload.get("ledger", []) or []
     ]
+    if coverage_collapse:
+        ledger.append(
+            {
+                "event": "refresh_pending",
+                "reason": "cluster_refresh_coverage_collapse",
+                "prior_covered_source_count": len(previous_sources),
+                "proposed_covered_source_count": len(current_sources),
+            }
+        )
 
     for cluster in current:
         old = old_by_id.get(str(cluster["cluster_id"]))
@@ -9885,60 +10047,6 @@ def _cluster_synthesis_quality_errors(
     if not limits_are_explicit:
         errors.append("missing_evidentiary_limits")
 
-    cluster_source_titles = " ".join(
-        str(row.get("title") or row.get("label") or "")
-        for row in cluster.get("representative_sources", []) or []
-        if isinstance(row, Mapping)
-    )
-    if (
-        "muscular mediation and ripeness theory" in cluster_source_titles.casefold()
-        or str(cluster.get("cluster_id") or "")
-        == "cluster-coercion-condition-mediation-ripeness-success-d355e0980e"
-    ):
-        kuperman_text = " ".join(
-            str(value or "")
-            for value in (
-                synthesis.get("synthesis"),
-                synthesis.get("evidence_threads"),
-                synthesis.get("central_findings"),
-                synthesis.get("source_contributions"),
-                synthesis.get("boundary_conditions"),
-                synthesis.get("methodological_fault_lines"),
-            )
-        ).casefold()
-        if not all(term in kuperman_text for term in ("1990", "1994", "genocide")):
-            errors.append(
-                "kuperman_requires_1990_1994_rwanda_civil_war_and_genocide_context"
-            )
-        if not (
-            ("half-million" in kuperman_text or "half million" in kuperman_text)
-            and (
-                "up to a million" in kuperman_text
-                or "up to one million" in kuperman_text
-            )
-        ):
-            errors.append(
-                "kuperman_requires_half_million_tutsi_vs_up_to_one_million_rwandans"
-            )
-        if not (
-            "500-fold" in kuperman_text
-            and ("6000-fold" in kuperman_text or "6,000-fold" in kuperman_text)
-            and "descriptive" in kuperman_text
-            and "causal" in kuperman_text
-        ):
-            errors.append(
-                "kuperman_requires_500_fold_and_6000_fold_as_descriptive_not_causal_effects"
-            )
-        if not (
-            ("process tracing" in kuperman_text or "process-tracing" in kuperman_text)
-            and re.search(
-                r"\b(?:alternative causes?|counterfactual|cannot rule out|regardless)\b",
-                kuperman_text,
-            )
-        ):
-            errors.append(
-                "kuperman_requires_process_tracing_logic_and_alternative_causes"
-            )
     synthesis_level_prose = {
         "synthesis": synthesis.get("synthesis"),
         "coherence_rationale": synthesis.get("coherence_rationale"),
@@ -15456,6 +15564,75 @@ def _project_navigation_onto_map(
         )
 
 
+def _project_planned_cluster_neighbors(
+    clusters: Sequence[Mapping[str, Any]],
+    cluster_syntheses: Mapping[str, dict[str, Any]],
+) -> None:
+    """Project one validated global-plan neighbor record in both directions."""
+
+    cluster_by_id = {
+        str(cluster.get("cluster_id") or ""): cluster
+        for cluster in clusters
+        if cluster.get("cluster_id")
+    }
+    for cluster_id, cluster in cluster_by_id.items():
+        synthesis = cluster_syntheses.get(cluster_id)
+        if synthesis is None:
+            continue
+        existing_targets = {
+            str(row.get("target_cluster_id") or "")
+            for row in synthesis.get("related_clusters", []) or []
+            if isinstance(row, Mapping)
+        }
+        current_sources = {
+            str(value) for value in cluster.get("source_ids", []) or []
+        }
+        for row in cluster.get("planned_neighbor_relationships", []) or []:
+            if not isinstance(row, Mapping):
+                continue
+            target_id = str(row.get("target_cluster_id") or "")
+            target = cluster_by_id.get(target_id)
+            if target is None or target_id in existing_targets:
+                continue
+            target_sources = {
+                str(value) for value in target.get("source_ids", []) or []
+            }
+            evidence = [
+                dict(reference)
+                for reference in row.get("evidence", []) or []
+                if isinstance(reference, Mapping)
+            ]
+            current_evidence = [
+                reference
+                for reference in evidence
+                if str(reference.get("source_id") or "") in current_sources
+            ]
+            target_evidence = [
+                reference
+                for reference in evidence
+                if str(reference.get("source_id") or "") in target_sources
+            ]
+            if not current_evidence or not target_evidence:
+                continue
+            pair_id = "cluster-plan-neighbor-" + _stable_hash(
+                sorted((cluster_id, target_id))
+            )[:14]
+            synthesis.setdefault("related_clusters", []).append(
+                {
+                    "relationship_id": pair_id,
+                    "target_cluster_id": target_id,
+                    "cluster_id": target_id,
+                    "relation_type": "planned_neighbor",
+                    "relationship": str(row.get("relationship") or ""),
+                    "evidence": current_evidence,
+                    "current_evidence": current_evidence,
+                    "target_evidence": target_evidence,
+                    "projection_origin": "global_cluster_plan",
+                }
+            )
+            existing_targets.add(target_id)
+
+
 def _project_cross_cluster_relationships(
     clusters: Sequence[Mapping[str, Any]],
     cluster_syntheses: Mapping[str, dict[str, Any]],
@@ -15879,11 +16056,13 @@ def build_coverage_register(
             note_id = str(item.get("note_id") or "")
             profile = profile_by_source.get(source_id) or profile_by_note.get(note_id)
             terminal_status = str(item.get("terminal_status") or "pending")
+            if terminal_status == "exhausted":
+                terminal_status = "parked_for_review"
             exclusion_reason = str(
                 (profile or {}).get("exclusion_reason")
                 or (
-                    "source_processing_exhausted"
-                    if terminal_status == "exhausted"
+                    "source_parked_for_review"
+                    if terminal_status == "parked_for_review"
                     else ""
                 )
             )
@@ -15905,7 +16084,7 @@ def build_coverage_register(
                         if str(value)
                     ],
                     "could_affect_existing_cluster": terminal_status
-                    in {"limited_note", "exhausted"},
+                    in {"limited_note", "parked_for_review"},
                 }
             )
     else:
@@ -15932,7 +16111,7 @@ def build_coverage_register(
     counts = {
         "validated_note": status_counts.get("validated_note", 0),
         "limited_note": status_counts.get("limited_note", 0),
-        "exhausted": status_counts.get("exhausted", 0),
+        "parked_for_review": status_counts.get("parked_for_review", 0),
         "partial": status_counts.get("partial", 0),
         "pending": status_counts.get("pending", 0),
     }
@@ -15940,7 +16119,7 @@ def build_coverage_register(
         "partial"
         if counts["partial"] or counts["pending"]
         else "complete_with_exclusions"
-        if counts["exhausted"]
+        if counts["parked_for_review"]
         else "complete"
     )
     return {
@@ -16202,6 +16381,683 @@ def _coverage_profile_projection(profile: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _cluster_planning_card(profile: Mapping[str, Any]) -> dict[str, Any]:
+    """Build one compact card from model-ranked source-local anchors."""
+
+    anchors = [
+        anchor
+        for anchor in profile.get("claims", []) or []
+        if isinstance(anchor, Mapping)
+        and (anchor.get("evidence_anchor_id") or anchor.get("claim_id"))
+        and _anchor_is_synthesis_eligible(anchor)
+    ]
+    ordered = sorted(
+        anchors,
+        key=lambda row: (
+            -_nonnegative_int(row.get("salience_priority")),
+            str(row.get("evidence_anchor_id") or row.get("claim_id") or ""),
+        ),
+    )
+    selected: list[Mapping[str, Any]] = []
+    selected_ids: set[str] = set()
+    roles = sorted(
+        {
+            str(role)
+            for anchor in ordered
+            for role in anchor.get("planning_roles", []) or []
+            if str(role)
+        },
+        key=lambda role: (
+            -max(
+                (
+                    _nonnegative_int(anchor.get("salience_priority"))
+                    for anchor in ordered
+                    if role in (anchor.get("planning_roles", []) or [])
+                ),
+                default=0,
+            ),
+            role,
+        ),
+    )
+    for role in roles:
+        anchor = next(
+            (
+                row
+                for row in ordered
+                if role in (row.get("planning_roles", []) or [])
+                and str(
+                    row.get("evidence_anchor_id") or row.get("claim_id") or ""
+                )
+                not in selected_ids
+            ),
+            None,
+        )
+        if anchor is None:
+            continue
+        selected.append(anchor)
+        selected_ids.add(
+            str(anchor.get("evidence_anchor_id") or anchor.get("claim_id") or "")
+        )
+        if len(selected) == 5:
+            break
+    for anchor in ordered:
+        if len(selected) == 5:
+            break
+        anchor_id = str(
+            anchor.get("evidence_anchor_id") or anchor.get("claim_id") or ""
+        )
+        if anchor_id in selected_ids:
+            continue
+        selected.append(anchor)
+        selected_ids.add(anchor_id)
+
+    compact = _coverage_profile_projection(profile)
+    compact.pop("claims", None)
+    compact.pop("evidence_anchors", None)
+    compact.update(
+        {
+            "authors": list(profile.get("authors", []) or [])[:4],
+            "year": str(profile.get("year") or "")[:24],
+            "method": str(
+                profile.get("method_or_knowledge_basis")
+                or compact.get("method")
+                or next(
+                    iter(_as_mapping(profile.get("dimensions")).get("method", [])),
+                    "",
+                )
+                or "Not specified"
+            )[:400],
+            "evidence_eligibility": str(
+                profile.get("evidence_eligibility") or "substantive_bounded"
+            ),
+            "evidence_references": [
+                {
+                    "evidence_anchor_id": str(
+                        anchor.get("evidence_anchor_id")
+                        or anchor.get("claim_id")
+                        or ""
+                    ),
+                    "proposition": str(
+                        anchor.get("text") or anchor.get("claim") or ""
+                    )[:600],
+                    "locator": str(anchor.get("locator") or "")[:160],
+                    "support_boundary": {
+                        key: value
+                        for key, value in _as_mapping(
+                            anchor.get("support_envelope")
+                        ).items()
+                        if key
+                        in {
+                            "argument_role",
+                            "coverage",
+                            "empirical_role",
+                            "restrictions",
+                            "scope",
+                            "support_status",
+                        }
+                    },
+                    "planning_roles": list(
+                        anchor.get("planning_roles", []) or []
+                    ),
+                    "salience_priority": _nonnegative_int(
+                        anchor.get("salience_priority")
+                    ),
+                }
+                for anchor in selected
+            ],
+        }
+    )
+    return compact
+
+
+def _cluster_synthesis_profile_projection(
+    profile: Mapping[str, Any],
+    cluster: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Load the full selected anchors only after membership is chosen."""
+
+    source_id = str(profile.get("source_id") or "")
+    selected_ids = {
+        str(reference.get("evidence_anchor_id") or reference.get("claim_id") or "")
+        for reference in cluster.get("proposal_supporting_evidence", []) or []
+        if isinstance(reference, Mapping)
+        and str(reference.get("source_id") or "") == source_id
+    }
+    selected = [
+        dict(anchor)
+        for anchor in profile.get("claims", []) or []
+        if isinstance(anchor, Mapping)
+        and str(anchor.get("evidence_anchor_id") or anchor.get("claim_id") or "")
+        in selected_ids
+    ]
+    compact = _coverage_profile_projection(profile)
+    compact["claims"] = selected
+    compact["evidence_anchors"] = selected
+    return compact
+
+
+def _cluster_plan_call_settings(
+    reasoner: Any,
+    request: Any,
+    *,
+    card_count: int,
+) -> dict[str, Any]:
+    capabilities = _as_mapping(getattr(reasoner, "capabilities", {}))
+    supported_output = int(
+        capabilities.get("supported_output_tokens")
+        or getattr(reasoner, "max_output_tokens", 16_000)
+        or 16_000
+    )
+    desired_output = 64_000 if supported_output >= 64_000 else 16_000
+    if card_count > 60 and supported_output < 64_000:
+        raise LiteratureSynthesisPartialError(
+            "cluster_plan_output_capability_insufficient"
+        )
+    configured_deadline = float(
+        capabilities.get("request_deadline_seconds")
+        or getattr(reasoner, "request_deadline", 0)
+        or getattr(reasoner, "timeout", 180)
+        or 180
+    )
+    context_tokens = int(
+        capabilities.get("context_window_tokens")
+        or getattr(reasoner, "context_window_tokens", 128_000)
+        or 128_000
+    )
+    prompt_reserve = int(getattr(reasoner, "prompt_reserve_tokens", 2_048) or 0)
+    usable_input_tokens = max(
+        0,
+        int(context_tokens * 0.5) - desired_output - prompt_reserve,
+    )
+    processing = _as_mapping(_as_mapping(request).get("processing"))
+    chars_per_token = float(
+        _policy_value(processing, "estimated_chars_per_token", 4.0)
+    )
+    return {
+        "output_tokens": desired_output,
+        "deadline_seconds": min(600.0, configured_deadline),
+        "input_char_budget": int(usable_input_tokens * chars_per_token),
+        "context_window_tokens": context_tokens,
+        "input_context_fraction": 0.5,
+        "capability_identity": str(
+            capabilities.get("capability_identity") or ""
+        ),
+    }
+
+
+def _global_plan_proposals(
+    response: Mapping[str, Any],
+    profiles: Sequence[Mapping[str, Any]],
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    """Validate source/anchor identity and adapt the plan to current admission."""
+
+    profile_by_source = {
+        str(profile.get("source_id") or ""): profile
+        for profile in profiles
+        if profile.get("analytical") and profile.get("source_id")
+    }
+    anchors_by_source = {
+        source_id: {
+            str(anchor.get("evidence_anchor_id") or anchor.get("claim_id") or ""): anchor
+            for anchor in profile.get("claims", []) or []
+            if isinstance(anchor, Mapping)
+        }
+        for source_id, profile in profile_by_source.items()
+    }
+    proposals: list[dict[str, Any]] = []
+    parked = [
+        dict(row)
+        for row in response.get("parked_clusters", []) or []
+        if isinstance(row, Mapping)
+    ]
+    plan_ids: set[str] = set()
+    dropped_members: list[dict[str, str]] = []
+    for raw_cluster in response.get("clusters", []) or []:
+        if not isinstance(raw_cluster, Mapping):
+            continue
+        plan_id = str(
+            raw_cluster.get("cluster_id")
+            or f"planned-{_stable_hash(raw_cluster)[:12]}"
+        )
+        members = [
+            dict(row)
+            for row in raw_cluster.get("members", []) or []
+            if isinstance(row, Mapping)
+        ]
+        supporting_evidence: list[dict[str, Any]] = []
+        roles: dict[str, str] = {}
+        membership_reasons: list[str] = []
+        for member in members:
+            source_id = str(member.get("source_id") or "")
+            role = str(member.get("role") or "")
+            anchor_ids = [
+                str(value)
+                for value in member.get("evidence_anchor_ids", []) or []
+                if str(value)
+            ]
+            if (
+                source_id not in profile_by_source
+                or role not in {"core", "context", "bridge"}
+                or not anchor_ids
+                or any(
+                    anchor_id not in anchors_by_source.get(source_id, {})
+                    or not _anchor_is_synthesis_eligible(
+                        anchors_by_source[source_id][anchor_id]
+                    )
+                    for anchor_id in anchor_ids
+                )
+            ):
+                if source_id in profile_by_source:
+                    dropped_members.append(
+                        {
+                            "source_id": source_id,
+                            "reason": "invalid_member_or_source_owned_anchor",
+                        }
+                    )
+                continue
+            roles[source_id] = role
+            membership_reasons.append(str(member.get("membership_reason") or ""))
+            for anchor_id in anchor_ids:
+                anchor = anchors_by_source[source_id][anchor_id]
+                supporting_evidence.append(_evidence_ref(anchor))
+        core_ids = sorted(
+            source_id for source_id, role in roles.items() if role == "core"
+        )
+        core_evidence = [
+            row
+            for row in supporting_evidence
+            if str(row.get("source_id") or "") in core_ids
+        ]
+        if len(core_ids) < 2 or any(
+            not any(str(row.get("source_id") or "") == source_id for row in core_evidence)
+            for source_id in core_ids
+        ):
+            parked.append(
+                {
+                    "cluster_id": plan_id,
+                    "reason": "cluster_requires_two_evidence_backed_core_members",
+                }
+            )
+            continue
+        label = str(raw_cluster.get("title") or raw_cluster.get("label") or "").strip()
+        question = str(raw_cluster.get("shared_question") or "").strip()
+        rationale = str(
+            raw_cluster.get("coherence_rationale")
+            or "; ".join(value for value in membership_reasons if value)
+        ).strip()
+        semantic_identity = str(
+            raw_cluster.get("semantic_identity") or label or question
+        ).strip()
+        proposals.append(
+            {
+                "proposal_id": plan_id,
+                "label": label or "Analytical Cluster",
+                "semantic_identity": semantic_identity,
+                "shared_question": question,
+                "bounded_object": str(
+                    raw_cluster.get("bounded_object") or semantic_identity
+                ),
+                "coherence_rationale": rationale,
+                "source_ids": sorted(roles),
+                "source_roles": roles,
+                "supporting_evidence": supporting_evidence,
+                "propositions": [],
+                "family_relations": [
+                    {
+                        "relation_type": "shared_research_problem",
+                        "source_ids": core_ids,
+                        "rationale": rationale,
+                        "comparability": {
+                            "passed": True,
+                            "provider_statement": rationale,
+                        },
+                        "evidence": core_evidence,
+                    }
+                ],
+                "formation_route": "global_cluster_plan",
+            }
+        )
+        plan_ids.add(plan_id)
+    neighbors = []
+    for row in response.get("neighbor_relationships", []) or []:
+        if not isinstance(row, Mapping):
+            continue
+        basis_source_ids = {
+            str(value)
+            for value in row.get("basis_source_ids", []) or []
+            if str(value)
+        }
+        anchor_ids = {
+            str(value)
+            for value in row.get("evidence_anchor_ids", []) or []
+            if str(value)
+        }
+        owned_anchor_ids = {
+            anchor_id
+            for source_id in basis_source_ids
+            for anchor_id in anchors_by_source.get(source_id, {})
+        }
+        every_basis_source_has_evidence = all(
+            anchor_ids & set(anchors_by_source.get(source_id, {}))
+            for source_id in basis_source_ids
+        )
+        if (
+            str(row.get("left_cluster_id") or "") not in plan_ids
+            or str(row.get("right_cluster_id") or "") not in plan_ids
+            or not basis_source_ids
+            or not anchor_ids
+            or not basis_source_ids.issubset(profile_by_source)
+            or not anchor_ids.issubset(owned_anchor_ids)
+            or not every_basis_source_has_evidence
+        ):
+            continue
+        neighbors.append(dict(row))
+    unclustered_by_source = {
+        str(row.get("source_id") or ""): {
+            "source_id": str(row.get("source_id") or ""),
+            "reason": str(row.get("reason") or ""),
+        }
+        for row in response.get("unclustered_sources", []) or []
+        if isinstance(row, Mapping)
+        and str(row.get("source_id") or "") in profile_by_source
+    }
+    for row in dropped_members:
+        unclustered_by_source.setdefault(row["source_id"], row)
+    unclustered = [
+        {
+            "source_id": row["source_id"],
+            "reason": row["reason"],
+        }
+        for row in sorted(
+            unclustered_by_source.values(), key=lambda value: value["source_id"]
+        )
+    ]
+    return proposals, parked, neighbors, unclustered
+
+
+def _cluster_plan_packets(
+    planning_cards: Sequence[Mapping[str, Any]],
+    catalogue_shards: Sequence[Mapping[str, Any]],
+    *,
+    input_char_budget: int,
+    preserve_shard_boundaries: bool = False,
+) -> list[dict[str, Any]]:
+    """Deterministically pack source cards for probabilistic local planning."""
+
+    cards_by_source = {
+        str(card.get("source_id") or ""): dict(card)
+        for card in planning_cards
+        if card.get("source_id")
+    }
+    ordered_source_ids: list[str] = []
+    seen: set[str] = set()
+    shard_by_source: dict[str, str] = {}
+    for shard in sorted(
+        (row for row in catalogue_shards if isinstance(row, Mapping)),
+        key=lambda row: (
+            str(row.get("literature_id") or ""),
+            str(row.get("shard_id") or ""),
+        ),
+    ):
+        shard_id = str(shard.get("shard_id") or "catalogue")
+        for value in shard.get("source_ids", []) or []:
+            source_id = str(value)
+            if source_id not in cards_by_source or source_id in seen:
+                continue
+            seen.add(source_id)
+            ordered_source_ids.append(source_id)
+            shard_by_source[source_id] = shard_id
+    ordered_source_ids.extend(sorted(set(cards_by_source) - seen))
+
+    # Reserve ample room for relationships, prompts, and serialization
+    # overhead. Actual complete packets are measured again before any call.
+    card_budget = max(1, int(input_char_budget * 0.65))
+    packets: list[dict[str, Any]] = []
+    current: list[dict[str, Any]] = []
+    current_chars = 0
+    current_shards: set[str] = set()
+    for source_id in ordered_source_ids:
+        card = cards_by_source[source_id]
+        card_chars = len(
+            json.dumps(card, sort_keys=True, ensure_ascii=False, default=str)
+        )
+        source_shard = shard_by_source.get(source_id, "")
+        # Keep useful catalogue boundaries, but carry a tiny tail into the
+        # next adjacent shard instead of spending a whole provider call on it.
+        starts_new_shard = bool(
+            preserve_shard_boundaries
+            and source_shard
+            and current_shards
+            and source_shard not in current_shards
+            and len(current) >= _SHARDED_CLUSTER_PLAN_CARD_LIMIT // 2
+        )
+        if current and (
+            starts_new_shard
+            or current_chars + card_chars > card_budget
+            or (
+                preserve_shard_boundaries
+                and len(current) >= _SHARDED_CLUSTER_PLAN_CARD_LIMIT
+            )
+        ):
+            packets.append(
+                {
+                    "cards": current,
+                    "catalogue_shard_ids": sorted(current_shards),
+                }
+            )
+            current = []
+            current_chars = 0
+            current_shards = set()
+        current.append(card)
+        current_chars += card_chars
+        if source_id in shard_by_source:
+            current_shards.add(shard_by_source[source_id])
+    if current:
+        packets.append(
+            {
+                "cards": current,
+                "catalogue_shard_ids": sorted(current_shards),
+            }
+        )
+
+    for index, packet in enumerate(packets, start=1):
+        source_ids = [
+            str(card.get("source_id") or "")
+            for card in packet["cards"]
+            if card.get("source_id")
+        ]
+        packet["packet_id"] = (
+            f"shard-{index:02d}-{_stable_hash(source_ids)[:10]}"
+        )
+    return packets
+
+
+def _namespace_cluster_plan(
+    response: Mapping[str, Any],
+    namespace: str,
+) -> dict[str, Any]:
+    """Give independently planned families collision-proof cluster IDs."""
+
+    cluster_ids = {
+        str(row.get("cluster_id") or "")
+        for row in response.get("clusters", []) or []
+        if isinstance(row, Mapping) and row.get("cluster_id")
+    }
+    replacements = {
+        cluster_id: f"{namespace}--{cluster_id}" for cluster_id in cluster_ids
+    }
+    clusters = [
+        {
+            **dict(row),
+            "cluster_id": replacements.get(
+                str(row.get("cluster_id") or ""),
+                str(row.get("cluster_id") or ""),
+            ),
+        }
+        for row in response.get("clusters", []) or []
+        if isinstance(row, Mapping)
+    ]
+    neighbors = []
+    for row in response.get("neighbor_relationships", []) or []:
+        if not isinstance(row, Mapping):
+            continue
+        neighbor = dict(row)
+        for field in ("left_cluster_id", "right_cluster_id"):
+            value = str(neighbor.get(field) or "")
+            neighbor[field] = replacements.get(value, value)
+        neighbors.append(neighbor)
+    parked = [
+        {
+            **dict(row),
+            "cluster_id": replacements.get(
+                str(row.get("cluster_id") or ""),
+                (
+                    f"{namespace}--{str(row.get('cluster_id') or '')}"
+                    if row.get("cluster_id")
+                    else ""
+                ),
+            ),
+        }
+        for row in response.get("parked_clusters", []) or []
+        if isinstance(row, Mapping)
+    ]
+    return {
+        "clusters": clusters,
+        "neighbor_relationships": neighbors,
+        "unclustered_sources": [
+            dict(row)
+            for row in response.get("unclustered_sources", []) or []
+            if isinstance(row, Mapping)
+        ],
+        "parked_clusters": parked,
+    }
+
+
+def _cluster_family_cards(
+    plan_responses: Sequence[Mapping[str, Any]],
+    planning_cards: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Compact local families for one probabilistic cross-family bridge pass."""
+
+    evidence_by_source = {
+        str(card.get("source_id") or ""): {
+            str(row.get("evidence_anchor_id") or ""): dict(row)
+            for row in card.get("evidence_references", []) or []
+            if isinstance(row, Mapping) and row.get("evidence_anchor_id")
+        }
+        for card in planning_cards
+        if card.get("source_id")
+    }
+    cards: list[dict[str, Any]] = []
+    for response in plan_responses:
+        for cluster in response.get("clusters", []) or []:
+            if not isinstance(cluster, Mapping):
+                continue
+            members = []
+            evidence_references = []
+            for member in cluster.get("members", []) or []:
+                if not isinstance(member, Mapping):
+                    continue
+                source_id = str(member.get("source_id") or "")
+                anchor_ids = [
+                    str(value)
+                    for value in member.get("evidence_anchor_ids", []) or []
+                    if str(value)
+                ][:2]
+                members.append(
+                    {
+                        "source_id": source_id,
+                        "role": str(member.get("role") or ""),
+                        "evidence_anchor_ids": anchor_ids,
+                        "membership_reason": str(
+                            member.get("membership_reason") or ""
+                        )[:300],
+                    }
+                )
+                for anchor_id in anchor_ids:
+                    reference = evidence_by_source.get(source_id, {}).get(anchor_id)
+                    if reference is not None:
+                        evidence_references.append(
+                            {"source_id": source_id, **reference}
+                        )
+            cards.append(
+                {
+                    "family_id": str(cluster.get("cluster_id") or ""),
+                    "title": str(
+                        cluster.get("title") or cluster.get("label") or ""
+                    )[:240],
+                    "semantic_identity": str(
+                        cluster.get("semantic_identity") or ""
+                    )[:300],
+                    "shared_question": str(
+                        cluster.get("shared_question") or ""
+                    )[:500],
+                    "coherence_rationale": str(
+                        cluster.get("coherence_rationale") or ""
+                    )[:600],
+                    "members": members,
+                    "source_ids": sorted(
+                        {
+                            str(member.get("source_id") or "")
+                            for member in members
+                            if member.get("source_id")
+                        }
+                    ),
+                    "evidence_references": evidence_references,
+                }
+            )
+    return sorted(cards, key=lambda row: str(row.get("family_id") or ""))
+
+
+def _merge_cluster_plan_responses(
+    responses: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    clusters = [
+        dict(row)
+        for response in responses
+        for row in response.get("clusters", []) or []
+        if isinstance(row, Mapping)
+    ]
+    clustered_sources = {
+        str(member.get("source_id") or "")
+        for cluster in clusters
+        for member in cluster.get("members", []) or []
+        if isinstance(member, Mapping) and member.get("source_id")
+    }
+    unclustered_by_source = {
+        str(row.get("source_id") or ""): dict(row)
+        for response in responses
+        for row in response.get("unclustered_sources", []) or []
+        if isinstance(row, Mapping)
+        and row.get("source_id")
+        and str(row.get("source_id") or "") not in clustered_sources
+    }
+    return {
+        "clusters": clusters,
+        "neighbor_relationships": [
+            dict(row)
+            for response in responses
+            for row in response.get("neighbor_relationships", []) or []
+            if isinstance(row, Mapping)
+        ],
+        "unclustered_sources": [
+            unclustered_by_source[source_id]
+            for source_id in sorted(unclustered_by_source)
+        ],
+        "parked_clusters": [
+            dict(row)
+            for response in responses
+            for row in response.get("parked_clusters", []) or []
+            if isinstance(row, Mapping)
+        ],
+    }
+
+
 def _reasoner_context_char_budget(reasoner: Any, request: Any) -> int:
     request_values = _as_mapping(request)
     processing = request_values.get("processing")
@@ -16214,7 +17070,7 @@ def _reasoner_context_char_budget(reasoner: Any, request: Any) -> int:
         _policy_value(policy, "deepseek_packet_context_fraction", 0.45)
     )
     # Keep room for prompts, context records, and output even on million-token models.
-    return max(8_000, min(120_000, int(context_tokens * chars_per_token * fraction * 0.6)))
+    return max(8_000, int(context_tokens * chars_per_token * min(0.5, fraction * 0.6)))
 
 
 def _reasoner_packet_chars(
@@ -16495,9 +17351,14 @@ def _cluster_relationship_context(
             relation.get("active", True)
         ):
             continue
+        if bool(relation.get("legacy_review_pending")) or str(
+            relation.get("decision_status") or ""
+        ) == "legacy_review_pending":
+            continue
         if str(relation.get("verification_status") or "") not in {
             "confirmed",
             "corrected",
+            "final",
         }:
             continue
         left = str(relation.get("source_id") or "")
@@ -16611,6 +17472,7 @@ def _cluster_proposal_partitions(
         if str(relation.get("verification_status") or "") not in {
             "confirmed",
             "corrected",
+            "final",
         }:
             continue
         left = str(relation.get("source_id") or "")
@@ -16703,13 +17565,277 @@ def build_literature_report(
         for row in normalized
         if row.get("analytical")
     }
-    partitions = _cluster_proposal_partitions(
-        normalized,
-        catalogue_shards,
-        accepted_relationships,
-        reasoner=reasoner,
-        request=request,
-    )
+    uses_global_cluster_plan = callable(getattr(reasoner, "plan_clusters", None))
+    global_plan_parked: list[dict[str, Any]] = []
+    global_plan_neighbors: list[dict[str, Any]] = []
+    global_plan_unclustered: list[dict[str, Any]] = []
+    combined_proposals: list[dict[str, Any]] = []
+    if uses_global_cluster_plan and len(analytical_families) >= 2:
+        planning_cards = [
+            _cluster_planning_card(row)
+            for row in normalized
+            if row.get("analytical")
+            and row.get("evidence_eligibility") == "substantive_bounded"
+        ]
+        analytical_source_ids = {
+            str(row.get("source_id") or "")
+            for row in normalized
+            if row.get("analytical") and row.get("source_id")
+        }
+        literature_positions = [
+            {
+                "source_id": str(row.get("source_id") or ""),
+                **dict(position),
+            }
+            for row in normalized
+            for position in row.get("literature_positions", []) or []
+            if isinstance(position, Mapping)
+            and (
+                position.get("matched_source_id")
+                or position.get("target_source_id")
+            )
+        ]
+        collection_identity = {
+            key: source_set.get(key)
+            for key in (
+                "source_set_id",
+                "collection_key",
+                "collection_name",
+                "source_set_alias",
+            )
+            if source_set and source_set.get(key)
+        }
+        plan_settings = _cluster_plan_call_settings(
+            reasoner,
+            request,
+            card_count=len(planning_cards),
+        )
+        plan_context = {
+            "accepted_relationships": _cluster_relationship_context(
+                accepted_relationships,
+                analytical_source_ids,
+            ),
+            "literature_positions": literature_positions,
+            "collection_identity": collection_identity,
+            "cluster_plan_mode": "collection",
+            "cluster_plan_settings": plan_settings,
+        }
+        plan_context["cluster_plan_settings"] = {
+            **plan_settings,
+            "serialized_input_chars": _reasoner_packet_chars(
+                planning_cards, plan_context
+            ),
+        }
+        if (
+            len(planning_cards) <= _GLOBAL_CLUSTER_PLAN_CARD_LIMIT
+            and
+            _reasoner_packet_chars(planning_cards, plan_context)
+            <= plan_settings["input_char_budget"]
+        ):
+            plan_response = _reasoner_stage(
+                reasoner,
+                reasoner_call,
+                stage="cluster_plan",
+                key="collection",
+                method_name="plan_clusters",
+                profiles=planning_cards,
+                request=request,
+                context=plan_context,
+            )
+        else:
+            pending_packets = _cluster_plan_packets(
+                planning_cards,
+                catalogue_shards,
+                input_char_budget=plan_settings["input_char_budget"],
+                preserve_shard_boundaries=(
+                    len(planning_cards) > _GLOBAL_CLUSTER_PLAN_CARD_LIMIT
+                ),
+            )
+            prepared_packets: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            while pending_packets:
+                packet = dict(pending_packets.pop(0))
+                packet_cards = [
+                    dict(card)
+                    for card in packet.get("cards", []) or []
+                    if isinstance(card, Mapping)
+                ]
+                packet_source_ids = {
+                    str(card.get("source_id") or "")
+                    for card in packet_cards
+                    if card.get("source_id")
+                }
+                packet_settings = _cluster_plan_call_settings(
+                    reasoner,
+                    request,
+                    card_count=len(packet_cards),
+                )
+                packet_context = {
+                    "accepted_relationships": _cluster_relationship_context(
+                        accepted_relationships, packet_source_ids
+                    ),
+                    "literature_positions": [
+                        dict(position)
+                        for position in literature_positions
+                        if str(position.get("source_id") or "")
+                        in packet_source_ids
+                        or str(
+                            position.get("matched_source_id")
+                            or position.get("target_source_id")
+                            or ""
+                        )
+                        in packet_source_ids
+                    ],
+                    "collection_identity": collection_identity,
+                    "cluster_plan_mode": "shard",
+                    "catalogue_shard_ids": list(
+                        packet.get("catalogue_shard_ids", []) or []
+                    ),
+                    "cluster_plan_settings": packet_settings,
+                }
+                packet_context["cluster_plan_settings"] = {
+                    **packet_settings,
+                    "serialized_input_chars": _reasoner_packet_chars(
+                        packet_cards, packet_context
+                    ),
+                }
+                packet_chars = _reasoner_packet_chars(
+                    packet_cards, packet_context
+                )
+                if packet_chars > packet_settings["input_char_budget"]:
+                    if len(packet_cards) < 3:
+                        raise LiteratureSynthesisPartialError(
+                            "cluster_plan_shard_context_capability_insufficient"
+                        )
+                    midpoint = len(packet_cards) // 2
+                    child_cards = (
+                        packet_cards[:midpoint],
+                        packet_cards[midpoint:],
+                    )
+                    pending_packets[0:0] = [
+                        {
+                            "packet_id": (
+                                "shard-"
+                                + _stable_hash(
+                                    [
+                                        str(card.get("source_id") or "")
+                                        for card in cards
+                                    ]
+                                )[:12]
+                            ),
+                            "cards": cards,
+                            "catalogue_shard_ids": list(
+                                packet.get("catalogue_shard_ids", []) or []
+                            ),
+                        }
+                        for cards in child_cards
+                    ]
+                    continue
+                prepared_packets.append((packet, packet_context))
+
+            if len(prepared_packets) > 8:
+                raise LiteratureSynthesisPartialError(
+                    "cluster_plan_shard_budget_exceeded"
+                )
+            local_plan_responses: list[dict[str, Any]] = []
+            for packet, packet_context in prepared_packets:
+                packet_id = str(packet.get("packet_id") or "shard")
+                response = _reasoner_stage(
+                    reasoner,
+                    reasoner_call,
+                    stage="cluster_plan",
+                    key=packet_id,
+                    method_name="plan_clusters",
+                    profiles=list(packet.get("cards", []) or []),
+                    request=request,
+                    context=packet_context,
+                )
+                local_plan_responses.append(
+                    _namespace_cluster_plan(response, packet_id)
+                )
+
+            family_cards = _cluster_family_cards(
+                local_plan_responses, planning_cards
+            )
+            plan_responses = list(local_plan_responses)
+            if len(family_cards) >= 2:
+                family_by_source: dict[str, set[str]] = defaultdict(set)
+                for family in family_cards:
+                    family_id = str(family.get("family_id") or "")
+                    for value in family.get("source_ids", []) or []:
+                        family_by_source[str(value)].add(family_id)
+                bridge_relations = [
+                    row
+                    for row in _cluster_relationship_context(
+                        accepted_relationships, analytical_source_ids
+                    )
+                    if len(
+                        {
+                            family_id
+                            for source_id in row.get("source_ids", []) or []
+                            for family_id in family_by_source.get(
+                                str(source_id), set()
+                            )
+                        }
+                    )
+                    > 1
+                ]
+                bridge_settings = _cluster_plan_call_settings(
+                    reasoner,
+                    request,
+                    card_count=len(family_cards),
+                )
+                bridge_context = {
+                    "accepted_relationships": bridge_relations,
+                    "collection_identity": collection_identity,
+                    "cluster_plan_mode": "bridge",
+                    "existing_family_ids": [
+                        str(card.get("family_id") or "")
+                        for card in family_cards
+                    ],
+                    "cluster_plan_settings": bridge_settings,
+                }
+                bridge_context["cluster_plan_settings"] = {
+                    **bridge_settings,
+                    "serialized_input_chars": _reasoner_packet_chars(
+                        family_cards, bridge_context
+                    ),
+                }
+                if (
+                    _reasoner_packet_chars(family_cards, bridge_context)
+                    > bridge_settings["input_char_budget"]
+                ):
+                    raise LiteratureSynthesisPartialError(
+                        "cluster_plan_bridge_context_capability_insufficient"
+                    )
+                bridge_response = _reasoner_stage(
+                    reasoner,
+                    reasoner_call,
+                    stage="cluster_plan",
+                    key="bridge",
+                    method_name="plan_clusters",
+                    profiles=family_cards,
+                    request=request,
+                    context=bridge_context,
+                )
+                plan_responses.append(
+                    _namespace_cluster_plan(bridge_response, "bridge")
+                )
+            plan_response = _merge_cluster_plan_responses(plan_responses)
+        (
+            combined_proposals,
+            global_plan_parked,
+            global_plan_neighbors,
+            global_plan_unclustered,
+        ) = _global_plan_proposals(plan_response, normalized)
+        partitions: list[dict[str, Any]] = []
+    else:
+        partitions = _cluster_proposal_partitions(
+            normalized,
+            catalogue_shards,
+            accepted_relationships,
+            reasoner=reasoner,
+            request=request,
+        )
     proposal_responses: list[Mapping[str, Any]] = []
     partition_queue = list(partitions if len(analytical_families) >= 2 else [])
     context_char_budget = _reasoner_context_char_budget(reasoner, request)
@@ -16788,8 +17914,13 @@ def build_literature_report(
             )
         )
     partitions = rendered_partitions
-    combined_proposals = _cluster_proposals_from_responses(proposal_responses)
-    if len(proposal_responses) > 1 and combined_proposals:
+    if not uses_global_cluster_plan:
+        combined_proposals = _cluster_proposals_from_responses(proposal_responses)
+    if (
+        not uses_global_cluster_plan
+        and len(proposal_responses) > 1
+        and combined_proposals
+    ):
         reconciliation_source_ids = {
             str(source_id)
             for proposal in combined_proposals
@@ -16844,6 +17975,28 @@ def build_literature_report(
         propositions=propositions,
         topic_neighborhoods=topic_neighborhoods,
     )
+    if global_plan_parked:
+        clustered["rejected_proposals"] = [
+            *clustered.get("rejected_proposals", []),
+            *[
+                {
+                    **row,
+                    "action": "park",
+                    "reason": str(row.get("reason") or "invalid_global_cluster_plan"),
+                }
+                for row in global_plan_parked
+            ],
+        ]
+    if global_plan_unclustered:
+        reason_by_source = {
+            str(row.get("source_id") or ""): str(row.get("reason") or "")
+            for row in global_plan_unclustered
+        }
+        for row in clustered.get("unclustered_sources", []) or []:
+            source_id = str(row.get("source_id") or "")
+            if source_id in reason_by_source:
+                row["reason"] = reason_by_source[source_id]
+                row["formation_route"] = "global_cluster_plan"
     completed_responses = getattr(reasoner_call, "completed_responses", None)
     coverage_plan = (
         _coverage_audit_plan(
@@ -16854,7 +18007,11 @@ def build_literature_report(
             reasoner=reasoner,
             request=request,
         )
-        if len(analytical_families) >= 2 and reasoner_call is not None
+        if (
+            not uses_global_cluster_plan
+            and len(analytical_families) >= 2
+            and reasoner_call is not None
+        )
         else []
     )
     coverage_queue = [dict(row) for row in coverage_plan]
@@ -17032,6 +18189,48 @@ def build_literature_report(
         if isinstance(row, Mapping)
     ]
     clustered["clusters"] = list(registry["clusters"])
+    if global_plan_neighbors:
+        cluster_id_by_plan_id = {
+            str(row.get("proposal_id") or ""): str(row.get("cluster_id") or "")
+            for row in registry["clusters"]
+            if row.get("proposal_id") and row.get("cluster_id")
+        }
+        anchor_by_id = {
+            str(anchor.get("evidence_anchor_id") or anchor.get("claim_id") or ""): anchor
+            for profile in normalized
+            for anchor in profile.get("claims", []) or []
+            if isinstance(anchor, Mapping)
+        }
+        planned_by_cluster: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in global_plan_neighbors:
+            left = cluster_id_by_plan_id.get(
+                str(row.get("left_cluster_id") or "")
+            )
+            right = cluster_id_by_plan_id.get(
+                str(row.get("right_cluster_id") or "")
+            )
+            if not left or not right or left == right:
+                continue
+            evidence = [
+                _evidence_ref(anchor_by_id[anchor_id])
+                for anchor_id in row.get("evidence_anchor_ids", []) or []
+                if str(anchor_id) in anchor_by_id
+            ]
+            for current, target in ((left, right), (right, left)):
+                planned_by_cluster[current].append(
+                    {
+                        "target_cluster_id": target,
+                        "relationship": str(row.get("relationship") or ""),
+                        "basis_source_ids": list(
+                            row.get("basis_source_ids", []) or []
+                        ),
+                        "evidence": evidence,
+                    }
+                )
+        for cluster in registry["clusters"]:
+            cluster["planned_neighbor_relationships"] = planned_by_cluster.get(
+                str(cluster.get("cluster_id") or ""), []
+            )
     clustered["unclustered_sources"] = _reconcile_final_unclustered_sources(
         normalized,
         registry["clusters"],
@@ -17107,6 +18306,27 @@ def build_literature_report(
     )
     for cluster in synthesis_order:
         cluster_id = str(cluster["cluster_id"])
+        prior_synthesis = _as_mapping(
+            _as_mapping(
+                (previous_registry or {}).get("cluster_syntheses")
+            ).get(cluster_id)
+        )
+        if (
+            cluster.get("refresh_pending")
+            and _cluster_projection_is_publishable(prior_synthesis)
+        ):
+            cluster_syntheses[cluster_id] = {
+                **dict(prior_synthesis),
+                "refresh_pending": True,
+                "last_good_revision_hash": str(
+                    cluster.get("revision_hash") or ""
+                ),
+                "pending_revision_hash": "",
+                "refresh_pending_source_ids": list(
+                    cluster.get("refresh_pending_source_ids", []) or []
+                ),
+            }
+            continue
         response_budget = _cluster_synthesis_response_budget(cluster)
         _notify_stage(stage_callback, "cluster_synthesis", active_cluster=cluster_id)
         member_profiles = [
@@ -17116,7 +18336,8 @@ def build_literature_report(
             in set(cluster.get("source_ids", []) or [])
         ]
         synthesis_profiles = [
-            _coverage_profile_projection(row) for row in member_profiles
+            _cluster_synthesis_profile_projection(row, cluster)
+            for row in member_profiles
         ]
         synthesis_context = {
             "cluster": cluster,
@@ -17149,26 +18370,87 @@ def build_literature_report(
                 accepted_relationships,
                 set(cluster.get("source_ids", []) or []),
             ),
+            "planned_neighbor_relationships": list(
+                cluster.get("planned_neighbor_relationships", []) or []
+            ),
             **({"response_budget": response_budget} if response_budget else {}),
         }
-        synthesis_response = _reasoner_stage(
-            reasoner,
-            reasoner_call,
-            stage="cluster_synthesis",
-            key=cluster_id,
-            method_name="synthesize_cluster",
-            profiles=synthesis_profiles,
-            request=request,
-            context=synthesis_context,
-        )
-        validated_synthesis = validate_cluster_synthesis(
-            synthesis_response,
-            cluster,
-            normalized,
-            deterministic_debate=deterministic_debate_by_cluster.get(cluster_id, {}),
-            all_clusters=registry["clusters"],
-        )
-        if validated_synthesis.get("status") == "partial" and reasoner_call is not None:
+        try:
+            synthesis_response = _reasoner_stage(
+                reasoner,
+                reasoner_call,
+                stage="cluster_synthesis",
+                key=cluster_id,
+                method_name="synthesize_cluster",
+                profiles=synthesis_profiles,
+                request=request,
+                context=synthesis_context,
+            )
+            validated_synthesis = validate_cluster_synthesis(
+                synthesis_response,
+                cluster,
+                normalized,
+                deterministic_debate=deterministic_debate_by_cluster.get(
+                    cluster_id, {}
+                ),
+                all_clusters=registry["clusters"],
+            )
+            if uses_global_cluster_plan and not synthesis_response:
+                validated_synthesis["status"] = "partial"
+                validated_synthesis["parked_for_review"] = True
+                validated_synthesis["quality_errors"] = sorted(
+                    {
+                        *validated_synthesis.get("quality_errors", []),
+                        "cluster_synthesis_unusable_response",
+                    }
+                )
+            elif (
+                uses_global_cluster_plan
+                and validated_synthesis.get("status") == "partial"
+                and (
+                    raw_synthesis := _as_mapping(synthesis_response)
+                ).get("synthesis")
+                and (
+                    raw_synthesis.get("evidence_threads")
+                    or raw_synthesis.get("central_findings")
+                )
+                and validated_synthesis.get("supporting_evidence")
+                and validated_synthesis.get("synthesis_assertions")
+            ):
+                validated_synthesis["quality_warnings"] = list(
+                    validated_synthesis.get("quality_errors", []) or []
+                )
+                validated_synthesis["quality_status"] = "warning"
+                validated_synthesis["status"] = "reasoned"
+        except Exception as exc:
+            if not uses_global_cluster_plan or str(exc) in {
+                "literature_stage_deadline_reached",
+                "literature_synthesis_call_budget_reached",
+            } or str(exc).startswith("literature_synthesis_stage_budget_reached"):
+                raise
+            synthesis_response = {}
+            validated_synthesis = validate_cluster_synthesis(
+                {},
+                cluster,
+                normalized,
+                deterministic_debate=deterministic_debate_by_cluster.get(
+                    cluster_id, {}
+                ),
+                all_clusters=registry["clusters"],
+            )
+            validated_synthesis["quality_errors"] = sorted(
+                {
+                    *validated_synthesis.get("quality_errors", []),
+                    f"cluster_synthesis_failed:{type(exc).__name__}",
+                }
+            )
+            validated_synthesis["status"] = "partial"
+            validated_synthesis["parked_for_review"] = True
+        if (
+            not uses_global_cluster_plan
+            and validated_synthesis.get("status") == "partial"
+            and reasoner_call is not None
+        ):
             repair_response = _reasoner_stage(
                 reasoner,
                 reasoner_call,
@@ -17209,11 +18491,6 @@ def build_literature_report(
                 and str(row.get("cluster_id") or "") == cluster_id
             ),
             None,
-        )
-        prior_synthesis = _as_mapping(
-            _as_mapping(
-                (previous_registry or {}).get("cluster_syntheses")
-            ).get(cluster_id)
         )
         if (
             validated_synthesis.get("status") == "partial"
@@ -17445,6 +18722,10 @@ def build_literature_report(
         gaps,
         policy=navigation_policy,
     )
+    _project_planned_cluster_neighbors(
+        registry["clusters"],
+        cluster_syntheses,
+    )
     _project_cross_cluster_relationships(
         registry["clusters"],
         cluster_syntheses,
@@ -17610,15 +18891,18 @@ def build_literature_report(
         "coverage_inventory_count": int(
             coverage_register.get("inventory_count", 0) or 0
         ),
-        "coverage_exhausted_count": int(
-            _as_mapping(coverage_register.get("counts")).get("exhausted", 0) or 0
+        "coverage_parked_for_review_count": int(
+            _as_mapping(coverage_register.get("counts")).get(
+                "parked_for_review", 0
+            )
+            or 0
         ),
         "coverage_accounting_valid": sum(
             int(_as_mapping(coverage_register.get("counts")).get(key, 0) or 0)
             for key in (
                 "validated_note",
                 "limited_note",
-                "exhausted",
+                "parked_for_review",
                 "partial",
                 "pending",
             )
@@ -17786,9 +19070,12 @@ def _prune_stale_generated_markdown(
 def _cluster_projection_is_publishable(synthesis: Mapping[str, Any]) -> bool:
     """Only a synthesis that passed the quality gate may replace a cluster note."""
 
+    status = str(synthesis.get("status") or "")
+    quality_status = str(synthesis.get("quality_status") or "")
     return (
-        str(synthesis.get("status") or "") in {"reasoned", "deterministic_fallback"}
-        and str(synthesis.get("quality_status") or "") == "complete"
+        status == "reasoned" and quality_status in {"complete", "warning"}
+    ) or (
+        status == "deterministic_fallback" and quality_status == "complete"
     )
 
 
@@ -20418,14 +21705,14 @@ def _literature_map_markdown_v09(
     inventory_count = int(
         coverage_register.get("inventory_count", analytical_count + limited_count) or 0
     )
-    exhausted_count = int(coverage_counts.get("exhausted", 0) or 0)
+    parked_count = int(coverage_counts.get("parked_for_review", 0) or 0)
     partial_count = int(coverage_counts.get("partial", 0) or 0)
     pending_count = int(coverage_counts.get("pending", 0) or 0)
     cluster_count = len(clusters)
     clustered_count = len(clustered_analytical_source_ids)
     collection_verdict = (
         f"The frozen collection contains {inventory_count} inventoried items: {analytical_count} analytical profiles, "
-        f"{limited_count} limited profiles, and {exhausted_count} exhausted sources. "
+        f"{limited_count} limited profiles, and {parked_count} sources parked for review. "
         f"The mapper admitted {cluster_count} analytical cluster{'s' if cluster_count != 1 else ''}; "
         f"{clustered_count} analytical source{'s' if clustered_count != 1 else ''} contribute to at least one admitted cluster. "
     )
@@ -20586,24 +21873,25 @@ def _literature_map_markdown_v09(
         f"- Frozen inventory: {inventory_count}",
         f"- Analytical profiles: {analytical_count}",
         f"- Limited profiles: {limited_count}",
-        f"- Exhausted sources: {exhausted_count}",
+        f"- Parked for review: {parked_count}",
         f"- Partial sources: {partial_count}",
         f"- Pending sources: {pending_count}",
         f"- Analytical sources represented in admitted clusters: {clustered_count}",
         f"- Unclustered sources: {len(unclustered)}",
-        f"- Accounting valid: {'yes' if sum(int(coverage_counts.get(key, 0) or 0) for key in ('validated_note', 'limited_note', 'exhausted', 'partial', 'pending')) == inventory_count else 'no'}",
+        f"- Accounting valid: {'yes' if sum(int(coverage_counts.get(key, 0) or 0) for key in ('validated_note', 'limited_note', 'parked_for_review', 'partial', 'pending')) == inventory_count else 'no'}",
     ]
-    exhausted_rows = [
+    parked_rows = [
         row
         for row in coverage_register.get("records", []) or []
-        if isinstance(row, Mapping) and row.get("terminal_state") == "exhausted"
+        if isinstance(row, Mapping)
+        and row.get("terminal_state") == "parked_for_review"
     ]
-    if exhausted_rows:
-        coverage_lines.extend(["", "**Exhausted-source register**"])
+    if parked_rows:
+        coverage_lines.extend(["", "**Sources parked for review**"])
         coverage_lines.extend(
             f"- `{row.get('zotero_key') or row.get('source_id') or 'unknown item'}` — "
-            f"{row.get('exclusion_reason') or 'source processing exhausted'}"
-            for row in exhausted_rows
+            f"{row.get('exclusion_reason') or 'source parked for review'}"
+            for row in parked_rows
         )
     if reason_counts:
         coverage_lines.extend(
@@ -20876,7 +22164,9 @@ def _literature_map_markdown(
     inventory_count = int(manifest.get("coverage_inventory_count", 0) or 0)
     analytical_count = int(manifest.get("analytical_profile_count", 0) or 0)
     limited_count = int(manifest.get("limited_profile_count", 0) or 0)
-    exhausted_count = int(manifest.get("coverage_exhausted_count", 0) or 0)
+    parked_count = int(
+        manifest.get("coverage_parked_for_review_count", 0) or 0
+    )
     partial_count = int(manifest.get("coverage_partial_count", 0) or 0)
     pending_count = int(manifest.get("coverage_pending_count", 0) or 0)
     clustered_sources = {
@@ -20900,7 +22190,7 @@ def _literature_map_markdown(
         f"- Frozen collection items: {inventory_count}",
         f"- Analytical profiles: {analytical_count}",
         f"- Limited profiles: {limited_count}",
-        f"- Exhausted sources: {exhausted_count}",
+        f"- Parked for review: {parked_count}",
         f"- Partial sources: {partial_count}",
         f"- Pending sources: {pending_count}",
         f"- Sources represented in clusters: {len(clustered_sources)}",
@@ -22321,8 +23611,8 @@ def build_literature_map(
         "coverage_inventory_count": report["manifest"].get(
             "coverage_inventory_count", 0
         ),
-        "coverage_exhausted_count": report["manifest"].get(
-            "coverage_exhausted_count", 0
+        "coverage_parked_for_review_count": report["manifest"].get(
+            "coverage_parked_for_review_count", 0
         ),
         "coverage_accounting_valid": report["manifest"].get(
             "coverage_accounting_valid", False

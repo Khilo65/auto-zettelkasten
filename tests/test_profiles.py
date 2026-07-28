@@ -47,7 +47,7 @@ from auto_zettelkasten.profiles import (
 
 
 def test_profile_versions_are_explicit() -> None:
-    assert PROFILE_SCHEMA_VERSION == "1.2"
+    assert PROFILE_SCHEMA_VERSION == "1.3"
     assert PROFILE_PROMPT_VERSION == profiles.profile_prompt_version == "6"
     assert PROFILE_CLASSIFIER_VERSION == profiles.profile_classifier_version == "3"
     assert PROFILE_ALGORITHM_VERSION == profiles.profile_algorithm_version == "4"
@@ -218,7 +218,7 @@ def test_v11_profile_is_mechanically_enriched_from_committed_note_without_a_read
     )
 
     assert changed is True
-    assert upgraded.profile_schema_version == "1.2"
+    assert upgraded.profile_schema_version == "1.3"
     assert upgraded.study_lineage is not None
     assert upgraded.study_lineage.datasets == ["panel survey"]
     assert len(upgraded.evidence_anchors) == 1
@@ -371,7 +371,7 @@ def test_unreconstructable_legacy_statistic_downgrades_only_its_anchor() -> None
     validation = validate_profile(upgraded)
     assert validation.passed
     assert (
-        "anchor_0:typed_quantitative_result_unresolved_support_unknown"
+        "anchor_0:typed_quantitative_result_unresolved"
         in validation.warnings
     )
 
@@ -465,7 +465,7 @@ def test_analytical_note_is_extracted_and_validated_from_committed_markdown() ->
     assert validation.substantive is True
 
 
-def test_profile_validation_rejects_unlocated_and_unexplained_statistical_anchors() -> (
+def test_profile_validation_warns_on_unlocated_and_unexplained_statistical_anchors() -> (
     None
 ):
     profile = deterministic_profile(_analytical_note())
@@ -475,13 +475,15 @@ def test_profile_validation_rejects_unlocated_and_unexplained_statistical_anchor
         replace(anchor, locator="", locators=[], source_locators=[])
     ]
     unlocated = validate_profile(profile)
-    assert "anchor_0:traceable_locator_required" in unlocated.errors
+    assert unlocated.passed
+    assert "anchor_0:traceable_locator_unresolved" in unlocated.warnings
 
     profile.evidence_anchors = [replace(anchor, plain_english_meaning="")]
     unexplained = validate_profile(profile)
+    assert unexplained.passed
     assert (
         "anchor_0:plain_english_meaning_required_for_statistical_anchor"
-        in unexplained.errors
+        in unexplained.warnings
     )
 
 
@@ -506,7 +508,8 @@ def test_generated_atomic_note_heading_is_not_source_native_evidence() -> None:
 
     validation = validate_profile(profile_from_dict(payload))
 
-    assert "anchor_0:source_native_locator_required" in validation.errors
+    assert validation.passed
+    assert "anchor_0:source_native_locator_unresolved" in validation.warnings
 
 
 def test_mechanical_quantitative_typing_keeps_unlike_estimands_separate() -> None:
@@ -690,7 +693,7 @@ def test_profile_fingerprint_includes_every_declared_dependency() -> None:
     assert payload["profile_prompt_version"] == "6"
     assert payload["classifier_version"] == "3"
     assert payload["algorithm_version"] == "4"
-    assert payload["profile_schema_version"] == "1.2"
+    assert payload["profile_schema_version"] == "1.3"
     assert payload["anchor_algorithm_version"] == "1"
     assert payload["support_envelope_version"] == "1"
     assert baseline == profile_dependency_fingerprint(
@@ -699,7 +702,7 @@ def test_profile_fingerprint_includes_every_declared_dependency() -> None:
     assert baseline != profile_dependency_fingerprint(
         note.replace("12%", "13%"), **kwargs
     )
-    assert baseline != profile_dependency_fingerprint(
+    assert baseline == profile_dependency_fingerprint(
         note, **{**kwargs, "source_set_id": "source-set-2"}
     )
     assert baseline != profile_dependency_fingerprint(
@@ -855,7 +858,7 @@ def test_v1_profile_mapping_sidecar_and_checkpoint_upgrade_mechanically(
     )
 
     upgraded = profile_from_dict(legacy_profile)
-    assert upgraded.profile_schema_version == "1.2"
+    assert upgraded.profile_schema_version == "1.3"
     assert upgraded.evidence_anchors[0].evidence_role == "support_unknown"
     assert (
         upgraded.evidence_anchors[0].support_envelope.support_status
@@ -873,7 +876,7 @@ def test_v1_profile_mapping_sidecar_and_checkpoint_upgrade_mechanically(
     assert load_profile_sidecar(sidecar) == upgraded
     assert write_profile_sidecar(sidecar, upgraded) is True
     persisted = yaml.safe_load(sidecar.read_text(encoding="utf-8"))["profile"]
-    assert persisted["profile_schema_version"] == "1.2"
+    assert persisted["profile_schema_version"] == "1.3"
     assert "evidence_anchor_id" in persisted["evidence_anchors"][0]
 
     state_dir = tmp_path / "state"

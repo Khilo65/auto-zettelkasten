@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+import re
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -42,6 +43,46 @@ from conftest import SECTION_KEYS, FakeReader, FakeZotero
 
 def _analysis() -> dict[str, str]:
     return {key: f"Source-grounded {key}; see page 1." for key in SECTION_KEYS}
+
+
+def _bundle_from_prompt(prompt: str, marker: str = "bundle-profile") -> dict[str, Any]:
+    source_match = re.search(r'"source_id":\s*"([^"]+)"', prompt)
+    key_match = re.search(r'"zotero_key":\s*"([^"]+)"', prompt)
+    assert source_match and key_match
+    source_id = source_match.group(1)
+    return {
+        "bundle_schema_version": "1",
+        "source_identity": {
+            "source_id": source_id,
+            "zotero_key": key_match.group(1),
+        },
+        "observed_bibliographic_identity": {},
+        "scope_assessment": {
+            "source_scope": "full_document",
+            "evidence_eligibility": "substantive_bounded",
+        },
+        "analysis_sections": _analysis(),
+        "compact_profile": {
+            "thesis": "The source advances a bounded institutional argument.",
+            "method_or_knowledge_basis": "Source-grounded analysis.",
+            "source_genre": "journal article",
+            "inferential_design": "descriptive",
+            "concepts": [marker],
+        },
+        "evidence_anchors": [
+            {
+                "evidence_anchor_id": f"anchor-{source_id}",
+                "source_id": source_id,
+                "claim": "The source advances a bounded institutional argument.",
+                "locator": "p. 1",
+                "planning_roles": ["thesis", "major_finding"],
+                "salience_priority": 10,
+            }
+        ],
+        "literature_positions": [],
+        "missing_source_recommendations": [],
+        "self_review": {"passed": True},
+    }
 
 
 def _profile_response(note_text: str, marker: str) -> dict[str, Any]:
@@ -481,6 +522,7 @@ class _ExplicitReasoner:
 
     def __init__(self) -> None:
         self.profile_calls = 0
+        self.request_deadline = 0.0
 
     def profile_source(
         self,
@@ -570,47 +612,30 @@ class _RelationshipThenClusterFailureReasoner(_ExplicitReasoner):
         *,
         context: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
-        by_source = {profile.source_id: profile for profile in profiles}
         assert context
         return {
             "decisions": [
                 {
-                    "source_id": pair["source_id"],
-                    "target_source_id": pair["target_source_id"],
-                    "status": "accepted",
+                    "pair_job_id": job["pair_job_id"],
+                    "decision": "relationship",
+                    "pair": job["pair"],
                     "relation_type": "complements",
-                    "comparison_unit": "institutional proposition",
+                    "actor_source_id": job["pair"]["left_source_id"],
+                    "reference_source_id": job["pair"]["right_source_id"],
+                    "forward_label": "complements",
+                    "inverse_label": "complements",
+                    "comparison_proposition": "The sources address the same bounded institutional proposition.",
                     "reason": "The sources provide complementary evidence for the same bounded institutional proposition.",
-                    "source_evidence_anchor_id": by_source[
-                        pair["source_id"]
-                    ].evidence_anchors[0].evidence_anchor_id,
-                    "target_evidence_anchor_id": by_source[
-                        pair["target_source_id"]
-                    ].evidence_anchors[0].evidence_anchor_id,
-                    "qualifiers": [],
-                    "confidence": 0.9,
+                    "left_evidence_anchor_ids": [
+                        job["selected_evidence"]["left"][0]["evidence_anchor_id"]
+                    ],
+                    "right_evidence_anchor_ids": [
+                        job["selected_evidence"]["right"][0]["evidence_anchor_id"]
+                    ],
+                    "confidence": "high",
+                    "output_contract": "relationship-decision-v4",
                 }
-                for pair in context["pairs"]
-            ]
-        }
-
-    def verify_relationships(
-        self,
-        profiles: Sequence[EvidenceProfile],
-        request: LiteratureMapRequest,
-        *,
-        context: Mapping[str, Any] | None = None,
-    ) -> Mapping[str, Any]:
-        assert context
-        return {
-            "verifications": [
-                {
-                    **row,
-                    "status": "confirmed",
-                    "reason": "Both located claims support the same bounded proposition.",
-                    "requested_context": [],
-                }
-                for row in context["preliminary_decisions"]
+                for job in context["pair_jobs"]
             ]
         }
 
@@ -699,9 +724,7 @@ def test_configured_builtin_reader_profiles_by_default_and_totals_live_calls(
     def generate(self, system_prompt, user_prompt, output_tokens, deadline_seconds):
         route = "profile" if "COMMITTED MARKDOWN NOTE:" in user_prompt else "source"
         calls.append((route, output_tokens, deadline_seconds))
-        if route == "profile":
-            return _profile_from_prompt(user_prompt, "built-in-profile")
-        return _analysis()
+        return _bundle_from_prompt(user_prompt, "built-in-profile")
 
     monkeypatch.setattr(DeepSeekReader, "_generate_text", generate)
     request = MapRequest(
@@ -713,21 +736,19 @@ def test_configured_builtin_reader_profiles_by_default_and_totals_live_calls(
     )
 
     assert report.status == "completed"
-    assert [route for route, _, _ in calls] == ["source", "profile"]
-    assert calls[1][1] == 16_000
-    assert calls[1][2] == request.processing.request_deadline_seconds
+    assert [route for route, _, _ in calls] == ["source"]
     assert isinstance(DeepSeekReader(allow_cloud=True), LiteratureReasoner)
     profile = _only_profile(tmp_path)
     assert profile.concepts == ["built-in-profile"]
-    assert profile.context["profile_generation_route"] == "built_in_reader"
+    assert profile.context["profile_generation_route"] == "source_analysis_bundle"
     progress = _progress(tmp_path, "builtin-profile")
     assert progress["source_provider_call_count"] == 1
-    assert progress["literature_provider_call_count"] == 1
-    assert progress["provider_call_count"] == 2
+    assert progress["literature_provider_call_count"] == 0
+    assert progress["provider_call_count"] == 1
     completed_status = get_status(tmp_path, "builtin-profile")
     assert completed_status.counts["source_provider_call_count"] == 1
-    assert completed_status.counts["literature_provider_call_count"] == 1
-    assert completed_status.counts["provider_call_count"] == 2
+    assert completed_status.counts["literature_provider_call_count"] == 0
+    assert completed_status.counts["provider_call_count"] == 1
 
 
 def test_build_map_constructs_configured_builtin_reasoner(
@@ -760,19 +781,23 @@ def test_build_map_constructs_configured_builtin_reasoner(
 
     assert result.status == "built"
     assert constructed == [("deepseek", "deepseek-v4-flash", True)]
-    assert reasoner.profile_calls == 2
+    assert reasoner.request_deadline == 600.0
+    assert reasoner.profile_calls == 0
     progress = _progress(tmp_path, "build-map-reasoner")
     assert progress["status"] == "completed"
     assert progress["stage"] == "reporting"
     assert progress["inventory_count"] == source_report.inventory_count
     assert progress["validated_note_count"] == source_report.validated_note_count
     assert progress["limited_note_count"] == source_report.limited_note_count
-    assert progress["exhausted_count"] == source_report.exhausted_count
+    assert (
+        progress["parked_for_review_count"]
+        == source_report.parked_for_review_count
+    )
     assert progress["pending_count"] == 0
     assert progress["profile_count"] == 2
-    assert progress["literature_provider_call_count"] == (
-        progress["profile_count"] + progress["synthesis_call_count"]
-    )
+    assert progress["literature_provider_call_count"] == progress[
+        "synthesis_call_count"
+    ]
     profile_hits = result.metadata["literature_map"]["profile_result"][
         "checkpoint_hits"
     ]
@@ -799,7 +824,7 @@ def test_cluster_failure_keeps_committed_reciprocal_atomic_relationships(
         "cluster provider unavailable" in str(row.get("reason") or "")
         for row in report.errors
     )
-    assert report.literature_map["synthesis_call_count"] == 4
+    assert report.literature_map["synthesis_call_count"] == 3
     assert report.literature_map["synthesis_failure_count"] == 1
     registry = yaml.safe_load(
         (
@@ -946,7 +971,7 @@ def test_primary_run_honors_synthesis_disabled_without_profile_or_map_artifacts(
     assert not (tmp_path / "03_literature_synthesis" / "manifest.yml").exists()
 
 
-def test_profile_workers_run_independent_profile_calls_concurrently(
+def test_legacy_profile_reasoner_is_not_called_after_source_generation(
     tmp_path: Path, sample_items
 ) -> None:
     reasoner = _ConcurrentReasoner()
@@ -964,15 +989,13 @@ def test_profile_workers_run_independent_profile_calls_concurrently(
     )
 
     assert report.status == "completed"
-    assert reasoner.profile_calls == 2
-    assert reasoner.max_active_calls == 2
-    assert report.literature_provider_call_count == (
-        reasoner.profile_calls + report.synthesis_call_count
-    )
+    assert reasoner.profile_calls == 0
+    assert reasoner.max_active_calls == 0
+    assert report.literature_provider_call_count == report.synthesis_call_count
     assert report.synthesis_call_count >= 1
 
 
-def test_profile_call_budget_returns_resumable_partial_after_checkpointing_successes(
+def test_profile_call_budget_caps_source_generation_without_profile_calls(
     tmp_path: Path,
     sample_items,
 ) -> None:
@@ -992,28 +1015,14 @@ def test_profile_call_budget_returns_resumable_partial_after_checkpointing_succe
         run_id="profile-budget",
     )
 
-    assert report.status == "partial"
-    assert report.validated_note_count == 2
-    assert report.literature_provider_call_count == 1
-    assert any(error.get("stage") == "literature_mapping" for error in report.errors)
-    assert (
-        len(
-            list(
-                (
-                    tmp_path
-                    / "11_state"
-                    / "runs"
-                    / "profile-budget"
-                    / "literature"
-                    / "profile_calls"
-                ).glob("*.yml")
-            )
-        )
-        == 1
-    )
+    assert report.status == "completed_with_parked_items"
+    assert report.validated_note_count == 1
+    assert report.parked_for_review_count == 1
+    assert report.source_provider_call_count == 1
+    assert reasoner.profile_calls == 0
 
 
-def test_one_profile_failure_does_not_discard_other_results_and_resume_retries_only_failure(
+def test_legacy_profile_failure_cannot_park_source_results(
     tmp_path: Path,
     sample_items,
 ) -> None:
@@ -1028,11 +1037,11 @@ def test_one_profile_failure_does_not_discard_other_results_and_resume_retries_o
         run_id="profile-recovery",
     )
 
-    assert first.status == "partial"
-    assert first.profile_count == 1
-    assert first.profile_valid_count == 1
-    assert first.literature_failure_count == 1
-    assert first_reasoner.profile_calls == 2
+    assert first.status == "completed"
+    assert first.profile_count == 2
+    assert first.profile_valid_count == 2
+    assert first.literature_failure_count == 0
+    assert first_reasoner.profile_calls == 0
     failure_dir = (
         tmp_path
         / "11_state"
@@ -1041,7 +1050,7 @@ def test_one_profile_failure_does_not_discard_other_results_and_resume_retries_o
         / "literature"
         / "profile_failures"
     )
-    assert len(list(failure_dir.glob("*.yml"))) == 1
+    assert not list(failure_dir.glob("*.yml"))
 
     recovered_reasoner = _RecoveringReasoner()
     recovered = resume_map(
@@ -1056,11 +1065,11 @@ def test_one_profile_failure_does_not_discard_other_results_and_resume_retries_o
     assert recovered.profile_count == 2
     assert recovered.profile_valid_count == 2
     assert recovered.literature_failure_count == 0
-    assert recovered_reasoner.profile_calls == 1
+    assert recovered_reasoner.profile_calls == 0
     assert not list(failure_dir.glob("*.yml"))
 
 
-def test_contract_invalid_profile_fallback_is_retried_when_reasoner_is_available(
+def test_contract_invalid_legacy_profile_method_is_not_used(
     tmp_path: Path,
     sample_items,
 ) -> None:
@@ -1075,18 +1084,13 @@ def test_contract_invalid_profile_fallback_is_retried_when_reasoner_is_available
 
     assert first.status == "completed"
     assert first.profile_count == 1
-    assert first.profile_valid_count == 0
-    assert first.profile_excluded_count == 1
+    assert first.profile_valid_count == 1
+    assert first.profile_excluded_count == 0
     assert first.literature_failure_count == 0
-    assert reasoner.profile_calls == 1
+    assert reasoner.profile_calls == 0
     profile = _only_profile(tmp_path)
-    assert profile.excluded_from_synthesis is True
-    assert profile.exclusion_reason
-    assert (
-        profile.context["profile_generation_route"]
-        == "mechanical_reasoner_contract_fallback"
-    )
-    assert profile.context["lazy_reprofile_required"] is True
+    assert profile.excluded_from_synthesis is False
+    assert profile.context["profile_generation_route"] == "deterministic"
 
     replay_reasoner = _RecoveringReasoner()
     replay = build_map(
@@ -1099,13 +1103,13 @@ def test_contract_invalid_profile_fallback_is_retried_when_reasoner_is_available
     )
 
     assert replay.status == "built"
-    assert replay_reasoner.profile_calls == 1
+    assert replay_reasoner.profile_calls == 0
     recovered = _only_profile(tmp_path)
     assert recovered.excluded_from_synthesis is False
     assert recovered.context.get("lazy_reprofile_required") is not True
 
 
-def test_resume_keeps_frozen_source_set_identity_when_an_exhausted_source_recovers(
+def test_resume_keeps_frozen_source_set_identity_when_a_parked_source_recovers(
     tmp_path: Path,
     sample_items,
 ) -> None:
@@ -1120,8 +1124,8 @@ def test_resume_keeps_frozen_source_set_identity_when_an_exhausted_source_recove
     )
 
     assert first.validated_note_count == 1
-    assert first.exhausted_count == 1
-    assert first_reasoner.profile_calls == 1
+    assert first.parked_for_review_count == 1
+    assert first_reasoner.profile_calls == 0
 
     resumed_reasoner = _RecoveringReasoner()
     resumed = resume_map(
@@ -1130,15 +1134,16 @@ def test_resume_keeps_frozen_source_set_identity_when_an_exhausted_source_recove
         client=FakeZotero([]),
         reader=_RecoveringSourceReader(),
         literature_reasoner=resumed_reasoner,
+        retry_terminal_failures=True,
     )
 
     assert resumed.validated_note_count == 2
-    assert resumed.exhausted_count == 0
+    assert resumed.parked_for_review_count == 0
     assert resumed.source_set_id == first.source_set_id
-    assert resumed_reasoner.profile_calls == 1
+    assert resumed_reasoner.profile_calls == 0
 
 
-def test_profile_content_rebases_collection_lineage_without_a_new_paid_call(
+def test_profile_content_remains_source_owned_across_collection_maps(
     tmp_path: Path,
     sample_items,
 ) -> None:
@@ -1169,7 +1174,7 @@ def test_profile_content_rebases_collection_lineage_without_a_new_paid_call(
     assert manifest.status == "built"
     assert rebased_reasoner.profile_calls == 0
     profile = _only_profile(tmp_path)
-    assert profile.context["source_set_id"] == "source-set-zotero-other-snapshot"
+    assert "source_set_id" not in profile.context
 
 
 def test_current_mechanical_profile_reuses_unchanged_inspected_source_content(
@@ -1236,7 +1241,7 @@ def test_explicit_reasoner_takes_precedence_over_builtin_reader(
             raise AssertionError(
                 "the built-in profile route must not replace an explicit reasoner"
             )
-        return _analysis()
+        return _bundle_from_prompt(user_prompt, "source-bundle-profile")
 
     monkeypatch.setattr(DeepSeekReader, "_generate_text", generate)
     reasoner = _ExplicitReasoner()
@@ -1252,10 +1257,10 @@ def test_explicit_reasoner_takes_precedence_over_builtin_reader(
 
     assert report.status == "completed"
     assert built_in_routes == ["source"]
-    assert reasoner.profile_calls == 1
+    assert reasoner.profile_calls == 0
     profile = _only_profile(tmp_path)
-    assert profile.concepts == ["explicit-profile"]
-    assert profile.context["profile_generation_route"] == "explicit_reasoner"
+    assert profile.concepts == ["source-bundle-profile"]
+    assert profile.context["profile_generation_route"] == "source_analysis_bundle"
 
 
 def test_limited_note_uses_deterministic_profile_without_builtin_call(
@@ -1675,7 +1680,7 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
     assert output_caps["collection-clustering"] == 16_000
     assert reader.map_debates([], request) == {"assessments": []}
     synthesis = reader.synthesize_cluster([], request)
-    assert output_caps["cluster-synthesis"] == 32_000
+    assert output_caps["cluster-synthesis"] == 64_000
     assert synthesis["cluster_id"] == "cluster-1"
     assert synthesis["boundaries"] == [
         "Temporal: 2000-2020",
@@ -1694,7 +1699,7 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
     ]
     assert synthesis["agreements"] == []
     assert synthesis["source_contributions"][0]["comparison_status"] == "single_source"
-    assert "cluster synthesis prompt v19" in system_prompts["cluster-synthesis"]
+    assert "cluster synthesis prompt v21" in system_prompts["cluster-synthesis"]
     assert "whether mediation happens" in system_prompts["cluster-synthesis"]
     assert "selection correlation" in system_prompts["cluster-synthesis"]
     assert "below 7,500 output tokens" in system_prompts["cluster-synthesis"]

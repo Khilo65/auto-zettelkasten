@@ -26,7 +26,7 @@ from .notes import (
 )
 
 
-PROFILE_SCHEMA_VERSION = "1.2"
+PROFILE_SCHEMA_VERSION = "1.3"
 PROFILE_SIDECAR_VERSION = "1"
 PROFILE_CHECKPOINT_VERSION = "1"
 PROFILE_PROMPT_VERSION = "6"
@@ -312,7 +312,6 @@ def profile_dependency_payload(
     effective_algorithm_version = profile_algorithm_version or algorithm_version
     return {
         "note_semantic_hash": semantic_note_hash(note_text),
-        "source_set_id": str(source_set_id),
         "provider": str(provider),
         "model": str(model),
         "policy": _canonical_value(policy),
@@ -964,6 +963,7 @@ def deterministic_profile(
         and source_scope == "full_document"
         and coverage_gate == "passed"
     )
+    substantive_bounded = _is_analytical_full_document(frontmatter)
     coverage = {
         "note_status": note_status,
         "source_scope": source_scope,
@@ -971,7 +971,7 @@ def deterministic_profile(
         "full_document": full_document,
     }
     validity = {
-        "status": "valid" if full_document else "excluded_context_only",
+        "status": "valid" if substantive_bounded else "excluded_context_only",
         "analytical": note_status in ANALYTICAL_NOTE_STATUSES,
         "full_document": full_document,
         "profile_prompt_version": PROFILE_PROMPT_VERSION,
@@ -1007,6 +1007,9 @@ def deterministic_profile(
             "source_set_id": source_set_id,
             "exclusion_reason": exclusion_reason,
         },
+        "evidence_eligibility": (
+            "context_only" if limited else "substantive_bounded"
+        ),
         "excluded_from_synthesis": limited,
         "features": features,
         "research_questions": questions,
@@ -1287,33 +1290,19 @@ def validate_profile(
         if not claim:
             errors.append(f"anchor_{index}:missing_claim")
         source_locator_rows = anchor.get("source_locators") or []
-        envelope = (
-            anchor.get("support_envelope")
-            if isinstance(anchor.get("support_envelope"), Mapping)
-            else {}
-        )
-        support_status = str(envelope.get("support_status") or "support_unknown")
         if source_locator_rows:
             if not _has_strong_source_locator(anchor):
-                if support_status == "support_unknown":
-                    warnings.append(
-                        f"anchor_{index}:source_native_locator_unresolved_support_unknown"
-                    )
-                else:
-                    errors.append(f"anchor_{index}:source_native_locator_required")
+                warnings.append(
+                    f"anchor_{index}:source_native_locator_unresolved"
+                )
         elif not any(
             _TRACEABLE_LOCATOR.search(locator)
             for locator in locator_values
             if locator.strip()
         ):
-            if support_status == "support_unknown":
-                warnings.append(
-                    f"anchor_{index}:traceable_locator_unresolved_support_unknown"
-                )
-            else:
-                errors.append(f"anchor_{index}:traceable_locator_required")
+            warnings.append(f"anchor_{index}:traceable_locator_unresolved")
         if statistical and not meaning:
-            errors.append(
+            warnings.append(
                 f"anchor_{index}:plain_english_meaning_required_for_statistical_anchor"
             )
         if (
@@ -1326,12 +1315,9 @@ def validate_profile(
                 if isinstance(anchor.get("support_envelope"), Mapping)
                 else {}
             )
-            if envelope.get("support_status") == "support_unknown":
-                warnings.append(
-                    f"anchor_{index}:typed_quantitative_result_unresolved_support_unknown"
-                )
-            else:
-                errors.append(f"anchor_{index}:typed_quantitative_result_required")
+            warnings.append(
+                f"anchor_{index}:typed_quantitative_result_unresolved"
+            )
     if substantive and not anchors:
         errors.append("analytical_profile_requires_substantive_anchor")
     return ProfileValidation(
@@ -1351,6 +1337,7 @@ def profile_to_dict(profile: Any) -> dict[str, Any]:
         raise ProfileContractError("profile must be an EvidenceProfile dataclass")
     payload = _canonical_value(profile.to_dict())
     payload["profile_schema_version"] = PROFILE_SCHEMA_VERSION
+    payload.pop("excluded_from_synthesis", None)
     return payload
 
 
@@ -1366,9 +1353,14 @@ def profile_from_dict(payload: Mapping[str, Any]) -> Any:
         )
     values = dict(payload)
     version = str(values.get("profile_schema_version") or "1.0")
-    if version not in {"1.0", "1.1", PROFILE_SCHEMA_VERSION}:
+    if version not in {"1.0", "1.1", "1.2", PROFILE_SCHEMA_VERSION}:
         raise ProfileContractError(f"unsupported profile_schema_version: {version!r}")
     values["profile_schema_version"] = PROFILE_SCHEMA_VERSION
+    legacy_excluded = bool(values.get("excluded_from_synthesis", False))
+    values.setdefault(
+        "evidence_eligibility",
+        "context_only" if legacy_excluded else "substantive_bounded",
+    )
     _validate_dataclass_value_types(profile_class, values, "profile")
     findings_field = _actual_field_name(profile_class, "findings", _PROFILE_ALIASES)
     if findings_field and findings_field in values:
@@ -1882,10 +1874,23 @@ def _limited_reason(
 
 
 def _is_analytical_full_document(frontmatter: Mapping[str, Any]) -> bool:
+    status = str(frontmatter.get("note_status") or "")
+    scope = str(frontmatter.get("source_scope") or "")
+    gate = _coverage_gate(frontmatter.get("source_coverage"))
+    eligibility = str(frontmatter.get("evidence_eligibility") or "")
+    if not eligibility:
+        eligibility = (
+            "substantive_bounded"
+            if scope == "full_document"
+            else "context_only"
+        )
     return (
-        str(frontmatter.get("note_status") or "") in ANALYTICAL_NOTE_STATUSES
-        and str(frontmatter.get("source_scope") or "") == "full_document"
-        and _coverage_gate(frontmatter.get("source_coverage")) == "passed"
+        status in ANALYTICAL_NOTE_STATUSES
+        and eligibility == "substantive_bounded"
+        and (
+            (scope == "full_document" and gate == "passed")
+            or (scope == "partial_document" and gate in {"limited", "passed"})
+        )
     )
 
 

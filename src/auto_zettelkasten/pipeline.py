@@ -8,6 +8,7 @@ import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -20,13 +21,7 @@ from .extraction import (
     extract_bytes,
     extract_path,
 )
-from .fidelity import (
-    ATOMIC_FIDELITY_VERSION,
-    analyze_atomic_fidelity,
-    apply_atomic_replacements,
-    source_passages_for_risks,
-    validate_atomic_replacements,
-)
+from .fidelity import analyze_atomic_fidelity
 from .files import (
     append_jsonl,
     atomic_write_bytes,
@@ -70,7 +65,10 @@ from .models import (
     LiteratureMapRequest,
     MapRequest,
     ProcessingPolicy,
+    RelationshipPairJob,
+    RelationshipProviderBatch,
     RunReport,
+    SourceAnalysisBundle,
 )
 from .notes import (
     internal_note_text,
@@ -84,6 +82,8 @@ from .notes import (
     semantic_note_hash,
     source_id_for_item,
     update_note_graph,
+    update_note_frontmatter,
+    update_note_literature,
     validate_note,
     write_atomic_note,
     write_limited_note,
@@ -115,18 +115,14 @@ from .profiles import (
     write_profile_checkpoint,
 )
 from .relationships import (
-    candidate_rows,
     canonical_pair,
     persist_relationship_registry,
     projected_related_links,
     relationship_decision_key,
     RELATIONSHIP_PROMPT_VERSION,
     stable_hash,
-    validate_bridge_shard_pairs,
-    validate_decisions,
-    validate_verifications,
 )
-from .readers import SECTION_KEYS, provider_from_name
+from .readers import SECTION_KEYS, SOURCE_BUNDLE_PROMPT_VERSION, provider_from_name
 from .workspace import (
     artifact_rows,
     assert_compatible,
@@ -135,10 +131,15 @@ from .workspace import (
     run_directory,
     validate_opaque_id,
 )
-from .zotero import ZoteroLocalClient
+from .zotero import (
+    ZoteroLocalClient,
+    normalize_collection_snapshot,
+    scope_collection_snapshot,
+)
 
 CHUNKING_VERSION = "2"
-CONTENT_CLASSIFIER_VERSION = "3"
+CONTENT_CLASSIFIER_VERSION = "4"
+_LITERATURE_MEMORY_LOCK = threading.Lock()
 
 
 def _analytical_profile_source_ids(profiles: Sequence[Any]) -> set[str]:
@@ -148,10 +149,15 @@ def _analytical_profile_source_ids(profiles: Sequence[Any]) -> set[str]:
         context = row.get("context") if isinstance(row.get("context"), Mapping) else {}
         analytical = row.get("analytical")
         if analytical is None:
-            analytical = bool(
-                not row.get("excluded_from_synthesis", False)
+            analytical = (
+                str(row.get("evidence_eligibility") or "substantive_bounded")
+                == "substantive_bounded"
                 and str(context.get("note_status") or "")
-                == "analytical_atomic_note"
+                in {
+                    "analytical_atomic_note",
+                    "verified_atomic_note",
+                    "partial_document_atomic_note",
+                }
             )
         if analytical and row.get("source_id"):
             source_ids.add(str(row["source_id"]))
@@ -171,7 +177,7 @@ class AtomicFidelityError(RuntimeError):
 
 
 class _ProfileProviderBudget:
-    """Persist the cumulative profile and fidelity provider-call ceiling."""
+    """Persist the cumulative source and profile provider-call ceiling."""
 
     def __init__(self, path: Path, max_calls: int) -> None:
         self.path = path
@@ -191,7 +197,7 @@ class _ProfileProviderBudget:
     def reserve(self, stage: str, key: str, fingerprint: str) -> str:
         with self._lock:
             if self.cumulative_calls >= self.max_calls:
-                raise RuntimeError("literature_profile_call_budget_reached")
+                raise RuntimeError("source_profile_call_budget_reached")
             attempt_number = 1 + sum(
                 1
                 for row in self.attempts
@@ -361,7 +367,7 @@ class _RunProgress:
             rejected_quantitative_comparison_count=0,
             rejected_generated_locator_count=0,
             coverage_inventory_count=0,
-            coverage_exhausted_count=0,
+            coverage_parked_for_review_count=0,
             coverage_accounting_valid=False,
             active_cluster="",
             active_gap_packet="",
@@ -382,6 +388,7 @@ class _RunProgress:
             "validated_note_count",
             "limited_note_count",
             "exhausted_count",
+            "parked_for_review_count",
             "partial_count",
             "pending_count",
             "active_count",
@@ -402,11 +409,13 @@ class _RunProgress:
             ):
                 prior = {}
             terminal_status = str(item.get("terminal_status") or "")
+            if terminal_status == "exhausted":
+                terminal_status = "parked_for_review"
             default_phase = (
                 "committed"
                 if terminal_status in {"validated_note", "limited_note"}
                 else "finished"
-                if terminal_status == "exhausted"
+                if terminal_status in {"exhausted", "parked_for_review"}
                 else "paused"
                 if terminal_status == "partial"
                 else "queued"
@@ -516,14 +525,16 @@ class _RunProgress:
             for name in (
                 "validated_note",
                 "limited_note",
-                "exhausted",
+                "parked_for_review",
                 "partial",
                 "pending",
                 "active",
             )
         }
         terminal_count = (
-            counts["validated_note"] + counts["limited_note"] + counts["exhausted"]
+            counts["validated_note"]
+            + counts["limited_note"]
+            + counts["parked_for_review"]
         )
         payload = {
             "status": self._status,
@@ -534,7 +545,7 @@ class _RunProgress:
             "inventory_count": len(self.items),
             "validated_note_count": counts["validated_note"],
             "limited_note_count": counts["limited_note"],
-            "exhausted_count": counts["exhausted"],
+            "parked_for_review_count": counts["parked_for_review"],
             "partial_count": counts["partial"],
             "pending_count": counts["pending"] + counts["active"],
             "active_count": counts["active"],
@@ -586,6 +597,8 @@ def run_pipeline(
 ) -> RunReport:
     workspace = resolve_workspace(request.workspace)
     initialize(workspace)
+    assert_compatible(workspace)
+    migrate_workspace(workspace)
     assert_compatible(workspace)
     run_id = run_id or _new_run_id()
     validate_opaque_id(run_id, field="run_id")
@@ -644,6 +657,8 @@ def run_pipeline(
     )
     frozen_inventory_path = run_dir / "inventory.json"
     frozen_manifest_path = run_dir / "frozen_inventory.yml"
+    frozen_collection_snapshot_path = run_dir / "collection_snapshot.yml"
+    collection_snapshot: dict[str, Any] = {}
     effective_collection_key = request.collection_key
     effective_collection_name = ""
     inventory_scope = request.scope
@@ -692,6 +707,9 @@ def run_pipeline(
                     frozen_source_set_snapshot_id = str(
                         previous_report.get("source_set_id") or ""
                     )
+            collection_snapshot = dict(
+                read_yaml(frozen_collection_snapshot_path, {}) or {}
+            )
         except Exception as exc:
             return _blocked_report(
                 request, run_id, f"frozen_inventory:{type(exc).__name__}:{exc}"
@@ -716,6 +734,22 @@ def run_pipeline(
                 effective_collection_name = _zotero_collection_name(
                     client, effective_collection_key
                 )
+            collection_snapshot = normalize_collection_snapshot(
+                [
+                    dict(row)
+                    for row in client.collections()
+                    if isinstance(row, Mapping)
+                ],
+                [
+                    dict(row)
+                    for row in (
+                        items
+                        if inventory_scope == "library" and not request.limit
+                        else client.inventory("library")
+                    )
+                    if isinstance(row, Mapping)
+                ],
+            )
         except Exception as exc:
             return _blocked_report(
                 request, run_id, f"zotero_inventory:{type(exc).__name__}:{exc}"
@@ -724,6 +758,14 @@ def run_pipeline(
             items = items[: request.limit]
         write_json(inventory_path, items)
         write_json(frozen_inventory_path, items)
+        write_yaml(frozen_collection_snapshot_path, collection_snapshot)
+        write_yaml(
+            workspace
+            / "01_custody"
+            / "zotero"
+            / "collection_snapshot.yml",
+            collection_snapshot,
+        )
         write_yaml(
             frozen_manifest_path,
             {
@@ -845,6 +887,7 @@ def run_pipeline(
                 )
     prepared.sort(key=lambda row: int(row.get("inventory_index", 0)))
     tag_report = commit_tag_reviews(workspace, proposals, decisions)
+    _reconcile_literature_memory(workspace)
 
     note_rows = _deduplicate_note_rows(note_rows)
     terminal_rows.sort(key=lambda row: int(row.get("inventory_index", 0)))
@@ -890,6 +933,7 @@ def run_pipeline(
         progress=progress,
         resume=resume,
         profile_budget=profile_budget,
+        collection_snapshot=collection_snapshot,
     )
     # The v0.4 map is already scoped to this run's frozen source set, so every
     # generated cluster and gap belongs to the run without a second heuristic filter.
@@ -1058,8 +1102,10 @@ def run_pipeline(
     limited_count = sum(
         1 for row in terminal_rows if row.get("terminal_status") == "limited_note"
     )
-    exhausted_count = sum(
-        1 for row in terminal_rows if row.get("terminal_status") == "exhausted"
+    parked_for_review_count = sum(
+        1
+        for row in terminal_rows
+        if row.get("terminal_status") in {"parked_for_review", "exhausted"}
     )
     partial_count = sum(
         1 for row in terminal_rows if row.get("terminal_status") == "partial"
@@ -1074,7 +1120,11 @@ def run_pipeline(
     status = (
         "partial"
         if partial_count or pending_count or literature_partial_reason
-        else ("completed" if exhausted_count == 0 else "completed_with_exhausted_items")
+        else (
+            "completed"
+            if parked_for_review_count == 0
+            else "completed_with_parked_items"
+        )
     )
     progress.finish(status)
     errors = [
@@ -1083,7 +1133,8 @@ def run_pipeline(
             "reason": row.get("reason", ""),
         }
         for row in terminal_rows
-        if row.get("terminal_status") in {"exhausted", "partial"}
+        if row.get("terminal_status")
+        in {"parked_for_review", "exhausted", "partial"}
     ]
     if literature_partial_reason:
         errors.append(
@@ -1132,7 +1183,7 @@ def run_pipeline(
         inventory_count=len(items),
         validated_note_count=validated_count,
         limited_note_count=limited_count,
-        exhausted_count=exhausted_count,
+        parked_for_review_count=parked_for_review_count,
         partial_count=partial_count,
         pending_count=pending_count,
         reused_count=reused_count,
@@ -1185,6 +1236,46 @@ def run_pipeline(
         artifact_manifest=manifest,
     )
     _write_run_report(run_dir, report)
+    if status.startswith("completed"):
+        scoped_item_keys = [
+            str(row.get("key") or "")
+            for row in collection_snapshot.get("items", []) or []
+            if isinstance(row, Mapping)
+            and (
+                inventory_scope == "library"
+                or str(effective_collection_key or "")
+                in {
+                    str(value)
+                    for value in row.get("collection_keys", []) or []
+                }
+            )
+        ]
+        processed_snapshot = scope_collection_snapshot(
+            collection_snapshot,
+            scope=inventory_scope,
+            collection_key=str(effective_collection_key or ""),
+            item_keys=scoped_item_keys,
+        )
+        processed_path = (
+            workspace
+            / "11_state"
+            / "zotero"
+            / "last_processed_snapshot.yml"
+            if inventory_scope == "library"
+            else workspace
+            / "11_state"
+            / "zotero"
+            / "processed_snapshots"
+            / f"collection-{slugify(str(effective_collection_key or ''))}.yml"
+        )
+        write_yaml(
+            processed_path,
+            {
+                **processed_snapshot,
+                "processed_run_id": run_id,
+                "processed_at": now_iso(),
+            },
+        )
     return report
 
 
@@ -1213,6 +1304,39 @@ def _finalize_prepared_row(
     for attempt in row.pop("attempts", []):
         append_jsonl(attempt_path, attempt)
     if row.get("reused") and row.get("note_path"):
+        path = workspace / str(row["note_path"])
+        data = item_data(row["item"])
+        update_note_frontmatter(
+            path,
+            {
+                "title": str(
+                    data.get("title")
+                    or row.get("zotero_item_key")
+                    or "Untitled Zotero item"
+                ),
+                "citation_key": _citation_key(data),
+                "creators": (
+                    data.get("creators", [])
+                    if isinstance(data.get("creators", []), list)
+                    else []
+                ),
+                "date": str(data.get("date") or ""),
+                "doi": str(data.get("DOI") or data.get("doi") or ""),
+                "isbn": str(data.get("ISBN") or data.get("isbn") or ""),
+                "url": str(data.get("url") or ""),
+                "original_zotero_tags": original_tags(row["item"]),
+                "zotero_relations": (
+                    data.get("relations", {})
+                    if isinstance(data.get("relations", {}), Mapping)
+                    else {}
+                ),
+                "aliases": [str(data.get("title") or "")],
+                "updated_at": now_iso(),
+                "engine_version": ENGINE_VERSION,
+                "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+            },
+        )
+        _write_fingerprint(workspace, row, str(row["note_path"]))
         return (
             _public_terminal_row(row),
             _note_summary_from_path(workspace, row),
@@ -1243,7 +1367,7 @@ def _finalize_prepared_row(
             )
     except Exception as exc:
         row.update(
-            terminal_status="exhausted",
+            terminal_status="parked_for_review",
             reason=f"{route}_failed:{type(exc).__name__}:{exc}",
             note_path="",
         )
@@ -1253,7 +1377,7 @@ def _finalize_prepared_row(
         return _public_terminal_row(row), None, proposals, decisions
     if not validation.passed:
         row.update(
-            terminal_status="exhausted",
+            terminal_status="parked_for_review",
             reason=f"{route}_validation_failed:" + ",".join(validation.errors),
             note_path="",
         )
@@ -1270,6 +1394,23 @@ def _finalize_prepared_row(
         "limited_note" if row.get("limited_analysis") else "validated_note"
     )
     row.update(terminal_status=terminal_status, note_path=relative_path)
+    if isinstance(row.get("source_analysis_bundle"), Mapping):
+        _commit_source_bundle(workspace, row, path, request)
+    if row.get("quality_diagnostics"):
+        write_yaml(
+            workspace
+            / "02_source_memory"
+            / "profiles"
+            / f"{safe_filename(str(row['note_id']))}.quality.yml",
+            {
+                "diagnostic_schema_version": "1",
+                "note_id": row["note_id"],
+                "source_id": row["source_id"],
+                "advisory_only": True,
+                "warnings": list(row.get("quality_diagnostics", []) or []),
+                "updated_at": now_iso(),
+            },
+        )
     _write_fingerprint(workspace, row, relative_path)
     append_jsonl(
         attempt_path,
@@ -1282,6 +1423,707 @@ def _finalize_prepared_row(
         proposals,
         decisions,
     )
+
+
+def _commit_source_bundle(
+    workspace: Path,
+    row: Mapping[str, Any],
+    note_path: Path,
+    request: MapRequest,
+) -> None:
+    bundle = SourceAnalysisBundle.from_dict(
+        dict(row["source_analysis_bundle"])
+    )
+    bundle_path = (
+        workspace
+        / "02_source_memory"
+        / "bundles"
+        / f"{safe_filename(str(row['source_id']))}.yml"
+    )
+    semantic_fingerprint = stable_hash(bundle.semantic_dict())
+    dependency_fingerprint = _source_bundle_dependency_fingerprint(row, request)
+    write_yaml(
+        bundle_path,
+        {
+            "source_analysis_bundle_schema_version": "1",
+            "semantic_fingerprint": semantic_fingerprint,
+            "dependency_fingerprint": dependency_fingerprint,
+            "bundle": bundle.to_dict(),
+        },
+    )
+    note_text = internal_note_text(note_path)
+    profile = build_evidence_profile(
+        note_text,
+        source_set_id="",
+        provider=request.provider,
+        model=request.model,
+        policy={
+            "profile_generation_route": "source_analysis_bundle",
+            "reasoner_identity": "source-analysis-bundle:v1",
+        },
+    )
+    profile.context = {
+        **dict(profile.context or {}),
+        "source_analysis_bundle_path": str(bundle_path.relative_to(workspace)),
+        "source_analysis_bundle_fingerprint": semantic_fingerprint,
+        "source_analysis_bundle_dependency_fingerprint": dependency_fingerprint,
+        "profile_generation_route": "source_analysis_bundle",
+    }
+    eligibility = str(
+        bundle.scope_assessment.get("evidence_eligibility")
+        or row.get("evidence_eligibility")
+        or "substantive_bounded"
+    )
+    profile.evidence_eligibility = eligibility  # type: ignore[assignment]
+    profile.excluded_from_synthesis = eligibility != "substantive_bounded"
+    if bundle.evidence_anchors:
+        profile.evidence_anchors = list(bundle.evidence_anchors)
+    compact = dict(bundle.compact_profile)
+    for field_name in (
+        "research_questions",
+        "concepts",
+        "theories",
+        "mechanisms",
+        "methods",
+        "cases",
+        "datasets",
+        "data",
+        "geography",
+        "periods",
+        "populations",
+        "outcomes",
+        "measures",
+        "limitations",
+        "boundaries",
+        "gaps",
+        "future_research",
+    ):
+        values = compact.get(field_name, [])
+        if isinstance(values, list):
+            setattr(
+                profile,
+                field_name,
+                list(
+                    dict.fromkeys(
+                        str(value).strip()
+                        for value in values
+                        if str(value).strip()
+                    )
+                ),
+            )
+    method = str(compact.get("method_or_knowledge_basis") or "").strip()
+    if method and method not in profile.methods:
+        profile.methods.insert(0, method)
+    profile.source_role = str(
+        compact.get("source_genre") or profile.source_role or ""
+    )
+    compact_coverage = compact.get("coverage")
+    if isinstance(compact_coverage, Mapping):
+        profile.coverage = {**dict(profile.coverage or {}), **compact_coverage}
+    elif str(compact_coverage or "").strip():
+        profile.coverage = {
+            **dict(profile.coverage or {}),
+            "description": str(compact_coverage).strip(),
+        }
+    profile.context = {
+        **dict(profile.context or {}),
+        "thesis": str(compact.get("thesis") or ""),
+        "method_or_knowledge_basis": method,
+        "source_genre": str(compact.get("source_genre") or ""),
+        "inferential_design": str(compact.get("inferential_design") or ""),
+    }
+    profile.validity = {
+        **dict(profile.validity or {}),
+        "source_analysis_bundle": "1",
+        "profile_prompt_version": "bundle-v1",
+    }
+    save_profile(workspace / "02_source_memory" / "profiles", profile)
+    with _LITERATURE_MEMORY_LOCK:
+        _commit_literature_memory(workspace, bundle, note_path)
+        _commit_remediation_ledgers(workspace, row, bundle)
+
+
+def _source_bundle_dependency_fingerprint(
+    row: Mapping[str, Any], request: MapRequest
+) -> str:
+    return stable_hash(
+        {
+            "source_fingerprint": str(row.get("fingerprint") or ""),
+            "content_hash": str(row.get("content_hash") or ""),
+            "provider": request.provider,
+            "model": request.model,
+            "prompt_version": request.prompt_version,
+            "source_bundle_prompt_version": SOURCE_BUNDLE_PROMPT_VERSION,
+            "source_bundle_normalization_version": "7",
+            "processing": request.to_dict().get("processing", {}),
+        }
+    )
+
+
+def _commit_literature_memory(
+    workspace: Path,
+    bundle: SourceAnalysisBundle,
+    note_path: Path,
+) -> None:
+    index_root = workspace / "02_source_memory" / "indexes"
+    positions_path = index_root / "literature_positions.yml"
+    existing = read_yaml(positions_path, {}) or {}
+    prior_rows = (
+        existing.get("positions", []) if isinstance(existing, Mapping) else []
+    )
+    by_id = {
+        str(row.get("literature_position_id") or ""): dict(row)
+        for row in prior_rows
+        if isinstance(row, Mapping) and row.get("literature_position_id")
+    }
+    current_source_id = str(bundle.source_identity.get("source_id") or "")
+    by_id = {
+        key: value
+        for key, value in by_id.items()
+        if str(value.get("current_source_id") or "") != current_source_id
+    }
+    source_index = _source_match_index(workspace)
+    wikilinks: dict[str, str] = {}
+    projected_positions = []
+    for position in bundle.literature_positions:
+        row = position.to_dict()
+        matched = _match_literature_position(row, source_index)
+        row["matched_source_id"] = matched
+        row["match_status"] = "matched" if matched else "unresolved"
+        by_id[position.literature_position_id] = row
+        projected_positions.append(row)
+        if matched and matched in source_index["by_source_id"]:
+            wikilinks[position.literature_position_id] = str(
+                source_index["by_source_id"][matched]["stem"]
+            )
+    rows = [by_id[key] for key in sorted(by_id)]
+    write_yaml(
+        positions_path,
+        {
+            "literature_position_registry_schema_version": "1",
+            "positions": rows,
+            "revision_hash": stable_hash(rows),
+        },
+    )
+    update_note_literature(note_path, projected_positions, wikilinks)
+
+    missing_path = index_root / "missing_sources.yml"
+    missing_existing = read_yaml(missing_path, {}) or {}
+    missing_by_id = {
+        str(row.get("external_source_id") or ""): dict(row)
+        for row in (
+            missing_existing.get("sources", [])
+            if isinstance(missing_existing, Mapping)
+            else []
+        )
+        if isinstance(row, Mapping) and row.get("external_source_id")
+    }
+    for external_id, prior in list(missing_by_id.items()):
+        discussing = [
+            str(value)
+            for value in prior.get("discussed_by_source_ids", []) or []
+            if str(value) and str(value) != current_source_id
+        ]
+        if discussing:
+            prior["discussed_by_source_ids"] = sorted(set(discussing))
+        else:
+            del missing_by_id[external_id]
+    recommendations = [
+        recommendation.to_dict()
+        for recommendation in bundle.missing_source_recommendations
+    ]
+    recommendations.extend(
+        {
+            "external_source_id": "external-source-"
+            + stable_hash(
+                {
+                    "citation": row.get("raw_citation", ""),
+                    "identifiers": row.get("identifiers", {}),
+                }
+            )[:16],
+            "raw_citation": row.get("raw_citation", ""),
+            "normalized_citation": {
+                key: str(row.get(key) or "")
+                for key in ("author", "year", "title")
+            },
+            "identifiers": dict(row.get("identifiers") or {}),
+            "discussed_by_source_ids": [
+                current_source_id
+            ],
+            "importance": str(row.get("engagement") or ""),
+            "relevant_collections": [],
+            "relevant_topics": [],
+            "relevant_clusters": [],
+            "acquisition_priority": "normal",
+            "match_status": "unresolved",
+            "retrieval_status": "not_requested",
+            "ambiguity_notes": "",
+            "zotero_key": "",
+            "source_id": "",
+            "note_id": "",
+        }
+        for row in projected_positions
+        if not row.get("matched_source_id")
+    )
+    for row in recommendations:
+        external_id = str(row.get("external_source_id") or "")
+        if not external_id:
+            continue
+        prior = missing_by_id.get(external_id, {})
+        discussing = sorted(
+            {
+                str(value)
+                for value in (
+                    list(prior.get("discussed_by_source_ids", []) or [])
+                    + list(row.get("discussed_by_source_ids", []) or [])
+                )
+                if str(value)
+            }
+        )
+        missing_by_id[external_id] = {
+            **dict(row),
+            "discussed_by_source_ids": discussing,
+            **{
+                field: sorted(
+                    {
+                        str(value)
+                        for value in (
+                            list(prior.get(field, []) or [])
+                            + list(row.get(field, []) or [])
+                        )
+                        if str(value)
+                    }
+                )
+                for field in (
+                    "relevant_collections",
+                    "relevant_topics",
+                    "relevant_clusters",
+                )
+            },
+            "acquisition_priority": str(
+                prior.get("acquisition_priority")
+                or row.get("acquisition_priority")
+                or "normal"
+            ),
+            "retrieval_status": str(
+                prior.get("retrieval_status")
+                or row.get("retrieval_status")
+                or "not_requested"
+            ),
+        }
+    missing_rows = [missing_by_id[key] for key in sorted(missing_by_id)]
+    write_yaml(
+        missing_path,
+        {
+            "missing_source_registry_schema_version": "1",
+            "sources": missing_rows,
+            "revision_hash": stable_hash(missing_rows),
+        },
+    )
+
+
+def _reconcile_literature_memory(workspace: Path) -> None:
+    """Resolve old citations when new canonical source notes become available."""
+
+    index_root = workspace / "02_source_memory" / "indexes"
+    positions_path = index_root / "literature_positions.yml"
+    existing = read_yaml(positions_path, {}) or {}
+    positions = [
+        dict(row)
+        for row in existing.get("positions", []) or []
+        if isinstance(row, Mapping)
+    ]
+    if not positions:
+        return
+    source_index = _source_match_index(workspace)
+    by_source: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in positions:
+        matched = _match_literature_position(row, source_index)
+        current_source_id = str(row.get("current_source_id") or "")
+        row["matched_source_id"] = (
+            matched if matched and matched != current_source_id else ""
+        )
+        row["match_status"] = (
+            "matched" if row["matched_source_id"] else "unresolved"
+        )
+        if current_source_id:
+            by_source[current_source_id].append(row)
+    positions.sort(key=lambda row: str(row.get("literature_position_id") or ""))
+    projection_errors: list[dict[str, str]] = []
+    for source_id, rows in sorted(by_source.items()):
+        source = source_index["by_source_id"].get(source_id)
+        if not source:
+            continue
+        wikilinks = {
+            str(row.get("literature_position_id") or ""): str(
+                source_index["by_source_id"][
+                    str(row["matched_source_id"])
+                ]["stem"]
+            )
+            for row in rows
+            if row.get("matched_source_id")
+            and str(row["matched_source_id"]) in source_index["by_source_id"]
+        }
+        try:
+            update_note_literature(
+                workspace / "02_source_memory" / "notes" / f"{source['stem']}.md",
+                rows,
+                wikilinks,
+            )
+        except (OSError, ValueError) as exc:
+            projection_errors.append(
+                {"source_id": source_id, "reason": f"{type(exc).__name__}:{exc}"}
+            )
+    write_yaml(
+        positions_path,
+        {
+            "literature_position_registry_schema_version": "1",
+            "positions": positions,
+            "projection_errors": projection_errors,
+            "revision_hash": stable_hash(positions),
+        },
+    )
+
+    missing_path = index_root / "missing_sources.yml"
+    missing = read_yaml(missing_path, {}) or {}
+    missing_rows = [
+        dict(row)
+        for row in missing.get("sources", []) or []
+        if isinstance(row, Mapping)
+    ]
+    missing_by_id = {
+        str(row.get("external_source_id") or ""): row
+        for row in missing_rows
+        if row.get("external_source_id")
+    }
+    for position in positions:
+        if position.get("matched_source_id"):
+            continue
+        external_id = "external-source-" + stable_hash(
+            {
+                "citation": position.get("raw_citation", ""),
+                "identifiers": position.get("identifiers", {}),
+            }
+        )[:16]
+        prior = missing_by_id.get(external_id, {})
+        missing_by_id[external_id] = {
+            "external_source_id": external_id,
+            "raw_citation": str(position.get("raw_citation") or ""),
+            "normalized_citation": {
+                key: str(position.get(key) or "")
+                for key in ("author", "year", "title")
+            },
+            "identifiers": dict(position.get("identifiers") or {}),
+            "discussed_by_source_ids": sorted(
+                {
+                    *(
+                        str(value)
+                        for value in prior.get("discussed_by_source_ids", []) or []
+                        if str(value)
+                    ),
+                    str(position.get("current_source_id") or ""),
+                }
+                - {""}
+            ),
+            "importance": str(position.get("engagement") or ""),
+            "relevant_collections": list(
+                prior.get("relevant_collections", []) or []
+            ),
+            "relevant_topics": list(prior.get("relevant_topics", []) or []),
+            "relevant_clusters": list(prior.get("relevant_clusters", []) or []),
+            "acquisition_priority": str(
+                prior.get("acquisition_priority") or "normal"
+            ),
+            "match_status": "unresolved",
+            "retrieval_status": str(
+                prior.get("retrieval_status") or "not_requested"
+            ),
+            "ambiguity_notes": str(prior.get("ambiguity_notes") or ""),
+            "zotero_key": "",
+            "source_id": "",
+            "note_id": "",
+        }
+    missing_rows = list(missing_by_id.values())
+    for row in missing_rows:
+        normalized = (
+            dict(row.get("normalized_citation") or {})
+            if isinstance(row.get("normalized_citation"), Mapping)
+            else {}
+        )
+        matched = _match_literature_position(
+            {
+                **normalized,
+                "identifiers": dict(row.get("identifiers") or {}),
+            },
+            source_index,
+        )
+        if not matched:
+            continue
+        target = source_index["by_source_id"].get(matched, {})
+        row.update(
+            match_status="matched",
+            zotero_key=str(target.get("zotero_key") or ""),
+            source_id=matched,
+            note_id=str(target.get("note_id") or ""),
+        )
+    missing_rows.sort(key=lambda row: str(row.get("external_source_id") or ""))
+    write_yaml(
+        missing_path,
+        {
+            "missing_source_registry_schema_version": "1",
+            "sources": missing_rows,
+            "revision_hash": stable_hash(missing_rows),
+        },
+    )
+
+
+def _source_match_index(workspace: Path) -> dict[str, Any]:
+    by_source_id: dict[str, dict[str, str]] = {}
+    by_doi: dict[str, str] = {}
+    by_isbn: dict[str, str] = {}
+    by_url: dict[str, str] = {}
+    by_identity: dict[tuple[str, str, str], list[str]] = defaultdict(list)
+    for path in sorted((workspace / "02_source_memory" / "notes").glob("*.md")):
+        try:
+            front = read_note(path)["frontmatter"]
+        except (OSError, ValueError):
+            continue
+        source_id = str(front.get("source_id") or "")
+        if not source_id:
+            continue
+        creators = list(front.get("creators", []) or [])
+        first = creators[0] if creators else {}
+        author = (
+            str(first.get("lastName") or first.get("name") or "")
+            if isinstance(first, Mapping)
+            else str(first)
+        )
+        year_match = re.search(r"(?:19|20)\d{2}", str(front.get("date") or ""))
+        identity = (
+            _normalized_match_text(str(front.get("title") or "")),
+            _normalized_match_text(author),
+            year_match.group(0) if year_match else "",
+        )
+        by_source_id[source_id] = {
+            "stem": path.stem,
+            "note_id": str(front.get("note_id") or ""),
+            "zotero_key": str(front.get("zotero_item_key") or ""),
+            "title": identity[0],
+            "author": identity[1],
+            "year": identity[2],
+        }
+        if str(front.get("doi") or "").strip():
+            by_doi[str(front["doi"]).strip().casefold()] = source_id
+        isbn = _normalized_strong_identifier(
+            str(front.get("isbn") or front.get("ISBN") or "")
+        )
+        if isbn:
+            by_isbn[isbn] = source_id
+        url = _normalized_url_identifier(str(front.get("url") or ""))
+        if url:
+            by_url[url] = source_id
+        by_identity[identity].append(source_id)
+    return {
+        "by_source_id": by_source_id,
+        "by_doi": by_doi,
+        "by_isbn": by_isbn,
+        "by_url": by_url,
+        "by_identity": by_identity,
+    }
+
+
+def _match_literature_position(
+    position: Mapping[str, Any],
+    source_index: Mapping[str, Any],
+) -> str:
+    identifiers = (
+        dict(position.get("identifiers") or {})
+        if isinstance(position.get("identifiers"), Mapping)
+        else {}
+    )
+    doi = str(identifiers.get("doi") or identifiers.get("DOI") or "").casefold()
+    if doi:
+        matched = dict(source_index.get("by_doi", {})).get(doi)
+        if matched:
+            return str(matched)
+    for identifier, index_name, normalizer in (
+        ("isbn", "by_isbn", _normalized_strong_identifier),
+        ("ISBN", "by_isbn", _normalized_strong_identifier),
+        ("url", "by_url", _normalized_url_identifier),
+        ("URL", "by_url", _normalized_url_identifier),
+    ):
+        value = normalizer(str(identifiers.get(identifier) or ""))
+        if value:
+            matched = dict(source_index.get(index_name, {})).get(value)
+            if matched:
+                return str(matched)
+    identity = (
+        _normalized_match_text(str(position.get("title") or "")),
+        _normalized_match_text(str(position.get("author") or "")),
+        str(position.get("year") or ""),
+    )
+    matches = list(dict(source_index.get("by_identity", {})).get(identity, []))
+    if len(matches) == 1:
+        return str(matches[0])
+    title, author, year = identity
+    if not title:
+        return ""
+    ranked = sorted(
+        (
+            (
+                SequenceMatcher(None, title, str(row.get("title") or "")).ratio(),
+                source_id,
+            )
+            for source_id, row in dict(
+                source_index.get("by_source_id", {})
+            ).items()
+            if (not year or not row.get("year") or row.get("year") == year)
+            and (
+                not author
+                or not row.get("author")
+                or row.get("author") == author
+            )
+        ),
+        reverse=True,
+    )
+    if not ranked or ranked[0][0] < 0.92:
+        return ""
+    if len(ranked) > 1 and ranked[0][0] - ranked[1][0] < 0.03:
+        return ""
+    return str(ranked[0][1])
+
+
+def _normalized_match_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
+
+
+def _normalized_strong_identifier(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+
+def _normalized_url_identifier(value: str) -> str:
+    return value.strip().casefold().rstrip("/")
+
+
+def _commit_remediation_ledgers(
+    workspace: Path,
+    row: Mapping[str, Any],
+    bundle: SourceAnalysisBundle,
+) -> None:
+    canonical = item_data(row.get("item", {}))
+    observed = dict(bundle.observed_bibliographic_identity)
+    differences = {
+        field: {
+            "current": canonical.get(field, ""),
+            "observed": observed.get(field, ""),
+        }
+        for field in ("title", "creators", "date", "itemType")
+        if observed.get(field)
+        and _normalized_match_text(str(observed.get(field) or ""))
+        != _normalized_match_text(str(canonical.get(field) or ""))
+    }
+    if differences:
+        path = (
+            workspace
+            / "01_custody"
+            / "zotero"
+            / "zotero_metadata_issues.yml"
+        )
+        existing = read_yaml(path, {}) or {}
+        rows = {
+            str(value.get("issue_id") or ""): dict(value)
+            for value in (
+                existing.get("issues", [])
+                if isinstance(existing, Mapping)
+                else []
+            )
+            if isinstance(value, Mapping) and value.get("issue_id")
+        }
+        issue_id = "zotero-metadata-" + stable_hash(
+            [row.get("zotero_item_key", ""), differences]
+        )[:16]
+        prior = rows.get(issue_id, {})
+        rows[issue_id] = {
+            "issue_id": issue_id,
+            "zotero_item_key": str(row.get("zotero_item_key") or ""),
+            "attachment_key": str(
+                bundle.source_identity.get("attachment_key") or ""
+            ),
+            "current_metadata": {
+                key: canonical.get(key)
+                for key in ("title", "creators", "date", "itemType")
+            },
+            "recommended_correction": differences,
+            "evidence": observed,
+            "confidence": "review_required",
+            "ambiguity": "Document-body identity is diagnostic; Zotero remains canonical.",
+            "status": str(prior.get("status") or "open"),
+            "last_observed_zotero_version": (
+                row.get("item", {}).get("version", "")
+                if isinstance(row.get("item"), Mapping)
+                else ""
+            ),
+        }
+        values = [rows[key] for key in sorted(rows)]
+        write_yaml(
+            path,
+            {
+                "zotero_metadata_issue_schema_version": "1",
+                "issues": values,
+                "revision_hash": stable_hash(values),
+            },
+        )
+    diagnostics = list(bundle.component_diagnostics)
+    for field in ("source_scope", "evidence_eligibility", "content_kind"):
+        observed_value = bundle.scope_assessment.get(field)
+        pipeline_value = row.get(field)
+        if (
+            observed_value
+            and pipeline_value
+            and _normalized_match_text(str(observed_value))
+            != _normalized_match_text(str(pipeline_value))
+        ):
+            diagnostics.append(
+                {
+                    "component": "scope_assessment",
+                    "field": field,
+                    "pipeline_value": pipeline_value,
+                    "model_observation": observed_value,
+                    "severity": "advisory",
+                }
+            )
+    if diagnostics:
+        path = workspace / "11_state" / "pipeline_classification_issues.yml"
+        existing = read_yaml(path, {}) or {}
+        rows = {
+            str(value.get("issue_id") or ""): dict(value)
+            for value in (
+                existing.get("issues", [])
+                if isinstance(existing, Mapping)
+                else []
+            )
+            if isinstance(value, Mapping) and value.get("issue_id")
+        }
+        issue_id = "pipeline-classification-" + stable_hash(
+            [row.get("source_id", ""), diagnostics]
+        )[:16]
+        prior = rows.get(issue_id, {})
+        rows[issue_id] = {
+            "issue_id": issue_id,
+            "source_id": str(row.get("source_id") or ""),
+            "zotero_item_key": str(row.get("zotero_item_key") or ""),
+            "diagnostics": diagnostics,
+            "status": str(prior.get("status") or "open"),
+        }
+        values = [rows[key] for key in sorted(rows)]
+        write_yaml(
+            path,
+            {
+                "pipeline_classification_issue_schema_version": "1",
+                "issues": values,
+                "revision_hash": stable_hash(values),
+            },
+        )
 
 
 def _park_note_decisions(
@@ -1385,6 +2227,40 @@ def _workspace_graph_inputs(
     return note_rows, profiles
 
 
+def _source_set_graph_inputs(
+    source_set: Mapping[str, Any],
+    note_rows: Sequence[Mapping[str, Any]],
+    profiles: Sequence[Any],
+) -> tuple[list[dict[str, Any]], list[Any]]:
+    source_ids = {
+        str(value)
+        for value in source_set.get("source_ids", []) or []
+        if str(value)
+    }
+    if not source_ids:
+        return [dict(row) for row in note_rows], list(profiles)
+    return (
+        [
+            dict(row)
+            for row in note_rows
+            if str(row.get("source_id") or "") in source_ids
+        ],
+        [
+            profile
+            for profile in profiles
+            if str(
+                (
+                    profile
+                    if isinstance(profile, Mapping)
+                    else profile_to_dict(profile)
+                ).get("source_id")
+                or ""
+            )
+            in source_ids
+        ],
+    )
+
+
 def _cluster_catalogue_rows(workspace: Path) -> list[dict[str, Any]]:
     payload = read_yaml(
         workspace / "03_literature_synthesis" / "cluster_registry.yml", {}
@@ -1485,10 +2361,10 @@ def _run_relationship_reasoning(
     reasoner_calls: _CheckpointedReasonerCalls | None,
     request: LiteratureMapRequest,
 ) -> dict[str, Any]:
+    """Run v0.13 discovery and one complete decision per immutable pair job."""
+
     selector = getattr(reasoner, "select_relationship_candidates", None)
     adjudicator = getattr(reasoner, "adjudicate_relationships", None)
-    verifier = getattr(reasoner, "verify_relationships", None)
-    bridge_selector = getattr(reasoner, "select_relationship_bridge_shards", None)
     if (
         reasoner_calls is None
         or not callable(selector)
@@ -1503,10 +2379,12 @@ def _run_relationship_reasoning(
             "reconciled_catalogue_revision": "",
         }
     profile_by_source = {
-        str(profile_to_dict(profile).get("source_id") or ""): profile
+        str(row.get("source_id") or ""): profile
         for profile in profiles
-        if profile_to_dict(profile).get("source_id")
-        and not profile_to_dict(profile).get("excluded_from_synthesis")
+        for row in [profile_to_dict(profile)]
+        if row.get("source_id")
+        and str(row.get("evidence_eligibility") or "substantive_bounded")
+        == "substantive_bounded"
     }
     if len(profile_by_source) < 2:
         return {
@@ -1518,78 +2396,46 @@ def _run_relationship_reasoning(
             "reconciled_catalogue_revision": "",
         }
     catalogue_payload = read_yaml(Path(str(catalogue["catalogue_path"])), {}) or {}
+    available_catalogue_ids = {
+        str(row.get("source_id") or "")
+        for row in catalogue_payload.get("sources", []) or []
+        if isinstance(row, Mapping)
+        and str(row.get("zotero_availability") or "available") != "unavailable"
+    }
+    profile_by_source = {
+        source_id: profile
+        for source_id, profile in profile_by_source.items()
+        if source_id in available_catalogue_ids
+    }
+    if len(profile_by_source) < 2:
+        return {
+            "accepted": [],
+            "no_relationship": [],
+            "parked": [],
+            "cluster_candidates": [],
+            "selected_profile_hashes": {},
+            "reconciled_catalogue_revision": "",
+        }
     entries = [
         _compact_relationship_catalogue_entry(row)
         for row in catalogue_payload.get("sources", []) or []
-        if isinstance(row, Mapping) and row.get("source_id")
+        if isinstance(row, Mapping)
+        and str(row.get("source_id") or "") in profile_by_source
     ]
     entry_by_source = {
         str(row["source_id"]): row for row in entries if row.get("source_id")
     }
-    eligible_entries = [
-        row
-        for row in entries
-        if str(row.get("source_id") or "") in profile_by_source
-    ]
-    relationship_profile_by_source = {
-        source_id: _relationship_evidence_projection(
-            profile,
-            entry_by_source.get(source_id, {}),
-            include_anchors=True,
-        )
-        for source_id, profile in profile_by_source.items()
+    catalogue_revision = stable_hash(entries)
+    current_hashes = {
+        source_id: stable_hash(profile_to_dict(profile))
+        for source_id, profile in sorted(profile_by_source.items())
     }
-    relationship_index_profile_by_source = {
-        source_id: _relationship_evidence_projection(
-            profile,
-            entry_by_source.get(source_id, {}),
-            include_anchors=False,
-        )
-        for source_id, profile in profile_by_source.items()
-    }
-    shards = [
-        dict(row)
-        for row in catalogue_payload.get("shards", []) or []
-        if isinstance(row, Mapping) and row.get("literature_id")
-    ]
-    cluster_catalogue = _cluster_catalogue_rows(workspace)
-    registry = read_yaml(
-        workspace / "02_source_memory" / "indexes" / "typed_links.yml", {}
-    ) or {}
-    existing_links = [
-        dict(row)
-        for row in (
-            registry.get("links", []) if isinstance(registry, Mapping) else []
-        )
-        if isinstance(row, Mapping)
-    ]
-    existing_relations = [
-        dict(row)
-        for row in (
-            registry.get("relations", []) if isinstance(registry, Mapping) else []
-        )
-        if isinstance(row, Mapping)
-    ]
-    decided_pair_keys = {
-        str(row.get("decision_key") or "")
-        for row in (
-            registry.get("pair_decisions", [])
-            if isinstance(registry, Mapping)
-            else []
-        )
-        if isinstance(row, Mapping) and row.get("decision_key")
-    }
-    relationship_provider = str(getattr(reasoner, "name", "") or request.provider)
-    relationship_model = str(getattr(reasoner, "model", "") or request.model)
     selection_identity = stable_hash(
         {
-            "provider": relationship_provider,
-            "model": relationship_model,
+            "provider": str(getattr(reasoner, "name", "")),
+            "model": str(getattr(reasoner, "model", "")),
             "prompt_version": RELATIONSHIP_PROMPT_VERSION,
-            "candidate_capability": callable(selector),
-            "adjudication_capability": callable(adjudicator),
-            "verification_capability": callable(verifier),
-            "bridge_capability": callable(bridge_selector),
+            "output_contract": "relationship-decision-v4",
         }
     )
     state_path = (
@@ -1598,48 +2444,25 @@ def _run_relationship_reasoning(
         / "indexes"
         / "relationship_selection_state.yml"
     )
-    state = read_yaml(state_path, {}) or {}
-    prior_hashes = (
-        dict(state.get("profile_hashes", {}) or {})
-        if isinstance(state, Mapping)
-        else {}
+    prior_state = read_yaml(state_path, {}) or {}
+    prior_hashes = dict(prior_state.get("profile_hashes", {}) or {})
+    identity_changed = (
+        str(prior_state.get("selection_identity") or "") != selection_identity
     )
-    current_hashes = {
-        source_id: stable_hash(profile_to_dict(profile))
-        for source_id, profile in profile_by_source.items()
-    }
-    catalogue_revision = str(
-        catalogue.get("routing_revision_hash")
-        or catalogue.get("revision_hash")
-        or ""
-    )
-    prior_catalogue_revision = str(
-        state.get("reconciled_catalogue_revision")
-        or state.get("catalogue_revision")
-        or ""
-    )
-    prior_selection_identity = str(state.get("selection_identity") or "")
-    catalogue_changed = bool(
-        prior_catalogue_revision
-        and prior_catalogue_revision != catalogue_revision
-    )
-    identity_changed = bool(
-        prior_selection_identity
-        and prior_selection_identity != selection_identity
-    )
-    home_shard_by_source = {
-        str(source_id): str(row.get("shard_id") or "")
-        for row in shards
-        for source_id in row.get("source_ids", []) or []
-        if str(source_id)
-    }
-    focus_ids = sorted(
+    focus_source_ids = sorted(
         source_id
         for source_id, profile_hash in current_hashes.items()
-        if identity_changed
-        or str(prior_hashes.get(source_id) or "") != profile_hash
+        if identity_changed or str(prior_hashes.get(source_id) or "") != profile_hash
     )
-    if not focus_ids and not catalogue_changed:
+    catalogue_changed = (
+        str(
+            prior_state.get("reconciled_catalogue_revision")
+            or prior_state.get("catalogue_revision")
+            or ""
+        )
+        != catalogue_revision
+    )
+    if not focus_source_ids and not catalogue_changed:
         return {
             "accepted": [],
             "no_relationship": [],
@@ -1649,675 +2472,886 @@ def _run_relationship_reasoning(
             "reconciled_catalogue_revision": "",
             "selection_identity": selection_identity,
             "state_path": str(state_path),
+            "pair_job_count": 0,
+            "provider_batch_count": 0,
         }
-    candidates: list[dict[str, Any]] = []
-    parked: list[dict[str, Any]] = []
-    incomplete_source_ids: set[str] = set()
-    catalogue_char_budget = _reasoner_context_char_budget(reasoner, request)
-    catalogue_requires_routing = len(eligible_entries) > 64 or len(
-        json.dumps(
-            eligible_entries,
-            sort_keys=True,
-            ensure_ascii=False,
-            default=str,
-        )
-    ) > catalogue_char_budget
-    routing_cards = [
-        {
-            **dict(row.get("routing_card") or {}),
-            "shard_id": str(row.get("shard_id") or ""),
-            "literature_id": str(row.get("literature_id") or ""),
-        }
-        for row in shards
-    ]
-    batch_size = 25 if catalogue_requires_routing else 12
-    focus_ids.sort(key=lambda value: (home_shard_by_source.get(value, ""), value))
-    focus_groups: dict[str, list[str]] = defaultdict(list)
-    for source_id in focus_ids:
-        focus_groups[home_shard_by_source.get(source_id, "unrouted")].append(
-            source_id
-        )
-    focus_batches = [
-        source_ids[start : start + batch_size]
-        for _shard_id, source_ids in sorted(focus_groups.items())
-        for start in range(0, len(source_ids), batch_size)
-    ]
-    for batch_ids in focus_batches:
-        batch_profiles = [
-            relationship_index_profile_by_source[source_id]
-            for source_id in batch_ids
-        ]
-        selected_shard_ids: set[str] = set()
-        if catalogue_requires_routing:
-            home_shard_ids = {
-                str(row.get("shard_id") or "")
-                for row in shards
-                if set(str(value) for value in row.get("source_ids", []) or [])
-                & set(batch_ids)
-            }
-            try:
-                routing_response = reasoner_calls(
-                    "relationship_shard_selection",
-                    f"batch-{stable_hash(batch_ids)[:16]}",
-                    "select_relationship_shards",
-                    batch_profiles,
-                    {
-                        "catalogue_revision": catalogue_revision,
-                        "routing_cards": routing_cards,
-                        "shards": routing_cards,
-                        "home_shard_ids": sorted(home_shard_ids),
-                        "cluster_catalogue": cluster_catalogue,
-                        "existing_neighbors": _relationship_neighbors(
-                            batch_ids, existing_links
-                        ),
-                    },
-                )
-                available_shard_ids = {
-                    str(row.get("shard_id") or "")
-                    for row in shards
-                    if str(row.get("shard_id") or "")
-                }
-                selected_shard_ids = {
-                    str(value)
-                    for value in routing_response.get("shard_ids", []) or []
-                    if str(value) in available_shard_ids
-                }
-                selected_shard_ids.update(home_shard_ids)
-            except Exception as exc:
-                incomplete_source_ids.update(batch_ids)
-                parked.append(
-                    {
-                        "source_ids": batch_ids,
-                        "reason": "relationship_shard_selection_failure",
-                        "error_type": type(exc).__name__,
-                        "error": str(exc),
-                    }
-                )
-                continue
-        selected_source_ids = {
-            str(value)
-            for row in shards
-            if str(row.get("shard_id") or "") in selected_shard_ids
-            for value in row.get("source_ids", []) or []
-            if str(value)
-        }
-        selected_entries = (
-            [
-                row
-                for row in eligible_entries
-                if str(row.get("source_id") or "") in selected_source_ids
-                and str(row.get("source_id") or "") not in set(batch_ids)
-            ]
-            if catalogue_requires_routing and selected_source_ids
-            else eligible_entries
-        )
-        candidate_context = {
-            "catalogue_revision": catalogue_revision,
-            "catalogue_entries": selected_entries,
-            "cluster_catalogue": cluster_catalogue,
-            "existing_neighbors": _relationship_neighbors(
-                batch_ids, existing_links
-            ),
-        }
-        if (
-            _reasoner_packet_chars(
-                [profile_to_dict(profile) for profile in batch_profiles],
-                candidate_context,
-            )
-            > catalogue_char_budget
-        ):
-            incomplete_source_ids.update(batch_ids)
-            parked.append(
-                {
-                    "source_ids": batch_ids,
-                    "reason": "relationship_catalogue_partition_exceeds_context_budget",
-                }
-            )
+    registry = read_yaml(
+        workspace / "02_source_memory" / "indexes" / "typed_links.yml", {}
+    ) or {}
+    mandatory_basis: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in registry.get("relations", []) or registry.get("links", []) or []:
+        if not isinstance(row, Mapping) or str(row.get("relation_type") or "") not in {
+            "cites",
+            "cited_by",
+            "zotero_related",
+        }:
             continue
-        try:
-            response = reasoner_calls(
-                "relationship_candidate_selection",
-                f"batch-{stable_hash(batch_ids)[:16]}",
-                "select_relationship_candidates",
-                batch_profiles,
-                candidate_context,
-            )
-        except Exception as exc:
-            incomplete_source_ids.update(batch_ids)
-            parked.append(
-                {
-                    "source_ids": batch_ids,
-                    "reason": "relationship_candidate_selection_failure",
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                }
-            )
-            continue
-        valid, invalid = candidate_rows(
-            response,
-            focus_source_ids=batch_ids,
-            available_source_ids=list(profile_by_source),
-            available_cluster_ids=[
-                str(row["cluster_id"]) for row in cluster_catalogue
-            ],
-            max_per_source=3,
-        )
-        candidates.extend(valid)
-        parked.extend(invalid)
-        for source_id in batch_ids:
-            for link in existing_links:
-                left = str(link.get("source_id") or "")
-                right = str(link.get("target_source_id") or "")
-                if str(link.get("relation_type") or "") not in {
-                    "supports",
-                    "undermines",
-                    "qualifies",
-                    "extends",
-                    "complements",
-                    "rival_explanation",
-                    "boundary_contrast",
-                    "methodological_fault_line",
-                    "sequential_relationship",
-                    "interpretive_or_normative_disagreement",
-                }:
-                    continue
-                target_id = right if left == source_id else left if right == source_id else ""
-                if target_id in profile_by_source:
-                    candidates.append(
-                        {
-                            "source_id": source_id,
-                            "target_kind": "source",
-                            "target_id": target_id,
-                            "why_relevant": "Existing accepted relationship requires review after profile change.",
-                            "comparison_unit": str(
-                                link.get("comparison_unit") or ""
-                            ),
-                            "likely_relation_type": str(
-                                link.get("relation_type") or ""
-                            ),
-                            "requested_evidence_depth": "profile",
-                            "confidence": 1.0,
-                        }
-                    )
-    for link in existing_relations:
-        if str(link.get("decision_status") or "") != "legacy_unverified":
-            continue
-        left = str(link.get("source_id") or "")
-        right = str(link.get("target_source_id") or "")
-        if left in profile_by_source and right in profile_by_source:
-            candidates.append(
-                {
-                    "source_id": left,
-                    "target_kind": "source",
-                    "target_id": right,
-                    "why_relevant": "Legacy machine relationship requires prompt-v2 verification.",
-                    "comparison_unit": str(link.get("comparison_unit") or ""),
-                    "likely_relation_type": str(link.get("relation_type") or ""),
-                    "requested_evidence_depth": "profile",
-                    "confidence": 1.0,
-                }
-            )
-
-    literature_ids = {
-        str(row.get("literature_id") or "") for row in routing_cards
-    }
-    if len(literature_ids) >= 2:
-        if not callable(bridge_selector):
-            parked.append(
-                {
-                    "reason": "relationship_bridge_discovery_unavailable",
-                    "verification_status": "not_attempted",
-                }
-            )
-        else:
-            try:
-                bridge_response = reasoner_calls(
-                    "relationship_bridge_shard_selection",
-                    f"catalogue-{catalogue_revision[:16]}",
-                    "select_relationship_bridge_shards",
-                    [],
-                    {
-                        "catalogue_revision": catalogue_revision,
-                        "routing_cards": routing_cards,
-                        "discovery_mode": "cross_literature_bridge",
-                    },
-                )
-                bridge_pairs, bridge_pair_errors = validate_bridge_shard_pairs(
-                    bridge_response,
-                    available_shards=shards,
-                )
-                parked.extend(bridge_pair_errors)
-            except Exception as exc:
-                bridge_pairs = []
-                parked.append(
-                    {
-                        "reason": "relationship_bridge_shard_selection_failure",
-                        "error_type": type(exc).__name__,
-                        "error": str(exc),
-                    }
-                )
-            shard_by_id = {
-                str(row.get("shard_id") or ""): row for row in shards
-            }
-            # The bridge stage reserves six calls total: one routing call and
-            # at most five selected-pair candidate calls.
-            for pair in bridge_pairs[:5]:
-                pair_packet = [pair]
-                selected_shard_ids = {
-                    str(pair[field])
-                    for pair in pair_packet
-                    for field in ("left_shard_id", "right_shard_id")
-                }
-                selected_source_ids = {
-                    str(source_id)
-                    for shard_id in selected_shard_ids
-                    for source_id in shard_by_id.get(shard_id, {}).get(
-                        "source_ids", []
-                    )
-                    if str(source_id) in profile_by_source
-                }
-                selected_entries = [
-                    row
-                    for row in eligible_entries
-                    if str(row.get("source_id") or "") in selected_source_ids
-                ]
-                if len(selected_entries) < 2:
-                    continue
-                try:
-                    response = reasoner_calls(
-                        "relationship_bridge_candidate_selection",
-                        f"pairs-{stable_hash(pair_packet)[:16]}",
-                        "select_relationship_candidates",
-                        [],
-                        {
-                            "catalogue_revision": catalogue_revision,
-                            "catalogue_entries": selected_entries,
-                            "shard_pairs": pair_packet,
-                            "discovery_mode": "cross_literature_bridge",
-                            "max_candidates_per_shard_pair": 8,
-                        },
-                    )
-                except Exception as exc:
-                    incomplete_source_ids.update(selected_source_ids)
-                    parked.append(
-                        {
-                            "source_ids": sorted(selected_source_ids),
-                            "reason": "relationship_bridge_candidate_selection_failure",
-                            "error_type": type(exc).__name__,
-                            "error": str(exc),
-                        }
-                    )
-                    continue
-                valid, invalid = candidate_rows(
-                    response,
-                    focus_source_ids=sorted(selected_source_ids),
-                    available_source_ids=list(profile_by_source),
-                    max_per_source=3,
-                )
-                parked.extend(invalid)
-                bridge_counts: dict[tuple[str, str], int] = {}
-                for row in valid:
-                    pair_identity = _bridge_candidate_shard_pair(
-                        row,
-                        pair_packet,
-                        shard_by_id,
-                    )
-                    if pair_identity is None:
-                        parked.append(
-                            {
-                                **row,
-                                "reason": "candidate_not_crossing_selected_shard_pair",
-                            }
-                        )
-                        continue
-                    if bridge_counts.get(pair_identity, 0) >= 8:
-                        parked.append(
-                            {**row, "reason": "bridge_candidate_limit_reached"}
-                        )
-                        continue
-                    bridge_counts[pair_identity] = (
-                        bridge_counts.get(pair_identity, 0) + 1
-                    )
-                    candidates.append(row)
-    source_candidates = {
-        canonical_pair(
+        pair = canonical_pair(
             str(row.get("source_id") or ""),
-            str(row.get("target_id") or ""),
-        ): row
-        for row in candidates
-        if row.get("target_kind") == "source"
-        and row.get("source_id") in profile_by_source
-        and row.get("target_id") in profile_by_source
-    }
-    cluster_candidates = [
+            str(row.get("target_source_id") or ""),
+        )
+        if pair[0] in profile_by_source and pair[1] in profile_by_source:
+            mandatory_basis[pair].append(
+                {
+                    "discovery_route": str(row.get("relation_type") or ""),
+                    "reason": str(row.get("reason") or "Explicit source relation."),
+                    "mandatory": True,
+                }
+            )
+    positions = read_yaml(
+        workspace / "02_source_memory" / "indexes" / "literature_positions.yml",
+        {},
+    ) or {}
+    for row in positions.get("positions", []) or []:
+        if not isinstance(row, Mapping) or not row.get("matched_source_id"):
+            continue
+        pair = canonical_pair(
+            str(row.get("current_source_id") or ""),
+            str(row.get("matched_source_id") or ""),
+        )
+        if pair[0] in profile_by_source and pair[1] in profile_by_source:
+            mandatory_basis[pair].append(
+                {
+                    "discovery_route": "matched_literature_position",
+                    "reason": str(row.get("engagement") or "Matched citation."),
+                    "mandatory": True,
+                    "literature_position_id": str(
+                        row.get("literature_position_id") or ""
+                    ),
+                }
+            )
+    prior_decisions = [
         dict(row)
-        for row in candidates
-        if row.get("target_kind") == "cluster"
+        for row in registry.get("pair_decisions", []) or []
+        if isinstance(row, Mapping)
     ]
-    tentative_accepted: list[dict[str, Any]] = []
-    tentative_no_relationship: list[dict[str, Any]] = []
-    needs_context: list[dict[str, Any]] = []
-    pair_rows = [
-        (pair, row)
-        for pair, row in sorted(source_candidates.items())
-        if relationship_decision_key(
+    relationship_provider = str(getattr(reasoner, "name", ""))
+    relationship_model = str(getattr(reasoner, "model", ""))
+    negative_pairs: set[tuple[str, str]] = set()
+    for row in prior_decisions:
+        if (
+            str(
+                row.get("status")
+                or row.get("decision_status")
+                or row.get("decision")
+                or ""
+            )
+            != "no_relationship"
+        ):
+            continue
+        pair = canonical_pair(
+            str(row.get("source_id") or row.get("left_source_id") or ""),
+            str(
+                row.get("target_source_id")
+                or row.get("right_source_id")
+                or ""
+            ),
+        )
+        if pair[0] not in current_hashes or pair[1] not in current_hashes:
+            continue
+        expected_key = relationship_decision_key(
             pair[0],
             pair[1],
             current_hashes[pair[0]],
             current_hashes[pair[1]],
             provider=relationship_provider,
             model=relationship_model,
+            prompt_version=RELATIONSHIP_PROMPT_VERSION,
         )
-        not in decided_pair_keys
-    ]
-    def adjudication_context(
-        packet: Sequence[tuple[tuple[str, str], Mapping[str, Any]]],
-    ) -> dict[str, Any]:
+        if str(row.get("decision_key") or "") == expected_key:
+            negative_pairs.add(pair)
+    for pair in negative_pairs:
+        mandatory_basis.pop(pair, None)
+
+    configured_max_calls = getattr(reasoner_calls, "max_calls", None)
+    remaining_calls = (
+        22
+        if configured_max_calls is None
+        else max(
+            0,
+            int(configured_max_calls or 0)
+            - int(
+                getattr(reasoner_calls, "cumulative_provider_calls", 0) or 0
+            ),
+        )
+    )
+    mandatory_call_count = (len(mandatory_basis) + 5) // 6
+    if mandatory_call_count > min(20, remaining_calls):
         return {
-            "pairs": [
+            "accepted": [],
+            "no_relationship": [],
+            "parked": [
                 {
                     "source_id": pair[0],
                     "target_source_id": pair[1],
-                    "candidate_reason": row.get("why_relevant", ""),
-                    "comparison_unit": row.get("comparison_unit", ""),
+                    "reason": "mandatory_relationship_budget_conflict",
                 }
-                for pair, row in packet
-            ]
+                for pair in sorted(mandatory_basis)
+            ],
+            "cluster_candidates": [],
+            "selected_profile_hashes": {},
+            "reconciled_catalogue_revision": "",
+            "selection_identity": selection_identity,
+            "state_path": str(state_path),
+            "pair_job_count": len(mandatory_basis),
+            "provider_batch_count": 0,
+        }
+    catalogue_char_budget = _relationship_context_char_budget(reasoner, request)
+    discovery_profiles = [
+        _relationship_evidence_projection(
+            profile_by_source[source_id],
+            entry_by_source.get(source_id, {}),
+            include_anchors=True,
+        )
+        for source_id in sorted(profile_by_source)
+    ]
+    discovery_entries = entries
+    discovery_parked: list[dict[str, Any]] = []
+    routing_cards = [
+        {
+            **dict(row.get("routing_card") or {}),
+            "shard_id": str(row.get("shard_id") or ""),
+            "literature_id": str(row.get("literature_id") or ""),
+        }
+        for row in catalogue_payload.get("shards", []) or []
+        if isinstance(row, Mapping) and row.get("shard_id")
+    ]
+    graph_context = [
+        {
+            "relation_id": str(row.get("relation_id") or ""),
+            "source_id": str(row.get("source_id") or ""),
+            "target_source_id": str(row.get("target_source_id") or ""),
+            "relation_type": str(row.get("relation_type") or ""),
+            "reason": " ".join(str(row.get("reason") or "").split())[:400],
+            "comparison_proposition": " ".join(
+                str(row.get("comparison_proposition") or "").split()
+            )[:400],
+        }
+        for row in registry.get("relations", []) or registry.get("links", []) or []
+        if isinstance(row, Mapping)
+        and row.get("active", True)
+        and str(row.get("source_id") or "") in profile_by_source
+        and str(row.get("target_source_id") or "") in profile_by_source
+    ]
+    position_context = [
+        {
+            "literature_position_id": str(
+                row.get("literature_position_id") or ""
+            ),
+            "current_source_id": str(row.get("current_source_id") or ""),
+            "matched_source_id": str(row.get("matched_source_id") or ""),
+            "engagement": " ".join(
+                str(row.get("engagement") or "").split()
+            )[:400],
+        }
+        for row in positions.get("positions", []) or []
+        if isinstance(row, Mapping)
+        and (
+            str(row.get("current_source_id") or "") in profile_by_source
+            or str(row.get("matched_source_id") or "") in profile_by_source
+        )
+    ]
+    cluster_context = [
+        row
+        for row in _cluster_catalogue_rows(workspace)
+        if set(row.get("core_source_ids", []) or []) & set(profile_by_source)
+    ]
+
+    def discovery_memory(source_ids: set[str]) -> dict[str, Any]:
+        return {
+            "existing_graph_neighbors": [
+                row
+                for row in graph_context
+                if row["source_id"] in source_ids
+                or row["target_source_id"] in source_ids
+            ],
+            "literature_positions": [
+                row
+                for row in position_context
+                if row["current_source_id"] in source_ids
+                or row["matched_source_id"] in source_ids
+            ],
+            "cluster_summaries": [
+                row
+                for row in cluster_context
+                if set(row.get("core_source_ids", []) or []) & source_ids
+            ],
         }
 
-    for packet in _pack_relationship_rows(
-        pair_rows,
-        pair_for=lambda row: row[0],
-        profile_by_source=relationship_profile_by_source,
-        context_for=adjudication_context,
-        max_chars=catalogue_char_budget,
-    ):
-        pairs = [pair for pair, _ in packet]
-        packet_source_ids = sorted({value for pair in pairs for value in pair})
-        provider_profiles = [
-            relationship_profile_by_source[source_id]
-            for source_id in packet_source_ids
+    base_discovery_context = {
+        "discovery_mode": "global",
+        "catalogue_revision": catalogue_revision,
+        "focus_source_ids": focus_source_ids,
+        "mandatory_pairs": [list(pair) for pair in sorted(mandatory_basis)],
+        "prior_negative_pairs": [list(pair) for pair in sorted(negative_pairs)],
+        "reserved_bridge_fraction": 0.4,
+    }
+    full_discovery_context = {
+        **base_discovery_context,
+        "catalogue": discovery_entries,
+        **discovery_memory(set(profile_by_source)),
+    }
+    requires_routing = (
+        _reasoner_packet_chars(
+            [profile_to_dict(profile) for profile in discovery_profiles],
+            full_discovery_context,
+        )
+        > catalogue_char_budget
+    )
+    routing_call_count = 1 if requires_routing else 0
+    discovery_call_count = 1 + routing_call_count
+    can_discover = (
+        remaining_calls >= mandatory_call_count + discovery_call_count + 1
+    )
+    adjudication_call_capacity = min(
+        20,
+        max(
+            mandatory_call_count,
+            remaining_calls - (discovery_call_count if can_discover else 0),
+        ),
+    )
+    pair_capacity = adjudication_call_capacity * 6
+    inferred_capacity = (
+        min(120, max(0, pair_capacity - len(mandatory_basis)))
+        if can_discover
+        else 0
+    )
+    discovery: Mapping[str, Any] = {}
+    discovery_completed = False
+    if can_discover and requires_routing:
+        routing_context = {
+            "catalogue_revision": catalogue_revision,
+            "routing_cards": routing_cards,
+            "focus_source_ids": focus_source_ids,
+            "discovery_mode": "relationship_shard_routing",
+            **discovery_memory(set(focus_source_ids)),
+        }
+        routing_profiles = [
+            _relationship_evidence_projection(
+                profile_by_source[source_id],
+                entry_by_source.get(source_id, {}),
+                include_anchors=False,
+            )
+            for source_id in focus_source_ids
         ]
-        validation_profiles = [
+        shard_selector = getattr(reasoner, "select_relationship_shards", None)
+        if (
+            not callable(shard_selector)
+            or not routing_cards
+            or _reasoner_packet_chars(
+                [profile_to_dict(profile) for profile in routing_profiles],
+                routing_context,
+            )
+            > catalogue_char_budget
+        ):
+            can_discover = False
+            inferred_capacity = 0
+            discovery_parked.append(
+                {
+                    "reason": "relationship_catalogue_routing_unavailable",
+                    "retry_on_resume": False,
+                }
+            )
+        else:
+            try:
+                routing = reasoner_calls(
+                    "relationship_shard_selection",
+                    f"global-{catalogue_revision[:16]}",
+                    "select_relationship_shards",
+                    routing_profiles,
+                    routing_context,
+                )
+            except Exception as exc:
+                routing = {}
+                can_discover = False
+                inferred_capacity = 0
+                discovery_parked.append(
+                    {
+                        "reason": "relationship_catalogue_routing_failed",
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    }
+                )
+            selected_shards = {
+                str(value)
+                for value in routing.get("shard_ids", []) or []
+                if str(value)
+            }
+            selected_source_ids = {
+                str(source_id)
+                for shard in catalogue_payload.get("shards", []) or []
+                if isinstance(shard, Mapping)
+                and str(shard.get("shard_id") or "") in selected_shards
+                for source_id in shard.get("source_ids", []) or []
+                if str(source_id) in profile_by_source
+            }
+            discovery_entries = [
+                row
+                for row in entries
+                if str(row.get("source_id") or "") in selected_source_ids
+            ]
+            discovery_profiles = [
+                _relationship_evidence_projection(
+                    profile_by_source[source_id],
+                    entry_by_source.get(source_id, {}),
+                    include_anchors=True,
+                )
+                for source_id in sorted(selected_source_ids)
+            ]
+            if not discovery_profiles:
+                can_discover = False
+                inferred_capacity = 0
+                discovery_parked.append(
+                    {"reason": "relationship_catalogue_routing_selected_no_sources"}
+                )
+    if can_discover:
+        discovery_source_ids = {
+            str(row.get("source_id") or "")
+            for row in discovery_entries
+            if str(row.get("source_id") or "")
+        }
+        discovery_context = {
+            **base_discovery_context,
+            "discovery_mode": (
+                "routed_shards" if requires_routing else "global"
+            ),
+            "catalogue": discovery_entries,
+            "max_inferred_pairs": inferred_capacity,
+            **discovery_memory(discovery_source_ids),
+        }
+        if (
+            _reasoner_packet_chars(
+                [profile_to_dict(profile) for profile in discovery_profiles],
+                discovery_context,
+            )
+            > catalogue_char_budget
+        ):
+            discovery_parked.append(
+                {
+                    "reason": "relationship_catalogue_partition_exceeds_context_budget",
+                    "retry_on_resume": False,
+                }
+            )
+        else:
+            try:
+                discovery = reasoner_calls(
+                    "relationship_candidate_selection",
+                    f"global-{catalogue_revision[:16]}",
+                    "select_relationship_candidates",
+                    discovery_profiles,
+                    discovery_context,
+                )
+                discovery_completed = True
+            except Exception as exc:
+                discovery_parked.append(
+                    {
+                        "reason": "relationship_candidate_discovery_failed",
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    }
+                )
+    inferred_rows = _ranked_relationship_candidates(
+        discovery,
+        available_source_ids=set(profile_by_source),
+        entry_by_source=entry_by_source,
+        excluded_pairs=set(mandatory_basis) | negative_pairs,
+        maximum=inferred_capacity,
+        bridge_fraction=0.4,
+    )
+    if focus_source_ids and not catalogue_changed:
+        focus = set(focus_source_ids)
+        inferred_rows = [
+            row
+            for row in inferred_rows
+            if str(row.get("source_id") or "") in focus
+            or str(row.get("target_id") or "") in focus
+        ]
+    candidate_by_pair = {
+        canonical_pair(
+            str(row.get("source_id") or ""),
+            str(row.get("target_id") or row.get("target_source_id") or ""),
+        ): [dict(row)]
+        for row in inferred_rows
+    }
+    for pair, basis in mandatory_basis.items():
+        candidate_by_pair[pair] = list(basis)
+
+    run_id = str(getattr(reasoner_calls, "run_id", "") or "")
+    job_root = (
+        workspace / "11_state" / "runs" / run_id / "relationship_jobs"
+    )
+    capabilities = dict(getattr(reasoner, "capabilities", {}) or {})
+    provider_name = str(getattr(reasoner, "name", ""))
+    model_name = str(getattr(reasoner, "model", ""))
+    reasoner_backend = str(
+        getattr(reasoner, "reasoner_backend", "") or provider_name
+    )
+    decision_identity = stable_hash(
+        {
+            "provider": provider_name,
+            "model": model_name,
+            "reasoner_backend": reasoner_backend,
+            "prompt_version": RELATIONSHIP_PROMPT_VERSION,
+            "capability_identity": str(
+                capabilities.get("capability_identity") or ""
+            ),
+            "output_contract": "relationship-decision-v4",
+        }
+    )
+    jobs: list[RelationshipPairJob] = []
+    for pair in sorted(candidate_by_pair):
+        selected = {
+            side: _selected_relationship_evidence(
+                profile_by_source[source_id],
+                requested_ids={
+                    str(value)
+                    for row in candidate_by_pair[pair]
+                    for value in row.get(f"{side}_evidence_anchor_ids", []) or []
+                    if str(value)
+                },
+            )
+            for side, source_id in zip(("left", "right"), pair, strict=True)
+        }
+        literature_rows = [
+            dict(row)
+            for row in positions.get("positions", []) or []
+            if isinstance(row, Mapping)
+            and {
+                str(row.get("current_source_id") or ""),
+                str(row.get("matched_source_id") or ""),
+            }
+            == set(pair)
+        ]
+        job = RelationshipPairJob(
+            catalogue_revision=catalogue_revision,
+            left_source_id=pair[0],
+            right_source_id=pair[1],
+            profiles={
+                "left": profile_to_dict(
+                    _relationship_evidence_projection(
+                        profile_by_source[pair[0]],
+                        entry_by_source.get(pair[0], {}),
+                        include_anchors=False,
+                    )
+                ),
+                "right": profile_to_dict(
+                    _relationship_evidence_projection(
+                        profile_by_source[pair[1]],
+                        entry_by_source.get(pair[1], {}),
+                        include_anchors=False,
+                    )
+                ),
+            },
+            literature_positions=literature_rows,
+            selected_evidence=selected,
+            graph_context={
+                "existing_neighbors": _relationship_neighbors(
+                    pair, registry.get("links", []) or []
+                )
+            },
+            candidate_basis=candidate_by_pair[pair],
+            prior_pair_memory={
+                "decisions": [
+                    row
+                    for row in prior_decisions
+                    if canonical_pair(
+                        str(
+                            row.get("source_id")
+                            or row.get("left_source_id")
+                            or ""
+                        ),
+                        str(
+                            row.get("target_source_id")
+                            or row.get("right_source_id")
+                            or ""
+                        ),
+                    )
+                    == pair
+                ]
+            },
+        )
+        path = job_root / job.pair_job_id
+        write_json(path / "input.json", job.to_dict())
+        if not (path / "status.yml").is_file():
+            write_yaml(
+                path / "status.yml",
+                {
+                    "pair_job_id": job.pair_job_id,
+                    "status": "pending",
+                    "output_contract": job.output_contract,
+                    "decision_identity": decision_identity,
+                    "reasoner_backend": reasoner_backend,
+                    "provider": provider_name,
+                    "model": model_name,
+                },
+            )
+        jobs.append(job)
+
+    responses: list[dict[str, Any]] = []
+    unresolved: list[RelationshipPairJob] = []
+    preparked: list[dict[str, Any]] = list(discovery_parked)
+    for job in jobs:
+        job_path = job_root / job.pair_job_id
+        result_path = job_path / "result.json"
+        status = read_yaml(job_path / "status.yml", {}) or {}
+        same_identity = (
+            str(status.get("decision_identity") or "") == decision_identity
+        )
+        if (
+            str(status.get("status") or "") == "parked_for_review"
+            and same_identity
+            and not bool(getattr(request, "retry_terminal_failures", False))
+        ):
+            preparked.append(
+                {
+                    "pair_job_id": job.pair_job_id,
+                    "source_id": job.left_source_id,
+                    "target_source_id": job.right_source_id,
+                    "reason": str(status.get("reason") or "terminal_pair_job_failure"),
+                }
+            )
+        elif result_path.is_file() and same_identity:
+            try:
+                payload = json.loads(result_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                unresolved.append(job)
+                continue
+            if isinstance(payload, Mapping):
+                responses.append(
+                    {
+                        **dict(payload),
+                        "reasoner_backend": str(
+                            payload.get("reasoner_backend")
+                            or status.get("reasoner_backend")
+                            or reasoner_backend
+                        ),
+                        "provider": str(
+                            payload.get("provider")
+                            or status.get("provider")
+                            or provider_name
+                        ),
+                        "model": str(
+                            payload.get("model")
+                            or status.get("model")
+                            or model_name
+                        ),
+                    }
+                )
+        else:
+            unresolved.append(job)
+    provider_batch_count = 0
+    job_packets = _pack_relationship_rows(
+        unresolved,
+        pair_for=lambda job: (job.left_source_id, job.right_source_id),
+        profile_by_source=profile_by_source,
+        context_for=lambda packet: {
+            "pair_jobs": [job.to_dict() for job in packet]
+        },
+        max_chars=catalogue_char_budget,
+        max_rows=6,
+    )
+    for packet in job_packets:
+        packet_context = {"pair_jobs": [job.to_dict() for job in packet]}
+        packet_source_ids = sorted(
+            {
+                source_id
+                for job in packet
+                for source_id in (job.left_source_id, job.right_source_id)
+            }
+        )
+        packet_profiles = [
             profile_by_source[source_id] for source_id in packet_source_ids
         ]
+        if (
+            _reasoner_packet_chars(
+                [profile_to_dict(profile) for profile in packet_profiles],
+                packet_context,
+            )
+            > catalogue_char_budget
+        ):
+            for job in packet:
+                write_yaml(
+                    job_root / job.pair_job_id / "status.yml",
+                    {
+                        "pair_job_id": job.pair_job_id,
+                        "status": "parked_for_review",
+                        "reason": "relationship_pair_job_exceeds_context_budget",
+                        "decision_identity": decision_identity,
+                    },
+                )
+                preparked.append(
+                    {
+                        "pair_job_id": job.pair_job_id,
+                        "source_id": job.left_source_id,
+                        "target_source_id": job.right_source_id,
+                        "reason": "relationship_pair_job_exceeds_context_budget",
+                    }
+                )
+            continue
+        batch = RelationshipProviderBatch(
+            pair_job_ids=[job.pair_job_id for job in packet],
+            provider=str(getattr(reasoner, "name", "")),
+            model=str(getattr(reasoner, "model", "")),
+            capability_identity=str(capabilities.get("capability_identity") or ""),
+            serialized_context_fingerprint=stable_hash(
+                [job.to_dict() for job in packet]
+            ),
+        )
+        batch_root = (
+            workspace
+            / "11_state"
+            / "runs"
+            / run_id
+            / "relationship_batches"
+            / batch.batch_id
+        )
+        write_yaml(
+            batch_root / "batch.yml",
+            {
+                **batch.to_dict(),
+                "status": "started",
+            },
+        )
+        provider_batch_count += 1
         try:
             response = reasoner_calls(
                 "relationship_adjudication",
-                f"pairs-{stable_hash(pairs)[:16]}",
+                batch.batch_id,
                 "adjudicate_relationships",
-                provider_profiles,
-                adjudication_context(packet),
+                packet_profiles,
+                packet_context,
             )
-        except Exception as exc:
-            incomplete_source_ids.update(packet_source_ids)
-            parked.extend(
-                {
-                    "source_id": pair[0],
-                    "target_source_id": pair[1],
-                    "reason": "relationship_adjudication_failure",
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                }
-                for pair in pairs
-            )
-            continue
-        result = validate_decisions(
-            response, offered_pairs=pairs, profiles=validation_profiles
-        )
-        for key in ("accepted", "no_relationship"):
-            for row in result[key]:
-                row.update(
-                    provider=relationship_provider,
-                    model=relationship_model,
-                    prompt_version=RELATIONSHIP_PROMPT_VERSION,
-                )
-        tentative_accepted.extend(result["accepted"])
-        tentative_no_relationship.extend(result["no_relationship"])
-        needs_context.extend(result["needs_more_context"])
-        parked.extend(result["parked"])
-        decided = {
-            canonical_pair(
-                str(row.get("source_id") or ""),
-                str(row.get("target_source_id") or ""),
-            )
-            for key in ("accepted", "no_relationship", "needs_more_context")
-            for row in result[key]
-        }
-        needs_context.extend(
-            {
-                "source_id": pair[0],
-                "target_source_id": pair[1],
-                "reason": "missing_or_malformed_pair_decision",
-                "requested_context": ["atomic_note"],
+            rows = [
+                dict(row)
+                for row in response.get("decisions", []) or []
+                if isinstance(row, Mapping)
+            ]
+            by_job = {
+                str(row.get("pair_job_id") or ""): row for row in rows
             }
-            for pair in pairs
-            if pair not in decided
-        )
-    parked.extend(
-        {
-            **row,
-            "reason": "adjudication_needs_more_context",
-        }
-        for row in needs_context
-    )
-
-    preliminary = [*tentative_accepted, *tentative_no_relationship]
-    accepted: list[dict[str, Any]] = []
-    no_relationship: list[dict[str, Any]] = []
-    verification_needs_context: list[dict[str, Any]] = []
-    if preliminary and not callable(verifier):
-        parked.extend(
-            {
-                **row,
-                "reason": "relationship_verification_unavailable",
-            }
-            for row in preliminary
-        )
-    def verification_context(
-        packet: Sequence[Mapping[str, Any]],
-    ) -> dict[str, Any]:
-        return {
-            "preliminary_decisions": [
-                _relationship_verification_packet(row) for row in packet
-            ],
-            "independent_verification": True,
-        }
-
-    for packet in _pack_relationship_rows(
-        preliminary,
-        pair_for=lambda row: canonical_pair(
-            str(row.get("source_id") or ""),
-            str(row.get("target_source_id") or ""),
-        ),
-        profile_by_source=relationship_profile_by_source,
-        context_for=verification_context,
-        max_chars=catalogue_char_budget,
-    ):
-        pairs = [
-            canonical_pair(
-                str(row.get("source_id") or ""),
-                str(row.get("target_source_id") or ""),
-            )
-            for row in packet
-        ]
-        packet_source_ids = sorted({value for pair in pairs for value in pair})
-        provider_profiles = [
-            relationship_profile_by_source[source_id]
-            for source_id in packet_source_ids
-        ]
-        validation_profiles = [
-            profile_by_source[source_id] for source_id in packet_source_ids
-        ]
-        if not callable(verifier):
-            continue
-        try:
-            response = reasoner_calls(
-                "relationship_verification",
-                f"pairs-{stable_hash(pairs)[:16]}",
-                "verify_relationships",
-                provider_profiles,
-                verification_context(packet),
-            )
-        except Exception as exc:
-            incomplete_source_ids.update(packet_source_ids)
-            parked.extend(
-                {
+            for job in packet:
+                row = by_job.get(job.pair_job_id)
+                status_path = job_root / job.pair_job_id / "status.yml"
+                if row is None:
+                    preparked.append(
+                        {
+                            "pair_job_id": job.pair_job_id,
+                            "status": "parked_for_review",
+                            "reason": "provider_batch_missing_pair_row",
+                        }
+                    )
+                    write_yaml(
+                        status_path,
+                        {
+                            "pair_job_id": job.pair_job_id,
+                            "status": "parked_for_review",
+                            "reason": "provider_batch_missing_pair_row",
+                            "decision_identity": decision_identity,
+                        },
+                    )
+                    continue
+                row = {
                     **row,
-                    "reason": "relationship_verification_failure",
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
+                    "reasoner_backend": reasoner_backend,
+                    "provider": provider_name,
+                    "model": model_name,
                 }
-                for row in packet
-            )
-            continue
-        verified = validate_verifications(
-            response,
-            preliminary_decisions=packet,
-            profiles=validation_profiles,
-            verifier_provider=relationship_provider,
-            verifier_model=relationship_model,
-        )
-        for key in ("accepted", "no_relationship"):
-            for row in verified[key]:
-                row.update(
-                    provider=relationship_provider,
-                    model=relationship_model,
-                    prompt_version=RELATIONSHIP_PROMPT_VERSION,
+                write_json(job_root / job.pair_job_id / "result.json", row)
+                write_yaml(
+                    status_path,
+                    {
+                        "pair_job_id": job.pair_job_id,
+                        "status": "completed",
+                        "batch_id": batch.batch_id,
+                        "decision_identity": decision_identity,
+                        "reasoner_backend": reasoner_backend,
+                        "provider": provider_name,
+                        "model": model_name,
+                    },
                 )
-        accepted.extend(verified["accepted"])
-        no_relationship.extend(verified["no_relationship"])
-        verification_needs_context.extend(verified["needs_more_context"])
-        parked.extend(verified["parked"])
-        decided = {
-            canonical_pair(
-                str(row.get("source_id") or ""),
-                str(row.get("target_source_id") or ""),
+                responses.append(row)
+            write_yaml(
+                batch_root / "batch.yml",
+                {**batch.to_dict(), "status": "completed"},
             )
-            for key in ("accepted", "no_relationship", "needs_more_context")
-            for row in verified[key]
-        }
-        parked.extend(
-            {
-                **row,
-                "reason": "missing_or_malformed_verification",
-            }
-            for row in packet
-            if canonical_pair(
-                str(row.get("source_id") or ""),
-                str(row.get("target_source_id") or ""),
-            )
-            not in decided
-        )
-
-    preliminary_by_pair = {
-        canonical_pair(
-            str(row.get("source_id") or ""),
-            str(row.get("target_source_id") or ""),
-        ): row
-        for row in preliminary
-    }
-    parked.extend(
-        {
-            **row,
-            "reason": "relationship_verification_escalation_capacity_reached",
-        }
-        for row in verification_needs_context[3:]
-    )
-    for unresolved_row in verification_needs_context[:3]:
-        unresolved = [unresolved_row]
-        pairs = [
-            canonical_pair(
-                str(row.get("source_id") or ""),
-                str(row.get("target_source_id") or ""),
-            )
-            for row in unresolved
-        ]
-        packet = [
-            preliminary_by_pair[pair]
-            for pair in pairs
-            if pair in preliminary_by_pair
-        ]
-        packet_source_ids = sorted({value for pair in pairs for value in pair})
-        provider_profiles = [
-            relationship_profile_by_source[source_id]
-            for source_id in packet_source_ids
-        ]
-        validation_profiles = [
-            profile_by_source[source_id] for source_id in packet_source_ids
-        ]
-        try:
-            response = reasoner_calls(
-                "relationship_verification_escalation",
-                f"pairs-{stable_hash(pairs)[:16]}",
-                "verify_relationships",
-                provider_profiles,
+        except Exception as exc:
+            write_yaml(
+                batch_root / "batch.yml",
                 {
-                    "preliminary_decisions": [
-                        _relationship_verification_packet(row) for row in packet
-                    ],
-                    "atomic_note_passages": _relationship_atomic_note_passages(
-                        workspace,
-                        validation_profiles,
-                        packet,
-                    ),
-                    "focused_escalation": True,
+                    **batch.to_dict(),
+                    "status": "parked_for_review",
+                    "reason": f"{type(exc).__name__}:{exc}",
                 },
             )
-        except Exception as exc:
-            incomplete_source_ids.update(packet_source_ids)
-            parked.extend(
-                {
-                    **row,
-                    "reason": "relationship_verification_escalation_failure",
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                }
-                for row in unresolved
-            )
-            continue
-        verified = validate_verifications(
-            response,
-            preliminary_decisions=packet,
-            profiles=validation_profiles,
-            verifier_provider=relationship_provider,
-            verifier_model=relationship_model,
-        )
-        for key in ("accepted", "no_relationship"):
-            for row in verified[key]:
-                row.update(
-                    provider=relationship_provider,
-                    model=relationship_model,
-                    prompt_version=RELATIONSHIP_PROMPT_VERSION,
+            for job in packet:
+                preparked.append(
+                    {
+                        "pair_job_id": job.pair_job_id,
+                        "status": "parked_for_review",
+                        "reason": "provider_batch_failed",
+                    }
                 )
-        accepted.extend(verified["accepted"])
-        no_relationship.extend(verified["no_relationship"])
-        parked.extend(verified["parked"])
-        parked.extend(
+                write_yaml(
+                    job_root / job.pair_job_id / "status.yml",
+                    {
+                        "pair_job_id": job.pair_job_id,
+                        "status": "parked_for_review",
+                        "reason": "provider_batch_failed",
+                        "decision_identity": decision_identity,
+                    },
+                )
+    from .relationships import validate_relationship_decision_rows
+
+    validated = validate_relationship_decision_rows(
+        {"decisions": responses},
+        jobs=jobs,
+        profiles=list(profile_by_source.values()),
+        provider=provider_name,
+        model=model_name,
+        reasoner_backend=reasoner_backend,
+        prompt_version=RELATIONSHIP_PROMPT_VERSION,
+    )
+    terminal_rows = [
+        *validated["needs_more_context"],
+        *validated["parked"],
+    ]
+    for row in terminal_rows:
+        pair_job_id = str(row.get("pair_job_id") or "")
+        if not pair_job_id:
+            continue
+        write_yaml(
+            job_root / pair_job_id / "status.yml",
             {
-                **row,
-                "reason": "needs_more_context_after_single_verification_escalation",
-            }
-            for row in verified["needs_more_context"]
+                "pair_job_id": pair_job_id,
+                "status": "parked_for_review",
+                "reason": str(
+                    row.get("reason")
+                    or "relationship_decision_needs_review"
+                ),
+                "decision_identity": decision_identity,
+            },
         )
     return {
-        "accepted": accepted,
-        "no_relationship": no_relationship,
-        "parked": parked,
-        "cluster_candidates": cluster_candidates,
-        "selected_profile_hashes": {
-            source_id: current_hashes[source_id]
-            for source_id in focus_ids
-            if source_id not in incomplete_source_ids
-        },
+        "accepted": validated["accepted"],
+        "no_relationship": validated["no_relationship"],
+        "parked": [*preparked, *terminal_rows],
+        "cluster_candidates": [],
+        "selected_profile_hashes": current_hashes if discovery_completed else {},
         "reconciled_catalogue_revision": (
-            catalogue_revision
-            if catalogue_changed or identity_changed
-            else ""
+            catalogue_revision if discovery_completed else ""
         ),
         "selection_identity": selection_identity,
-        "state_path": str(state_path),
+        "pair_job_count": len(jobs),
+        "provider_batch_count": provider_batch_count,
+        "state_path": str(
+            state_path
+        ),
+        "job_root": str(job_root),
     }
+
+
+def _ranked_relationship_candidates(
+    response: Mapping[str, Any],
+    *,
+    available_source_ids: set[str],
+    entry_by_source: Mapping[str, Mapping[str, Any]],
+    excluded_pairs: set[tuple[str, str]],
+    maximum: int,
+    bridge_fraction: float,
+) -> list[dict[str, Any]]:
+    seen: set[tuple[str, str]] = set()
+    within: list[dict[str, Any]] = []
+    bridges: list[dict[str, Any]] = []
+    for index, raw in enumerate(response.get("candidates", []) or []):
+        if not isinstance(raw, Mapping):
+            continue
+        row = dict(raw)
+        source_id = str(row.get("source_id") or "")
+        target_id = str(
+            row.get("target_id") or row.get("target_source_id") or ""
+        )
+        pair = canonical_pair(source_id, target_id)
+        if (
+            pair in seen
+            or pair in excluded_pairs
+            or source_id not in available_source_ids
+            or target_id not in available_source_ids
+            or source_id == target_id
+        ):
+            continue
+        seen.add(pair)
+        row["source_id"] = source_id
+        row["target_id"] = target_id
+        row["_model_rank"] = int(row.get("rank") or row.get("priority") or index + 1)
+        left_collections = set(
+            entry_by_source.get(source_id, {}).get("collections", []) or []
+        )
+        right_collections = set(
+            entry_by_source.get(target_id, {}).get("collections", []) or []
+        )
+        bridge = bool(
+            row.get("cross_literature")
+            or row.get("discovery_route") == "cross_literature_bridge"
+            or (
+                left_collections
+                and right_collections
+                and left_collections.isdisjoint(right_collections)
+            )
+        )
+        (bridges if bridge else within).append(row)
+    bridges.sort(key=lambda row: (row["_model_rank"], row["source_id"], row["target_id"]))
+    within.sort(key=lambda row: (row["_model_rank"], row["source_id"], row["target_id"]))
+    bridge_slots = min(len(bridges), int(maximum * bridge_fraction + 0.999))
+    within_slots = min(len(within), maximum - bridge_slots)
+    selected = bridges[:bridge_slots] + within[:within_slots]
+    remaining = maximum - len(selected)
+    if remaining:
+        selected.extend(bridges[bridge_slots : bridge_slots + remaining])
+    for row in selected:
+        row.pop("_model_rank", None)
+    return selected
+
+
+def _selected_relationship_evidence(
+    profile: Any,
+    *,
+    requested_ids: set[str],
+) -> list[dict[str, Any]]:
+    row = profile_to_dict(profile)
+    anchors = [
+        dict(anchor)
+        for anchor in row.get("evidence_anchors", []) or []
+        if isinstance(anchor, Mapping)
+    ]
+    if requested_ids:
+        requested = [
+            anchor
+            for anchor in anchors
+            if str(anchor.get("evidence_anchor_id") or "") in requested_ids
+        ]
+        if requested:
+            return requested[:5]
+    anchors.sort(
+        key=lambda anchor: (
+            -int(anchor.get("salience_priority", 0) or 0),
+            str(anchor.get("evidence_anchor_id") or ""),
+        )
+    )
+    selected: list[dict[str, Any]] = []
+    roles: set[str] = set()
+    for anchor in anchors:
+        anchor_roles = {
+            str(value)
+            for value in anchor.get("planning_roles", []) or []
+            if str(value)
+        }
+        if selected and anchor_roles and anchor_roles.issubset(roles):
+            continue
+        selected.append(anchor)
+        roles.update(anchor_roles)
+        if len(selected) == 5:
+            break
+    return selected or anchors[:5]
 
 
 def _relationship_neighbors(
@@ -2332,68 +3366,8 @@ def _relationship_neighbors(
     ]
 
 
-def _bridge_candidate_shard_pair(
-    candidate: Mapping[str, Any],
-    offered_pairs: Sequence[Mapping[str, Any]],
-    shard_by_id: Mapping[str, Mapping[str, Any]],
-) -> tuple[str, str] | None:
-    source_id = str(candidate.get("source_id") or "")
-    target_id = str(candidate.get("target_id") or "")
-    for pair in offered_pairs:
-        left_id = str(pair.get("left_shard_id") or "")
-        right_id = str(pair.get("right_shard_id") or "")
-        left_sources = {
-            str(value)
-            for value in shard_by_id.get(left_id, {}).get("source_ids", []) or []
-        }
-        right_sources = {
-            str(value)
-            for value in shard_by_id.get(right_id, {}).get("source_ids", []) or []
-        }
-        if (
-            source_id in left_sources
-            and target_id in right_sources
-        ) or (
-            source_id in right_sources
-            and target_id in left_sources
-        ):
-            return canonical_pair(left_id, right_id)
-    return None
-
-
-def _relationship_verification_packet(
-    row: Mapping[str, Any],
-) -> dict[str, Any]:
-    source_evidence = (
-        row.get("source_evidence")
-        if isinstance(row.get("source_evidence"), Mapping)
-        else {}
-    )
-    target_evidence = (
-        row.get("target_evidence")
-        if isinstance(row.get("target_evidence"), Mapping)
-        else {}
-    )
-    return {
-        "source_id": str(row.get("source_id") or ""),
-        "target_source_id": str(row.get("target_source_id") or ""),
-        "status": str(row.get("decision_status") or row.get("status") or ""),
-        "relation_type": str(row.get("relation_type") or ""),
-        "comparison_unit": str(row.get("comparison_unit") or ""),
-        "reason": str(row.get("reason") or ""),
-        "source_evidence_anchor_id": str(
-            row.get("source_evidence_anchor_id")
-            or source_evidence.get("evidence_anchor_id")
-            or ""
-        ),
-        "target_evidence_anchor_id": str(
-            row.get("target_evidence_anchor_id")
-            or target_evidence.get("evidence_anchor_id")
-            or ""
-        ),
-        "qualifiers": list(row.get("qualifiers", []) or []),
-        "confidence": row.get("confidence"),
-    }
+def _relationship_context_char_budget(reasoner: Any, request: Any) -> int:
+    return _reasoner_context_char_budget(reasoner, request)
 
 
 def _relationship_evidence_projection(
@@ -2405,7 +3379,29 @@ def _relationship_evidence_projection(
     row = profile_to_dict(profile)
     anchors = row.get("evidence_anchors") or row.get("claims") or []
     compact_anchors = [
-        EvidenceAnchor.from_dict(anchor)
+        EvidenceAnchor(
+            evidence_anchor_id=str(
+                anchor.get("evidence_anchor_id")
+                or anchor.get("claim_id")
+                or ""
+            ),
+            source_id=str(anchor.get("source_id") or row.get("source_id") or ""),
+            claim=" ".join(
+                str(
+                    anchor.get("claim")
+                    or anchor.get("proposition")
+                    or anchor.get("finding")
+                    or ""
+                ).split()
+            )[:360],
+            locator=str(anchor.get("locator") or "")[:160],
+            planning_roles=[
+                str(value)[:80]
+                for value in anchor.get("planning_roles", [])[:4]
+                if str(value)
+            ],
+            salience_priority=int(anchor.get("salience_priority", 0) or 0),
+        )
         for anchor in anchors
         if isinstance(anchor, Mapping)
         and (anchor.get("evidence_anchor_id") or anchor.get("claim_id"))
@@ -2476,6 +3472,16 @@ def _compact_relationship_catalogue_entry(
             for value in entry.get("collections", [])[:2]
             if str(value).strip()
         ],
+        "cluster_ids": [
+            str(value)[:160]
+            for value in entry.get("cluster_ids", [])[:6]
+            if str(value)
+        ],
+        "relationship_ids": [
+            str(value)[:160]
+            for value in entry.get("relationship_ids", [])[:12]
+            if str(value)
+        ],
     }
 
 
@@ -2515,81 +3521,6 @@ def _pack_relationship_rows(
     if current:
         packets.append(current)
     return packets
-
-
-def _relationship_atomic_note_passages(
-    workspace: Path,
-    profiles: Sequence[Any],
-    decisions: Sequence[Mapping[str, Any]],
-) -> list[dict[str, Any]]:
-    requested_anchor_ids = {
-        str(value)
-        for decision in decisions
-        for value in (
-            decision.get("source_evidence_anchor_id"),
-            decision.get("target_evidence_anchor_id"),
-        )
-        if str(value or "")
-    }
-    passages = []
-    for profile in profiles:
-        row = profile_to_dict(profile)
-        context = (
-            row.get("context")
-            if isinstance(row.get("context"), Mapping)
-            else {}
-        )
-        path = workspace / str(context.get("note_path") or "")
-        if not path.is_file():
-            continue
-        body = internal_note_text(path)
-        section_text = "\n\n".join(
-            value
-            for heading in (
-                "Thesis",
-                "Method and Research Design",
-                "Detailed Findings",
-                "What This Source Can Support",
-                "What This Source Cannot Support",
-            )
-            if (value := _note_section(body, heading))
-        )[:6_000]
-        anchor_rows = [
-            {
-                "evidence_anchor_id": str(
-                    anchor.get("evidence_anchor_id")
-                    or anchor.get("claim_id")
-                    or ""
-                ),
-                "claim": str(
-                    anchor.get("claim")
-                    or anchor.get("text")
-                    or ""
-                )[:1_200],
-                "locator": str(anchor.get("locator") or "")[:240],
-            }
-            for anchor in (
-                row.get("evidence_anchors") or row.get("claims") or []
-            )
-            if isinstance(anchor, Mapping)
-            and str(
-                anchor.get("evidence_anchor_id")
-                or anchor.get("claim_id")
-                or ""
-            )
-            in requested_anchor_ids
-        ]
-        passages.append(
-            {
-                "source_id": str(row.get("source_id") or ""),
-                "note_id": str(row.get("note_id") or ""),
-                "passage": section_text,
-                "selected_anchors": anchor_rows,
-            }
-        )
-    return passages
-
-
 def _commit_relationship_selection_state(
     workspace: Path,
     result: Mapping[str, Any],
@@ -2767,6 +3698,8 @@ def _write_relationship_run_ledger(
     if existing != payload:
         write_yaml(path, payload)
     return path
+
+
 
 
 def _relationship_event_id(event_type: str, row: Mapping[str, Any]) -> str:
@@ -3127,6 +4060,7 @@ def rebuild_map(
     progress: _RunProgress | None = None,
     resume: bool = False,
     profile_budget: _ProfileProviderBudget | None = None,
+    collection_snapshot: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     del (
         external_discovery
@@ -3134,7 +4068,17 @@ def rebuild_map(
     effective_request = request or MapRequest(
         workspace=workspace, provider="ollama", model="deterministic-v1"
     )
+    collection_snapshot = collection_snapshot or read_yaml(
+        workspace / "01_custody" / "zotero" / "collection_snapshot.yml",
+        {},
+    )
     if not effective_request.literature_policy.synthesis_enabled:
+        workspace_note_rows, workspace_profiles = _workspace_graph_inputs(
+            workspace, []
+        )
+        orphaned_source_ids = _orphaned_source_ids(
+            workspace_note_rows, collection_snapshot
+        )
         relations = build_typed_source_relations(
             note_rows,
             max_inferred_links_per_source=effective_request.navigation_policy.max_inferred_related_note_links,
@@ -3143,11 +4087,9 @@ def rebuild_map(
             **persist_relationship_registry(
                 workspace,
                 structural_relations=relations,
+                orphaned_source_ids=orphaned_source_ids,
             )
         }
-        workspace_note_rows, workspace_profiles = _workspace_graph_inputs(
-            workspace, []
-        )
         graph_profiles: Sequence[Any] = (
             workspace_profiles or workspace_note_rows
         )
@@ -3164,6 +4106,7 @@ def rebuild_map(
             workspace_profiles,
             workspace_note_rows,
             _cluster_catalogue_rows(workspace),
+            collection_snapshot=collection_snapshot,
         )
         source_index = Path(catalogue["master_index_path"])
         if progress is not None:
@@ -3298,6 +4241,9 @@ def rebuild_map(
     workspace_note_rows, workspace_profiles = _workspace_graph_inputs(
         workspace, profiles
     )
+    orphaned_source_ids = _orphaned_source_ids(
+        workspace_note_rows, collection_snapshot
+    )
     existing_clusters = _cluster_catalogue_rows(workspace)
     navigation = build_navigation_projection(
         workspace,
@@ -3309,12 +4255,14 @@ def rebuild_map(
         workspace,
         structural_relations=navigation.get("typed_relations", []) or [],
         preserve_unmentioned_structural=True,
+        orphaned_source_ids=orphaned_source_ids,
     )
     catalogue = build_source_catalogue(
         workspace,
         workspace_profiles,
         workspace_note_rows,
         existing_clusters,
+        collection_snapshot=collection_snapshot,
     )
     try:
         relationship_result = _run_relationship_reasoning(
@@ -3354,6 +4302,8 @@ def rebuild_map(
         )
         or [],
         parked_rows=relationship_result.get("parked", []) or [],
+        preserve_unmentioned_structural=True,
+        orphaned_source_ids=orphaned_source_ids,
     )
     graph_note_paths = _project_atomic_graph(
         workspace,
@@ -3384,14 +4334,17 @@ def rebuild_map(
         *graph_note_paths,
         *([selection_state_path] if selection_state_path is not None else []),
     ]
+    literature_note_rows, literature_profiles = _source_set_graph_inputs(
+        source_set, workspace_note_rows, workspace_profiles
+    )
     try:
         cluster_map, gap_map, packet, paths = build_literature_map(
             workspace,
             source_set=source_set,
-            notes=note_rows,
+            notes=literature_note_rows,
             question=question,
             run_id=run_id,
-            profiles=profiles,
+            profiles=literature_profiles,
             request=base_literature_request,
             policy=effective_request.literature_policy,
             reasoner=reasoner,
@@ -3526,6 +4479,7 @@ def rebuild_map(
     typed = persist_relationship_registry(
         workspace,
         structural_relations=combined_structural.values(),
+        orphaned_source_ids=orphaned_source_ids,
     )
     profile_packet_paths = [
         path
@@ -3624,8 +4578,8 @@ def rebuild_map(
             coverage_inventory_count=int(
                 cluster_map.get("coverage_inventory_count", 0) or 0
             ),
-            coverage_exhausted_count=int(
-                cluster_map.get("coverage_exhausted_count", 0) or 0
+            coverage_parked_for_review_count=int(
+                cluster_map.get("coverage_parked_for_review_count", 0) or 0
             ),
             coverage_accounting_valid=bool(
                 cluster_map.get("coverage_accounting_valid", False)
@@ -3660,81 +4614,8 @@ def rebuild_map(
         workspace_profiles,
         workspace_note_rows,
         catalogue_clusters.values(),
+        collection_snapshot=collection_snapshot,
     )
-    if str(source_set.get("source_set_type") or "") == "auto_zettelkasten_workspace":
-        try:
-            post_cluster_relationships = _run_relationship_reasoning(
-                workspace,
-                profiles=workspace_profiles,
-                source_set=source_set,
-                catalogue=catalogue,
-                reasoner=reasoner,
-                reasoner_calls=reasoner_calls,
-                request=base_literature_request,
-            )
-        except Exception as exc:
-            post_cluster_relationships = {
-                "accepted": [],
-                "no_relationship": [],
-                "parked": [
-                    {
-                        "reason": "post_cluster_relationship_stage_failure",
-                        "error_type": type(exc).__name__,
-                        "error": str(exc),
-                    }
-                ],
-                "cluster_candidates": [],
-                "selected_profile_hashes": {},
-                "reconciled_catalogue_revision": "",
-            }
-        relationship_result = {
-            "accepted": [
-                *(relationship_result.get("accepted", []) or []),
-                *(post_cluster_relationships.get("accepted", []) or []),
-            ],
-            "no_relationship": [
-                *(relationship_result.get("no_relationship", []) or []),
-                *(post_cluster_relationships.get("no_relationship", []) or []),
-            ],
-            "parked": [
-                *(relationship_result.get("parked", []) or []),
-                *(post_cluster_relationships.get("parked", []) or []),
-            ],
-            "cluster_candidates": [
-                *(relationship_result.get("cluster_candidates", []) or []),
-                *(post_cluster_relationships.get("cluster_candidates", []) or []),
-            ],
-        }
-        relationship_ledger_path = _write_relationship_run_ledger(
-            workspace, run_id, relationship_result
-        )
-        typed = persist_relationship_registry(
-            workspace,
-            structural_relations=combined_structural.values(),
-            accepted_relations=post_cluster_relationships.get("accepted", [])
-            or [],
-            no_relationship_decisions=post_cluster_relationships.get(
-                "no_relationship", []
-            )
-            or [],
-        )
-        post_state_path = _commit_relationship_selection_state(
-            workspace,
-            post_cluster_relationships,
-            catalogue_revision=str(
-                catalogue.get("routing_revision_hash")
-                or catalogue.get("revision_hash")
-                or ""
-            ),
-        )
-        if post_state_path is not None and post_state_path not in graph_paths:
-            graph_paths.append(post_state_path)
-        catalogue = build_source_catalogue(
-            workspace,
-            workspace_profiles,
-            workspace_note_rows,
-            catalogue_clusters.values(),
-        )
     note_paths = _project_atomic_graph(
         workspace,
         note_rows=workspace_note_rows,
@@ -3878,9 +4759,14 @@ def _build_profiles_for_map(
         note_status = str(row.get("note_status") or "")
         terminal_status = str(row.get("terminal_status") or "")
         analytical = (
-            note_status in {"analytical_atomic_note", "verified_atomic_note"}
+            note_status
+            in {
+                "analytical_atomic_note",
+                "verified_atomic_note",
+                "partial_document_atomic_note",
+            }
             or terminal_status == "validated_note"
-        ) and str(row.get("source_scope") or "full_document") == "full_document"
+        )
         profile_policy, profile_route, reasoner_identity = _profile_dependency_policy(
             request,
             reasoner,
@@ -3905,16 +4791,28 @@ def _build_profiles_for_map(
             if sidecar.exists():
                 existing = load_profile_sidecar(sidecar)
                 existing_payload = profile_to_dict(existing)
-                existing_dependency = str(existing_payload.get("dependency_hash") or "")
-                if existing_dependency == fingerprint:
+                existing_context = (
+                    dict(existing_payload.get("context", {}))
+                    if isinstance(existing_payload.get("context", {}), Mapping)
+                    else {}
+                )
+                if (
+                    existing_context.get("profile_generation_route")
+                    == "source_analysis_bundle"
+                    and (
+                        workspace
+                        / str(
+                            existing_context.get("source_analysis_bundle_path") or ""
+                        )
+                    ).is_file()
+                ):
                     profile = existing
                     checkpoint_hit = 1
-                else:
-                    existing_context = (
-                        dict(existing_payload.get("context", {}))
-                        if isinstance(existing_payload.get("context", {}), Mapping)
-                        else {}
-                    )
+                existing_dependency = str(existing_payload.get("dependency_hash") or "")
+                if profile is None and existing_dependency == fingerprint:
+                    profile = existing
+                    checkpoint_hit = 1
+                elif profile is None:
                     recorded_source_set_id = str(
                         existing_context.get("source_set_id") or ""
                     )
@@ -4145,7 +5043,12 @@ def _build_profiles_for_map(
                         profile = existing
                         checkpoint_hit = 1
                         mechanically_upgraded = True
-            if profile is not None and reasoner is not None and analytical:
+            if (
+                profile is not None
+                and profile_route != "deterministic"
+                and reasoner is not None
+                and analytical
+            ):
                 cached_context = dict(getattr(profile, "context", {}) or {})
                 cached_retryable = bool(
                     cached_context.get("lazy_reprofile_required")
@@ -4175,7 +5078,11 @@ def _build_profiles_for_map(
                         mechanically_upgraded = False
                         profile_contract_fallback = False
             if profile is None:
-                if reasoner is not None and analytical:
+                if (
+                    profile_route != "deterministic"
+                    and reasoner is not None
+                    and analytical
+                ):
                     profile_attempt_id = reserve_provider_call(
                         note_id, reasoner_attempt_fingerprint
                     )
@@ -4248,6 +5155,7 @@ def _build_profiles_for_map(
                         model=request.model,
                         policy=fallback_policy,
                     )
+                    profile.evidence_eligibility = "context_only"
                     profile.excluded_from_synthesis = True
                     profile.exclusion_reason = (
                         "profile_reasoner_contract_fallback_requires_lazy_reprofile"
@@ -4306,6 +5214,7 @@ def _build_profiles_for_map(
             # upgrade instead of turning one ambiguous anchor into a
             # permanent document-level exclusion. This must also run for an
             # exact profile-checkpoint hit.
+            profile.evidence_eligibility = "substantive_bounded"
             profile.excluded_from_synthesis = False
             profile.exclusion_reason = ""
         if analytical:
@@ -4316,7 +5225,7 @@ def _build_profiles_for_map(
             profile, _ = augment_profile_from_committed_note(
                 profile,
                 text,
-                source_set_id=str(source_set.get("source_set_id") or ""),
+                source_set_id="",
                 provider=request.provider,
                 model=request.model,
                 policy=profile_policy,
@@ -4372,8 +5281,10 @@ def _build_profiles_for_map(
                 ),
             }
         )
+        context.pop("source_set_id", None)
         profile.context = context
         if not validation.passed or not note_valid:
+            profile.evidence_eligibility = "context_only"
             profile.excluded_from_synthesis = True
             reasons = list(validation.errors) + list(
                 row.get("validation_errors", []) or []
@@ -4382,6 +5293,7 @@ def _build_profiles_for_map(
                 sorted(set(reasons))
             )
         elif prior_exclusion_reason.startswith("profile_or_note_validation_failed:"):
+            profile.evidence_eligibility = "substantive_bounded"
             profile.excluded_from_synthesis = False
             profile.exclusion_reason = ""
         profile_path = profile_sidecar_path(profiles_dir, note_id)
@@ -4512,21 +5424,9 @@ def _profile_dependency_policy(
     *,
     analytical: bool,
 ) -> tuple[dict[str, Any], str, str]:
-    if not analytical or reasoner is None:
-        route = "deterministic"
-        identity = "auto_zettelkasten.profiles.deterministic_profile:v1"
-    else:
-        route = str(
-            getattr(reasoner, "profile_generation_route", "explicit_reasoner")
-            or "explicit_reasoner"
-        )
-        identity = str(getattr(reasoner, "profile_reasoner_identity", "") or "")
-        if not identity:
-            reasoner_type = type(reasoner)
-            identity = (
-                f"{reasoner_type.__module__}.{reasoner_type.__qualname__}:"
-                f"{getattr(reasoner, 'name', 'unknown')}:{getattr(reasoner, 'model', 'unknown')}"
-            )
+    del analytical, reasoner
+    route = "deterministic"
+    identity = "auto_zettelkasten.profiles.deterministic_profile:v1"
     profile_relevant_policy = request.literature_policy.to_dict()
     for field_name in (
         "weak_gap_handling",
@@ -4780,6 +5680,29 @@ def workspace_source_set(
     )
 
 
+def _orphaned_source_ids(
+    note_rows: Sequence[Mapping[str, Any]],
+    collection_snapshot: Mapping[str, Any] | None,
+) -> list[str]:
+    if not collection_snapshot:
+        return []
+    available_keys = {
+        str(row.get("key") or "").upper()
+        for row in collection_snapshot.get("items", []) or []
+        if isinstance(row, Mapping) and row.get("key")
+    }
+    return sorted(
+        {
+            str(row.get("source_id") or "")
+            for row in note_rows
+            if row.get("source_id")
+            and row.get("zotero_item_key")
+            and str(row.get("zotero_item_key") or "").upper()
+            not in available_keys
+        }
+    )
+
+
 def _prepare_item(
     workspace: Path,
     run_dir: Path,
@@ -4800,7 +5723,7 @@ def _prepare_item(
         "source_id": source_id_for_item(item),
         "note_id": note_id_for_item(item),
         "attempts": [],
-        "terminal_status": "exhausted",
+        "terminal_status": "parked_for_review",
         "reason": "",
         "reader_provider": str(getattr(reader, "name", request.provider)),
         "reader_model": str(getattr(reader, "model", request.model)),
@@ -4844,7 +5767,6 @@ def _prepare_item(
         key,
         content_hash,
         request,
-        item,
         effective_provider,
         effective_model,
         str(content.get("source_scope") or "full_document"),
@@ -4867,7 +5789,12 @@ def _prepare_item(
         )
         base.update(
             terminal_status="validated_note"
-            if prior_status in {"analytical_atomic_note", "verified_atomic_note"}
+            if prior_status
+            in {
+                "analytical_atomic_note",
+                "verified_atomic_note",
+                "partial_document_atomic_note",
+            }
             else "limited_note",
             note_path=str(prior["note_path"]),
             note_status=prior_status,
@@ -4893,7 +5820,12 @@ def _prepare_item(
         relative_path = str(compatible_path.relative_to(workspace))
         base.update(
             terminal_status="validated_note"
-            if prior_status in {"analytical_atomic_note", "verified_atomic_note"}
+            if prior_status
+            in {
+                "analytical_atomic_note",
+                "verified_atomic_note",
+                "partial_document_atomic_note",
+            }
             else "limited_note",
             note_path=relative_path,
             note_status=prior_status,
@@ -4941,6 +5873,11 @@ def _prepare_item(
         reader_metadata = {
             **item_data(item),
             "_source_context": {
+                "source_id": str(base["source_id"]),
+                "zotero_key": key,
+                "attachment_key": str(
+                    item_data(item).get("parentItem") and key or ""
+                ),
                 "source_file": str(content.get("source_file") or ""),
                 "route": str(content.get("content_route") or ""),
                 "media_type": str(content.get("media_type") or ""),
@@ -4978,7 +5915,7 @@ def _prepare_item(
                 ),
             },
         }
-        analysis, reader_route, reader_reason = _read_document(
+        source_result, reader_route, reader_reason = _read_document(
             reader,
             str(content["text"]),
             reader_metadata,
@@ -4987,6 +5924,7 @@ def _prepare_item(
             checkpoint_root=checkpoint_root,
             progress=progress,
             inventory_index=index,
+            provider_budget=profile_budget,
         )
     except DocumentPartialError as exc:
         base.update(
@@ -5025,6 +5963,21 @@ def _prepare_item(
         )
         base["reason"] = f"reader_failed:{type(exc).__name__}"
         return base
+    try:
+        bundle = _source_bundle_from_result(source_result, base, source_scope)
+    except ValueError as exc:
+        base["reason"] = f"source_bundle_ownership_invalid:{exc}"
+        base["attempts"].append(
+            _attempt(base, reader_route, "failed", base["reason"])
+        )
+        return base
+    analysis = (
+        dict(bundle.analysis_sections)
+        if bundle is not None
+        else _ensure_analysis_contract(source_result)
+    )
+    if bundle is not None:
+        base["source_analysis_bundle"] = bundle.to_dict()
     base["attempts"].append(
         _attempt(
             base,
@@ -5036,182 +5989,315 @@ def _prepare_item(
     )
     if source_scope == "partial_document":
         base.update(
-            terminal_status="limited_note",
+            terminal_status="validated_note",
             note_status="partial_document_atomic_note",
-            limited_analysis=_limited_analysis(
-                {**content, "analysis": dict(analysis)},
-                item,
-            ),
+            analysis=dict(analysis),
+            evidence_eligibility="substantive_bounded",
             reason=str(content.get("coverage_reason") or source_scope),
         )
-        return base
-    try:
-        analysis = _verify_atomic_fidelity(
-            reader,
-            analysis,
-            source_text=str(content["text"]),
-            source_scope=source_scope,
-            coverage_metrics=extraction_metrics,
-            checkpoint_root=checkpoint_root,
-            request=request,
-            progress=progress,
-            profile_budget=profile_budget,
-        )
-    except AtomicFidelityError as exc:
-        base["attempts"].append(
-            _attempt(base, "atomic_fidelity", "failed", str(exc))
-        )
-        base["reason"] = str(exc)
-        return base
+    risks = analyze_atomic_fidelity(
+        analysis, str(content["text"]), extraction_metrics
+    )
+    if risks:
+        base["quality_diagnostics"] = risks
     base["analysis"] = dict(analysis)
     return base
 
 
-def _verify_atomic_fidelity(
-    reader: ReaderProvider,
-    analysis: Mapping[str, Any],
-    *,
-    source_text: str,
+def _source_bundle_from_result(
+    result: Mapping[str, Any],
+    row: Mapping[str, Any],
     source_scope: str,
-    coverage_metrics: Mapping[str, Any],
-    checkpoint_root: Path,
-    request: MapRequest,
-    progress: _RunProgress | None,
-    profile_budget: _ProfileProviderBudget | None = None,
-) -> dict[str, Any]:
-    risks = analyze_atomic_fidelity(analysis, source_text, coverage_metrics)
-    if not risks:
-        return dict(analysis)
-    identity = {
-        "analysis_hash": sha256_text(
-            json.dumps(
-                dict(analysis),
-                sort_keys=True,
-                ensure_ascii=False,
-                default=str,
-            )
-        ),
-        "source_hash": sha256_text(source_text),
-        "coverage_hash": sha256_text(
-            json.dumps(
-                dict(coverage_metrics),
-                sort_keys=True,
-                ensure_ascii=False,
-                default=str,
-            )
-        ),
-        "provider": str(getattr(reader, "name", "")),
-        "model": str(getattr(reader, "model", "")),
-        "prompt_version": request.prompt_version,
-        "fidelity_version": ATOMIC_FIDELITY_VERSION,
-    }
-    checkpoint_path = checkpoint_root / "atomic_fidelity.yml"
-    checkpoint = read_yaml(checkpoint_path, {}) or {}
-    if checkpoint.get("identity") == identity:
-        if checkpoint.get("status") == "completed" and isinstance(
-            checkpoint.get("analysis"), Mapping
+) -> SourceAnalysisBundle | None:
+    if str(result.get("bundle_schema_version") or "") != "1":
+        return None
+    payload = dict(result)
+    diagnostics = payload.get("component_diagnostics", [])
+    if isinstance(diagnostics, list):
+        for field_name in (
+            "evidence_anchors",
+            "literature_positions",
+            "missing_source_recommendations",
         ):
-            patched = dict(checkpoint["analysis"])
-            if not analyze_atomic_fidelity(patched, source_text, coverage_metrics):
-                return patched
-        raise AtomicFidelityError(
-            str(checkpoint.get("reason") or "atomic_fidelity_review_required")
-        )
-    verifier = getattr(reader, "verify_atomic_claims", None)
-    if not callable(verifier):
-        reason = "atomic_fidelity_verification_unavailable"
-        write_yaml(
-            checkpoint_path,
-            {
-                "identity": identity,
-                "status": "failed",
-                "reason": reason,
-                "risks": risks,
-                "updated_at": now_iso(),
-            },
-        )
-        raise AtomicFidelityError(reason)
-    context = {
-        "risks": risks,
-        "source_passages": source_passages_for_risks(
-            source_text,
-            risks,
-            page_map=dict(
-                coverage_metrics.get("ordinal_to_printed_page", {}) or {}
-            ),
+            recovered = [
+                dict(row["raw"])
+                for row in diagnostics
+                if isinstance(row, Mapping)
+                and row.get("component") == field_name
+                and isinstance(row.get("raw"), Mapping)
+            ]
+            current = payload.get(field_name, [])
+            if recovered and isinstance(current, list):
+                payload[field_name] = [*current, *recovered]
+    expected_source_id = str(row.get("source_id") or "")
+    expected_zotero_key = str(row.get("zotero_item_key") or "")
+    identity = (
+        dict(payload.get("source_identity") or {})
+        if isinstance(payload.get("source_identity"), Mapping)
+        else {}
+    )
+    returned_source_id = str(identity.get("source_id") or "")
+    returned_zotero_key = str(identity.get("zotero_key") or "")
+    if returned_source_id and returned_source_id != expected_source_id:
+        raise ValueError("source_identity.source_id does not match requested source")
+    if (
+        returned_zotero_key
+        and returned_zotero_key.casefold() != expected_zotero_key.casefold()
+    ):
+        raise ValueError("source_identity.zotero_key does not match requested source")
+    identity.update(
+        {
+            "source_id": expected_source_id,
+            "zotero_key": expected_zotero_key,
+        }
+    )
+    payload["source_identity"] = identity
+    for field_name, owner_field in (
+        ("evidence_anchors", "source_id"),
+        ("literature_positions", "current_source_id"),
+    ):
+        values = payload.get(field_name, [])
+        if not isinstance(values, list):
+            continue
+        normalized = []
+        for value in values:
+            if not isinstance(value, Mapping):
+                normalized.append(value)
+                continue
+            owned = dict(value)
+            returned_owner = str(owned.get(owner_field) or "")
+            if returned_owner and returned_owner != expected_source_id:
+                raise ValueError(
+                    f"{field_name}.{owner_field} does not match requested source"
+                )
+            owned[owner_field] = expected_source_id
+            normalized.append(owned)
+        payload[field_name] = normalized
+    scope = (
+        dict(payload.get("scope_assessment") or {})
+        if isinstance(payload.get("scope_assessment"), Mapping)
+        else {}
+    )
+    model_scope = str(scope.get("source_scope") or "")
+    model_eligibility = str(scope.get("evidence_eligibility") or "")
+    authoritative_eligibility = (
+        "substantive_bounded"
+        if source_scope in {"full_document", "partial_document"}
+        else "context_only"
+    )
+    if model_scope and model_scope != source_scope:
+        scope["model_source_scope"] = model_scope
+    if model_eligibility and model_eligibility != authoritative_eligibility:
+        scope["model_evidence_eligibility"] = model_eligibility
+    scope["source_scope"] = source_scope
+    scope["evidence_eligibility"] = authoritative_eligibility
+    payload["scope_assessment"] = scope
+    anchors = payload.get("evidence_anchors", [])
+    if isinstance(anchors, list):
+        normalized_anchors = []
+        seen_anchors: set[str] = set()
+        for value in anchors:
+            if not isinstance(value, Mapping):
+                normalized_anchors.append(value)
+                continue
+            anchor = dict(value)
+            planning_roles = anchor.get("planning_roles")
+            if isinstance(planning_roles, str):
+                anchor["planning_roles"] = [planning_roles]
+            envelope = anchor.get("support_envelope")
+            if isinstance(envelope, str):
+                boundary = envelope.strip()
+                anchor["support_envelope"] = {
+                    "coverage": (
+                        "limited_text"
+                        if source_scope == "partial_document"
+                        else "full_text"
+                    ),
+                    "restrictions": [boundary] if boundary else [],
+                    "support_status": "supported",
+                }
+            elif isinstance(envelope, Mapping):
+                anchor["support_envelope"] = _normalized_support_envelope(
+                    envelope, source_scope
+                )
+            anchor_key = str(anchor.get("evidence_anchor_id") or "") or stable_hash(
+                anchor
+            )
+            if anchor_key in seen_anchors:
+                continue
+            seen_anchors.add(anchor_key)
+            normalized_anchors.append(anchor)
+        payload["evidence_anchors"] = normalized_anchors
+    positions = payload.get("literature_positions", [])
+    if isinstance(positions, list):
+        normalized_positions = []
+        seen_positions: set[str] = set()
+        for value in positions:
+            if not isinstance(value, Mapping):
+                normalized_positions.append(value)
+                continue
+            position = dict(value)
+            if not position.get("author") and position.get("flat_author"):
+                position["author"] = position["flat_author"]
+            position.pop("flat_author", None)
+            if position.get("year") is not None:
+                position["year"] = str(position["year"])
+            if isinstance(position.get("identifiers"), str):
+                identifier = str(position["identifiers"]).strip()
+                position["identifiers"] = (
+                    {"other": identifier} if identifier else {}
+                )
+            position_key = stable_hash(
+                {
+                    "current_source_id": position.get("current_source_id"),
+                    "raw_citation": position.get("raw_citation"),
+                    "engagement": position.get("engagement"),
+                }
+            )
+            if position_key in seen_positions:
+                continue
+            seen_positions.add(position_key)
+            normalized_positions.append(position)
+        payload["literature_positions"] = normalized_positions
+    recommendations = payload.get("missing_source_recommendations", [])
+    if isinstance(recommendations, list):
+        payload["missing_source_recommendations"] = [
+            _normalized_missing_source_recommendation(value, expected_source_id)
+            if isinstance(value, Mapping)
+            else value
+            for value in recommendations
+        ]
+    return SourceAnalysisBundle.from_dict(payload)
+
+
+def _normalized_support_envelope(
+    value: Mapping[str, Any], source_scope: str
+) -> dict[str, Any]:
+    empirical = str(value.get("empirical_role") or "").casefold()
+    argument = str(value.get("argument_role") or "").casefold()
+    status = str(value.get("support_status") or "").casefold()
+    scope = value.get("scope")
+    restrictions = value.get("restrictions")
+    return {
+        "empirical_role": (
+            "causal"
+            if "causal" in empirical
+            else "associational"
+            if any(token in empirical for token in ("statistic", "associat", "regression"))
+            else "descriptive"
+            if any(token in empirical for token in ("descript", "illustrat"))
+            else "mechanism_evidence"
+            if any(token in empirical for token in ("mechanism", "qualitative"))
+            else "none"
         ),
-        "source_scope": source_scope,
-        "page_map": dict(
-            coverage_metrics.get("ordinal_to_printed_page", {}) or {}
+        "argument_role": (
+            "methodological"
+            if any(token in argument for token in ("method", "data", "evidence"))
+            else "normative"
+            if "normative" in argument
+            else "practitioner_guidance"
+            if any(token in argument for token in ("pract", "guidance"))
+            else "conceptual"
+            if any(token in argument for token in ("concept", "theor", "claim", "thesis"))
+            else "interpretive"
+            if argument
+            else "none"
+        ),
+        "coverage": (
+            "limited_text" if source_scope == "partial_document" else "full_text"
+        ),
+        "scope": (
+            {
+                str(key): (
+                    [str(item) for item in items]
+                    if isinstance(items, list)
+                    else [str(items)]
+                )
+                for key, items in scope.items()
+                if str(key) and (items if isinstance(items, list) else str(items))
+            }
+            if isinstance(scope, Mapping)
+            else {"description": [str(scope)]}
+            if str(scope or "").strip()
+            else {}
+        ),
+        "restrictions": (
+            [str(item) for item in restrictions if str(item).strip()]
+            if isinstance(restrictions, list)
+            else [str(restrictions)]
+            if str(restrictions or "").strip()
+            else []
+        ),
+        "support_status": (
+            "unsupported"
+            if "unsupported" in status
+            else "limited"
+            if any(token in status for token in ("limited", "mixed", "plausible"))
+            else "supported"
+            if any(
+                token in status
+                for token in ("supported", "supportive", "robust", "consistent")
+            )
+            else "support_unknown"
         ),
     }
-    diagnostics: dict[str, Any] = {}
-    attempt_id = ""
-    try:
-        if profile_budget is not None:
-            attempt_id = profile_budget.reserve(
-                "atomic_fidelity",
-                str(checkpoint_root.name),
-                sha256_text(
-                    json.dumps(identity, sort_keys=True, ensure_ascii=False)
-                ),
-            )
-        if progress is not None:
-            progress.record_source_provider_call()
-        response = verifier(dict(analysis), context=context)
-        if attempt_id:
-            profile_budget.finish(attempt_id, status="completed")
-        if not isinstance(response, Mapping):
-            raise ValueError("atomic fidelity verifier must return a mapping")
-        diagnostics["response"] = dict(response)
-        replacements = validate_atomic_replacements(
-            analysis,
-            response,
-            allowed_risk_ids=[str(row["risk_id"]) for row in risks],
-            discard_invalid=True,
-        )
-        diagnostics["replacements"] = replacements
-        patched = apply_atomic_replacements(
-            analysis,
-            replacements,
-            allowed_risk_ids=[str(row["risk_id"]) for row in risks],
-        )
-        remaining = analyze_atomic_fidelity(
-            patched,
-            source_text,
-            coverage_metrics,
-        )
-        diagnostics["remaining_risks"] = remaining
-        if remaining:
-            raise ValueError("atomic_fidelity_risks_unresolved")
-    except Exception as exc:
-        if attempt_id:
-            profile_budget.finish(attempt_id, status="failed")
-        reason = f"atomic_fidelity_review_required:{type(exc).__name__}:{exc}"
-        write_yaml(
-            checkpoint_path,
-            {
-                "identity": identity,
-                "status": "failed",
-                "reason": reason,
-                "risks": risks,
-                **diagnostics,
-                "updated_at": now_iso(),
-            },
-        )
-        raise AtomicFidelityError(reason) from exc
-    write_yaml(
-        checkpoint_path,
-        {
-            "identity": identity,
-            "status": "completed",
-            "risk_ids": [str(row["risk_id"]) for row in risks],
-            "replacements": replacements,
-            "analysis": patched,
-            "updated_at": now_iso(),
-        },
+
+
+def _normalized_missing_source_recommendation(
+    value: Mapping[str, Any], source_id: str
+) -> dict[str, Any]:
+    allowed = {
+        "external_source_id",
+        "raw_citation",
+        "normalized_citation",
+        "identifiers",
+        "discussed_by_source_ids",
+        "importance",
+        "relevant_collections",
+        "relevant_topics",
+        "relevant_clusters",
+        "acquisition_priority",
+        "match_status",
+        "retrieval_status",
+        "ambiguity_notes",
+        "zotero_key",
+        "source_id",
+        "note_id",
+    }
+    normalized = {key: item for key, item in value.items() if key in allowed}
+    citation = (
+        dict(normalized.get("normalized_citation") or {})
+        if isinstance(normalized.get("normalized_citation"), Mapping)
+        else {}
     )
-    return patched
+    for field in ("author", "year", "title"):
+        if str(value.get(field) or "").strip():
+            citation[field] = str(value[field]).strip()
+    normalized["normalized_citation"] = citation
+    normalized["discussed_by_source_ids"] = list(
+        dict.fromkeys(
+            [
+                *(
+                    normalized.get("discussed_by_source_ids", [])
+                    if isinstance(normalized.get("discussed_by_source_ids"), list)
+                    else []
+                ),
+                str(value.get("current_source_id") or source_id),
+            ]
+        )
+    )
+    if not str(normalized.get("importance") or "").strip():
+        normalized["importance"] = str(
+            value.get("engagement") or value.get("provenance") or ""
+        ).strip()
+    ambiguity = " | ".join(
+        str(value.get(field) or "").strip()
+        for field in ("relation_label", "locator")
+        if str(value.get(field) or "").strip()
+    )
+    if ambiguity and not str(normalized.get("ambiguity_notes") or "").strip():
+        normalized["ambiguity_notes"] = ambiguity
+    return normalized
 
 
 def _write_frozen_content(checkpoint_root: Path, content: Mapping[str, Any]) -> None:
@@ -5756,19 +6842,40 @@ def _apply_bibliographic_scope(
         or ""
     ).strip()
     meaningful_label = label and not _GENERIC_ATTACHMENT_LABEL_RE.fullmatch(label)
-    first_page = str(row.get("text") or "")[:2_000]
+    first_page = str(row.get("text") or "")[:8_000]
+    metrics = dict(row.get("coverage_metrics", {}) or {})
+    page_count = int(metrics.get("page_count", 0) or 0)
     bounded_match = (
         _BOUNDED_ATTACHMENT_RE.search(label) if meaningful_label else None
     ) or re.search(
         r"(?im)^(?:--- Page 1 ---\s*)?(?:chapter\s+(?:\d+|[ivxlcdm]+)"
         r"(?:\s*[:.-]\s*|\s+)|introduction\s*$|appendix\s+[a-z0-9]+)",
         first_page,
+    ) or (
+        re.search(
+            r"(?im)^(?:--- Page 1 ---\s*)?(?:chapter\s+)?"
+            r"(?:one|two|three|four|five|six|seven|eight|nine|ten)\s*$",
+            first_page,
+        )
+        if 0 < page_count <= 100
+        else None
     )
-    if not bounded_match:
+    bounded_source_object = (
+        str(bounded_match.group(0)).strip() if bounded_match else ""
+    )
+    if not bounded_source_object and 0 < page_count <= 100:
+        contents_page_numbers = [
+            int(value)
+            for value in re.findall(
+                r"(?im)^.{3,100}?\.{2,}\s*(\d{2,4})\s*$",
+                first_page,
+            )
+        ]
+        if contents_page_numbers and max(contents_page_numbers) > page_count + 20:
+            bounded_source_object = "table of contents exceeds attachment span"
+    if not bounded_source_object:
         return row
     coverage = dict(row.get("source_coverage", {}) or {})
-    metrics = dict(row.get("coverage_metrics", {}) or {})
-    page_count = int(metrics.get("page_count", 0) or 0)
     metrics.update(
         {
             "bibliographic_scope": "bounded_attachment_excerpt",
@@ -5791,7 +6898,7 @@ def _apply_bibliographic_scope(
         source_coverage=coverage,
         coverage_reason="bounded_attachment_excerpt",
         coverage_metrics=metrics,
-        bounded_source_object=str(bounded_match.group(0)).strip(),
+        bounded_source_object=bounded_source_object,
         rank=70,
     )
     return row
@@ -6080,6 +7187,7 @@ def _frontmatter(
         else [],
         "date": str(data.get("date") or ""),
         "doi": str(data.get("DOI") or data.get("doi") or ""),
+        "isbn": str(data.get("ISBN") or data.get("isbn") or ""),
         "url": str(data.get("url") or ""),
         "original_zotero_tags": original_tags(row["item"]),
         "zotero_relations": data.get("relations", {})
@@ -6096,6 +7204,15 @@ def _frontmatter(
         "inspected_content_hash": row["content_hash"],
         "content_route": row["content_route"],
         "source_scope": str(row.get("source_scope") or "full_document"),
+        "evidence_eligibility": str(
+            row.get("evidence_eligibility")
+            or (
+                "substantive_bounded"
+                if str(row.get("source_scope") or "")
+                in {"full_document", "partial_document"}
+                else "context_only"
+            )
+        ),
         "source_coverage": dict(
             row.get("source_coverage", {})
             or {"coverage_gate": "passed", "reason": "full_document"}
@@ -6107,6 +7224,12 @@ def _frontmatter(
         "reader_model": row["reader_model"],
         "extraction_version": request.extraction_version,
         "prompt_version": request.prompt_version,
+        "source_bundle_prompt_version": SOURCE_BUNDLE_PROMPT_VERSION,
+        "source_bundle_dependency_fingerprint": (
+            _source_bundle_dependency_fingerprint(row, request)
+            if row.get("source_analysis_bundle")
+            else ""
+        ),
         "engine_version": ENGINE_VERSION,
         "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
         "created_at": now_iso(),
@@ -6199,7 +7322,6 @@ def _fingerprint(
     key: str,
     content_hash: str,
     request: MapRequest,
-    item: Mapping[str, Any],
     reader_provider: str,
     reader_model: str,
     source_scope: str,
@@ -6209,11 +7331,11 @@ def _fingerprint(
         "content_hash": content_hash,
         "extraction_version": request.extraction_version,
         "prompt_version": request.prompt_version,
+        "source_bundle_prompt_version": SOURCE_BUNDLE_PROMPT_VERSION,
         "reader_provider": reader_provider,
         "reader_model": reader_model,
         "source_scope": source_scope,
         "question_lens_policy_version": "collection_invariant-1",
-        "metadata_hash": _prompt_metadata_hash(item),
         "chunking_version": CHUNKING_VERSION,
         "content_classifier_version": CONTENT_CLASSIFIER_VERSION,
         "extraction_policy_hash": sha256_text(
@@ -6295,7 +7417,7 @@ def _exhausted_result(
         "zotero_item_key": item_key(item),
         "source_id": source_id_for_item(item),
         "note_id": note_id_for_item(item),
-        "terminal_status": "exhausted",
+        "terminal_status": "parked_for_review",
         "reason": reason,
         "fingerprint": "",
         "note_path": "",
@@ -6318,7 +7440,7 @@ def _public_terminal_row(row: Mapping[str, Any]) -> dict[str, Any]:
         "source_id": str(row.get("source_id", "")),
         "note_id": str(row.get("note_id", "")),
         "note_path": str(row.get("note_path", "")),
-        "terminal_status": str(row.get("terminal_status", "exhausted")),
+        "terminal_status": str(row.get("terminal_status", "parked_for_review")),
         "reason": str(row.get("reason", "")),
         "fingerprint": str(row.get("fingerprint", "")),
         "content_hash": str(row.get("content_hash", "")),
@@ -6369,7 +7491,7 @@ def _reusable_note(path: Path, row: Mapping[str, Any], request: MapRequest) -> b
         return False
     if not validate_note(text).passed:
         return False
-    return all(
+    reusable = all(
         (
             str(frontmatter.get("zotero_item_key", ""))
             == str(row.get("zotero_item_key", "")),
@@ -6384,8 +7506,69 @@ def _reusable_note(path: Path, row: Mapping[str, Any], request: MapRequest) -> b
             str(frontmatter.get("extraction_version", ""))
             == request.extraction_version,
             str(frontmatter.get("prompt_version", "")) == request.prompt_version,
+            str(frontmatter.get("source_bundle_prompt_version", ""))
+            == SOURCE_BUNDLE_PROMPT_VERSION,
         )
     )
+    if not reusable:
+        return False
+    if str(frontmatter.get("note_status") or "") not in {
+        "analytical_atomic_note",
+        "verified_atomic_note",
+        "partial_document_atomic_note",
+    }:
+        return True
+    bundle_path = (
+        path.parents[2]
+        / "02_source_memory"
+        / "bundles"
+        / f"{safe_filename(str(row.get('source_id') or ''))}.yml"
+    )
+    if (
+        not bundle_path.is_file()
+        and not str(frontmatter.get("source_bundle_dependency_fingerprint") or "")
+    ):
+        return True
+    bundle = read_yaml(bundle_path, {}) or {}
+    expected_dependency = _source_bundle_dependency_fingerprint(row, request)
+    if str(bundle.get("dependency_fingerprint") or "") == expected_dependency:
+        return True
+    stored_payload = bundle.get("bundle")
+    if not isinstance(stored_payload, Mapping):
+        return False
+    try:
+        normalized = _source_bundle_from_result(
+            stored_payload,
+            row,
+            str(row.get("source_scope") or "full_document"),
+        )
+    except (TypeError, ValueError):
+        return False
+    if normalized is None:
+        return False
+    try:
+        stored_bundle = SourceAnalysisBundle.from_dict(stored_payload)
+    except (TypeError, ValueError):
+        stored_bundle = None
+    if (
+        stored_bundle is not None
+        and stored_bundle.semantic_dict() == normalized.semantic_dict()
+    ):
+        write_yaml(
+            bundle_path,
+            {
+                **dict(bundle),
+                "dependency_fingerprint": expected_dependency,
+            },
+        )
+        return True
+    _commit_source_bundle(
+        path.parents[2],
+        {**dict(row), "source_analysis_bundle": normalized.to_dict()},
+        path,
+        request,
+    )
+    return True
 
 
 def _compatible_committed_note(
@@ -6409,7 +7592,6 @@ def _compatible_committed_note(
         return None
     zotero_item_key = str(row.get("zotero_item_key") or "")
     source_id = str(row.get("source_id") or "")
-    current_metadata_hash = _prompt_metadata_hash(row.get("item", {}))
     candidates: list[Path] = []
     for fingerprint_path in fingerprint_root.glob("*.yml"):
         payload = read_yaml(fingerprint_path, {}) or {}
@@ -6418,14 +7600,8 @@ def _compatible_committed_note(
         recorded_source_id = str(payload.get("source_id") or "")
         if source_id and recorded_source_id and recorded_source_id != source_id:
             continue
-        recorded_metadata_hash = str(payload.get("metadata_hash") or "")
-        if recorded_metadata_hash and recorded_metadata_hash != current_metadata_hash:
-            continue
         note_path = workspace / str(payload.get("note_path") or "")
-        if note_path.is_file() and (
-            recorded_metadata_hash
-            or _legacy_note_metadata_matches(note_path, row.get("item", {}))
-        ):
+        if note_path.is_file():
             candidates.append(note_path)
     for note_path in sorted(set(candidates), key=lambda path: str(path)):
         if _reusable_note(note_path, row, request):
@@ -6520,6 +7696,7 @@ def _read_document(
     checkpoint_root: Path | None = None,
     progress: _RunProgress | None = None,
     inventory_index: int = 0,
+    provider_budget: _ProfileProviderBudget | None = None,
 ) -> tuple[Mapping[str, Any], str, str]:
     policy = request.processing if request is not None else ProcessingPolicy()
     context_tokens = int(getattr(reader, "context_window_tokens", 0) or 0)
@@ -6541,12 +7718,11 @@ def _read_document(
         "provider": str(getattr(reader, "name", "unknown")),
         "model": str(getattr(reader, "model", "unknown")),
         "prompt_version": request.prompt_version if request else "9",
+        "source_bundle_prompt_version": SOURCE_BUNDLE_PROMPT_VERSION,
         "chunking_version": CHUNKING_VERSION,
         "content_classifier_version": CONTENT_CLASSIFIER_VERSION,
         "question_hash": sha256_text(question or ""),
-        "metadata_hash": sha256_text(
-            json.dumps(dict(metadata), sort_keys=True, ensure_ascii=False, default=str)
-        ),
+        "metadata_hash": _source_read_metadata_hash(metadata),
         "chunk_output_tokens": policy.chunk_output_tokens,
         "synthesis_output_tokens": policy.synthesis_output_tokens,
     }
@@ -6564,16 +7740,39 @@ def _read_document(
             direct_checkpoint.get("analysis"), Mapping
         ):
             return (
-                _ensure_analysis_contract(dict(direct_checkpoint["analysis"])),
+                _ensure_source_result_contract(dict(direct_checkpoint["analysis"])),
                 f"{reader.name}_text",
                 "reused_direct_source_checkpoint",
             )
+        attempt_id = (
+            provider_budget.reserve(
+                "source_bundle_direct",
+                str(
+                    (
+                        metadata.get("_source_context", {})
+                        if isinstance(metadata.get("_source_context"), Mapping)
+                        else {}
+                    ).get("zotero_key")
+                    or document_hash
+                ),
+                stable_hash(direct_identity),
+            )
+            if provider_budget is not None
+            else ""
+        )
         try:
             if progress is not None:
                 progress.record_source_provider_call()
-            analysis = _ensure_analysis_contract(
-                dict(reader.read_source(text, metadata, question))
-            )
+            bundle_reader = getattr(reader, "read_source_bundle", None)
+            if callable(bundle_reader):
+                analysis = dict(bundle_reader(text, metadata, question))
+                SourceAnalysisBundle.from_dict(analysis)
+            else:
+                analysis = _ensure_analysis_contract(
+                    dict(reader.read_source(text, metadata, question))
+                )
+            if provider_budget is not None:
+                provider_budget.finish(attempt_id, status="completed")
             if checkpoint_enabled:
                 write_yaml(
                     direct_path,
@@ -6583,18 +7782,25 @@ def _read_document(
                         "updated_at": now_iso(),
                     },
                 )
-            return analysis, f"{reader.name}_text", "full_document_source_read"
+            return (
+                _ensure_source_result_contract(analysis),
+                f"{reader.name}_text",
+                "full_document_source_read",
+            )
         except Exception as exc:
+            if provider_budget is not None:
+                provider_budget.finish(attempt_id, status="failed")
             message = str(exc).casefold()
             if not any(
                 token in message
                 for token in (
-                    "context",
-                    "token",
-                    "too long",
+                    "context length",
+                    "context window",
+                    "input token",
+                    "maximum context",
+                    "prompt too long",
                     "too large",
                     "request size",
-                    "length",
                 )
             ):
                 raise
@@ -6631,21 +7837,50 @@ def _read_document(
                     "document_deadline_reached", len(analyses), len(chunks)
                 )
             locator = _chunk_locator(chunk, index, len(chunks))
-            attempts_before = int(getattr(reader, "transport_attempt_count", 0) or 0)
-            if progress is not None:
-                progress.record_source_provider_call()
-            if hasattr(reader, "summarize_chunk"):
-                analysis = reader.summarize_chunk(  # type: ignore[attr-defined]
-                    chunk,
-                    metadata,
-                    question,
-                    chunk_id=f"chunk-{index + 1:04d}",
-                    locator=locator,
-                    max_output_tokens=policy.chunk_output_tokens,
-                    deadline_seconds=policy.request_deadline_seconds,
+            attempt_id = (
+                provider_budget.reserve(
+                    "source_chunk",
+                    str(
+                        (
+                            metadata.get("_source_context", {})
+                            if isinstance(metadata.get("_source_context"), Mapping)
+                            else {}
+                        ).get("zotero_key")
+                        or document_hash
+                    ),
+                    stable_hash(
+                        {
+                            **checkpoint_identity,
+                            "chunk_index": index,
+                            "chunk_hash": sha256_text(chunk),
+                        }
+                    ),
                 )
-            else:
-                analysis = reader.read_source(chunk, metadata, question)
+                if provider_budget is not None
+                else ""
+            )
+            attempts_before = int(getattr(reader, "transport_attempt_count", 0) or 0)
+            try:
+                if progress is not None:
+                    progress.record_source_provider_call()
+                if hasattr(reader, "summarize_chunk"):
+                    analysis = reader.summarize_chunk(  # type: ignore[attr-defined]
+                        chunk,
+                        metadata,
+                        question,
+                        chunk_id=f"chunk-{index + 1:04d}",
+                        locator=locator,
+                        max_output_tokens=policy.chunk_output_tokens,
+                        deadline_seconds=policy.request_deadline_seconds,
+                    )
+                else:
+                    analysis = reader.read_source(chunk, metadata, question)
+            except Exception:
+                if provider_budget is not None:
+                    provider_budget.finish(attempt_id, status="failed")
+                raise
+            if provider_budget is not None:
+                provider_budget.finish(attempt_id, status="completed")
             attempts_after = int(getattr(reader, "transport_attempt_count", 0) or 0)
             calls += max(1, attempts_after - attempts_before)
             if checkpoint_enabled:
@@ -6674,8 +7909,10 @@ def _read_document(
     if synthesis.get("identity") == checkpoint_identity and isinstance(
         synthesis.get("analysis"), Mapping
     ):
-        merged = _ensure_analysis_contract(dict(synthesis["analysis"]))
-    elif hasattr(reader, "synthesize_document"):
+        merged = _ensure_source_result_contract(dict(synthesis["analysis"]))
+    elif hasattr(reader, "synthesize_document_bundle") or hasattr(
+        reader, "synthesize_document"
+    ):
         if calls >= policy.max_calls_per_document_run:
             raise DocumentPartialError(
                 "document_call_budget_reached_before_synthesis",
@@ -6686,19 +7923,56 @@ def _read_document(
             raise DocumentPartialError(
                 "document_deadline_reached_before_synthesis", len(analyses), len(chunks)
             )
-        if progress is not None:
-            progress.record_source_provider_call()
-        merged = _ensure_analysis_contract(
-            dict(
-                reader.synthesize_document(  # type: ignore[attr-defined]
-                    analyses,
-                    metadata,
-                    question,
-                    max_output_tokens=policy.synthesis_output_tokens,
-                    deadline_seconds=policy.request_deadline_seconds,
-                )
+        attempt_id = (
+            provider_budget.reserve(
+                "source_bundle_synthesis",
+                str(
+                    (
+                        metadata.get("_source_context", {})
+                        if isinstance(metadata.get("_source_context"), Mapping)
+                        else {}
+                    ).get("zotero_key")
+                    or document_hash
+                ),
+                stable_hash(checkpoint_identity),
             )
+            if provider_budget is not None
+            else ""
         )
+        try:
+            if progress is not None:
+                progress.record_source_provider_call()
+            bundle_synthesizer = getattr(reader, "synthesize_document_bundle", None)
+            if callable(bundle_synthesizer):
+                merged = _ensure_source_result_contract(
+                    dict(
+                        bundle_synthesizer(
+                            analyses,
+                            metadata,
+                            question,
+                            max_output_tokens=policy.synthesis_output_tokens,
+                            deadline_seconds=policy.request_deadline_seconds,
+                        )
+                    )
+                )
+            else:
+                merged = _ensure_analysis_contract(
+                    dict(
+                        reader.synthesize_document(  # type: ignore[attr-defined]
+                            analyses,
+                            metadata,
+                            question,
+                            max_output_tokens=policy.synthesis_output_tokens,
+                            deadline_seconds=policy.request_deadline_seconds,
+                        )
+                    )
+                )
+        except Exception:
+            if provider_budget is not None:
+                provider_budget.finish(attempt_id, status="failed")
+            raise
+        if provider_budget is not None:
+            provider_budget.finish(attempt_id, status="completed")
         if checkpoint_enabled:
             write_yaml(
                 synthesis_path,
@@ -6724,6 +7998,44 @@ def _read_document(
         f"{reader.name}_hierarchical_text",
         f"hierarchical_source_read:{len(chunks)}",
     )
+
+
+def _source_read_metadata_hash(metadata: Mapping[str, Any]) -> str:
+    """Hash stable identity/extraction context, not mutable display metadata."""
+
+    context = (
+        dict(metadata.get("_source_context") or {})
+        if isinstance(metadata.get("_source_context"), Mapping)
+        else {}
+    )
+    stable = {
+        key: context.get(key)
+        for key in (
+            "source_id",
+            "zotero_key",
+            "attachment_key",
+            "source_scope",
+            "page_count",
+            "unresolved_pages",
+            "recovered_pages",
+            "recovered_page_ratio",
+            "content_kind",
+            "ordinal_to_printed_page",
+            "heading_spans",
+            "table_spans",
+            "figure_spans",
+        )
+        if context.get(key) not in (None, "", [], {})
+    }
+    return sha256_text(
+        json.dumps(stable, sort_keys=True, ensure_ascii=False, default=str)
+    )
+
+
+def _ensure_source_result_contract(result: Mapping[str, Any]) -> dict[str, Any]:
+    if str(result.get("bundle_schema_version") or "") == "1":
+        return SourceAnalysisBundle.from_dict(result).to_dict()
+    return _ensure_analysis_contract(result)
 
 
 def _ensure_analysis_contract(analysis: Mapping[str, Any]) -> dict[str, Any]:

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 import auto_zettelkasten.extraction as extraction
 from auto_zettelkasten.extraction import (
     ContentAdequacyClass,
@@ -12,12 +14,14 @@ from auto_zettelkasten.navigation import _profile_is_analytical
 from auto_zettelkasten.notes import (
     parse_atomic_note,
     public_note_frontmatter,
-    render_limited_note,
-    validate_limited_note,
+    render_atomic_note,
+    validate_atomic_note,
+    write_atomic_note,
     write_limited_note,
 )
 from auto_zettelkasten.pipeline import all_workspace_note_rows
 from auto_zettelkasten.profiles import deterministic_profile, profile_to_dict
+from conftest import SECTION_KEYS
 
 
 def test_substantive_mixed_pdf_with_one_unresolved_page_is_partial(
@@ -52,6 +56,47 @@ def test_substantive_mixed_pdf_with_one_unresolved_page_is_partial(
     assert result.coverage_metrics["recovered_pages"] == (1, 2, 3, 4)
     assert result.coverage_metrics["recovered_page_ratio"] == 0.8
     assert result.coverage_metrics["ordinal_to_printed_page"]["1"] == "1"
+
+
+@pytest.mark.parametrize("recovered_count", [39, 100, 105])
+def test_near_complete_pdf_keeps_recovered_content_with_one_unresolved_page(
+    monkeypatch,
+    recovered_count: int,
+) -> None:
+    monkeypatch.setattr(
+        extraction,
+        "_ocr_pdf_page",
+        lambda *_args: extraction._OCRPageResult(),
+    )
+    def unique_page(page_index: int) -> str:
+        def letters(number: int) -> str:
+            value = ""
+            while number >= 0:
+                value = chr(97 + number % 26) + value
+                number = number // 26 - 1
+            return value
+
+        return " ".join(
+            f"concept{letters(page_index * 120 + word_index)}"
+            for word_index in range(110)
+        ) + "."
+
+    pages = [unique_page(index) for index in range(recovered_count)]
+    pages.insert(recovered_count // 2, "scan")
+
+    result = extraction.extract_bytes(
+        _pdf(pages),
+        media_type="application/pdf",
+        filename=f"near-complete-{recovered_count + 1}.pdf",
+    )
+
+    assert result.status == "succeeded"
+    assert result.source_scope == "partial_document"
+    assert len(result.coverage_metrics["unresolved_pages"]) == 1
+    assert len(result.coverage_metrics["recovered_pages"]) == recovered_count
+    assert result.coverage_metrics["recovered_page_ratio"] == pytest.approx(
+        recovered_count / (recovered_count + 1),
+    )
 
 
 def test_pdf_classification_records_printed_page_map_and_source_spans() -> None:
@@ -104,6 +149,46 @@ def test_reference_only_pdf_is_not_analytical() -> None:
     assert adequacy.metrics["content_kind"] == "bibliography_only"
 
 
+def test_reference_heading_on_archive_cover_does_not_hide_article_body() -> None:
+    references = "\n".join(
+        f"Scholar, A. ({1980 + index}). Conflict study {index}."
+        for index in range(30)
+    )
+    body = "\n".join(
+        f"--- Page {page} ---\n"
+        + ("The article develops and tests a conflict mechanism. " * 45)
+        for page in range(2, 24)
+    )
+    text = (
+        "--- Page 1 ---\nREFERENCES\nArchive cover\n"
+        f"{body}\n--- Page 24 ---\nReferences\n{references}"
+    )
+
+    adequacy = classify_pdf_text(text, page_count=24)
+
+    assert adequacy.is_full_publication
+    assert adequacy.reason != "bibliography_only_attachment"
+
+
+def test_reference_archive_cover_without_trailing_bibliography_keeps_article() -> None:
+    body = "\n".join(
+        f"--- Page {page} ---\n"
+        + ("The analysis tests a conflict recurrence mechanism in panel data. " * 50)
+        for page in range(3, 24)
+    )
+    text = (
+        "--- Page 1 ---\nREFERENCES\nJSTOR archive cover\n"
+        "--- Page 2 ---\nAbstract\nThe study evaluates postwar recurrence.\n"
+        "Introduction\n"
+        f"{body}"
+    )
+
+    adequacy = classify_pdf_text(text, page_count=23)
+
+    assert adequacy.is_full_publication
+    assert adequacy.reason != "bibliography_only_attachment"
+
+
 def test_complete_institutional_html_passes_without_article_or_p_tags() -> None:
     blocks = [
         "The institution explains its mandate governance membership history and "
@@ -122,6 +207,25 @@ def test_complete_institutional_html_passes_without_article_or_p_tags() -> None:
     assert adequacy.metrics["strong_visible_body"] is True
     assert adequacy.metrics["article_word_count"] == 0
     assert adequacy.access_markers == ("institutional access",)
+
+
+def test_partial_jstor_viewer_is_evidence_bounded() -> None:
+    excerpt = " ".join(
+        ["The article develops an insider mediation argument from a regional case."]
+        * 120
+    )
+    raw_html = (
+        "<html><body><h1>Article on JSTOR</h1>"
+        "<p>Journal article, pp. 85-98 (14 pages)</p>"
+        f"<article><h2>Introduction</h2><p>{excerpt}</p></article>"
+        "</body></html>"
+    )
+
+    adequacy = classify_html_content(raw_html)
+
+    assert adequacy.source_scope == "partial_document"
+    assert adequacy.coverage_gate == "limited"
+    assert adequacy.reason == "partial_article_viewer_html"
 
 
 def test_incidental_access_marker_does_not_demote_complete_html() -> None:
@@ -164,57 +268,56 @@ def test_long_abstract_inside_paywall_is_not_mistaken_for_full_html() -> None:
     assert adequacy.metrics["enclosing_paywall"] is True
 
 
-def test_partial_document_note_is_limited_and_discloses_missing_pages(
+def test_evidence_bounded_partial_document_uses_analytical_note_structure(
     tmp_path: Path,
 ) -> None:
     frontmatter = _partial_frontmatter()
-    content = {
-        "available_content_findings": (
-            "Across the recovered text, the source reports a negotiated transition "
-            "and identifies implementation constraints (PDF pages 1-4)."
-        ),
-        "coverage_limitation": (
-            "Recovered PDF pages 1, 2, 3, and 4 were inspected. PDF page 5 is "
-            "missing or unresolved, so this note does not represent the complete document."
-        ),
+    frontmatter["evidence_eligibility"] = "substantive_bounded"
+    analysis = {
+        key: (
+            "The recovered pages support this bounded analysis; PDF pages 1-4 "
+            "were inspected and PDF page 5 remains unresolved."
+        )
+        for key in SECTION_KEYS
     }
 
-    text = render_limited_note(frontmatter, content)
-    validation = validate_limited_note(text)
-    path, written_validation = write_limited_note(tmp_path, frontmatter, content)
+    text = render_atomic_note(frontmatter, analysis)
+    validation = validate_atomic_note(text)
+    path, written_validation = write_atomic_note(tmp_path, frontmatter, analysis)
 
     assert validation.passed, validation.errors
     assert written_validation.passed, written_validation.errors
-    assert "## Available-content Findings" in text
-    assert "## Coverage Limitation" in text
-    assert "## Thesis" not in text
+    assert "## Thesis" in text
+    assert "Coverage boundary" in text
+    assert "PDF page 5 remains unresolved" in text
     projected, _ = parse_atomic_note(path.read_text())
-    assert projected["type"] == "limited-source-note"
+    assert projected["type"] == "atomic-note"
     assert projected["coverage"] == "partial document"
     assert public_note_frontmatter(frontmatter)["coverage"] == "partial document"
 
 
-def test_partial_document_profile_is_context_only() -> None:
-    note = render_limited_note(
-        _partial_frontmatter(),
+def test_evidence_bounded_partial_document_profile_is_analytical() -> None:
+    frontmatter = _partial_frontmatter()
+    frontmatter["evidence_eligibility"] = "substantive_bounded"
+    note = render_atomic_note(
+        frontmatter,
         {
-            "available_content_findings": (
-                "The recovered pages describe mediation practice (PDF pages 1-4)."
-            ),
-            "coverage_limitation": (
-                "Recovered PDF pages 1-4 were inspected; PDF page 5 is missing."
-            ),
+            key: (
+                "The recovered pages describe mediation practice and bound every "
+                "claim to PDF pages 1-4; PDF page 5 is missing."
+            )
+            for key in SECTION_KEYS
         },
     )
 
     profile = profile_to_dict(deterministic_profile(note))
 
-    assert profile["excluded_from_synthesis"] is True
-    assert profile["validity"]["status"] == "excluded_context_only"
-    assert profile["findings"] == []
-    assert profile["evidence_anchors"] == []
-    assert _profile_is_analytical(profile) is False
-    assert "Partial-document context" in profile["context"]["exclusion_reason"]
+    assert profile["evidence_eligibility"] == "substantive_bounded"
+    assert "excluded_from_synthesis" not in profile
+    assert profile["validity"]["status"] == "valid"
+    assert profile["findings"]
+    assert profile["evidence_anchors"]
+    assert _profile_is_analytical(profile) is True
 
 
 def test_workspace_source_set_keeps_partial_document_context(tmp_path: Path) -> None:
@@ -261,6 +364,8 @@ def _partial_frontmatter() -> dict[str, object]:
         "source_file": "partial.pdf",
         "inspected_content_hash": "a" * 64,
         "content_route": "pypdf_text",
+        "reader_provider": "fake",
+        "reader_model": "fake-1",
         "original_zotero_tags": [],
         "normalized_tags": [],
         "related_notes": [],

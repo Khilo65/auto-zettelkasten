@@ -6,11 +6,14 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .files import now_iso, read_yaml, sha256_text, write_yaml
+from .models import RelationshipDecision, RelationshipPairJob
 from .navigation import TYPED_SOURCE_RELATIONS, rank_human_related_links
 
 
-RELATIONSHIP_PROMPT_VERSION = "2"
-RELATIONSHIP_REGISTRY_SCHEMA_VERSION = "3"
+RELATIONSHIP_PROMPT_VERSION = "3"
+RELATIONSHIP_REGISTRY_SCHEMA_VERSION = "4"
+RELATIONSHIP_DECISION_SCHEMA_VERSION = "4"
+RELATIONSHIP_DECISION_CONTRACT = "relationship-decision-v4"
 SUBSTANTIVE_RELATION_TYPES = frozenset(
     {
         "supports",
@@ -18,6 +21,7 @@ SUBSTANTIVE_RELATION_TYPES = frozenset(
         "qualifies",
         "extends",
         "complements",
+        "contrasts",
         "rival_explanation",
         "boundary_contrast",
         "methodological_fault_line",
@@ -31,11 +35,31 @@ RECIPROCAL_RELATION_TYPES = {
     "qualifies": "qualified_by",
     "extends": "extended_by",
     "complements": "complements",
+    "contrasts": "contrasts",
     "rival_explanation": "rival_explanation",
     "boundary_contrast": "boundary_contrast",
     "methodological_fault_line": "methodological_fault_line",
     "sequential_relationship": "sequential_relationship",
     "interpretive_or_normative_disagreement": "interpretive_or_normative_disagreement",
+}
+RELATIONSHIP_PROJECTION_LABELS = {
+    "supports": ("supports", "supported by"),
+    "undermines": ("undermines", "undermined by"),
+    "qualifies": ("qualifies", "qualified by"),
+    "extends": ("extends", "extended by"),
+    "complements": ("complements", "complements"),
+    "contrasts": ("contrasts with", "contrasts with"),
+    "rival_explanation": ("offers a rival explanation to", "has a rival explanation from"),
+    "boundary_contrast": ("contrasts in scope with", "contrasts in scope with"),
+    "methodological_fault_line": (
+        "differs methodologically from",
+        "differs methodologically from",
+    ),
+    "sequential_relationship": ("precedes in sequence", "follows in sequence"),
+    "interpretive_or_normative_disagreement": (
+        "disagrees interpretively with",
+        "disagrees interpretively with",
+    ),
 }
 _LIMITED_STATUSES = {
     "abstract_only_atomic_note",
@@ -259,6 +283,218 @@ def validate_bridge_shard_pairs(
             }
         )
     return accepted, parked
+
+
+def ingest_relationship_decision_batch(
+    response: Mapping[str, Any],
+    *,
+    pair_jobs: Sequence[RelationshipPairJob | Mapping[str, Any]],
+    profiles: Sequence[Any] = (),
+    provider: str = "",
+    model: str = "",
+    reasoner_backend: str = "",
+    prompt_version: str = RELATIONSHIP_PROMPT_VERSION,
+) -> dict[str, list[dict[str, Any]]]:
+    """Validate independent decision-v4 rows without rejudging their semantics."""
+
+    jobs: dict[str, tuple[RelationshipPairJob, dict[str, Any]]] = {}
+    for value in pair_jobs:
+        job = (
+            value
+            if isinstance(value, RelationshipPairJob)
+            else RelationshipPairJob.from_dict(value)
+        )
+        if job.pair_job_id in jobs:
+            raise ValueError(f"duplicate relationship pair job: {job.pair_job_id}")
+        jobs[job.pair_job_id] = (job, job.to_dict())
+    profiles_by_source = {
+        str(row.get("source_id") or ""): row
+        for row in (profile_row(value) for value in profiles)
+        if row.get("source_id")
+    }
+
+    raw_rows = response.get("decisions", []) or []
+    if not isinstance(raw_rows, Sequence) or isinstance(
+        raw_rows, (str, bytes, bytearray)
+    ):
+        raw_rows = []
+    job_counts: dict[str, int] = {}
+    for value in raw_rows:
+        if isinstance(value, Mapping):
+            job_id = str(value.get("pair_job_id") or "").strip()
+            if job_id:
+                job_counts[job_id] = job_counts.get(job_id, 0) + 1
+
+    accepted: list[dict[str, Any]] = []
+    no_relationship: list[dict[str, Any]] = []
+    needs_more_context: list[dict[str, Any]] = []
+    parked: list[dict[str, Any]] = []
+    completed_job_ids: set[str] = set()
+    for index, raw in enumerate(raw_rows):
+        if not isinstance(raw, Mapping):
+            parked.append(
+                {
+                    "row_index": index,
+                    "reason": "decision_v4_not_mapping",
+                    "raw": raw,
+                }
+            )
+            continue
+        row = dict(raw)
+        row_provider = str(row.pop("provider", "") or provider)
+        row_model = str(row.pop("model", "") or model)
+        row_backend = str(
+            row.pop("reasoner_backend", "") or reasoner_backend or row_provider
+        )
+        job_id = str(row.get("pair_job_id") or "").strip()
+        if job_id not in jobs:
+            parked.append(
+                {
+                    "row_index": index,
+                    "pair_job_id": job_id,
+                    "reason": "pair_job_not_in_batch",
+                    "raw": row,
+                }
+            )
+            continue
+        if job_counts.get(job_id, 0) != 1:
+            parked.append(
+                {
+                    "row_index": index,
+                    "pair_job_id": job_id,
+                    "reason": "duplicate_pair_job_decision",
+                    "raw": row,
+                }
+            )
+            continue
+
+        job, job_row = jobs[job_id]
+        reasons: list[str] = []
+        try:
+            decision = RelationshipDecision.from_dict(row)
+        except (TypeError, ValueError) as exc:
+            parked.append(
+                {
+                    "row_index": index,
+                    "pair_job_id": job_id,
+                    "reason": "invalid_decision_v4_contract",
+                    "error": str(exc),
+                    "raw": row,
+                }
+            )
+            continue
+
+        if (
+            decision.left_source_id != job.left_source_id
+            or decision.right_source_id != job.right_source_id
+        ):
+            reasons.append("decision_pair_does_not_match_job")
+
+        left_anchors = _job_anchor_rows(
+            job_row,
+            side="left",
+            source_id=job.left_source_id,
+            profile=profiles_by_source.get(job.left_source_id, {}),
+        )
+        right_anchors = _job_anchor_rows(
+            job_row,
+            side="right",
+            source_id=job.right_source_id,
+            profile=profiles_by_source.get(job.right_source_id, {}),
+        )
+        if decision.decision == "relationship":
+            if decision.relation_type not in SUBSTANTIVE_RELATION_TYPES:
+                reasons.append("unsupported_relation_type")
+            if {
+                decision.actor_source_id,
+                decision.reference_source_id,
+            } != {job.left_source_id, job.right_source_id}:
+                reasons.append("direction_does_not_use_job_pair")
+            expected_labels = RELATIONSHIP_PROJECTION_LABELS.get(
+                decision.relation_type
+            )
+            if expected_labels and (
+                _normalized_label(decision.forward_label)
+                != _normalized_label(expected_labels[0])
+                or _normalized_label(decision.inverse_label)
+                != _normalized_label(expected_labels[1])
+            ):
+                reasons.append("relation_labels_do_not_match_type")
+            if not set(decision.left_evidence_anchor_ids) <= set(left_anchors):
+                reasons.append("left_anchor_not_owned_by_left_source")
+            if not set(decision.right_evidence_anchor_ids) <= set(right_anchors):
+                reasons.append("right_anchor_not_owned_by_right_source")
+
+        if reasons:
+            parked.append(
+                {
+                    "row_index": index,
+                    "pair_job_id": job_id,
+                    "source_id": job.left_source_id,
+                    "target_source_id": job.right_source_id,
+                    "reason": ",".join(reasons),
+                    "raw": row,
+                }
+            )
+            continue
+
+        completed_job_ids.add(job_id)
+        normalized = _normalized_v4_decision(
+            decision,
+            job=job,
+            job_row=job_row,
+            left_anchors=left_anchors,
+            right_anchors=right_anchors,
+            provider=row_provider,
+            model=row_model,
+            reasoner_backend=row_backend,
+            prompt_version=prompt_version,
+            profiles_by_source=profiles_by_source,
+        )
+        if decision.decision == "relationship":
+            accepted.append(normalized)
+        elif decision.decision == "no_relationship":
+            no_relationship.append(normalized)
+        else:
+            needs_more_context.append(normalized)
+
+    for job_id, (job, _job_row) in jobs.items():
+        if job_id not in completed_job_ids and job_counts.get(job_id, 0) == 0:
+            parked.append(
+                {
+                    "pair_job_id": job_id,
+                    "source_id": job.left_source_id,
+                    "target_source_id": job.right_source_id,
+                    "reason": "missing_decision_for_pair_job",
+                }
+            )
+    return {
+        "accepted": accepted,
+        "no_relationship": no_relationship,
+        "needs_more_context": needs_more_context,
+        "parked": parked,
+    }
+
+
+def validate_relationship_decision_rows(
+    response: Mapping[str, Any],
+    *,
+    jobs: Sequence[RelationshipPairJob | Mapping[str, Any]],
+    profiles: Sequence[Any],
+    provider: str = "",
+    model: str = "",
+    reasoner_backend: str = "",
+    prompt_version: str = RELATIONSHIP_PROMPT_VERSION,
+) -> dict[str, list[dict[str, Any]]]:
+    return ingest_relationship_decision_batch(
+        response,
+        pair_jobs=jobs,
+        profiles=profiles,
+        provider=provider,
+        model=model,
+        reasoner_backend=reasoner_backend,
+        prompt_version=prompt_version,
+    )
 
 
 def validate_decisions(
@@ -627,6 +863,7 @@ def persist_relationship_registry(
     no_relationship_decisions: Sequence[Mapping[str, Any]] = (),
     parked_rows: Sequence[Mapping[str, Any]] = (),
     preserve_unmentioned_structural: bool = False,
+    orphaned_source_ids: Sequence[str] = (),
 ) -> dict[str, Any]:
     path = workspace / "02_source_memory" / "indexes" / "typed_links.yml"
     compatibility_path = (
@@ -649,6 +886,17 @@ def persist_relationship_registry(
             continue
         row = dict(raw)
         if (
+            existing_schema == "3"
+            and _machine_substantive(row)
+            and bool(row.get("active", True))
+            and _verified_machine_relation(row)
+        ):
+            row.update(
+                decision_status="legacy_review_pending",
+                legacy_review_pending=True,
+                cluster_evidence_eligible=False,
+            )
+        elif (
             existing_schema != RELATIONSHIP_REGISTRY_SCHEMA_VERSION
             and _machine_substantive(row)
             and bool(row.get("active", True))
@@ -662,20 +910,28 @@ def persist_relationship_registry(
             )
         migrated_rows.append(row)
     existing_rows = migrated_rows
-    verified_accepted_relations = [
+    final_accepted_relations = [
         dict(row)
         for row in accepted_relations
         if isinstance(row, Mapping)
         and (
-            _verified_machine_relation(row)
+            _final_v4_relation(row)
+            or _verified_machine_relation(row)
             or str(row.get("provenance") or "").startswith("human")
+        )
+    ]
+    final_no_relationship_decisions = [
+        dict(row)
+        for row in no_relationship_decisions
+        if isinstance(row, Mapping)
+        and (
+            _final_v4_decision(row, decision="no_relationship")
+            or str(row.get("verification_status") or "") == "no_relationship"
         )
     ]
     verified_no_relationship_decisions = [
         dict(row)
-        for row in no_relationship_decisions
-        if isinstance(row, Mapping)
-        and str(row.get("verification_status") or "") == "no_relationship"
+        for row in final_no_relationship_decisions
     ]
     retained = [
         dict(row)
@@ -699,6 +955,20 @@ def persist_relationship_registry(
             row.get("relation_id") or row.get("link_id") or stable_hash(row)
         )
         rows_by_id[identity] = row
+    orphaned = {str(value) for value in orphaned_source_ids if str(value)}
+    if orphaned:
+        for row in rows_by_id.values():
+            if str(row.get("provenance") or "").startswith("human"):
+                continue
+            if {
+                str(row.get("source_id") or ""),
+                str(row.get("target_source_id") or ""),
+            } & orphaned:
+                row.update(
+                    active=False,
+                    decision_status="orphaned_source",
+                    retirement_reason="source_unavailable_in_zotero_snapshot",
+                )
 
     for decision in verified_no_relationship_decisions:
         pair = canonical_pair(
@@ -718,7 +988,7 @@ def persist_relationship_registry(
                 ),
             )
 
-    for accepted in verified_accepted_relations:
+    for accepted in final_accepted_relations:
         row = dict(accepted)
         pair = canonical_pair(
             str(row.get("source_id") or ""),
@@ -753,7 +1023,7 @@ def persist_relationship_registry(
         if bool(row.get("active", True))
         and (
             not _machine_substantive(row)
-            or _verified_machine_relation(row)
+            or _publishable_machine_relation(row)
         )
     ]
     prior_decisions = (
@@ -767,7 +1037,7 @@ def persist_relationship_registry(
         if isinstance(row, Mapping)
     }
     for status, decisions in (
-        ("accepted", verified_accepted_relations),
+        ("accepted", final_accepted_relations),
         ("no_relationship", verified_no_relationship_decisions),
     ):
         for row in decisions:
@@ -782,7 +1052,13 @@ def persist_relationship_registry(
                     row.get("prompt_version") or RELATIONSHIP_PROMPT_VERSION
                 ),
             )
-            pair_decisions[decision_key] = {
+            decision_record = {
+                **(
+                    dict(row)
+                    if str(row.get("output_contract") or "")
+                    == RELATIONSHIP_DECISION_CONTRACT
+                    else {}
+                ),
                 "decision_key": decision_key,
                 "source_id": str(row.get("source_id") or ""),
                 "target_source_id": str(row.get("target_source_id") or ""),
@@ -812,6 +1088,44 @@ def persist_relationship_registry(
                     or RELATIONSHIP_PROMPT_VERSION
                 ),
             }
+            pair_decisions[decision_key] = decision_record
+
+    events = {
+        str(row.get("event_id") or ""): dict(row)
+        for row in (
+            existing.get("events", []) or []
+            if isinstance(existing, Mapping)
+            else []
+        )
+        if isinstance(row, Mapping) and row.get("event_id")
+    }
+    for row in migrated_rows:
+        if str(row.get("decision_status") or "") == "legacy_review_pending":
+            _merge_registry_event(events, "legacy_review_pending", row)
+    for row in final_accepted_relations:
+        _merge_registry_event(events, "accepted", row)
+    for row in verified_no_relationship_decisions:
+        _merge_registry_event(events, "no_relationship", row)
+    for row in parked_rows:
+        if isinstance(row, Mapping):
+            _merge_registry_event(events, "parked", row)
+    for row in relations:
+        if str(row.get("decision_status") or "") in {
+            "retired",
+            "superseded",
+            "legacy_review_pending",
+            "orphaned_source",
+        }:
+            _merge_registry_event(
+                events, str(row.get("decision_status") or ""), row
+            )
+    event_rows = [events[key] for key in sorted(events)]
+    parked = [
+        dict(event.get("payload") or {})
+        for event in event_rows
+        if event.get("event_type") == "parked"
+        and isinstance(event.get("payload"), Mapping)
+    ]
     semantic = {
         "registry_schema_version": RELATIONSHIP_REGISTRY_SCHEMA_VERSION,
         "relations": relations,
@@ -819,6 +1133,8 @@ def persist_relationship_registry(
         "pair_decisions": [
             pair_decisions[key] for key in sorted(pair_decisions)
         ],
+        "events": event_rows,
+        "parked": parked,
     }
     revision_hash = stable_hash(semantic)
     if (
@@ -847,6 +1163,8 @@ def persist_relationship_registry(
         "links": list(payload.get("links", []) or []),
         "relations": list(payload.get("relations", []) or []),
         "pair_decisions": list(payload.get("pair_decisions", []) or []),
+        "events": list(payload.get("events", []) or []),
+        "parked": list(payload.get("parked", []) or []),
         "link_count": len(payload.get("links", []) or []),
         "relation_counts": dict(payload.get("relation_counts", {}) or {}),
         "graph_projection_hash": str(payload.get("graph_projection_hash") or ""),
@@ -881,17 +1199,20 @@ def projected_related_links(
     for row in active:
         if str(row.get("relation_type") or "") not in SUBSTANTIVE_RELATION_TYPES:
             continue
-        if _machine_substantive(row) and not _verified_machine_relation(row):
+        if _machine_substantive(row) and not _publishable_machine_relation(row):
             continue
         left = str(row.get("source_id") or "")
         right = str(row.get("target_source_id") or "")
         if source_id == left:
             target = right
-            relation_type = str(row.get("relation_type") or "")
+            relation_type = str(
+                row.get("forward_label") or row.get("relation_type") or ""
+            )
         elif source_id == right:
             target = left
             relation_type = str(
-                row.get("reciprocal_type")
+                row.get("inverse_label")
+                or row.get("reciprocal_type")
                 or RECIPROCAL_RELATION_TYPES.get(
                     str(row.get("relation_type") or ""),
                     str(row.get("relation_type") or ""),
@@ -932,6 +1253,183 @@ def projected_related_links(
             str(row.get("primary_relation_type") or ""),
         ),
     )
+
+
+def _job_anchor_rows(
+    job: Mapping[str, Any],
+    *,
+    side: str,
+    source_id: str,
+    profile: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    selected = (
+        job.get("selected_evidence")
+        if isinstance(job.get("selected_evidence"), Mapping)
+        else {}
+    )
+    values = selected.get(side) or selected.get(source_id) or []
+    profile_anchors = {
+        _evidence_id(row): row
+        for row in (
+            dict(value)
+            if isinstance(value, Mapping)
+            else value.to_dict()
+            if callable(getattr(value, "to_dict", None))
+            else {}
+            for value in (
+                profile.get("evidence_anchors")
+                or profile.get("claims")
+                or profile.get("findings")
+                or []
+            )
+        )
+        if _evidence_id(row)
+        and str(row.get("source_id") or source_id) == source_id
+    }
+    anchors: dict[str, dict[str, Any]] = {}
+    for value in values:
+        row = (
+            dict(value)
+            if isinstance(value, Mapping)
+            else value.to_dict()
+            if callable(getattr(value, "to_dict", None))
+            else profile_anchors.get(str(value), {})
+        )
+        anchor_id = _evidence_id(row)
+        owner = str(row.get("source_id") or source_id)
+        if anchor_id and owner == source_id:
+            anchors[anchor_id] = profile_anchors.get(anchor_id, row)
+    return anchors
+
+
+def _job_profile(
+    job: Mapping[str, Any], *, side: str, source_id: str
+) -> dict[str, Any]:
+    profiles = (
+        job.get("profiles") if isinstance(job.get("profiles"), Mapping) else {}
+    )
+    value = profiles.get(side) or profiles.get(source_id) or {}
+    try:
+        return profile_row(value)
+    except ValueError:
+        return {}
+
+
+def _normalized_label(value: str) -> str:
+    return " ".join(str(value).strip().lower().replace("_", " ").split())
+
+
+def _normalized_v4_decision(
+    decision: RelationshipDecision,
+    *,
+    job: RelationshipPairJob,
+    job_row: Mapping[str, Any],
+    left_anchors: Mapping[str, Mapping[str, Any]],
+    right_anchors: Mapping[str, Mapping[str, Any]],
+    provider: str,
+    model: str,
+    reasoner_backend: str,
+    prompt_version: str,
+    profiles_by_source: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    left_profile = dict(
+        profiles_by_source.get(job.left_source_id)
+        or _job_profile(
+            job_row, side="left", source_id=job.left_source_id
+        )
+    )
+    right_profile = dict(
+        profiles_by_source.get(job.right_source_id)
+        or _job_profile(
+            job_row, side="right", source_id=job.right_source_id
+        )
+    )
+    common = {
+        "decision_schema_version": RELATIONSHIP_DECISION_SCHEMA_VERSION,
+        "output_contract": RELATIONSHIP_DECISION_CONTRACT,
+        "pair_job_id": job.pair_job_id,
+        "catalogue_revision": job.catalogue_revision,
+        "left_source_id": job.left_source_id,
+        "right_source_id": job.right_source_id,
+        "reason": decision.reason,
+        "confidence": decision.confidence,
+        "provider": provider,
+        "model": model,
+        "reasoner_backend": reasoner_backend,
+        "prompt_version": str(prompt_version),
+        "source_profile_hash": profile_content_hash(left_profile),
+        "target_profile_hash": profile_content_hash(right_profile),
+        "verification_status": "final",
+    }
+    if decision.decision != "relationship":
+        return {
+            **common,
+            "source_id": job.left_source_id,
+            "target_source_id": job.right_source_id,
+            "decision": decision.decision,
+            "decision_status": decision.decision,
+            "comparison_proposition": decision.comparison_proposition,
+            "boundary_or_qualification": decision.boundary_or_qualification,
+            "active": False,
+        }
+
+    actor_is_left = decision.actor_source_id == job.left_source_id
+    source_profile = left_profile if actor_is_left else right_profile
+    target_profile = right_profile if actor_is_left else left_profile
+    source_anchor_ids = (
+        decision.left_evidence_anchor_ids
+        if actor_is_left
+        else decision.right_evidence_anchor_ids
+    )
+    target_anchor_ids = (
+        decision.right_evidence_anchor_ids
+        if actor_is_left
+        else decision.left_evidence_anchor_ids
+    )
+    source_anchors = left_anchors if actor_is_left else right_anchors
+    target_anchors = right_anchors if actor_is_left else left_anchors
+    source_anchor = source_anchors[source_anchor_ids[0]]
+    target_anchor = target_anchors[target_anchor_ids[0]]
+    forward_label, inverse_label = RELATIONSHIP_PROJECTION_LABELS[
+        decision.relation_type
+    ]
+    return {
+        **common,
+        "source_profile_hash": profile_content_hash(source_profile),
+        "target_profile_hash": profile_content_hash(target_profile),
+        "decision": "relationship",
+        "decision_status": "accepted",
+        "relation_id": _relation_id(
+            decision.actor_source_id,
+            decision.reference_source_id,
+            decision.relation_type,
+        ),
+        "source_id": decision.actor_source_id,
+        "target_source_id": decision.reference_source_id,
+        "source_note_id": str(source_profile.get("note_id") or ""),
+        "target_note_id": str(target_profile.get("note_id") or ""),
+        "relation_type": decision.relation_type,
+        "reciprocal_type": RECIPROCAL_RELATION_TYPES[decision.relation_type],
+        "forward_label": forward_label,
+        "inverse_label": inverse_label,
+        "comparison_proposition": decision.comparison_proposition,
+        "boundary_or_qualification": decision.boundary_or_qualification,
+        "left_evidence_anchor_ids": list(decision.left_evidence_anchor_ids),
+        "right_evidence_anchor_ids": list(decision.right_evidence_anchor_ids),
+        "source_evidence_anchor_ids": list(source_anchor_ids),
+        "target_evidence_anchor_ids": list(target_anchor_ids),
+        "source_evidence": _evidence_reference(
+            decision.actor_source_id, source_anchor_ids[0], source_anchor
+        ),
+        "target_evidence": _evidence_reference(
+            decision.reference_source_id, target_anchor_ids[0], target_anchor
+        ),
+        "provenance": "probabilistic_relationship_adjudication_v4",
+        "cluster_evidence_eligible": True,
+        "inferred": True,
+        "strength": 110,
+        "active": True,
+    }
 
 
 def canonical_pair(left: str, right: str) -> tuple[str, str]:
@@ -1039,7 +1537,12 @@ def _evidence_reference(
         "source_id": source_id,
         "evidence_anchor_id": anchor_id,
         "locator": str(anchor.get("locator") or ""),
-        "claim": str(anchor.get("claim") or anchor.get("text") or ""),
+        "claim": str(
+            anchor.get("claim")
+            or anchor.get("proposition")
+            or anchor.get("text")
+            or ""
+        ),
     }
 
 
@@ -1060,11 +1563,9 @@ def _same_pair(row: Mapping[str, Any], pair: tuple[str, str]) -> bool:
 def _machine_substantive(row: Mapping[str, Any]) -> bool:
     return bool(
         str(row.get("relation_type") or "") in SUBSTANTIVE_RELATION_TYPES
-        and str(row.get("provenance") or "")
-        in {
-            "probabilistic_relationship_adjudication",
-            "probabilistic_relationship_verification",
-        }
+        and str(row.get("provenance") or "").startswith(
+            "probabilistic_relationship_"
+        )
     )
 
 
@@ -1074,6 +1575,81 @@ def _verified_machine_relation(row: Mapping[str, Any]) -> bool:
         and str(row.get("verification_status") or "")
         in {"confirmed", "corrected"}
     )
+
+
+def _final_v4_relation(row: Mapping[str, Any]) -> bool:
+    return bool(
+        _machine_substantive(row)
+        and str(row.get("output_contract") or "")
+        == RELATIONSHIP_DECISION_CONTRACT
+        and str(row.get("decision_schema_version") or "")
+        == RELATIONSHIP_DECISION_SCHEMA_VERSION
+        and str(row.get("decision_status") or "") == "accepted"
+        and str(row.get("verification_status") or "") == "final"
+    )
+
+
+def _final_v4_decision(
+    row: Mapping[str, Any], *, decision: str
+) -> bool:
+    return bool(
+        str(row.get("output_contract") or "")
+        == RELATIONSHIP_DECISION_CONTRACT
+        and str(row.get("decision_schema_version") or "")
+        == RELATIONSHIP_DECISION_SCHEMA_VERSION
+        and str(row.get("decision") or row.get("decision_status") or "")
+        == decision
+        and str(row.get("verification_status") or "") == "final"
+    )
+
+
+def _publishable_machine_relation(row: Mapping[str, Any]) -> bool:
+    return _final_v4_relation(row) or _verified_machine_relation(row)
+
+
+def _merge_registry_event(
+    events: dict[str, dict[str, Any]],
+    event_type: str,
+    row: Mapping[str, Any],
+) -> None:
+    payload = dict(row)
+    pair = canonical_pair(
+        str(payload.get("source_id") or payload.get("left_source_id") or ""),
+        str(
+            payload.get("target_source_id")
+            or payload.get("right_source_id")
+            or ""
+        ),
+    )
+    identity = {
+        "event_type": event_type,
+        "pair_job_id": str(payload.get("pair_job_id") or ""),
+        "relation_id": str(payload.get("relation_id") or ""),
+        "decision_key": str(payload.get("decision_key") or ""),
+        "pair": pair,
+        "reason": (
+            str(payload.get("reason") or "")
+            if event_type == "parked"
+            else ""
+        ),
+    }
+    event_id = str(payload.get("event_id") or stable_hash(identity))
+    prior = events.get(event_id, {})
+    history = {
+        stable_hash(value): dict(value)
+        for value in prior.get("payload_history", []) or []
+        if isinstance(value, Mapping)
+    }
+    prior_payload = prior.get("payload")
+    if isinstance(prior_payload, Mapping):
+        history[stable_hash(prior_payload)] = dict(prior_payload)
+    history[stable_hash(payload)] = payload
+    events[event_id] = {
+        "event_id": event_id,
+        "event_type": event_type,
+        "payload": payload,
+        "payload_history": [history[key] for key in sorted(history)],
+    }
 
 
 def _relation_counts(rows: Sequence[Mapping[str, Any]]) -> dict[str, int]:

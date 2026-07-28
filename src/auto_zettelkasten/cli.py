@@ -16,6 +16,7 @@ from .api import (
     list_collections,
     resume_map,
     run_map,
+    sync_zotero,
 )
 from .models import (
     ExtractionPolicy,
@@ -85,6 +86,27 @@ def build_parser() -> argparse.ArgumentParser:
     map_parser.add_argument("--estimated-chars-per-token", type=float, default=None)
     _add_literature_policy_arguments(map_parser)
     _add_navigation_policy_arguments(map_parser)
+
+    sync_parser = commands.add_parser(
+        "sync",
+        help="Process new and changed Zotero records through the resumable mapper.",
+    )
+    sync_parser.add_argument("--workspace", type=Path, required=True)
+    sync_parser.add_argument(
+        "--scope", choices=("library", "collection", "selected"), default=None
+    )
+    sync_parser.add_argument("--collection", default="")
+    sync_parser.add_argument(
+        "--provider",
+        choices=("deepseek", "openrouter", "gemini", "ollama"),
+        default=None,
+    )
+    sync_parser.add_argument("--model", default=None)
+    sync_parser.add_argument("--allow-cloud", action="store_true", default=None)
+    sync_parser.add_argument("--parallel", type=int, default=None)
+    sync_parser.add_argument("--run-id", default="")
+    _add_literature_policy_arguments(sync_parser)
+    _add_navigation_policy_arguments(sync_parser)
 
     resume_parser = commands.add_parser("resume", help="Resume an interrupted or partially terminal run.")
     resume_parser.add_argument("--workspace", type=Path, required=True)
@@ -169,6 +191,39 @@ def main(argv: Sequence[str] | None = None) -> int:
                 navigation_policy=_navigation_policy(args, config),
             )
             result = run_map(request, run_id=args.run_id or None).to_dict()
+        elif args.command == "sync":
+            config = load_config(args.workspace)
+            configured_provider = str(config.get("provider") or "deepseek")
+            provider = args.provider or configured_provider
+            configured_model = (
+                str(config.get("model") or "")
+                if provider == configured_provider
+                else ""
+            )
+            model = (
+                args.model
+                or configured_model
+                or DEFAULT_MODELS.get(provider, "")
+            )
+            request = MapRequest(
+                workspace=args.workspace,
+                scope=args.scope or str(config.get("scope") or "library"),
+                collection_key=args.collection or None,
+                provider=provider,
+                model=model,
+                allow_cloud=args.allow_cloud is True,
+                parallel=(
+                    args.parallel
+                    if args.parallel is not None
+                    else int(config.get("parallel", 4))
+                ),
+                literature_policy=_literature_policy(args, config),
+                navigation_policy=_navigation_policy(args, config),
+            )
+            result = sync_zotero(
+                request,
+                run_id=args.run_id or None,
+            )
         elif args.command == "resume":
             result = resume_map(
                 args.workspace,
@@ -238,7 +293,7 @@ def _status_text(payload: dict[str, Any]) -> str:
         f"Inventory: {counts.get('inventory_count', 0)}\n"
         f"Validated notes: {counts.get('validated_note_count', 0)}\n"
         f"Limited notes: {counts.get('limited_note_count', 0)}\n"
-        f"Exhausted: {counts.get('exhausted_count', 0)}\n"
+        f"Parked for review: {counts.get('parked_for_review_count', 0)}\n"
         f"Partial: {counts.get('partial_count', 0)}\n"
         f"Pending: {counts.get('pending_count', 0)}\n"
         f"Profiles: {counts.get('profile_count', 0)}\n"

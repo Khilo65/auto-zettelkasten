@@ -7,8 +7,8 @@ candidate-gap records, and an Obsidian-ready vault projection.
 It is a standalone, file-first Python package. It does not require Research OS,
 does not read `zotero.sqlite`, and never writes to Zotero.
 
-> **Release status:** v0.11 is an alpha-quality CLI and Python API using artifact
-> schema 1.11 and evidence-profile schema 1.2. Mapped gaps are claims about the
+> **Release status:** v0.13 is an alpha-quality CLI and Python API using artifact
+> schema 1.12 and evidence-profile schema 1.3. Mapped gaps are claims about the
 > frozen collection only, never literature-wide novelty claims.
 
 ## What it produces
@@ -22,8 +22,10 @@ workspace/
 │   └── read_attempts/
 ├── 02_source_memory/
 │   ├── notes/
+│   ├── bundles/
 │   ├── profiles/
 │   └── indexes/
+│       ├── collections/
 │       ├── source_sets/
 │       ├── by_literature/
 │       ├── source_catalogue.yml
@@ -52,6 +54,8 @@ workspace/
 └── 11_state/
     ├── runs/RUN_ID/
     │   ├── progress.yml
+    │   ├── relationship_jobs/
+    │   ├── relationship_batches/
     │   ├── literature/
     │   └── items/ITEM_KEY/
     ├── fingerprints/
@@ -60,7 +64,13 @@ workspace/
     └── exports/
 ```
 
-Full-document analytical notes contain:
+One source-reading call produces a source-owned bundle containing the atomic
+analysis, compact profile, evidence anchors, important literature positions,
+and missing-source recommendations. Deterministic projectors then write the
+note, profile, indexes, and managed links without asking a model to rewrite
+atomic prose.
+
+Analytical notes contain:
 
 - thesis;
 - method and research design;
@@ -75,9 +85,10 @@ Full-document analytical notes contain:
 - locators; and
 - structural validation, source coverage, model/provider, and source-lineage metadata.
 
-Passing the structural and full-document coverage gates commits an
-`analytical_atomic_note`. Generated notes contain no review-status field or
-boilerplate validation section.
+Useful full and evidence-bounded partial documents commit analytical notes.
+Metadata- and abstract-only records remain context-only. Advisory locator,
+numeric, metadata, and causal-language diagnostics do not trigger hidden retry
+calls; only grossly unusable output is parked for review.
 
 Abstracts, paywall snapshots, and metadata-only records use compact limited
 notes instead of empty analytical templates. Their statuses are
@@ -428,7 +439,7 @@ The run invariant is therefore:
 
 ```text
 inventory_count == validated_note_count + limited_note_count
-                 + exhausted_count + partial_count + pending_count
+                 + parked_for_review_count + partial_count + pending_count
 ```
 
 Notes and checkpoints are fingerprinted by Zotero item key, inspected-content
@@ -447,7 +458,8 @@ run's frozen inventory and frozen acquired representations, reuses completed
 direct, chunk, profile, and packet checkpoints, and continues only missing
 work. A completed replay with unchanged source, model, policy, prompt, and
 algorithm fingerprints reuses those checkpoints and makes no paid model calls.
-Zotero changes require a new run. A partial CLI run exits with code 3.
+`sync` compares the read-only Zotero inventory with the last processed snapshot
+and updates only changed work. A partial CLI run exits with code 3.
 
 The run source set records exactly what that run attempted. Automatic mapping
 uses that frozen run collection—not unrelated notes elsewhere in the
@@ -462,19 +474,20 @@ notes, evidence profiles, cluster/gap identities, or the underlying collection
 map. Research OS may use the lens for downstream ranking without mutating the
 base map.
 
-Artifact schemas 1.0-1.11 and evidence-profile schemas 1.0-1.2 remain readable.
+Artifact schemas 1.0-1.12 and evidence-profile schemas 1.0-1.3 remain readable.
 The idempotent schema-1.9 migration retires the standalone Literature Neighborhoods Markdown projection, archives superseded current cluster and gap
 projections, preserves historical maps, profiles, analytical identities, and
 atomic-note bytes, and makes no model or Zotero call. Existing schema-1.5
 proposition anchors remain valid; unsupported legacy anchors cannot establish
 strong synthesis until they are lazily reprofiled.
-The schema-1.11 migration updates managed artifact version markers and lazily
-deactivates unverified v0.11 machine relationships without rewriting notes.
+The schema-1.12 migration creates provider-free legacy source bundles where
+safe, retains conflicting variants for review, and moves old machine
+relationships into schema-4 review state without rewriting notes.
 Legacy unmarked `## Graph Links` sections are converted to bounded
 `auto-zettelkasten:graph` markers on their next graph projection; source prose,
 profiles, and human-authored sections are not rewritten.
 
-## Scope deliberately deferred from v0.11
+## Scope deliberately deferred from v0.13
 
 - direct `zotero.sqlite` ingestion;
 - Zotero writes or collection synchronization;

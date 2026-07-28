@@ -3,11 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 
 from auto_zettelkasten.notes import (
     _assert_source_note_safe_to_replace,
     _write_note_metadata,
     parse_atomic_note,
+    render_atomic_note,
     semantic_note_hash,
     source_obsidian_tags,
     update_note_graph,
@@ -233,5 +235,43 @@ def test_changed_source_note_with_human_content_is_not_replaceable(
     )
     path.write_text(original + "\nHuman annotation.\n", encoding="utf-8")
 
+    with pytest.raises(ValueError, match="unmanaged_changes"):
+        _assert_source_note_safe_to_replace(workspace, path)
+
+
+def test_machine_bundle_note_remains_replaceable_after_graph_projection(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path
+    path = workspace / "02_source_memory" / "notes" / "note.md"
+    path.parent.mkdir(parents=True)
+    frontmatter = {
+        "note_id": "note-1",
+        "source_id": "source-1",
+        "title": "Source",
+        "clusters": [],
+        "related_notes": [],
+        "updated_at": "original",
+    }
+    analysis = {"thesis": "Substantive claim."}
+    original = render_atomic_note(frontmatter, analysis)
+    path.write_text(original, encoding="utf-8")
+    _write_note_metadata(workspace, path, frontmatter, machine_text=original)
+    bundle_path = workspace / "02_source_memory" / "bundles" / "source-1.yml"
+    bundle_path.parent.mkdir(parents=True)
+    bundle_path.write_text(
+        yaml.safe_dump({"bundle": {"analysis_sections": analysis}}),
+        encoding="utf-8",
+    )
+
+    update_note_graph(
+        path,
+        {"related_notes": ["[[Other Source]]"]},
+        [],
+        [],
+    )
+
+    _assert_source_note_safe_to_replace(workspace, path)
+    path.write_text(path.read_text(encoding="utf-8") + "\nHuman annotation.\n")
     with pytest.raises(ValueError, match="unmanaged_changes"):
         _assert_source_note_safe_to_replace(workspace, path)
