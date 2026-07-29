@@ -50,7 +50,7 @@ def test_profile_versions_are_explicit() -> None:
     assert PROFILE_SCHEMA_VERSION == "1.3"
     assert PROFILE_PROMPT_VERSION == profiles.profile_prompt_version == "6"
     assert PROFILE_CLASSIFIER_VERSION == profiles.profile_classifier_version == "3"
-    assert PROFILE_ALGORITHM_VERSION == profiles.profile_algorithm_version == "4"
+    assert PROFILE_ALGORITHM_VERSION == profiles.profile_algorithm_version == "5"
     assert ANCHOR_ALGORITHM_VERSION == SUPPORT_ENVELOPE_VERSION == "1"
     assert COMMITTED_NOTE_ANCHOR_AUGMENTATION_VERSION == "8"
 
@@ -400,7 +400,7 @@ def test_analytical_note_is_extracted_and_validated_from_committed_markdown() ->
     }
     assert profile.validity["profile_prompt_version"] == "6"
     assert profile.validity["classifier_version"] == "3"
-    assert profile.validity["algorithm_version"] == "4"
+    assert profile.validity["algorithm_version"] == "5"
     assert profile.research_questions
     assert {"participation", "trust"} <= set(profile.concepts)
     assert profile.theories == ["contact theory"]
@@ -577,6 +577,25 @@ def test_limited_note_is_deterministic_context_only_and_never_calls_reasoner() -
     assert "limited_profile_contains_substantive_anchors" in rejected.errors
 
 
+def test_evidence_bounded_partial_note_is_substantive() -> None:
+    note = _with_frontmatter_updates(
+        _analytical_note(),
+        note_status="partial_document_atomic_note",
+        source_scope="partial_document",
+        source_coverage={"gate": "limited"},
+        evidence_eligibility="substantive_bounded",
+    )
+
+    profile = deterministic_profile(note)
+    validation = validate_profile(profile)
+
+    assert profile.evidence_eligibility == "substantive_bounded"
+    assert profile.excluded_from_synthesis is False
+    assert profile.findings
+    assert profile.evidence_anchors
+    assert validation.passed, validation.errors
+
+
 def test_non_full_analytical_note_is_context_only_and_never_calls_reasoner() -> None:
     invalid = _with_frontmatter_updates(
         _analytical_note(),
@@ -692,7 +711,7 @@ def test_profile_fingerprint_includes_every_declared_dependency() -> None:
     assert payload["note_semantic_hash"] == shared_semantic_note_hash(note)
     assert payload["profile_prompt_version"] == "6"
     assert payload["classifier_version"] == "3"
-    assert payload["algorithm_version"] == "4"
+    assert payload["algorithm_version"] == "5"
     assert payload["profile_schema_version"] == "1.3"
     assert payload["anchor_algorithm_version"] == "1"
     assert payload["support_envelope_version"] == "1"
@@ -721,7 +740,7 @@ def test_profile_fingerprint_includes_every_declared_dependency() -> None:
         note, **kwargs, profile_classifier_version="4"
     )
     assert baseline != profile_dependency_fingerprint(
-        note, **kwargs, profile_algorithm_version="5"
+        note, **kwargs, profile_algorithm_version="6"
     )
     assert baseline != profile_dependency_fingerprint(
         note, **kwargs, profile_schema_version="1.0"

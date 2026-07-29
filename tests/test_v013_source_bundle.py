@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import threading
 
 import pytest
 
@@ -175,6 +176,48 @@ def test_remediation_ledgers_record_creator_and_scope_discrepancies(
     assert {
         row["field"] for row in classification["issues"][0]["diagnostics"]
     } == {"source_scope", "evidence_eligibility"}
+
+
+def test_pathways_for_peace_book_metadata_recommends_institutional_report_review(
+    tmp_path,
+) -> None:
+    payload = _bundle_payload()
+    payload["observed_bibliographic_identity"] = {
+        "title": "Pathways for Peace: Inclusive Approaches to Preventing Violent Conflict",
+        "creators": [
+            {"creatorType": "author", "name": "United Nations"},
+            {"creatorType": "author", "name": "World Bank"},
+        ],
+        "date": "2018",
+        "itemType": "report",
+    }
+    row = {
+        "source_id": "source-zotero-pathways",
+        "zotero_item_key": "PATHWAYS",
+        "item": {
+            "key": "PATHWAYS",
+            "data": {
+                "key": "PATHWAYS",
+                "title": payload["observed_bibliographic_identity"]["title"],
+                "creators": [
+                    {"creatorType": "editor", "name": "World Bank Group"}
+                ],
+                "date": "2018",
+                "itemType": "book",
+            },
+        },
+    }
+
+    _commit_remediation_ledgers(
+        tmp_path, row, SourceAnalysisBundle.from_dict(payload)
+    )
+
+    issue = read_yaml(
+        tmp_path / "01_custody" / "zotero" / "zotero_metadata_issues.yml"
+    )["issues"][0]
+    assert "probable_document_type_mismatch" in issue["issue_types"]
+    assert "institutional_report_represented_as_book" in issue["issue_types"]
+    assert "probable_creator_role_mismatch" in issue["issue_types"]
 
 
 def test_bundle_repairs_mechanical_envelope_errors_without_losing_analysis() -> None:
@@ -356,7 +399,7 @@ def test_ordinary_bundle_source_uses_one_call_and_no_profile_or_fidelity_call(
     assert profile["source_role"] == "journal article"
     assert profile["coverage"]["status"] == "partial"
     note = read_note(tmp_path / report.items[0]["note_path"])
-    assert note["frontmatter"]["source_bundle_prompt_version"] == "3"
+    assert note["frontmatter"]["source_bundle_prompt_version"] == "4"
 
 
 def test_source_calls_share_the_cumulative_profile_budget_and_replay_is_free(
@@ -484,6 +527,50 @@ def test_unchanged_source_bundle_reuses_committed_note(tmp_path) -> None:
 
     assert reader.calls == 1
     assert replay.reused_count == 1
+
+
+def test_auto_provider_concurrency_runs_all_ready_source_calls(
+    tmp_path,
+) -> None:
+    barrier = threading.Barrier(4)
+
+    class ConcurrentBundleReader(BundleReader):
+        def read_source_bundle(self, text, metadata, question=None):
+            barrier.wait(timeout=3)
+            return super().read_source_bundle(text, metadata, question)
+
+    items = [
+        {
+            "key": f"ITEM{index}",
+            "data": {
+                "key": f"ITEM{index}",
+                "itemType": "journalArticle",
+                "title": f"Source {index}",
+                "date": "2024",
+                "creators": [
+                    {"creatorType": "author", "lastName": f"Author{index}"}
+                ],
+            },
+        }
+        for index in range(4)
+    ]
+    reader = ConcurrentBundleReader()
+
+    report = run_map(
+        MapRequest(
+            tmp_path,
+            provider="ollama",
+            model="bundle-v1",
+            provider_concurrency="auto",
+        ),
+        client=FakeZotero(items),
+        reader=reader,
+        run_id="concurrent-source-bundles",
+    )
+
+    assert reader.calls == 4
+    assert report.source_peak_concurrency == 4
+    assert report.source_stage_wall_seconds > 0
 
 
 def test_truncated_direct_bundle_does_not_start_hierarchical_calls(tmp_path) -> None:
@@ -792,6 +879,42 @@ def test_zotero_metadata_correction_updates_projection_without_source_call(
     assert second.reused_count == 1
     note = tmp_path / first.items[0]["note_path"]
     assert "# Corrected canonical title" in note.read_text(encoding="utf-8")
+
+
+def test_zotero_document_type_change_invalidates_source_bundle(tmp_path) -> None:
+    original = {
+        "key": "ITEMA",
+        "data": {
+            "key": "ITEMA",
+            "itemType": "book",
+            "title": "Institutional study",
+            "date": "2024",
+            "creators": [{"creatorType": "author", "lastName": "One"}],
+        },
+    }
+    corrected = {
+        **original,
+        "data": {
+            **original["data"],
+            "itemType": "report",
+        },
+    }
+    reader = BundleReader()
+    run_map(
+        MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1),
+        client=FakeZotero([original]),
+        reader=reader,
+        run_id="type-one",
+    )
+    second = run_map(
+        MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1),
+        client=FakeZotero([corrected]),
+        reader=reader,
+        run_id="type-two",
+    )
+
+    assert reader.calls == 2
+    assert second.reused_count == 0
 
 
 def test_reprocessing_source_replaces_its_stale_literature_memory(tmp_path) -> None:

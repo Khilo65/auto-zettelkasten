@@ -189,6 +189,26 @@ def test_reference_archive_cover_without_trailing_bibliography_keeps_article() -
     assert adequacy.reason != "bibliography_only_attachment"
 
 
+def test_reference_archive_cover_before_named_article_section_keeps_article() -> None:
+    references = "\n".join(
+        f"Scholar, A. ({1980 + index}). Conflict study {index}."
+        for index in range(30)
+    )
+    body = "Substantive civil-war analysis and findings. " * 500
+    text = (
+        "--- Page 1 ---\nREFERENCES\n"
+        f"{references}\n"
+        "--- Page 2 ---\nCIVIL WAR DYNAMICS AND OUTCOMES\n"
+        f"{body}\n"
+        "--- Page 3 ---\nRESULTS AND IMPLICATIONS\n"
+        f"{body}"
+    )
+
+    adequacy = classify_pdf_text(text, page_count=3)
+
+    assert adequacy.reason != "bibliography_only_attachment"
+
+
 def test_complete_institutional_html_passes_without_article_or_p_tags() -> None:
     blocks = [
         "The institution explains its mandate governance membership history and "
@@ -225,6 +245,23 @@ def test_partial_jstor_viewer_is_evidence_bounded() -> None:
 
     assert adequacy.source_scope == "partial_document"
     assert adequacy.coverage_gate == "limited"
+    assert adequacy.reason == "partial_article_viewer_html"
+
+
+def test_partial_jstor_viewer_without_article_container_is_evidence_bounded() -> None:
+    cited_by = "Cited by item and publication metadata. " * 400
+    excerpt = "The visible article excerpt develops its mediation argument. " * 180
+    raw_html = (
+        "<html><body><p>Journal article (14 pages)</p>"
+        f"<section>Cited by (22) {cited_by}</section>"
+        "<div>This is the content viewer section.</div>"
+        f"<div>{excerpt}</div>"
+        "<footer>Explore JSTOR</footer></body></html>"
+    )
+
+    adequacy = classify_html_content(raw_html)
+
+    assert adequacy.source_scope == "partial_document"
     assert adequacy.reason == "partial_article_viewer_html"
 
 

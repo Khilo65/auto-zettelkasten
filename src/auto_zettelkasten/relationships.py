@@ -10,8 +10,8 @@ from .models import RelationshipDecision, RelationshipPairJob
 from .navigation import TYPED_SOURCE_RELATIONS, rank_human_related_links
 
 
-RELATIONSHIP_PROMPT_VERSION = "3"
-RELATIONSHIP_REGISTRY_SCHEMA_VERSION = "4"
+RELATIONSHIP_PROMPT_VERSION = "5"
+RELATIONSHIP_REGISTRY_SCHEMA_VERSION = "5"
 RELATIONSHIP_DECISION_SCHEMA_VERSION = "4"
 RELATIONSHIP_DECISION_CONTRACT = "relationship-decision-v4"
 SUBSTANTIVE_RELATION_TYPES = frozenset(
@@ -1286,7 +1286,10 @@ def _job_anchor_rows(
         if _evidence_id(row)
         and str(row.get("source_id") or source_id) == source_id
     }
-    anchors: dict[str, dict[str, Any]] = {}
+    # The adjudicator receives the current endpoint profiles as well as this
+    # preselected routing subset. The subset helps navigation; it must not make
+    # another source-owned anchor that the model actually saw invalid.
+    anchors: dict[str, dict[str, Any]] = dict(profile_anchors)
     for value in values:
         row = (
             dict(value)

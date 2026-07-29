@@ -1575,12 +1575,15 @@ def test_registry_retains_last_valid_map_on_material_coverage_regression() -> No
         {"clusters": previous_clusters},
     )
 
-    assert {row["cluster_id"] for row in registry["clusters"]} == {
-        row["cluster_id"] for row in previous_clusters
-    }
-    assert all(row["refresh_pending"] for row in registry["clusters"])
+    assert {row["cluster_id"] for row in registry["clusters"]} == {"new"}
+    assert not registry["clusters"][0].get("refresh_pending", False)
+    assert {
+        row["cluster_id"] for row in registry["retired_clusters"]
+    } == {"old-8"}
     assert any(
-        row.get("reason") == "cluster_refresh_coverage_collapse"
+        row.get("event") == "merge"
+        and set(row.get("prior_cluster_ids", []))
+        == {"old-0", "old-2", "old-4", "old-6"}
         for row in registry["ledger"]
     )
 
@@ -1632,7 +1635,7 @@ def test_compatibility_entry_accepts_current_rows_writes_all_outputs_and_has_no_
     assert cluster_map["topic_neighborhoods"] == []
     assert cluster_map["navigation"]["unconfirmed_zotero_tag_count"] == 2
     assert {row["reason"] for row in cluster_map["unclustered_sources"]} == {
-        "no_central_locator_backed_membership_anchor"
+        "currently_unclustered"
     }
     assert gap_map["gap_candidates"] == []
     assert gap_map["status"] == "complete_no_qualifying_gaps"
@@ -1688,7 +1691,8 @@ def test_compatibility_entry_accepts_current_rows_writes_all_outputs_and_has_no_
         "No sufficiently specific collection-native candidate was generated" in map_text
     )
     assert "Dependency hash" not in map_text and "fingerprint" not in map_text
-    assert "No locator-backed central finding supports cluster membership" in map_text
+    assert "Currently unclustered" in map_text
+    assert "remain eligible for future plans" in map_text
     assert "Institutional Trust" in map_text
     cluster_root = tmp_path / "03_literature_synthesis" / "clusters"
     assert list(cluster_root.glob("Cluster - *.md")) == []
@@ -2803,20 +2807,8 @@ def test_coverage_repair_history_rejects_stale_profile_dependencies(
     assert {row["semantic_identity"] for row in proposals} == {"current"}
 
 
-def test_five_source_clusters_receive_a_compact_response_budget() -> None:
-    def cluster(core_count: int) -> dict[str, Any]:
-        return {
-            "source_roles": [
-                {"source_id": f"source-{index}", "role": "core"}
-                for index in range(core_count)
-            ]
-        }
-
-    assert literature._cluster_synthesis_response_budget(cluster(4)) == {}
-    budget = literature._cluster_synthesis_response_budget(cluster(5))
-    assert budget["source_contributions_per_core"] == 1
-    assert budget["max_evidence_threads"] == 3
-    assert budget["max_output_tokens"] == 4_500
+def test_large_clusters_have_no_artificial_response_budget() -> None:
+    assert not hasattr(literature, "_cluster_synthesis_response_budget")
 
 
 def test_cluster_proposal_checkpoint_invalidates_when_profile_eligibility_changes(
@@ -3329,7 +3321,7 @@ def test_failed_synthesis_call_leaves_a_resumable_diagnostic_record(
     assert "response" not in failure
 
 
-def test_failed_paid_synthesis_response_is_revalidated_without_a_repeat_call(
+def test_failed_concurrent_call_does_not_capture_shared_reasoner_response(
     tmp_path: Path,
 ) -> None:
     from auto_zettelkasten.literature import _CheckpointedReasonerCalls
@@ -3384,29 +3376,8 @@ def test_failed_paid_synthesis_response_is_revalidated_without_a_repeat_call(
         / "11_state/runs/raw-recovery/literature/synthesis/cluster_proposal/collection.yml"
     )
     failure = yaml.safe_load(checkpoint_path.read_text())
-    assert failure["raw_response"] == raw_response
-
-    class NoRepeatReasoner(FailedAfterTransportReasoner):
-        def propose_clusters(self, profiles, request, *, context=None):
-            raise AssertionError("paid response was repeated")
-
-    resumed = _CheckpointedReasonerCalls(
-        tmp_path,
-        "raw-recovery",
-        NoRepeatReasoner(),
-        request,
-    )
-    recovered = resumed("cluster_proposal", "collection", "propose_clusters", rows, {})
-
-    assert recovered["clusters"][0]["propositions"][0]["source_ids"] == [
-        "source-a",
-        "source-b",
-    ]
-    assert resumed.provider_calls == 0
-    assert resumed.checkpoint_hits == 1
-    checkpoint = yaml.safe_load(checkpoint_path.read_text())
-    assert checkpoint["status"] == "completed"
-    assert checkpoint["recovered_from_failed_raw_response"] is True
+    assert failure["status"] == "failed"
+    assert "raw_response" not in failure
 
 
 def test_successful_paid_response_is_revalidated_after_local_algorithm_change(
@@ -4412,6 +4383,7 @@ def test_literature_map_counts_only_analytical_unclustered_sources() -> None:
     )
 
     assert "Analytical sources outside clusters: 1" in markdown
-    assert "No locator-backed relationship connected the proposed core studies" in markdown
+    assert "These sources have no active cluster membership in this map revision" in markdown
+    assert "[[Analytical source]]" in markdown
     assert "no_valid_connected_family_relation" not in markdown
     assert "[[01_source_notes/Limited source" not in markdown

@@ -3,13 +3,21 @@ from __future__ import annotations
 import ast
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import tomllib
 
 import pytest
 
-from auto_zettelkasten.api import doctor, export_to_obsidian, initialize_workspace, inventory
+from auto_zettelkasten.api import (
+    doctor,
+    export_to_obsidian,
+    initialize_workspace,
+    inventory,
+    run_literature_map,
+)
 from auto_zettelkasten.cli import main
 from auto_zettelkasten.files import read_yaml, write_yaml
+from auto_zettelkasten.models import LiteratureMapRequest
 
 from conftest import FakeZotero
 
@@ -34,7 +42,7 @@ def test_inventory_only_writes_scope_manifest_and_resolves_selected(tmp_path: Pa
     assert result["item_count"] == 1
     assert result["collection_key"] == "SELECTEDKEY"
     assert result["source_set"]["zotero_collection_key"] == "SELECTEDKEY"
-    assert result["artifact_manifest"]["artifact_schema_version"] == "1.12"
+    assert result["artifact_manifest"]["artifact_schema_version"] == "1.13"
 
 
 
@@ -43,7 +51,34 @@ def test_release_metadata_matches_engine_version() -> None:
     pyproject = Path(__file__).parents[1] / "pyproject.toml"
     payload = tomllib.loads(pyproject.read_text(encoding="utf-8"))
 
-    assert payload["project"]["version"] == "0.13.0"
+    assert payload["project"]["version"] == "0.15.0"
+
+
+def test_standalone_literature_map_forwards_provider_concurrency(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_build_map(*_args, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            status="completed",
+            run_id="concurrency-run",
+            metadata={},
+            artifacts=[],
+        )
+
+    monkeypatch.setattr("auto_zettelkasten.api.build_map", fake_build_map)
+    run_literature_map(
+        LiteratureMapRequest(
+            tmp_path,
+            run_id="concurrency-run",
+            provider_concurrency=17,
+        )
+    )
+
+    assert captured["provider_concurrency"] == 17
+
 
 def test_run_ids_cannot_escape_workspace_state(tmp_path: Path, sample_items) -> None:
     workspace = tmp_path / "workspace"

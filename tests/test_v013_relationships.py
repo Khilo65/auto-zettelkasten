@@ -51,7 +51,16 @@ def _profile(source_id: str) -> dict[str, Any]:
 
 
 def test_million_token_reasoner_uses_measured_half_context_budget() -> None:
-    reasoner = type("Reasoner", (), {"context_window_tokens": 1_000_000})()
+    reasoner = type(
+        "Reasoner",
+        (),
+        {
+            "context_window_tokens": 1_000_000,
+            "direct_read_fraction": 0.5,
+            "prompt_reserve_tokens": 2_048,
+            "capabilities": {"supported_output_tokens": 64_000},
+        },
+    )()
 
     budget = _reasoner_context_char_budget(
         reasoner,
@@ -61,7 +70,7 @@ def test_million_token_reasoner_uses_measured_half_context_budget() -> None:
         },
     )
 
-    assert budget == 1_680_000
+    assert budget == 1_301_856
 
 
 def _job(left: str, right: str) -> RelationshipPairJob:
@@ -303,7 +312,7 @@ def test_schema_three_visible_machine_edges_become_legacy_review_pending(
     result = persist_relationship_registry(tmp_path, structural_relations=[])
     relation = result["relations"][0]
 
-    assert read_yaml(path)["registry_schema_version"] == "4"
+    assert read_yaml(path)["registry_schema_version"] == "5"
     assert relation["active"] is True
     assert relation["decision_status"] == "legacy_review_pending"
     assert relation["cluster_evidence_eligible"] is False

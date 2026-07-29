@@ -82,6 +82,28 @@ def test_numbered_book_chapter_excerpt_is_not_treated_as_the_full_book() -> None
     assert scoped["coverage_reason"] == "bounded_attachment_excerpt"
 
 
+def test_complete_thesis_introduction_is_not_misclassified_as_an_excerpt() -> None:
+    scoped = _apply_bibliographic_scope(
+        {
+            "source_scope": "full_document",
+            "source_coverage": {
+                "source_scope": "full_document",
+                "coverage_gate": "passed",
+            },
+            "coverage_metrics": {"page_count": 60},
+            "text": (
+                "--- Page 1 ---\nA COMPLETE THESIS\n"
+                "Introduction\nThis thesis examines conflict recurrence.\n"
+            ),
+            "rank": 100,
+        },
+        {"itemType": "thesis", "title": "A Complete Thesis"},
+        {"itemType": "attachment", "title": "A Complete Thesis.pdf"},
+    )
+
+    assert scoped["source_scope"] == "full_document"
+
+
 def test_thesis_excerpt_with_missing_contents_span_is_partial() -> None:
     scoped = _apply_bibliographic_scope(
         {

@@ -7,8 +7,8 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
-CURRENT_ENGINE_VERSION = "0.13.0"
-CURRENT_ARTIFACT_SCHEMA_VERSION = "1.12"
+CURRENT_ENGINE_VERSION = "0.15.0"
+CURRENT_ARTIFACT_SCHEMA_VERSION = "1.13"
 CURRENT_PROFILE_SCHEMA_VERSION = "1.3"
 
 
@@ -600,9 +600,10 @@ class MapRequest:
     model: str = "deepseek-v4-flash"
     allow_cloud: bool = False
     parallel: int = 4
+    provider_concurrency: int | Literal["auto"] | None = None
     limit: int = 0
     extraction_version: str = "2"
-    prompt_version: str = "9"
+    prompt_version: str = "10"
     retry_terminal_failures: bool = False
     extraction_policy: ExtractionPolicy = field(default_factory=ExtractionPolicy)
     processing: ProcessingPolicy = field(default_factory=ProcessingPolicy)
@@ -631,6 +632,15 @@ class MapRequest:
             raise ValueError("collection scope requires collection_key")
         if self.parallel < 1:
             raise ValueError("parallel must be at least 1")
+        if self.provider_concurrency is not None:
+            if self.provider_concurrency != "auto" and (
+                isinstance(self.provider_concurrency, bool)
+                or not isinstance(self.provider_concurrency, int)
+                or self.provider_concurrency < 1
+            ):
+                raise ValueError(
+                    "provider_concurrency must be auto or a positive integer"
+                )
         if self.limit < 0:
             raise ValueError("limit cannot be negative")
         if not self.provider.strip():
@@ -696,9 +706,16 @@ class MapRequest:
                 payload.get("allow_cloud", False), field="allow_cloud"
             ),
             parallel=int(payload.get("parallel", 4)),
+            provider_concurrency=(
+                "auto"
+                if payload.get("provider_concurrency") == "auto"
+                else int(payload["provider_concurrency"])
+                if payload.get("provider_concurrency") is not None
+                else None
+            ),
             limit=int(payload.get("limit", 0)),
             extraction_version=str(payload.get("extraction_version", "2")),
-            prompt_version=str(payload.get("prompt_version", "9")),
+            prompt_version=str(payload.get("prompt_version", "10")),
             retry_terminal_failures=_strict_bool(
                 payload.get("retry_terminal_failures", False),
                 field="retry_terminal_failures",
@@ -2134,6 +2151,7 @@ class RelationshipPairJob:
     left_source_id: str = ""
     right_source_id: str = ""
     profiles: dict[str, Any] = field(default_factory=dict)
+    atomic_notes: dict[str, Any] = field(default_factory=dict)
     literature_positions: list[dict[str, Any]] = field(default_factory=list)
     selected_evidence: dict[str, list[dict[str, Any]]] = field(
         default_factory=dict
@@ -2155,7 +2173,13 @@ class RelationshipPairJob:
         left, right = sorted((self.left_source_id, self.right_source_id))
         object.__setattr__(self, "left_source_id", left)
         object.__setattr__(self, "right_source_id", right)
-        for field_name in ("profiles", "selected_evidence", "graph_context", "prior_pair_memory"):
+        for field_name in (
+            "profiles",
+            "atomic_notes",
+            "selected_evidence",
+            "graph_context",
+            "prior_pair_memory",
+        ):
             object.__setattr__(
                 self,
                 field_name,
@@ -2186,13 +2210,39 @@ class RelationshipPairJob:
                 "relationship-job-"
                 + _stable_json_hash(
                     {
-                        "catalogue_revision": self.catalogue_revision,
                         "pair": [left, right],
-                        "profiles": self.profiles,
-                        "literature_positions": self.literature_positions,
-                        "selected_evidence": self.selected_evidence,
-                        "candidate_basis": self.candidate_basis,
-                        "prior_pair_memory": self.prior_pair_memory,
+                        "endpoint_semantic_hashes": {
+                            side: str(
+                                _any_mapping(
+                                    self.atomic_notes.get(side, {}),
+                                    field=(
+                                        "relationship pair job.atomic_notes."
+                                        + side
+                                    ),
+                                ).get("semantic_hash")
+                                or _any_mapping(
+                                    self.profiles.get(side, {}),
+                                    field=(
+                                        "relationship pair job.profiles."
+                                        + side
+                                    ),
+                                ).get("dependency_hash")
+                                or _any_mapping(
+                                    self.profiles.get(side, {}),
+                                    field=(
+                                        "relationship pair job.profiles."
+                                        + side
+                                    ),
+                                ).get("note_hash")
+                                or ""
+                            )
+                            for side in ("left", "right")
+                        },
+                        "adjudication_evidence": {
+                            "literature_positions": self.literature_positions,
+                            "selected_evidence": self.selected_evidence,
+                            "candidate_basis": self.candidate_basis,
+                        },
                         "output_contract": self.output_contract,
                     }
                 )[:20],
@@ -2207,6 +2257,7 @@ class RelationshipPairJob:
                 "right_source_id": self.right_source_id,
             },
             "profiles": dict(self.profiles),
+            "atomic_notes": dict(self.atomic_notes),
             "literature_positions": list(self.literature_positions),
             "selected_evidence": dict(self.selected_evidence),
             "graph_context": dict(self.graph_context),
@@ -5214,6 +5265,7 @@ class LiteratureMapRequest:
     provider: str = "deepseek"
     model: str = "deepseek-v4-flash"
     allow_cloud: bool = False
+    provider_concurrency: int | Literal["auto"] = "auto"
     literature_policy: LiteratureMappingPolicy = field(
         default_factory=LiteratureMappingPolicy
     )
@@ -5225,6 +5277,14 @@ class LiteratureMapRequest:
             raise ValueError("provider cannot be empty")
         if not self.model.strip():
             raise ValueError("model cannot be empty")
+        if self.provider_concurrency != "auto" and (
+            isinstance(self.provider_concurrency, bool)
+            or not isinstance(self.provider_concurrency, int)
+            or self.provider_concurrency < 1
+        ):
+            raise ValueError(
+                "provider_concurrency must be auto or a positive integer"
+            )
         if not isinstance(self.literature_policy, LiteratureMappingPolicy):
             if isinstance(self.literature_policy, Mapping):
                 object.__setattr__(
@@ -5254,6 +5314,11 @@ class LiteratureMapRequest:
             model=str(payload.get("model", "deepseek-v4-flash")),
             allow_cloud=_strict_bool(
                 payload.get("allow_cloud", False), field="allow_cloud"
+            ),
+            provider_concurrency=(
+                "auto"
+                if payload.get("provider_concurrency", "auto") == "auto"
+                else int(payload["provider_concurrency"])
             ),
             literature_policy=payload.get(
                 "literature_policy", LiteratureMappingPolicy()
@@ -5407,6 +5472,11 @@ class RunReport:
     provider_call_count: int = 0
     literature_failure_count: int = 0
     internal_falsification_count: int = 0
+    source_peak_concurrency: int = 0
+    source_stage_wall_seconds: float = 0.0
+    relationship_stage_wall_seconds: float = 0.0
+    cluster_peak_concurrency: int = 0
+    cluster_stage_wall_seconds: float = 0.0
 
     @property
     def terminal_count(self) -> int:

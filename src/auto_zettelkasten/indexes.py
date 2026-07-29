@@ -180,8 +180,8 @@ def write_source_set(
     items: Sequence[Mapping[str, Any]],
     terminal_rows: Sequence[Mapping[str, Any]],
     note_rows: Sequence[Mapping[str, Any]],
-    cluster_ids: Sequence[str] = (),
-    gap_ids: Sequence[str] = (),
+    cluster_ids: Sequence[str] | None = None,
+    gap_ids: Sequence[str] | None = None,
     source_set_id: str | None = None,
     source_set_type: str | None = None,
     snapshot_id: str | None = None,
@@ -217,6 +217,8 @@ def write_source_set(
     ]
     dependency_hash = sha256_text(json.dumps(dependency_payload, sort_keys=True, ensure_ascii=False, default=str))
     source_set_id = snapshot_id or f"{source_set_alias}-{dependency_hash[:12]}"
+    path = workspace / "02_source_memory" / "indexes" / "source_sets" / f"{source_set_id}.yml"
+    existing = read_yaml(path, {}) or {}
     status_counts = {
         status: sum(
             1
@@ -262,8 +264,20 @@ def write_source_set(
         "zotero_item_keys": zotero_keys,
         "original_zotero_tags": original_tags,
         "normalized_tags": normalized_tags,
-        "cluster_ids": sorted(set(cluster_ids)),
-        "gap_ids": sorted(set(gap_ids)),
+        "cluster_ids": sorted(
+            set(
+                cluster_ids
+                if cluster_ids is not None
+                else existing.get("cluster_ids", []) or []
+            )
+        ),
+        "gap_ids": sorted(
+            set(
+                gap_ids
+                if gap_ids is not None
+                else existing.get("gap_ids", []) or []
+            )
+        ),
         "dependency_hash": dependency_hash,
         "frozen_inventory": True,
         "refresh_requires_new_run": True,
@@ -280,8 +294,6 @@ def write_source_set(
             for index, key in enumerate(zotero_keys)
         ],
     }
-    path = workspace / "02_source_memory" / "indexes" / "source_sets" / f"{source_set_id}.yml"
-    existing = read_yaml(path, {}) or {}
     existing_without_timestamp = dict(existing)
     existing_without_timestamp.pop("updated_at", None)
     payload["updated_at"] = (
@@ -404,7 +416,8 @@ def build_source_catalogue(
         entries.append(_catalogue_entry({}, _catalogue_note_summary(workspace, note)))
 
     literatures = _catalogue_literatures(workspace, entries)
-    relationship_ids_by_source = _catalogue_relationship_ids(workspace)
+    relationship_rows = _catalogue_relationship_rows(workspace)
+    relationship_ids_by_source = _catalogue_relationship_ids(relationship_rows)
     cluster_ids_by_source: dict[str, set[str]] = defaultdict(set)
     for cluster in clusters:
         cluster_id = str(cluster.get("cluster_id") or "")
@@ -542,6 +555,7 @@ def build_source_catalogue(
     collection_projection = _collection_catalogue_projection(
         entries,
         collection_snapshot,
+        relationship_rows,
     )
     compact_literatures = [
         {
@@ -774,6 +788,7 @@ def build_source_catalogue(
 def _collection_catalogue_projection(
     entries: Sequence[Mapping[str, Any]],
     snapshot: Mapping[str, Any] | None,
+    relationships: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     if not snapshot:
         return {"catalogue": [], "tree_lines": [], "files": []}
@@ -861,6 +876,8 @@ def _collection_catalogue_projection(
         chunks = _meaningful_catalogue_chunks(direct_entries) if direct_entries else []
         shard_links: list[str] = []
         shard_revision_payload: list[str] = []
+        relationship_links: list[str] = []
+        relationship_revision_payload: list[str] = []
         collection_dir = directories[key]
         for number, (_label, chunk_entries) in enumerate(chunks, start=1):
             filename = f"sources-{number:03d}.md"
@@ -885,6 +902,81 @@ def _collection_catalogue_projection(
                 f"- [[{Path(filename).stem}|Direct sources {number}]] — {len(chunk_entries)} sources"
             )
             shard_revision_payload.append(shard_revision)
+        direct_source_set = set(direct_source_ids)
+        entry_by_source = {
+            str(entry.get("source_id") or ""): entry for entry in entries
+        }
+        known_source_ids = set(entry_by_source)
+        view_relationships = sorted(
+            (
+                dict(relationship)
+                for relationship in relationships
+                if (
+                    endpoints := {
+                        str(relationship.get("source_id") or ""),
+                        str(relationship.get("target_source_id") or ""),
+                    }
+                ).issubset(known_source_ids)
+                and endpoints & direct_source_set
+            ),
+            key=lambda relationship: (
+                str(relationship.get("source_id") or ""),
+                str(relationship.get("target_source_id") or ""),
+                str(relationship.get("relation_type") or ""),
+                str(relationship.get("relation_id") or ""),
+            ),
+        )
+        for number, start in enumerate(range(0, len(view_relationships), 100), start=1):
+            relation_chunk = view_relationships[start : start + 100]
+            filename = f"relationships-{number:03d}.md"
+            relation_path = (
+                f"02_source_memory/indexes/collections/{collection_dir}/{filename}"
+            )
+            lines = [
+                f"# {name} — Graph connections {number}",
+                "",
+                f"Collection key: `{key}`",
+                "",
+            ]
+            for relationship in relation_chunk:
+                left_id = str(relationship.get("source_id") or "")
+                right_id = str(relationship.get("target_source_id") or "")
+                left = entry_by_source.get(left_id, {})
+                right = entry_by_source.get(right_id, {})
+                if not left or not right:
+                    continue
+                relation_type = str(
+                    relationship.get("relation_type") or "related"
+                ).replace("_", " ")
+                scope_label = (
+                    "within collection"
+                    if left_id in direct_source_set and right_id in direct_source_set
+                    else "cross-collection"
+                )
+                reason = " ".join(
+                    str(relationship.get("reason") or "").split()
+                )[:240]
+                lines.append(
+                    f"- {left['note_link']} **{relation_type}** "
+                    f"{right['note_link']} — {scope_label}"
+                    + (f"; {reason}" if reason else "")
+                )
+            relation_body = "\n".join(lines).rstrip() + "\n"
+            relation_revision = sha256_text(relation_body)
+            files.append(
+                {
+                    "path": relation_path,
+                    "text": (
+                        f"{relation_body}\n"
+                        f"View revision: `{relation_revision}`\n"
+                    ),
+                }
+            )
+            relationship_links.append(
+                f"- [[{Path(filename).stem}|Graph connections {number}]] "
+                f"— {len(relation_chunk)} relationships"
+            )
+            relationship_revision_payload.append(relation_revision)
 
         status_counts = _collection_status_counts(direct_entries)
         missing_count = sum(
@@ -903,6 +995,16 @@ def _collection_catalogue_projection(
             "status_counts": status_counts,
             "cluster_ids": clusters,
             "shard_revisions": shard_revision_payload,
+            "relationship_count": len(view_relationships),
+            "cross_collection_relationship_count": sum(
+                1
+                for relationship in view_relationships
+                if not {
+                    str(relationship.get("source_id") or ""),
+                    str(relationship.get("target_source_id") or ""),
+                }.issubset(direct_source_set)
+            ),
+            "relationship_view_revisions": relationship_revision_payload,
         }
         revision = sha256_text(
             json.dumps(
@@ -937,6 +1039,9 @@ def _collection_catalogue_projection(
             )
         index_lines.extend(["", "## Direct source shards", ""])
         index_lines.extend(shard_links or ["No processed direct sources yet."])
+        if relationship_links:
+            index_lines.extend(["", "## Graph connections", ""])
+            index_lines.extend(relationship_links)
         if clusters:
             index_lines.extend(
                 [
@@ -1031,6 +1136,7 @@ def _prune_stale_collection_indexes(
             [
                 directory / "INDEX.md",
                 *directory.glob("sources-*.md"),
+                *directory.glob("relationships-*.md"),
             ]
         ):
             if stale.is_file() and stale.resolve() not in expected:
@@ -1064,21 +1170,37 @@ def _catalogue_profile_rows(profiles: Sequence[Any] | Mapping[str, Any]) -> list
     return rows
 
 
-def _catalogue_relationship_ids(workspace: Path) -> dict[str, set[str]]:
+def _catalogue_relationship_rows(workspace: Path) -> list[dict[str, Any]]:
     payload = read_yaml(
         workspace / "02_source_memory" / "indexes" / "typed_links.yml", {}
     ) or {}
     rows = payload.get("links", []) if isinstance(payload, Mapping) else []
+    return [
+        dict(row)
+        for row in rows
+        if isinstance(row, Mapping)
+        and bool(row.get("active", True))
+        and row.get("source_id")
+        and row.get("target_source_id")
+        and row.get("relation_id", row.get("link_id"))
+        and _relationship_confidence(row) >= 0.55
+    ]
+
+
+def _relationship_confidence(row: Mapping[str, Any]) -> float:
+    try:
+        return float(row.get("confidence", 1))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _catalogue_relationship_ids(
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[str, set[str]]:
     result: dict[str, set[str]] = defaultdict(set)
     for row in rows:
-        if not isinstance(row, Mapping) or not bool(row.get("active", True)):
-            continue
-        try:
-            confidence = float(row.get("confidence", 1))
-        except (TypeError, ValueError):
-            confidence = 0
         relation_id = str(row.get("relation_id") or row.get("link_id") or "")
-        if not relation_id or confidence < 0.55:
+        if not relation_id:
             continue
         for source_id in (
             str(row.get("source_id") or ""),
@@ -1132,7 +1254,8 @@ def _compact_cluster_catalogue(
                 "title": _compact_catalogue_text(
                     cluster.get("display_label")
                     or cluster.get("label")
-                    or cluster.get("semantic_identity"),
+                    or cluster.get("semantic_identity")
+                    or cluster.get("title"),
                     180,
                 ),
                 "shared_question": _compact_catalogue_text(

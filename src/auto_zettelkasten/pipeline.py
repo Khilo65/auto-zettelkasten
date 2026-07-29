@@ -47,6 +47,7 @@ from .navigation import build_typed_source_relations
 from .literature import (
     _CheckpointedReasonerCalls,
     _preserve_last_valid_clusters_on_refresh_failure,
+    _provider_worker_count,
     _reasoner_context_char_budget,
     _reasoner_packet_chars,
     build_navigation_projection,
@@ -80,6 +81,7 @@ from .notes import (
     propose_tags,
     read_note,
     semantic_note_hash,
+    source_note_semantic_components,
     source_id_for_item,
     update_note_graph,
     update_note_frontmatter,
@@ -139,6 +141,7 @@ from .zotero import (
 
 CHUNKING_VERSION = "2"
 CONTENT_CLASSIFIER_VERSION = "4"
+_RELATIONSHIP_BATCH_MAX_JOBS = 8
 _LITERATURE_MEMORY_LOCK = threading.Lock()
 
 
@@ -850,13 +853,37 @@ def run_pipeline(
             seen_keys.add(key)
         pending.append((index, item))
 
-    workers = max(1, min(request.parallel, len(pending) or 1))
-    with ThreadPoolExecutor(
-        max_workers=workers, thread_name_prefix="auto-zettelkasten"
-    ) as executor:
-        future_map = {
-            executor.submit(
-                _prepare_item,
+    requested_concurrency = request.provider_concurrency
+    automatic_workers = (
+        (len(pending) or 1)
+        if bool(getattr(reader, "is_cloud", False))
+        else request.parallel
+    )
+    workers = max(
+        1,
+        min(
+            len(pending) or 1,
+            (
+                automatic_workers
+                if requested_concurrency == "auto"
+                else int(requested_concurrency or request.parallel)
+            ),
+        ),
+    )
+    source_stage_started = time.monotonic()
+    concurrency_lock = threading.Lock()
+    active_source_jobs = 0
+    peak_source_concurrency = 0
+
+    def prepare_one(index: int, item: Mapping[str, Any]) -> dict[str, Any]:
+        nonlocal active_source_jobs, peak_source_concurrency
+        with concurrency_lock:
+            active_source_jobs += 1
+            peak_source_concurrency = max(
+                peak_source_concurrency, active_source_jobs
+            )
+        try:
+            return _prepare_item(
                 workspace,
                 run_dir,
                 index,
@@ -867,6 +894,24 @@ def run_pipeline(
                 vision,
                 progress,
                 profile_budget,
+            )
+        finally:
+            with concurrency_lock:
+                active_source_jobs -= 1
+
+    progress.set_stage(
+        "source_processing",
+        source_worker_count=workers,
+        provider_concurrency_mode=str(requested_concurrency or request.parallel),
+    )
+    with ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="auto-zettelkasten"
+    ) as executor:
+        future_map = {
+            executor.submit(
+                prepare_one,
+                index,
+                item,
             ): index
             for index, item in pending
         }
@@ -885,6 +930,13 @@ def run_pipeline(
                         f"unhandled_worker_error:{type(exc).__name__}:{exc}",
                     )
                 )
+    progress.set_stage(
+        "source_terminal_barrier",
+        source_peak_concurrency=peak_source_concurrency,
+        source_stage_wall_seconds=round(
+            time.monotonic() - source_stage_started, 3
+        ),
+    )
     prepared.sort(key=lambda row: int(row.get("inventory_index", 0)))
     tag_report = commit_tag_reviews(workspace, proposals, decisions)
     _reconcile_literature_memory(workspace)
@@ -1069,6 +1121,22 @@ def run_pipeline(
         "profile_result": map_result.get("profile_result", {}),
         "migration": map_result.get("migration", {}),
         "partial_reason": literature_partial_reason,
+        "source_peak_concurrency": int(
+            progress.literature.get("source_peak_concurrency", 0) or 0
+        ),
+        "source_stage_wall_seconds": float(
+            progress.literature.get("source_stage_wall_seconds", 0.0) or 0.0
+        ),
+        "relationship_stage_wall_seconds": float(
+            progress.literature.get("relationship_stage_wall_seconds", 0.0)
+            or 0.0
+        ),
+        "cluster_peak_concurrency": int(
+            progress.literature.get("cluster_peak_concurrency", 0) or 0
+        ),
+        "cluster_stage_wall_seconds": float(
+            progress.literature.get("cluster_stage_wall_seconds", 0.0) or 0.0
+        ),
     }
     progress.set_stage(
         "reporting",
@@ -1233,6 +1301,22 @@ def run_pipeline(
             progress.literature.get("literature_failure_count", 0) or 0
         ),
         internal_falsification_count=internal_falsification_count,
+        source_peak_concurrency=int(
+            progress.literature.get("source_peak_concurrency", 0) or 0
+        ),
+        source_stage_wall_seconds=float(
+            progress.literature.get("source_stage_wall_seconds", 0.0) or 0.0
+        ),
+        relationship_stage_wall_seconds=float(
+            progress.literature.get("relationship_stage_wall_seconds", 0.0)
+            or 0.0
+        ),
+        cluster_peak_concurrency=int(
+            progress.literature.get("cluster_peak_concurrency", 0) or 0
+        ),
+        cluster_stage_wall_seconds=float(
+            progress.literature.get("cluster_stage_wall_seconds", 0.0) or 0.0
+        ),
         artifact_manifest=manifest,
     )
     _write_run_report(run_dir, report)
@@ -1330,6 +1414,7 @@ def _finalize_prepared_row(
                     if isinstance(data.get("relations", {}), Mapping)
                     else {}
                 ),
+                "item_type": str(data.get("itemType") or ""),
                 "aliases": [str(data.get("title") or "")],
                 "updated_at": now_iso(),
                 "engine_version": ENGINE_VERSION,
@@ -1442,15 +1527,22 @@ def _commit_source_bundle(
     )
     semantic_fingerprint = stable_hash(bundle.semantic_dict())
     dependency_fingerprint = _source_bundle_dependency_fingerprint(row, request)
-    write_yaml(
-        bundle_path,
-        {
-            "source_analysis_bundle_schema_version": "1",
-            "semantic_fingerprint": semantic_fingerprint,
-            "dependency_fingerprint": dependency_fingerprint,
-            "bundle": bundle.to_dict(),
-        },
+    bundle_record = {
+        "source_analysis_bundle_schema_version": "1",
+        "semantic_fingerprint": semantic_fingerprint,
+        "dependency_fingerprint": dependency_fingerprint,
+        "bundle": bundle.to_dict(),
+    }
+    write_yaml(bundle_path, bundle_record)
+    immutable_bundle_path = (
+        workspace
+        / "02_source_memory"
+        / "bundles"
+        / "by_fingerprint"
+        / f"{dependency_fingerprint}.yml"
     )
+    if not immutable_bundle_path.is_file():
+        write_yaml(immutable_bundle_path, bundle_record)
     note_text = internal_note_text(note_path)
     profile = build_evidence_profile(
         note_text,
@@ -1554,8 +1646,7 @@ def _source_bundle_dependency_fingerprint(
             "model": request.model,
             "prompt_version": request.prompt_version,
             "source_bundle_prompt_version": SOURCE_BUNDLE_PROMPT_VERSION,
-            "source_bundle_normalization_version": "7",
-            "processing": request.to_dict().get("processing", {}),
+            "source_bundle_normalization_version": "8",
         }
     )
 
@@ -2023,6 +2114,21 @@ def _commit_remediation_ledgers(
         != _normalized_match_text(str(canonical.get(field) or ""))
     }
     if differences:
+        issue_types = []
+        if "itemType" in differences:
+            issue_types.append("probable_document_type_mismatch")
+            current_type = _normalized_match_text(
+                str(differences["itemType"]["current"] or "")
+            )
+            observed_type = _normalized_match_text(
+                str(differences["itemType"]["observed"] or "")
+            )
+            if current_type == "book" and "report" in observed_type:
+                issue_types.append("institutional_report_represented_as_book")
+        if "creators" in differences:
+            issue_types.append("probable_creator_role_mismatch")
+        if "title" in differences:
+            issue_types.append("probable_title_mismatch")
         path = (
             workspace
             / "01_custody"
@@ -2054,6 +2160,7 @@ def _commit_remediation_ledgers(
                 for key in ("title", "creators", "date", "itemType")
             },
             "recommended_correction": differences,
+            "issue_types": issue_types,
             "evidence": observed,
             "confidence": "review_required",
             "ambiguity": "Document-body identity is diagnostic; Zotero remains canonical.",
@@ -2154,6 +2261,7 @@ def _write_fingerprint(
             "source_id": row.get("source_id", ""),
             "note_status": row.get("note_status", ""),
             "source_scope": row.get("source_scope", ""),
+            "source_item_type": item_data(row.get("item", {})).get("itemType", ""),
             "note_path": relative_path,
             "content_hash": row.get("content_hash", ""),
             "metadata_hash": _prompt_metadata_hash(row.get("item", {})),
@@ -2285,6 +2393,15 @@ def _cluster_catalogue_rows(workspace: Path) -> list[dict[str, Any]]:
                     or ""
                 ),
                 "bounded_scope": str(row.get("bounded_object") or ""),
+                "central_debate": str(
+                    row.get("central_debate")
+                    or row.get("debate_state")
+                    or row.get("relationship_among_findings")
+                    or ""
+                ),
+                "source_ids": list(
+                    row.get("source_ids") or row.get("core_source_ids") or []
+                ),
                 "core_source_ids": list(row.get("core_source_ids", []) or []),
                 "neighboring_cluster_ids": [
                     str(value)
@@ -2361,7 +2478,7 @@ def _run_relationship_reasoning(
     reasoner_calls: _CheckpointedReasonerCalls | None,
     request: LiteratureMapRequest,
 ) -> dict[str, Any]:
-    """Run v0.13 discovery and one complete decision per immutable pair job."""
+    """Run v0.14 discovery and one complete decision per immutable pair job."""
 
     selector = getattr(reasoner, "select_relationship_candidates", None)
     adjudicator = getattr(reasoner, "adjudicate_relationships", None)
@@ -2394,6 +2511,36 @@ def _run_relationship_reasoning(
             "cluster_candidates": [],
             "selected_profile_hashes": {},
             "reconciled_catalogue_revision": "",
+        }
+    note_row_by_source = {
+        str(row.get("source_id") or ""): row
+        for row in all_workspace_note_rows(workspace)
+        if row.get("source_id") and row.get("note_path")
+    }
+    atomic_note_by_source: dict[str, dict[str, str]] = {}
+    for source_id, profile in profile_by_source.items():
+        profile_row = profile_to_dict(profile)
+        context = (
+            profile_row.get("context")
+            if isinstance(profile_row.get("context"), Mapping)
+            else {}
+        )
+        raw_path = str(
+            note_row_by_source.get(source_id, {}).get("note_path")
+            or context.get("note_path")
+            or ""
+        )
+        note_path = Path(raw_path)
+        if raw_path and not note_path.is_absolute():
+            note_path = workspace / note_path
+        if not raw_path or not note_path.is_file():
+            continue
+        internal_text = internal_note_text(note_path)
+        _frontmatter, semantic_body = source_note_semantic_components(internal_text)
+        atomic_note_by_source[source_id] = {
+            "source_id": source_id,
+            "semantic_hash": semantic_note_hash(internal_text),
+            "markdown": semantic_body.strip(),
         }
     catalogue_payload = read_yaml(Path(str(catalogue["catalogue_path"])), {}) or {}
     available_catalogue_ids = {
@@ -2430,6 +2577,61 @@ def _run_relationship_reasoning(
         source_id: stable_hash(profile_to_dict(profile))
         for source_id, profile in sorted(profile_by_source.items())
     }
+    registry = read_yaml(
+        workspace / "02_source_memory" / "indexes" / "typed_links.yml", {}
+    ) or {}
+    positions = read_yaml(
+        workspace / "02_source_memory" / "indexes" / "literature_positions.yml",
+        {},
+    ) or {}
+    memory_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in registry.get("relations", []) or registry.get("links", []) or []:
+        if not isinstance(row, Mapping) or str(row.get("relation_type") or "") not in {
+            "cites",
+            "cited_by",
+            "zotero_related",
+        }:
+            continue
+        pair = canonical_pair(
+            str(row.get("source_id") or ""),
+            str(row.get("target_source_id") or ""),
+        )
+        if pair[0] not in profile_by_source or pair[1] not in profile_by_source:
+            continue
+        memory = {
+            "kind": "explicit_relation",
+            "pair": list(pair),
+            "relation_type": str(row.get("relation_type") or ""),
+            "reason": str(row.get("reason") or ""),
+            "provenance": str(row.get("provenance") or ""),
+        }
+        for source_id in pair:
+            memory_rows[source_id].append(memory)
+    for row in positions.get("positions", []) or []:
+        if not isinstance(row, Mapping) or not row.get("matched_source_id"):
+            continue
+        pair = canonical_pair(
+            str(row.get("current_source_id") or ""),
+            str(row.get("matched_source_id") or ""),
+        )
+        if pair[0] not in profile_by_source or pair[1] not in profile_by_source:
+            continue
+        memory = {
+            "kind": "literature_position",
+            **{
+                key: value
+                for key, value in row.items()
+                if key not in {"match_status", "updated_at"}
+            },
+        }
+        for source_id in pair:
+            memory_rows[source_id].append(memory)
+    current_memory_hashes = {
+        source_id: stable_hash(
+            sorted(memory_rows.get(source_id, []), key=stable_hash)
+        )
+        for source_id in sorted(profile_by_source)
+    }
     selection_identity = stable_hash(
         {
             "provider": str(getattr(reasoner, "name", "")),
@@ -2446,13 +2648,19 @@ def _run_relationship_reasoning(
     )
     prior_state = read_yaml(state_path, {}) or {}
     prior_hashes = dict(prior_state.get("profile_hashes", {}) or {})
+    prior_memory_hashes = dict(
+        prior_state.get("relationship_memory_hashes", {}) or {}
+    )
     identity_changed = (
         str(prior_state.get("selection_identity") or "") != selection_identity
     )
     focus_source_ids = sorted(
         source_id
         for source_id, profile_hash in current_hashes.items()
-        if identity_changed or str(prior_hashes.get(source_id) or "") != profile_hash
+        if identity_changed
+        or str(prior_hashes.get(source_id) or "") != profile_hash
+        or str(prior_memory_hashes.get(source_id) or "")
+        != current_memory_hashes[source_id]
     )
     catalogue_changed = (
         str(
@@ -2475,9 +2683,6 @@ def _run_relationship_reasoning(
             "pair_job_count": 0,
             "provider_batch_count": 0,
         }
-    registry = read_yaml(
-        workspace / "02_source_memory" / "indexes" / "typed_links.yml", {}
-    ) or {}
     mandatory_basis: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in registry.get("relations", []) or registry.get("links", []) or []:
         if not isinstance(row, Mapping) or str(row.get("relation_type") or "") not in {
@@ -2498,10 +2703,6 @@ def _run_relationship_reasoning(
                     "mandatory": True,
                 }
             )
-    positions = read_yaml(
-        workspace / "02_source_memory" / "indexes" / "literature_positions.yml",
-        {},
-    ) or {}
     for row in positions.get("positions", []) or []:
         if not isinstance(row, Mapping) or not row.get("matched_source_id"):
             continue
@@ -2575,7 +2776,9 @@ def _run_relationship_reasoning(
             ),
         )
     )
-    mandatory_call_count = (len(mandatory_basis) + 5) // 6
+    mandatory_call_count = (
+        len(mandatory_basis) + _RELATIONSHIP_BATCH_MAX_JOBS - 1
+    ) // _RELATIONSHIP_BATCH_MAX_JOBS
     if mandatory_call_count > min(20, remaining_calls):
         return {
             "accepted": [],
@@ -2654,7 +2857,7 @@ def _run_relationship_reasoning(
     cluster_context = [
         row
         for row in _cluster_catalogue_rows(workspace)
-        if set(row.get("core_source_ids", []) or []) & set(profile_by_source)
+        if set(row.get("source_ids", []) or []) & set(profile_by_source)
     ]
 
     def discovery_memory(source_ids: set[str]) -> dict[str, Any]:
@@ -2674,7 +2877,7 @@ def _run_relationship_reasoning(
             "cluster_summaries": [
                 row
                 for row in cluster_context
-                if set(row.get("core_source_ids", []) or []) & source_ids
+                if set(row.get("source_ids", []) or []) & source_ids
             ],
         }
 
@@ -2710,7 +2913,7 @@ def _run_relationship_reasoning(
             remaining_calls - (discovery_call_count if can_discover else 0),
         ),
     )
-    pair_capacity = adjudication_call_capacity * 6
+    pair_capacity = adjudication_call_capacity * _RELATIONSHIP_BATCH_MAX_JOBS
     inferred_capacity = (
         min(120, max(0, pair_capacity - len(mandatory_basis)))
         if can_discover
@@ -2880,6 +3083,7 @@ def _run_relationship_reasoning(
     job_root = (
         workspace / "11_state" / "runs" / run_id / "relationship_jobs"
     )
+    global_job_root = workspace / "11_state" / "relationship_jobs"
     capabilities = dict(getattr(reasoner, "capabilities", {}) or {})
     provider_name = str(getattr(reasoner, "name", ""))
     model_name = str(getattr(reasoner, "model", ""))
@@ -2890,11 +3094,7 @@ def _run_relationship_reasoning(
         {
             "provider": provider_name,
             "model": model_name,
-            "reasoner_backend": reasoner_backend,
             "prompt_version": RELATIONSHIP_PROMPT_VERSION,
-            "capability_identity": str(
-                capabilities.get("capability_identity") or ""
-            ),
             "output_contract": "relationship-decision-v4",
         }
     )
@@ -2941,6 +3141,12 @@ def _run_relationship_reasoning(
                         include_anchors=False,
                     )
                 ),
+            },
+            atomic_notes={
+                side: atomic_note_by_source.get(source_id, {})
+                for side, source_id in zip(
+                    ("left", "right"), pair, strict=True
+                )
             },
             literature_positions=literature_rows,
             selected_evidence=selected,
@@ -2994,8 +3200,15 @@ def _run_relationship_reasoning(
         job_path = job_root / job.pair_job_id
         result_path = job_path / "result.json"
         status = read_yaml(job_path / "status.yml", {}) or {}
+        cached_path = global_job_root / job.pair_job_id
+        cached_status = read_yaml(cached_path / "status.yml", {}) or {}
+        cached_result_path = cached_path / "result.json"
         same_identity = (
             str(status.get("decision_identity") or "") == decision_identity
+        )
+        cache_same_identity = (
+            str(cached_status.get("decision_identity") or "")
+            == decision_identity
         )
         if (
             str(status.get("status") or "") == "parked_for_review"
@@ -3010,9 +3223,19 @@ def _run_relationship_reasoning(
                     "reason": str(status.get("reason") or "terminal_pair_job_failure"),
                 }
             )
-        elif result_path.is_file() and same_identity:
+        elif (
+            (result_path.is_file() and same_identity)
+            or (cached_result_path.is_file() and cache_same_identity)
+        ):
+            reusable_result_path = (
+                result_path
+                if result_path.is_file() and same_identity
+                else cached_result_path
+            )
             try:
-                payload = json.loads(result_path.read_text(encoding="utf-8"))
+                payload = json.loads(
+                    reusable_result_path.read_text(encoding="utf-8")
+                )
             except (OSError, json.JSONDecodeError):
                 unresolved.append(job)
                 continue
@@ -3048,8 +3271,91 @@ def _run_relationship_reasoning(
             "pair_jobs": [job.to_dict() for job in packet]
         },
         max_chars=catalogue_char_budget,
-        max_rows=6,
+        max_rows=_RELATIONSHIP_BATCH_MAX_JOBS,
     )
+    concurrent_batch_results: dict[
+        tuple[str, ...], Mapping[str, Any] | BaseException
+    ] = {}
+
+    def adjudicate_packet(
+        packet: Sequence[RelationshipPairJob],
+    ) -> Mapping[str, Any]:
+        packet_context = {"pair_jobs": [job.to_dict() for job in packet]}
+        packet_source_ids = sorted(
+            {
+                source_id
+                for job in packet
+                for source_id in (job.left_source_id, job.right_source_id)
+            }
+        )
+        packet_profiles = [
+            profile_by_source[source_id] for source_id in packet_source_ids
+        ]
+        batch = RelationshipProviderBatch(
+            pair_job_ids=[job.pair_job_id for job in packet],
+            provider=str(getattr(reasoner, "name", "")),
+            model=str(getattr(reasoner, "model", "")),
+            capability_identity=str(
+                capabilities.get("capability_identity") or ""
+            ),
+            serialized_context_fingerprint=stable_hash(
+                [job.to_dict() for job in packet]
+            ),
+        )
+        return reasoner_calls(
+            "relationship_adjudication",
+            batch.batch_id,
+            "adjudicate_relationships",
+            packet_profiles,
+            packet_context,
+        )
+
+    runnable_packets = []
+    for packet in job_packets:
+        packet_context = {"pair_jobs": [job.to_dict() for job in packet]}
+        packet_source_ids = sorted(
+            {
+                source_id
+                for job in packet
+                for source_id in (job.left_source_id, job.right_source_id)
+            }
+        )
+        packet_profiles = [
+            profile_by_source[source_id] for source_id in packet_source_ids
+        ]
+        if (
+            _reasoner_packet_chars(
+                [profile_to_dict(profile) for profile in packet_profiles],
+                packet_context,
+            )
+            <= catalogue_char_budget
+        ):
+            runnable_packets.append(packet)
+    if runnable_packets:
+        relationship_started = time.monotonic()
+        with ThreadPoolExecutor(
+            max_workers=_provider_worker_count(
+                request, len(runnable_packets)
+            ),
+            thread_name_prefix="auto-zettelkasten-relationship",
+        ) as executor:
+            future_map = {
+                executor.submit(adjudicate_packet, packet): tuple(
+                    job.pair_job_id for job in packet
+                )
+                for packet in runnable_packets
+            }
+            for future in as_completed(future_map):
+                packet_key = future_map[future]
+                try:
+                    concurrent_batch_results[packet_key] = future.result()
+                except BaseException as exc:
+                    concurrent_batch_results[packet_key] = exc
+        relationship_stage_seconds = round(
+            time.monotonic() - relationship_started, 3
+        )
+    else:
+        relationship_stage_seconds = 0.0
     for packet in job_packets:
         packet_context = {"pair_jobs": [job.to_dict() for job in packet]}
         packet_source_ids = sorted(
@@ -3114,13 +3420,14 @@ def _run_relationship_reasoning(
         )
         provider_batch_count += 1
         try:
-            response = reasoner_calls(
-                "relationship_adjudication",
-                batch.batch_id,
-                "adjudicate_relationships",
-                packet_profiles,
-                packet_context,
+            response_or_error = concurrent_batch_results.get(
+                tuple(job.pair_job_id for job in packet)
             )
+            if isinstance(response_or_error, BaseException):
+                raise response_or_error
+            if response_or_error is None:
+                raise RuntimeError("relationship_batch_was_not_scheduled")
+            response = response_or_error
             rows = [
                 dict(row)
                 for row in response.get("decisions", []) or []
@@ -3157,12 +3464,26 @@ def _run_relationship_reasoning(
                     "model": model_name,
                 }
                 write_json(job_root / job.pair_job_id / "result.json", row)
+                write_json(
+                    global_job_root / job.pair_job_id / "result.json", row
+                )
                 write_yaml(
                     status_path,
                     {
                         "pair_job_id": job.pair_job_id,
                         "status": "completed",
                         "batch_id": batch.batch_id,
+                        "decision_identity": decision_identity,
+                        "reasoner_backend": reasoner_backend,
+                        "provider": provider_name,
+                        "model": model_name,
+                    },
+                )
+                write_yaml(
+                    global_job_root / job.pair_job_id / "status.yml",
+                    {
+                        "pair_job_id": job.pair_job_id,
+                        "status": "completed",
                         "decision_identity": decision_identity,
                         "reasoner_backend": reasoner_backend,
                         "provider": provider_name,
@@ -3237,12 +3558,16 @@ def _run_relationship_reasoning(
         "parked": [*preparked, *terminal_rows],
         "cluster_candidates": [],
         "selected_profile_hashes": current_hashes if discovery_completed else {},
+        "selected_relationship_memory_hashes": (
+            current_memory_hashes if discovery_completed else {}
+        ),
         "reconciled_catalogue_revision": (
             catalogue_revision if discovery_completed else ""
         ),
         "selection_identity": selection_identity,
         "pair_job_count": len(jobs),
         "provider_batch_count": provider_batch_count,
+        "relationship_stage_wall_seconds": relationship_stage_seconds,
         "state_path": str(
             state_path
         ),
@@ -3289,13 +3614,12 @@ def _ranked_relationship_candidates(
         right_collections = set(
             entry_by_source.get(target_id, {}).get("collections", []) or []
         )
-        bridge = bool(
-            row.get("cross_literature")
-            or row.get("discovery_route") == "cross_literature_bridge"
-            or (
-                left_collections
-                and right_collections
-                and left_collections.isdisjoint(right_collections)
+        bridge = (
+            left_collections.isdisjoint(right_collections)
+            if left_collections and right_collections
+            else bool(
+                row.get("cross_literature")
+                or row.get("discovery_route") == "cross_literature_bridge"
             )
         )
         (bridges if bridge else within).append(row)
@@ -3472,16 +3796,6 @@ def _compact_relationship_catalogue_entry(
             for value in entry.get("collections", [])[:2]
             if str(value).strip()
         ],
-        "cluster_ids": [
-            str(value)[:160]
-            for value in entry.get("cluster_ids", [])[:6]
-            if str(value)
-        ],
-        "relationship_ids": [
-            str(value)[:160]
-            for value in entry.get("relationship_ids", [])[:12]
-            if str(value)
-        ],
     }
 
 
@@ -3528,6 +3842,9 @@ def _commit_relationship_selection_state(
     catalogue_revision: str,
 ) -> Path | None:
     selected = dict(result.get("selected_profile_hashes", {}) or {})
+    selected_memory = dict(
+        result.get("selected_relationship_memory_hashes", {}) or {}
+    )
     reconciled = str(result.get("reconciled_catalogue_revision") or "")
     selection_identity = str(result.get("selection_identity") or "")
     if not selected and not reconciled and not selection_identity:
@@ -3544,9 +3861,16 @@ def _commit_relationship_selection_state(
     existing = read_yaml(path, {}) or {}
     profile_hashes = dict(existing.get("profile_hashes", {}) or {})
     profile_hashes.update(selected)
+    relationship_memory_hashes = dict(
+        existing.get("relationship_memory_hashes", {}) or {}
+    )
+    relationship_memory_hashes.update(selected_memory)
     payload = {
-        "state_schema_version": "2",
+        "state_schema_version": "3",
         "profile_hashes": dict(sorted(profile_hashes.items())),
+        "relationship_memory_hashes": dict(
+            sorted(relationship_memory_hashes.items())
+        ),
         "reconciled_catalogue_revision": reconciled
         or str(existing.get("reconciled_catalogue_revision") or ""),
         "catalogue_revision": catalogue_revision,
@@ -4213,15 +4537,41 @@ def rebuild_map(
             literature_provider_call_count=int(profile_result["provider_calls"]),
             literature_failure_count=int(profile_result["failure_count"]),
         )
+    workspace_note_rows, workspace_profiles = _workspace_graph_inputs(
+        workspace, profiles
+    )
+    global_source_ids = sorted(
+        {
+            str(row.get("source_id") or "")
+            for row in workspace_note_rows
+            if row.get("source_id")
+        }
+    )
+    global_source_set = {
+        "source_set_id": "source-set-auto-zettelkasten-workspace",
+        "source_set_type": "auto_zettelkasten_workspace",
+        "scope": "workspace",
+        "source_ids": global_source_ids,
+        "note_ids": sorted(
+            str(row.get("note_id") or "")
+            for row in workspace_note_rows
+            if row.get("note_id")
+        ),
+        "dependency_hash": stable_hash(global_source_ids),
+    }
+    global_map_id = stable_literature_map_id(global_source_set)
     base_literature_request = LiteratureMapRequest(
         workspace=workspace,
-        source_set_id=str(source_set.get("source_set_id") or ""),
+        source_set_id=str(global_source_set["source_set_id"]),
         run_id=run_id,
-        map_id=stable_literature_map_id(source_set),
+        map_id=global_map_id,
         question=None,
         provider=effective_request.provider,
         model=effective_request.model,
         allow_cloud=effective_request.allow_cloud,
+        provider_concurrency=(
+            effective_request.provider_concurrency or effective_request.parallel
+        ),
         literature_policy=effective_request.literature_policy,
     )
     reasoner_calls = (
@@ -4237,9 +4587,6 @@ def rebuild_map(
         )
         if reasoner is not None
         else None
-    )
-    workspace_note_rows, workspace_profiles = _workspace_graph_inputs(
-        workspace, profiles
     )
     orphaned_source_ids = _orphaned_source_ids(
         workspace_note_rows, collection_snapshot
@@ -4264,6 +4611,30 @@ def rebuild_map(
         existing_clusters,
         collection_snapshot=collection_snapshot,
     )
+    catalogue_payload = read_yaml(Path(str(catalogue["catalogue_path"])), {}) or {}
+    collection_rows = [
+        dict(row)
+        for row in catalogue_payload.get("collections", []) or []
+        if isinstance(row, Mapping)
+    ]
+    global_source_set["collection_memberships"] = {
+        str(source_id): sorted(
+            str(row.get("name") or row.get("key") or "")
+            for row in collection_rows
+            if str(source_id) in set(row.get("direct_source_ids", []) or [])
+        )
+        for source_id in global_source_ids
+    }
+    global_source_set["collection_views"] = [
+        {
+            "collection_key": str(row.get("key") or ""),
+            "name": str(row.get("name") or ""),
+            "parent_key": str(row.get("parent_key") or ""),
+            "child_keys": list(row.get("child_keys", []) or []),
+            "direct_source_ids": list(row.get("direct_source_ids", []) or []),
+        }
+        for row in collection_rows
+    ]
     try:
         relationship_result = _run_relationship_reasoning(
             workspace,
@@ -4293,6 +4664,13 @@ def rebuild_map(
     relationship_ledger_path = _write_relationship_run_ledger(
         workspace, run_id, relationship_result
     )
+    if progress is not None:
+        progress.update_literature(
+            relationship_stage_wall_seconds=float(
+                relationship_result.get("relationship_stage_wall_seconds", 0.0)
+                or 0.0
+            )
+        )
     typed = persist_relationship_registry(
         workspace,
         structural_relations=navigation.get("typed_relations", []) or [],
@@ -4305,6 +4683,23 @@ def rebuild_map(
         preserve_unmentioned_structural=True,
         orphaned_source_ids=orphaned_source_ids,
     )
+    global_source_set["rejected_pair_memory"] = [
+        {
+            "source_id": str(row.get("source_id") or row.get("left_source_id") or ""),
+            "target_source_id": str(
+                row.get("target_source_id") or row.get("right_source_id") or ""
+            ),
+        }
+        for row in typed.get("pair_decisions", []) or []
+        if isinstance(row, Mapping)
+        and str(
+            row.get("status")
+            or row.get("decision_status")
+            or row.get("decision")
+            or ""
+        )
+        == "no_relationship"
+    ]
     graph_note_paths = _project_atomic_graph(
         workspace,
         note_rows=workspace_note_rows,
@@ -4334,13 +4729,12 @@ def rebuild_map(
         *graph_note_paths,
         *([selection_state_path] if selection_state_path is not None else []),
     ]
-    literature_note_rows, literature_profiles = _source_set_graph_inputs(
-        source_set, workspace_note_rows, workspace_profiles
-    )
+    literature_note_rows = list(workspace_note_rows)
+    literature_profiles = list(workspace_profiles)
     try:
         cluster_map, gap_map, packet, paths = build_literature_map(
             workspace,
-            source_set=source_set,
+            source_set=global_source_set,
             notes=literature_note_rows,
             question=question,
             run_id=run_id,
@@ -4356,10 +4750,26 @@ def rebuild_map(
                 "cluster_candidates", []
             )
             or [],
-            catalogue_shards=(
-                read_yaml(Path(str(catalogue["catalogue_path"])), {}) or {}
-            ).get("shards", [])
-            or [],
+            catalogue_shards=[
+                *[
+                    {
+                        "literature_id": (
+                            "collection-"
+                            + str(row.get("key") or "unfiled").casefold()
+                        ),
+                        "shard_id": (
+                            "collection-"
+                            + str(row.get("key") or "unfiled").casefold()
+                        ),
+                        "source_ids": list(
+                            row.get("direct_source_ids", []) or []
+                        ),
+                    }
+                    for row in collection_rows
+                    if row.get("direct_source_ids")
+                ],
+                *list(catalogue_payload.get("shards", []) or []),
+            ],
         )
     except Exception as exc:
         reason = f"literature_synthesis_partial:{type(exc).__name__}:{exc}"
@@ -4368,7 +4778,7 @@ def rebuild_map(
         preserved_clusters, refresh_paths = (
             _preserve_last_valid_clusters_on_refresh_failure(
                 workspace,
-                stable_literature_map_id(source_set),
+                global_map_id,
                 reason,
             )
         )
@@ -4467,10 +4877,7 @@ def rebuild_map(
                 or []
             ),
             *_cluster_membership_relations(
-                [
-                    *existing_clusters,
-                    *(cluster_map.get("clusters", []) or []),
-                ],
+                cluster_map.get("clusters", []) or [],
                 workspace_profiles,
             ),
         ]
@@ -4598,15 +5005,12 @@ def rebuild_map(
         )
     current_note_ids = [
         str(row.get("note_id") or "")
-        for row in note_rows
+        for row in workspace_note_rows
         if row.get("note_id")
     ]
     catalogue_clusters = {
         str(cluster.get("cluster_id") or ""): dict(cluster)
-        for cluster in [
-            *existing_clusters,
-            *(cluster_map.get("clusters", []) or []),
-        ]
+        for cluster in cluster_map.get("clusters", []) or []
         if isinstance(cluster, Mapping) and cluster.get("cluster_id")
     }
     catalogue = build_source_catalogue(
@@ -4650,7 +5054,6 @@ def rebuild_map(
             str(row.get("note_id") or ""): str(row.get("dependency_hash") or "")
             for row in profile_payloads
         },
-        source_set=source_set,
         request=effective_request,
     )
     result_paths = list(
@@ -5546,7 +5949,6 @@ def _finalize_literature_projection_hashes(
     *,
     profile_hashes: Mapping[str, str],
     profile_dependency_hashes: Mapping[str, str],
-    source_set: Mapping[str, Any],
     request: MapRequest,
 ) -> None:
     manifest_paths = [path for path in paths if path.name == "manifest.yml"]
@@ -5561,8 +5963,6 @@ def _finalize_literature_projection_hashes(
             "profile_dependency_hashes": dict(
                 sorted(profile_dependency_hashes.items())
             ),
-            "source_set_id": source_set.get("source_set_id", ""),
-            "source_set_dependency_hash": source_set.get("dependency_hash", ""),
             "provider": request.provider,
             "model": request.model,
             "literature_policy": request.literature_policy.to_dict(),
@@ -5770,6 +6170,7 @@ def _prepare_item(
         effective_provider,
         effective_model,
         str(content.get("source_scope") or "full_document"),
+        str(item_data(item).get("itemType") or ""),
     )
     base.update(
         content,
@@ -6845,11 +7246,12 @@ def _apply_bibliographic_scope(
     first_page = str(row.get("text") or "")[:8_000]
     metrics = dict(row.get("coverage_metrics", {}) or {})
     page_count = int(metrics.get("page_count", 0) or 0)
+    parent_type = str(parent.get("itemType") or "")
     bounded_match = (
         _BOUNDED_ATTACHMENT_RE.search(label) if meaningful_label else None
     ) or re.search(
         r"(?im)^(?:--- Page 1 ---\s*)?(?:chapter\s+(?:\d+|[ivxlcdm]+)"
-        r"(?:\s*[:.-]\s*|\s+)|introduction\s*$|appendix\s+[a-z0-9]+)",
+        r"(?:\s*[:.-]\s*|\s+)|appendix\s+[a-z0-9]+)",
         first_page,
     ) or (
         re.search(
@@ -6857,7 +7259,7 @@ def _apply_bibliographic_scope(
             r"(?:one|two|three|four|five|six|seven|eight|nine|ten)\s*$",
             first_page,
         )
-        if 0 < page_count <= 100
+        if parent_type == "book" and 0 < page_count <= 100
         else None
     )
     bounded_source_object = (
@@ -7193,6 +7595,7 @@ def _frontmatter(
         "zotero_relations": data.get("relations", {})
         if isinstance(data.get("relations", {}), Mapping)
         else {},
+        "item_type": str(data.get("itemType") or ""),
         "normalized_tags": list(normalized_tags),
         "tags": [],
         "clusters": [],
@@ -7325,6 +7728,7 @@ def _fingerprint(
     reader_provider: str,
     reader_model: str,
     source_scope: str,
+    source_item_type: str = "",
 ) -> str:
     payload = {
         "zotero_item_key": key,
@@ -7335,6 +7739,7 @@ def _fingerprint(
         "reader_provider": reader_provider,
         "reader_model": reader_model,
         "source_scope": source_scope,
+        "source_item_type": str(source_item_type),
         "question_lens_policy_version": "collection_invariant-1",
         "chunking_version": CHUNKING_VERSION,
         "content_classifier_version": CONTENT_CLASSIFIER_VERSION,
@@ -7342,9 +7747,6 @@ def _fingerprint(
             json.dumps(
                 request.to_dict().get("extraction_policy", {}), sort_keys=True
             )
-        ),
-        "processing_policy_hash": sha256_text(
-            json.dumps(request.to_dict().get("processing", {}), sort_keys=True)
         ),
     }
     return sha256_text(json.dumps(payload, sort_keys=True))
@@ -7491,6 +7893,10 @@ def _reusable_note(path: Path, row: Mapping[str, Any], request: MapRequest) -> b
         return False
     if not validate_note(text).passed:
         return False
+    prior_item_type = str(frontmatter.get("item_type") or "")
+    current_item_type = str(item_data(row.get("item", {})).get("itemType") or "")
+    if prior_item_type and prior_item_type != current_item_type:
+        return False
     reusable = all(
         (
             str(frontmatter.get("zotero_item_key", ""))
@@ -7583,8 +7989,9 @@ def _compatible_committed_note(
     source content that already produced a valid committed note. Restrict this
     fallback to a committed note that passes the current validator and still
     matches the source content, scope, provider, model, prompt, extraction
-    version, and prompt-visible metadata. This also honors the migration policy
-    for readable legacy notes without rereading their source documents.
+    version, and source item type. Mutable Zotero bibliography fields are
+    projected locally onto the existing note. This also honors the migration
+    policy for readable legacy notes without rereading their source documents.
     """
 
     fingerprint_root = workspace / "11_state" / "fingerprints"
@@ -7717,7 +8124,7 @@ def _read_document(
         "document_hash": document_hash,
         "provider": str(getattr(reader, "name", "unknown")),
         "model": str(getattr(reader, "model", "unknown")),
-        "prompt_version": request.prompt_version if request else "9",
+        "prompt_version": request.prompt_version if request else "10",
         "source_bundle_prompt_version": SOURCE_BUNDLE_PROMPT_VERSION,
         "chunking_version": CHUNKING_VERSION,
         "content_classifier_version": CONTENT_CLASSIFIER_VERSION,
@@ -7859,7 +8266,6 @@ def _read_document(
                 if provider_budget is not None
                 else ""
             )
-            attempts_before = int(getattr(reader, "transport_attempt_count", 0) or 0)
             try:
                 if progress is not None:
                     progress.record_source_provider_call()
@@ -7881,8 +8287,10 @@ def _read_document(
                 raise
             if provider_budget is not None:
                 provider_budget.finish(attempt_id, status="completed")
-            attempts_after = int(getattr(reader, "transport_attempt_count", 0) or 0)
-            calls += max(1, attempts_after - attempts_before)
+            # One chunk call is one document-budget unit. A reader-wide
+            # transport counter races when independent documents are read in
+            # parallel and can incorrectly charge one document for another.
+            calls += 1
             if checkpoint_enabled:
                 write_yaml(
                     checkpoint_path,

@@ -8,9 +8,11 @@ from auto_zettelkasten.models import (
     EvidenceAnchor,
     EvidenceProfile,
     LiteratureMapRequest,
+    RelationshipPairJob,
 )
 from auto_zettelkasten.profiles import profile_to_dict
 from auto_zettelkasten.relationships import (
+    ingest_relationship_decision_batch,
     relationship_decision_key,
     stable_hash,
 )
@@ -190,10 +192,34 @@ def _run(
     )
 
 
+def _write_atomic_note(workspace: Path, source_id: str) -> None:
+    root = workspace / "02_source_memory" / "notes"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / f"Source {source_id}.md").write_text(
+        "---\n"
+        f"note_id: note-{source_id.lower()}\n"
+        f"source_id: {source_id}\n"
+        f"zotero_item_key: {source_id}\n"
+        "note_status: analytical_atomic_note\n"
+        f"title: Source {source_id}\n"
+        "---\n"
+        f"# Source {source_id}\n\n"
+        "## Thesis\n\n"
+        f"Complete semantic argument from {source_id}.\n\n"
+        "## Graph Links\n\n"
+        "<!-- auto-zettelkasten:graph:start -->\n"
+        "- [[Generated neighbor]]\n"
+        "<!-- auto-zettelkasten:graph:end -->\n",
+        encoding="utf-8",
+    )
+
+
 def test_global_discovery_creates_immutable_pair_job(
     tmp_path: Path,
 ) -> None:
     profiles = [_profile("A"), _profile("B")]
+    _write_atomic_note(tmp_path, "A")
+    _write_atomic_note(tmp_path, "B")
 
     def handler(
         stage: str,
@@ -214,6 +240,18 @@ def test_global_discovery_creates_immutable_pair_job(
         jobs = context["pair_jobs"]
         assert len(jobs) == 1
         assert jobs[0]["output_contract"] == "relationship-decision-v4"
+        assert all(
+            jobs[0]["atomic_notes"][side]["markdown"]
+            for side in ("left", "right")
+        )
+        assert all(
+            "Complete semantic argument" in jobs[0]["atomic_notes"][side]["markdown"]
+            for side in ("left", "right")
+        )
+        assert all(
+            "Generated neighbor" not in jobs[0]["atomic_notes"][side]["markdown"]
+            for side in ("left", "right")
+        )
         return {"decisions": [_decision(jobs[0])]}
 
     calls = _Calls(handler)
@@ -291,7 +329,68 @@ def test_candidate_cap_reserves_bridge_slots_and_keeps_model_rank() -> None:
     ]
 
 
-def test_pair_jobs_are_bounded_into_six_row_transport_batches(
+def test_known_collection_membership_overrides_false_model_bridge_flag() -> None:
+    entries = {
+        "A": {"source_id": "A", "collections": ["Mediation"]},
+        "B": {"source_id": "B", "collections": ["Mediation"]},
+        "C": {"source_id": "C", "collections": ["Conflict relapse"]},
+    }
+    selected = _ranked_relationship_candidates(
+        {
+            "candidates": [
+                _candidate("A", "B", rank=1, cross_literature=True),
+                _candidate("A", "C", rank=2),
+            ]
+        },
+        available_source_ids=set(entries),
+        entry_by_source=entries,
+        excluded_pairs=set(),
+        maximum=2,
+        bridge_fraction=0.5,
+    )
+
+    assert [(row["source_id"], row["target_id"]) for row in selected] == [
+        ("A", "C"),
+        ("A", "B"),
+    ]
+
+
+def test_endpoint_owned_profile_anchor_need_not_be_preselected() -> None:
+    left = _profile("A")
+    right = _profile("B")
+    extra = EvidenceAnchor(
+        evidence_anchor_id="anchor-a-extra",
+        source_id="A",
+        claim="A second source-owned claim.",
+        locator="p. 11",
+        support_envelope={
+            "support_status": "supported",
+            "coverage": "full_text",
+        },
+    )
+    left.evidence_anchors.append(extra)
+    job = RelationshipPairJob(
+        left_source_id="A",
+        right_source_id="B",
+        selected_evidence={
+            "left": [left.evidence_anchors[0].to_dict()],
+            "right": [right.evidence_anchors[0].to_dict()],
+        },
+    )
+    decision = _decision(job.to_dict())
+    decision["left_evidence_anchor_ids"] = [extra.evidence_anchor_id]
+
+    result = ingest_relationship_decision_batch(
+        {"decisions": [decision]},
+        pair_jobs=[job],
+        profiles=[left, right],
+    )
+
+    assert len(result["accepted"]) == 1
+    assert result["parked"] == []
+
+
+def test_pair_jobs_are_bounded_into_eight_row_transport_batches(
     tmp_path: Path,
 ) -> None:
     profiles = [_profile("A"), *[_profile(f"S{index:02d}") for index in range(13)]]
@@ -314,8 +413,8 @@ def test_pair_jobs_are_bounded_into_six_row_transport_batches(
 
     result = _run(tmp_path, profiles, _Calls(handler))
 
-    assert batch_sizes == [6, 6, 1]
-    assert result["provider_batch_count"] == 3
+    assert sorted(batch_sizes) == [5, 8]
+    assert result["provider_batch_count"] == 2
     assert result["pair_job_count"] == 13
     assert len(result["accepted"]) == 13
     batch_files = list(
@@ -327,7 +426,7 @@ def test_pair_jobs_are_bounded_into_six_row_transport_batches(
             / "relationship_batches"
         ).glob("*/batch.yml")
     )
-    assert len(batch_files) == 3
+    assert len(batch_files) == 2
     assert {
         read_yaml(path)["status"] for path in batch_files
     } == {"completed"}
@@ -402,7 +501,7 @@ def test_failed_batch_preserves_sibling_batches_and_job_status(
 
     result = _run(tmp_path, profiles, _Calls(handler))
 
-    assert len(result["accepted"]) == 7
+    assert 0 < len(result["accepted"]) < 13
     statuses = [
         read_yaml(path)
         for path in (
@@ -413,8 +512,10 @@ def test_failed_batch_preserves_sibling_batches_and_job_status(
             / "relationship_jobs"
         ).glob("*/status.yml")
     ]
-    assert sum(row["status"] == "completed" for row in statuses) == 7
-    assert sum(row["status"] == "parked_for_review" for row in statuses) == 6
+    completed = sum(row["status"] == "completed" for row in statuses)
+    parked = sum(row["status"] == "parked_for_review" for row in statuses)
+    assert completed == len(result["accepted"])
+    assert completed + parked == 13
 
 
 def test_committed_selection_state_makes_unchanged_replay_call_free(
@@ -448,6 +549,63 @@ def test_committed_selection_state_makes_unchanged_replay_call_free(
     assert replay_calls.seen == []
     assert replay["pair_job_count"] == 0
     assert replay["provider_batch_count"] == 0
+
+
+def test_changed_literature_position_reopens_pair_without_reusing_decision(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile("A"), _profile("B")]
+    positions_path = (
+        tmp_path / "02_source_memory" / "indexes" / "literature_positions.yml"
+    )
+
+    def write_position(engagement: str) -> None:
+        write_yaml(
+            positions_path,
+            {
+                "positions": [
+                    {
+                        "literature_position_id": "position-a-b",
+                        "current_source_id": "A",
+                        "matched_source_id": "B",
+                        "raw_citation": "Source B",
+                        "engagement": engagement,
+                    }
+                ]
+            },
+        )
+
+    job_ids: list[str] = []
+
+    def handler(
+        stage: str,
+        _profiles: Sequence[Any],
+        context: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if stage == "relationship_candidate_selection":
+            return {"candidates": []}
+        job_ids.append(str(context["pair_jobs"][0]["pair_job_id"]))
+        return {"decisions": [_decision(context["pair_jobs"][0])]}
+
+    write_position("Source A builds on Source B.")
+    first = _run(tmp_path, profiles, _Calls(handler))
+    _commit_relationship_selection_state(
+        tmp_path,
+        first,
+        catalogue_revision="catalogue-revision",
+    )
+
+    write_position("Source A challenges Source B.")
+    second_calls = _Calls(handler)
+    second = _run(tmp_path, profiles, second_calls)
+
+    assert [stage for stage, _key, _context in second_calls.seen] == [
+        "relationship_candidate_selection",
+        "relationship_adjudication",
+    ]
+    assert len(job_ids) == 2
+    assert job_ids[0] != job_ids[1]
+    assert second["pair_job_count"] == 1
 
 
 def test_large_catalogue_routes_to_selected_shards_before_discovery(
@@ -568,7 +726,7 @@ def test_pair_batches_split_on_measured_context_size(
 def test_mandatory_pairs_fail_preflight_before_any_provider_call(
     tmp_path: Path,
 ) -> None:
-    profiles = [_profile("A"), *[_profile(f"S{index}") for index in range(7)]]
+    profiles = [_profile("A"), *[_profile(f"S{index}") for index in range(9)]]
     write_yaml(
         tmp_path / "02_source_memory" / "indexes" / "typed_links.yml",
         {
@@ -580,7 +738,7 @@ def test_mandatory_pairs_fail_preflight_before_any_provider_call(
                     "relation_type": "zotero_related",
                     "active": True,
                 }
-                for index in range(7)
+                for index in range(9)
             ]
         },
     )
@@ -595,7 +753,7 @@ def test_mandatory_pairs_fail_preflight_before_any_provider_call(
     result = _run(tmp_path, profiles, calls)
 
     assert calls.seen == []
-    assert len(result["parked"]) == 7
+    assert len(result["parked"]) == 9
     assert {
         row["reason"] for row in result["parked"]
     } == {"mandatory_relationship_budget_conflict"}

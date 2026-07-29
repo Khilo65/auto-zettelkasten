@@ -1,14 +1,14 @@
 # Auto-Zettelkasten
 
-Auto-Zettelkasten turns a Zotero Desktop library or collection into validated
-atomic Markdown notes, typed links, source-backed literature clusters,
+Auto-Zettelkasten turns a Zotero Desktop library or collection into atomic
+Markdown notes, typed links, full-note literature syntheses, optional
 candidate-gap records, and an Obsidian-ready vault projection.
 
 It is a standalone, file-first Python package. It does not require Research OS,
 does not read `zotero.sqlite`, and never writes to Zotero.
 
-> **Release status:** v0.13 is an alpha-quality CLI and Python API using artifact
-> schema 1.12 and evidence-profile schema 1.3. Mapped gaps are claims about the
+> **Release status:** v0.15 is an alpha-quality CLI and Python API using artifact
+> schema 1.13 and evidence-profile schema 1.3. Mapped gaps are claims about the
 > frozen collection only, never literature-wide novelty claims.
 
 ## What it produces
@@ -93,8 +93,10 @@ calls; only grossly unusable output is parked for review.
 Abstracts, paywall snapshots, and metadata-only records use compact limited
 notes instead of empty analytical templates. Their statuses are
 `abstract_only_atomic_note`, `metadata_only_source_note`, or
-`fulltext_available`. They remain searchable and linkable, but cannot form
-canonical clusters or support candidate gaps.
+`fulltext_available`. They remain searchable and linkable, but cannot support
+substantive cluster findings. Evidence-bounded partial documents can participate
+in relationships and clusters, with their recovered scope carried into the
+synthesis.
 
 For PDF sources, the mapper prefers the actual primary Zotero attachment and
 preserves page markers throughout extraction. Born-digital pages use `pypdf`.
@@ -124,24 +126,15 @@ blocks in both atomic notes. Graph projection is committed before cluster
 synthesis, leaves the source-analysis semantic hash unchanged, and is
 provider-call-free on an unchanged replay.
 
-A `topic_neighborhood` is promoted only when at least two effective analytical
-evidence bases share a discriminative typed subject tag. Single-source facets stay
-as source-local search metadata and do not become native graph tags or neighborhoods. Neighborhoods remain machine-sidecar
-retrieval and candidate-discovery signals; they do not receive a competing researcher-facing Markdown map and never establish
-a cluster, debate, or gap. Analytical clusters are coherent research conversations or evidence bases. They may connect the same proposition,
-rival explanations, complementary mechanisms, boundary contrasts,
-methodological fault lines, sequential relationships, or interpretive and
-normative disagreements. A cluster does not require consensus or disagreement to exist, and shared vocabulary alone is insufficient.
-`emerging_cluster` requires two effective evidence bases and
-`source_backed_cluster` requires at least three. Connected publications that
-reuse one evidence base remain visible as an `evidence_concentrated_cluster`;
-they cannot establish independent consensus. Context and bridge sources do not
-count toward qualification. Analytical membership may overlap, up to three
-core cluster roles per source.
+A `topic_neighborhood` remains a machine-sidecar retrieval signal rather than a
+competing researcher-facing map. Analytical clusters are model-planned,
+coherent research conversations organized around a question, debate,
+mechanism, outcome, method, case, historical problem, or practice problem.
+Shared vocabulary alone is insufficient. Every retained analytical member must
+have a specific cluster-relevant finding; descriptive source roles never
+exclude a member from the synthesis.
 
-Subject tags are projected into Obsidian's native `tags` property. A cluster
-inherits a tag only after analytical admission, when at least two independent
-core sources use it while supporting the same admitted proposition. Gap tags
+Subject tags are projected into Obsidian's native `tags` property. Gap tags
 come only from the originating proposition and finalized related clusters.
 Navigation changes therefore alter a separate `graph_projection_hash`; they do
 not change cluster, proposition, gap, evidence-anchor, or source semantic IDs.
@@ -158,41 +151,25 @@ and `Gap - Peace duration [gap-author_stated_gap-…].md`. The same stable ID is
 retained in frontmatter and aliases, so filenames are scannable by humans
 without weakening deterministic agent references.
 
-Debates require at least two independently located, comparable positions. Publication
-count is kept separate from effective evidence-base count so reprints, overlapping
-samples, shared datasets, and within-program reports do not inflate support. The
-mapper distinguishes `mapped_debate`, `mapped_consensus`, `emerging_convergence`,
-`aligned_institutional_guidance`, `within_program_consistency`, `mixed_evidence`,
-`conditional_relationship`, `complementary_positions`, `parallel_literatures`,
-`single_position`, and `no_debate`. Gaps are
-generated only by declared rules, searched against every analytical profile in
-the frozen collection, and promoted only when the evidence rule, non-obviousness
-gate, worth assessment, and feasible-resolution gate all pass. Promotion still
-requires at least two independent sources and complete locators. Zero gaps is a
-valid result. Every promoted gap records
-`scope: collection_only`, `automation_status: promoted`, and
-`novelty_claimed: false`.
+Debate, agreement, qualification, and contradiction are model judgments made
+from the complete member notes and must remain traceable to those members.
+Publication count remains distinct from effective evidence-base count so
+reprints, overlapping samples, shared datasets, and within-program reports do
+not inflate support. Gap discovery is no longer part of the default map build;
+existing gap memory remains readable for an explicit downstream workflow.
 
 The generated **Literature Map** is the main human entry point. It reports frozen-collection coverage, explains specific reasons for
 unclustered analytical sources, catalogs admitted clusters and their verdicts, links collection-relative gaps, and points to source,
 cluster, and gap indexes. Topic neighborhoods and complete audit matrices remain machine-readable sidecars.
 
-Cluster-first synthesis runs after thematic-cluster admission and strict proposition-level comparison.
-One checkpointed reasoning call per cluster reads the complete atomic notes,
-profiles, and proposition-evidence matrix, then explains the central findings, technical
-figures and plain-English meaning, agreements, debate positions,
-contradictions, boundary conditions, methodological fault lines, neighboring
-clusters, source roles, and specific proposition-linked gap hypotheses. It also retains
-the most important cluster-relevant findings from every core study in the
-"What the studies find" section, even when no other source reports the same
-finding. Those source-specific contributions are never mislabeled as agreement. Every
-exact comparative assertion resolves to a map-local proposition and one or
-more source-local evidence anchors; broader family assertions resolve to a
-typed located family relation and cannot be presented as consensus or
-contradiction. Descriptive or associational anchors cannot
-support causal wording. Generated atomic-note headings cannot serve as strong source
-locators, and quantitative prose must pass arithmetic and estimand checks. Anchor IDs remain hidden from human Markdown unless a
-machine-readable link requires them.
+The planner reads compact catalogue entries. Each cluster then receives every
+complete, projection-free atomic note for its proposed members in one
+checkpointed call. The writer may refine the organizing problem, drop a
+decorative member, and arrange specific findings into lines of inquiry. Local
+code validates schemas, source IDs, evidence ownership, and reciprocal
+projection; it does not replace rejected model prose with generic verdicts.
+Independent cluster jobs run concurrently and an unchanged semantic cluster is
+reused across run IDs.
 
 Atomic-note generation uses the complete page-preserving source text and asks
 the reader to adapt to the actual source type, including academic studies,
@@ -204,32 +181,9 @@ author interpretation, and what the source can establish. DeepSeek runs atomic
 notes with high reasoning and cluster synthesis with maximum reasoning. Paid
 calls are checkpointed; replaying an unchanged completed run reuses them.
 
-Independent gap notes are canonical. Each visible gap explains how cluster
-analysis generated it, the exact missing relationship or evidence-matrix cell,
-supporting and countervailing sources with locators, collection-wide internal
-search results, closest collection evidence, its strongest obvious answer, why
-that answer is inadequate, what resolving the puzzle changes, and a concise
-type-sensitive `ResolutionPath`. Quantitative paths specify estimands,
-comparisons, identification, and measurement; qualitative, historical,
-theoretical, normative, methodological, and practitioner paths instead state
-the discriminating evidence appropriate to those forms of inquiry. A resolution
-path is not a finalized project study design.
-
-Gap opportunities appear inside the exact cluster finding, debate,
-contradiction, boundary condition, method fault line, or neighboring-cluster
-relationship that generated them. The compact Obsidian callout links to the
-canonical gap note without repeating its evidence record. Near-duplicates merge
-under a stable gap ID and remain traceable in `gap_merge_ledger.yml`.
-Underspecified, obvious, low-value, or non-executable candidates remain audit
-records and receive no Markdown or cluster mention.
-
-Every cluster Markdown note also includes deterministic strict-claim checks for
-consensus and contradiction. A failed threshold is explained rather than
-silently omitted: the note states which requirement failed, why it failed in
-the collection, and what evidence could change the judgment. Every visible gap
-or lead similarly explains whether it meets the stronger gap threshold. These
-checks are embedded in the existing cluster and gap records; they do not create
-new claim files or controller objects.
+Existing gap notes and ledgers remain canonical and readable. A later explicit
+gap workflow may use the completed graph and clusters; gap failure cannot make
+the default graph or cluster map partial.
 
 ## Install
 
@@ -280,6 +234,7 @@ auto-zettelkasten map \
   --collection COLLECTION_KEY \
   --provider deepseek \
   --model deepseek-v4-flash \
+  --provider-concurrency auto \
   --allow-cloud
 ```
 
@@ -376,6 +331,7 @@ report = run_map(
         collection_key="COLLECTION_KEY",
         provider="ollama",
         model="llama3.2",
+        provider_concurrency="auto",
         processing=ProcessingPolicy(
             max_calls_per_document_run=24,
             request_deadline_seconds=120,
@@ -431,7 +387,7 @@ Every inventoried item ends a mapping run as either:
 
 - `validated_note`; or
 - `limited_note`; or
-- `exhausted`, with a route-level attempt record and reason.
+- `parked_for_review`, with a route-level attempt record and reason.
 
 During resumable work, an item can instead be `partial` or `pending`.
 
@@ -443,9 +399,11 @@ inventory_count == validated_note_count + limited_note_count
 ```
 
 Notes and checkpoints are fingerprinted by Zotero item key, inspected-content
-hash, source scope, Zotero metadata, source-classifier and
-chunking versions, processing policy, prompt version, and effective provider
-and model. Each completed item and attempt record is committed immediately.
+hash, source scope, source-shaping document type, classifier and chunking
+versions, prompt version, and effective provider and model. Display metadata,
+run IDs, timeouts, registry revisions, and Markdown projections do not enter
+semantic identities. Harmless Zotero metadata corrections therefore update the
+projection without another source call.
 Prompt version 2 keeps technical figures in `Detailed Findings` and requires a
 separate statistical interpretation for non-specialists. Remapping an older
 prompt-version note invalidates its old fingerprint and replaces it in place.
@@ -461,20 +419,21 @@ algorithm fingerprints reuses those checkpoints and makes no paid model calls.
 `sync` compares the read-only Zotero inventory with the last processed snapshot
 and updates only changed work. A partial CLI run exits with code 3.
 
-The run source set records exactly what that run attempted. Automatic mapping
-uses that frozen run collection—not unrelated notes elsewhere in the
-workspace. `build-map` can instead target an explicit source-set snapshot or
-all existing workspace notes. Source-set snapshots are dependency-hashed and
-immutable; stable compatibility files point to the latest snapshot. Limited
+The run source set records exactly what source generation attempted. The
+canonical literature graph and cluster registry span all eligible workspace
+notes; Zotero collections and subcollections are deterministic, provider-free
+views of that global state. An explicit source-set remains available when a
+separate semantic resynthesis is deliberately requested. Limited
 `fulltext_available` or metadata/abstract notes remain searchable and can
-participate in typed links, but cannot form analytical clusters or answer gaps.
+participate in structural links, but cannot support substantive cluster
+findings.
 
 `MapRequest.question` is an optional projection lens. It does not change source
 notes, evidence profiles, cluster/gap identities, or the underlying collection
 map. Research OS may use the lens for downstream ranking without mutating the
 base map.
 
-Artifact schemas 1.0-1.12 and evidence-profile schemas 1.0-1.3 remain readable.
+Artifact schemas 1.0-1.13 and evidence-profile schemas 1.0-1.3 remain readable.
 The idempotent schema-1.9 migration retires the standalone Literature Neighborhoods Markdown projection, archives superseded current cluster and gap
 projections, preserves historical maps, profiles, analytical identities, and
 atomic-note bytes, and makes no model or Zotero call. Existing schema-1.5
@@ -483,11 +442,18 @@ strong synthesis until they are lazily reprofiled.
 The schema-1.12 migration creates provider-free legacy source bundles where
 safe, retains conflicting variants for review, and moves old machine
 relationships into schema-4 review state without rewriting notes.
+The schema-1.13 migration preserves atomic notes and human content, marks
+pre-v0.14 cluster syntheses as legacy projections, selects the broadest legacy
+cluster registry as the global baseline, consolidates relationship registry
+copies, and retires stale machine cluster memberships locally without provider
+or Zotero calls.
+The v0.15 metadata migration keeps schema 1.13, advances the source prompt to
+v10, and makes no provider, Zotero, source-read, or note-rewrite call.
 Legacy unmarked `## Graph Links` sections are converted to bounded
 `auto-zettelkasten:graph` markers on their next graph projection; source prose,
 profiles, and human-authored sections are not rewritten.
 
-## Scope deliberately deferred from v0.13
+## Scope deliberately deferred from v0.15
 
 - direct `zotero.sqlite` ingestion;
 - Zotero writes or collection synchronization;

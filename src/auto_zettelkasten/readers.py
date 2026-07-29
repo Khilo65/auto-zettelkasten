@@ -67,7 +67,7 @@ DEFAULT_MAX_OUTPUT_TOKENS = 6_000
 DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 32_000
-SOURCE_BUNDLE_PROMPT_VERSION = "3"
+SOURCE_BUNDLE_PROMPT_VERSION = "4"
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 16_000
 GAP_ADJUDICATION_MAX_OUTPUT_TOKENS = 32_000
@@ -590,26 +590,33 @@ class _CapabilityAwareReader:
                 "families. Identify only genuinely cross-family or "
                 "cross-literature clusters that the local plans could not see. "
                 "Members must still use the supplied underlying source IDs and "
-                "source-local evidence anchor IDs. Do not repeat a local family "
+                "must state why they belong. Do not repeat a local family "
                 "as a new cluster. Neighbor relationships may refer to supplied "
                 "existing_family_ids as well as new cluster IDs. Before "
-                "returning, self-check evidence ownership and direction."
+                "returning, self-check membership and direction."
             )
         elif mode == "shard":
             instruction = (
                 "Create a complete local cluster plan for this bounded catalogue "
-                "packet. Use only source-local evidence IDs supplied on each "
-                "card. Record sources that do not fit under unclustered_sources. "
-                "Before returning, check member roles, evidence ownership, and "
+                "packet. It is acceptable for sources to remain unclustered in this "
+                "map revision; do not force weak memberships. Before returning, check member relevance and "
                 "neighbor direction in the same call."
+            )
+        elif (context or {}).get("incremental_source_delta"):
+            instruction = (
+                "Update the prior active cluster families for the supplied "
+                "changed-source delta. Preserve coherent unaffected families, "
+                "place changed sources where the evidence warrants, and revise "
+                "only memberships or neighboring relationships that the new "
+                "source cards change. A changed source may remain unclustered. "
+                "Before returning, check member relevance in the same call."
             )
         else:
             instruction = (
                 "Create one complete cluster plan for the supplied eligible "
                 "corpus. Find mixed-literature debates as well as coherent "
-                "within-literature families. Use only source-local evidence IDs "
-                "supplied on each card. Before returning, check member roles, "
-                "direction, evidence ownership, unclustered coverage, and "
+                "within-literature families. Before returning, check membership, "
+                "direction and "
                 "neighboring relationships in the same call."
             )
         user_prompt = _literature_prompt(
@@ -664,61 +671,34 @@ class _CapabilityAwareReader:
     ) -> Mapping[str, Any]:
         self._authorize_request()
         system_prompt = _cluster_synthesis_system_prompt()
-        response_budget = dict((context or {}).get("response_budget", {}) or {})
-        budget_instruction = ""
-        if response_budget:
-            budget_instruction = (
-                " This is a structurally large cluster. To guarantee complete JSON, use at most "
-                f"{int(response_budget.get('max_evidence_threads', 3))} evidence threads, exactly one best "
-                "source_contribution per core source, at most "
-                f"{int(response_budget.get('max_central_findings', 3))} central findings, at most "
-                f"{int(response_budget.get('max_items_per_optional_section', 2))} items in every other optional "
-                "narrative array, and at most "
-                f"{int(response_budget.get('max_gap_hypotheses', 2))} gap hypotheses. Use empty arrays for unused "
-                f"sections and keep the entire response below {int(response_budget.get('max_output_tokens', 4_500))} "
-                "output tokens. Do not repeat source contributions in synthesis or evidence-thread summaries."
-            )
         instruction = (
-            "Synthesize this admitted cluster and retain the evidence and inferential "
-            "logic behind each important source-specific contribution even without "
-            "multi-source agreement. Never translate an observational association as "
-            "something that works better, helps, drives, leads to, or causes; preserve "
-            "associational wording in plain English. Normalize inverse predictor "
-            "framings before calling findings inconsistent. Emit only specific, "
-            "rule-bound collection gap hypotheses. Before returning, review evidence "
-            "ownership, attribution, numbers, causal scope, cluster membership, and "
-            "neighbor direction in the same call."
+            "Read every complete atomic note in the packet and write the most useful "
+            "source-specific synthesis of the proposed cluster. Use the depth needed "
+            "by the literature, without decorative sections or generic summaries."
         )
-        instruction += budget_instruction
         user_prompt = _literature_prompt(
             profiles,
             request,
             context,
             instruction=instruction,
         )
-        user_prompt += (
-            "\n\nFINAL SYNTHESIS REQUIREMENTS — apply these after reading every supplied evidence profile:\n"
-            "1. Preserve the case, period, actors, observed comparison, method, explanatory logic, and inferential limit "
-            "when they are necessary to understand a core source.\n"
-            "2. In plain English, observational results remain associations: never say a strategy works better, helps, "
-            "drives, leads to, causes, or increases an outcome.\n"
-            "3. Preserve source-specific cases, periods, quantitative distinctions, process-tracing logic, alternatives, "
-            "and inferential limits whenever the supplied evidence makes them necessary to understand a core contribution.\n"
-            "Return only the requested JSON object."
-        )
         supported_output = int(self.capabilities["supported_output_tokens"])
         desired_output = min(64_000, supported_output)
-        return _validate_literature_response(
-            self._literature_json_call(
-                system_prompt,
-                user_prompt,
-                label="cluster synthesis",
-                reasoning_effort="max",
-                output_tokens=desired_output,
-                deadline_seconds=min(600.0, self._request_deadline_seconds()),
-            ),
-            kind="cluster_synthesis",
+        raw_response = self._literature_json_call(
+            system_prompt,
+            user_prompt,
+            label="cluster synthesis",
+            reasoning_effort="max",
+            output_tokens=desired_output,
+            deadline_seconds=min(600.0, self._request_deadline_seconds()),
         )
+        try:
+            return _validate_literature_response(
+                raw_response, kind="cluster_synthesis"
+            )
+        except ProviderError as exc:
+            exc.raw_response = raw_response
+            raise
 
     def detect_gaps(
         self,
@@ -1268,15 +1248,17 @@ class OllamaReader(_CapabilityAwareReader):
 def _system_prompt() -> str:
     keys = ", ".join(SECTION_KEYS)
     return (
-        "You create source-faithful atomic notes using Auto-Zettelkasten atomic prompt v9. "
+        "You create source-faithful atomic notes using Auto-Zettelkasten atomic prompt v10. "
         "Adapt the analysis to the source actually supplied: it may be an academic article or book, a report, policy or legal "
         "document, archival material, conference or meeting record, practitioner guidance, speech, working paper, blog post, "
         "or another evidence-bearing source. Do not force a nonacademic source into an academic-study template. "
         "Return only one JSON object. Do not infer facts absent from the source. "
         f"Every value must be a non-empty string. Required keys: {keys}. "
-        "Copy only numbers and numerical comparisons explicitly printed in the supplied source. Do not calculate, derive, correct, "
-        "convert, combine, or extrapolate a number, rate, ratio, percentage, fold-change, or illustrative example. If the source's "
-        "arithmetic appears inconsistent, report it as the source's claim and flag the uncertainty without solving it. "
+        "Always preserve source-reported numbers, their original scale, comparison, reference group, denominator, and uncertainty. "
+        "A simple derived explanation is allowed only when every required input is explicit in the source; label it as derived, retain "
+        "the original statistic beside it, and never invent a missing baseline, denominator, model quantity, or uncertainty measure. "
+        "If the source's arithmetic appears inconsistent or the statistic does not support an intuitive conversion, report that "
+        "limitation instead of forcing one. "
         "Identify the source's important findings, arguments, observations, interpretations, or recommendations and explain "
         "the method or knowledge basis behind them. Preserve the case or conflict, actors, population, geography, period, "
         "outcome, and comparison needed to understand each important point. Distinguish what the source observes or reports, "
@@ -1286,9 +1268,14 @@ def _system_prompt() -> str:
         "Detailed findings must retain the source's exact estimates, units, denominators, sample sizes, uncertainty measures, "
         "technical labels, examples, and qualifications when present. Pair technical detail with a plain-English explanation; "
         "do not replace the figures with a simplification or leave them unexplained. "
-        "For every important quantitative finding, explain for a statistically non-specialist what changed, by how much, compared with "
-        "what, and what the reported uncertainty does and does not establish. Do this naturally rather than as a compulsory checklist, "
-        "and never invent a numerical example or transformation. "
+        "For the two to four quantitative findings most important to understanding the source, explain for a statistically "
+        "non-specialist what changed, by how much, compared with what, and what the reported uncertainty does and does not establish. "
+        "Do this naturally rather than as a compulsory checklist. Distinguish percentage points from relative percentage change: "
+        "a move from 40% to 31% is 9 percentage points lower and, when useful, 22.5% lower relative to the 40% baseline. Distinguish "
+        "odds, hazards, risks, and probabilities. A logit coefficient is not a probability change, an odds ratio is not a probability "
+        "ratio, and a hazard ratio is not cumulative risk. Do not convert a coefficient or interaction into a percentage unless the "
+        "source reports a marginal effect or predicted probability, or supplies every quantity required for that derivation. A p-value "
+        "is not an effect size or the probability that a hypothesis is true; statistical significance is not practical importance. "
         "When a source uses a ratio or fold-change, identify the numerator, denominator, comparison periods or groups, and any "
         "different population estimates used in the arithmetic. Do not silently substitute a subgroup estimate for a broader "
         "estimate, or present descriptive before-and-after arithmetic as an identified causal effect. For comparative or "
@@ -1300,8 +1287,8 @@ def _system_prompt() -> str:
         "based on historical comparison, case study, or process tracing, explain the observed events and reported numbers, what the author "
         "argues explains them, the comparison or counterfactual logic, and what the design cannot rule out. Attribute the explanatory step "
         "with phrases such as 'the author argues' unless the design identifies the effect. A source-reported before-and-after fold-change is "
-        "descriptive arithmetic, not an estimated causal effect. Do not recalculate or silently replace its denominators, and do not compute "
-        "additional deaths, rates, percentages, hypothetical populations, or other examples absent from the source. "
+        "descriptive arithmetic, not an estimated causal effect. Do not silently replace its denominators or invent additional deaths, "
+        "rates, percentages, hypothetical populations, or examples absent from the source. "
         "If a baseline, denominator, comparison, or uncertainty measure is absent, say that it is not reported and explain "
         "why that limits interpretation. Never invent a benchmark, call an effect large or small without a stated reference, "
         "treat statistical significance as practical importance, or treat association as causation. "
@@ -1317,7 +1304,7 @@ def _system_prompt() -> str:
 def _source_bundle_system_prompt() -> str:
     keys = ", ".join(SECTION_KEYS)
     return (
-        "You are the source-reading reasoner for Auto-Zettelkasten source bundle prompt v3. "
+        "You are the source-reading reasoner for Auto-Zettelkasten source bundle prompt v4. "
         "Return exactly one JSON object with bundle_schema_version, source_identity, "
         "observed_bibliographic_identity, scope_assessment, analysis_sections, compact_profile, "
         "evidence_anchors, literature_positions, missing_source_recommendations, and self_review. "
@@ -1336,15 +1323,34 @@ def _source_bundle_system_prompt() -> str:
         "not apply. Distinguish observations, author arguments, tested mechanisms, reported "
         "mechanisms, recommendations, and what the design can establish. Observational evidence uses "
         "associational wording unless the source and design justify causality. Qualitative work uses "
-        "attributed language such as 'the author argues' for explanatory inferences. Preserve printed "
-        "numbers and qualifications without calculating new ones. Locators are approximate human "
+        "attributed language such as 'the author argues' for explanatory inferences. Always preserve source-reported "
+        "numbers, their original scale, comparison, reference group, denominator, and uncertainty. A simple derived "
+        "explanation is allowed only when every required input is explicit in the source; mark its provenance as "
+        "system_derived, retain the source statistic beside it, and never invent a missing baseline, denominator, "
+        "reference group, model quantity, or uncertainty measure. Never turn an author recommendation "
+        "into a demonstrated result. Do not use best, only, causes, works, helps, more effective, or "
+        "similar comparative or causal wording unless the inspected source and its design establish "
+        "that exact strength. Keep modeled quantities distinct from observed quantities. In Plain-English Interpretation, "
+        "explain the two to four findings most important to understanding the source rather than repeating the abstract. "
+        "Keep the technical statistic beside its explanation. A move from 40% to 31% is 9 percentage points lower and, "
+        "when useful, 22.5% lower relative to the 40% baseline. Keep percentage points and relative percentages distinct. "
+        "Keep odds, hazards, risks, and probabilities distinct. Do not convert a logit coefficient or interaction into a "
+        "percentage unless the source reports a marginal effect or predicted probability, or supplies every quantity "
+        "required for the derivation. A p-value is not an effect size or the probability that a hypothesis is true, and "
+        "statistical significance is not practical importance. State plainly when no intuitive percentage is defensible. "
+        "Locators are approximate human "
         "navigation aids and must never be invented. Before returning, silently check attribution, "
-        "scope, numbers, and causal wording in the same call. "
+        "source identity, scope, conspicuous numbers, and causal wording in the same call. "
         "compact_profile contains thesis, method_or_knowledge_basis, source_genre, inferential_design, "
         "coverage, and bounded facets for mechanisms, outcomes, cases, populations, periods, and "
         "datasets. It contains no collection membership. evidence_anchors contains no more than 24 "
         "source-local rows with evidence_anchor_id, source_id, claim, locator, planning_roles, "
-        "salience_priority, support_boundary, and support_envelope. planning_roles may include thesis, "
+        "salience_priority, support_boundary, support_envelope, plain_english_meaning, uncertainty, and "
+        "optional quantitative_result. quantitative_result uses the existing statistic, estimand_type, "
+        "outcome_definition, estimate, unit, scale, baseline, reference_group, comparison_group, denominator, "
+        "sample, uncertainty, population, period, model, and provenance fields. Use source_reported provenance "
+        "for copied values, system_derived only for a transparent derivation supported by explicit inputs, and "
+        "unknown otherwise. planning_roles may include thesis, "
         "method, major_finding, mechanism, limitation, or literature_position. Higher salience_priority "
         "means more useful for downstream planning. support_envelope must be a JSON object with "
         "empirical_role, argument_role, coverage, scope, restrictions, and support_status; never return "
@@ -1358,7 +1364,12 @@ def _source_bundle_system_prompt() -> str:
         "matching later finds them absent; do not claim knowledge of library holdings, invent notes, or "
         "invent retrieval status. source_identity must "
         "copy only the stable IDs supplied by the caller. observed_bibliographic_identity is diagnostic "
-        "body evidence and cannot override Zotero metadata."
+        "body evidence and cannot override Zotero metadata. In self_review, silently check that source-reported "
+        "numbers were preserved; percentage points and relative percentages were not confused; odds, hazards, risks, "
+        "probabilities, coefficients, and interactions stayed on their proper scales; p-values were not presented as "
+        "effect sizes or truth probabilities; practical and statistical significance were distinguished; and causal "
+        "language matches the design. Record that review in the existing self_review object. It is not a request for "
+        "another model call or a separate note section."
     )
 
 
@@ -1531,19 +1542,22 @@ def _relationship_bridge_shard_system_prompt() -> str:
 
 def _relationship_candidate_system_prompt() -> str:
     return (
-        "You globally rank source comparisons for Auto-Zettelkasten relationship prompt v3. Return exactly one JSON "
+        "You globally rank source comparisons for Auto-Zettelkasten relationship prompt v5. Return exactly one JSON "
         "object with a candidates array. Each row must contain source_id, target_kind, target_id, why_relevant, "
         "comparison_unit, likely_relation_type, requested_evidence_depth, confidence, rank, cross_literature, "
         "discovery_route, left_evidence_anchor_ids, and right_evidence_anchor_ids. target_kind must be source. "
         "requested_evidence_depth is profile, atomic_note, or source_passage. confidence is a number from 0 to 1. "
         "Use the supplied max_inferred_pairs as a global output ceiling, rank the strongest comparisons across the "
-        "whole packet, and preserve substantial cross-literature bridges instead of filling the list with one "
-        "literature. Evidence-anchor arrays may contain only supplied IDs owned by the corresponding canonical pair "
+        "whole packet. Use the supplied reserved_bridge_fraction for the strongest genuine cross-collection comparisons "
+        "when the evidence supports them; same-collection pairs cannot consume that capacity. cross_literature is true "
+        "only when the supplied collection memberships are disjoint, never merely because topics differ. Evidence-anchor "
+        "arrays may contain only supplied IDs owned by the corresponding canonical pair "
         "side; order source_id and target_id lexicographically so source_id is the canonical left side, and leave "
         "anchor arrays empty when no supplied anchor is task-relevant. discovery_route is source_led, "
         "cross_literature_bridge, citation_match, or graph_neighbor. Return none when none is worthwhile. Choose works "
         "that may support, undermine, qualify, extend, complement, offer a rival explanation, expose a boundary or "
-        "methodological fault line, form a sequence, or express an interpretive disagreement. Shared vocabulary, method, "
+        "methodological fault line, form a sequence, or express an interpretive disagreement. Before returning, separately "
+        "audit within-collection and cross-collection candidates so strong bridges are not crowded out. Shared vocabulary, method, "
         "case, tag, or collection alone is only a retrieval clue. Use only supplied IDs and do not classify the final "
         "relationship."
     )
@@ -1552,7 +1566,10 @@ def _relationship_candidate_system_prompt() -> str:
 def _relationship_adjudication_system_prompt() -> str:
     return (
         "You adjudicate immutable relationship pair jobs for Auto-Zettelkasten "
-        "relationship prompt v3 and output contract relationship-decision-v4. "
+        "relationship prompt v5 and output contract relationship-decision-v4. "
+        "Read both complete atomic-note bodies supplied in each pair job before "
+        "deciding; compact profiles and selected anchors are navigation aids, not "
+        "substitutes for the notes. "
         "Return exactly one JSON object with a decisions array and exactly one "
         "complete row per supplied pair_job_id. Copy pair_job_id and the canonical "
         "pair.left_source_id and pair.right_source_id exactly. Each row contains "
@@ -1566,7 +1583,7 @@ def _relationship_adjudication_system_prompt() -> str:
         "labels, and anchor arrays empty but give a reason. For relationship, "
         "actor_source_id is the work doing the intellectual action and "
         "reference_source_id is the work acted on; do not infer direction from "
-        "pair ordering or chronology. Use only selected evidence IDs owned by the "
+        "pair ordering or chronology. Use only supplied evidence IDs owned by the "
         "corresponding left or right source. relation_type and exact labels are: "
         "supports/supports/supported by; undermines/undermines/undermined by; "
         "qualifies/qualifies/qualified by; extends/extends/extended by; "
@@ -1578,8 +1595,13 @@ def _relationship_adjudication_system_prompt() -> str:
         "sequence/follows in sequence; "
         "interpretive_or_normative_disagreement/disagrees interpretively "
         "with/disagrees interpretively with. Compare the actual claims, findings, "
-        "arguments, methods, scope, and causal language. Citation or shared topic "
-        "alone does not establish agreement. Self-review the direction, labels, "
+        "arguments, methods, scope, and causal language. Citation or a shared broad topic "
+        "alone does not establish a relationship. supports requires evidence that "
+        "bears directly on the same proposition; qualifies requires a stated boundary "
+        "or condition on the reference claim; extends requires a genuine new application, "
+        "test, or development rather than a suggestion for future use; and complements "
+        "requires a shared bounded question or proposition whose answer is sharpened "
+        "by both works, not mere adjacency. Self-review the direction, labels, "
         "rationale, and evidence ownership inside this same call. Never invent "
         "IDs, anchors, locators, provenance, timestamps, or Markdown."
     )
@@ -1667,25 +1689,37 @@ def _cluster_proposal_system_prompt() -> str:
 def _cluster_plan_system_prompt() -> str:
     return (
         "You are the global collection-clustering reasoner for Auto-Zettelkasten "
-        "cluster plan prompt v1. Return exactly one concise JSON object containing "
-        "clusters, neighbor_relationships, and unclustered_sources. Each cluster "
-        "contains cluster_id, title, semantic_identity, shared_question, "
-        "bounded_object, coherence_rationale, and members. Each member contains "
-        "source_id, role, evidence_anchor_ids, and membership_reason. role is exactly "
-        "core, context, or bridge. Every core member must cite one or more supplied "
-        "source-local anchor IDs that make this literature central to the source. "
-        "Use at least two core members; context and bridge sources do not establish "
-        "coherence. A neighbor relationship contains left_cluster_id, "
+        "cluster plan prompt v5. Return exactly one JSON object containing "
+        "clusters and neighbor_relationships. For backward compatibility you may "
+        "also return an unclustered_sources array, but local code computes current "
+        "non-membership and does not need reasons from you. Each cluster "
+        "contains cluster_id, title, semantic_identity, organizing_mode, "
+        "organizing_problem, optional guiding_question, optional central_tension, "
+        "coherence_rationale, and members. organizing_mode is question, debate, "
+        "mechanism, outcome, method, case, historical_problem, or practice_problem. "
+        "Each member contains source_id and membership_reason; role and "
+        "evidence_anchor_ids are optional descriptive routing metadata and never "
+        "determine whether the member may contribute later. Use at least two members. "
+        "A neighbor relationship contains left_cluster_id, "
         "right_cluster_id, relationship, basis_source_ids, and evidence_anchor_ids. "
-        "Its source and anchor IDs must come from the supplied cards and ground the "
-        "stated relationship. Return one record per neighboring pair; local code "
-        "projects both directions. unclustered_sources contains source_id and a "
-        "concise reason. Do not summarize every source again. Do not infer coherence "
+        "Its source IDs must come from the supplied cards; anchor IDs are optional. "
+        "Return one record per neighboring pair; local code "
+        "projects both directions. Do not summarize every source again. Do not infer coherence "
         "from shared tags, methods, geography, or vocabulary alone. Preserve "
         "differences in construct, outcome, population, period, evidence type, and "
         "causal scope. A citation or verified relationship is a routing signal, not "
-        "automatic agreement. Do not invent IDs, locators, sources, claims, debates, "
-        "consensus, contradictions, or intellectual lineage."
+        "automatic agreement. Planning chooses membership and organization; it does "
+        "not preselect the only evidence the cluster writer may read. Do not invent "
+        "IDs, locators, sources, claims, debates, consensus, contradictions, or "
+        "intellectual lineage. Produce a comprehensive map, not a showcase sample, "
+        "but do not create weak clusters or memberships to maximize coverage. Any "
+        "number of sources may remain unclustered in the current map and may fit a "
+        "future cluster as the library grows. A source may belong to more than one "
+        "genuinely relevant family. Do not stop "
+        "after the first few families. Audit the complete source-ID inventory before "
+        "returning, look explicitly for evidence-supported mixed-collection families, "
+        "and preserve distinct major subliteratures rather than collapsing them into "
+        "a few broad themes."
     )
 
 
@@ -1703,105 +1737,47 @@ def _debate_system_prompt() -> str:
 
 def _cluster_synthesis_system_prompt() -> str:
     return (
-        "You are the cluster-synthesis reasoner for Auto-Zettelkasten cluster synthesis prompt v21. Read the bounded evidence "
-        "profiles and verified relationships supplied for this admitted cluster. Return exactly one JSON object containing cluster_id, scope, boundaries, "
-        "coherence_rationale, synthesis, evidence_threads, central_findings, agreements, "
-        "positions, contradictions, boundary_conditions, methodological_fault_lines, related_clusters, source_roles, "
-        "source_contributions, supporting_evidence, synthesis_assertions, debate_state, gap_hypotheses, evidence_base_groups, "
-        "independence_assessments, quantitative_comparisons, and effective_evidence_base_count. "
-        "evidence_threads is mandatory. Each thread must contain thread_id, title, question, summary, plain_english_meaning, "
-        "relationship, source_ids, proposition_ids, and evidence. A thread organizes a real line of inquiry inside the broader "
-        "cluster and may contain comparable findings, complementary mechanisms, institutional positions, methodological "
-        "approaches, or important source-specific findings. Explain how its sources connect without implying agreement when "
-        "their evidence is merely adjacent. Every core source must appear in at least one evidence thread, and the threads together "
-        "must cover every principal conceptual, empirical, methodological, or practice position needed to answer the cluster question. "
-        "A source-specific bullet cannot substitute for that cluster-level organization. source_contributions is mandatory: retain one to three important cluster-relevant contributions from every core source "
-        "and at most one from each context or bridge source. A unique finding remains visible with comparison_status single_source; "
-        "it does not need multi-source agreement. Each contribution must state source_id, cluster_role, contribution_kind, "
-        "related_proposition_ids, evidence_thread_id, finding, technical_result, plain_english_meaning, relation_to_cluster_question, comparison_status, "
-        "and evidence. Core contributions prioritize direct proposition findings, unique relevant findings, boundary evidence, and "
-        "methodological contributions. When a source's main contribution depends on a case comparison, historical sequence, or "
-        "process-tracing argument, retain the decisive case evidence as well as the abstract theory: identify the conflict or case, "
-        "actors, period, observed sequence or comparison, the author's explanatory logic, and the most important alternative explanation "
-        "or inferential limit. Use a second contribution from that source when needed to make this logic understandable. Context and "
-        "bridge contributions must say context_only and cannot enter the verdict, central "
-        "cross-source findings, agreement, contradiction, debate classification, causal-effectiveness claim, or gap promotion. "
-        "Every substantive synthesis assertion must use real source-local evidence_anchor_id and locator references. An exact "
-        "cross-source comparison must name one or more admitted proposition_ids. A broader family assertion may instead be "
-        "supported by supplied family_relations, but must identify it as complementary, sequential, conditional, methodological, "
-        "parallel, or interpretive rather than consensus or contradiction. "
-        "Descriptive, associational, illustrative, or prescriptive anchors cannot support causal wording. Do not combine "
-        "differently defined actors, mechanisms, populations, outcomes, or estimands into consensus, and do not label "
-        "incomparable claims as contradictions. The synthesis must answer the cluster question in connected prose rather than "
-        "merely listing contributions. Explain what technical findings mean in plain English while retaining "
-        "reported figures, comparisons, uncertainty, and qualifications. Plain English must never strengthen the source's inference: "
-        "for observational associations say 'is associated with' or 'appears alongside', not 'works', 'helps', 'drives', 'leads to', "
-        "or 'causes'. For descriptive before-and-after arithmetic, name the observed periods or groups and attribute any explanatory "
-        "claim to the author. Preserve quantitative_result types: observed rates, "
-        "model-predicted probabilities, coefficients, marginal effects, odds ratios, and raw percentages are not interchangeable. "
-        "Keep every uncertainty statistic attached to the exact estimate or diagnostic it qualifies. A p-value for a selection "
-        "correlation, specification test, or different coefficient must never be described as the p-value for the focal result. "
-        "Prefer a narrow source-local anchor and its exact locator over a composite note summary whenever both are available. "
-        "Separate mediation occurrence or selection, process design, and mediation success or settlement outcomes: evidence about "
-        "whether mediation happens cannot by itself answer whether mediation succeeds. Preserve temporal tensions and opposite "
-        "directions. Never say all, both, every, or consistently when one cited source reports decline, a null result, a different "
-        "period, or an evidentiary qualification. State that tension and explain what changes across periods or evidence designs. "
-        "Universal wording must cite every core source it describes. If prose names an author, report, or institution, the evidence "
-        "for that exact sentence must include that source; never attach one publication's name to another publication's number. "
-        "Every displayed number must occur in the union of the cited source-local anchors for that sentence. "
-        "Before treating quantitative findings as disagreement, contradiction, or a measurement gap, restate them using the same "
-        "predictor and outcome orientation. 'Higher fatalities are associated with lower success' and 'low fatalities are associated "
-        "with higher success' describe the same direction, not opposite results. Continuous, categorical, and dichotomous measures "
-        "may be a methodological difference, but that difference alone is not a collection gap unless the located results remain "
-        "substantively unresolved after orientation and estimands are aligned. "
-        "For each publication, choose the finding that most changes the cluster-level inference. Training counts, web visits, "
-        "workshop totals, and other implementation activity belong only when implementation reach is part of the cluster question; "
-        "otherwise prefer the source's substantive finding, mechanism, boundary, comparison, or central recommendation. "
-        "Do not reproduce arithmetic unless it is source-reported or directly calculable from compatible supplied values. "
-        "Every evidence reference used in the verdict, comparison, agreement, contradiction, debate, or gap must resolve to a typed "
-        "source-native locator with supports_strong_assertion true; generated note headings do not qualify. Boundaries must be an array of concise strings. "
-        "Central findings and every other substantive narrative section must be arrays of objects, never arrays of strings; "
-        "each object must contain its narrative under finding, agreement, position, contradiction, boundary, fault_line, "
-        "relationship, or role as appropriate, plus an evidence array of real source_id, claim_id, and locator references. "
-        "Each central finding must explain the cross-source conclusion in two to four concrete sentences: what the sources find, "
-        "what the finding means in plain English, and the important evidentiary limit or reference point. Central finding objects "
-        "should also include technical_detail and plain_english_meaning when the source supports them. The synthesis prose must "
-        "contain no claim absent from those evidence-bearing narrative objects. The human verdict will be projected assertion by "
-        "assertion from those objects, so a detached supporting_evidence list cannot support extra prose. Agreements and emerging "
-        "convergence require at least two proposition-comparable effective "
-        "evidence bases. mapped_consensus requires at least three. Publications from one study, overlapping evidence base, or "
-        "institutional series may show within-program consistency or aligned institutional guidance, but not scholarly consensus. "
-        "Use only mapped_consensus, emerging_convergence, aligned_institutional_guidance, within_program_consistency, "
-        "conditional_relationship, mapped_debate, mixed_evidence, complementary_positions, parallel_literatures, single_position, "
-        "or no_debate as debate_state. The supplied deterministic_debate is authoritative. Explain why strict consensus or "
-        "contradiction is not established when the family is instead complementary, conditional, mixed, parallel, or concentrated. "
-        "Those explanations must be cluster-specific: name the actual proposition, outcome definition, measure, method, population, "
-        "period, evidence-base dependence, or boundary that prevents the strict inference. Generic source-count boilerplate is insufficient. "
-        "The input includes an all_clusters catalog with human labels, questions, propositions, bounded objects, and compact evidence. "
-        "Use related_clusters only for defensible intellectual relationships to entries in that catalog. Each relationship must use "
-        "{target_cluster_id, relation_type, relationship, current_evidence, target_evidence}. relationship must explain a substantive "
-        "bridge, contrast, sequence, shared mechanism, or boundary in plain English. current_evidence must cite at least one exact anchor "
-        "from this cluster, and target_evidence at least one exact anchor supplied for the target cluster. Shared generic words, a shared "
-        "tag, or a context-only source are insufficient. "
-        "Do not create a debate when evidence is consensus or incomparable. "
-        "Keep the response detailed but bounded so the JSON always finishes. synthesis must be one 120-250 word bottom-line "
-        "answer, not a second copy of the whole note. Use at most six evidence threads, each with a summary of at most 180 words. "
-        "Keep each source contribution's finding, technical result, and plain-English meaning together under 120 words. Keep "
-        "other narrative items under 100 words each and return at most three gap hypotheses. Do not repeat one assertion across "
-        "synthesis, evidence_threads, central_findings, and source_contributions: put the detailed support in its best-fitting "
-        "structured field and let synthesis state the conclusion. Keep the complete JSON below 7,500 output tokens. For a "
-        "source_backed_cluster, supply enough non-repetitive detail for roughly a 900-1,800 word Markdown projection; for an "
-        "emerging_cluster, supply enough detail for 600-1,200 words. Organize the analysis by evidence thread and prefer evidence "
-        "density over filler. Inspect the mapped propositions and evidence threads for defensible collection-native gap hypotheses. "
-        "Return an empty gap_hypotheses array when none is specific and worthwhile. Never call something a gap in synthesis, an "
-        "evidence thread, or a source contribution unless the same bounded candidate appears in gap_hypotheses for deterministic adjudication. "
-        "Gap hypotheses must use one of these rules: contradictory_findings, untested_mechanism, empirical_coverage, "
-        "methodological_concentration, measurement_or_data, boundary_condition, replication, cross_cluster_integration, "
-        "author_stated_gap. Each hypothesis must originate from a named proposition, contradiction, boundary condition, or "
-        "precise matrix cell and specify proposition_id, topic, precise_missing_evidence, observed_pattern, why_matters, "
-        "contribution, related_cluster_ids, and supporting_evidence. Reject generic phrases such as unobserved factors, "
-        "more research is needed, limited data, or future studies unless the exact relationship, outcome, bounded context, "
-        "and evidence needed are stated from supplied evidence. Do not invent sources, claims, locators, or findings."
+        "You are the full-note cluster writer for Auto-Zettelkasten cluster "
+        "synthesis prompt v25. Read every supplied atomic_note_markdown before "
+        "drafting. Copy cluster_id exactly from context.cluster.cluster_id. Return "
+        "exactly one JSON object with cluster_id, status, title, "
+        "organizing_mode, organizing_problem, optional guiding_question, optional "
+        "central_tension, bottom_line, lines_of_inquiry, differences, limits, "
+        "related_clusters, retained_member_ids, dropped_members, optional "
+        "split_proposals, and optional missing_member_ids. status is accepted or "
+        "rejected; it is the writer decision, not a copied planning or registry "
+        "status. Each line of inquiry contains title, synthesis, and "
+        "study_findings. Each study finding contains source_id, finding, "
+        "method_scope, relation_to_line, and evidence, plus technical_result and "
+        "plain_english_meaning when it reports an important quantitative result. relation_to_line is supports, "
+        "qualifies, contrasts, extends, applies, or contextualizes. Evidence uses "
+        "an array of objects; every object copies source_id, evidence_anchor_id, "
+        "and locator exactly from a supplied source-owned anchor. Every retained member must "
+        "have at least one specific study finding; drop a source rather than retain "
+        "decorative context. Any member may contribute regardless of a prior core, "
+        "context, or bridge label. State what each study actually finds or argues, "
+        "not generic thematic boilerplate. Preserve the source-reported statistic and "
+        "its scale in technical_result, then explain its substantive meaning for a "
+        "non-specialist in plain_english_meaning. Distinguish percentage points from "
+        "relative percentage change; odds, hazards, risks, and probabilities; and "
+        "coefficients from predicted probabilities or marginal effects. Do not turn "
+        "an interaction coefficient into a percentage without the required reported "
+        "quantities. A p-value is not an effect size or the probability a hypothesis "
+        "is true, and statistical significance is not practical importance. If no "
+        "intuitive conversion is defensible, explain the direction, comparison, and "
+        "uncertainty without inventing one. Preserve null "
+        "results, uncertainty, observational, descriptive, "
+        "model-based, preliminary, normative, and practitioner limits. Explain "
+        "support, qualification, disagreement, complementarity, and sequence only "
+        "when the notes establish them. Keep the bottom line within the exact outcomes "
+        "the retained studies examine; do not silently generalize onset, duration, "
+        "violence, recovery, or settlement findings into recurrence findings. You may refine the title and organizing "
+        "problem, reject an incoherent cluster, or propose splits, but cannot "
+        "silently add a source whose full note was not supplied. In the same call, "
+        "review attribution, direction, raw numbers, percentage-point versus relative "
+        "percentage language, statistical scale, membership, and inferential scope "
+        "before returning. "
+        "Do not generate research gaps or administrative diagnostics."
     )
 
 
@@ -2092,7 +2068,19 @@ def _gap_adjudication_prompt(
             "map_id": str(getattr(request, "map_id", "") or ""),
             "provider": str(getattr(request, "provider", "") or ""),
             "model": str(getattr(request, "model", "") or ""),
-            "policy": getattr(request, "literature_policy").to_dict(),
+            "policy": {
+                key: value
+                for key, value in getattr(
+                    request, "literature_policy"
+                ).to_dict().items()
+                if key
+                not in {
+                    "literature_deadline_seconds",
+                    "max_profile_calls",
+                    "max_synthesis_calls",
+                    "profile_workers",
+                }
+            },
         },
         "clusters": compact_clusters,
         "cluster_evidence": compact_syntheses,
@@ -2685,13 +2673,27 @@ def _validate_literature_response(
                 cluster = dict(raw_cluster)
                 cluster_id = scalar_text(cluster.get("cluster_id"))
                 title = scalar_text(cluster.get("title") or cluster.get("label"))
-                question = scalar_text(cluster.get("shared_question"))
+                organizing_mode = scalar_text(
+                    cluster.get("organizing_mode") or "question"
+                )
+                organizing_problem = scalar_text(
+                    cluster.get("organizing_problem")
+                    or cluster.get("bounded_object")
+                    or cluster.get("shared_question")
+                )
+                question = scalar_text(
+                    cluster.get("guiding_question")
+                    or cluster.get("shared_question")
+                )
                 members = cluster.get("members")
                 valid_members = (
                     [
                         {
                             "source_id": scalar_text(member.get("source_id")),
-                            "role": scalar_text(member.get("role")).casefold(),
+                            "role": (
+                                scalar_text(member.get("role")).casefold()
+                                or "member"
+                            ),
                             "evidence_anchor_ids": string_values(
                                 member.get("evidence_anchor_ids")
                             ),
@@ -2708,9 +2710,21 @@ def _validate_literature_response(
                 if (
                     not cluster_id
                     or not title
-                    or not question
+                    or not organizing_problem
+                    or organizing_mode
+                    not in {
+                        "question",
+                        "debate",
+                        "mechanism",
+                        "outcome",
+                        "method",
+                        "case",
+                        "historical_problem",
+                        "practice_problem",
+                    }
                     or len(valid_members) != len(members or [])
-                    or not valid_members
+                    or len(valid_members) < 2
+                    or any(not row["source_id"] for row in valid_members)
                 ):
                     parked_clusters.append(
                         {
@@ -2726,10 +2740,14 @@ def _validate_literature_response(
                         "semantic_identity": scalar_text(
                             cluster.get("semantic_identity")
                         ),
-                        "shared_question": question,
-                        "bounded_object": scalar_text(
-                            cluster.get("bounded_object")
+                        "organizing_mode": organizing_mode,
+                        "organizing_problem": organizing_problem,
+                        "guiding_question": question,
+                        "central_tension": scalar_text(
+                            cluster.get("central_tension")
                         ),
+                        "shared_question": question,
+                        "bounded_object": organizing_problem,
                         "coherence_rationale": scalar_text(
                             cluster.get("coherence_rationale")
                         ),
@@ -2839,6 +2857,8 @@ def _validate_literature_response(
                 )
             return {"clusters": normalized_clusters}
         if kind == "cluster_synthesis":
+            if "lines_of_inquiry" in payload or "bottom_line" in payload:
+                return _validate_streamlined_cluster_response(payload)
             normalized = dict(payload)
             # DeepSeek sometimes adds a top-level explanation alongside the
             # requested object during a repair. It is noncanonical commentary,
@@ -3286,6 +3306,168 @@ def _validate_literature_response(
             f"invalid {kind.replace('_', ' ')} response: {exc}"
         ) from exc
     raise ProviderError(f"unsupported literature response kind: {kind}")
+
+
+def _validate_streamlined_cluster_response(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    organizing_mode = (
+        str(payload.get("organizing_mode") or "question")
+        .strip()
+        .casefold()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+    organizing_problem = str(
+        payload.get("organizing_problem")
+        or payload.get("guiding_question")
+        or payload.get("central_tension")
+        or payload.get("title")
+        or ""
+    ).strip()
+    result = {
+        "cluster_contract": "streamlined-full-note-v1",
+        "cluster_id": str(payload.get("cluster_id") or "").strip(),
+        "status": str(payload.get("status") or "accepted").strip().casefold(),
+        "title": str(payload.get("title") or organizing_problem).strip(),
+        "organizing_mode": organizing_mode,
+        "organizing_problem": organizing_problem,
+        "guiding_question": str(payload.get("guiding_question") or "").strip(),
+        "central_tension": str(payload.get("central_tension") or "").strip(),
+        "bottom_line": str(payload.get("bottom_line") or "").strip(),
+    }
+    if (
+        not result["cluster_id"]
+        or not result["title"]
+        or not result["organizing_problem"]
+        or result["status"] not in {"accepted", "rejected"}
+    ):
+        raise ProviderError(
+            "invalid streamlined cluster response identity or organizing mode"
+        )
+
+    def mapping_rows(name: str) -> list[dict[str, Any]]:
+        value = payload.get(name, [])
+        if value is None or isinstance(value, str):
+            return []
+        if isinstance(value, Mapping):
+            return [dict(value)]
+        if not isinstance(value, list):
+            raise ProviderError(
+                f"streamlined cluster response {name} must be a list of objects"
+            )
+        return [dict(row) for row in value if isinstance(row, Mapping)]
+
+    def narrative_rows(name: str, field: str) -> list[dict[str, Any]]:
+        value = payload.get(name, [])
+        if value is None or value == "":
+            return []
+        if isinstance(value, Mapping):
+            return [dict(value)]
+        if isinstance(value, str):
+            return [{field: value.strip()}] if value.strip() else []
+        if not isinstance(value, list):
+            raise ProviderError(
+                f"streamlined cluster response {name} must be a list"
+            )
+        return [
+            dict(row)
+            if isinstance(row, Mapping)
+            else {field: str(row).strip()}
+            for row in value
+            if isinstance(row, Mapping) or str(row).strip()
+        ]
+
+    lines = mapping_rows("lines_of_inquiry")
+    normalized_lines: list[dict[str, Any]] = []
+    for line in lines:
+        findings = line.get("study_findings", [])
+        if not isinstance(findings, list) or any(
+            not isinstance(row, Mapping) for row in findings
+        ):
+            raise ProviderError(
+                "streamlined cluster study_findings must be a list of objects"
+            )
+        normalized_findings: list[dict[str, Any]] = []
+        for row in findings:
+            finding = dict(row)
+            source_id = str(finding.get("source_id") or "").strip()
+            evidence = finding.get("evidence", [])
+            if evidence is None or evidence == "":
+                evidence = []
+            elif isinstance(evidence, (str, Mapping)):
+                evidence = [evidence]
+            if not isinstance(evidence, list):
+                raise ProviderError(
+                    "streamlined cluster finding evidence must be a list"
+                )
+            finding["evidence"] = [
+                dict(reference)
+                if isinstance(reference, Mapping)
+                else {
+                    "source_id": source_id,
+                    "locator": str(reference).strip(),
+                }
+                for reference in evidence
+                if isinstance(reference, Mapping) or str(reference).strip()
+            ]
+            normalized_findings.append(finding)
+        normalized_lines.append(
+            {
+                "title": str(line.get("title") or "").strip(),
+                "synthesis": str(line.get("synthesis") or "").strip(),
+                "study_findings": normalized_findings,
+            }
+        )
+    retained = payload.get("retained_member_ids", [])
+    missing = payload.get("missing_member_ids", [])
+    if retained is None:
+        retained = []
+    if missing is None:
+        missing = []
+    if not isinstance(retained, list) or not isinstance(missing, list):
+        raise ProviderError(
+            "streamlined cluster member IDs must be lists"
+        )
+    dropped_members = payload.get("dropped_members", [])
+    if isinstance(dropped_members, list):
+        dropped_members = [
+            dict(value)
+            if isinstance(value, Mapping)
+            else {"source_id": str(value).strip()}
+            for value in dropped_members
+            if isinstance(value, Mapping) or str(value).strip()
+        ]
+    limits = payload.get("limits", [])
+    if isinstance(limits, str):
+        limits = [limits]
+    elif limits is None:
+        limits = []
+    if not isinstance(limits, list):
+        raise ProviderError("streamlined cluster response limits must be a list")
+    return {
+        **result,
+        "lines_of_inquiry": normalized_lines,
+        "differences": narrative_rows("differences", "difference"),
+        "limits": [
+            str(value).strip()
+            for value in limits
+            if str(value).strip()
+        ],
+        "related_clusters": mapping_rows("related_clusters"),
+        "retained_member_ids": [
+            str(value).strip() for value in retained if str(value).strip()
+        ],
+        "dropped_members": (
+            dropped_members
+            if isinstance(dropped_members, list)
+            else mapping_rows("dropped_members")
+        ),
+        "split_proposals": mapping_rows("split_proposals"),
+        "missing_member_ids": [
+            str(value).strip() for value in missing if str(value).strip()
+        ],
+    }
 
 
 def _validate_relationship_response(

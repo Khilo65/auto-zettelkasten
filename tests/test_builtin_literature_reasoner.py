@@ -1202,7 +1202,7 @@ def test_current_mechanical_profile_reuses_unchanged_inspected_source_content(
         {
             "profile_prompt_version": "6",
             "classifier_version": "3",
-            "algorithm_version": "4",
+                "algorithm_version": "5",
             "legacy_profile_upgraded_mechanically": True,
         }
     )
@@ -1466,47 +1466,43 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
     responses = {
         "collection-clustering": {"clusters": []},
         "debate-mapping": {"assessments": []},
-        "cluster-synthesis": {
+        "full-note cluster writer": {
             "cluster_id": "cluster-1",
-            "boundaries": [
-                "Temporal: 2000-2020",
+            "status": "accepted",
+            "title": "Mediator legitimacy",
+            "organizing_mode": "question",
+            "organizing_problem": "How does legitimacy shape settlement durability?",
+            "bottom_line": "Legitimacy is associated with durability in the supplied scope.",
+            "lines_of_inquiry": [
                 {
-                    "boundary": "Regional: African civil wars",
-                    "evidence": [
+                    "title": "Legitimacy and durability",
+                    "synthesis": "The source reports a bounded association.",
+                    "study_findings": [
                         {
                             "source_id": "source-a",
-                            "claim_id": "claim-a",
-                            "locator": "p. 10",
-                        }
-                    ],
-                },
-            ],
-            "central_findings": [
-                "unsupported prose without evidence",
-                {"finding": "Supported structure", "evidence": []},
-            ],
-            "agreements": "unsupported section without evidence objects",
-            "source_contributions": [
-                {
-                    "contribution_id": "contribution-a",
-                    "source_id": "source-a",
-                    "cluster_role": "core",
-                    "contribution_kind": "unique_cluster_relevant_finding",
-                    "related_proposition_ids": [],
-                    "finding": "A source-specific result remains relevant.",
-                    "technical_result": "No comparable estimate was supplied.",
-                    "plain_english_meaning": "This source adds a distinct result, not an agreement.",
-                    "relation_to_cluster_question": "It addresses one bounded part of the question.",
-                    "comparison_status": "single_source",
-                    "evidence": [
-                        {
-                            "source_id": "source-a",
-                            "evidence_anchor_id": "claim-a",
-                            "locator": "p. 10",
+                            "finding": "A source-specific result remains relevant.",
+                            "method_scope": "Comparative case study.",
+                            "relation_to_line": "supports",
+                            "evidence": [
+                                {
+                                    "source_id": "source-a",
+                                    "evidence_anchor_id": "claim-a",
+                                    "locator": "p. 10",
+                                }
+                            ],
                         }
                     ],
                 }
             ],
+            "differences": [],
+            "limits": [
+                "Temporal: 2000-2020",
+                "Regional: African civil wars",
+            ],
+            "related_clusters": [],
+            "retained_member_ids": ["source-a"],
+            "dropped_members": [],
+            "missing_member_ids": [],
         },
         "collection-gap": {"gaps": [], "rejected": []},
     }
@@ -1680,37 +1676,28 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
     assert output_caps["collection-clustering"] == 16_000
     assert reader.map_debates([], request) == {"assessments": []}
     synthesis = reader.synthesize_cluster([], request)
-    assert output_caps["cluster-synthesis"] == 64_000
+    assert output_caps["full-note cluster writer"] == 64_000
     assert synthesis["cluster_id"] == "cluster-1"
-    assert synthesis["boundaries"] == [
+    assert synthesis["limits"] == [
         "Temporal: 2000-2020",
         "Regional: African civil wars",
     ]
-    assert synthesis["boundary_conditions"] == [
-        {
-            "boundary": "Regional: African civil wars",
-            "evidence": [
-                {"source_id": "source-a", "claim_id": "claim-a", "locator": "p. 10"}
-            ],
-        }
+    assert synthesis["cluster_contract"] == "streamlined-full-note-v1"
+    assert synthesis["lines_of_inquiry"][0]["study_findings"][0]["source_id"] == "source-a"
+    assert "cluster synthesis prompt v25" in system_prompts["full-note cluster writer"]
+    assert "Read every supplied atomic_note_markdown" in system_prompts[
+        "full-note cluster writer"
     ]
-    assert synthesis["central_findings"] == [
-        {"finding": "Supported structure", "evidence": []}
+    assert "Every retained member" in system_prompts["full-note cluster writer"]
+    assert "not generic thematic boilerplate" in system_prompts[
+        "full-note cluster writer"
     ]
-    assert synthesis["agreements"] == []
-    assert synthesis["source_contributions"][0]["comparison_status"] == "single_source"
-    assert "cluster synthesis prompt v21" in system_prompts["cluster-synthesis"]
-    assert "whether mediation happens" in system_prompts["cluster-synthesis"]
-    assert "selection correlation" in system_prompts["cluster-synthesis"]
-    assert "below 7,500 output tokens" in system_prompts["cluster-synthesis"]
-    assert (
-        "one to three important cluster-relevant contributions"
-        in system_prompts["cluster-synthesis"]
-    )
-    assert "context_only" in system_prompts["cluster-synthesis"]
-    assert "model-predicted probabilities" in system_prompts["cluster-synthesis"]
-    assert "FINAL SYNTHESIS REQUIREMENTS" in prompts["cluster-synthesis"]
-    assert "never say a strategy works better" in prompts["cluster-synthesis"]
+    assert "below 7,500 output tokens" not in system_prompts[
+        "full-note cluster writer"
+    ]
+    assert "read every complete atomic note" in prompts[
+        "full-note cluster writer"
+    ].casefold()
     reader.synthesize_cluster(
         [],
         request,
@@ -1725,11 +1712,7 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
             }
         },
     )
-    assert (
-        "exactly one best source_contribution per core source"
-        in prompts["cluster-synthesis"]
-    )
-    assert "below 4500 output tokens" in prompts["cluster-synthesis"]
+    assert "below 4500 output tokens" not in prompts["full-note cluster writer"]
     gap_context = {
         "clusters": [{"cluster_id": "cluster-1", "label": "Mediator legitimacy"}],
         "cluster_syntheses": {
@@ -1801,7 +1784,7 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
         "collection-clustering",
         "collection-clustering",
         "debate-mapping",
-        "cluster-synthesis",
-        "cluster-synthesis",
+        "full-note cluster writer",
+        "full-note cluster writer",
         "collection-gap",
     ]

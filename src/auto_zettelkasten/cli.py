@@ -65,6 +65,11 @@ def build_parser() -> argparse.ArgumentParser:
     map_parser.add_argument("--model", default=None)
     map_parser.add_argument("--allow-cloud", action="store_true", default=None)
     map_parser.add_argument("--parallel", type=int, default=None)
+    map_parser.add_argument(
+        "--provider-concurrency",
+        default=None,
+        help="Maximum concurrent provider jobs, or 'auto' for all ready jobs.",
+    )
     map_parser.add_argument("--limit", type=int, default=None)
     map_parser.add_argument("--run-id", default="")
     map_parser.add_argument("--ocr", choices=("auto", "off", "required"), default=None)
@@ -104,6 +109,11 @@ def build_parser() -> argparse.ArgumentParser:
     sync_parser.add_argument("--model", default=None)
     sync_parser.add_argument("--allow-cloud", action="store_true", default=None)
     sync_parser.add_argument("--parallel", type=int, default=None)
+    sync_parser.add_argument(
+        "--provider-concurrency",
+        default=None,
+        help="Maximum concurrent provider jobs, or 'auto' for all ready jobs.",
+    )
     sync_parser.add_argument("--run-id", default="")
     _add_literature_policy_arguments(sync_parser)
     _add_navigation_policy_arguments(sync_parser)
@@ -126,6 +136,11 @@ def build_parser() -> argparse.ArgumentParser:
     build_parser_command.add_argument("--provider", choices=("deepseek", "openrouter", "gemini", "ollama"), default=None)
     build_parser_command.add_argument("--model", default=None)
     build_parser_command.add_argument("--allow-cloud", action="store_true", default=None)
+    build_parser_command.add_argument(
+        "--provider-concurrency",
+        default=None,
+        help="Maximum concurrent provider jobs, or 'auto' for all ready jobs.",
+    )
     build_parser_command.add_argument("--resume", action="store_true")
     build_parser_command.add_argument("--retry-terminal-literature", action="store_true")
     _add_literature_policy_arguments(build_parser_command)
@@ -182,9 +197,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 model=model,
                 allow_cloud=args.allow_cloud is True,
                 parallel=args.parallel if args.parallel is not None else int(config.get("parallel", 4)),
+                provider_concurrency=_provider_concurrency(
+                    args.provider_concurrency,
+                    config.get("provider_concurrency"),
+                ),
                 limit=args.limit if args.limit is not None else 0,
                 extraction_version=str(extraction_config.get("version") or "2"),
-                prompt_version=str(config.get("prompt_version") or "9"),
+                prompt_version=str(config.get("prompt_version") or "10"),
                 extraction_policy=_extraction_policy(args, config),
                 processing=_processing_policy(args, config),
                 literature_policy=_literature_policy(args, config),
@@ -216,6 +235,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.parallel
                     if args.parallel is not None
                     else int(config.get("parallel", 4))
+                ),
+                provider_concurrency=_provider_concurrency(
+                    args.provider_concurrency,
+                    config.get("provider_concurrency"),
                 ),
                 literature_policy=_literature_policy(args, config),
                 navigation_policy=_navigation_policy(args, config),
@@ -250,6 +273,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 provider=provider,
                 model=model,
                 allow_cloud=args.allow_cloud is True,
+                provider_concurrency=_provider_concurrency(
+                    args.provider_concurrency,
+                    config.get("provider_concurrency"),
+                ),
                 literature_policy=_literature_policy(args, config),
                 navigation_policy=_navigation_policy(args, config),
                 resume=args.resume,
@@ -339,6 +366,25 @@ def _processing_policy(args: argparse.Namespace, config: dict[str, Any]) -> Proc
     payload = {field: getattr(defaults, field) for field in defaults.__dataclass_fields__}
     payload.update({key: value for key, value in values.items() if value is not None})
     return ProcessingPolicy.from_dict(payload)
+
+
+def _provider_concurrency(
+    command_value: str | None, configured_value: Any
+) -> int | str | None:
+    value = command_value if command_value is not None else configured_value
+    if value is None or value == "":
+        return None
+    if str(value).strip().casefold() == "auto":
+        return "auto"
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "provider_concurrency must be auto or a positive integer"
+        ) from exc
+    if parsed < 1:
+        raise ValueError("provider_concurrency must be auto or a positive integer")
+    return parsed
 
 
 def _extraction_policy(

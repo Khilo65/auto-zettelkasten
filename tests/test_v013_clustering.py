@@ -134,7 +134,7 @@ def test_global_plan_uses_only_source_owned_member_and_neighbor_anchors() -> Non
     } == {"a-anchor-1", "b-anchor-1"}
 
 
-def test_invalid_context_member_does_not_discard_valid_core_cluster() -> None:
+def test_member_without_planner_anchor_uses_source_owned_profile_evidence() -> None:
     profiles = normalize_evidence_profiles(
         [_profile("a"), _profile("b"), _profile("c")]
     )
@@ -170,13 +170,8 @@ def test_invalid_context_member_does_not_discard_valid_core_cluster() -> None:
     )
 
     assert not parked
-    assert proposals[0]["source_ids"] == ["a", "b"]
-    assert unclustered == [
-        {
-            "source_id": "c",
-            "reason": "invalid_member_or_source_owned_anchor",
-        }
-    ]
+    assert proposals[0]["source_ids"] == ["a", "b", "c"]
+    assert unclustered == []
 
 
 def test_cluster_plan_validation_parks_only_the_bad_sibling() -> None:
@@ -664,7 +659,7 @@ def test_large_global_plan_falls_back_to_bounded_shards_and_one_family_pass() ->
     )
 
 
-def test_global_plan_uses_shards_above_collection_card_limit() -> None:
+def test_large_global_plan_uses_one_call_when_it_fits_context() -> None:
     class HighContextReasoner(_ShardedPlanReasoner):
         @property
         def capabilities(self) -> dict:
@@ -701,7 +696,5 @@ def test_global_plan_uses_shards_above_collection_card_limit() -> None:
         catalogue_shards=shards,
     )
 
-    assert "collection" not in reasoner.plan_modes
-    assert reasoner.plan_modes.count("shard") == 6
-    assert reasoner.plan_modes.count("bridge") == 1
-    assert max(reasoner.packet_sizes[:-1]) <= 24
+    assert reasoner.plan_modes == ["global"]
+    assert reasoner.packet_sizes == [121]

@@ -769,6 +769,12 @@ def _strip_review_status_sections(body: str) -> str:
 def update_note_frontmatter(path: Path, updates: Mapping[str, Any]) -> None:
     note = read_note(path)
     frontmatter = dict(note["frontmatter"])
+    if all(
+        frontmatter.get(key) == value
+        for key, value in updates.items()
+        if key != "updated_at"
+    ):
+        return
     body = str(note["body"])
     old_title = str(frontmatter.get("title") or "")
     frontmatter.update(dict(updates))

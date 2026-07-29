@@ -174,6 +174,22 @@ def test_collection_tree_indexes_use_direct_members_and_replay_byte_identically(
     tmp_path: Path,
 ) -> None:
     initialize_workspace(tmp_path)
+    write_yaml(
+        tmp_path / "02_source_memory" / "indexes" / "typed_links.yml",
+        {
+            "links": [
+                {
+                    "relation_id": "relation-one-two",
+                    "source_id": "source-zotero-item1",
+                    "target_source_id": "source-zotero-item2",
+                    "relation_type": "supports",
+                    "reason": "The studies support the same bounded proposition.",
+                    "confidence": 0.9,
+                    "active": True,
+                }
+            ]
+        },
+    )
     snapshot = normalize_collection_snapshot(_collections(), _items())
     notes = [
         _note("ITEM1", "Direct parent source", "Parent"),
@@ -219,6 +235,11 @@ def test_collection_tree_indexes_use_direct_members_and_replay_byte_identically(
     assert "Child source" in parent_shard.read_text()
     assert "Child source" in child_shard.read_text()
     assert "Direct parent source" not in child_shard.read_text()
+    parent_relationships = parent_index.parent / "relationships-001.md"
+    child_relationships = child_index.parent / "relationships-001.md"
+    assert "within collection" in parent_relationships.read_text()
+    assert "cross-collection" in child_relationships.read_text()
+    assert "## Graph connections" in child_index.read_text()
     root = Path(first["master_index_path"]).read_text()
     assert "[[collections/PARENT/INDEX|Peace Studies]]" in root
     assert "  - [[collections/CHILD/INDEX|Mediation]]" in root

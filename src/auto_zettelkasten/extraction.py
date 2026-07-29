@@ -414,11 +414,27 @@ def classify_html_content(
     expected_page_count = (
         int(expected_page_match.group(1)) if expected_page_match else 0
     )
+    visible_folded = visible.casefold()
+    viewer_start = visible_folded.find("this is the content viewer section")
+    viewer_end = (
+        visible_folded.find("explore jstor", viewer_start)
+        if viewer_start >= 0
+        else -1
+    )
+    viewer_text = (
+        visible[viewer_start:viewer_end]
+        if viewer_start >= 0 and viewer_end > viewer_start
+        else ""
+    )
+    viewer_word_count = len(
+        re.findall(r"\b\w+\b", viewer_text, flags=re.UNICODE)
+    )
+    jstor_body_word_count = article_word_count or viewer_word_count
     partial_jstor_viewer = bool(
         "jstor" in marker_text
         and expected_page_count >= 4
-        and article_word_count >= 500
-        and article_word_count < expected_page_count * 250
+        and jstor_body_word_count >= 500
+        and jstor_body_word_count < expected_page_count * 250
     )
     abstract_dominates = bool(
         abstract
@@ -448,10 +464,11 @@ def classify_html_content(
             "paywall_marker_count": len(paywall_markers),
             "access_marker_count": len(access_markers),
             "expected_page_count": expected_page_count,
+            "viewer_word_count": viewer_word_count,
             "partial_jstor_viewer": partial_jstor_viewer,
         }
     )
-    if full_article_evidence and partial_jstor_viewer:
+    if partial_jstor_viewer:
         return ContentAdequacy(
             classification=ContentAdequacyClass.PARTIAL_ARTICLE_HTML,
             source_scope="partial_document",
@@ -1151,13 +1168,17 @@ def _bibliography_only_analysis(text: str) -> dict[str, Any]:
     before_words = len(_alphabetic_words(before))
     after_words = len(_alphabetic_words(after))
     cover_followup = after[:200_000]
+    archive_body_heading = re.search(
+        r"(?im)^\s*(?:abstract|introduction|methods?|results?|discussion|conclusions?)\s*$",
+        cover_followup,
+    ) or re.search(
+        r"(?m)^\s*(?!(?:REFERENCES|BIBLIOGRAPHY|WORKS CITED)\s*$)"
+        r"(?:[A-Z][A-Z0-9'’&:,-]*\s+){2,}[A-Z][A-Z0-9'’&:,-]*\s*$",
+        cover_followup,
+    )
     if (
         heading.start() <= int(len(text) * 0.08)
-        and re.search(r"(?im)^---\s*Page\s+[2-9]\d*\s*---", cover_followup)
-        and re.search(
-            r"(?im)^\s*(?:abstract|introduction|methods?|results?|discussion|conclusions?)\s*$",
-            cover_followup,
-        )
+        and archive_body_heading
     ):
         return {
             "bibliography_only": False,

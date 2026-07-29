@@ -348,7 +348,7 @@ def test_reference_accepts_profile_validated_paragraph_locator() -> None:
     assert literature._reference_matches_profile(reference, profile)
 
 
-def test_matrix_rejected_sources_remain_explicitly_unclustered() -> None:
+def test_matrix_rejected_sources_remain_neutrally_unclustered() -> None:
     profiles = normalize_evidence_profiles([_profile("kept"), _profile("dropped")])
     unclustered = literature._reconcile_final_unclustered_sources(
         profiles,
@@ -364,8 +364,8 @@ def test_matrix_rejected_sources_remain_explicitly_unclustered() -> None:
     )
 
     assert [row["source_id"] for row in unclustered] == ["dropped"]
-    assert unclustered[0]["reason"] == "proposed_cluster_failed_evidence_matrix"
-    assert "Internationalized civil-war mediation" in unclustered[0]["reason_detail"]
+    assert unclustered[0]["reason"] == "currently_unclustered"
+    assert "remains eligible for future cluster plans" in unclustered[0]["reason_detail"]
 
 
 def test_source_level_dimensions_are_not_inherited_by_anchors_or_matrix_cells() -> None:

@@ -1111,6 +1111,7 @@ def build_map(
     provider: str | None = None,
     model: str | None = None,
     allow_cloud: bool = False,
+    provider_concurrency: int | str | None = None,
     literature_policy: LiteratureMappingPolicy | Mapping[str, Any] | None = None,
     navigation_policy: NavigationPolicy | Mapping[str, Any] | None = None,
     reasoner: LiteratureReasoner | None = None,
@@ -1175,9 +1176,14 @@ def build_map(
         provider=provider,
         model=model,
         allow_cloud=allow_cloud,
+        provider_concurrency=(
+            provider_concurrency
+            if provider_concurrency is not None
+            else config.get("provider_concurrency", "auto")
+        ),
         question=question,
         extraction_version=str(extraction_config.get("version") or "2"),
-        prompt_version=str(config.get("prompt_version") or "9"),
+        prompt_version=str(config.get("prompt_version") or "10"),
         retry_terminal_failures=retry_terminal_failures,
         extraction_policy=ExtractionPolicy.from_dict(extraction_config),
         processing=ProcessingPolicy.from_dict(
@@ -1268,6 +1274,16 @@ def build_map(
         "synthesis_failure_count": int(result["literature_packet"].get("synthesis_failure_count", 0) or 0),
         "partial_reason": str(result.get("partial_reason") or ""),
         "profile_result": result.get("profile_result", {}),
+        "relationship_stage_wall_seconds": float(
+            progress.literature.get("relationship_stage_wall_seconds", 0.0)
+            or 0.0
+        ),
+        "cluster_peak_concurrency": int(
+            progress.literature.get("cluster_peak_concurrency", 0) or 0
+        ),
+        "cluster_stage_wall_seconds": float(
+            progress.literature.get("cluster_stage_wall_seconds", 0.0) or 0.0
+        ),
     }
     manifest = ArtifactManifest(
         status="partial" if result.get("partial_reason") else "built",
@@ -1347,6 +1363,7 @@ def run_literature_map(
         provider=request.provider,
         model=request.model,
         allow_cloud=request.allow_cloud,
+        provider_concurrency=request.provider_concurrency,
         literature_policy=request.literature_policy,
         reasoner=reasoner,
         external_discovery=external_discovery,

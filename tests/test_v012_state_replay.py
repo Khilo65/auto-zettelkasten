@@ -6,7 +6,7 @@ from typing import Any, Mapping, Sequence
 import pytest
 
 from auto_zettelkasten.files import read_yaml, write_yaml
-from auto_zettelkasten.indexes import write_source_set
+from auto_zettelkasten.indexes import update_source_set_map, write_source_set
 from auto_zettelkasten.literature import (
     LiteratureSynthesisPartialError,
     _CheckpointedReasonerCalls,
@@ -136,8 +136,8 @@ def test_relationship_catalogue_projection_keeps_bounded_graph_navigation() -> N
 
     assert projected["zotero_key"] == "ABCD1234"
     assert projected["thesis"] == "A thesis"
-    assert projected["relationship_ids"] == ["relation-a"] * 12
-    assert projected["cluster_ids"] == ["cluster-a"]
+    assert "relationship_ids" not in projected
+    assert "cluster_ids" not in projected
     assert "profile_hash" not in projected
     assert "note_link" not in projected
 
@@ -206,6 +206,54 @@ def test_unchanged_source_set_replay_is_byte_stable(tmp_path: Path) -> None:
     replay = write_source_set(tmp_path, **kwargs)
 
     assert replay["updated_at"] == first["updated_at"]
+    assert {
+        path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths
+    } == before
+
+
+def test_source_set_inventory_replay_preserves_projected_membership(
+    tmp_path: Path,
+) -> None:
+    kwargs = {
+        "run_id": "run",
+        "scope": "workspace",
+        "collection_key": None,
+        "items": [{"key": "ITEM1"}],
+        "terminal_rows": [
+            {
+                "inventory_index": 0,
+                "zotero_item_key": "ITEM1",
+                "source_id": "source-item1",
+                "note_id": "note-item1",
+                "note_path": "02_source_memory/notes/Item 1.md",
+                "terminal_status": "validated_note",
+                "fingerprint": "fingerprint",
+            }
+        ],
+        "note_rows": [
+            {
+                "zotero_item_key": "ITEM1",
+                "source_id": "source-item1",
+                "note_id": "note-item1",
+                "note_path": "02_source_memory/notes/Item 1.md",
+            }
+        ],
+        "source_set_id": "source-set-workspace",
+    }
+    source_set = write_source_set(tmp_path, **kwargs)
+    projected = update_source_set_map(
+        tmp_path,
+        source_set,
+        [{"cluster_id": "cluster-one"}],
+        [{"gap_id": "gap-one"}],
+    )
+    paths = [Path(projected["path"]), Path(projected["latest_path"])]
+    before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+
+    replay = write_source_set(tmp_path, **kwargs)
+
+    assert replay["cluster_ids"] == ["cluster-one"]
+    assert replay["gap_ids"] == ["gap-one"]
     assert {
         path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths
     } == before
@@ -314,6 +362,43 @@ def test_transport_failure_gets_one_checkpointed_resume_retry(
     assert resumed.cumulative_provider_calls == 2
 
 
+def test_contract_failure_is_terminal_without_paid_resume_retry(
+    tmp_path: Path,
+) -> None:
+    reasoner = _CallReasoner(failure=ValueError("invalid provider contract"))
+    request = _request(tmp_path, max_calls=3)
+
+    with pytest.raises(ValueError, match="invalid provider contract"):
+        _CheckpointedReasonerCalls(
+            tmp_path, "run", reasoner, request
+        )("cluster_proposal", "one", "propose_clusters", [], {})
+
+    checkpoint = read_yaml(
+        tmp_path
+        / "11_state"
+        / "runs"
+        / "run"
+        / "literature"
+        / "synthesis"
+        / "cluster_proposal"
+        / "one.yml",
+        {},
+    )
+    assert checkpoint["failure_class"] == "contract"
+    assert checkpoint["terminal"] is True
+    assert checkpoint["retry_on_resume"] is False
+
+    reasoner.failure = None
+    resumed = _CheckpointedReasonerCalls(tmp_path, "run", reasoner, request)
+    with pytest.raises(
+        LiteratureSynthesisPartialError,
+        match="literature_synthesis_terminal_failure:cluster_proposal:one",
+    ):
+        resumed("cluster_proposal", "one", "propose_clusters", [], {})
+    assert reasoner.calls == 1
+    assert resumed.cumulative_provider_calls == 1
+
+
 def test_profile_and_fidelity_share_one_frozen_resume_ceiling(
     tmp_path: Path,
 ) -> None:
@@ -357,15 +442,17 @@ def test_existing_run_ceiling_cannot_be_raised_on_resume(tmp_path: Path) -> None
     assert reasoner.calls == 1
 
 
-def test_acceptance_stage_reservations_protect_later_work(tmp_path: Path) -> None:
+def test_stage_allocations_do_not_override_the_single_hard_ceiling(
+    tmp_path: Path,
+) -> None:
     reasoner = _CallReasoner()
     calls = _CheckpointedReasonerCalls(
         tmp_path,
         "run",
         reasoner,
-        _request(tmp_path, max_calls=100),
+        _request(tmp_path, max_calls=4),
     )
-    for index in range(30):
+    for index in range(4):
         calls(
             "relationship_candidate_selection",
             f"source-{index}",
@@ -376,7 +463,7 @@ def test_acceptance_stage_reservations_protect_later_work(tmp_path: Path) -> Non
 
     with pytest.raises(
         LiteratureSynthesisPartialError,
-        match="literature_synthesis_stage_budget_reached:source_discovery",
+        match="literature_synthesis_call_budget_reached",
     ):
         calls(
             "relationship_candidate_selection",
@@ -385,7 +472,7 @@ def test_acceptance_stage_reservations_protect_later_work(tmp_path: Path) -> Non
             [],
             {},
         )
-    assert calls.cumulative_provider_calls == 30
+    assert calls.cumulative_provider_calls == 4
 
 
 def test_terminal_checkpoint_is_zero_call_until_explicit_retry(

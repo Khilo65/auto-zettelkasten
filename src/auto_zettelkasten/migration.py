@@ -30,7 +30,11 @@ from .notes import (
     source_id_for_item,
     strip_review_status_material,
 )
-from .models import NavigationPolicy
+from .models import (
+    CURRENT_ARTIFACT_SCHEMA_VERSION,
+    CURRENT_ENGINE_VERSION,
+    NavigationPolicy,
+)
 from .workspace import resolve_workspace
 
 MIGRATION_ID = "auto-zettelkasten-0.3-literature-map"
@@ -90,6 +94,13 @@ V013_MIGRATION_ID = "auto-zettelkasten-0.13-source-bundle-graph"
 V013_MIGRATION_VERSION = "1"
 V013_TARGET_ENGINE_VERSION = "0.13.0"
 V013_TARGET_ARTIFACT_SCHEMA_VERSION = "1.12"
+
+V014_MIGRATION_ID = "auto-zettelkasten-0.14-streamlined-full-note-synthesis"
+V014_MIGRATION_VERSION = "1"
+V014_TARGET_ENGINE_VERSION = "0.14.0"
+V014_TARGET_ARTIFACT_SCHEMA_VERSION = "1.13"
+
+V015_MIGRATION_ID = "auto-zettelkasten-0.15-statistical-explanation-metadata"
 
 _MARKER_FIELDS = {
     "migration_id",
@@ -203,6 +214,24 @@ _V013_MARKER_FIELDS = {
     "legacy_source_bundle_conflicts",
     "fidelity_drafts_recovered",
     "partial_documents_promoted",
+    "completed_at",
+}
+
+_V014_MARKER_FIELDS = {
+    "migration_id",
+    "migration_version",
+    "status",
+    "target_engine_version",
+    "target_artifact_schema_version",
+    "rewritten_files",
+    "provider_calls",
+    "source_documents_reread",
+    "source_notes_rewritten",
+    "profile_files_rewritten",
+    "legacy_cluster_syntheses_marked",
+    "relationship_rows_consolidated",
+    "stale_cluster_memberships_retired",
+    "global_cluster_registry_selected",
     "completed_at",
 }
 
@@ -355,7 +384,23 @@ def migrate_workspace(workspace: Path | str, *, dry_run: bool = False) -> dict[s
         ).is_file()
         else migrate_verified_relationship_graph_schema(workspace, dry_run=dry_run)
     )
-    v013 = migrate_v013_schema(workspace, dry_run=dry_run)
+    v013 = (
+        {
+            "status": "not_applicable",
+            "dry_run": dry_run,
+            "migration_id": V013_MIGRATION_ID,
+            "reason": "schema_1.12_or_newer",
+            "provider_calls": 0,
+        }
+        if starting_schema is not None
+        and starting_schema >= (1, 12)
+        and not (
+            root / "11_state" / "migrations" / f"{V013_MIGRATION_ID}.yml"
+        ).is_file()
+        else migrate_v013_schema(workspace, dry_run=dry_run)
+    )
+    v014 = migrate_v014_schema(workspace, dry_run=dry_run)
+    v015 = migrate_v015_metadata(workspace, dry_run=dry_run)
     return {
         "status": "dry_run" if dry_run else "completed",
         "dry_run": dry_run,
@@ -372,6 +417,8 @@ def migrate_workspace(workspace: Path | str, *, dry_run: bool = False) -> dict[s
             managed_graph,
             verified_graph,
             v013,
+            v014,
+            v015,
         ],
         "literature_map": legacy,
         "review_status": review,
@@ -384,6 +431,8 @@ def migrate_workspace(workspace: Path | str, *, dry_run: bool = False) -> dict[s
         "managed_graph": managed_graph,
         "verified_graph": verified_graph,
         "v013": v013,
+        "v014": v014,
+        "v015": v015,
     }
 
 
@@ -1469,6 +1518,510 @@ def migrate_v013_schema(
                 atomic_write_text(path, original)
         raise
     return {"dry_run": False, **payload, "status": "migrated", "marker": str(marker)}
+
+
+def migrate_v014_schema(
+    workspace: Path | str,
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Advance local state to v0.14 without rewriting notes or calling providers."""
+
+    root = resolve_workspace(workspace)
+    marker = root / "11_state" / "migrations" / f"{V014_MIGRATION_ID}.yml"
+    if marker.is_file():
+        payload = read_yaml(marker, {})
+        _validate_v014_marker(payload)
+        return {
+            "dry_run": dry_run,
+            **dict(payload),
+            "status": "already_migrated",
+            "marker": str(marker),
+        }
+    schema = _workspace_schema_version(root)
+    if schema is None:
+        return {
+            "status": "not_applicable",
+            "dry_run": dry_run,
+            "migration_id": V014_MIGRATION_ID,
+            "reason": "workspace_version_files_absent",
+            "provider_calls": 0,
+        }
+    target = _parse_schema_version(
+        V014_TARGET_ARTIFACT_SCHEMA_VERSION, field="v0.14 artifact schema"
+    )
+    if schema > target:
+        raise ValueError("workspace is newer than the v0.14 migration target")
+    if schema == target:
+        return {
+            "status": "not_applicable",
+            "dry_run": dry_run,
+            "migration_id": V014_MIGRATION_ID,
+            "reason": "schema_1.13_or_newer",
+            "provider_calls": 0,
+        }
+    if schema < (1, 12) and not dry_run:
+        raise ValueError("v0.14 migration requires the schema-1.12 migration first")
+
+    changes: list[tuple[Path, str | None, str]] = []
+    for relative in _VERSION_FILE_RELATIVES:
+        path = root / relative
+        original = path.read_text(encoding="utf-8")
+        value = yaml.safe_load(original)
+        if not isinstance(value, Mapping):
+            raise ValueError(f"workspace version file must be a mapping: {path}")
+        updated = {
+            **dict(value),
+            "engine_version": V014_TARGET_ENGINE_VERSION,
+            "artifact_schema_version": V014_TARGET_ARTIFACT_SCHEMA_VERSION,
+        }
+        cleaned = yaml.safe_dump(
+            updated, sort_keys=False, allow_unicode=True, width=10_000
+        )
+        if cleaned != original:
+            changes.append((path, original, cleaned))
+
+    registry_changes, registry_stats = _v014_registry_changes(root)
+    changes.extend(registry_changes)
+
+    legacy_cluster_syntheses_marked = 0
+    synthesis_root = root / "03_literature_synthesis"
+    for path in (
+        sorted(synthesis_root.rglob("cluster_syntheses.yml"))
+        if synthesis_root.is_dir()
+        else []
+    ):
+        original = path.read_text(encoding="utf-8")
+        value = yaml.safe_load(original)
+        if not isinstance(value, Mapping):
+            raise ValueError(f"cluster synthesis registry must be a mapping: {path}")
+        syntheses = value.get("syntheses")
+        if not isinstance(syntheses, Mapping):
+            continue
+        updated_syntheses: dict[str, Any] = {}
+        for cluster_id, raw in syntheses.items():
+            if not isinstance(raw, Mapping):
+                updated_syntheses[str(cluster_id)] = raw
+                continue
+            row = dict(raw)
+            if row.get("cluster_contract") != "streamlined-full-note-v1":
+                row["legacy_projection"] = True
+                row["projection_status"] = "legacy_v013"
+                legacy_cluster_syntheses_marked += 1
+            updated_syntheses[str(cluster_id)] = row
+        updated = {**dict(value), "syntheses": updated_syntheses}
+        cleaned = yaml.safe_dump(
+            updated, sort_keys=False, allow_unicode=True, width=10_000
+        )
+        if cleaned != original:
+            changes.append((path, original, cleaned))
+
+    rewritten_files = [
+        {
+            "source": str(path.relative_to(root)),
+            "before_sha256": sha256_text(original or ""),
+            "after_sha256": sha256_text(cleaned),
+        }
+        for path, original, cleaned in changes
+    ]
+    safety = {
+        "target_engine_version": V014_TARGET_ENGINE_VERSION,
+        "target_artifact_schema_version": V014_TARGET_ARTIFACT_SCHEMA_VERSION,
+        "rewritten_files": rewritten_files,
+        "provider_calls": 0,
+        "source_documents_reread": 0,
+        "source_notes_rewritten": 0,
+        "profile_files_rewritten": 0,
+        "legacy_cluster_syntheses_marked": legacy_cluster_syntheses_marked,
+        **registry_stats,
+    }
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "dry_run": True,
+            "migration_id": V014_MIGRATION_ID,
+            **safety,
+        }
+
+    written: list[tuple[Path, str | None]] = []
+    try:
+        for path, original, cleaned in changes:
+            atomic_write_text(path, cleaned)
+            written.append((path, original))
+        payload = {
+            "migration_id": V014_MIGRATION_ID,
+            "migration_version": V014_MIGRATION_VERSION,
+            "status": "completed",
+            **safety,
+            "completed_at": now_iso(),
+        }
+        write_yaml(marker, payload)
+    except Exception:
+        for path, original in reversed(written):
+            if original is None:
+                path.unlink(missing_ok=True)
+            else:
+                atomic_write_text(path, original)
+        raise
+    return {"dry_run": False, **payload, "status": "migrated", "marker": str(marker)}
+
+
+def migrate_v015_metadata(
+    workspace: Path | str,
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Update release and prompt metadata without touching semantic artifacts."""
+
+    root = resolve_workspace(workspace)
+    changes: list[tuple[Path, str, str]] = []
+    for relative in _VERSION_FILE_RELATIVES:
+        path = root / relative
+        if not path.is_file():
+            continue
+        original = path.read_text(encoding="utf-8")
+        value = yaml.safe_load(original)
+        if not isinstance(value, Mapping):
+            raise ValueError(f"workspace version file must be a mapping: {path}")
+        updated = {
+            **dict(value),
+            "engine_version": CURRENT_ENGINE_VERSION,
+            "artifact_schema_version": CURRENT_ARTIFACT_SCHEMA_VERSION,
+        }
+        if relative == "auto-zettelkasten.yml":
+            prompt_version = str(updated.get("prompt_version") or "")
+            if not prompt_version or (
+                prompt_version.isdigit() and int(prompt_version) < 10
+            ):
+                updated["prompt_version"] = "10"
+        cleaned = yaml.safe_dump(
+            updated, sort_keys=False, allow_unicode=True, width=10_000
+        )
+        if cleaned != original:
+            changes.append((path, original, cleaned))
+
+    result = {
+        "migration_id": V015_MIGRATION_ID,
+        "target_engine_version": CURRENT_ENGINE_VERSION,
+        "target_artifact_schema_version": CURRENT_ARTIFACT_SCHEMA_VERSION,
+        "prompt_version": "10",
+        "rewritten_files": [
+            {
+                "source": str(path.relative_to(root)),
+                "before_sha256": sha256_text(original),
+                "after_sha256": sha256_text(cleaned),
+            }
+            for path, original, cleaned in changes
+        ],
+        "provider_calls": 0,
+        "source_documents_reread": 0,
+        "source_notes_rewritten": 0,
+        "profile_files_rewritten": 0,
+    }
+    if dry_run:
+        return {"status": "dry_run", "dry_run": True, **result}
+    written: list[tuple[Path, str]] = []
+    try:
+        for path, original, cleaned in changes:
+            atomic_write_text(path, cleaned)
+            written.append((path, original))
+    except Exception:
+        for path, original in reversed(written):
+            atomic_write_text(path, original)
+        raise
+    return {
+        "status": "migrated" if changes else "already_current",
+        "dry_run": False,
+        **result,
+    }
+
+
+def _v014_registry_changes(
+    root: Path,
+) -> tuple[list[tuple[Path, str | None, str]], dict[str, int]]:
+    """Merge legacy cluster maps and unify the graph registries."""
+
+    changes: list[tuple[Path, str | None, str]] = []
+    cluster_path = root / "03_literature_synthesis" / "cluster_registry.yml"
+    cluster_candidates = [
+        path
+        for path in (
+            cluster_path,
+            *sorted(
+                (
+                    root / "03_literature_synthesis" / "maps"
+                ).glob("*/cluster_registry.yml")
+            ),
+        )
+        if path.is_file()
+    ]
+    cluster_payloads: dict[Path, Mapping[str, Any]] = {}
+    for path in cluster_candidates:
+        payload = read_yaml(path, {}) or {}
+        if not isinstance(payload, Mapping):
+            raise ValueError(f"cluster registry must be a mapping: {path}")
+        rows = payload.get("clusters", []) or []
+        if not isinstance(rows, list) or any(
+            not isinstance(row, Mapping) for row in rows
+        ):
+            raise ValueError(f"cluster registry rows must be mappings: {path}")
+        cluster_payloads[path] = payload
+
+    def cluster_score(path: Path) -> tuple[int, int, int]:
+        rows = cluster_payloads[path].get("clusters", []) or []
+        source_ids = {
+            str(source_id)
+            for row in rows
+            for source_id in (
+                row.get("source_ids", [])
+                or [
+                    member.get("source_id")
+                    for member in row.get("members", []) or []
+                    if isinstance(member, Mapping)
+                ]
+            )
+            if str(source_id)
+        }
+        return (len(source_ids), len(rows), path == cluster_path)
+
+    selected_cluster_path = (
+        max(cluster_candidates, key=cluster_score) if cluster_candidates else None
+    )
+    selected_cluster_payload = (
+        cluster_payloads[selected_cluster_path]
+        if selected_cluster_path is not None
+        else {}
+    )
+    merged_clusters: list[dict[str, Any]] = []
+    semantic_indexes: dict[str, int] = {}
+    seen_member_sets: set[tuple[str, ...]] = set()
+    seen_fallback_ids: set[str] = set()
+    for path in sorted(cluster_candidates, key=cluster_score, reverse=True):
+        for raw in cluster_payloads[path].get("clusters", []) or []:
+            row = dict(raw)
+            semantic_identity = re.sub(
+                r"\s+",
+                " ",
+                str(row.get("semantic_identity") or "").strip().casefold(),
+            )
+            raw_source_ids = row.get("source_ids", []) or [
+                member.get("source_id")
+                for member in row.get("members", []) or []
+                if isinstance(member, Mapping)
+            ]
+            member_set = tuple(
+                sorted(
+                    {
+                        str(source_id)
+                        for source_id in raw_source_ids
+                        if str(source_id)
+                    }
+                )
+            )
+            fallback_id = str(row.get("cluster_id") or "")
+            if member_set and member_set in seen_member_sets:
+                continue
+            if semantic_identity and semantic_identity in semantic_indexes:
+                existing = merged_clusters[semantic_indexes[semantic_identity]]
+                source_ids = sorted(
+                    {
+                        *(
+                            str(value)
+                            for value in (
+                                existing.get("source_ids", [])
+                                or [
+                                    member.get("source_id")
+                                    for member in existing.get("members", []) or []
+                                    if isinstance(member, Mapping)
+                                ]
+                            )
+                            if str(value)
+                        ),
+                        *member_set,
+                    }
+                )
+                if source_ids:
+                    existing["source_ids"] = source_ids
+                    seen_member_sets.add(tuple(source_ids))
+                members = {
+                    str(member.get("source_id") or ""): dict(member)
+                    for member in existing.get("members", []) or []
+                    if isinstance(member, Mapping) and member.get("source_id")
+                }
+                for member in row.get("members", []) or []:
+                    if isinstance(member, Mapping) and member.get("source_id"):
+                        members.setdefault(
+                            str(member["source_id"]), dict(member)
+                        )
+                if members:
+                    existing["members"] = [
+                        members[source_id] for source_id in sorted(members)
+                    ]
+                continue
+            if (
+                not semantic_identity
+                and not member_set
+                and fallback_id in seen_fallback_ids
+            ):
+                continue
+            merged_clusters.append(row)
+            if semantic_identity:
+                semantic_indexes[semantic_identity] = len(merged_clusters) - 1
+            if member_set:
+                seen_member_sets.add(member_set)
+            if fallback_id:
+                seen_fallback_ids.add(fallback_id)
+    merged_cluster_payload = {
+        **dict(selected_cluster_payload),
+        "clusters": sorted(
+            merged_clusters, key=lambda row: str(row.get("cluster_id") or "")
+        ),
+    }
+    current_cluster_payload = read_yaml(cluster_path, {}) or {}
+    global_cluster_registry_selected = int(
+        bool(cluster_candidates)
+        and dict(current_cluster_payload) != merged_cluster_payload
+    )
+    if global_cluster_registry_selected:
+        _append_yaml_change(changes, cluster_path, merged_cluster_payload)
+    active_cluster_ids = {
+        str(row.get("cluster_id") or "")
+        for row in merged_cluster_payload.get("clusters", []) or []
+        if row.get("cluster_id")
+    }
+
+    registry_paths = [root / relative for relative in _RELATIONSHIP_REGISTRY_RELATIVES]
+    registry_payloads: list[Mapping[str, Any]] = []
+    for path in registry_paths:
+        if not path.is_file():
+            continue
+        payload = read_yaml(path, {}) or {}
+        if not isinstance(payload, Mapping):
+            raise ValueError(f"relationship registry must be a mapping: {path}")
+        registry_payloads.append(payload)
+    if not registry_payloads:
+        return changes, {
+            "relationship_rows_consolidated": 0,
+            "stale_cluster_memberships_retired": 0,
+            "global_cluster_registry_selected": global_cluster_registry_selected,
+        }
+
+    relations: dict[str, dict[str, Any]] = {}
+    pair_decisions: dict[str, dict[str, Any]] = {}
+    events: dict[str, dict[str, Any]] = {}
+    parked: dict[str, dict[str, Any]] = {}
+    machine_identity_by_relation_id: dict[str, str] = {}
+    for payload in reversed(registry_payloads):
+        for raw in payload.get("relations", []) or payload.get("links", []) or []:
+            if not isinstance(raw, Mapping):
+                raise ValueError("relationship registry rows must be mappings")
+            row = dict(raw)
+            relation_id = str(row.get("relation_id") or row.get("link_id") or "")
+            human_authored = str(row.get("provenance") or "").startswith("human")
+            source_id = str(row.get("source_id") or "")
+            target_id = str(
+                row.get("target_cluster_id")
+                or row.get("target_source_id")
+                or row.get("target_id")
+                or ""
+            )
+            relation_type = str(row.get("relation_type") or "")
+            probabilistic_pair = str(row.get("provenance") or "").startswith(
+                "probabilistic_relationship_"
+            )
+            semantic_identity = (
+                str(row.get("source_kind") or "source"),
+                source_id,
+                str(row.get("target_kind") or "source"),
+                target_id,
+                relation_type,
+            )
+            if human_authored or not all((source_id, target_id, relation_type)):
+                identity = f"id:{relation_id or _json_hash(row)}"
+            elif probabilistic_pair:
+                identity = "probabilistic-pair:" + _json_hash(
+                    tuple(sorted((source_id, target_id)))
+                )
+            else:
+                identity = "semantic:" + _json_hash(semantic_identity)
+            if not human_authored and relation_id:
+                prior_identity = machine_identity_by_relation_id.get(relation_id)
+                if prior_identity and prior_identity != identity:
+                    relations.pop(prior_identity, None)
+                machine_identity_by_relation_id[relation_id] = identity
+            relations[identity] = row
+        for raw in payload.get("pair_decisions", []) or []:
+            if isinstance(raw, Mapping):
+                row = dict(raw)
+                pair_decisions[
+                    str(row.get("decision_key") or _json_hash(row))
+                ] = row
+        for raw in payload.get("events", []) or []:
+            if isinstance(raw, Mapping):
+                row = dict(raw)
+                events[str(row.get("event_id") or _json_hash(row))] = row
+        for raw in payload.get("parked", []) or []:
+            if isinstance(raw, Mapping):
+                row = dict(raw)
+                parked[_json_hash(row)] = row
+
+    retired = 0
+    if active_cluster_ids:
+        for row in relations.values():
+            if str(row.get("provenance") or "").startswith("human"):
+                continue
+            referenced_clusters = {
+                str(row.get("source_id") or "")
+                if str(row.get("source_kind") or "") == "cluster"
+                else "",
+                str(row.get("target_cluster_id") or row.get("target_source_id") or "")
+                if str(row.get("target_kind") or "") == "cluster"
+                else "",
+            } - {""}
+            if referenced_clusters and not referenced_clusters.issubset(
+                active_cluster_ids
+            ):
+                if bool(row.get("active", True)):
+                    retired += 1
+                row.update(
+                    active=False,
+                    decision_status="retired",
+                    retirement_reason="cluster_absent_from_global_registry",
+                )
+
+    relation_rows = sorted(
+        relations.values(),
+        key=lambda row: (
+            str(row.get("source_id") or ""),
+            str(row.get("target_source_id") or row.get("target_cluster_id") or ""),
+            str(row.get("relation_type") or ""),
+            str(row.get("relation_id") or row.get("link_id") or ""),
+        ),
+    )
+    links = [row for row in relation_rows if bool(row.get("active", True))]
+    semantic = {
+        "registry_schema_version": "5",
+        "relations": relation_rows,
+        "links": links,
+        "pair_decisions": [pair_decisions[key] for key in sorted(pair_decisions)],
+        "events": [events[key] for key in sorted(events)],
+        "parked": [parked[key] for key in sorted(parked)],
+    }
+    base = dict(registry_payloads[0])
+    updated = {
+        **base,
+        **semantic,
+        "revision_hash": _json_hash(semantic),
+        "graph_projection_hash": _json_hash(links),
+        "relation_counts": _active_relation_counts(links),
+    }
+    for path in registry_paths:
+        _append_yaml_change(changes, path, updated)
+    return changes, {
+        "relationship_rows_consolidated": len(relation_rows),
+        "stale_cluster_memberships_retired": retired,
+        "global_cluster_registry_selected": global_cluster_registry_selected,
+    }
 
 
 def _legacy_source_bundle_changes(
@@ -2867,6 +3420,7 @@ def _validate_existing_markers(root: Path) -> None:
             _validate_verified_graph_marker,
         ),
         (V013_MIGRATION_ID, _validate_v013_marker),
+        (V014_MIGRATION_ID, _validate_v014_marker),
     )
     for migration_id, validate in marker_validators:
         marker = marker_root / f"{migration_id}.yml"
@@ -2917,6 +3471,39 @@ def _validate_v013_marker(value: Any) -> None:
         )
     ):
         raise ValueError("invalid v0.13 migration marker")
+
+
+def _validate_v014_marker(value: Any) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError("v0.14 migration marker must be a mapping")
+    unknown = sorted(set(value) - _V014_MARKER_FIELDS)
+    missing = sorted(_V014_MARKER_FIELDS - set(value))
+    if unknown or missing:
+        raise ValueError(
+            "invalid v0.14 migration marker fields"
+            f"; unknown={','.join(unknown)}; missing={','.join(missing)}"
+        )
+    if (
+        value.get("migration_id") != V014_MIGRATION_ID
+        or str(value.get("migration_version")) != V014_MIGRATION_VERSION
+        or value.get("target_engine_version") != V014_TARGET_ENGINE_VERSION
+        or value.get("target_artifact_schema_version")
+        != V014_TARGET_ARTIFACT_SCHEMA_VERSION
+        or int(value.get("provider_calls", -1)) != 0
+        or int(value.get("source_documents_reread", -1)) != 0
+        or int(value.get("source_notes_rewritten", -1)) != 0
+        or int(value.get("profile_files_rewritten", -1)) != 0
+        or any(
+            int(value.get(field_name, -1)) < 0
+            for field_name in (
+                "legacy_cluster_syntheses_marked",
+                "relationship_rows_consolidated",
+                "stale_cluster_memberships_retired",
+                "global_cluster_registry_selected",
+            )
+        )
+    ):
+        raise ValueError("invalid v0.14 migration marker")
 
 
 def _confined_marker_path(root: Path, value: Any, *, label: str) -> Path:

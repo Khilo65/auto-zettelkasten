@@ -29,7 +29,7 @@ def test_extraction_policy_is_serializable_and_validated(tmp_path: Path) -> None
     assert restored == request
     assert restored.extraction_policy.languages == ("eng", "ara")
     assert restored.extraction_version == "2"
-    assert restored.prompt_version == "9"
+    assert restored.prompt_version == "10"
     with pytest.raises(ValueError, match="auto, off, or required"):
         ExtractionPolicy(ocr="sometimes")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="language code"):
@@ -45,7 +45,7 @@ def test_workspace_and_cli_extraction_precedence(tmp_path: Path) -> None:
         "languages": ["eng"],
         "vision": "configured_only",
     }
-    assert config["prompt_version"] == "9"
+    assert config["prompt_version"] == "10"
 
     args = build_parser().parse_args(
         [

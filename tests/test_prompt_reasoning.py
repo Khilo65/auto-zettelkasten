@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from auto_zettelkasten.models import ClusterSynthesis, LiteratureMapRequest
+from auto_zettelkasten.models import LiteratureMapRequest
 from auto_zettelkasten.readers import (
     SECTION_KEYS,
     DeepSeekReader,
@@ -32,10 +32,10 @@ def _completion(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def test_atomic_prompt_v9_is_source_adaptive_and_inference_aware() -> None:
+def test_atomic_prompt_v10_is_source_adaptive_and_statistics_aware() -> None:
     prompt = _system_prompt()
 
-    assert "atomic prompt v9" in prompt
+    assert "atomic prompt v10" in prompt
     assert "blog post" in prompt
     assert "conference or meeting record" in prompt
     assert "findings, arguments, observations, interpretations, or recommendations" in prompt
@@ -48,7 +48,10 @@ def test_atomic_prompt_v9_is_source_adaptive_and_inference_aware() -> None:
     assert "do not force fixed labels" in prompt
     assert "observed events and reported numbers" in prompt
     assert "what the design cannot rule out" in prompt
-    assert "Do not recalculate" in prompt
+    assert "9 percentage points lower" in prompt
+    assert "22.5% lower relative" in prompt
+    assert "logit coefficient is not a probability change" in prompt
+    assert "p-value is not an effect size" in prompt
     assert "hypothetical populations" in prompt
     assert "descriptive arithmetic, not an estimated causal effect" in prompt
     assert "approximately half-million Tutsi estimate" not in prompt
@@ -104,13 +107,14 @@ def test_partial_source_prompt_prohibits_complete_document_inference() -> None:
 def test_cluster_prompt_preserves_inference_and_case_evidence() -> None:
     prompt = _cluster_synthesis_system_prompt()
 
-    assert "cluster synthesis prompt v21" in prompt
-    assert "same predictor and outcome orientation" in prompt
-    assert "describe the same direction, not opposite results" in prompt
-    assert "retain the decisive case evidence" in prompt
-    assert "identify the conflict or case" in prompt
-    assert "descriptive before-and-after arithmetic" in prompt
-    assert "Kuperman" not in prompt
+    assert "cluster synthesis prompt v25" in prompt
+    assert "Read every supplied atomic_note_markdown" in prompt
+    assert "Every retained member" in prompt
+    assert "specific study finding" in prompt
+    assert "not generic thematic boilerplate" in prompt
+    assert "observational, descriptive" in prompt
+    assert "percentage-point versus relative percentage" in prompt
+    assert "p-value is not an effect size" in prompt
 
 
 def test_gap_prompt_rejects_invented_resolution_details() -> None:
@@ -131,8 +135,22 @@ def test_deepseek_atomic_and_cluster_calls_use_requested_thinking_effort(
         bodies.append(dict(body))
         system_prompt = body["messages"][0]["content"]
         payload = (
-            ClusterSynthesis(cluster_id="cluster-a").to_dict()
-            if "cluster-synthesis reasoner" in system_prompt
+            {
+                "cluster_id": "cluster-a",
+                "status": "accepted",
+                "title": "A cluster",
+                "organizing_mode": "question",
+                "organizing_problem": "What does the literature establish?",
+                "bottom_line": "The supplied source provides one bounded finding.",
+                "lines_of_inquiry": [],
+                "differences": [],
+                "limits": [],
+                "related_clusters": [],
+                "retained_member_ids": [],
+                "dropped_members": [],
+                "missing_member_ids": [],
+            }
+            if "full-note cluster writer" in system_prompt
             else _analysis()
         )
         return _completion(payload)

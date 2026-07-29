@@ -18,7 +18,11 @@ from auto_zettelkasten.api import (
 )
 from auto_zettelkasten.literature import cluster_display_title, cluster_note_stem
 from auto_zettelkasten.models import MapRequest, ProcessingPolicy
-from auto_zettelkasten.notes import parse_atomic_note, read_note
+from auto_zettelkasten.notes import (
+    parse_atomic_note,
+    read_note,
+    update_note_frontmatter,
+)
 from auto_zettelkasten.pipeline import _RunProgress
 
 from conftest import FakeReader, FakeZotero
@@ -233,6 +237,8 @@ def test_processing_budget_change_reuses_current_schema_committed_note(
         run_id="budget-first",
     )
     assert first_reader.calls == 1
+    note_path = next((tmp_path / "02_source_memory" / "notes").glob("*.md"))
+    note_before = (note_path.read_bytes(), note_path.stat().st_mtime_ns)
     for fingerprint_path in (tmp_path / "11_state" / "fingerprints").glob("*.yml"):
         payload = yaml.safe_load(fingerprint_path.read_text())
         payload["engine_version"] = "0.3.0"
@@ -257,8 +263,9 @@ def test_processing_budget_change_reuses_current_schema_committed_note(
 
     assert second.validated_note_count == 1
     assert second.reused_count == 1
-    assert second.items[0]["reason"] == "compatible_committed_note"
+    assert second.items[0]["reason"] == "fingerprint_match"
     assert second_reader.calls == 0
+    assert (note_path.read_bytes(), note_path.stat().st_mtime_ns) == note_before
 
 
 def test_resume_revalidates_item_identity_and_content_fingerprint(
@@ -456,7 +463,7 @@ def test_current_prompt_replaces_prompt_v1_note_instead_of_reusing_it(
     note = tmp_path / second.items[0]["note_path"]
     frontmatter = read_note(note)["frontmatter"]
     _, body = parse_atomic_note(note.read_text())
-    assert frontmatter["prompt_version"] == "9"
+    assert frontmatter["prompt_version"] == "10"
     assert "## Plain-English Interpretation" in body
 
 
@@ -632,6 +639,48 @@ def test_workspace_map_remains_coherent_across_collection_runs(
     )
     exported = export_to_obsidian(tmp_path, tmp_path / "vault", new_vault=True)
     assert exported.metadata["missing_wikilink_count"] == 0
+
+
+def test_collection_build_clears_stale_cluster_projection_across_workspace(
+    tmp_path: Path, sample_items
+) -> None:
+    report = run_map(
+        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        client=FakeZotero(sample_items),
+        reader=FakeReader(),
+        run_id="global-projection-source",
+    )
+    stale_path = tmp_path / report.items[1]["note_path"]
+    update_note_frontmatter(
+        stale_path,
+        {
+            "clusters": ["cluster-stale"],
+            "cluster_links": ["[[Cluster - stale]]"],
+        },
+    )
+    selected = {
+        **dict(report.source_set),
+        "source_ids": [report.items[0]["source_id"]],
+        "note_ids": [report.items[0]["note_id"]],
+        "rows": [dict(report.source_set["rows"][0])],
+        "inventory_count": 1,
+        "terminal_count": 1,
+        "validated_note_count": 1,
+        "limited_note_count": 0,
+        "parked_for_review_count": 0,
+        "partial_count": 0,
+        "pending_count": 0,
+    }
+
+    build_map(
+        tmp_path,
+        run_id="global-projection-rebuild",
+        source_set=selected,
+    )
+
+    frontmatter = read_note(stale_path)["frontmatter"]
+    assert frontmatter["clusters"] == []
+    assert frontmatter["cluster_links"] == []
 
 
 def test_existing_custody_relations_feed_compatible_typed_note_links(

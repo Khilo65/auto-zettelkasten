@@ -31,7 +31,7 @@ PROFILE_SIDECAR_VERSION = "1"
 PROFILE_CHECKPOINT_VERSION = "1"
 PROFILE_PROMPT_VERSION = "6"
 PROFILE_CLASSIFIER_VERSION = "3"
-PROFILE_ALGORITHM_VERSION = "4"
+PROFILE_ALGORITHM_VERSION = "5"
 COMMITTED_NOTE_ANCHOR_AUGMENTATION_VERSION = "8"
 ANCHOR_ALGORITHM_VERSION = "1"
 SUPPORT_ENVELOPE_VERSION = "1"
@@ -1252,15 +1252,27 @@ def validate_profile(
         anchors = []
     if len(anchors) > 24:
         errors.append("evidence_anchors_hard_max_24")
+    evidence_eligibility = str(
+        _value(payload, "evidence_eligibility") or ""
+    )
+    evidence_bounded_partial = (
+        status == "partial_document_atomic_note"
+        and scope == "partial_document"
+        and gate in {"limited", "passed"}
+        and evidence_eligibility == "substantive_bounded"
+        and not bool(payload.get("excluded_from_synthesis"))
+    )
     limited = (
-        status in LIMITED_NOTE_STATUSES
+        (status in LIMITED_NOTE_STATUSES and not evidence_bounded_partial)
         or bool(payload.get("excluded_from_synthesis"))
         or str(_value(payload, "profile_status") or "").startswith("limited")
     )
     substantive = (
         status in ANALYTICAL_NOTE_STATUSES
-        and scope == "full_document"
-        and gate == "passed"
+        and (
+            (scope == "full_document" and gate == "passed")
+            or evidence_bounded_partial
+        )
         and not limited
     )
     if limited and findings:
