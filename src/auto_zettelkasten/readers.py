@@ -66,12 +66,15 @@ DEFAULT_PROMPT_RESERVE_TOKENS = 2_048
 DEFAULT_MAX_OUTPUT_TOKENS = 6_000
 DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
-SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 32_000
-SOURCE_BUNDLE_PROMPT_VERSION = "4"
+SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
+SOURCE_BUNDLE_PROMPT_VERSION = "5"
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
-CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 16_000
+CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
 GAP_ADJUDICATION_MAX_OUTPUT_TOKENS = 32_000
-RELATIONSHIP_MAX_OUTPUT_TOKENS = 64_000
+RELATIONSHIP_ROUTING_MAX_OUTPUT_TOKENS = 8_000
+RELATIONSHIP_CANDIDATE_MAX_OUTPUT_TOKENS = 32_000
+RELATIONSHIP_MAX_OUTPUT_TOKENS = 128_000
+CLUSTER_SYNTHESIS_MAX_OUTPUT_TOKENS = 128_000
 ATOMIC_FIDELITY_MAX_OUTPUT_TOKENS = 8_000
 
 MODEL_CONTEXT_WINDOWS: Mapping[tuple[str, str], int] = {
@@ -124,6 +127,7 @@ class _CapabilityAwareReader:
     chunk_output_tokens: int
     timeout: float
     request_deadline: float | None
+    relationship_decision_contract = "relationship-decision-v5"
 
     def _record_transport_attempt(self) -> None:
         self.transport_attempt_count = (
@@ -154,7 +158,7 @@ class _CapabilityAwareReader:
     @property
     def capabilities(self) -> Mapping[str, Any]:
         supported_output_tokens = (
-            64_000
+            384_000
             if (self.name, self.model) == ("deepseek", "deepseek-v4-flash")
             else self.max_output_tokens
         )
@@ -274,7 +278,7 @@ class _CapabilityAwareReader:
         self._ensure_prompt_fits(
             system_prompt, user_prompt, output_tokens, label="source analysis bundle"
         )
-        payload = _parse_json_object(
+        payload = _normalize_source_bundle_payload(_parse_json_object(
             self._generate_with_reasoning(
                 system_prompt,
                 user_prompt,
@@ -283,7 +287,7 @@ class _CapabilityAwareReader:
                 reasoning_effort="high",
             ),
             label="source analysis bundle response",
-        )
+        ))
         return SourceAnalysisBundle.from_dict(payload).to_dict()
 
     def verify_atomic_claims(
@@ -394,7 +398,7 @@ class _CapabilityAwareReader:
                 _relationship_prompt(profiles, request, context),
                 label="relationship shard selection",
                 reasoning_effort="high",
-                output_tokens=RELATIONSHIP_MAX_OUTPUT_TOKENS,
+                output_tokens=RELATIONSHIP_ROUTING_MAX_OUTPUT_TOKENS,
                 list_key="shard_ids",
             ),
             kind="shard_selection",
@@ -416,7 +420,7 @@ class _CapabilityAwareReader:
                 _relationship_prompt(profiles, request, context),
                 label="relationship bridge shard selection",
                 reasoning_effort="high",
-                output_tokens=RELATIONSHIP_MAX_OUTPUT_TOKENS,
+                output_tokens=RELATIONSHIP_ROUTING_MAX_OUTPUT_TOKENS,
                 list_key="shard_pairs",
             ),
             kind="shard_pair_selection",
@@ -438,7 +442,7 @@ class _CapabilityAwareReader:
                 _relationship_prompt(profiles, request, context),
                 label="relationship candidate selection",
                 reasoning_effort="high",
-                output_tokens=RELATIONSHIP_MAX_OUTPUT_TOKENS,
+                output_tokens=RELATIONSHIP_CANDIDATE_MAX_OUTPUT_TOKENS,
                 list_key="candidates",
             ),
             kind="candidate_selection",
@@ -579,7 +583,9 @@ class _CapabilityAwareReader:
 
         self._authorize_request()
         settings = dict((context or {}).get("cluster_plan_settings", {}) or {})
-        output_tokens = int(settings.get("output_tokens") or 16_000)
+        output_tokens = int(
+            settings.get("output_tokens") or CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS
+        )
         deadline_seconds = float(
             settings.get("deadline_seconds") or self._request_deadline_seconds()
         )
@@ -683,7 +689,7 @@ class _CapabilityAwareReader:
             instruction=instruction,
         )
         supported_output = int(self.capabilities["supported_output_tokens"])
-        desired_output = min(64_000, supported_output)
+        desired_output = min(CLUSTER_SYNTHESIS_MAX_OUTPUT_TOKENS, supported_output)
         raw_response = self._literature_json_call(
             system_prompt,
             user_prompt,
@@ -761,7 +767,13 @@ class _CapabilityAwareReader:
             float(deadline_seconds or self._request_deadline_seconds()),
             self._request_deadline_seconds(),
         )
-        self._ensure_prompt_fits(system_prompt, user_prompt, output_tokens, label=label)
+        self._ensure_prompt_fits(
+            system_prompt,
+            user_prompt,
+            output_tokens,
+            label=label,
+            context_fraction=0.8,
+        )
         response = _parse_json_object(
             self._generate_with_reasoning(
                 system_prompt,
@@ -881,7 +893,7 @@ class _CapabilityAwareReader:
             output_tokens,
             label="hierarchical source analysis bundle",
         )
-        payload = _parse_json_object(
+        payload = _normalize_source_bundle_payload(_parse_json_object(
             self._generate_with_reasoning(
                 system_prompt,
                 user_prompt,
@@ -890,7 +902,7 @@ class _CapabilityAwareReader:
                 reasoning_effort="high",
             ),
             label="hierarchical source analysis bundle response",
-        )
+        ))
         return SourceAnalysisBundle.from_dict(payload).to_dict()
 
     def _generate_with_reasoning(
@@ -915,19 +927,42 @@ class _CapabilityAwareReader:
             _REASONING_EFFORT.reset(token)
 
     def _prompt_fits(
-        self, system_prompt: str, user_prompt: str, output_tokens: int
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        output_tokens: int,
+        *,
+        context_fraction: float | None = None,
     ) -> bool:
         estimated_input = _estimate_tokens(system_prompt) + _estimate_tokens(
             user_prompt
         )
         reserve = self.prompt_reserve_tokens + output_tokens
-        usable = int(int(self.context_window_tokens or 0) * self.direct_read_fraction)
+        usable = int(
+            int(self.context_window_tokens or 0)
+            * (
+                self.direct_read_fraction
+                if context_fraction is None
+                else context_fraction
+            )
+        )
         return estimated_input + reserve <= usable
 
     def _ensure_prompt_fits(
-        self, system_prompt: str, user_prompt: str, output_tokens: int, *, label: str
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        output_tokens: int,
+        *,
+        label: str,
+        context_fraction: float | None = None,
     ) -> None:
-        if not self._prompt_fits(system_prompt, user_prompt, output_tokens):
+        if not self._prompt_fits(
+            system_prompt,
+            user_prompt,
+            output_tokens,
+            context_fraction=context_fraction,
+        ):
             raise ProviderError(
                 f"{label} exceeds the {self.name} context budget; use coarse hierarchical chunks"
             )
@@ -1248,7 +1283,7 @@ class OllamaReader(_CapabilityAwareReader):
 def _system_prompt() -> str:
     keys = ", ".join(SECTION_KEYS)
     return (
-        "You create source-faithful atomic notes using Auto-Zettelkasten atomic prompt v10. "
+        "You create source-faithful atomic notes using Auto-Zettelkasten atomic prompt v11. "
         "Adapt the analysis to the source actually supplied: it may be an academic article or book, a report, policy or legal "
         "document, archival material, conference or meeting record, practitioner guidance, speech, working paper, blog post, "
         "or another evidence-bearing source. Do not force a nonacademic source into an academic-study template. "
@@ -1304,7 +1339,13 @@ def _system_prompt() -> str:
 def _source_bundle_system_prompt() -> str:
     keys = ", ".join(SECTION_KEYS)
     return (
-        "You are the source-reading reasoner for Auto-Zettelkasten source bundle prompt v4. "
+        "You are the source-reading reasoner for Auto-Zettelkasten source bundle prompt v5. "
+        "Use eight governing rules: capture the thesis, knowledge basis, important evidence, findings, limitations, "
+        "literature position, and contribution; include the detail needed to evaluate the argument; distinguish reported "
+        "observations, modeled estimates, author interpretations, and your explanation; preserve statistical scale, "
+        "estimand, baseline, reference condition, uncertainty, and observed range; preserve causal and comparative "
+        "certainty; stay within recovered-document scope; explain technical findings plainly without inventing numbers "
+        "or analogies; and self-review the required bundle before returning it. "
         "Return exactly one JSON object with bundle_schema_version, source_identity, "
         "observed_bibliographic_identity, scope_assessment, analysis_sections, compact_profile, "
         "evidence_anchors, literature_positions, missing_source_recommendations, and self_review. "
@@ -1320,7 +1361,17 @@ def _source_bundle_system_prompt() -> str:
         "normative work, practitioner guidance, book or excerpt, archival, speech, meeting, web, or "
         "another explicitly described form. Do not force fields that do not apply; use a short "
         "'Not applicable to this source form' statement when a required note section genuinely does "
-        "not apply. Distinguish observations, author arguments, tested mechanisms, reported "
+        "not apply. Quantitative work should retain consequential data, population, period, sample and unit; variables, "
+        "baseline and comparison; headline estimates, uncertainty, nulls, interactions, robustness, and design limits. "
+        "Qualitative and comparative work should retain case selection, evidence sources, chronology, mechanisms, decisive "
+        "examples and counterexamples, alternative explanations, and limits on generalization. Historical work should "
+        "retain chronology, primary and secondary evidence, important analogies, the inference drawn from them, and their "
+        "boundaries. Theoretical or normative work should retain assumptions, logical sequence, mechanisms, propositions, "
+        "examples or thought experiments, rivals, premises, and scope. Practitioner and institutional work should separate "
+        "consultations, cases and data from recommendations, implementation examples, constraints, and uncertainty. Reviews "
+        "should retain the organizing debate, important cited positions, evidence bases, unresolved questions, and the "
+        "author's distinct contribution. Select only consequential detail; do not fill irrelevant categories. "
+        "Distinguish observations, author arguments, tested mechanisms, reported "
         "mechanisms, recommendations, and what the design can establish. Observational evidence uses "
         "associational wording unless the source and design justify causality. Qualitative work uses "
         "attributed language such as 'the author argues' for explanatory inferences. Always preserve source-reported "
@@ -1542,9 +1593,9 @@ def _relationship_bridge_shard_system_prompt() -> str:
 
 def _relationship_candidate_system_prompt() -> str:
     return (
-        "You globally rank source comparisons for Auto-Zettelkasten relationship prompt v5. Return exactly one JSON "
+        "You globally rank source comparisons for Auto-Zettelkasten relationship prompt v6. Return exactly one JSON "
         "object with a candidates array. Each row must contain source_id, target_kind, target_id, why_relevant, "
-        "comparison_unit, likely_relation_type, requested_evidence_depth, confidence, rank, cross_literature, "
+        "comparison_unit, candidate_class, likely_relation_type, requested_evidence_depth, confidence, rank, cross_literature, "
         "discovery_route, left_evidence_anchor_ids, and right_evidence_anchor_ids. target_kind must be source. "
         "requested_evidence_depth is profile, atomic_note, or source_passage. confidence is a number from 0 to 1. "
         "Use the supplied max_inferred_pairs as a global output ceiling, rank the strongest comparisons across the "
@@ -1559,28 +1610,28 @@ def _relationship_candidate_system_prompt() -> str:
         "methodological fault line, form a sequence, or express an interpretive disagreement. Before returning, separately "
         "audit within-collection and cross-collection candidates so strong bridges are not crowded out. Shared vocabulary, method, "
         "case, tag, or collection alone is only a retrieval clue. Use only supplied IDs and do not classify the final "
-        "relationship."
+        "relationship. candidate_class is direct_intellectual, contextual, or citation and is only a retrieval hint."
     )
 
 
 def _relationship_adjudication_system_prompt() -> str:
     return (
         "You adjudicate immutable relationship pair jobs for Auto-Zettelkasten "
-        "relationship prompt v5 and output contract relationship-decision-v4. "
-        "Read both complete atomic-note bodies supplied in each pair job before "
+        "relationship prompt v6 and output contract relationship-decision-v5. "
+        "Read both complete atomic-note bodies supplied in source_documents before "
         "deciding; compact profiles and selected anchors are navigation aids, not "
         "substitutes for the notes. "
         "Return exactly one JSON object with a decisions array and exactly one "
         "complete row per supplied pair_job_id. Copy pair_job_id and the canonical "
         "pair.left_source_id and pair.right_source_id exactly. Each row contains "
-        "pair_job_id, decision, pair, relation_type, actor_source_id, "
+        "pair_job_id, decision, pair, relation_type, relationship_tier, actor_source_id, "
         "reference_source_id, forward_label, inverse_label, "
         "comparison_proposition, reason, left_evidence_anchor_ids, "
         "right_evidence_anchor_ids, boundary_or_qualification, confidence, and "
         "output_contract. decision is relationship, no_relationship, or "
-        "needs_more_context; output_contract is relationship-decision-v4. For "
+        "needs_more_context; output_contract is relationship-decision-v5. For "
         "no_relationship and needs_more_context, leave relation_type, direction, "
-        "labels, and anchor arrays empty but give a reason. For relationship, "
+        "labels, relationship_tier, and anchor arrays empty but give a reason. For relationship, "
         "actor_source_id is the work doing the intellectual action and "
         "reference_source_id is the work acted on; do not infer direction from "
         "pair ordering or chronology. Use only supplied evidence IDs owned by the "
@@ -1594,7 +1645,12 @@ def _relationship_adjudication_system_prompt() -> str:
         "from/differs methodologically from; sequential_relationship/precedes in "
         "sequence/follows in sequence; "
         "interpretive_or_normative_disagreement/disagrees interpretively "
-        "with/disagrees interpretively with. Compare the actual claims, findings, "
+        "with/disagrees interpretively with; contextual_connection/is contextually connected to/is contextually connected to. "
+        "relationship_tier is direct for every direct intellectual relation and contextual only for contextual_connection. "
+        "Use contextual_connection when the works illuminate distinct dimensions, stages, cases, or evidence bases that are "
+        "useful to inspect together without claiming agreement or direct evidentiary support. Its reason must name each work's "
+        "distinct contribution, why joint reading is useful, and the boundary preventing a stronger direct label. "
+        "Compare the actual claims, findings, "
         "arguments, methods, scope, and causal language. Citation or a shared broad topic "
         "alone does not establish a relationship. supports requires evidence that "
         "bears directly on the same proposition; qualifies requires a stated boundary "
@@ -1738,7 +1794,7 @@ def _debate_system_prompt() -> str:
 def _cluster_synthesis_system_prompt() -> str:
     return (
         "You are the full-note cluster writer for Auto-Zettelkasten cluster "
-        "synthesis prompt v25. Read every supplied atomic_note_markdown before "
+        "synthesis prompt v26. Read every supplied atomic_note_markdown before "
         "drafting. Copy cluster_id exactly from context.cluster.cluster_id. Return "
         "exactly one JSON object with cluster_id, status, title, "
         "organizing_mode, organizing_problem, optional guiding_question, optional "
@@ -2596,15 +2652,16 @@ def _parse_json_object(
         # ambiguous responses containing multiple JSON objects.
         decoder = json.JSONDecoder()
         recovered: list[dict[str, Any]] = []
-        for index, character in enumerate(text):
-            if character != "{":
-                continue
+        index = 0
+        while (start := text.find("{", index)) >= 0:
             try:
-                candidate, _ = decoder.raw_decode(text, index)
+                candidate, end = decoder.raw_decode(text, start)
             except json.JSONDecodeError:
+                index = start + 1
                 continue
             if isinstance(candidate, dict):
                 recovered.append(candidate)
+            index = max(start + 1, end)
         if len(recovered) != 1:
             raise ProviderError(f"{label} was not valid JSON") from exc
         payload = recovered[0]
@@ -2613,6 +2670,98 @@ def _parse_json_object(
     if not isinstance(payload, dict):
         raise ProviderError(f"{label} must be a JSON object")
     return payload
+
+
+def _normalize_source_bundle_payload(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Keep complete one-shot analyses usable when presentation fields are omitted."""
+
+    normalized = dict(payload)
+    sections = normalized.get("analysis_sections")
+    if not isinstance(sections, Mapping):
+        raise ProviderError(
+            "source analysis bundle response omitted usable analysis_sections"
+        )
+    sections = {
+        str(key): _source_bundle_text(value)
+        for key, value in sections.items()
+        if _source_bundle_text(value)
+    }
+    profile = (
+        dict(normalized.get("compact_profile") or {})
+        if isinstance(normalized.get("compact_profile"), Mapping)
+        else {}
+    )
+    anchors = [
+        row
+        for row in normalized.get("evidence_anchors", []) or []
+        if isinstance(row, Mapping)
+    ]
+    has_core = {
+        "thesis": bool(sections.get("thesis") or profile.get("thesis")),
+        "method_and_research_design": bool(
+            sections.get("method_and_research_design")
+            or profile.get("method_or_knowledge_basis")
+            or profile.get("method")
+        ),
+        "evidence_and_data": bool(sections.get("evidence_and_data") or anchors),
+        "detailed_findings": bool(
+            sections.get("detailed_findings")
+            or any(
+                "major_finding" in (row.get("planning_roles") or [])
+                or str(row.get("claim") or "").strip()
+                for row in anchors
+            )
+        ),
+    }
+    missing_core = [key for key, present in has_core.items() if not present]
+    if missing_core:
+        raise ProviderError(
+            "source analysis bundle response omitted core content: "
+            + ", ".join(missing_core)
+        )
+    missing_sections = [key for key in SECTION_KEYS if not sections.get(key)]
+    for key in missing_sections:
+        sections[key] = "Not separately returned by the source reader."
+    normalized["analysis_sections"] = sections
+    if missing_sections:
+        diagnostics = [
+            dict(row)
+            for row in normalized.get("component_diagnostics", []) or []
+            if isinstance(row, Mapping)
+        ]
+        diagnostics.extend(
+            {
+                "component": "analysis_sections",
+                "field": key,
+                "reason": "noncritical_section_not_separately_returned",
+                "severity": "advisory",
+            }
+            for key in missing_sections
+        )
+        normalized["component_diagnostics"] = diagnostics
+    return normalized
+
+
+def _source_bundle_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, Sequence) and not isinstance(
+        value, (str, bytes, bytearray)
+    ):
+        return "\n".join(
+            f"- {_source_bundle_text(item)}"
+            for item in value
+            if _source_bundle_text(item)
+        )
+    if isinstance(value, Mapping):
+        return "\n".join(
+            f"- {key}: {_source_bundle_text(item)}"
+            for key, item in value.items()
+            if _source_bundle_text(item)
+        )
+    return str(value).strip() if value is not None else ""
 
 
 def _validate_literature_response(

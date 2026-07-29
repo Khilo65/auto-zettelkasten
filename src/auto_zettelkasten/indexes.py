@@ -11,7 +11,7 @@ from typing import Any, Mapping, Sequence
 from .files import atomic_write_text, now_iso, read_yaml, sha256_text, slugify, write_yaml
 from .notes import read_note
 
-SOURCE_CATALOGUE_SCHEMA_VERSION = "3"
+SOURCE_CATALOGUE_SCHEMA_VERSION = "4"
 SOURCE_CATALOGUE_SHARD_MAX_CHARS = 36_000
 SOURCE_CATALOGUE_ROUTING_CARD_MAX_CHARS = 1_500
 
@@ -668,6 +668,14 @@ def build_source_catalogue(
     if collection_projection["catalogue"]:
         master_lines.extend(["## Zotero Collections", ""])
         master_lines.extend(collection_projection["tree_lines"])
+        master_lines.extend(["", "### Collection routing cards", ""])
+        for collection in collection_projection["catalogue"]:
+            card = dict(collection.get("routing_card") or {})
+            master_lines.append(
+                f"- `{collection['key']}` — {card.get('scope') or collection['name']}; "
+                f"{int(card.get('direct_source_count', 0) or 0)} direct, "
+                f"{int(card.get('descendant_source_count', 0) or 0)} descendant"
+            )
         master_lines.append("")
     master_text = "\n".join(master_lines).rstrip() + "\n"
     cluster_semantic = {
@@ -861,6 +869,15 @@ def _collection_catalogue_projection(
             ),
         )
         descendant_keys = nested_item_keys(key)
+        routing_keys = set(direct_keys) | descendant_keys
+        routing_entries = sorted(
+            (
+                entries_by_zotero_key[item_key]
+                for item_key in routing_keys
+                if item_key in entries_by_zotero_key
+            ),
+            key=lambda entry: str(entry.get("source_id") or ""),
+        )
         direct_source_ids = [
             str(entry.get("source_id") or entry.get("note_id") or "")
             for entry in direct_entries
@@ -983,6 +1000,24 @@ def _collection_catalogue_projection(
             1 for item_key in direct_keys if item_key not in entries_by_zotero_key
         )
         parent_key = str(row.get("parent_key") or "")
+        routing_card = _collection_routing_card(
+            key=key,
+            name=name,
+            parent_key=parent_key,
+            child_keys=children.get(key, []),
+            direct_source_count=len(direct_keys),
+            descendant_source_count=len(descendant_keys),
+            entries=routing_entries,
+            cluster_ids=clusters,
+            cross_collection_relationship_count=sum(
+                1
+                for relationship in view_relationships
+                if not {
+                    str(relationship.get("source_id") or ""),
+                    str(relationship.get("target_source_id") or ""),
+                }.issubset(direct_source_set)
+            ),
+        )
         semantic = {
             "key": key,
             "name": name,
@@ -1005,6 +1040,7 @@ def _collection_catalogue_projection(
                 }.issubset(direct_source_set)
             ),
             "relationship_view_revisions": relationship_revision_payload,
+            "routing_card": routing_card,
         }
         revision = sha256_text(
             json.dumps(
@@ -1026,6 +1062,8 @@ def _collection_catalogue_projection(
             f"- Partial documents: {status_counts['partial']}",
             f"- Parked for review: {status_counts['parked_for_review']}",
             f"- Missing atomic notes: {missing_count}",
+            f"- Routing scope: {routing_card['scope']}",
+            f"- Dominant facets: {', '.join(routing_card['dominant_facets']) or 'none yet'}",
         ]
         if parent_key in collections:
             index_lines.append(
@@ -1113,6 +1151,85 @@ def _collection_status_counts(
         if status in {"parked_for_review", "exhausted"}:
             counts["parked_for_review"] += 1
     return counts
+
+
+def _collection_routing_card(
+    *,
+    key: str,
+    name: str,
+    parent_key: str,
+    child_keys: Sequence[str],
+    direct_source_count: int,
+    descendant_source_count: int,
+    entries: Sequence[Mapping[str, Any]],
+    cluster_ids: Sequence[str],
+    cross_collection_relationship_count: int,
+) -> dict[str, Any]:
+    card = _catalogue_shard_routing_card(
+        shard_id=f"collection-{key}",
+        title=name,
+        scope=f"Sources filed in {name} and its child collections.",
+        entries=entries,
+    )
+    method_counts = Counter(
+        _compact_catalogue_text(entry.get("method"), 100)
+        for entry in entries
+        if _compact_catalogue_text(entry.get("method"), 100)
+        not in {"", "Not specified"}
+    )
+
+    def dominant_facet(facet_type: str) -> list[str]:
+        counts = Counter(
+            _compact_catalogue_text(value, 80)
+            for entry in entries
+            for value in (
+                entry.get("facets_by_type", {}).get(facet_type, [])
+                if isinstance(entry.get("facets_by_type"), Mapping)
+                else []
+            )
+            if _compact_catalogue_text(value, 80)
+        )
+        return [
+            value
+            for value, _count in sorted(
+                counts.items(), key=lambda item: (-item[1], item[0].casefold())
+            )[:3]
+        ]
+
+    result = {
+        "collection_key": key,
+        "name": name,
+        "parent_key": parent_key,
+        "child_keys": list(child_keys),
+        "direct_source_count": direct_source_count,
+        "descendant_source_count": descendant_source_count,
+        "scope": card["scope"],
+        "dominant_facets": card["dominant_facets"],
+        "method_mix": [
+            {"method": method, "count": count}
+            for method, count in sorted(
+                method_counts.items(),
+                key=lambda item: (-item[1], item[0].casefold()),
+            )[:4]
+        ],
+        "representative_theses": card["representative_theses"],
+        "important_cases": dominant_facet("case"),
+        "important_periods": dominant_facet("period"),
+        "important_datasets": dominant_facet("dataset"),
+        "active_cluster_ids": sorted(str(value) for value in cluster_ids),
+        "cross_collection_relationship_count": int(
+            cross_collection_relationship_count
+        ),
+    }
+    result["revision_hash"] = sha256_text(
+        json.dumps(
+            result,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    )
+    return result
 
 
 def _collection_directory_name(key: str) -> str:

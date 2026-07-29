@@ -10,10 +10,10 @@ from .models import RelationshipDecision, RelationshipPairJob
 from .navigation import TYPED_SOURCE_RELATIONS, rank_human_related_links
 
 
-RELATIONSHIP_PROMPT_VERSION = "5"
-RELATIONSHIP_REGISTRY_SCHEMA_VERSION = "5"
-RELATIONSHIP_DECISION_SCHEMA_VERSION = "4"
-RELATIONSHIP_DECISION_CONTRACT = "relationship-decision-v4"
+RELATIONSHIP_PROMPT_VERSION = "6"
+RELATIONSHIP_REGISTRY_SCHEMA_VERSION = "6"
+RELATIONSHIP_DECISION_SCHEMA_VERSION = "5"
+RELATIONSHIP_DECISION_CONTRACT = "relationship-decision-v5"
 SUBSTANTIVE_RELATION_TYPES = frozenset(
     {
         "supports",
@@ -27,6 +27,7 @@ SUBSTANTIVE_RELATION_TYPES = frozenset(
         "methodological_fault_line",
         "sequential_relationship",
         "interpretive_or_normative_disagreement",
+        "contextual_connection",
     }
 )
 RECIPROCAL_RELATION_TYPES = {
@@ -41,6 +42,7 @@ RECIPROCAL_RELATION_TYPES = {
     "methodological_fault_line": "methodological_fault_line",
     "sequential_relationship": "sequential_relationship",
     "interpretive_or_normative_disagreement": "interpretive_or_normative_disagreement",
+    "contextual_connection": "contextual_connection",
 }
 RELATIONSHIP_PROJECTION_LABELS = {
     "supports": ("supports", "supported by"),
@@ -59,6 +61,10 @@ RELATIONSHIP_PROJECTION_LABELS = {
     "interpretive_or_normative_disagreement": (
         "disagrees interpretively with",
         "disagrees interpretively with",
+    ),
+    "contextual_connection": (
+        "is contextually connected to",
+        "is contextually connected to",
     ),
 }
 _LIMITED_STATUSES = {
@@ -897,6 +903,16 @@ def persist_relationship_registry(
                 cluster_evidence_eligible=False,
             )
         elif (
+            existing_schema == "5"
+            and _machine_substantive(row)
+            and bool(row.get("active", True))
+        ):
+            row["relationship_tier"] = (
+                "legacy_unclassified"
+                if str(row.get("relation_type") or "") == "complements"
+                else "direct"
+            )
+        elif (
             existing_schema != RELATIONSHIP_REGISTRY_SCHEMA_VERSION
             and _machine_substantive(row)
             and bool(row.get("active", True))
@@ -1348,8 +1364,12 @@ def _normalized_v4_decision(
         )
     )
     common = {
-        "decision_schema_version": RELATIONSHIP_DECISION_SCHEMA_VERSION,
-        "output_contract": RELATIONSHIP_DECISION_CONTRACT,
+        "decision_schema_version": (
+            RELATIONSHIP_DECISION_SCHEMA_VERSION
+            if decision.output_contract == RELATIONSHIP_DECISION_CONTRACT
+            else "4"
+        ),
+        "output_contract": decision.output_contract,
         "pair_job_id": job.pair_job_id,
         "catalogue_revision": job.catalogue_revision,
         "left_source_id": job.left_source_id,
@@ -1412,6 +1432,7 @@ def _normalized_v4_decision(
         "source_note_id": str(source_profile.get("note_id") or ""),
         "target_note_id": str(target_profile.get("note_id") or ""),
         "relation_type": decision.relation_type,
+        "relationship_tier": decision.relationship_tier,
         "reciprocal_type": RECIPROCAL_RELATION_TYPES[decision.relation_type],
         "forward_label": forward_label,
         "inverse_label": inverse_label,
@@ -1427,7 +1448,11 @@ def _normalized_v4_decision(
         "target_evidence": _evidence_reference(
             decision.reference_source_id, target_anchor_ids[0], target_anchor
         ),
-        "provenance": "probabilistic_relationship_adjudication_v4",
+        "provenance": (
+            "probabilistic_relationship_adjudication_v5"
+            if decision.output_contract == RELATIONSHIP_DECISION_CONTRACT
+            else "probabilistic_relationship_adjudication_v4"
+        ),
         "cluster_evidence_eligible": True,
         "inferred": True,
         "strength": 110,
@@ -1583,10 +1608,19 @@ def _verified_machine_relation(row: Mapping[str, Any]) -> bool:
 def _final_v4_relation(row: Mapping[str, Any]) -> bool:
     return bool(
         _machine_substantive(row)
-        and str(row.get("output_contract") or "")
-        == RELATIONSHIP_DECISION_CONTRACT
-        and str(row.get("decision_schema_version") or "")
-        == RELATIONSHIP_DECISION_SCHEMA_VERSION
+        and (
+            (
+                str(row.get("output_contract") or "")
+                == RELATIONSHIP_DECISION_CONTRACT
+                and str(row.get("decision_schema_version") or "")
+                == RELATIONSHIP_DECISION_SCHEMA_VERSION
+            )
+            or (
+                str(row.get("output_contract") or "")
+                == "relationship-decision-v4"
+                and str(row.get("decision_schema_version") or "") == "4"
+            )
+        )
         and str(row.get("decision_status") or "") == "accepted"
         and str(row.get("verification_status") or "") == "final"
     )
@@ -1596,10 +1630,19 @@ def _final_v4_decision(
     row: Mapping[str, Any], *, decision: str
 ) -> bool:
     return bool(
-        str(row.get("output_contract") or "")
-        == RELATIONSHIP_DECISION_CONTRACT
-        and str(row.get("decision_schema_version") or "")
-        == RELATIONSHIP_DECISION_SCHEMA_VERSION
+        (
+            (
+                str(row.get("output_contract") or "")
+                == RELATIONSHIP_DECISION_CONTRACT
+                and str(row.get("decision_schema_version") or "")
+                == RELATIONSHIP_DECISION_SCHEMA_VERSION
+            )
+            or (
+                str(row.get("output_contract") or "")
+                == "relationship-decision-v4"
+                and str(row.get("decision_schema_version") or "") == "4"
+            )
+        )
         and str(row.get("decision") or row.get("decision_status") or "")
         == decision
         and str(row.get("verification_status") or "") == "final"
@@ -1607,7 +1650,17 @@ def _final_v4_decision(
 
 
 def _publishable_machine_relation(row: Mapping[str, Any]) -> bool:
-    return _final_v4_relation(row) or _verified_machine_relation(row)
+    return (
+        _final_v4_relation(row)
+        or _verified_machine_relation(row)
+        or (
+            str(row.get("relationship_tier") or "")
+            in {"direct", "legacy_unclassified"}
+            and str(row.get("output_contract") or "")
+            == "relationship-decision-v4"
+            and str(row.get("verification_status") or "") == "final"
+        )
+    )
 
 
 def _merge_registry_event(

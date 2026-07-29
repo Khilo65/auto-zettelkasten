@@ -48,7 +48,7 @@ def _profile(source_id: str) -> dict[str, object]:
 def test_source_bundle_prompt_uses_one_shot_statistical_interpretation() -> None:
     prompt = _source_bundle_system_prompt()
 
-    assert "source bundle prompt v4" in prompt
+    assert "source bundle prompt v5" in prompt
     assert "9 percentage points lower" in prompt
     assert "22.5% lower relative" in prompt
     assert "odds, hazards, risks, and probabilities distinct" in prompt
@@ -193,8 +193,13 @@ def test_v015_metadata_migration_is_local_and_idempotent(tmp_path) -> None:
     manifest_path = tmp_path / "11_state" / "workspace_manifest.yml"
     config = read_yaml(config_path)
     manifest = read_yaml(manifest_path)
-    config.update(engine_version="0.14.0", prompt_version="9")
+    config.update(
+        engine_version="0.14.0",
+        artifact_schema_version="1.13",
+        prompt_version="9",
+    )
     manifest["engine_version"] = "0.14.0"
+    manifest["artifact_schema_version"] = "1.13"
     write_yaml(config_path, config)
     write_yaml(manifest_path, manifest)
     note = tmp_path / "02_source_memory" / "notes" / "human.md"

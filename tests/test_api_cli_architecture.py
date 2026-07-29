@@ -42,7 +42,7 @@ def test_inventory_only_writes_scope_manifest_and_resolves_selected(tmp_path: Pa
     assert result["item_count"] == 1
     assert result["collection_key"] == "SELECTEDKEY"
     assert result["source_set"]["zotero_collection_key"] == "SELECTEDKEY"
-    assert result["artifact_manifest"]["artifact_schema_version"] == "1.13"
+    assert result["artifact_manifest"]["artifact_schema_version"] == "1.14"
 
 
 
@@ -51,7 +51,7 @@ def test_release_metadata_matches_engine_version() -> None:
     pyproject = Path(__file__).parents[1] / "pyproject.toml"
     payload = tomllib.loads(pyproject.read_text(encoding="utf-8"))
 
-    assert payload["project"]["version"] == "0.15.0"
+    assert payload["project"]["version"] == "0.16.0"
 
 
 def test_standalone_literature_map_forwards_provider_concurrency(

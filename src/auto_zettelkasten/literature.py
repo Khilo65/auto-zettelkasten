@@ -79,7 +79,7 @@ GAP_RULES = (
 LITERATURE_ALGORITHM_VERSION = "36"
 CLUSTER_PLAN_PROMPT_VERSION = "5"
 CLUSTER_PROPOSAL_PROMPT_VERSION = "17"
-CLUSTER_SYNTHESIS_PROMPT_VERSION = "25"
+CLUSTER_SYNTHESIS_PROMPT_VERSION = "26"
 GAP_REASONING_PROMPT_VERSION = "12"
 ANCHOR_ALGORITHM_VERSION = "3"
 SUPPORT_ENVELOPE_VERSION = "2"
@@ -8217,13 +8217,8 @@ def reconcile_cluster_registry(
                 }
             )
         elif str(old.get("revision_hash")) == str(cluster.get("revision_hash")):
-            cluster["registry_status"] = "unchanged"
-            ledger.append(
-                {
-                    "event": "unchanged",
-                    "cluster_id": cluster["cluster_id"],
-                    "revision_hash": cluster["revision_hash"],
-                }
+            cluster["registry_status"] = str(
+                old.get("registry_status") or "unchanged"
             )
         else:
             cluster["registry_status"] = "revision"
@@ -17340,13 +17335,10 @@ def _reasoner_context_char_budget(reasoner: Any, request: Any) -> int:
     configured_fraction = float(
         _policy_value(policy, "deepseek_packet_context_fraction", 0.45)
     )
-    input_fraction = min(
-        configured_fraction,
-        float(getattr(reasoner, "direct_read_fraction", 0.5) or 0.5),
-    )
+    input_fraction = min(0.8, configured_fraction)
     capabilities = _as_mapping(getattr(reasoner, "capabilities", {}))
     output_reserve = min(
-        64_000,
+        128_000,
         int(
             capabilities.get("supported_output_tokens")
             or getattr(reasoner, "max_output_tokens", 0)
@@ -18922,14 +18914,6 @@ def build_literature_report(
         removed = sorted(prior_ids - retained)
         if removed:
             writer_membership_changed = True
-            registry["ledger"].append(
-                {
-                    "event": "writer_membership_revision",
-                    "cluster_id": str(cluster.get("cluster_id") or ""),
-                    "removed_source_ids": removed,
-                    "revision_hash": cluster["revision_hash"],
-                }
-            )
 
     reverted_refresh = False
     synthesis_order = sorted(
@@ -19354,6 +19338,34 @@ def build_literature_report(
                     "cluster_id": cluster_id,
                 }
             )
+    final_lifecycle = reconcile_cluster_registry(
+        registry["clusters"], previous_registry
+    )
+    lifecycle_extras = [
+        dict(row)
+        for row in registry.get("ledger", []) or []
+        if isinstance(row, Mapping)
+        and str(row.get("event") or "")
+        in {"refresh_pending", "cluster_rejected_by_writer"}
+    ]
+    final_lifecycle["ledger"] = sorted(
+        {
+            _stable_hash(row): row
+            for row in [
+                *final_lifecycle.get("ledger", []),
+                *lifecycle_extras,
+            ]
+        }.values(),
+        key=lambda row: (
+            str(row.get("event") or ""),
+            str(row.get("cluster_id") or ""),
+            str(row.get("revision_hash") or ""),
+        ),
+    )
+    registry = {
+        **registry,
+        **final_lifecycle,
+    }
     if reverted_refresh or writer_membership_changed:
         clustered["clusters"] = list(registry["clusters"])
         clustered["unclustered_sources"] = _reconcile_final_unclustered_sources(

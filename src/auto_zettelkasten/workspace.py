@@ -106,7 +106,7 @@ def initialize(workspace: Path | str, *, overwrite: bool = False) -> ArtifactMan
                     **ExtractionPolicy().to_dict(),
                     "vision": "configured_only",
                 },
-                "prompt_version": "10",
+                "prompt_version": "11",
                 "parallel": 4,
                 "provider_concurrency": "auto",
                 "processing": {
@@ -174,12 +174,13 @@ def assert_compatible(workspace: Path | str) -> None:
         (1, 6),
         (1, 7),
         (1, 8),
-            (1, 9),
-            (1, 10),
-            (1, 11),
-            (1, 12),
-            (1, 13),
-        }
+        (1, 9),
+        (1, 10),
+        (1, 11),
+        (1, 12),
+        (1, 13),
+        (1, 14),
+    }
     current = _parse_schema_version(CURRENT_ARTIFACT_SCHEMA_VERSION, field="current artifact schema")
     if manifest_version not in supported:
         actual = ".".join(str(value) for value in manifest_version)

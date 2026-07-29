@@ -27,6 +27,11 @@ def ensure_dir(path: Path) -> Path:
 
 def atomic_write_text(path: Path, text: str) -> None:
     ensure_dir(path.parent)
+    try:
+        if path.read_text(encoding="utf-8") == text:
+            return
+    except FileNotFoundError:
+        pass
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
         temporary.write_text(text, encoding="utf-8")
@@ -37,6 +42,11 @@ def atomic_write_text(path: Path, text: str) -> None:
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:
     ensure_dir(path.parent)
+    try:
+        if path.read_bytes() == data:
+            return
+    except FileNotFoundError:
+        pass
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
         temporary.write_bytes(data)

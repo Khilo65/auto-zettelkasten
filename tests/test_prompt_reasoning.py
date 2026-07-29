@@ -32,10 +32,10 @@ def _completion(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def test_atomic_prompt_v10_is_source_adaptive_and_statistics_aware() -> None:
+def test_atomic_prompt_v11_is_source_adaptive_and_statistics_aware() -> None:
     prompt = _system_prompt()
 
-    assert "atomic prompt v10" in prompt
+    assert "atomic prompt v11" in prompt
     assert "blog post" in prompt
     assert "conference or meeting record" in prompt
     assert "findings, arguments, observations, interpretations, or recommendations" in prompt
@@ -107,7 +107,7 @@ def test_partial_source_prompt_prohibits_complete_document_inference() -> None:
 def test_cluster_prompt_preserves_inference_and_case_evidence() -> None:
     prompt = _cluster_synthesis_system_prompt()
 
-    assert "cluster synthesis prompt v25" in prompt
+    assert "cluster synthesis prompt v26" in prompt
     assert "Read every supplied atomic_note_markdown" in prompt
     assert "Every retained member" in prompt
     assert "specific study finding" in prompt

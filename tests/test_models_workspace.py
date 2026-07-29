@@ -19,7 +19,7 @@ def test_map_request_is_versioned_serializable_and_validated(tmp_path: Path) -> 
     )
     assert MapRequest.from_dict(request.to_dict()) == request
     assert request.processing.max_calls_per_document_run == 7
-    assert request.prompt_version == "10"
+    assert request.prompt_version == "11"
     assert request.extraction_version == "2"
     assert request.extraction_policy.ocr == "auto"
     with pytest.raises(ValueError, match="collection_key"):
@@ -56,8 +56,8 @@ def test_initialize_creates_compatible_file_first_workspace(tmp_path: Path) -> N
     workspace = tmp_path / "workspace"
     manifest = initialize(workspace)
     assert manifest.status == "initialized"
-    assert manifest.engine_version == "0.15.0"
-    assert manifest.artifact_schema_version == "1.13"
+    assert manifest.engine_version == "0.16.0"
+    assert manifest.artifact_schema_version == "1.14"
     for relative in (
         "01_custody",
         "02_source_memory/notes",
@@ -70,10 +70,10 @@ def test_initialize_creates_compatible_file_first_workspace(tmp_path: Path) -> N
     config_text = (workspace / "auto-zettelkasten.yml").read_text()
     config = read_yaml(workspace / "auto-zettelkasten.yml")
     assert "API_KEY" not in config_text
-    assert config["engine_version"] == "0.15.0"
-    assert config["artifact_schema_version"] == "1.13"
+    assert config["engine_version"] == "0.16.0"
+    assert config["artifact_schema_version"] == "1.14"
     assert config["privacy"]["allow_cloud"] is False
-    assert config["prompt_version"] == "10"
+    assert config["prompt_version"] == "11"
     assert config["extraction"]["version"] == "2"
     assert config["extraction"]["ocr"] == "auto"
     assert config["literature_mapping"]["synthesis_enabled"] is True
@@ -136,6 +136,7 @@ def test_schema_1_2_workspace_remains_readable_until_local_migration(tmp_path: P
         "1.11",
         "1.12",
         "1.13",
+        "1.14",
     ],
 )
 def test_all_supported_artifact_schemas_remain_readable(tmp_path: Path, schema_version: str) -> None:

@@ -1486,9 +1486,7 @@ def test_semantic_cluster_id_survives_membership_revision_and_revision_hash_chan
     assert any(
         row["event"] == "revision" for row in replay["cluster_registry"]["ledger"]
     )
-    assert any(
-        row["event"] == "unchanged" for row in replay["cluster_registry"]["ledger"]
-    )
+    assert replay["cluster_registry"] == revised["cluster_registry"]
 
 
 def test_registry_infers_split_merge_supersede_and_retire() -> None:

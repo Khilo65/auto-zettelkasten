@@ -118,6 +118,10 @@ def test_literature_json_parser_recovers_one_object_wrapped_in_provider_prose() 
         'Here is the requested result:\n{"gaps": [], "rejected": []}\nDone.',
         label="gap adjudication response",
     ) == {"gaps": [], "rejected": []}
+    assert _parse_json_object(
+        'Here is the requested result:\n{"analysis": {"thesis": "Nested"}}\nDone.',
+        label="source bundle response",
+    ) == {"analysis": {"thesis": "Nested"}}
 
     with pytest.raises(ProviderError, match="was not valid JSON"):
         _parse_json_object(
@@ -1628,7 +1632,7 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
         "unused-detail-must-not-enter-clustering-packet"
         not in prompts["collection-clustering"]
     )
-    assert output_caps["collection-clustering"] == 16_000
+    assert output_caps["collection-clustering"] == 64_000
     assert reasoning_efforts["collection-clustering"] == "medium"
     unrelated_profile = {
         **normalized_profile,
@@ -1673,10 +1677,10 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
         "collection-clustering"
     ]
     assert "coverage_candidate_components" in prompts["collection-clustering"]
-    assert output_caps["collection-clustering"] == 16_000
+    assert output_caps["collection-clustering"] == 64_000
     assert reader.map_debates([], request) == {"assessments": []}
     synthesis = reader.synthesize_cluster([], request)
-    assert output_caps["full-note cluster writer"] == 64_000
+    assert output_caps["full-note cluster writer"] == 128_000
     assert synthesis["cluster_id"] == "cluster-1"
     assert synthesis["limits"] == [
         "Temporal: 2000-2020",
@@ -1684,7 +1688,7 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
     ]
     assert synthesis["cluster_contract"] == "streamlined-full-note-v1"
     assert synthesis["lines_of_inquiry"][0]["study_findings"][0]["source_id"] == "source-a"
-    assert "cluster synthesis prompt v25" in system_prompts["full-note cluster writer"]
+    assert "cluster synthesis prompt v26" in system_prompts["full-note cluster writer"]
     assert "Read every supplied atomic_note_markdown" in system_prompts[
         "full-note cluster writer"
     ]

@@ -1183,7 +1183,7 @@ def build_map(
         ),
         question=question,
         extraction_version=str(extraction_config.get("version") or "2"),
-        prompt_version=str(config.get("prompt_version") or "10"),
+        prompt_version=str(config.get("prompt_version") or "11"),
         retry_terminal_failures=retry_terminal_failures,
         extraction_policy=ExtractionPolicy.from_dict(extraction_config),
         processing=ProcessingPolicy.from_dict(

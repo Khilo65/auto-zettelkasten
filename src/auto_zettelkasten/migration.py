@@ -101,6 +101,9 @@ V014_TARGET_ENGINE_VERSION = "0.14.0"
 V014_TARGET_ARTIFACT_SCHEMA_VERSION = "1.13"
 
 V015_MIGRATION_ID = "auto-zettelkasten-0.15-statistical-explanation-metadata"
+V015_TARGET_ENGINE_VERSION = "0.15.0"
+V015_TARGET_ARTIFACT_SCHEMA_VERSION = "1.13"
+V016_MIGRATION_ID = "auto-zettelkasten-0.16-scalable-discovery-replay"
 
 _MARKER_FIELDS = {
     "migration_id",
@@ -401,6 +404,7 @@ def migrate_workspace(workspace: Path | str, *, dry_run: bool = False) -> dict[s
     )
     v014 = migrate_v014_schema(workspace, dry_run=dry_run)
     v015 = migrate_v015_metadata(workspace, dry_run=dry_run)
+    v016 = migrate_v016_metadata(workspace, dry_run=dry_run)
     return {
         "status": "dry_run" if dry_run else "completed",
         "dry_run": dry_run,
@@ -419,6 +423,7 @@ def migrate_workspace(workspace: Path | str, *, dry_run: bool = False) -> dict[s
             v013,
             v014,
             v015,
+            v016,
         ],
         "literature_map": legacy,
         "review_status": review,
@@ -1551,7 +1556,13 @@ def migrate_v014_schema(
         V014_TARGET_ARTIFACT_SCHEMA_VERSION, field="v0.14 artifact schema"
     )
     if schema > target:
-        raise ValueError("workspace is newer than the v0.14 migration target")
+        return {
+            "status": "not_applicable",
+            "dry_run": dry_run,
+            "migration_id": V014_MIGRATION_ID,
+            "reason": "schema_newer_than_1.13",
+            "provider_calls": 0,
+        }
     if schema == target:
         return {
             "status": "not_applicable",
@@ -1674,6 +1685,15 @@ def migrate_v015_metadata(
     """Update release and prompt metadata without touching semantic artifacts."""
 
     root = resolve_workspace(workspace)
+    schema = _workspace_schema_version(root)
+    if schema is not None and schema > (1, 13):
+        return {
+            "status": "not_applicable",
+            "dry_run": dry_run,
+            "migration_id": V015_MIGRATION_ID,
+            "reason": "schema_newer_than_1.13",
+            "provider_calls": 0,
+        }
     changes: list[tuple[Path, str, str]] = []
     for relative in _VERSION_FILE_RELATIVES:
         path = root / relative
@@ -1685,8 +1705,8 @@ def migrate_v015_metadata(
             raise ValueError(f"workspace version file must be a mapping: {path}")
         updated = {
             **dict(value),
-            "engine_version": CURRENT_ENGINE_VERSION,
-            "artifact_schema_version": CURRENT_ARTIFACT_SCHEMA_VERSION,
+            "engine_version": V015_TARGET_ENGINE_VERSION,
+            "artifact_schema_version": V015_TARGET_ARTIFACT_SCHEMA_VERSION,
         }
         if relative == "auto-zettelkasten.yml":
             prompt_version = str(updated.get("prompt_version") or "")
@@ -1702,8 +1722,8 @@ def migrate_v015_metadata(
 
     result = {
         "migration_id": V015_MIGRATION_ID,
-        "target_engine_version": CURRENT_ENGINE_VERSION,
-        "target_artifact_schema_version": CURRENT_ARTIFACT_SCHEMA_VERSION,
+        "target_engine_version": V015_TARGET_ENGINE_VERSION,
+        "target_artifact_schema_version": V015_TARGET_ARTIFACT_SCHEMA_VERSION,
         "prompt_version": "10",
         "rewritten_files": [
             {
@@ -1729,6 +1749,141 @@ def migrate_v015_metadata(
         for path, original in reversed(written):
             atomic_write_text(path, original)
         raise
+    return {
+        "status": "migrated" if changes else "already_current",
+        "dry_run": False,
+        **result,
+    }
+
+
+def migrate_v016_metadata(
+    workspace: Path | str,
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Upgrade release metadata and relationship tiers without model or source calls."""
+
+    root = resolve_workspace(workspace)
+    changes: list[tuple[Path, str, str]] = []
+    for relative in _VERSION_FILE_RELATIVES:
+        path = root / relative
+        if not path.is_file():
+            continue
+        original = path.read_text(encoding="utf-8")
+        value = yaml.safe_load(original)
+        if not isinstance(value, Mapping):
+            raise ValueError(f"workspace version file must be a mapping: {path}")
+        updated = {
+            **dict(value),
+            "engine_version": CURRENT_ENGINE_VERSION,
+            "artifact_schema_version": CURRENT_ARTIFACT_SCHEMA_VERSION,
+        }
+        if relative == "auto-zettelkasten.yml":
+            updated["prompt_version"] = "11"
+        cleaned = yaml.safe_dump(
+            updated, sort_keys=False, allow_unicode=True, width=10_000
+        )
+        if cleaned != original:
+            changes.append((path, original, cleaned))
+
+    for relative in (
+        "02_source_memory/indexes/typed_links.yml",
+        "02_source_memory/indexes/typed_note_links.yml",
+    ):
+        path = root / relative
+        if not path.is_file():
+            continue
+        original = path.read_text(encoding="utf-8")
+        value = yaml.safe_load(original)
+        if not isinstance(value, Mapping):
+            continue
+        relations = []
+        for raw in value.get("relations") or value.get("links") or []:
+            if not isinstance(raw, Mapping):
+                continue
+            row = dict(raw)
+            if str(row.get("provenance") or "").startswith(
+                "probabilistic_relationship_"
+            ):
+                row.setdefault(
+                    "relationship_tier",
+                    "legacy_unclassified"
+                    if str(row.get("relation_type") or "") == "complements"
+                    else "direct",
+                )
+            relations.append(row)
+        updated = {
+            **dict(value),
+            "registry_schema_version": "6",
+            "relations": relations,
+            "links": [
+                row for row in relations if bool(row.get("active", True))
+            ],
+        }
+        semantic = {
+            key: item
+            for key, item in updated.items()
+            if key
+            not in {
+                "updated_at",
+                "revision_hash",
+                "graph_projection_hash",
+                "relation_counts",
+            }
+        }
+        updated["revision_hash"] = sha256_text(
+            json.dumps(
+                semantic,
+                sort_keys=True,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            )
+        )
+        updated["graph_projection_hash"] = sha256_text(
+            json.dumps(
+                updated["links"],
+                sort_keys=True,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            )
+        )
+        relation_counts: dict[str, int] = {}
+        for row in updated["links"]:
+            relation_type = str(row.get("relation_type") or "")
+            relation_counts[relation_type] = (
+                relation_counts.get(relation_type, 0) + 1
+            )
+        updated["relation_counts"] = dict(sorted(relation_counts.items()))
+        cleaned = yaml.safe_dump(
+            updated, sort_keys=False, allow_unicode=True, width=10_000
+        )
+        if cleaned != original:
+            changes.append((path, original, cleaned))
+
+    result = {
+        "migration_id": V016_MIGRATION_ID,
+        "target_engine_version": CURRENT_ENGINE_VERSION,
+        "target_artifact_schema_version": CURRENT_ARTIFACT_SCHEMA_VERSION,
+        "prompt_version": "11",
+        "rewritten_files": [
+            {
+                "source": str(path.relative_to(root)),
+                "before_sha256": sha256_text(original),
+                "after_sha256": sha256_text(cleaned),
+            }
+            for path, original, cleaned in changes
+        ],
+        "provider_calls": 0,
+        "source_documents_reread": 0,
+        "source_notes_rewritten": 0,
+        "profile_files_rewritten": 0,
+    }
+    if dry_run:
+        return {"status": "dry_run", "dry_run": True, **result}
+    for path, _original, cleaned in changes:
+        atomic_write_text(path, cleaned)
     return {
         "status": "migrated" if changes else "already_current",
         "dry_run": False,

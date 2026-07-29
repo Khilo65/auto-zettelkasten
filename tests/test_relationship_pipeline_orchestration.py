@@ -640,10 +640,7 @@ def test_large_catalogue_routes_to_selected_shards_before_discovery(
         context: Mapping[str, Any],
     ) -> Mapping[str, Any]:
         if stage == "relationship_shard_selection":
-            assert {profile.source_id for profile in provider_profiles} == {
-                f"S{index:03d}" for index in range(40)
-            }
-            assert all(not profile.evidence_anchors for profile in provider_profiles)
+            assert not provider_profiles
             return {"shard_ids": ["shard-selected"]}
         if stage == "relationship_candidate_selection":
             assert context["discovery_mode"] == "routed_shards"

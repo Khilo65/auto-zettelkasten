@@ -7,8 +7,8 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
-CURRENT_ENGINE_VERSION = "0.15.0"
-CURRENT_ARTIFACT_SCHEMA_VERSION = "1.13"
+CURRENT_ENGINE_VERSION = "0.16.0"
+CURRENT_ARTIFACT_SCHEMA_VERSION = "1.14"
 CURRENT_PROFILE_SCHEMA_VERSION = "1.3"
 
 
@@ -603,7 +603,7 @@ class MapRequest:
     provider_concurrency: int | Literal["auto"] | None = None
     limit: int = 0
     extraction_version: str = "2"
-    prompt_version: str = "10"
+    prompt_version: str = "11"
     retry_terminal_failures: bool = False
     extraction_policy: ExtractionPolicy = field(default_factory=ExtractionPolicy)
     processing: ProcessingPolicy = field(default_factory=ProcessingPolicy)
@@ -715,7 +715,7 @@ class MapRequest:
             ),
             limit=int(payload.get("limit", 0)),
             extraction_version=str(payload.get("extraction_version", "2")),
-            prompt_version=str(payload.get("prompt_version", "10")),
+            prompt_version=str(payload.get("prompt_version", "11")),
             retry_terminal_failures=_strict_bool(
                 payload.get("retry_terminal_failures", False),
                 field="retry_terminal_failures",
@@ -2159,7 +2159,7 @@ class RelationshipPairJob:
     graph_context: dict[str, Any] = field(default_factory=dict)
     candidate_basis: list[dict[str, Any]] = field(default_factory=list)
     prior_pair_memory: dict[str, Any] = field(default_factory=dict)
-    output_contract: str = "relationship-decision-v4"
+    output_contract: str = "relationship-decision-v5"
 
     def __post_init__(self) -> None:
         if (
@@ -2168,7 +2168,10 @@ class RelationshipPairJob:
             or self.left_source_id == self.right_source_id
         ):
             raise ValueError("relationship pair job requires two distinct source IDs")
-        if self.output_contract != "relationship-decision-v4":
+        if self.output_contract not in {
+            "relationship-decision-v4",
+            "relationship-decision-v5",
+        }:
             raise ValueError("relationship pair job output contract is invalid")
         left, right = sorted((self.left_source_id, self.right_source_id))
         object.__setattr__(self, "left_source_id", left)
@@ -2293,11 +2296,11 @@ class RelationshipProviderBatch:
         pair_job_ids = _string_list(
             self.pair_job_ids, field="relationship provider batch.pair_job_ids"
         )
-        if not 1 <= len(pair_job_ids) <= 8 or len(pair_job_ids) != len(
+        if not 1 <= len(pair_job_ids) <= 30 or len(pair_job_ids) != len(
             set(pair_job_ids)
         ):
             raise ValueError(
-                "relationship provider batch requires one to eight unique pair jobs"
+                "relationship provider batch requires one to thirty unique pair jobs"
             )
         object.__setattr__(self, "pair_job_ids", pair_job_ids)
         if not self.batch_id:
@@ -2328,7 +2331,7 @@ class RelationshipProviderBatch:
 
 @dataclass(frozen=True, slots=True)
 class RelationshipDecision:
-    """One complete final schema-4 judgment; partial semantic edits are impossible."""
+    """One complete final relationship judgment; partial semantic edits are impossible."""
 
     pair_job_id: str = ""
     decision: Literal["relationship", "no_relationship", "needs_more_context"] = (
@@ -2337,6 +2340,7 @@ class RelationshipDecision:
     left_source_id: str = ""
     right_source_id: str = ""
     relation_type: str = ""
+    relationship_tier: str = ""
     actor_source_id: str = ""
     reference_source_id: str = ""
     forward_label: str = ""
@@ -2347,7 +2351,7 @@ class RelationshipDecision:
     right_evidence_anchor_ids: list[str] = field(default_factory=list)
     boundary_or_qualification: str = ""
     confidence: str = ""
-    output_contract: str = "relationship-decision-v4"
+    output_contract: str = "relationship-decision-v5"
 
     def __post_init__(self) -> None:
         if self.decision not in {
@@ -2356,7 +2360,10 @@ class RelationshipDecision:
             "needs_more_context",
         }:
             raise ValueError("relationship decision is invalid")
-        if self.output_contract != "relationship-decision-v4":
+        if self.output_contract not in {
+            "relationship-decision-v4",
+            "relationship-decision-v5",
+        }:
             raise ValueError("relationship decision output contract is invalid")
         pair = {self.left_source_id, self.right_source_id}
         if len(pair) != 2 or "" in pair:
@@ -2378,6 +2385,17 @@ class RelationshipDecision:
             ),
         )
         if self.decision == "relationship":
+            expected_tier = (
+                "contextual"
+                if self.relation_type == "contextual_connection"
+                else "direct"
+            )
+            if not self.relationship_tier:
+                object.__setattr__(self, "relationship_tier", expected_tier)
+            elif self.relationship_tier != expected_tier:
+                raise ValueError(
+                    "relationship decision tier does not match relation type"
+                )
             if (
                 {self.actor_source_id, self.reference_source_id} != pair
                 or self.actor_source_id == self.reference_source_id
@@ -2402,6 +2420,7 @@ class RelationshipDecision:
         elif any(
             (
                 self.relation_type,
+                self.relationship_tier,
                 self.actor_source_id,
                 self.reference_source_id,
                 self.forward_label,
@@ -2425,6 +2444,7 @@ class RelationshipDecision:
                 "right_source_id": self.right_source_id,
             },
             "relation_type": self.relation_type,
+            "relationship_tier": self.relationship_tier,
             "actor_source_id": self.actor_source_id,
             "reference_source_id": self.reference_source_id,
             "forward_label": self.forward_label,

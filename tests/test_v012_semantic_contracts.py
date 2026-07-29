@@ -193,7 +193,7 @@ def test_schema_two_machine_links_migrate_to_inactive_legacy_history(
 
     result = persist_relationship_registry(tmp_path, structural_relations=[])
     by_id = {row["relation_id"]: row for row in result["relations"]}
-    assert read_yaml(path)["registry_schema_version"] == "5"
+    assert read_yaml(path)["registry_schema_version"] == "6"
     assert by_id["legacy-machine"]["verification_status"] == "legacy_unverified"
     assert by_id["legacy-machine"]["active"] is False
     assert by_id["human-link"]["active"] is True

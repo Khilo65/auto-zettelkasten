@@ -121,10 +121,16 @@ from .relationships import (
     persist_relationship_registry,
     projected_related_links,
     relationship_decision_key,
+    RELATIONSHIP_DECISION_CONTRACT,
     RELATIONSHIP_PROMPT_VERSION,
     stable_hash,
 )
-from .readers import SECTION_KEYS, SOURCE_BUNDLE_PROMPT_VERSION, provider_from_name
+from .readers import (
+    SECTION_KEYS,
+    SOURCE_BUNDLE_PROMPT_VERSION,
+    _normalize_source_bundle_payload,
+    provider_from_name,
+)
 from .workspace import (
     artifact_rows,
     assert_compatible,
@@ -141,7 +147,8 @@ from .zotero import (
 
 CHUNKING_VERSION = "2"
 CONTENT_CLASSIFIER_VERSION = "4"
-_RELATIONSHIP_BATCH_MAX_JOBS = 8
+_RELATIONSHIP_BATCH_MAX_JOBS = 30
+_LEGACY_RELATIONSHIP_BATCH_MAX_JOBS = 8
 _LITERATURE_MEMORY_LOCK = threading.Lock()
 
 
@@ -2478,7 +2485,7 @@ def _run_relationship_reasoning(
     reasoner_calls: _CheckpointedReasonerCalls | None,
     request: LiteratureMapRequest,
 ) -> dict[str, Any]:
-    """Run v0.14 discovery and one complete decision per immutable pair job."""
+    """Run global discovery and one complete decision per immutable pair job."""
 
     selector = getattr(reasoner, "select_relationship_candidates", None)
     adjudicator = getattr(reasoner, "adjudicate_relationships", None)
@@ -2493,8 +2500,17 @@ def _run_relationship_reasoning(
             "parked": [],
             "cluster_candidates": [],
             "selected_profile_hashes": {},
-            "reconciled_catalogue_revision": "",
+            "reconciled_catalogue_revision": catalogue_revision,
         }
+    decision_contract = str(
+        getattr(reasoner, "relationship_decision_contract", "")
+        or "relationship-decision-v4"
+    )
+    batch_max_jobs = (
+        _RELATIONSHIP_BATCH_MAX_JOBS
+        if decision_contract == RELATIONSHIP_DECISION_CONTRACT
+        else _LEGACY_RELATIONSHIP_BATCH_MAX_JOBS
+    )
     profile_by_source = {
         str(row.get("source_id") or ""): profile
         for profile in profiles
@@ -2637,7 +2653,7 @@ def _run_relationship_reasoning(
             "provider": str(getattr(reasoner, "name", "")),
             "model": str(getattr(reasoner, "model", "")),
             "prompt_version": RELATIONSHIP_PROMPT_VERSION,
-            "output_contract": "relationship-decision-v4",
+            "output_contract": decision_contract,
         }
     )
     state_path = (
@@ -2777,8 +2793,8 @@ def _run_relationship_reasoning(
         )
     )
     mandatory_call_count = (
-        len(mandatory_basis) + _RELATIONSHIP_BATCH_MAX_JOBS - 1
-    ) // _RELATIONSHIP_BATCH_MAX_JOBS
+        len(mandatory_basis) + batch_max_jobs - 1
+    ) // batch_max_jobs
     if mandatory_call_count > min(20, remaining_calls):
         return {
             "accepted": [],
@@ -2818,6 +2834,20 @@ def _run_relationship_reasoning(
         }
         for row in catalogue_payload.get("shards", []) or []
         if isinstance(row, Mapping) and row.get("shard_id")
+    ]
+    collection_rows = [
+        dict(row)
+        for row in catalogue_payload.get("collections", []) or []
+        if isinstance(row, Mapping) and row.get("key")
+    ]
+    collection_cards = [
+        {
+            **dict(row.get("routing_card") or {}),
+            "shard_id": f"collection-{row['key']}",
+            "literature_id": f"collection-{row.get('parent_key') or row['key']}",
+        }
+        for row in collection_rows
+        if isinstance(row.get("routing_card"), Mapping)
     ]
     graph_context = [
         {
@@ -2901,7 +2931,9 @@ def _run_relationship_reasoning(
         )
         > catalogue_char_budget
     )
-    routing_call_count = 1 if requires_routing else 0
+    routing_call_count = (
+        (2 if collection_cards else 1) if requires_routing else 0
+    )
     discovery_call_count = 1 + routing_call_count
     can_discover = (
         remaining_calls >= mandatory_call_count + discovery_call_count + 1
@@ -2913,7 +2945,7 @@ def _run_relationship_reasoning(
             remaining_calls - (discovery_call_count if can_discover else 0),
         ),
     )
-    pair_capacity = adjudication_call_capacity * _RELATIONSHIP_BATCH_MAX_JOBS
+    pair_capacity = adjudication_call_capacity * batch_max_jobs
     inferred_capacity = (
         min(120, max(0, pair_capacity - len(mandatory_basis)))
         if can_discover
@@ -2922,6 +2954,73 @@ def _run_relationship_reasoning(
     discovery: Mapping[str, Any] = {}
     discovery_completed = False
     if can_discover and requires_routing:
+        selected_collection_source_ids = set(profile_by_source)
+        if collection_cards:
+            try:
+                collection_routing = reasoner_calls(
+                    "relationship_collection_selection",
+                    f"collections-{catalogue_revision[:16]}",
+                    "select_relationship_shards",
+                    [],
+                    {
+                        "catalogue_revision": catalogue_revision,
+                        "routing_cards": collection_cards,
+                        "focus_source_ids": [],
+                        "discovery_mode": "relationship_collection_routing",
+                    },
+                )
+            except Exception as exc:
+                collection_routing = {}
+                discovery_parked.append(
+                    {
+                        "reason": "relationship_collection_routing_failed",
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    }
+                )
+            selected_collection_keys = {
+                str(value).removeprefix("collection-")
+                for value in collection_routing.get("shard_ids", []) or []
+                if str(value).startswith("collection-")
+            }
+            if selected_collection_keys:
+                children_by_key = {
+                    str(row.get("key") or ""): {
+                        str(value) for value in row.get("child_keys", []) or []
+                    }
+                    for row in collection_rows
+                }
+                pending = list(selected_collection_keys)
+                while pending:
+                    current = pending.pop()
+                    for child in children_by_key.get(current, set()):
+                        if child not in selected_collection_keys:
+                            selected_collection_keys.add(child)
+                            pending.append(child)
+                selected_collection_source_ids = {
+                    str(source_id)
+                    for row in collection_rows
+                    if str(row.get("key") or "") in selected_collection_keys
+                    for source_id in row.get("direct_source_ids", []) or []
+                    if str(source_id) in profile_by_source
+                }
+                routing_cards = [
+                    card
+                    for card in routing_cards
+                    if set(
+                        next(
+                            (
+                                shard.get("source_ids", []) or []
+                                for shard in catalogue_payload.get("shards", []) or []
+                                if isinstance(shard, Mapping)
+                                and str(shard.get("shard_id") or "")
+                                == str(card.get("shard_id") or "")
+                            ),
+                            [],
+                        )
+                    )
+                    & selected_collection_source_ids
+                ]
         routing_context = {
             "catalogue_revision": catalogue_revision,
             "routing_cards": routing_cards,
@@ -2929,14 +3028,7 @@ def _run_relationship_reasoning(
             "discovery_mode": "relationship_shard_routing",
             **discovery_memory(set(focus_source_ids)),
         }
-        routing_profiles = [
-            _relationship_evidence_projection(
-                profile_by_source[source_id],
-                entry_by_source.get(source_id, {}),
-                include_anchors=False,
-            )
-            for source_id in focus_source_ids
-        ]
+        routing_profiles: list[EvidenceProfile] = []
         shard_selector = getattr(reasoner, "select_relationship_shards", None)
         if (
             not callable(shard_selector)
@@ -2988,6 +3080,7 @@ def _run_relationship_reasoning(
                 for source_id in shard.get("source_ids", []) or []
                 if str(source_id) in profile_by_source
             }
+            selected_source_ids &= selected_collection_source_ids
             discovery_entries = [
                 row
                 for row in entries
@@ -3095,7 +3188,7 @@ def _run_relationship_reasoning(
             "provider": provider_name,
             "model": model_name,
             "prompt_version": RELATIONSHIP_PROMPT_VERSION,
-            "output_contract": "relationship-decision-v4",
+            "output_contract": decision_contract,
         }
     )
     jobs: list[RelationshipPairJob] = []
@@ -3175,6 +3268,7 @@ def _run_relationship_reasoning(
                     == pair
                 ]
             },
+            output_contract=decision_contract,
         )
         path = job_root / job.pair_job_id
         write_json(path / "input.json", job.to_dict())
@@ -3267,11 +3361,11 @@ def _run_relationship_reasoning(
         unresolved,
         pair_for=lambda job: (job.left_source_id, job.right_source_id),
         profile_by_source=profile_by_source,
-        context_for=lambda packet: {
-            "pair_jobs": [job.to_dict() for job in packet]
-        },
+        context_for=lambda packet: _relationship_transport_context(
+            packet, decision_contract=decision_contract
+        ),
         max_chars=catalogue_char_budget,
-        max_rows=_RELATIONSHIP_BATCH_MAX_JOBS,
+        max_rows=batch_max_jobs,
     )
     concurrent_batch_results: dict[
         tuple[str, ...], Mapping[str, Any] | BaseException
@@ -3280,7 +3374,9 @@ def _run_relationship_reasoning(
     def adjudicate_packet(
         packet: Sequence[RelationshipPairJob],
     ) -> Mapping[str, Any]:
-        packet_context = {"pair_jobs": [job.to_dict() for job in packet]}
+        packet_context = _relationship_transport_context(
+            packet, decision_contract=decision_contract
+        )
         packet_source_ids = sorted(
             {
                 source_id
@@ -3288,9 +3384,11 @@ def _run_relationship_reasoning(
                 for source_id in (job.left_source_id, job.right_source_id)
             }
         )
-        packet_profiles = [
-            profile_by_source[source_id] for source_id in packet_source_ids
-        ]
+        packet_profiles = (
+            []
+            if decision_contract == RELATIONSHIP_DECISION_CONTRACT
+            else [profile_by_source[source_id] for source_id in packet_source_ids]
+        )
         batch = RelationshipProviderBatch(
             pair_job_ids=[job.pair_job_id for job in packet],
             provider=str(getattr(reasoner, "name", "")),
@@ -3312,7 +3410,9 @@ def _run_relationship_reasoning(
 
     runnable_packets = []
     for packet in job_packets:
-        packet_context = {"pair_jobs": [job.to_dict() for job in packet]}
+        packet_context = _relationship_transport_context(
+            packet, decision_contract=decision_contract
+        )
         packet_source_ids = sorted(
             {
                 source_id
@@ -3320,9 +3420,11 @@ def _run_relationship_reasoning(
                 for source_id in (job.left_source_id, job.right_source_id)
             }
         )
-        packet_profiles = [
-            profile_by_source[source_id] for source_id in packet_source_ids
-        ]
+        packet_profiles = (
+            []
+            if decision_contract == RELATIONSHIP_DECISION_CONTRACT
+            else [profile_by_source[source_id] for source_id in packet_source_ids]
+        )
         if (
             _reasoner_packet_chars(
                 [profile_to_dict(profile) for profile in packet_profiles],
@@ -3357,7 +3459,9 @@ def _run_relationship_reasoning(
     else:
         relationship_stage_seconds = 0.0
     for packet in job_packets:
-        packet_context = {"pair_jobs": [job.to_dict() for job in packet]}
+        packet_context = _relationship_transport_context(
+            packet, decision_contract=decision_contract
+        )
         packet_source_ids = sorted(
             {
                 source_id
@@ -3365,9 +3469,11 @@ def _run_relationship_reasoning(
                 for source_id in (job.left_source_id, job.right_source_id)
             }
         )
-        packet_profiles = [
-            profile_by_source[source_id] for source_id in packet_source_ids
-        ]
+        packet_profiles = (
+            []
+            if decision_contract == RELATIONSHIP_DECISION_CONTRACT
+            else [profile_by_source[source_id] for source_id in packet_source_ids]
+        )
         if (
             _reasoner_packet_chars(
                 [profile_to_dict(profile) for profile in packet_profiles],
@@ -3691,7 +3797,14 @@ def _relationship_neighbors(
 
 
 def _relationship_context_char_budget(reasoner: Any, request: Any) -> int:
-    return _reasoner_context_char_budget(reasoner, request)
+    context_tokens = int(
+        getattr(reasoner, "context_window_tokens", 0) or 128_000
+    )
+    prompt_reserve = int(
+        getattr(reasoner, "prompt_reserve_tokens", 0) or 0
+    )
+    input_tokens = max(0, int(context_tokens * 0.65) - prompt_reserve)
+    return max(8_000, input_tokens * 3)
 
 
 def _relationship_evidence_projection(
@@ -3799,6 +3912,48 @@ def _compact_relationship_catalogue_entry(
     }
 
 
+def _relationship_transport_context(
+    jobs: Sequence[RelationshipPairJob],
+    *,
+    decision_contract: str,
+) -> dict[str, Any]:
+    if decision_contract != RELATIONSHIP_DECISION_CONTRACT:
+        return {"pair_jobs": [job.to_dict() for job in jobs]}
+    source_documents: dict[str, Any] = {}
+    source_profiles: dict[str, Any] = {}
+    pair_jobs: list[dict[str, Any]] = []
+    for job in jobs:
+        row = job.to_dict()
+        profiles = row.pop("profiles", {})
+        atomic_notes = row.pop("atomic_notes", {})
+        for side, source_id in (
+            ("left", job.left_source_id),
+            ("right", job.right_source_id),
+        ):
+            if source_id not in source_documents:
+                source_documents[source_id] = dict(
+                    atomic_notes.get(side)
+                    or atomic_notes.get(source_id)
+                    or {}
+                )
+            if source_id not in source_profiles:
+                source_profiles[source_id] = dict(
+                    profiles.get(side)
+                    or profiles.get(source_id)
+                    or {}
+                )
+        pair_jobs.append(row)
+    return {
+        "source_documents": {
+            key: source_documents[key] for key in sorted(source_documents)
+        },
+        "source_profiles": {
+            key: source_profiles[key] for key in sorted(source_profiles)
+        },
+        "pair_jobs": pair_jobs,
+    }
+
+
 def _pack_relationship_rows(
     rows: Sequence[Any],
     *,
@@ -3873,7 +4028,8 @@ def _commit_relationship_selection_state(
         ),
         "reconciled_catalogue_revision": reconciled
         or str(existing.get("reconciled_catalogue_revision") or ""),
-        "catalogue_revision": catalogue_revision,
+        "catalogue_revision": catalogue_revision
+        or str(existing.get("catalogue_revision") or ""),
         "selection_identity": selection_identity
         or str(existing.get("selection_identity") or ""),
     }
@@ -3901,7 +4057,12 @@ def _write_relationship_run_ledger(
         if isinstance(row, Mapping) and row.get("event_id")
     }
 
-    def merge_event(event_type: str, row: Mapping[str, Any]) -> None:
+    def merge_event(
+        event_type: str,
+        row: Mapping[str, Any],
+        *,
+        preserve_existing: bool = False,
+    ) -> None:
         payload = dict(row)
         if event_type == "no_relationship" and not payload.get("decision_key"):
             payload["decision_key"] = relationship_decision_key(
@@ -3916,6 +4077,8 @@ def _write_relationship_run_ledger(
                 ),
             )
         event_id = _relationship_event_id(event_type, payload)
+        if preserve_existing and event_id in events:
+            return
         prior = events.get(event_id, {})
         history = {
             stable_hash(value): dict(value)
@@ -3960,13 +4123,13 @@ def _write_relationship_run_ledger(
                 merge_event(event_type, row)
     for row in registry.get("pair_decisions", []) or []:
         if isinstance(row, Mapping) and row.get("status") == "no_relationship":
-            merge_event("no_relationship", row)
+            merge_event("no_relationship", row, preserve_existing=True)
     for row in registry.get("relations", []) or []:
         if (
             isinstance(row, Mapping)
             and str(row.get("decision_status") or "") == "retired"
         ):
-            merge_event("retired", row)
+            merge_event("retired", row, preserve_existing=True)
 
     event_rows = [events[key] for key in sorted(events)]
 
@@ -4712,8 +4875,7 @@ def rebuild_map(
         workspace,
         relationship_result,
         catalogue_revision=str(
-            catalogue.get("routing_revision_hash")
-            or catalogue.get("revision_hash")
+            relationship_result.get("reconciled_catalogue_revision")
             or ""
         ),
     )
@@ -6430,6 +6592,7 @@ def _source_bundle_from_result(
             current = payload.get(field_name, [])
             if recovered and isinstance(current, list):
                 payload[field_name] = [*current, *recovered]
+    payload = _normalize_source_bundle_payload(payload)
     expected_source_id = str(row.get("source_id") or "")
     expected_zotero_key = str(row.get("zotero_item_key") or "")
     identity = (
@@ -8124,7 +8287,7 @@ def _read_document(
         "document_hash": document_hash,
         "provider": str(getattr(reader, "name", "unknown")),
         "model": str(getattr(reader, "model", "unknown")),
-        "prompt_version": request.prompt_version if request else "10",
+        "prompt_version": request.prompt_version if request else "11",
         "source_bundle_prompt_version": SOURCE_BUNDLE_PROMPT_VERSION,
         "chunking_version": CHUNKING_VERSION,
         "content_classifier_version": CONTENT_CLASSIFIER_VERSION,

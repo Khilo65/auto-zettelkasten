@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import unicodedata
 from pathlib import Path
 
 from .files import atomic_write_text, ensure_dir, now_iso, read_yaml, sha256_text, write_yaml
@@ -207,14 +208,24 @@ def export_obsidian(
 
 
 def _missing_links_from_contents(export_root: Path, contents: dict[Path, str]) -> list[dict[str, str]]:
-    relative_targets = {str(path.relative_to(export_root).with_suffix("")) for path in contents}
-    stems = {path.stem for path in contents}
+    def link_key(value: str) -> str:
+        return (
+            unicodedata.normalize("NFKC", value)
+            .translate(str.maketrans({"’": "'", "‘": "'", "“": '"', "”": '"'}))
+            .casefold()
+        )
+
+    relative_targets = {
+        link_key(str(path.relative_to(export_root).with_suffix("")))
+        for path in contents
+    }
+    stems = {link_key(path.stem) for path in contents}
     missing: list[dict[str, str]] = []
     for path, text in contents.items():
         for match in re.finditer(r"\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]", text):
             target = match.group(1).strip()
-            normalized = target.removesuffix(".md")
-            if normalized not in relative_targets and Path(normalized).name not in stems:
+            normalized = link_key(target.removesuffix(".md"))
+            if normalized not in relative_targets and link_key(Path(normalized).name) not in stems:
                 missing.append({"source": str(path.relative_to(export_root)), "target": target})
     return missing
 

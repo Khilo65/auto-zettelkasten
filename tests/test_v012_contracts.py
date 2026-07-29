@@ -6,8 +6,8 @@ from auto_zettelkasten.models import MapRequest
 
 
 def test_v013_versions() -> None:
-    assert ENGINE_VERSION == "0.15.0"
-    assert ARTIFACT_SCHEMA_VERSION == "1.13"
+    assert ENGINE_VERSION == "0.16.0"
+    assert ARTIFACT_SCHEMA_VERSION == "1.14"
 
 
 def test_map_request_round_trips_terminal_retry_flag(tmp_path) -> None:
