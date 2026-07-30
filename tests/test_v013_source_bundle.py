@@ -161,9 +161,11 @@ def test_source_bundle_envelope_recovery_is_unambiguous_and_source_owned() -> No
         expected_identity=expected,
     )["source_identity"]["source_id"] == "source-zotero-A1"
 
+    conflicting = deepcopy(payload)
+    conflicting["analysis_sections"]["thesis"] = "A different source interpretation."
     with pytest.raises(ProviderError, match="multiple valid"):
         _parse_source_bundle_response(
-            f"{json.dumps(payload)}\n{json.dumps(payload | {'self_review': {'passed': False}})}",
+            f"{json.dumps(payload)}\n{json.dumps(conflicting)}",
             label="bundle",
             expected_identity=expected,
         )
@@ -261,6 +263,73 @@ def test_source_bundle_repairs_only_lexical_json_defects() -> None:
     assert any(
         row.get("reason") == "conservative_json_lexical_recovery"
         for row in recovered["component_diagnostics"]
+    )
+
+
+def test_equivalent_local_recovery_routes_do_not_create_false_ambiguity(
+    monkeypatch,
+) -> None:
+    import auto_zettelkasten.readers as readers
+
+    first = _bundle_payload()
+    second = deepcopy(first)
+    second["self_review"] = {"ignored_provider_field": True}
+    monkeypatch.setattr(
+        readers,
+        "_conservative_json_superset_mapping",
+        lambda _text: first,
+    )
+    monkeypatch.setattr(
+        readers,
+        "_conservative_json_repair_mapping",
+        lambda _text: second,
+    )
+
+    recovered = _parse_source_bundle_response(
+        "{malformed",
+        label="bundle",
+        expected_identity={
+            "source_id": "source-zotero-A1",
+            "zotero_key": "A1",
+        },
+    )
+
+    assert recovered["source_identity"]["source_id"] == "source-zotero-A1"
+
+
+def test_local_recovery_prefers_the_unique_text_completion(monkeypatch) -> None:
+    import auto_zettelkasten.readers as readers
+
+    shorter = _bundle_payload()
+    shorter["evidence_anchors"][0]["quantitative_result"] = {
+        "sample": "175 (122 ethnic",
+    }
+    complete = deepcopy(shorter)
+    complete["evidence_anchors"][0]["quantitative_result"]["sample"] = (
+        "175 (122 ethnic, 53 nonethnic)"
+    )
+    monkeypatch.setattr(
+        readers,
+        "_conservative_json_superset_mapping",
+        lambda _text: shorter,
+    )
+    monkeypatch.setattr(
+        readers,
+        "_conservative_json_repair_mapping",
+        lambda _text: complete,
+    )
+
+    recovered = _parse_source_bundle_response(
+        "{malformed",
+        label="bundle",
+        expected_identity={
+            "source_id": "source-zotero-A1",
+            "zotero_key": "A1",
+        },
+    )
+
+    assert recovered["evidence_anchors"][0]["quantitative_result"]["sample"] == (
+        "175 (122 ethnic, 53 nonethnic)"
     )
 
 

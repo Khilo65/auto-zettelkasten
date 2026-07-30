@@ -3152,15 +3152,85 @@ def _parse_source_bundle_response(
                 continue
         except (TypeError, ValueError, ProviderError):
             continue
-        identity_key = json.dumps(candidate, sort_keys=True, ensure_ascii=False)
+        identity_key = json.dumps(
+            _recovered_bundle_identity(bundle),
+            sort_keys=True,
+            ensure_ascii=False,
+        )
         if identity_key not in seen:
             seen.add(identity_key)
             valid.append(bundle)
     if len(valid) == 1:
         return valid[0]
     if len(valid) > 1:
+        dominant = [
+            candidate
+            for candidate in valid
+            if all(
+                candidate == other
+                or _recovered_bundle_dominates(candidate, other)
+                for other in valid
+            )
+        ]
+        if len(dominant) == 1:
+            return dominant[0]
         raise ProviderError(f"{label} contained multiple valid source bundles")
     raise ProviderError(f"{label} contained no complete source-owned bundle")
+
+
+def _recovered_bundle_dominates(left: Any, right: Any) -> bool:
+    """Prefer a recovery that only completes otherwise identical text fields."""
+
+    generated = {
+        "component_diagnostics",
+        "evidence_anchor_id",
+        "literature_position_id",
+        "quantitative_result_id",
+        "revision_hash",
+    }
+    if isinstance(left, Mapping) and isinstance(right, Mapping):
+        left_values = {key: value for key, value in left.items() if key not in generated}
+        right_values = {
+            key: value for key, value in right.items() if key not in generated
+        }
+        return left_values.keys() == right_values.keys() and all(
+            left_values[key] == right_values[key]
+            or _recovered_bundle_dominates(left_values[key], right_values[key])
+            for key in left_values
+        ) and left_values != right_values
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(
+            left_value == right_value
+            or _recovered_bundle_dominates(left_value, right_value)
+            for left_value, right_value in zip(left, right, strict=True)
+        ) and left != right
+    return (
+        isinstance(left, str)
+        and isinstance(right, str)
+        and len(left) > len(right)
+        and left.startswith(right)
+    )
+
+
+def _recovered_bundle_identity(value: Any) -> Any:
+    """Remove parser-generated provenance when comparing recovered bundles."""
+
+    ignored = {
+        "component_diagnostics",
+        "evidence_anchor_id",
+        "literature_position_id",
+        "quantitative_result_id",
+        "revision_hash",
+    }
+    if isinstance(value, Mapping):
+        return {
+            key: _recovered_bundle_identity(item)
+            for key, item in value.items()
+            if key not in ignored
+        }
+    if isinstance(value, list):
+        return [_recovered_bundle_identity(item) for item in value]
+    return value
 
 
 def _parse_json_object(

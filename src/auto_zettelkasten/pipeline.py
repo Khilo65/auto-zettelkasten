@@ -1665,7 +1665,10 @@ def _commit_source_bundle(
     profile.evidence_eligibility = eligibility  # type: ignore[assignment]
     profile.excluded_from_synthesis = eligibility != "substantive_bounded"
     if bundle.evidence_anchors:
-        profile.evidence_anchors = list(bundle.evidence_anchors)
+        profile.evidence_anchors = sorted(
+            bundle.evidence_anchors,
+            key=lambda anchor: -anchor.salience_priority,
+        )[:24]
     compact = dict(bundle.compact_profile)
     for field_name in (
         "research_questions",
