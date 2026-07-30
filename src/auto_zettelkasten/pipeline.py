@@ -4592,6 +4592,20 @@ def _run_relationship_reasoning(
                         ),
                     }
                 )
+                write_yaml(
+                    job_path / "status.yml",
+                    {
+                        "pair_job_id": job.pair_job_id,
+                        "status": "completed",
+                        "decision_identity": decision_identity,
+                        "reasoner_backend": str(
+                            payload.get("reasoner_backend") or reasoner_backend
+                        ),
+                        "provider": str(payload.get("provider") or provider_name),
+                        "model": str(payload.get("model") or model_name),
+                        "checkpoint_hit": True,
+                    },
+                )
         else:
             unresolved.append(job)
     provider_batch_count = 0
