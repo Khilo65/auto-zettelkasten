@@ -328,10 +328,11 @@ def _normalize_provider_decision_row(
         "right_source_id": job.right_source_id,
     }
     normalized["output_contract"] = contract
-    if str(normalized.get("decision") or "") == "contextual_connection":
+    decision = str(normalized.get("decision") or "")
+    if decision in SUBSTANTIVE_RELATION_TYPES:
         normalized["decision"] = "relationship"
-        normalized.setdefault("relation_type", "contextual_connection")
-        warnings.append("normalized_contextual_decision_shorthand")
+        normalized.setdefault("relation_type", decision)
+        warnings.append("normalized_relation_decision_shorthand")
     if str(normalized.get("decision") or "") != "relationship":
         return normalized, warnings
 

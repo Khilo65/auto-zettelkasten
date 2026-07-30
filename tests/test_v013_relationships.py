@@ -162,7 +162,49 @@ def test_v7_contextual_decision_shorthand_is_normalized() -> None:
     assert result["parked"] == []
     assert result["accepted"][0]["relation_type"] == "contextual_connection"
     assert result["accepted"][0]["contract_warnings"] == [
-        "normalized_contextual_decision_shorthand"
+        "normalized_relation_decision_shorthand"
+    ]
+
+
+def test_v7_direct_relation_decision_shorthand_is_normalized() -> None:
+    profiles = {source_id: _profile(source_id) for source_id in ("A", "B")}
+    job = RelationshipPairJob(
+        left_source_id="A",
+        right_source_id="B",
+        profiles={"left": profiles["A"], "right": profiles["B"]},
+        selected_evidence={
+            "left": [profiles["A"]["evidence_anchors"][0]],
+            "right": [profiles["B"]["evidence_anchors"][0]],
+        },
+    )
+
+    result = validate_relationship_decision_rows(
+        {
+            "decisions": {
+                job.pair_job_id: {
+                    "decision": "supports",
+                    "relation_type": "supports",
+                    "actor_source_id": "A",
+                    "reference_source_id": "B",
+                    "comparison_proposition": "A supports B's bounded claim.",
+                    "left_endpoint_claim": "Claim A",
+                    "left_evidence_anchor_id": "anchor-a",
+                    "right_endpoint_claim": "Claim B",
+                    "right_evidence_anchor_id": "anchor-b",
+                    "reason": "Both endpoint claims establish the support.",
+                    "boundary_or_qualification": "The evidence is associational.",
+                    "confidence": "high",
+                }
+            }
+        },
+        jobs=[job],
+        profiles=list(profiles.values()),
+    )
+
+    assert result["parked"] == []
+    assert result["accepted"][0]["relation_type"] == "supports"
+    assert result["accepted"][0]["contract_warnings"] == [
+        "normalized_relation_decision_shorthand"
     ]
 
 
