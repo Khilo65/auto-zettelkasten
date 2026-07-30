@@ -122,6 +122,7 @@ from .relationships import (
     projected_related_links,
     relationship_decision_key,
     RELATIONSHIP_DECISION_CONTRACT,
+    RELATIONSHIP_DECISION_NORMALIZATION_VERSION,
     RELATIONSHIP_PROMPT_VERSION,
     stable_hash,
 )
@@ -3248,6 +3249,7 @@ def _run_relationship_reasoning(
             "model": str(getattr(reasoner, "model", "")),
             "prompt_version": RELATIONSHIP_PROMPT_VERSION,
             "output_contract": decision_contract,
+            "decision_normalization_version": RELATIONSHIP_DECISION_NORMALIZATION_VERSION,
         }
     )
     state_path = (
