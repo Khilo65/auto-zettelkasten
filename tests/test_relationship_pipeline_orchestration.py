@@ -233,7 +233,25 @@ def _catalogue(
                 }
                 for profile in profiles
             ],
+            "collections": [
+                {
+                    "key": literature_id,
+                    "parent_key": "",
+                    "direct_source_ids": [
+                        profile.source_id
+                        for profile in profiles
+                        if literature_id
+                        in set(profile.context.get("collections", []) or [])
+                    ],
+                    "routing_card": {
+                        "title": literature_id.title(),
+                        "scope": f"Sources in {literature_id}.",
+                    },
+                }
+                for literature_id in literature_ids
+            ],
             "shards": list(shards),
+            "virtual_shards": list(shards),
         },
     )
     return {"catalogue_path": str(path)}
@@ -303,8 +321,8 @@ def test_global_discovery_creates_immutable_pair_job(
         if stage == "relationship_candidate_selection":
             assert context["discovery_mode"] == "global"
             assert {profile.source_id for profile in provider_profiles} == {"A", "B"}
-            assert all(profile.evidence_anchors for profile in provider_profiles)
-            assert context["max_inferred_pairs"] == 72
+            assert all(not profile.evidence_anchors for profile in provider_profiles)
+            assert context["max_inferred_pairs"] == 64
             assert context["reserved_bridge_fraction"] == 0.4
             assert "literature_positions" in context
             assert "existing_graph_neighbors" not in context
@@ -462,15 +480,25 @@ def test_general_and_bridge_discovery_use_separate_candidate_pools(
         provider_profiles: Sequence[Any],
         context: Mapping[str, Any],
     ) -> Mapping[str, Any]:
+        if stage == "relationship_bridge_shard_selection":
+            return {
+                "shard_pairs": [
+                    {
+                        "left_shard_id": "collection-mediation",
+                        "right_shard_id": "collection-relapse",
+                        "bridge_family": "conflict management",
+                        "target_candidate_count": 12,
+                    }
+                ]
+            }
         if stage == "relationship_candidate_selection":
             assert context["discovery_mode"] == "global"
-            assert context["max_inferred_pairs"] == 72
+            assert context["max_inferred_pairs"] == 64
             return {"candidates": []}
         assert stage == "relationship_bridge_candidate_selection"
         assert context["discovery_mode"] == "bridge_only"
-        assert context["max_inferred_pairs"] == 32
-        assert context["bridge_orientation"] in {"forward", "reverse"}
-        assert len(context["oriented_literature_pairs"]) == 1
+        assert context["max_inferred_pairs"] == 96
+        assert len(context["bridge_jobs"]) == 1
         assert provider_profiles == []
         assert {
             row["literature_id"] for row in context["collection_index_cards"]
@@ -483,11 +511,14 @@ def test_general_and_bridge_discovery_use_separate_candidate_pools(
         return {"candidates": []}
 
     calls = _Calls(handler)
-    result = _run(tmp_path, profiles, calls)
+    result = _run(
+        tmp_path, profiles, calls, reasoner=_BridgeRoutedReasoner()
+    )
 
     assert {
         stage for stage, _key, _context in calls.seen
     } == {
+        "relationship_bridge_shard_selection",
         "relationship_candidate_selection",
         "relationship_bridge_candidate_selection",
     }
@@ -496,20 +527,13 @@ def test_general_and_bridge_discovery_use_separate_candidate_pools(
         for stage, _key, context in calls.seen
         if stage == "relationship_bridge_candidate_selection"
     ]
-    assert {row["bridge_orientation"] for row in bridge_contexts} == {
-        "forward",
-        "reverse",
-    }
-    assert {
-        (
-            row["focal_literature_id"],
-            tuple(row["comparison_literature_ids"]),
-        )
-        for row in bridge_contexts
-    } == {
-        ("mediation", ("relapse",)),
-        ("relapse", ("mediation",)),
-    }
+    assert len(bridge_contexts) == 1
+    assert bridge_contexts[0]["bridge_jobs"][0]["left_shard_id"] == (
+        "collection-mediation"
+    )
+    assert bridge_contexts[0]["bridge_jobs"][0]["right_shard_id"] == (
+        "collection-relapse"
+    )
     assert result["pair_job_count"] == 0
 
 
@@ -543,13 +567,13 @@ def test_multi_collection_bridge_packet_preserves_every_routed_pair(
         if stage == "relationship_bridge_shard_selection":
             return {
                 "shard_pairs": [
-                    {
-                        "left_shard_id": "shard-one",
-                        "right_shard_id": "shard-two",
-                    },
-                    {
-                        "left_shard_id": "shard-three",
-                        "right_shard_id": "shard-four",
+                        {
+                            "left_shard_id": "collection-one",
+                            "right_shard_id": "collection-two",
+                        },
+                        {
+                            "left_shard_id": "collection-three",
+                            "right_shard_id": "collection-four",
                     },
                 ]
             }
@@ -571,20 +595,18 @@ def test_multi_collection_bridge_packet_preserves_every_routed_pair(
         if stage == "relationship_bridge_candidate_selection"
     ]
 
-    assert len(contexts) == 2
+    assert len(contexts) == 1
     assert {
         (
-            row["focal_literature_id"],
-            row["comparison_literature_id"],
+            row["left_shard_id"],
+            row["right_shard_id"],
         )
         for context in contexts
-        for row in context["oriented_literature_pairs"]
-    } == {
-        ("one", "two"),
-        ("two", "one"),
-        ("three", "four"),
-        ("four", "three"),
-    }
+        for row in context["bridge_jobs"]
+        } == {
+            ("collection-one", "collection-two"),
+            ("collection-three", "collection-four"),
+        }
 
 
 def test_multi_packet_discovery_reserves_actual_call_count(
@@ -629,12 +651,12 @@ def test_multi_packet_discovery_reserves_actual_call_count(
             return {
                 "shard_pairs": [
                     {
-                        "left_shard_id": "shard-one",
-                        "right_shard_id": "shard-two",
+                            "left_shard_id": "collection-one",
+                            "right_shard_id": "collection-two",
                     },
                     {
-                        "left_shard_id": "shard-three",
-                        "right_shard_id": "shard-four",
+                            "left_shard_id": "collection-three",
+                            "right_shard_id": "collection-four",
                     },
                 ]
             }
@@ -658,11 +680,13 @@ def test_multi_packet_discovery_reserves_actual_call_count(
         if "candidate_selection" in stage
     ]
 
-    assert len(candidate_contexts) == 5
-    assert {
-        context["max_inferred_pairs"] for context in candidate_contexts
-    } == {12, 18}
-    assert calls.cumulative_provider_calls == 6
+    assert len(candidate_contexts) == 3
+    assert candidate_contexts[0]["max_inferred_pairs"] <= 64
+    assert all(
+        context["max_inferred_pairs"] <= 96
+        for context in candidate_contexts[1:]
+    )
+    assert calls.cumulative_provider_calls == 4
     assert not any(
         row.get("reason") == "relationship_discovery_budget_conflict"
         for row in result["parked"]
@@ -802,15 +826,24 @@ def test_more_than_two_literatures_use_existing_bridge_shard_router(
                 }
                 for source_id in ("A", "B", "C")
             ],
-            "shards": [
+                "shards": [
                 {
                     "shard_id": f"shard-{source_id.lower()}",
                     "literature_id": f"lit-{source_id.lower()}",
                     "source_ids": [source_id],
                     "routing_card": {"title": f"Literature {source_id}"},
                 }
-                for source_id in ("A", "B", "C")
-            ],
+                    for source_id in ("A", "B", "C")
+                ],
+                "virtual_shards": [
+                    {
+                        "shard_id": f"shard-{source_id.lower()}",
+                        "topic_id": f"lit-{source_id.lower()}",
+                        "source_ids": [source_id],
+                        "routing_card": {"title": f"Literature {source_id}"},
+                    }
+                    for source_id in ("A", "B", "C")
+                ],
         },
     )
 
@@ -910,6 +943,7 @@ def test_endpoint_owned_profile_anchor_need_not_be_preselected() -> None:
             "left": [left.evidence_anchors[0].to_dict()],
             "right": [right.evidence_anchors[0].to_dict()],
         },
+        output_contract="relationship-decision-v6",
     )
     decision = _decision(job.to_dict())
     decision["left_evidence_anchor_ids"] = [extra.evidence_anchor_id]
@@ -1445,16 +1479,18 @@ def test_large_catalogue_routes_to_selected_shards_before_discovery(
             assert {
                 profile.source_id for profile in provider_profiles
             } == {"S000", "S001"}
-            assert all(profile.evidence_anchors for profile in provider_profiles)
+            assert all(not profile.evidence_anchors for profile in provider_profiles)
             return {"candidates": [_candidate("S000", "S001")]}
         return {"decisions": [_decision(context["pair_jobs"][0])]}
 
     calls = _Calls(handler)
+    reasoner = _RoutedReasoner()
+    reasoner.context_window_tokens = 10_000
     result = _run(
         tmp_path,
         profiles,
         calls,
-        reasoner=_RoutedReasoner(),
+        reasoner=reasoner,
         catalogue=catalogue,
     )
 

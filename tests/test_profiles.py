@@ -9,7 +9,12 @@ import pytest
 import yaml
 
 from auto_zettelkasten import profiles
-from auto_zettelkasten.models import EvidenceAnchor, EvidenceFinding, EvidenceProfile
+from auto_zettelkasten.models import (
+    EvidenceAnchor,
+    EvidenceFinding,
+    EvidenceProfile,
+    _canonicalize_anchor_ids,
+)
 from auto_zettelkasten.notes import (
     parse_atomic_note,
     render_atomic_note,
@@ -60,6 +65,57 @@ def test_actor_position_labels_are_not_misread_as_page_locators() -> None:
     assert profiles._first_locator("Positions P3 and P5 diverged") == ""
     assert profiles._first_locator("See p. 3 and pp. 5-7") == "p. 3; pp. 5-7"
     assert profiles._first_locator("See pages 12-14") == "pages 12-14"
+
+
+def test_canonical_anchor_collision_rebinds_nested_ids() -> None:
+    anchors = [
+        EvidenceAnchor.from_dict(
+            {
+                "source_id": "source-a",
+                "evidence_role": "associational",
+                "claim": f"Claim {index}",
+                "locator": "p. 10",
+                "magnitude": magnitude,
+                "source_locators": [
+                    {
+                        "locator_id": f"locator-{index}",
+                        "source_id": "source-a",
+                        "evidence_anchor_id": "stale-anchor",
+                        "locator_type": "page",
+                        "value": "10",
+                        "page_start": 10,
+                        "page_end": 10,
+                        "source_native": True,
+                        "supports_strong_assertion": True,
+                    }
+                ],
+                "quantitative_result": {
+                    "quantitative_result_id": f"result-{index}",
+                    "source_id": "source-a",
+                    "evidence_anchor_id": "stale-anchor",
+                    "statistic": magnitude,
+                    "provenance": "unknown",
+                },
+            }
+        )
+        for index, magnitude in enumerate(("0.2", "0.4"), start=1)
+    ]
+
+    canonical = _canonicalize_anchor_ids(anchors)
+
+    assert len(canonical) == 2
+    assert len({anchor.evidence_anchor_id for anchor in canonical}) == 2
+    assert all(
+        locator.evidence_anchor_id == anchor.evidence_anchor_id
+        for anchor in canonical
+        for locator in anchor.source_locators
+    )
+    assert all(
+        anchor.quantitative_result is not None
+        and anchor.quantitative_result.evidence_anchor_id
+        == anchor.evidence_anchor_id
+        for anchor in canonical
+    )
 
 
 def test_central_contribution_gets_a_locator_matched_conceptual_anchor() -> None:

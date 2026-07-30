@@ -139,36 +139,33 @@ def test_vertical_slice_matches_golden_and_builds_obsidian_graph(
     assert len(list((export_root / "Indexes").glob("Literature Map - *.md"))) == 1
 
 
-def test_missing_attachment_becomes_limited_and_duplicate_is_parked(
+def test_missing_attachment_becomes_limited_and_duplicate_becomes_alias(
     tmp_path: Path, sample_items
 ) -> None:
     items = [sample_items[0], sample_items[0], sample_items[1]]
+    reader = FakeReader()
     report = run_map(
         MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=1),
         client=FakeZotero(items, missing={"ITEMB"}),
-        reader=FakeReader(),
+        reader=reader,
         run_id="coverage-run",
     )
     assert report.inventory_count == 3
     assert report.terminal_count == 3
     assert report.validated_note_count == 1
     assert report.limited_note_count == 1
-    assert report.parked_for_review_count == 1
-    reasons = {
-        row["reason"]
-        for row in report.items
-        if row["terminal_status"] == "parked_for_review"
-    }
-    assert reasons == {"duplicate_zotero_item_key"}
+    assert report.duplicate_alias_count == 1
+    assert report.parked_for_review_count == 0
+    assert reader.calls == 1
     assert [row["terminal_status"] for row in report.source_set["rows"]] == [
         "validated_note",
-        "parked_for_review",
+        "duplicate_alias",
         "limited_note",
     ]
     attempts = (
         tmp_path / "01_custody" / "read_attempts" / "coverage-run.jsonl"
     ).read_text()
-    assert "duplicate_zotero_item_key" in attempts
+    assert "duplicate_alias_of:ITEMA" in attempts
     assert "metadata_only" in attempts
 
 
@@ -345,7 +342,7 @@ def test_untagged_source_can_commit_without_creating_cluster(
     assert report.cluster_map["clusters"] == []
 
 
-def test_note_filename_collision_gets_stable_non_overwriting_suffix(
+def test_duplicate_work_identity_reuses_one_canonical_note(
     tmp_path: Path, sample_items
 ) -> None:
     collision = {
@@ -360,13 +357,51 @@ def test_note_filename_collision_gets_stable_non_overwriting_suffix(
         run_id="collision",
     )
     assert report.inventory_count == report.terminal_count == 2
-    assert report.validated_note_count == 2
+    assert report.validated_note_count == 1
+    assert report.duplicate_alias_count == 1
     assert report.exhausted_count == 0
     names = sorted(
         path.name for path in (tmp_path / "02_source_memory" / "notes").glob("*.md")
     )
-    assert len(names) == 2
-    assert any("[other]" in name or "[itema]" in name for name in names)
+    assert len(names) == 1
+    note = read_note(next((tmp_path / "02_source_memory" / "notes").glob("*.md")))
+    assert note["frontmatter"]["canonical_zotero_key"] == "ITEMA"
+    assert note["frontmatter"]["zotero_item_keys"] == ["ITEMA", "OTHER"]
+
+
+def test_alias_only_collection_source_set_includes_canonical_note(
+    tmp_path: Path, sample_items
+) -> None:
+    canonical = run_map(
+        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        client=FakeZotero(sample_items[:1]),
+        reader=FakeReader(),
+        run_id="canonical",
+    )
+    alias = {
+        **sample_items[0],
+        "key": "OTHER",
+        "data": {**sample_items[0]["data"], "key": "OTHER"},
+    }
+    reader = FakeReader()
+
+    report = run_map(
+        MapRequest(
+            tmp_path,
+            scope="collection",
+            collection_key="ALIASES",
+            provider="ollama",
+            model="fake-1",
+        ),
+        client=FakeZotero([alias]),
+        reader=reader,
+        run_id="alias-only",
+    )
+
+    assert reader.calls == 0
+    assert report.duplicate_alias_count == 1
+    assert report.source_set["source_ids"] == [canonical.items[0]["source_id"]]
+    assert len(report.source_set["rows"]) == 1
 
 
 def test_question_is_only_a_projection_lens_but_metadata_and_reader_remain_in_fingerprint(

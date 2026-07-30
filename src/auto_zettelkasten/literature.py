@@ -79,7 +79,7 @@ GAP_RULES = (
 LITERATURE_ALGORITHM_VERSION = "36"
 CLUSTER_PLAN_PROMPT_VERSION = "5"
 CLUSTER_PROPOSAL_PROMPT_VERSION = "17"
-CLUSTER_SYNTHESIS_PROMPT_VERSION = "28"
+CLUSTER_SYNTHESIS_PROMPT_VERSION = "29"
 GAP_REASONING_PROMPT_VERSION = "12"
 ANCHOR_ALGORITHM_VERSION = "3"
 SUPPORT_ENVELOPE_VERSION = "2"
@@ -18849,7 +18849,6 @@ def build_literature_report(
     deterministic_debates = build_debate_registry(
         normalized, registry["clusters"], policy=policy
     )
-    matrix_by_cluster = {str(row["cluster_id"]): row for row in matrices}
     deterministic_debate_by_cluster = {
         str(row["cluster_id"]): row for row in deterministic_debates["assessments"]
     }
@@ -19445,9 +19444,6 @@ def build_literature_report(
         deterministic_debates = build_debate_registry(
             normalized, registry["clusters"], policy=policy
         )
-        matrix_by_cluster = {
-            str(row["cluster_id"]): row for row in matrices
-        }
         deterministic_debate_by_cluster = {
             str(row["cluster_id"]): row
             for row in deterministic_debates["assessments"]

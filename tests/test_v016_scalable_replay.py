@@ -136,6 +136,35 @@ def test_relationship_packet_deduplicates_shared_source_documents() -> None:
     assert all("atomic_notes" not in row for row in packet["pair_jobs"])
 
 
+def test_v7_relationship_packet_deduplicates_shared_source_evidence() -> None:
+    def job(left: str, right: str) -> RelationshipPairJob:
+        return RelationshipPairJob(
+            left_source_id=left,
+            right_source_id=right,
+            profiles={"left": {"source_id": left}, "right": {"source_id": right}},
+            atomic_notes={
+                "left": {"source_id": left, "markdown": f"# {left}"},
+                "right": {"source_id": right, "markdown": f"# {right}"},
+            },
+            selected_evidence={
+                "left": [{"evidence_anchor_id": f"anchor-{left.lower()}"}],
+                "right": [{"evidence_anchor_id": f"anchor-{right.lower()}"}],
+            },
+            output_contract="relationship-decision-v7",
+        )
+
+    packet = _relationship_transport_context(
+        [job("A", "B"), job("A", "C")],
+        decision_contract="relationship-decision-v7",
+    )
+
+    assert list(packet["source_evidence"]) == ["A", "B", "C"]
+    assert packet["source_evidence"]["A"] == [
+        {"evidence_anchor_id": "anchor-a"}
+    ]
+    assert all("selected_evidence" not in row for row in packet["pair_jobs"])
+
+
 def test_pair_context_changes_relationship_job_identity() -> None:
     common = {
         "left_source_id": "A",
@@ -187,6 +216,8 @@ def test_contextual_relationship_has_an_explicit_non_direct_tier() -> None:
         inverse_label="is contextually connected to",
         comparison_proposition="Together they frame a broader conflict process.",
         reason="They concern adjacent stages but do not test the same proposition.",
+        left_endpoint_claim="Claim A",
+        right_endpoint_claim="Claim B",
         left_evidence_anchor_ids=["anchor-a"],
         right_evidence_anchor_ids=["anchor-b"],
     )
@@ -228,10 +259,12 @@ def test_contextual_relationship_projects_reciprocally(tmp_path: Path) -> None:
                 job.pair_job_id: {
                     "decision": "relationship",
                     "relation_type": "contextual_connection",
-                    "comparison_proposition": "The studies concern adjacent stages.",
-                    "reason": "Useful context without a shared tested proposition.",
-                    "left_evidence_anchor_ids": ["anchor-a"],
-                    "right_evidence_anchor_ids": ["anchor-b"],
+                        "comparison_proposition": "The studies concern adjacent stages.",
+                        "reason": "Useful context without a shared tested proposition.",
+                        "left_endpoint_claim": "Claim A",
+                        "left_evidence_anchor_id": "anchor-a",
+                        "right_endpoint_claim": "Claim B",
+                        "right_evidence_anchor_id": "anchor-b",
                 }
             }
         },

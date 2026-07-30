@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import re
 from pathlib import Path
 import urllib.error
 import urllib.parse
@@ -273,6 +274,15 @@ def normalize_collection_snapshot(
         parent_key = str(data.get("parentItem") or "").strip()
         parent_raw = parents.get(parent_key, {}) if parent_key else {}
         parent_metadata = _parent_metadata(parent_raw) if parent_raw else {}
+        identity_metadata = parent_metadata or {
+            "title": str(data.get("title") or ""),
+            "creators": _stable_value(data.get("creators", []) or []),
+            "date": str(data.get("date") or ""),
+            "doi": str(data.get("DOI") or data.get("doi") or ""),
+            "isbn": str(data.get("ISBN") or data.get("isbn") or ""),
+            "url": str(data.get("url") or ""),
+            "relations": _stable_value(data.get("relations", {}) or {}),
+        }
         content = {
             key_name: _stable_value(value)
             for key_name, value in data.items()
@@ -291,6 +301,21 @@ def normalize_collection_snapshot(
                 }
             ),
             "parent_metadata": parent_metadata,
+            "identity": {
+                "title": str(identity_metadata.get("title") or ""),
+                "creators": _stable_value(
+                    identity_metadata.get("creators", []) or []
+                ),
+                "year": _publication_year(
+                    str(identity_metadata.get("date") or "")
+                ),
+                "doi": str(identity_metadata.get("doi") or ""),
+                "isbn": str(identity_metadata.get("isbn") or ""),
+                "url": str(identity_metadata.get("url") or ""),
+                "relations": _stable_value(
+                    identity_metadata.get("relations", {}) or {}
+                ),
+            },
         }
         normalized_items.append(
             {
@@ -301,7 +326,7 @@ def normalize_collection_snapshot(
     normalized_items.sort(key=lambda row: row["key"])
 
     semantic_snapshot = {
-        "schema_version": "1",
+        "schema_version": "2",
         "collections": normalized_collections,
         "items": normalized_items,
     }
@@ -457,7 +482,14 @@ def _parent_metadata(raw: Mapping[str, Any]) -> dict[str, Any]:
         "publisher": str(data.get("publisher") or ""),
         "doi": str(data.get("DOI") or ""),
         "isbn": str(data.get("ISBN") or ""),
+        "url": str(data.get("url") or ""),
+        "relations": _stable_value(data.get("relations", {}) or {}),
     }
+
+
+def _publication_year(value: str) -> str:
+    match = re.search(r"(?:19|20)\d{2}", value)
+    return match.group(0) if match else ""
 
 
 def _rows_by_key(value: Any) -> dict[str, Mapping[str, Any]]:

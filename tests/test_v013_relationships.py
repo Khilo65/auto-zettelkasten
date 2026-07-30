@@ -11,6 +11,7 @@ from auto_zettelkasten.literature import (
 from auto_zettelkasten.models import RelationshipPairJob
 from auto_zettelkasten.readers import (
     RELATIONSHIP_MAX_OUTPUT_TOKENS,
+    _relationship_adjudication_system_prompt,
     _relationship_candidate_system_prompt,
     _validate_relationship_response,
 )
@@ -30,13 +31,96 @@ def test_relationship_discovery_uses_lean_recall_first_prompt() -> None:
     assert "optimize recall" in prompt
     assert "not a published relationship" in prompt
     assert "max_inferred_pairs" in prompt
-    assert "bridge_orientation" in prompt
-    assert "Target 24 to 32" in prompt
+    assert "bridge_job_id" in prompt
+    assert "target_candidate_count" in prompt
     assert "left_source_id" in prompt
     assert "right_source_id" in prompt
     assert "why_compare" in prompt
     assert "evidence_anchor_ids" not in prompt
     assert RELATIONSHIP_MAX_OUTPUT_TOKENS == 128_000
+
+
+def test_v7_relationship_requires_claim_owned_primary_anchor_per_endpoint() -> None:
+    profiles = {source_id: _profile(source_id) for source_id in ("A", "B")}
+    job = RelationshipPairJob(
+        left_source_id="A",
+        right_source_id="B",
+        profiles={"left": profiles["A"], "right": profiles["B"]},
+        selected_evidence={
+            "left": [profiles["A"]["evidence_anchors"][0]],
+            "right": [profiles["B"]["evidence_anchors"][0]],
+        },
+    )
+    result = validate_relationship_decision_rows(
+        {
+            "decisions": {
+                job.pair_job_id: {
+                    "decision": "relationship",
+                    "relation_type": "qualifies",
+                    "actor_source_id": "A",
+                    "reference_source_id": "B",
+                    "comparison_proposition": "A narrows B's bounded claim.",
+                    "left_endpoint_claim": "Claim A",
+                    "left_evidence_anchor_id": "anchor-a",
+                    "right_endpoint_claim": "Claim B",
+                    "right_evidence_anchor_id": "anchor-b",
+                    "reason": "The endpoint claims establish the qualification.",
+                    "boundary_or_qualification": "The qualification applies to one case.",
+                    "confidence": "high",
+                }
+            }
+        },
+        jobs=[job],
+        profiles=list(profiles.values()),
+    )
+
+    assert result["parked"] == []
+    assert result["accepted"][0]["left_endpoint_claim"] == "Claim A"
+    assert result["accepted"][0]["left_evidence_anchor_ids"] == ["anchor-a"]
+    prompt = _relationship_adjudication_system_prompt()
+    assert "left_endpoint_claim" in prompt
+    assert "left_evidence_anchor_id" in prompt
+
+
+def test_v7_contextual_decision_shorthand_is_normalized() -> None:
+    profiles = {source_id: _profile(source_id) for source_id in ("A", "B")}
+    job = RelationshipPairJob(
+        left_source_id="A",
+        right_source_id="B",
+        profiles={"left": profiles["A"], "right": profiles["B"]},
+        selected_evidence={
+            "left": [profiles["A"]["evidence_anchors"][0]],
+            "right": [profiles["B"]["evidence_anchors"][0]],
+        },
+    )
+
+    result = validate_relationship_decision_rows(
+        {
+            "decisions": {
+                job.pair_job_id: {
+                    "decision": "contextual_connection",
+                    "actor_source_id": "A",
+                    "reference_source_id": "B",
+                    "comparison_proposition": "The works illuminate adjacent stages.",
+                    "left_endpoint_claim": "Claim A",
+                    "left_evidence_anchor_id": "anchor-a",
+                    "right_endpoint_claim": "Claim B",
+                    "right_evidence_anchor_id": "anchor-b",
+                    "reason": "Joint reading is useful despite distinct propositions.",
+                    "boundary_or_qualification": "The outcomes differ.",
+                    "confidence": "medium",
+                }
+            }
+        },
+        jobs=[job],
+        profiles=list(profiles.values()),
+    )
+
+    assert result["parked"] == []
+    assert result["accepted"][0]["relation_type"] == "contextual_connection"
+    assert result["accepted"][0]["contract_warnings"] == [
+        "normalized_contextual_decision_shorthand"
+    ]
 
 
 def test_v6_keyed_provider_envelope_normalizes_to_rows() -> None:
@@ -134,6 +218,7 @@ def _job(left: str, right: str) -> RelationshipPairJob:
             "left": [profiles[left]["evidence_anchors"][0]],
             "right": [profiles[right]["evidence_anchors"][0]],
         },
+        output_contract="relationship-decision-v6",
     )
 
 

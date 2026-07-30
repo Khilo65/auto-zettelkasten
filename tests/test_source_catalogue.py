@@ -97,13 +97,15 @@ def test_build_source_catalogue_projects_profiles_into_collection_shards(tmp_pat
     assert result["source_count"] == 2
     assert result["literature_count"] == 2
     assert result["shard_count"] == 2
-    assert SOURCE_CATALOGUE_SCHEMA_VERSION == "4"
-    assert catalogue["schema_version"] == "4"
-    assert cluster_catalogue["schema_version"] == "4"
+    assert SOURCE_CATALOGUE_SCHEMA_VERSION == "5"
+    assert catalogue["schema_version"] == "5"
+    assert cluster_catalogue["schema_version"] == "5"
     assert catalogue["revision_hash"] == result["revision_hash"]
     assert {row["title"] for row in catalogue["literatures"]} == {"Mediation", "Conflict relapse"}
     assert all(len(row["facets"]) <= 3 for row in catalogue["sources"])
     assert all(row["cluster_ids"] == ["cluster-bridge"] for row in catalogue["sources"])
+    assert all(row["navigation"]["title"] == row["title"] for row in catalogue["sources"])
+    assert all(row["identity"]["year"] == row["year"] for row in catalogue["sources"])
     master = Path(result["master_index_path"]).read_text(encoding="utf-8")
     assert "Mediation (1)" in master
     assert "Conflict relapse (1)" in master
@@ -137,7 +139,7 @@ def test_build_source_catalogue_upgrades_schema_two_locally_and_replays_stably(
     upgraded_bytes = catalogue_path.read_bytes()
     replay = build_source_catalogue(tmp_path, [profile], [note])
 
-    assert yaml.safe_load(upgraded_bytes)["schema_version"] == "4"
+    assert yaml.safe_load(upgraded_bytes)["schema_version"] == "5"
     assert str(catalogue_path) in upgraded["changed_paths"]
     assert replay["changed_paths"] == []
     assert catalogue_path.read_bytes() == upgraded_bytes
@@ -188,7 +190,7 @@ def test_build_source_catalogue_is_byte_stable_and_rewrites_only_changed_shard(t
     assert "INDEX.md" in changed_names
 
 
-def test_refresh_pending_does_not_invalidate_relationship_routing(
+def test_downstream_graph_outputs_do_not_invalidate_relationship_routing(
     tmp_path: Path,
 ) -> None:
     source_id = "source-zotero-abcd1234"
@@ -221,12 +223,43 @@ def test_refresh_pending_does_not_invalidate_relationship_routing(
         tmp_path,
         [profile],
         [note],
-        [{**cluster, "refresh_pending": True}],
+        [
+            {
+                **cluster,
+                "cluster_id": "cluster-b",
+                "shared_question": "A completely different downstream synthesis.",
+                "refresh_pending": True,
+            }
+        ],
+    )
+    typed_links = tmp_path / "02_source_memory" / "indexes" / "typed_links.yml"
+    typed_links.write_text(
+        yaml.safe_dump(
+            {
+                "links": [
+                    {
+                        "relation_id": "relationship-new",
+                        "source_id": source_id,
+                        "target_source_id": "source-zotero-efgh5678",
+                        "relation_type": "supports",
+                        "confidence": 0.9,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    third = build_source_catalogue(
+        tmp_path,
+        [profile],
+        [note],
+        [],
     )
     catalogue = yaml.safe_load(Path(second["catalogue_path"]).read_text())
 
     assert second["revision_hash"] != first["revision_hash"]
     assert second["routing_revision_hash"] == first["routing_revision_hash"]
+    assert third["routing_revision_hash"] == first["routing_revision_hash"]
     assert catalogue["sources"][0]["zotero_key"] == "ABCD1234"
 
 
@@ -271,3 +304,102 @@ def test_large_catalogue_uses_bounded_unique_shards_and_prunes_stale_files(
     collapsed = build_source_catalogue(tmp_path, profiles[:2], notes[:2])
     assert collapsed["shard_count"] == 1
     assert all(not path.exists() for path in old_shards - {Path(collapsed["shard_paths"][0])})
+
+
+def test_catalogue_exposes_machine_identity_without_rendering_it_to_navigation_shards(
+    tmp_path: Path,
+) -> None:
+    note = {
+        **_note(
+            "source-zotero-abcd1234",
+            "n1",
+            "Mediation and Peace",
+            "Fortna",
+            "Monitoring reduces uncertainty.",
+        ),
+        "zotero_item_key": "ABCD1234",
+        "zotero_item_keys": ["ABCD1234", "WXYZ9876"],
+        "DOI": "10.1234/Example",
+        "ISBN": "978-1-23456-789-0",
+        "url": "https://example.test/study",
+        "zotero_relations": {"dc:relation": ["WXYZ9876"]},
+    }
+    result = build_source_catalogue(
+        tmp_path,
+        [
+            {
+                "source_id": "source-zotero-abcd1234",
+                "note_id": "n1",
+                "mechanisms": ["monitoring"],
+                "outcomes": ["peace duration"],
+            }
+        ],
+        [note],
+    )
+    catalogue = yaml.safe_load(Path(result["catalogue_path"]).read_text())
+    source = catalogue["sources"][0]
+
+    assert source["identity"] == {
+        "canonical_zotero_key": "ABCD1234",
+        "zotero_item_keys": ["ABCD1234", "WXYZ9876"],
+        "doi": "10.1234/example",
+        "isbn": "9781234567890",
+        "url": "https://example.test/study",
+        "normalized_title": "mediation and peace",
+        "normalized_author_surnames": ["fortna"],
+        "year": "2024",
+        "zotero_relations": {"dc:relation": ["WXYZ9876"]},
+    }
+    assert source["navigation"]["thesis"] == source["thesis"]
+    rendered = "\n".join(
+        Path(path).read_text(encoding="utf-8")
+        for path in [*result["shard_paths"], *result["virtual_shard_paths"]]
+    )
+    assert "10.1234/example" not in rendered
+    assert "9781234567890" not in rendered
+
+
+def test_virtual_topic_indexes_are_bounded_overlapping_and_replay_stable(
+    tmp_path: Path,
+) -> None:
+    profiles = [
+        {
+            "source_id": f"s{index}",
+            "note_id": f"n{index}",
+            "concepts": concepts,
+            "mechanisms": mechanisms,
+            "outcomes": outcomes,
+        }
+        for index, concepts, mechanisms, outcomes in (
+            (1, ["peacekeeping"], ["monitoring"], ["peace duration"]),
+            (2, ["peacekeeping"], ["monitoring"], ["peace duration"]),
+            (3, ["recurrence"], ["commitment problems"], ["peace duration"]),
+            (4, ["recurrence"], ["commitment problems"], ["peace duration"]),
+            (5, ["conflict"], [], []),
+        )
+    ]
+    notes = [
+        _note(f"s{index}", f"n{index}", f"Study {index}", f"Author{index}", f"Thesis {index}.")
+        for index in range(1, 6)
+    ]
+
+    first = build_source_catalogue(tmp_path, profiles, notes)
+    catalogue = yaml.safe_load(Path(first["catalogue_path"]).read_text())
+    virtual_paths = [Path(path) for path in first["virtual_shard_paths"]]
+    memberships = {
+        row["source_id"]: row["navigation"]["virtual_topic_ids"]
+        for row in catalogue["sources"]
+    }
+
+    assert first["virtual_shard_count"] >= 4
+    assert all(path.parent.name == "by_topic" for path in virtual_paths)
+    assert all(path.stat().st_size <= 36_000 for path in virtual_paths)
+    assert 1 < len(memberships["s1"]) <= 3
+    assert memberships["s5"] == ["topic-catch-all"]
+    assert not any("conflict" in path.stem for path in virtual_paths)
+    assert Path(first["virtual_index_path"]).is_file()
+
+    before = {path: path.read_bytes() for path in virtual_paths}
+    replay = build_source_catalogue(tmp_path, profiles, notes)
+    assert replay["changed_paths"] == []
+    assert {path: path.read_bytes() for path in virtual_paths} == before

@@ -105,6 +105,10 @@ def test_normalize_and_diff_complete_collection_snapshot() -> None:
     )
 
     assert replay == first
+    assert first["schema_version"] == "2"
+    assert first["items"][0]["identity"]["title"] == "Direct parent source"
+    assert first["items"][1]["identity"]["title"] == "Canonical parent title"
+    assert first["items"][1]["identity"]["year"] == "2020"
     assert first["items"][1]["collection_keys"] == ["CHILD", "PARENT"]
     assert first["items"][1]["parent_metadata"]["title"] == "Canonical parent title"
 

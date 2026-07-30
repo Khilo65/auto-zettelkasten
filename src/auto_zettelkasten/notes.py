@@ -95,7 +95,7 @@ GRAPH_END_MARKER = "<!-- auto-zettelkasten:graph:end -->"
 LITERATURE_HEADING = "## Position in the Literature"
 LITERATURE_START_MARKER = "<!-- auto-zettelkasten:literature:start -->"
 LITERATURE_END_MARKER = "<!-- auto-zettelkasten:literature:end -->"
-NOTE_METADATA_SCHEMA_VERSION = "1"
+NOTE_METADATA_SCHEMA_VERSION = "2"
 REQUIRED_LIMITED_FRONTMATTER = (REQUIRED_FRONTMATTER - {"reader_provider", "reader_model"}) | {
     "source_scope",
     "source_coverage",

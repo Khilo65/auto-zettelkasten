@@ -14,14 +14,17 @@ from auto_zettelkasten.models import (
     SourceAnalysisBundle,
 )
 from auto_zettelkasten.api import run_map
-from auto_zettelkasten.files import read_yaml
+from auto_zettelkasten.files import read_yaml, write_yaml
 from auto_zettelkasten.notes import read_note
 from auto_zettelkasten.pipeline import (
     _ProfileProviderBudget,
     _commit_literature_memory,
     _commit_remediation_ledgers,
+    _literature_position_relations,
     _match_literature_position,
+    _match_literature_position_detail,
     _read_document,
+    _recover_saved_source_bundle,
     _source_bundle_from_result,
 )
 from auto_zettelkasten.readers import (
@@ -31,6 +34,40 @@ from auto_zettelkasten.readers import (
 )
 
 from conftest import FakeZotero
+
+
+def test_resolved_literature_position_projects_cites_and_cited_by(
+    tmp_path,
+) -> None:
+    write_yaml(
+        tmp_path
+        / "02_source_memory"
+        / "indexes"
+        / "literature_positions.yml",
+        {
+            "positions": [
+                {
+                    "literature_position_id": "position-a-b",
+                    "current_source_id": "source-a",
+                    "matched_source_id": "source-b",
+                    "engagement": "A uses B's result.",
+                    "locator": "p. 4",
+                }
+            ]
+        },
+    )
+    relations = _literature_position_relations(
+        tmp_path,
+        [
+            EvidenceProfile(source_id="source-a", note_id="note-a"),
+            EvidenceProfile(source_id="source-b", note_id="note-b"),
+        ],
+    )
+
+    assert [(row["source_id"], row["target_source_id"], row["relation_type"]) for row in relations] == [
+        ("source-a", "source-b", "cites"),
+        ("source-b", "source-a", "cited_by"),
+    ]
 
 
 def _bundle_payload() -> dict:
@@ -140,6 +177,121 @@ def test_source_bundle_envelope_recovery_is_unambiguous_and_source_owned() -> No
         )
 
 
+def test_source_bundle_conservative_yaml_recovery_uses_local_identity() -> None:
+    recovered = _parse_source_bundle_response(
+        """
+analysis_sections:
+  thesis: Monitoring changes implementation.
+  method_and_research_design: Comparative qualitative analysis.
+  evidence_and_data: 1093 dyad-years.
+  detailed_findings: Monitoring is associated with implementation.
+compact_profile:
+  thesis: Monitoring changes implementation.
+  method_or_knowledge_basis: Comparative qualitative analysis.
+evidence_anchors:
+  - claim: Monitoring is associated with implementation.
+    locator: p. 12
+    planning_roles: major_finding
+    salience_priority: 10
+    evidence_role: associational
+    support_boundary: Recovered text only.
+literature_positions:
+  - raw_citation: Walter 1997
+    author: Walter
+    year: 1997
+    title: The Critical Barrier to Civil War Settlement
+    identifiers: {}
+    engagement: Builds on the commitment-problem account.
+    relation_label: builds_on
+    locator: p. 4
+observed_bibliographic_identity:
+  title: Observed title
+""",
+        label="bundle",
+        expected_identity={
+            "source_id": "source-zotero-A1",
+            "zotero_key": "A1",
+        },
+    )
+
+    assert recovered["source_identity"] == {
+        "source_id": "source-zotero-A1",
+        "zotero_key": "A1",
+    }
+    assert recovered["bundle_schema_version"] == "1"
+    assert recovered["evidence_anchors"][0]["source_id"] == "source-zotero-A1"
+    assert recovered["evidence_anchors"][0]["evidence_anchor_id"]
+    assert recovered["literature_positions"][0]["year"] == "1997"
+    assert (
+        recovered["literature_positions"][0]["current_source_id"]
+        == "source-zotero-A1"
+    )
+
+
+def test_saved_source_failure_reparses_locally_without_provider_call(
+    tmp_path,
+) -> None:
+    checkpoint = tmp_path / "items" / "A1"
+    checkpoint.mkdir(parents=True)
+    raw = """
+analysis_sections:
+  thesis: Monitoring changes implementation.
+  method_and_research_design: Comparative analysis.
+  evidence_and_data: 1093 dyad-years.
+  detailed_findings: Monitoring is associated with implementation.
+compact_profile:
+  thesis: Monitoring changes implementation.
+  method_or_knowledge_basis: Comparative analysis.
+evidence_anchors: []
+literature_positions: []
+observed_bibliographic_identity: {}
+"""
+    from auto_zettelkasten.files import write_yaml
+
+    write_yaml(
+        checkpoint / "source_failure.yml",
+        {
+            "source_id": "source-zotero-A1",
+            "zotero_item_key": "A1",
+            "fingerprint": "fingerprint-a",
+            "raw_response": raw,
+            "raw_response_hash": "raw-a",
+        },
+    )
+
+    recovered = _recover_saved_source_bundle(
+        checkpoint,
+        source_id="source-zotero-A1",
+        zotero_key="A1",
+        fingerprint="fingerprint-a",
+    )
+
+    assert recovered is not None
+    assert recovered["analysis_sections"]["thesis"]
+    recovery = read_yaml(checkpoint / "source_recovery.yml")
+    assert recovery["provider_calls"] == 0
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "analysis_sections: &sections {thesis: A}\ncopy: *sections\n",
+        "analysis_sections: {thesis: A}\n---\nanalysis_sections: {thesis: B}\n",
+        "analysis_sections: {thesis: A, thesis: B}\n",
+        "!!python/object/apply:os.system ['echo unsafe']\n",
+    ],
+)
+def test_source_bundle_conservative_yaml_recovery_rejects_ambiguous_features(
+    raw: str,
+) -> None:
+    with pytest.raises(ProviderError, match="no complete source-owned"):
+        _parse_source_bundle_response(
+            raw,
+            label="bundle",
+            expected_identity={"source_id": "source-zotero-A1"},
+        )
+
+
 def test_missing_source_memory_retains_retrieval_context_and_strong_ids() -> None:
     recommendation = MissingSourceRecommendation(
         raw_citation="Example report",
@@ -163,6 +315,120 @@ def test_missing_source_memory_retains_retrieval_context_and_strong_ids() -> Non
         )
         == "source-book"
     )
+
+
+def test_berg_style_citations_match_compatible_first_author_surnames() -> None:
+    index = {
+        "by_source_id": {
+            "source-walter": {
+                "source_id": "source-walter",
+                "zotero_key": "WALTER",
+                "title": "committing to peace the successful settlement of civil wars",
+                "author": "walter",
+                "author_surnames": ["walter"],
+                "year": "2002",
+            },
+            "source-hegre": {
+                "source_id": "source-hegre",
+                "zotero_key": "HEGRE",
+                "title": "governance and conflict relapse",
+                "author": "hegre",
+                "author_surnames": ["hegre", "nygard"],
+                "year": "2015",
+            },
+        },
+        "by_zotero_key": {},
+        "by_doi": {},
+        "by_isbn": {},
+        "by_url": {},
+        "known_zotero_items": [],
+    }
+
+    walter = _match_literature_position_detail(
+        {
+            "title": "Committing to Peace: The Successful Settlement of Civil Wars",
+            "author": "Walter, Barbara F.",
+            "year": "2002",
+        },
+        index,
+    )
+    hegre = _match_literature_position_detail(
+        {
+            "title": "Governance and Conflict Relapse",
+            "author": "Håvard Hegre",
+            "year": "2015",
+        },
+        index,
+    )
+
+    assert walter["source_id"] == "source-walter"
+    assert hegre["source_id"] == "source-hegre"
+    assert walter["basis"] == hegre["basis"] == "title_year_first_author"
+
+
+def test_literature_match_distinguishes_known_unmapped_from_absent() -> None:
+    index = {
+        "by_source_id": {},
+        "by_zotero_key": {},
+        "by_doi": {},
+        "by_isbn": {},
+        "by_url": {},
+        "known_zotero_items": [
+            {
+                "zotero_key": "KNOWN",
+                "title": "known report",
+                "author_surnames": ["author"],
+                "year": "2020",
+                "doi": "10.1000/known",
+                "isbn": "",
+                "url": "",
+            }
+        ],
+    }
+
+    known = _match_literature_position_detail(
+        {
+            "title": "Known Report",
+            "author": "Author",
+            "year": "2020",
+            "identifiers": {"doi": "10.1000/known"},
+        },
+        index,
+    )
+    absent = _match_literature_position_detail(
+        {
+            "title": "Absent Report",
+            "author": "Other",
+            "year": "2021",
+        },
+        index,
+    )
+
+    assert known["status"] == "known_zotero_unmapped"
+    assert known["zotero_key"] == "KNOWN"
+    assert absent["status"] == "not_in_snapshot"
+
+
+def test_literature_match_normalizes_doi_urls() -> None:
+    match = _match_literature_position_detail(
+        {"identifiers": {"doi": "https://doi.org/10.1000/KNOWN"}},
+        {
+            "by_source_id": {
+                "source-known": {
+                    "source_id": "source-known",
+                    "zotero_key": "KNOWN",
+                }
+            },
+            "by_zotero_key": {},
+            "by_doi": {"10.1000/known": ["source-known"]},
+            "by_isbn": {},
+            "by_url": {},
+            "known_zotero_items": [],
+        },
+    )
+
+    assert match["source_id"] == "source-known"
+    assert match["basis"] == "doi"
 
 
 def test_remediation_ledgers_record_creator_and_scope_discrepancies(
@@ -274,6 +540,37 @@ def test_bundle_repairs_mechanical_envelope_errors_without_losing_analysis() -> 
         "scope_assessment",
         "self_review",
     }
+
+
+def test_pipeline_does_not_reinsert_rejected_optional_rows() -> None:
+    payload = _bundle_payload()
+    payload["component_diagnostics"] = [
+        {
+            "component": "evidence_anchors",
+            "reason": "invalid_optional_row",
+            "raw": {
+                "source_id": "source-zotero-wrong",
+                "claim": "Malformed row must remain diagnostic only.",
+            },
+        }
+    ]
+
+    bundle = _source_bundle_from_result(
+        payload,
+        {
+            "source_id": "source-zotero-A1",
+            "zotero_item_key": "A1",
+        },
+        "full_document",
+    )
+
+    assert bundle is not None
+    assert [row.claim for row in bundle.evidence_anchors] == [
+        "Monitoring changes implementation."
+    ]
+    assert bundle.component_diagnostics[0]["raw"]["source_id"] == (
+        "source-zotero-wrong"
+    )
 
 
 def test_bundle_normalizes_provider_helper_shapes_without_dropping_rows() -> None:
@@ -927,9 +1224,6 @@ def test_pipeline_normalizes_descriptive_support_envelopes_and_missing_sources()
     payload["component_diagnostics"].extend(
         deepcopy(payload["component_diagnostics"][:2])
     )
-    payload["evidence_anchors"] = []
-    payload["literature_positions"] = []
-    payload["missing_source_recommendations"] = []
 
     bundle = _source_bundle_from_result(
         payload,
@@ -947,11 +1241,9 @@ def test_pipeline_normalizes_descriptive_support_envelopes_and_missing_sources()
     assert envelope.restrictions == ["Observational design"]
     assert envelope.support_status == "supported"
     recommendation = bundle.missing_source_recommendations[0]
-    assert bundle.literature_positions[0].author == "Walter, Barbara"
+    assert bundle.literature_positions[0].author == "Walter"
     assert bundle.literature_positions[0].year == "1997"
-    assert bundle.literature_positions[0].identifiers == {
-        "other": "DOI 10.0000/example"
-    }
+    assert bundle.literature_positions[0].identifiers == {}
     assert recommendation.normalized_citation["title"] == "The Critical Barrier"
     assert recommendation.discussed_by_source_ids == ["source-zotero-A1"]
 

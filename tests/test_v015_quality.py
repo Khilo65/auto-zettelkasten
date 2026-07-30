@@ -54,7 +54,8 @@ def test_source_bundle_prompt_uses_one_shot_statistical_interpretation() -> None
     assert "odds, hazards, risks, and probabilities distinct" in prompt
     assert "Do not convert a logit coefficient or interaction" in prompt
     assert "p-value is not an effect size" in prompt
-    assert "existing self_review object" in prompt
+    assert "Do not return stable IDs" in prompt
+    assert "or a self-review object" in prompt
     assert "another model call" in prompt
     assert "without calculating new ones" not in prompt
 

@@ -126,11 +126,14 @@ from .relationships import (
     stable_hash,
 )
 from .readers import (
+    ProviderError,
     SECTION_KEYS,
+    SOURCE_BUNDLE_ENVELOPE_CONTRACT,
     SOURCE_BUNDLE_MAX_OUTPUT_TOKENS,
     SOURCE_BUNDLE_PROMPT_VERSION,
     SOURCE_CHUNK_MAX_OUTPUT_TOKENS,
     _normalize_source_bundle_payload,
+    _parse_source_bundle_response,
     provider_from_name,
 )
 from .workspace import (
@@ -151,6 +154,9 @@ CHUNKING_VERSION = "2"
 CONTENT_CLASSIFIER_VERSION = "4"
 _RELATIONSHIP_BATCH_MAX_JOBS = 30
 _LEGACY_RELATIONSHIP_BATCH_MAX_JOBS = 8
+_RELATIONSHIP_GENERAL_CANDIDATE_MAX = 64
+_RELATIONSHIP_BRIDGE_CANDIDATE_MAX = 96
+_RELATIONSHIP_CANDIDATE_MAX = 160
 _LITERATURE_MEMORY_LOCK = threading.Lock()
 
 
@@ -537,6 +543,7 @@ class _RunProgress:
             for name in (
                 "validated_note",
                 "limited_note",
+                "duplicate_alias",
                 "parked_for_review",
                 "partial",
                 "pending",
@@ -546,6 +553,7 @@ class _RunProgress:
         terminal_count = (
             counts["validated_note"]
             + counts["limited_note"]
+            + counts["duplicate_alias"]
             + counts["parked_for_review"]
         )
         payload = {
@@ -557,6 +565,7 @@ class _RunProgress:
             "inventory_count": len(self.items),
             "validated_note_count": counts["validated_note"],
             "limited_note_count": counts["limited_note"],
+            "duplicate_alias_count": counts["duplicate_alias"],
             "parked_for_review_count": counts["parked_for_review"],
             "partial_count": counts["partial"],
             "pending_count": counts["pending"] + counts["active"],
@@ -827,8 +836,7 @@ def run_pipeline(
     attempt_path = (
         workspace / "01_custody" / "read_attempts" / f"{slugify(run_id)}.jsonl"
     )
-    seen_keys: set[str] = set()
-    pending: list[tuple[int, dict[str, Any]]] = []
+    pending, duplicate_aliases = _canonical_inventory_plan(workspace, items)
 
     def commit_result(row: dict[str, Any]) -> None:
         prepared.append(row)
@@ -852,15 +860,6 @@ def run_pipeline(
             completed_chunks=int(row.get("completed_chunks", 0) or 0),
             total_chunks=int(row.get("total_chunks", 0) or 0),
         )
-
-    for index, item in enumerate(items):
-        key = item_key(item)
-        if key and key in seen_keys:
-            commit_result(_duplicate_result(index, item))
-            continue
-        if key:
-            seen_keys.add(key)
-        pending.append((index, item))
 
     requested_concurrency = request.provider_concurrency
     automatic_workers = (
@@ -939,6 +938,75 @@ def run_pipeline(
                         f"unhandled_worker_error:{type(exc).__name__}:{exc}",
                     )
                 )
+    canonical_results = {
+        int(row.get("inventory_index", -1)): row for row in prepared
+    }
+    for alias in duplicate_aliases:
+        existing = dict(alias.get("existing_canonical") or {})
+        canonical = (
+            existing
+            if existing
+            else canonical_results.get(
+                int(alias.get("canonical_inventory_index", -1)), {}
+            )
+        )
+        if not canonical or not canonical.get("note_path"):
+            commit_result(
+                _exhausted_result(
+                    int(alias["inventory_index"]),
+                    dict(alias["item"]),
+                    "identity_reconciliation",
+                    "duplicate_canonical_note_unavailable",
+                )
+            )
+            continue
+        alias_row = _duplicate_alias_result(alias, canonical)
+        prepared.append(alias_row)
+        for attempt in alias_row.pop("attempts", []):
+            append_jsonl(attempt_path, attempt)
+        public_alias = _public_terminal_row(alias_row)
+        terminal_rows.append(public_alias)
+        canonical_note = workspace / str(public_alias["note_path"])
+        if canonical_note.is_file():
+            canonical_front = read_note(canonical_note)["frontmatter"]
+            canonical_keys = sorted(
+                {
+                    str(
+                        canonical_front.get("canonical_zotero_key")
+                        or canonical.get("zotero_item_key")
+                        or canonical.get("zotero_key")
+                        or ""
+                    ),
+                    *(
+                        str(value)
+                        for value in canonical_front.get(
+                            "zotero_item_keys", []
+                        )
+                        or []
+                        if str(value)
+                    ),
+                    str(public_alias["zotero_item_key"]),
+                }
+                - {""}
+            )
+            update_note_frontmatter(
+                canonical_note,
+                {
+                    "canonical_zotero_key": str(
+                        canonical.get("zotero_item_key")
+                        or canonical.get("zotero_key")
+                        or canonical_keys[0]
+                    ),
+                    "zotero_item_keys": canonical_keys,
+                },
+            )
+            note_rows.append(_note_summary_from_path(workspace, public_alias))
+        progress.update(
+            int(public_alias["inventory_index"]),
+            status="duplicate_alias",
+            phase="finished",
+            reason=str(public_alias["reason"]),
+        )
     progress.set_stage(
         "source_terminal_barrier",
         source_peak_concurrency=peak_source_concurrency,
@@ -1179,6 +1247,9 @@ def run_pipeline(
     limited_count = sum(
         1 for row in terminal_rows if row.get("terminal_status") == "limited_note"
     )
+    duplicate_alias_count = sum(
+        1 for row in terminal_rows if row.get("terminal_status") == "duplicate_alias"
+    )
     parked_for_review_count = sum(
         1
         for row in terminal_rows
@@ -1260,6 +1331,7 @@ def run_pipeline(
         inventory_count=len(items),
         validated_note_count=validated_count,
         limited_note_count=limited_count,
+        duplicate_alias_count=duplicate_alias_count,
         parked_for_review_count=parked_for_review_count,
         partial_count=partial_count,
         pending_count=pending_count,
@@ -1687,9 +1759,23 @@ def _commit_literature_memory(
     projected_positions = []
     for position in bundle.literature_positions:
         row = position.to_dict()
-        matched = _match_literature_position(row, source_index)
+        match = _match_literature_position_detail(row, source_index)
+        matched = str(match.get("source_id") or "")
+        if matched == current_source_id:
+            matched = ""
+            match = {
+                **match,
+                "status": "not_in_snapshot",
+                "basis": "self_citation_ignored",
+                "source_id": "",
+                "candidates": [],
+            }
         row["matched_source_id"] = matched
-        row["match_status"] = "matched" if matched else "unresolved"
+        row["match_status"] = str(match.get("status") or "not_in_snapshot")
+        row["match_basis"] = str(match.get("basis") or "")
+        row["match_confidence"] = str(match.get("confidence") or "")
+        row["matched_zotero_key"] = str(match.get("zotero_key") or "")
+        row["match_candidates"] = list(match.get("candidates") or [])
         by_id[position.literature_position_id] = row
         projected_positions.append(row)
         if matched and matched in source_index["by_source_id"]:
@@ -1700,7 +1786,7 @@ def _commit_literature_memory(
     write_yaml(
         positions_path,
         {
-            "literature_position_registry_schema_version": "1",
+            "literature_position_registry_schema_version": "2",
             "positions": rows,
             "revision_hash": stable_hash(rows),
         },
@@ -1838,14 +1924,23 @@ def _reconcile_literature_memory(workspace: Path) -> None:
     source_index = _source_match_index(workspace)
     by_source: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in positions:
-        matched = _match_literature_position(row, source_index)
+        match = _match_literature_position_detail(row, source_index)
+        matched = str(match.get("source_id") or "")
         current_source_id = str(row.get("current_source_id") or "")
         row["matched_source_id"] = (
             matched if matched and matched != current_source_id else ""
         )
         row["match_status"] = (
-            "matched" if row["matched_source_id"] else "unresolved"
+            str(match.get("status") or "not_in_snapshot")
+            if row["matched_source_id"]
+            else "not_in_snapshot"
+            if matched == current_source_id
+            else str(match.get("status") or "not_in_snapshot")
         )
+        row["match_basis"] = str(match.get("basis") or "")
+        row["match_confidence"] = str(match.get("confidence") or "")
+        row["matched_zotero_key"] = str(match.get("zotero_key") or "")
+        row["match_candidates"] = list(match.get("candidates") or [])
         if current_source_id:
             by_source[current_source_id].append(row)
     positions.sort(key=lambda row: str(row.get("literature_position_id") or ""))
@@ -1877,7 +1972,7 @@ def _reconcile_literature_memory(workspace: Path) -> None:
     write_yaml(
         positions_path,
         {
-            "literature_position_registry_schema_version": "1",
+            "literature_position_registry_schema_version": "2",
             "positions": positions,
             "projection_errors": projection_errors,
             "revision_hash": stable_hash(positions),
@@ -1950,14 +2045,24 @@ def _reconcile_literature_memory(workspace: Path) -> None:
             if isinstance(row.get("normalized_citation"), Mapping)
             else {}
         )
-        matched = _match_literature_position(
+        match = _match_literature_position_detail(
             {
                 **normalized,
                 "identifiers": dict(row.get("identifiers") or {}),
             },
             source_index,
         )
+        matched = str(match.get("source_id") or "")
         if not matched:
+            row.update(
+                match_status=str(match.get("status") or "not_in_snapshot"),
+                zotero_key=str(match.get("zotero_key") or ""),
+                ambiguity_notes=(
+                    ", ".join(str(value) for value in match.get("candidates", []) or [])
+                    if match.get("status") == "ambiguous"
+                    else str(row.get("ambiguity_notes") or "")
+                ),
+            )
             continue
         target = source_index["by_source_id"].get(matched, {})
         row.update(
@@ -1978,10 +2083,11 @@ def _reconcile_literature_memory(workspace: Path) -> None:
 
 
 def _source_match_index(workspace: Path) -> dict[str, Any]:
-    by_source_id: dict[str, dict[str, str]] = {}
-    by_doi: dict[str, str] = {}
-    by_isbn: dict[str, str] = {}
-    by_url: dict[str, str] = {}
+    by_source_id: dict[str, dict[str, Any]] = {}
+    by_zotero_key: dict[str, list[str]] = defaultdict(list)
+    by_doi: dict[str, list[str]] = defaultdict(list)
+    by_isbn: dict[str, list[str]] = defaultdict(list)
+    by_url: dict[str, list[str]] = defaultdict(list)
     by_identity: dict[tuple[str, str, str], list[str]] = defaultdict(list)
     for path in sorted((workspace / "02_source_memory" / "notes").glob("*.md")):
         try:
@@ -1992,60 +2098,129 @@ def _source_match_index(workspace: Path) -> dict[str, Any]:
         if not source_id:
             continue
         creators = list(front.get("creators", []) or [])
-        first = creators[0] if creators else {}
-        author = (
-            str(first.get("lastName") or first.get("name") or "")
-            if isinstance(first, Mapping)
-            else str(first)
-        )
+        author_surnames = _creator_surnames(creators)
+        author = author_surnames[0] if author_surnames else ""
         year_match = re.search(r"(?:19|20)\d{2}", str(front.get("date") or ""))
         identity = (
             _normalized_match_text(str(front.get("title") or "")),
-            _normalized_match_text(author),
+            author,
             year_match.group(0) if year_match else "",
         )
+        zotero_key = str(front.get("zotero_item_key") or "")
+        zotero_keys = {
+            zotero_key,
+            str(front.get("canonical_zotero_key") or ""),
+            *(
+                str(value)
+                for value in front.get("zotero_item_keys", []) or []
+                if str(value)
+            ),
+        } - {""}
         by_source_id[source_id] = {
             "stem": path.stem,
+            "note_path": str(path.relative_to(workspace)),
             "note_id": str(front.get("note_id") or ""),
-            "zotero_key": str(front.get("zotero_item_key") or ""),
+            "zotero_key": zotero_key,
             "title": identity[0],
             "author": identity[1],
             "year": identity[2],
+            "author_surnames": author_surnames,
+            "item_type": str(front.get("item_type") or "").casefold(),
         }
-        if str(front.get("doi") or "").strip():
-            by_doi[str(front["doi"]).strip().casefold()] = source_id
+        for value in zotero_keys:
+            by_zotero_key[value.upper()].append(source_id)
+        doi = _normalized_doi_identifier(str(front.get("doi") or ""))
+        if doi:
+            by_doi[doi].append(source_id)
         isbn = _normalized_strong_identifier(
             str(front.get("isbn") or front.get("ISBN") or "")
         )
         if isbn:
-            by_isbn[isbn] = source_id
+            by_isbn[isbn].append(source_id)
         url = _normalized_url_identifier(str(front.get("url") or ""))
         if url:
-            by_url[url] = source_id
+            by_url[url].append(source_id)
         by_identity[identity].append(source_id)
+
+    mapped_keys = set(by_zotero_key)
+    known_items: list[dict[str, Any]] = []
+    snapshot = read_yaml(
+        workspace / "01_custody" / "zotero" / "collection_snapshot.yml",
+        {},
+    ) or {}
+    for row in snapshot.get("items", []) or []:
+        if not isinstance(row, Mapping):
+            continue
+        zotero_key = str(row.get("key") or "")
+        if not zotero_key or zotero_key.upper() in mapped_keys:
+            continue
+        identity = (
+            dict(row.get("identity") or {})
+            if isinstance(row.get("identity"), Mapping)
+            else {}
+        )
+        known_items.append(
+            {
+                "zotero_key": zotero_key,
+                "title": _normalized_match_text(str(identity.get("title") or "")),
+                "author_surnames": _creator_surnames(
+                    list(identity.get("creators", []) or [])
+                ),
+                "year": str(identity.get("year") or ""),
+                "doi": _normalized_doi_identifier(
+                    str(identity.get("doi") or "")
+                ),
+                "isbn": _normalized_strong_identifier(
+                    str(identity.get("isbn") or "")
+                ),
+                "url": _normalized_url_identifier(str(identity.get("url") or "")),
+            }
+        )
     return {
         "by_source_id": by_source_id,
-        "by_doi": by_doi,
-        "by_isbn": by_isbn,
-        "by_url": by_url,
+        "by_zotero_key": dict(by_zotero_key),
+        "by_doi": dict(by_doi),
+        "by_isbn": dict(by_isbn),
+        "by_url": dict(by_url),
         "by_identity": by_identity,
+        "known_zotero_items": known_items,
     }
 
 
-def _match_literature_position(
+def _match_literature_position_detail(
     position: Mapping[str, Any],
     source_index: Mapping[str, Any],
-) -> str:
+) -> dict[str, Any]:
     identifiers = (
         dict(position.get("identifiers") or {})
         if isinstance(position.get("identifiers"), Mapping)
         else {}
     )
-    doi = str(identifiers.get("doi") or identifiers.get("DOI") or "").casefold()
+    zotero_key = str(
+        identifiers.get("zotero_key")
+        or identifiers.get("zoteroKey")
+        or position.get("zotero_key")
+        or ""
+    ).upper()
+    if zotero_key:
+        matches = _unique_index_matches(
+            source_index.get("by_zotero_key", {}), zotero_key
+        )
+        if len(matches) == 1:
+            return _mapped_literature_match(
+                matches[0], "zotero_key", source_index
+            )
+        if len(matches) > 1:
+            return _ambiguous_literature_match(matches, "zotero_key")
+    doi = _normalized_doi_identifier(
+        str(identifiers.get("doi") or identifiers.get("DOI") or "")
+    )
     if doi:
-        matched = dict(source_index.get("by_doi", {})).get(doi)
-        if matched:
-            return str(matched)
+        matches = _unique_index_matches(source_index.get("by_doi", {}), doi)
+        if len(matches) == 1:
+            return _mapped_literature_match(matches[0], "doi", source_index)
+        if len(matches) > 1:
+            return _ambiguous_literature_match(matches, "doi")
     for identifier, index_name, normalizer in (
         ("isbn", "by_isbn", _normalized_strong_identifier),
         ("ISBN", "by_isbn", _normalized_strong_identifier),
@@ -2054,20 +2229,52 @@ def _match_literature_position(
     ):
         value = normalizer(str(identifiers.get(identifier) or ""))
         if value:
-            matched = dict(source_index.get(index_name, {})).get(value)
-            if matched:
-                return str(matched)
-    identity = (
-        _normalized_match_text(str(position.get("title") or "")),
-        _normalized_match_text(str(position.get("author") or "")),
-        str(position.get("year") or ""),
+            matches = _unique_index_matches(
+                source_index.get(index_name, {}), value
+            )
+            if len(matches) == 1:
+                return _mapped_literature_match(
+                    matches[0], identifier.casefold(), source_index
+                )
+            if len(matches) > 1:
+                return _ambiguous_literature_match(
+                    matches, identifier.casefold()
+                )
+    title = _normalized_match_text(str(position.get("title") or ""))
+    author_surnames = _citation_author_surnames(
+        str(position.get("author") or "")
     )
-    matches = list(dict(source_index.get("by_identity", {})).get(identity, []))
+    first_author = author_surnames[0] if author_surnames else ""
+    year_match = re.search(r"(?:19|20)\d{2}", str(position.get("year") or ""))
+    year = year_match.group(0) if year_match else ""
+    exact_candidates = [
+        source_id
+        for source_id, row in dict(source_index.get("by_source_id", {})).items()
+        if title
+        and str(row.get("title") or "") == title
+        and (not year or not row.get("year") or str(row.get("year")) == year)
+        and _compatible_first_author(
+            first_author, list(row.get("author_surnames", []) or [])
+        )
+    ]
+    matches = sorted(set(exact_candidates))
     if len(matches) == 1:
-        return str(matches[0])
-    title, author, year = identity
+        return _mapped_literature_match(
+            matches[0], "title_year_first_author", source_index
+        )
+    if len(matches) > 1:
+        return _ambiguous_literature_match(
+            matches, "title_year_first_author"
+        )
     if not title:
-        return ""
+        return _known_or_absent_literature_match(
+            position,
+            source_index,
+            title=title,
+            first_author=first_author,
+            year=year,
+            identifiers=identifiers,
+        )
     ranked = sorted(
         (
             (
@@ -2078,27 +2285,227 @@ def _match_literature_position(
                 source_index.get("by_source_id", {})
             ).items()
             if (not year or not row.get("year") or row.get("year") == year)
-            and (
-                not author
-                or not row.get("author")
-                or row.get("author") == author
+            and _compatible_first_author(
+                first_author, list(row.get("author_surnames", []) or [])
             )
         ),
         reverse=True,
     )
-    if not ranked or ranked[0][0] < 0.92:
-        return ""
-    if len(ranked) > 1 and ranked[0][0] - ranked[1][0] < 0.03:
-        return ""
-    return str(ranked[0][1])
+    if ranked and ranked[0][0] >= 0.92 and (
+        len(ranked) == 1 or ranked[0][0] - ranked[1][0] >= 0.03
+    ):
+        return _mapped_literature_match(
+            str(ranked[0][1]), "unique_fuzzy_title", source_index, confidence="high"
+        )
+    if (
+        len(ranked) > 1
+        and ranked[0][0] >= 0.92
+        and ranked[0][0] - ranked[1][0] < 0.03
+    ):
+        return _ambiguous_literature_match(
+            [str(row[1]) for row in ranked if row[0] >= 0.92],
+            "fuzzy_title",
+        )
+    return _known_or_absent_literature_match(
+        position,
+        source_index,
+        title=title,
+        first_author=first_author,
+        year=year,
+        identifiers=identifiers,
+    )
+
+
+def _match_literature_position(
+    position: Mapping[str, Any],
+    source_index: Mapping[str, Any],
+) -> str:
+    return str(
+        _match_literature_position_detail(position, source_index).get(
+            "source_id"
+        )
+        or ""
+    )
+
+
+def _unique_index_matches(index: Any, key: str) -> list[str]:
+    value = dict(index or {}).get(key)
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, Sequence) and not isinstance(
+        value, (str, bytes, bytearray)
+    ):
+        return sorted({str(item) for item in value if str(item)})
+    return []
+
+
+def _mapped_literature_match(
+    source_id: str,
+    basis: str,
+    source_index: Mapping[str, Any],
+    *,
+    confidence: str = "exact",
+) -> dict[str, Any]:
+    source = dict(source_index.get("by_source_id", {})).get(source_id, {})
+    return {
+        "status": "mapped",
+        "basis": basis,
+        "confidence": confidence,
+        "source_id": source_id,
+        "zotero_key": str(source.get("zotero_key") or ""),
+        "candidates": [source_id],
+    }
+
+
+def _ambiguous_literature_match(
+    candidates: Sequence[str], basis: str
+) -> dict[str, Any]:
+    return {
+        "status": "ambiguous",
+        "basis": basis,
+        "confidence": "ambiguous",
+        "source_id": "",
+        "zotero_key": "",
+        "candidates": sorted({str(value) for value in candidates if str(value)}),
+    }
+
+
+def _known_or_absent_literature_match(
+    position: Mapping[str, Any],
+    source_index: Mapping[str, Any],
+    *,
+    title: str,
+    first_author: str,
+    year: str,
+    identifiers: Mapping[str, Any],
+) -> dict[str, Any]:
+    doi = _normalized_doi_identifier(
+        str(identifiers.get("doi") or identifiers.get("DOI") or "")
+    )
+    isbn = _normalized_strong_identifier(
+        str(identifiers.get("isbn") or identifiers.get("ISBN") or "")
+    )
+    url = _normalized_url_identifier(
+        str(identifiers.get("url") or identifiers.get("URL") or "")
+    )
+    known = [
+        dict(row)
+        for row in source_index.get("known_zotero_items", []) or []
+        if isinstance(row, Mapping)
+        and (
+            (doi and str(row.get("doi") or "") == doi)
+            or (isbn and str(row.get("isbn") or "") == isbn)
+            or (url and str(row.get("url") or "") == url)
+            or (
+                title
+                and str(row.get("title") or "") == title
+                and (not year or not row.get("year") or row.get("year") == year)
+                and _compatible_first_author(
+                    first_author, list(row.get("author_surnames", []) or [])
+                )
+            )
+        )
+    ]
+    unique_keys = sorted(
+        {str(row.get("zotero_key") or "") for row in known if row.get("zotero_key")}
+    )
+    if len(unique_keys) == 1:
+        return {
+            "status": "known_zotero_unmapped",
+            "basis": (
+                "doi"
+                if doi
+                else "isbn"
+                if isbn
+                else "url"
+                if url
+                else "title_year_first_author"
+            ),
+            "confidence": "exact",
+            "source_id": "",
+            "zotero_key": unique_keys[0],
+            "candidates": unique_keys,
+        }
+    if len(unique_keys) > 1:
+        return {
+            "status": "ambiguous",
+            "basis": "zotero_snapshot",
+            "confidence": "ambiguous",
+            "source_id": "",
+            "zotero_key": "",
+            "candidates": unique_keys,
+        }
+    return {
+        "status": "not_in_snapshot",
+        "basis": "",
+        "confidence": "",
+        "source_id": "",
+        "zotero_key": "",
+        "candidates": [],
+    }
 
 
 def _normalized_match_text(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
 
 
+def _creator_surnames(creators: Sequence[Any]) -> list[str]:
+    surnames: list[str] = []
+    for creator in creators:
+        if isinstance(creator, Mapping):
+            value = str(
+                creator.get("lastName")
+                or creator.get("name")
+                or creator.get("firstName")
+                or ""
+            )
+        else:
+            value = str(creator)
+        surname = _person_surname(value)
+        if surname:
+            surnames.append(surname)
+    return list(dict.fromkeys(surnames))
+
+
+def _citation_author_surnames(value: str) -> list[str]:
+    if not value.strip():
+        return []
+    parts = re.split(r"\s*(?:;|&|\band\b|\bet al\.?)\s*", value)
+    return list(
+        dict.fromkeys(
+            surname
+            for part in parts
+            if (surname := _person_surname(part))
+        )
+    )
+
+
+def _person_surname(value: str) -> str:
+    value = value.strip()
+    if not value:
+        return ""
+    candidate = value.split(",", 1)[0] if "," in value else value.split()[-1]
+    return _normalized_match_text(candidate)
+
+
+def _compatible_first_author(
+    cited_first_author: str, candidate_surnames: Sequence[str]
+) -> bool:
+    if not cited_first_author or not candidate_surnames:
+        return True
+    return cited_first_author == _normalized_match_text(str(candidate_surnames[0]))
+
+
 def _normalized_strong_identifier(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+
+def _normalized_doi_identifier(value: str) -> str:
+    return re.sub(
+        r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)",
+        "",
+        value.strip().casefold(),
+    ).rstrip("/")
 
 
 def _normalized_url_identifier(value: str) -> str:
@@ -2378,6 +2785,62 @@ def _source_set_graph_inputs(
     )
 
 
+def _literature_position_relations(
+    workspace: Path, profiles: Sequence[Any]
+) -> list[dict[str, Any]]:
+    note_id_by_source = {
+        str(row.get("source_id") or ""): str(row.get("note_id") or "")
+        for row in (profile_to_dict(profile) for profile in profiles)
+        if row.get("source_id")
+    }
+    payload = read_yaml(
+        workspace / "02_source_memory" / "indexes" / "literature_positions.yml",
+        {},
+    ) or {}
+    relations: list[dict[str, Any]] = []
+    for row in payload.get("positions", []) or []:
+        if not isinstance(row, Mapping):
+            continue
+        source_id = str(row.get("current_source_id") or "")
+        target_id = str(row.get("matched_source_id") or "")
+        if (
+            source_id == target_id
+            or source_id not in note_id_by_source
+            or target_id not in note_id_by_source
+        ):
+            continue
+        evidence = [
+            {
+                "literature_position_id": str(
+                    row.get("literature_position_id") or ""
+                ),
+                "locator": str(row.get("locator") or ""),
+                "engagement": str(row.get("engagement") or ""),
+            }
+        ]
+        for left, right, relation_type in (
+            (source_id, target_id, "cites"),
+            (target_id, source_id, "cited_by"),
+        ):
+            relations.append(
+                {
+                    "relation_id": "typed-relation-"
+                    + stable_hash([left, right, relation_type])[:16],
+                    "source_id": left,
+                    "target_source_id": right,
+                    "source_note_id": note_id_by_source[left],
+                    "target_note_id": note_id_by_source[right],
+                    "relation_type": relation_type,
+                    "evidence": evidence,
+                    "provenance": "resolved_literature_position",
+                    "inferred": False,
+                    "strength": 100,
+                    "active": True,
+                }
+            )
+    return relations
+
+
 def _cluster_catalogue_rows(workspace: Path) -> list[dict[str, Any]]:
     payload = read_yaml(
         workspace / "03_literature_synthesis" / "cluster_registry.yml", {}
@@ -2642,6 +3105,20 @@ def _run_relationship_reasoning(
             for row in catalogue_payload.get("shards", []) or []
             if isinstance(row, Mapping)
         ],
+        "virtual_shards": [
+            {
+                "shard_id": str(row.get("shard_id") or ""),
+                "topic_id": str(row.get("topic_id") or ""),
+                "source_ids": sorted(
+                    str(value)
+                    for value in row.get("source_ids", []) or []
+                    if str(value) in profile_by_source
+                ),
+                "routing_card": dict(row.get("routing_card") or {}),
+            }
+            for row in catalogue_payload.get("virtual_shards", []) or []
+            if isinstance(row, Mapping)
+        ],
     }
     catalogue_revision = stable_hash(
         {"entries": entries, "collection_structure": collection_structure}
@@ -2893,7 +3370,7 @@ def _run_relationship_reasoning(
         _relationship_evidence_projection(
             profile_by_source[source_id],
             entry_by_source.get(source_id, {}),
-            include_anchors=True,
+            include_anchors=False,
         )
         for source_id in sorted(profile_by_source)
     ]
@@ -2918,8 +3395,24 @@ def _run_relationship_reasoning(
             **dict(row.get("routing_card") or {}),
             "shard_id": f"collection-{row['key']}",
             "literature_id": f"collection-{row.get('parent_key') or row['key']}",
+            "routing_kind": "zotero_collection",
         }
         for row in collection_rows
+        if isinstance(row.get("routing_card"), Mapping)
+    ]
+    virtual_shard_rows = [
+        dict(row)
+        for row in catalogue_payload.get("virtual_shards", []) or []
+        if isinstance(row, Mapping) and row.get("shard_id")
+    ]
+    virtual_cards = [
+        {
+            **dict(row.get("routing_card") or {}),
+            "shard_id": str(row["shard_id"]),
+            "literature_id": f"virtual-{row.get('topic_id') or row['shard_id']}",
+            "routing_kind": "virtual_topic",
+        }
+        for row in virtual_shard_rows
         if isinstance(row.get("routing_card"), Mapping)
     ]
     collection_index_cards = [
@@ -3024,19 +3517,11 @@ def _run_relationship_reasoning(
         )
         > catalogue_char_budget
     )
-    literature_ids = sorted(
-        {
-            str(value)
-            for entry in entries
-            for value in entry.get("literature_ids", []) or []
-            if str(value)
-        }
-    )
     routing_call_count = (
         (2 if collection_cards else 1) if requires_routing else 0
     )
-    bridge_routing_call_count = int(len(literature_ids) > 2)
-    discovery_call_count = 3 + routing_call_count + bridge_routing_call_count
+    bridge_routing_call_count = int(bool(collection_cards or virtual_cards))
+    discovery_call_count = 2 + routing_call_count + bridge_routing_call_count
     can_discover = (
         remaining_calls >= mandatory_call_count + discovery_call_count + 1
     )
@@ -3050,14 +3535,20 @@ def _run_relationship_reasoning(
     pair_capacity = adjudication_call_capacity * batch_max_jobs
     inferred_capacity = (
         min(
-            max(0, 120 - len(mandatory_basis)),
+            max(0, _RELATIONSHIP_CANDIDATE_MAX - len(mandatory_basis)),
             max(0, pair_capacity - len(mandatory_basis)),
         )
         if can_discover
         else 0
     )
-    general_capacity = min(72, (inferred_capacity * 3 + 4) // 5)
-    bridge_capacity = min(48, max(0, inferred_capacity - general_capacity))
+    general_capacity = min(
+        _RELATIONSHIP_GENERAL_CANDIDATE_MAX,
+        (inferred_capacity * 2 + 4) // 5,
+    )
+    bridge_capacity = min(
+        _RELATIONSHIP_BRIDGE_CANDIDATE_MAX,
+        max(0, inferred_capacity - general_capacity),
+    )
     discovery_completed = False
     discovery_terminal = False
     if can_discover and requires_routing:
@@ -3203,7 +3694,7 @@ def _run_relationship_reasoning(
                 _relationship_evidence_projection(
                     profile_by_source[source_id],
                     entry_by_source.get(source_id, {}),
-                    include_anchors=True,
+                    include_anchors=False,
                 )
                 for source_id in sorted(selected_source_ids)
             ]
@@ -3257,15 +3748,32 @@ def _run_relationship_reasoning(
             discovery_terminal = True
 
     bridge_source_sets: list[tuple[set[str], tuple[str, str]]] = []
-    if can_discover and bridge_capacity and len(literature_ids) == 2:
-        bridge_source_sets = [
-            (set(profile_by_source), (literature_ids[0], literature_ids[1]))
-        ]
-    elif can_discover and bridge_capacity and len(literature_ids) > 2:
-        bridge_selector = getattr(
-            reasoner, "select_relationship_bridge_shards", None
-        )
-        if callable(bridge_selector) and routing_cards:
+    bridge_side_sources: dict[str, set[str]] = {}
+    bridge_route_metadata: dict[tuple[str, str], dict[str, Any]] = {}
+    bridge_selector = getattr(reasoner, "select_relationship_bridge_shards", None)
+    collection_side_sources = {
+        f"collection-{row['key']}": {
+            str(source_id)
+            for source_id in row.get("direct_source_ids", []) or []
+            if str(source_id) in profile_by_source
+        }
+        for row in collection_rows
+    }
+    usable_collection_cards = [
+        card
+        for card in collection_cards
+        if collection_side_sources.get(str(card.get("shard_id") or ""))
+    ]
+    bridge_cards = (
+        usable_collection_cards
+        if len(usable_collection_cards) >= 2
+        else virtual_cards
+    )
+    offered_bridge_ids = {
+        str(card.get("shard_id") or "") for card in bridge_cards
+    }
+    if can_discover and bridge_capacity:
+        if callable(bridge_selector) and bridge_cards:
             try:
                 routed = reasoner_calls(
                     "relationship_bridge_shard_selection",
@@ -3274,25 +3782,22 @@ def _run_relationship_reasoning(
                     [],
                     {
                         "catalogue_revision": catalogue_revision,
-                        "routing_cards": routing_cards,
+                        "routing_cards": bridge_cards,
+                        "collection_index_cards": collection_index_cards,
+                        "navigation_cards": virtual_cards,
                         "discovery_mode": "bridge_shard_routing",
                     },
                 )
-                shard_sources = {
-                    str(row.get("shard_id") or ""): {
-                        str(source_id)
-                        for source_id in row.get("source_ids", []) or []
-                        if str(source_id) in profile_by_source
-                    }
-                    for row in catalogue_payload.get("shards", []) or []
-                    if isinstance(row, Mapping) and row.get("shard_id")
-                }
-                shard_literatures = {
-                    str(row.get("shard_id") or ""): str(
-                        row.get("literature_id") or ""
-                    )
-                    for row in catalogue_payload.get("shards", []) or []
-                    if isinstance(row, Mapping) and row.get("shard_id")
+                bridge_side_sources = {
+                    **collection_side_sources,
+                    **{
+                        str(row.get("shard_id") or ""): {
+                            str(source_id)
+                            for source_id in row.get("source_ids", []) or []
+                            if str(source_id) in profile_by_source
+                        }
+                        for row in virtual_shard_rows
+                    },
                 }
                 bridge_source_sets = []
                 for row in routed.get("shard_pairs", []) or []:
@@ -3300,25 +3805,43 @@ def _run_relationship_reasoning(
                         continue
                     left_shard_id = str(row.get("left_shard_id") or "")
                     right_shard_id = str(row.get("right_shard_id") or "")
-                    pair = (
-                        shard_literatures.get(left_shard_id, ""),
-                        shard_literatures.get(right_shard_id, ""),
-                    )
-                    source_ids = shard_sources.get(
-                        left_shard_id, set()
-                    ) | shard_sources.get(right_shard_id, set())
                     if (
-                        len(source_ids) >= 2
-                        and pair[0]
-                        and pair[1]
-                        and pair[0] != pair[1]
+                        left_shard_id not in offered_bridge_ids
+                        or right_shard_id not in offered_bridge_ids
+                        or left_shard_id == right_shard_id
                     ):
-                        bridge_source_sets.append((source_ids, pair))
-                bridge_source_sets = [
-                    (source_ids, pair)
-                    for source_ids, pair in bridge_source_sets
-                    if len(source_ids) >= 2
-                ]
+                        continue
+                    left_sources = bridge_side_sources.get(left_shard_id, set())
+                    right_sources = bridge_side_sources.get(right_shard_id, set())
+                    overlap = left_sources & right_sources
+                    left_sources = left_sources - overlap
+                    right_sources = right_sources - overlap
+                    if not left_sources or not right_sources:
+                        continue
+                    try:
+                        target_count = int(
+                            row.get("target_candidate_count", 12) or 12
+                        )
+                    except (TypeError, ValueError):
+                        target_count = 12
+                    bridge_route_metadata[(left_shard_id, right_shard_id)] = {
+                        "bridge_family": str(row.get("bridge_family") or ""),
+                        "why_examine": str(
+                            row.get("why_examine") or row.get("reason") or ""
+                        ),
+                        "target_candidate_count": max(
+                            1,
+                            min(32, target_count),
+                        ),
+                        "left_source_ids": sorted(left_sources),
+                        "right_source_ids": sorted(right_sources),
+                    }
+                    bridge_source_sets.append(
+                        (
+                            left_sources | right_sources,
+                            (left_shard_id, right_shard_id),
+                        )
+                    )
             except Exception as exc:
                 failure_class = _synthesis_failure_class(exc)
                 discovery_terminal |= failure_class != "transport"
@@ -3330,7 +3853,7 @@ def _run_relationship_reasoning(
                         "retry_on_resume": failure_class == "transport",
                     }
                 )
-        else:
+        elif bridge_cards:
             discovery_terminal = True
             discovery_parked.append(
                 {
@@ -3461,47 +3984,46 @@ def _run_relationship_reasoning(
                 }
             )
             continue
-        for orientation in ("forward", "reverse"):
-            oriented_pairs = [
+        bridge_jobs = [
+            {
+                "bridge_job_id": f"bridge-job-{packet_index + 1}-{index + 1}",
+                "left_shard_id": pair[0],
+                "right_shard_id": pair[1],
+                "left_source_ids": sorted(
+                    bridge_route_metadata.get(pair, {}).get(
+                        "left_source_ids",
+                        bridge_side_sources.get(pair[0], set()),
+                    )
+                ),
+                "right_source_ids": sorted(
+                    bridge_route_metadata.get(pair, {}).get(
+                        "right_source_ids",
+                        bridge_side_sources.get(pair[1], set()),
+                    )
+                ),
+                **bridge_route_metadata.get(pair, {}),
+            }
+            for index, pair in enumerate(literature_pairs)
+        ]
+        candidate_tasks.append(
+            (
+                "relationship_bridge_candidate_selection",
+                f"bridge-{catalogue_revision[:16]}-{packet_index + 1}",
+                [],
                 {
-                    "focal_literature_id": (
-                        pair[0] if orientation == "forward" else pair[1]
+                    **bridge_context,
+                    "bridge_jobs": bridge_jobs,
+                    "max_inferred_pairs": min(
+                        bridge_capacity,
+                        sum(
+                            int(row.get("target_candidate_count", 12) or 12)
+                            for row in bridge_jobs
+                        ),
                     ),
-                    "comparison_literature_id": (
-                        pair[1] if orientation == "forward" else pair[0]
-                    ),
-                }
-                for pair in literature_pairs
-            ]
-            singular_context = (
-                {
-                    "focal_literature_id": oriented_pairs[0][
-                        "focal_literature_id"
-                    ],
-                    "comparison_literature_ids": [
-                        oriented_pairs[0]["comparison_literature_id"]
-                    ],
-                }
-                if len(oriented_pairs) == 1
-                else {}
+                },
+                "bridge",
             )
-            candidate_tasks.append(
-                (
-                    "relationship_bridge_candidate_selection",
-                    (
-                        f"bridge-{catalogue_revision[:16]}-"
-                        f"{packet_index + 1}-{orientation}"
-                    ),
-                    [],
-                    {
-                        **bridge_context,
-                        "bridge_orientation": orientation,
-                        "oriented_literature_pairs": oriented_pairs,
-                        **singular_context,
-                    },
-                    "bridge",
-                )
-            )
+        )
 
     current_remaining_calls = (
         remaining_calls
@@ -3538,14 +4060,16 @@ def _run_relationship_reasoning(
         )
         pair_capacity = adjudication_call_capacity * batch_max_jobs
         inferred_capacity = min(
-            max(0, 120 - len(mandatory_basis)),
+            max(0, _RELATIONSHIP_CANDIDATE_MAX - len(mandatory_basis)),
             max(0, pair_capacity - len(mandatory_basis)),
         )
         general_capacity = min(
-            72, (inferred_capacity * 3 + 4) // 5
+            _RELATIONSHIP_GENERAL_CANDIDATE_MAX,
+            (inferred_capacity * 2 + 4) // 5,
         )
         bridge_capacity = min(
-            48, max(0, inferred_capacity - general_capacity)
+            _RELATIONSHIP_BRIDGE_CANDIDATE_MAX,
+            max(0, inferred_capacity - general_capacity),
         )
         candidate_tasks = [
             (
@@ -3569,15 +4093,56 @@ def _run_relationship_reasoning(
         task: tuple[str, str, Sequence[Any], dict[str, Any], str]
     ) -> tuple[str, Mapping[str, Any]]:
         stage, key, task_profiles, task_context, pool = task
+        response = reasoner_calls(
+            stage,
+            key,
+            "select_relationship_candidates",
+            task_profiles,
+            task_context,
+        )
+        if pool == "bridge":
+            jobs = {
+                str(row.get("bridge_job_id") or ""): row
+                for row in task_context.get("bridge_jobs", []) or []
+                if isinstance(row, Mapping) and row.get("bridge_job_id")
+            }
+            candidates: list[dict[str, Any]] = []
+            for raw in response.get("candidates", []) or []:
+                if not isinstance(raw, Mapping):
+                    continue
+                row = dict(raw)
+                job = jobs.get(str(row.get("bridge_job_id") or ""))
+                if not job:
+                    continue
+                left_source_id = str(
+                    row.get("left_source_id") or row.get("source_id") or ""
+                )
+                right_source_id = str(
+                    row.get("right_source_id")
+                    or row.get("target_source_id")
+                    or row.get("target_id")
+                    or ""
+                )
+                left_side = {
+                    str(value) for value in job.get("left_source_ids", []) or []
+                }
+                right_side = {
+                    str(value) for value in job.get("right_source_ids", []) or []
+                }
+                if not (
+                    (left_source_id in left_side and right_source_id in right_side)
+                    or (
+                        left_source_id in right_side
+                        and right_source_id in left_side
+                    )
+                ):
+                    continue
+                row["discovery_route"] = "routed_cross_collection_bridge"
+                candidates.append(row)
+            response = {**dict(response), "candidates": candidates}
         return (
             pool,
-            reasoner_calls(
-                stage,
-                key,
-                "select_relationship_candidates",
-                task_profiles,
-                task_context,
-            ),
+            response,
         )
 
     if candidate_tasks:
@@ -3640,12 +4205,16 @@ def _run_relationship_reasoning(
         )
         pair_capacity = adjudication_call_capacity * batch_max_jobs
         inferred_capacity = min(
-            max(0, 120 - len(mandatory_basis)),
+            max(0, _RELATIONSHIP_CANDIDATE_MAX - len(mandatory_basis)),
             max(0, pair_capacity - len(mandatory_basis)),
         )
-        general_capacity = min(72, (inferred_capacity * 3 + 4) // 5)
+        general_capacity = min(
+            _RELATIONSHIP_GENERAL_CANDIDATE_MAX,
+            (inferred_capacity * 2 + 4) // 5,
+        )
         bridge_capacity = min(
-            48, max(0, inferred_capacity - general_capacity)
+            _RELATIONSHIP_BRIDGE_CANDIDATE_MAX,
+            max(0, inferred_capacity - general_capacity),
         )
     excluded_pairs = set(mandatory_basis) | negative_pairs
     bridge_rows = _ranked_relationship_candidates(
@@ -3670,7 +4239,7 @@ def _run_relationship_reasoning(
         bridge_fraction=0.4,
     )
     inferred_rows = [*bridge_rows, *general_rows][:inferred_capacity]
-    if focus_source_ids and not catalogue_changed:
+    if focus_source_ids and not identity_changed:
         focus = set(focus_source_ids)
         inferred_rows = [
             row
@@ -4444,41 +5013,20 @@ def _selected_relationship_evidence(
     *,
     requested_ids: set[str],
 ) -> list[dict[str, Any]]:
+    del requested_ids
     row = profile_to_dict(profile)
     anchors = [
         dict(anchor)
         for anchor in row.get("evidence_anchors", []) or []
         if isinstance(anchor, Mapping)
     ]
-    if requested_ids:
-        requested = [
-            anchor
-            for anchor in anchors
-            if str(anchor.get("evidence_anchor_id") or "") in requested_ids
-        ]
-        if requested:
-            return requested[:5]
     anchors.sort(
         key=lambda anchor: (
             -int(anchor.get("salience_priority", 0) or 0),
             str(anchor.get("evidence_anchor_id") or ""),
         )
     )
-    selected: list[dict[str, Any]] = []
-    roles: set[str] = set()
-    for anchor in anchors:
-        anchor_roles = {
-            str(value)
-            for value in anchor.get("planning_roles", []) or []
-            if str(value)
-        }
-        if selected and anchor_roles and anchor_roles.issubset(roles):
-            continue
-        selected.append(anchor)
-        roles.update(anchor_roles)
-        if len(selected) == 5:
-            break
-    return selected or anchors[:5]
+    return anchors
 
 
 def _relationship_neighbors(
@@ -4619,15 +5167,24 @@ def _relationship_transport_context(
     *,
     decision_contract: str,
 ) -> dict[str, Any]:
-    if decision_contract != RELATIONSHIP_DECISION_CONTRACT:
+    if decision_contract not in {
+        "relationship-decision-v6",
+        RELATIONSHIP_DECISION_CONTRACT,
+    }:
         return {"pair_jobs": [job.to_dict() for job in jobs]}
     source_documents: dict[str, Any] = {}
     source_profiles: dict[str, Any] = {}
+    source_evidence: dict[str, Any] = {}
     pair_jobs: list[dict[str, Any]] = []
     for job in jobs:
         row = job.to_dict()
         profiles = row.pop("profiles", {})
         atomic_notes = row.pop("atomic_notes", {})
+        selected_evidence = (
+            row.pop("selected_evidence", {})
+            if decision_contract == RELATIONSHIP_DECISION_CONTRACT
+            else {}
+        )
         for side, source_id in (
             ("left", job.left_source_id),
             ("right", job.right_source_id),
@@ -4644,8 +5201,17 @@ def _relationship_transport_context(
                     or profiles.get(source_id)
                     or {}
                 )
+            if (
+                decision_contract == RELATIONSHIP_DECISION_CONTRACT
+                and source_id not in source_evidence
+            ):
+                source_evidence[source_id] = list(
+                    selected_evidence.get(side)
+                    or selected_evidence.get(source_id)
+                    or []
+                )
         pair_jobs.append(row)
-    return {
+    payload = {
         "source_documents": {
             key: source_documents[key] for key in sorted(source_documents)
         },
@@ -4654,6 +5220,11 @@ def _relationship_transport_context(
         },
         "pair_jobs": pair_jobs,
     }
+    if decision_contract == RELATIONSHIP_DECISION_CONTRACT:
+        payload["source_evidence"] = {
+            key: source_evidence[key] for key in sorted(source_evidence)
+        }
+    return payload
 
 
 def _pack_relationship_rows(
@@ -5481,9 +6052,15 @@ def rebuild_map(
         workspace_note_rows,
         navigation_policy=effective_request.navigation_policy,
     )
+    citation_relations = _literature_position_relations(
+        workspace, workspace_profiles
+    )
     persist_relationship_registry(
         workspace,
-        structural_relations=navigation.get("typed_relations", []) or [],
+        structural_relations=[
+            *(navigation.get("typed_relations", []) or []),
+            *citation_relations,
+        ],
         preserve_unmentioned_structural=True,
         orphaned_source_ids=orphaned_source_ids,
     )
@@ -5712,6 +6289,7 @@ def rebuild_map(
                     if row.get("direct_source_ids")
                 ],
                 *list(catalogue_payload.get("shards", []) or []),
+                *list(catalogue_payload.get("virtual_shards", []) or []),
             ],
         )
     except Exception as exc:
@@ -7050,6 +7628,50 @@ def _orphaned_source_ids(
     )
 
 
+def _recover_saved_source_bundle(
+    checkpoint_root: Path,
+    *,
+    source_id: str,
+    zotero_key: str,
+    fingerprint: str,
+) -> dict[str, Any] | None:
+    """Reparse a saved provider response locally before making another call."""
+
+    failure = read_yaml(checkpoint_root / "source_failure.yml", {}) or {}
+    if (
+        not isinstance(failure, Mapping)
+        or str(failure.get("fingerprint") or "") != fingerprint
+    ):
+        return None
+    raw = failure.get("raw_response")
+    if not isinstance(raw, (str, Mapping, list)) or raw in ("", {}, []):
+        return None
+    try:
+        recovered = _parse_source_bundle_response(
+            raw,
+            label="saved source analysis bundle response",
+            expected_identity={
+                "source_id": source_id,
+                "zotero_key": zotero_key,
+            },
+        )
+    except (TypeError, ValueError, ProviderError):
+        return None
+    write_yaml(
+        checkpoint_root / "source_recovery.yml",
+        {
+            "source_id": source_id,
+            "zotero_item_key": zotero_key,
+            "fingerprint": fingerprint,
+            "status": "recovered_locally",
+            "source_bundle_envelope_contract": SOURCE_BUNDLE_ENVELOPE_CONTRACT,
+            "raw_response_hash": str(failure.get("raw_response_hash") or ""),
+            "provider_calls": 0,
+        },
+    )
+    return recovered
+
+
 def _prepare_item(
     workspace: Path,
     run_dir: Path,
@@ -7208,7 +7830,17 @@ def _prepare_item(
             reason=str(content.get("coverage_reason") or source_scope),
         )
         return base
-    if bool(getattr(reader, "is_cloud", True)) and not request.allow_cloud:
+    recovered_source_result = _recover_saved_source_bundle(
+        checkpoint_root,
+        source_id=str(base["source_id"]),
+        zotero_key=key,
+        fingerprint=fingerprint,
+    )
+    if (
+        recovered_source_result is None
+        and bool(getattr(reader, "is_cloud", True))
+        and not request.allow_cloud
+    ):
         base["attempts"].append(
             _attempt(base, f"{reader.name}_text", "disallowed", "cloud_not_allowed")
         )
@@ -7263,17 +7895,22 @@ def _prepare_item(
                 ),
             },
         }
-        source_result, reader_route, reader_reason = _read_document(
-            reader,
-            str(content["text"]),
-            reader_metadata,
-            None,
-            request=request,
-            checkpoint_root=checkpoint_root,
-            progress=progress,
-            inventory_index=index,
-            provider_budget=profile_budget,
-        )
+        if recovered_source_result is not None:
+            source_result = recovered_source_result
+            reader_route = "local_source_envelope_recovery"
+            reader_reason = "saved_provider_response_reparsed_without_call"
+        else:
+            source_result, reader_route, reader_reason = _read_document(
+                reader,
+                str(content["text"]),
+                reader_metadata,
+                None,
+                request=request,
+                checkpoint_root=checkpoint_root,
+                progress=progress,
+                inventory_index=index,
+                provider_budget=profile_budget,
+            )
     except DocumentPartialError as exc:
         base.update(
             terminal_status="partial",
@@ -7312,6 +7949,7 @@ def _prepare_item(
                 "zotero_item_key": key,
                 "fingerprint": fingerprint,
                 "status": "parked_for_review",
+                "source_bundle_envelope_contract": SOURCE_BUNDLE_ENVELOPE_CONTRACT,
                 "error_type": type(exc).__name__,
                 "error": str(exc),
                 "raw_response": raw_response,
@@ -7341,6 +7979,7 @@ def _prepare_item(
                 "zotero_item_key": key,
                 "fingerprint": fingerprint,
                 "status": "parked_for_review",
+                "source_bundle_envelope_contract": SOURCE_BUNDLE_ENVELOPE_CONTRACT,
                 "error_type": type(exc).__name__,
                 "error": str(exc),
                 "raw_response": dict(source_result),
@@ -7395,23 +8034,6 @@ def _source_bundle_from_result(
     if str(result.get("bundle_schema_version") or "") != "1":
         return None
     payload = dict(result)
-    diagnostics = payload.get("component_diagnostics", [])
-    if isinstance(diagnostics, list):
-        for field_name in (
-            "evidence_anchors",
-            "literature_positions",
-            "missing_source_recommendations",
-        ):
-            recovered = [
-                dict(row["raw"])
-                for row in diagnostics
-                if isinstance(row, Mapping)
-                and row.get("component") == field_name
-                and isinstance(row.get("raw"), Mapping)
-            ]
-            current = payload.get(field_name, [])
-            if recovered and isinstance(current, list):
-                payload[field_name] = [*current, *recovered]
     payload = _normalize_source_bundle_payload(payload)
     expected_source_id = str(row.get("source_id") or "")
     expected_zotero_key = str(row.get("zotero_item_key") or "")
@@ -8850,6 +9472,188 @@ def _duplicate_result(index: int, item: Mapping[str, Any]) -> dict[str, Any]:
     )
 
 
+def _inventory_work_identity(item: Mapping[str, Any]) -> tuple[str, ...]:
+    data = item_data(item)
+    doi = _normalized_doi_identifier(
+        str(data.get("DOI") or data.get("doi") or "")
+    )
+    if doi:
+        return ("doi", doi)
+    isbn = _normalized_strong_identifier(
+        str(data.get("ISBN") or data.get("isbn") or "")
+    )
+    title = _normalized_match_text(str(data.get("title") or ""))
+    if isbn and title:
+        return ("isbn", isbn, title)
+    surnames = tuple(_creator_surnames(list(data.get("creators", []) or [])))
+    year_match = re.search(r"(?:19|20)\d{2}", str(data.get("date") or ""))
+    item_type = str(data.get("itemType") or "").casefold()
+    if title and surnames and year_match and item_type:
+        return (
+            "bibliographic",
+            title,
+            *surnames,
+            year_match.group(0),
+            item_type,
+        )
+    return ("zotero_key", item_key(item).upper())
+
+
+def _existing_canonical_for_item(
+    item: Mapping[str, Any], source_index: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    key = item_key(item).upper()
+    exact_key = _unique_index_matches(source_index.get("by_zotero_key", {}), key)
+    if len(exact_key) == 1:
+        return dict(source_index.get("by_source_id", {})).get(exact_key[0])
+    data = item_data(item)
+    doi = _normalized_doi_identifier(
+        str(data.get("DOI") or data.get("doi") or "")
+    )
+    isbn = _normalized_strong_identifier(
+        str(data.get("ISBN") or data.get("isbn") or "")
+    )
+    for index_name, value in (("by_doi", doi), ("by_isbn", isbn)):
+        if not value:
+            continue
+        matches = _unique_index_matches(source_index.get(index_name, {}), value)
+        if len(matches) == 1:
+            return dict(source_index.get("by_source_id", {})).get(matches[0])
+    title = _normalized_match_text(str(data.get("title") or ""))
+    surnames = _creator_surnames(list(data.get("creators", []) or []))
+    year_match = re.search(r"(?:19|20)\d{2}", str(data.get("date") or ""))
+    item_type = str(data.get("itemType") or "").casefold()
+    if not title or not surnames or not year_match:
+        return None
+    matches = [
+        dict(row)
+        for row in source_index.get("by_source_id", {}).values()
+        if isinstance(row, Mapping)
+        and str(row.get("title") or "") == title
+        and list(row.get("author_surnames", []) or []) == surnames
+        and str(row.get("year") or "") == year_match.group(0)
+        and (
+            not item_type
+            or not row.get("item_type")
+            or str(row.get("item_type") or "") == item_type
+        )
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _canonical_item_rank(item: Mapping[str, Any]) -> tuple[int, str]:
+    data = item_data(item)
+    richness = sum(
+        bool(data.get(field))
+        for field in (
+            "DOI",
+            "doi",
+            "ISBN",
+            "isbn",
+            "title",
+            "creators",
+            "date",
+            "abstractNote",
+            "publicationTitle",
+            "publisher",
+            "url",
+        )
+    )
+    return (-richness, item_key(item).casefold())
+
+
+def _canonical_inventory_plan(
+    workspace: Path,
+    items: Sequence[Mapping[str, Any]],
+) -> tuple[list[tuple[int, dict[str, Any]]], list[dict[str, Any]]]:
+    source_index = _source_match_index(workspace)
+    grouped: dict[tuple[str, ...], list[tuple[int, dict[str, Any]]]] = defaultdict(
+        list
+    )
+    for index, raw in enumerate(items):
+        item = dict(raw)
+        grouped[_inventory_work_identity(item)].append((index, item))
+
+    pending: list[tuple[int, dict[str, Any]]] = []
+    aliases: list[dict[str, Any]] = []
+    for group in grouped.values():
+        existing = next(
+            (
+                match
+                for _, item in group
+                if (match := _existing_canonical_for_item(item, source_index))
+            ),
+            None,
+        )
+        existing_key = str((existing or {}).get("zotero_key") or "")
+        matching_existing = [
+            row for row in group if item_key(row[1]).casefold() == existing_key.casefold()
+        ]
+        if matching_existing:
+            canonical_index, canonical_item = min(
+                matching_existing, key=lambda row: row[0]
+            )
+            pending.append((canonical_index, canonical_item))
+            existing = None
+        elif existing is None:
+            canonical_index, canonical_item = min(
+                group,
+                key=lambda row: (*_canonical_item_rank(row[1]), row[0]),
+            )
+            pending.append((canonical_index, canonical_item))
+        else:
+            canonical_index = -1
+        for index, item in group:
+            if existing is None and index == canonical_index:
+                continue
+            aliases.append(
+                {
+                    "inventory_index": index,
+                    "item": item,
+                    "canonical_inventory_index": canonical_index,
+                    "existing_canonical": dict(existing or {}),
+                }
+            )
+    pending.sort(key=lambda row: row[0])
+    aliases.sort(key=lambda row: int(row["inventory_index"]))
+    return pending, aliases
+
+
+def _duplicate_alias_result(
+    alias: Mapping[str, Any],
+    canonical: Mapping[str, Any],
+) -> dict[str, Any]:
+    item = dict(alias["item"])
+    index = int(alias["inventory_index"])
+    canonical_key = str(canonical.get("zotero_item_key") or canonical.get("zotero_key") or "")
+    return {
+        "inventory_index": index,
+        "item": item,
+        "zotero_item_key": item_key(item),
+        "canonical_zotero_key": canonical_key,
+        "source_id": str(canonical.get("source_id") or ""),
+        "note_id": str(canonical.get("note_id") or ""),
+        "note_path": str(canonical.get("note_path") or ""),
+        "terminal_status": "duplicate_alias",
+        "reason": f"duplicate_alias_of:{canonical_key}",
+        "fingerprint": "",
+        "content_hash": "",
+        "reused": True,
+        "attempts": [
+            _attempt(
+                {
+                    "source_id": str(canonical.get("source_id") or ""),
+                    "zotero_item_key": item_key(item),
+                },
+                "identity_reconciliation",
+                "skipped",
+                f"duplicate_alias_of:{canonical_key}",
+                output_path=str(canonical.get("note_path") or ""),
+            )
+        ],
+    }
+
+
 def _public_terminal_row(row: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "inventory_index": int(row.get("inventory_index", 0)),
@@ -8861,6 +9665,7 @@ def _public_terminal_row(row: Mapping[str, Any]) -> dict[str, Any]:
         "reason": str(row.get("reason", "")),
         "fingerprint": str(row.get("fingerprint", "")),
         "content_hash": str(row.get("content_hash", "")),
+        "canonical_zotero_key": str(row.get("canonical_zotero_key", "")),
     }
 
 

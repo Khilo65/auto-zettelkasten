@@ -104,7 +104,38 @@ def test_complete_thesis_introduction_is_not_misclassified_as_an_excerpt() -> No
     assert scoped["source_scope"] == "full_document"
 
 
-def test_long_report_introduction_label_is_not_treated_as_an_excerpt() -> None:
+def test_partial_fulfillment_in_complete_thesis_title_does_not_mean_excerpt() -> None:
+    scoped = _apply_bibliographic_scope(
+        {
+            "source_scope": "full_document",
+            "source_coverage": {
+                "source_scope": "full_document",
+                "coverage_gate": "passed",
+            },
+            "coverage_metrics": {
+                "page_count": 60,
+                "recovered_pages": list(range(1, 61)),
+            },
+            "text": (
+                "--- Page 1 ---\nA dissertation submitted in partial fulfillment "
+                "of the requirements.\n"
+            ),
+            "rank": 100,
+        },
+        {
+            "itemType": "thesis",
+            "title": "Ethnicity and Conflict Recurrence: An Analysis on the Deterioration of Peace",
+        },
+        {
+            "itemType": "attachment",
+            "title": "Civil War Recurrence - Partial Fulfillment.pdf",
+        },
+    )
+
+    assert scoped["source_scope"] == "full_document"
+
+
+def test_pathways_for_peace_introduction_label_is_not_treated_as_excerpt() -> None:
     scoped = _apply_bibliographic_scope(
         {
             "source_scope": "full_document",
@@ -119,7 +150,7 @@ def test_long_report_introduction_label_is_not_treated_as_an_excerpt() -> None:
             "text": "--- Page 1 ---\nPathways for Peace\nInclusive Approaches.",
             "rank": 100,
         },
-        {"itemType": "report", "title": "Pathways for Peace"},
+        {"itemType": "book", "title": "Pathways for Peace"},
         {"itemType": "attachment", "title": "Introduction"},
     )
 

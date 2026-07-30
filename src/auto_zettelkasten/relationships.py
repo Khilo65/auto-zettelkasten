@@ -10,10 +10,10 @@ from .models import RelationshipDecision, RelationshipPairJob
 from .navigation import TYPED_SOURCE_RELATIONS, rank_human_related_links
 
 
-RELATIONSHIP_PROMPT_VERSION = "9"
+RELATIONSHIP_PROMPT_VERSION = "10"
 RELATIONSHIP_REGISTRY_SCHEMA_VERSION = "6"
-RELATIONSHIP_DECISION_SCHEMA_VERSION = "6"
-RELATIONSHIP_DECISION_CONTRACT = "relationship-decision-v6"
+RELATIONSHIP_DECISION_SCHEMA_VERSION = "7"
+RELATIONSHIP_DECISION_CONTRACT = "relationship-decision-v7"
 SUBSTANTIVE_RELATION_TYPES = frozenset(
     {
         "supports",
@@ -308,27 +308,32 @@ def _normalize_provider_decision_row(
     left_anchors: Mapping[str, Mapping[str, Any]],
     right_anchors: Mapping[str, Mapping[str, Any]],
 ) -> tuple[dict[str, Any], list[str]]:
-    """Fill job-owned v6 structure and normalize anchor ownership."""
+    """Fill job-owned structure and normalize endpoint evidence ownership."""
 
     normalized = dict(row)
     contract = str(job.output_contract or "")
-    if contract != RELATIONSHIP_DECISION_CONTRACT:
+    warnings: list[str] = []
+    if contract not in {"relationship-decision-v6", RELATIONSHIP_DECISION_CONTRACT}:
         if str(normalized.get("decision") or "") == "relationship":
             labels = RELATIONSHIP_PROJECTION_LABELS.get(
                 str(normalized.get("relation_type") or "")
             )
             if labels:
                 normalized["forward_label"], normalized["inverse_label"] = labels
-        return normalized, []
+        return normalized, warnings
 
     normalized["pair_job_id"] = job.pair_job_id
     normalized["pair"] = {
         "left_source_id": job.left_source_id,
         "right_source_id": job.right_source_id,
     }
-    normalized["output_contract"] = RELATIONSHIP_DECISION_CONTRACT
+    normalized["output_contract"] = contract
+    if str(normalized.get("decision") or "") == "contextual_connection":
+        normalized["decision"] = "relationship"
+        normalized.setdefault("relation_type", "contextual_connection")
+        warnings.append("normalized_contextual_decision_shorthand")
     if str(normalized.get("decision") or "") != "relationship":
-        return normalized, []
+        return normalized, warnings
 
     relation_type = str(normalized.get("relation_type") or "")
     labels = RELATIONSHIP_PROJECTION_LABELS.get(relation_type)
@@ -343,10 +348,32 @@ def _normalize_provider_decision_row(
 
     raw_left = normalized.get("left_evidence_anchor_ids", [])
     raw_right = normalized.get("right_evidence_anchor_ids", [])
+    if contract == RELATIONSHIP_DECISION_CONTRACT:
+        raw_left = [
+            normalized.pop("left_evidence_anchor_id", ""),
+            *(
+                normalized.pop("left_additional_evidence_anchor_ids", [])
+                if isinstance(
+                    normalized.get("left_additional_evidence_anchor_ids", []),
+                    list,
+                )
+                else []
+            ),
+        ]
+        raw_right = [
+            normalized.pop("right_evidence_anchor_id", ""),
+            *(
+                normalized.pop("right_additional_evidence_anchor_ids", [])
+                if isinstance(
+                    normalized.get("right_additional_evidence_anchor_ids", []),
+                    list,
+                )
+                else []
+            ),
+        ]
     if not isinstance(raw_left, list) or not isinstance(raw_right, list):
         return normalized, []
 
-    warnings: list[str] = []
     left_ids: list[str] = []
     right_ids: list[str] = []
     seen: set[str] = set()
@@ -1557,6 +1584,8 @@ def _normalized_v4_decision(
         "inverse_label": inverse_label,
         "comparison_proposition": decision.comparison_proposition,
         "boundary_or_qualification": decision.boundary_or_qualification,
+        "left_endpoint_claim": decision.left_endpoint_claim,
+        "right_endpoint_claim": decision.right_endpoint_claim,
         "left_evidence_anchor_ids": list(decision.left_evidence_anchor_ids),
         "right_evidence_anchor_ids": list(decision.right_evidence_anchor_ids),
         "source_evidence_anchor_ids": list(source_anchor_ids),
@@ -1741,6 +1770,7 @@ def _final_v4_relation(row: Mapping[str, Any]) -> bool:
                 in {
                     ("relationship-decision-v4", "4"),
                     ("relationship-decision-v5", "5"),
+                    ("relationship-decision-v6", "6"),
                 }
             )
         )
@@ -1768,6 +1798,7 @@ def _final_v4_decision(
                 in {
                     ("relationship-decision-v4", "4"),
                     ("relationship-decision-v5", "5"),
+                    ("relationship-decision-v6", "6"),
                 }
             )
         )

@@ -1322,11 +1322,6 @@ def validate_profile(
             and "quantitative_result" in anchor
             and not isinstance(anchor.get("quantitative_result"), Mapping)
         ):
-            envelope = (
-                anchor.get("support_envelope")
-                if isinstance(anchor.get("support_envelope"), Mapping)
-                else {}
-            )
             warnings.append(
                 f"anchor_{index}:typed_quantitative_result_unresolved"
             )

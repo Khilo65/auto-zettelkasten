@@ -17,6 +17,8 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import UTC, datetime
 from typing import Any, Callable, Mapping, Sequence
 
+import yaml
+
 from .fidelity import ANALYSIS_SECTION_KEYS, validate_atomic_replacements
 from .files import require_loopback_http_url
 from .models import (
@@ -82,6 +84,7 @@ SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
 SOURCE_BUNDLE_PROMPT_VERSION = "5"
+SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v2"
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
 GAP_ADJUDICATION_MAX_OUTPUT_TOKENS = 32_000
@@ -141,7 +144,7 @@ class _CapabilityAwareReader:
     chunk_output_tokens: int
     timeout: float
     request_deadline: float | None
-    relationship_decision_contract = "relationship-decision-v6"
+    relationship_decision_contract = "relationship-decision-v7"
 
     def _record_transport_attempt(self) -> None:
         self.transport_attempt_count = (
@@ -1393,87 +1396,47 @@ def _source_bundle_system_prompt() -> str:
     keys = ", ".join(SECTION_KEYS)
     return (
         "You are the source-reading reasoner for Auto-Zettelkasten source bundle prompt v5. "
-        "Use eight governing rules: capture the thesis, knowledge basis, important evidence, findings, limitations, "
-        "literature position, and contribution; include the detail needed to evaluate the argument; distinguish reported "
-        "observations, modeled estimates, author interpretations, and your explanation; preserve statistical scale, "
-        "estimand, baseline, reference condition, uncertainty, and observed range; preserve causal and comparative "
-        "certainty; stay within recovered-document scope; explain technical findings plainly without inventing numbers "
-        "or analogies; and self-review the required bundle before returning it. "
-        "Return exactly one JSON object with bundle_schema_version, source_identity, "
-        "observed_bibliographic_identity, scope_assessment, analysis_sections, compact_profile, "
-        "evidence_anchors, literature_positions, missing_source_recommendations, and self_review. "
-        'bundle_schema_version must be the JSON string "1", never a number or another version. '
-        "source_identity, observed_bibliographic_identity, scope_assessment, analysis_sections, "
-        "compact_profile, and self_review must each be JSON objects, using {} when empty; never use "
-        "null, a string, or an array for those fields. evidence_anchors, literature_positions, and "
-        "missing_source_recommendations must each be JSON arrays, using [] when empty. "
-        f"analysis_sections uses these keys: {keys}. Every analysis_sections value must be a readable "
-        "Markdown string, never a nested object or array. Adapt the analysis to the source's genre and "
-        "knowledge basis: observational, experimental or quasi-experimental, qualitative or process "
-        "tracing, mixed method, theoretical, review, policy or institutional report, legal or "
-        "normative work, practitioner guidance, book or excerpt, archival, speech, meeting, web, or "
-        "another explicitly described form. Do not force fields that do not apply; use a short "
-        "'Not applicable to this source form' statement when a required note section genuinely does "
-        "not apply. Quantitative work should retain consequential data, population, period, sample and unit; variables, "
-        "baseline and comparison; headline estimates, uncertainty, nulls, interactions, robustness, and design limits. "
-        "Qualitative and comparative work should retain case selection, evidence sources, chronology, mechanisms, decisive "
-        "examples and counterexamples, alternative explanations, and limits on generalization. Historical work should "
-        "retain chronology, primary and secondary evidence, important analogies, the inference drawn from them, and their "
-        "boundaries. Theoretical or normative work should retain assumptions, logical sequence, mechanisms, propositions, "
-        "examples or thought experiments, rivals, premises, and scope. Practitioner and institutional work should separate "
-        "consultations, cases and data from recommendations, implementation examples, constraints, and uncertainty. Reviews "
-        "should retain the organizing debate, important cited positions, evidence bases, unresolved questions, and the "
-        "author's distinct contribution. Select only consequential detail; do not fill irrelevant categories. "
-        "Distinguish observations, author arguments, tested mechanisms, reported "
-        "mechanisms, recommendations, and what the design can establish. Observational evidence uses "
-        "associational wording unless the source and design justify causality. Qualitative work uses "
-        "attributed language such as 'the author argues' for explanatory inferences. Always preserve source-reported "
-        "numbers, their original scale, comparison, reference group, denominator, and uncertainty. A simple derived "
-        "explanation is allowed only when every required input is explicit in the source; mark its provenance as "
-        "system_derived, retain the source statistic beside it, and never invent a missing baseline, denominator, "
-        "reference group, model quantity, or uncertainty measure. Never turn an author recommendation "
-        "into a demonstrated result. Do not use best, only, causes, works, helps, more effective, or "
-        "similar comparative or causal wording unless the inspected source and its design establish "
-        "that exact strength. Keep modeled quantities distinct from observed quantities. In Plain-English Interpretation, "
-        "explain the two to four findings most important to understanding the source rather than repeating the abstract. "
-        "Keep the technical statistic beside its explanation. A move from 40% to 31% is 9 percentage points lower and, "
-        "when useful, 22.5% lower relative to the 40% baseline. Keep percentage points and relative percentages distinct. "
-        "Keep odds, hazards, risks, and probabilities distinct. Do not convert a logit coefficient or interaction into a "
-        "percentage unless the source reports a marginal effect or predicted probability, or supplies every quantity "
-        "required for the derivation. A p-value is not an effect size or the probability that a hypothesis is true, and "
-        "statistical significance is not practical importance. State plainly when no intuitive percentage is defensible. "
-        "Locators are approximate human "
-        "navigation aids and must never be invented. Before returning, silently check attribution, "
-        "source identity, scope, conspicuous numbers, and causal wording in the same call. "
-        "compact_profile contains thesis, method_or_knowledge_basis, source_genre, inferential_design, "
-        "coverage, and bounded facets for mechanisms, outcomes, cases, populations, periods, and "
-        "datasets. It contains no collection membership. evidence_anchors contains no more than 24 "
-        "source-local rows with evidence_anchor_id, source_id, claim, locator, planning_roles, "
-        "salience_priority, support_boundary, support_envelope, plain_english_meaning, uncertainty, and "
-        "optional quantitative_result. quantitative_result uses the existing statistic, estimand_type, "
-        "outcome_definition, estimate, unit, scale, baseline, reference_group, comparison_group, denominator, "
-        "sample, uncertainty, population, period, model, and provenance fields. Use source_reported provenance "
-        "for copied values, system_derived only for a transparent derivation supported by explicit inputs, and "
-        "unknown otherwise. planning_roles may include thesis, "
-        "method, major_finding, mechanism, limitation, or literature_position. Higher salience_priority "
-        "means more useful for downstream planning. support_envelope must be a JSON object with "
-        "empirical_role, argument_role, coverage, scope, restrictions, and support_status; never return "
-        "it as a string. literature_positions contains only approximately "
-        "three to eight important works substantively engaged by the author, not the bibliography. "
-        "Each row contains current_source_id, raw_citation, flat author, year, and title strings when "
-        "known, identifiers, engagement, relation_label, locator, and provenance. Use the exact field "
-        "name engagement; do not return normalized, engagement_account, merged_engagement, or "
-        "merged_engagement_account helper fields. "
-        "missing_source_recommendations contains only important engaged works worth acquiring if local "
-        "matching later finds them absent; do not claim knowledge of library holdings, invent notes, or "
-        "invent retrieval status. source_identity must "
-        "copy only the stable IDs supplied by the caller. observed_bibliographic_identity is diagnostic "
-        "body evidence and cannot override Zotero metadata. In self_review, silently check that source-reported "
-        "numbers were preserved; percentage points and relative percentages were not confused; odds, hazards, risks, "
-        "probabilities, coefficients, and interactions stayed on their proper scales; p-values were not presented as "
-        "effect sizes or truth probabilities; practical and statistical significance were distinguished; and causal "
-        "language matches the design. Record that review in the existing self_review object. It is not a request for "
-        "another model call or a separate note section."
+        "Capture the thesis, knowledge basis, important evidence, detailed findings, limitations, literature position, "
+        "and distinct contribution. Include the consequential data, examples, historical analogies, mechanisms, nulls, "
+        "counterexamples, and qualifications needed to evaluate the argument. Distinguish reported observations, modeled "
+        "estimates, author interpretations, recommendations, and your explanation. Stay within the recovered-document scope. "
+        "Adapt to the source form: quantitative work retains population, period, sample, unit, variables, baseline, "
+        "comparison, estimates, uncertainty, interactions, robustness, and design limits; qualitative and comparative work "
+        "retains case selection, evidence, chronology, mechanisms, decisive examples, alternatives, and generalization limits; "
+        "historical work retains chronology, sources, analogies, inferences, and boundaries; theoretical or normative work "
+        "retains assumptions, logical sequence, propositions, rivals, examples, and scope; institutional or practitioner work "
+        "separates evidence and consultations from recommendations and implementation constraints; reviews retain the "
+        "organizing debate, important cited positions, evidence bases, unresolved questions, and the author's contribution. "
+        "Use associational wording for observational evidence unless the design and source justify causality. Attribute "
+        "qualitative explanatory claims to the author. Never turn a recommendation into a demonstrated result. Preserve every "
+        "important source-reported number on its original scale with its estimand, comparison, reference group, denominator, "
+        "baseline, uncertainty, and observed range. Keep modeled and observed quantities distinct. A simple derivation is "
+        "allowed only when all inputs are explicit; retain the source statistic and label the derivation system_derived. "
+        "In plain English, explain the two to four most important findings rather than repeating the abstract. Keep the "
+        "technical statistic beside the explanation. A move from 40% to 31% is 9 percentage points lower and, when useful, "
+        "22.5% lower relative to the 40% baseline. Keep odds, hazards, risks, and probabilities distinct. Do not convert a "
+        "logit coefficient or interaction into a percentage without a reported marginal effect, predicted probability, or "
+        "all required inputs. A p-value is not an effect size or the probability that a hypothesis is true. Locators are "
+        "approximate navigation aids and must not be invented. "
+        f"Return exactly one JSON object for {SOURCE_BUNDLE_ENVELOPE_CONTRACT} with only these top-level fields: "
+        "analysis_sections, compact_profile, evidence_anchors, literature_positions, and "
+        "observed_bibliographic_identity. "
+        f"analysis_sections is an object with readable Markdown strings for these keys: {keys}. "
+        "Use a short 'Not applicable to this source form' string only when necessary. compact_profile is an object containing "
+        "thesis, method_or_knowledge_basis, source_genre, inferential_design, and bounded arrays for mechanisms, outcomes, "
+        "cases, populations, periods, and datasets. evidence_anchors is an array of no more than 24 consequential rows. Each "
+        "row uses claim, locator, planning_roles, salience_priority, evidence_role, support_boundary, plain_english_meaning, "
+        "uncertainty, and optional quantitative_result. evidence_role should be a short controlled description such as "
+        "causal, associational, descriptive, mechanism_evidence, conceptual, methodological, normative, or "
+        "practitioner_guidance. quantitative_result may use statistic, estimand_type, outcome_definition, estimate, unit, "
+        "scale, baseline, reference_group, comparison_group, denominator, sample, uncertainty, population, period, model, "
+        "and provenance. literature_positions contains approximately three to eight important substantively engaged works, "
+        "not the whole bibliography. Each row uses raw_citation, author, year, title, identifiers, engagement, "
+        "relation_label, and locator. observed_bibliographic_identity is a diagnostic object using title, creators, and date "
+        "when visible in the source. Do not return stable IDs, source ownership, scope classification, support-envelope "
+        "bookkeeping, library match status, missing-source recommendations, or a self-review object; the engine supplies or "
+        "derives those fields locally. Before returning, silently self-review attribution, scope, conspicuous numbers, "
+        "statistical scale, and causal wording inside this same call. This is not another model call or a separate note section."
     )
 
 
@@ -1634,22 +1597,23 @@ def _relationship_shard_system_prompt() -> str:
 
 def _relationship_bridge_shard_system_prompt() -> str:
     return (
-        "You route cross-literature bridge discovery for Auto-Zettelkasten relationship prompt v2. "
+        "You route cross-literature bridge discovery for Auto-Zettelkasten relationship prompt v10. "
         "Return exactly one JSON object with a shard_pairs array of objects. Each object must contain "
-        "left_shard_id, right_shard_id, reason, and confidence. Use only IDs from the supplied routing cards, "
-        "put different IDs in each pair, and select no more than twelve pairs. Select a pair only when the compact "
-        "theses, methods, scopes, or facets indicate a plausible intellectual bridge across literatures. Shared "
-        "vocabulary alone is insufficient. Do not classify source relationships, manufacture source pairs, or ask "
-        "for full notes. Return an empty array when no cross-literature comparison is worthwhile."
+        "left_shard_id, right_shard_id, bridge_family, why_examine, "
+        "target_candidate_count, and confidence. Use only IDs from the supplied "
+        "routing cards, put different IDs in each pair, and select no more than twelve diverse pairs. Route "
+        "plausible shared propositions, mechanisms, outcomes, sequences, debates, applications, and boundaries; "
+        "this is recall-oriented navigation, not relationship publication. Do not classify source relationships "
+        "or manufacture source pairs. Return an empty array only when no cross-literature comparison is worthwhile."
     )
 
 
 def _relationship_candidate_system_prompt() -> str:
     return (
-        "You retrieve comparisons for Auto-Zettelkasten relationship prompt v9. "
+        "You retrieve comparisons for Auto-Zettelkasten relationship prompt v10. "
         "Return exactly one JSON object with a candidates array. Each candidate "
         "contains only left_source_id, right_source_id, comparison_proposition, "
-        "why_compare, bridge_family, and rank. Use only supplied IDs, put the "
+        "why_compare, bridge_family, bridge_job_id, and rank. Use only supplied IDs, put the "
         "canonical lexicographically earlier ID on the left, and never repeat a "
         "pair. A candidate is a request for later full-note comparison, not a "
         "published relationship, so optimize recall, coverage, diversity, and "
@@ -1657,14 +1621,10 @@ def _relationship_candidate_system_prompt() -> str:
         "outcome, debate, sequence, implementation problem, or boundary; shared "
         "vocabulary alone is insufficient. Use max_inferred_pairs as a hard "
         "ceiling. When discovery_mode is bridge_only, return only pairs whose "
-        "supplied collection memberships are disjoint. Follow bridge_orientation "
-        "and oriented_literature_pairs; each pair names one focal literature and "
-        "one comparison literature for this call. When the singular "
-        "focal_literature_id and comparison_literature_ids fields are present, "
-        "they are the same authoritative one-pair instruction. Target 24 to 32 "
-        "candidates per "
-        "orientation, no more "
-        "than two per focal source, unless further pairs would be purely "
+        "supplied collection memberships are disjoint. For bridge_only packets, "
+        "each candidate must name a supplied bridge_job_id and place one endpoint "
+        "on each of that job's source sides. Meet each job's target_candidate_count "
+        "when useful, with no more than two candidates per source unless further pairs would be purely "
         "superficial. Cover multiple theoretical, mechanistic, empirical, "
         "institutional, implementation, outcome, sequence, and boundary families "
         "rather than stopping after citations or one theme. Full-note "
@@ -1675,13 +1635,16 @@ def _relationship_candidate_system_prompt() -> str:
 def _relationship_adjudication_system_prompt() -> str:
     return (
         "You adjudicate immutable relationship pair jobs for Auto-Zettelkasten "
-        "relationship prompt v9 and provider contract relationship-decision-v6. "
-        "Read both complete atomic-note bodies in source_documents. Return exactly "
+        "relationship prompt v10 and provider contract relationship-decision-v7. "
+        "Read both complete atomic-note bodies in source_documents and use the "
+        "source-owned anchors in source_evidence. Return exactly "
         "one JSON object whose decisions value is an object keyed by every supplied "
         "pair_job_id, with no missing or additional keys. A relationship value "
         "contains decision, relation_type, actor_source_id, reference_source_id, "
         "comparison_proposition, reason, boundary_or_qualification, "
-        "left_evidence_anchor_ids, right_evidence_anchor_ids, and confidence. A "
+        "left_endpoint_claim, left_evidence_anchor_id, right_endpoint_claim, "
+        "right_evidence_anchor_id, optional left_additional_evidence_anchor_ids and "
+        "right_additional_evidence_anchor_ids, and confidence. A "
         "no_relationship or needs_more_context value contains only decision, reason, "
         "and confidence. Use only supplied source and evidence-anchor IDs. "
         "First identify the bounded proposition, question, mechanism, outcome, or "
@@ -1706,11 +1669,13 @@ def _relationship_adjudication_system_prompt() -> str:
         "action and reference_source_id is the work acted on; do not infer direction "
         "from pair order or chronology. If A cites B as evidence for A's claim, B "
         "normally supports A. Actor and reference may be omitted only for a symmetric "
-        "relation. State the relevant claim from each work and why the selected type "
-        "follows. Treat limited notes only as evidence for what their supplied text "
-        "establishes. Before returning, self-check that every pair job has one keyed "
-        "decision and that type, actor, reference, proposition, evidence, and "
-        "reason express one consistent direction. "
+        "relation. State the exact claim used from each endpoint, then select the "
+        "source-owned anchor that establishes that claim. The rationale, relationship "
+        "type, and direction must connect those two claims. Treat partial or limited "
+        "notes only as evidence for what their supplied text establishes, and state "
+        "that boundary. Before returning, self-check that every pair job has one "
+        "keyed decision and that type, actor, reference, proposition, endpoint claims, "
+        "anchors, and reason express one consistent direction. "
         "Never invent IDs, anchors, locators, provenance, timestamps, or Markdown."
     )
 
@@ -1846,7 +1811,7 @@ def _debate_system_prompt() -> str:
 def _cluster_synthesis_system_prompt() -> str:
     return (
         "You are the full-note cluster writer for Auto-Zettelkasten cluster "
-        "synthesis prompt v28. Read every supplied atomic_note_markdown before "
+        "synthesis prompt v29. Read every supplied atomic_note_markdown before "
         "drafting. Copy cluster_id exactly from context.cluster.cluster_id. Return "
         "exactly one JSON object with cluster_id, status, title, "
         "organizing_mode, organizing_problem, optional guiding_question, optional "
@@ -1863,7 +1828,12 @@ def _cluster_synthesis_system_prompt() -> str:
         "and locator exactly from a supplied source-owned anchor. Every retained member must "
         "have at least one specific study finding; drop a source rather than retain "
         "decorative context. Any member may contribute regardless of a prior core, "
-        "context, or bridge label. State what each study actually finds or argues, "
+        "context, or bridge label. A partial-document member may be retained when its "
+        "recovered text supplies a specific theoretical, methodological, contextual, "
+        "or boundary contribution. State that contribution and its available-content "
+        "boundary, and do not present unavailable findings as empirical support. Do "
+        "not remove a central work solely because its contribution is non-empirical. "
+        "State what each study actually finds or argues, "
         "not generic thematic boilerplate. Preserve the source-reported statistic and "
         "its scale in technical_result, then explain its substantive meaning for a "
         "non-specialist in plain_english_meaning. Distinguish percentage points from "
@@ -2714,6 +2684,192 @@ def _source_bundle_expected_identity(
     }
 
 
+class _UniqueSafeLoader(yaml.SafeLoader):
+    """Safe YAML loader for conservative recovery of JSON-shaped output."""
+
+    def compose_node(self, parent: Any, index: Any) -> Any:
+        if self.check_event(yaml.AliasEvent):
+            raise yaml.YAMLError("aliases are not allowed")
+        return super().compose_node(parent, index)
+
+
+def _construct_unique_mapping(
+    loader: _UniqueSafeLoader,
+    node: yaml.nodes.MappingNode,
+    deep: bool = False,
+) -> dict[Any, Any]:
+    if not isinstance(node, yaml.nodes.MappingNode):
+        raise yaml.YAMLError("expected a mapping")
+    result: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        if (
+            key_node.tag == "tag:yaml.org,2002:merge"
+            or getattr(key_node, "value", None) == "<<"
+        ):
+            raise yaml.YAMLError("merge keys are not allowed")
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in result
+        except TypeError as exc:
+            raise yaml.YAMLError("mapping keys must be hashable") from exc
+        if duplicate:
+            raise yaml.YAMLError(f"duplicate mapping key: {key!r}")
+        result[key] = loader.construct_object(value_node, deep=deep)
+    return result
+
+
+_UniqueSafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
+
+
+def _conservative_json_superset_mapping(text: str) -> dict[str, Any] | None:
+    """Recover one JSON-like YAML mapping without accepting YAML graph features."""
+
+    if re.search(r"(?m)^\s*%(?:YAML|TAG)\b", text):
+        return None
+    try:
+        documents = list(yaml.load_all(text, Loader=_UniqueSafeLoader))
+    except yaml.YAMLError:
+        return None
+    if len(documents) != 1 or not isinstance(documents[0], Mapping):
+        return None
+    return {str(key): value for key, value in documents[0].items()}
+
+
+def _provider_source_bundle_payload(
+    payload: Mapping[str, Any],
+    *,
+    expected_identity: Mapping[str, str],
+    locally_recovered: bool = False,
+) -> dict[str, Any]:
+    """Normalize the lean provider envelope into the existing internal bundle."""
+
+    normalized = dict(payload)
+    identity = (
+        dict(normalized.get("source_identity") or {})
+        if isinstance(normalized.get("source_identity"), Mapping)
+        else {}
+    )
+    for key, expected in expected_identity.items():
+        returned = str(identity.get(key) or "")
+        if returned and returned.casefold() != expected.casefold():
+            raise ProviderError(f"source_identity.{key} does not match requested source")
+    identity.update(expected_identity)
+    normalized["bundle_schema_version"] = "1"
+    normalized["source_identity"] = identity
+    for field_name in (
+        "observed_bibliographic_identity",
+        "scope_assessment",
+        "compact_profile",
+    ):
+        if not isinstance(normalized.get(field_name), Mapping):
+            normalized[field_name] = {}
+    normalized["self_review"] = {}
+    normalized["missing_source_recommendations"] = []
+
+    source_id = str(expected_identity.get("source_id") or "")
+    anchors: list[Any] = []
+    for value in normalized.get("evidence_anchors", []) or []:
+        if not isinstance(value, Mapping):
+            anchors.append(value)
+            continue
+        row = dict(value)
+        row.pop("evidence_anchor_id", None)
+        row.pop("finding_id", None)
+        row.pop("claim_id", None)
+        row["source_id"] = source_id
+        if isinstance(row.get("planning_roles"), str):
+            row["planning_roles"] = [str(row["planning_roles"])]
+        if isinstance(row.get("salience_priority"), str):
+            try:
+                row["salience_priority"] = int(float(row["salience_priority"]))
+            except ValueError:
+                pass
+        role = str(row.get("evidence_role") or "").strip().casefold()
+        row["support_envelope"] = {
+            "empirical_role": (
+                "causal"
+                if role == "causal"
+                else "associational"
+                if any(token in role for token in ("associat", "regression"))
+                else "descriptive"
+                if any(token in role for token in ("descript", "quantitative"))
+                else "mechanism_evidence"
+                if "mechanism" in role
+                else "none"
+            ),
+            "argument_role": (
+                "methodological"
+                if "method" in role
+                else "normative"
+                if "normative" in role
+                else "practitioner_guidance"
+                if any(token in role for token in ("pract", "guidance"))
+                else "conceptual"
+                if any(token in role for token in ("concept", "theor", "argument"))
+                else "none"
+            ),
+            "coverage": "unknown",
+            "restrictions": (
+                [str(row.get("support_boundary"))]
+                if str(row.get("support_boundary") or "").strip()
+                else []
+            ),
+            "support_status": "supported",
+        }
+        anchors.append(row)
+    normalized["evidence_anchors"] = anchors
+
+    positions: list[Any] = []
+    for value in normalized.get("literature_positions", []) or []:
+        if not isinstance(value, Mapping):
+            positions.append(value)
+            continue
+        row = dict(value)
+        row.pop("literature_position_id", None)
+        row["current_source_id"] = source_id
+        if row.get("year") is not None:
+            row["year"] = str(row["year"])
+        identifiers = row.get("identifiers")
+        if isinstance(identifiers, Mapping):
+            row["identifiers"] = {
+                str(key): str(item)
+                for key, item in identifiers.items()
+                if item not in (None, "")
+            }
+        elif str(identifiers or "").strip():
+            row["identifiers"] = {"other": str(identifiers).strip()}
+        else:
+            row["identifiers"] = {}
+        row.setdefault("author", "")
+        row.setdefault("title", "")
+        row.setdefault("relation_label", "")
+        row.setdefault("locator", "")
+        row.setdefault("matched_source_id", "")
+        row.setdefault("provenance", "explicit")
+        positions.append(row)
+    normalized["literature_positions"] = positions
+
+    diagnostics = [
+        dict(row)
+        for row in normalized.get("component_diagnostics", []) or []
+        if isinstance(row, Mapping)
+    ]
+    if locally_recovered:
+        diagnostics.append(
+            {
+                "component": "provider_envelope",
+                "reason": "conservative_json_superset_recovery",
+                "severity": "advisory",
+                "contract": SOURCE_BUNDLE_ENVELOPE_CONTRACT,
+            }
+        )
+    normalized["component_diagnostics"] = diagnostics
+    return normalized
+
+
 def _parse_source_bundle_response(
     value: Any,
     *,
@@ -2723,6 +2879,7 @@ def _parse_source_bundle_response(
     """Recover exactly one complete, source-owned bundle from a response."""
 
     candidates: list[Mapping[str, Any]] = []
+    recovered_candidate_ids: set[int] = set()
     if isinstance(value, Mapping):
         candidates.append(value)
     elif isinstance(value, list):
@@ -2757,6 +2914,10 @@ def _parse_source_bundle_response(
                 ):
                     candidates.append(candidate[0])
                 index = max(start + 1, end)
+            recovered = _conservative_json_superset_mapping(text)
+            if recovered is not None:
+                candidates.append(recovered)
+                recovered_candidate_ids.add(id(recovered))
         else:
             if isinstance(payload, Mapping):
                 candidates.append(payload)
@@ -2776,7 +2937,12 @@ def _parse_source_bundle_response(
     seen: set[str] = set()
     for candidate in candidates:
         try:
-            normalized = _normalize_source_bundle_payload(candidate)
+            provider_payload = _provider_source_bundle_payload(
+                candidate,
+                expected_identity=expected,
+                locally_recovered=id(candidate) in recovered_candidate_ids,
+            )
+            normalized = _normalize_source_bundle_payload(provider_payload)
             bundle = SourceAnalysisBundle.from_dict(normalized).to_dict()
             identity = dict(bundle.get("source_identity") or {})
             if any(
@@ -2800,7 +2966,7 @@ def _parse_source_bundle_response(
                 continue
         except (TypeError, ValueError, ProviderError):
             continue
-        identity_key = json.dumps(bundle, sort_keys=True, ensure_ascii=False)
+        identity_key = json.dumps(candidate, sort_keys=True, ensure_ascii=False)
         if identity_key not in seen:
             seen.add(identity_key)
             valid.append(bundle)

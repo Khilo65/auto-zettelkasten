@@ -7,8 +7,8 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
-CURRENT_ENGINE_VERSION = "0.19.0"
-CURRENT_ARTIFACT_SCHEMA_VERSION = "1.14"
+CURRENT_ENGINE_VERSION = "0.20.0"
+CURRENT_ARTIFACT_SCHEMA_VERSION = "1.15"
 CURRENT_PROFILE_SCHEMA_VERSION = "1.3"
 
 
@@ -1623,15 +1623,36 @@ def _dedupe_anchors(anchors: list[EvidenceAnchor]) -> list[EvidenceAnchor]:
     return [by_id[anchor_id] for anchor_id in sorted(by_id)]
 
 
+def _anchor_payload_with_bound_nested_ids(
+    anchor: EvidenceAnchor, anchor_id: str
+) -> dict[str, Any]:
+    payload = anchor.to_dict()
+    source_id = anchor.source_id
+    payload["evidence_anchor_id"] = anchor_id
+    payload["source_locators"] = [
+        {
+            **dict(row),
+            "source_id": source_id,
+            "evidence_anchor_id": anchor_id,
+        }
+        for row in payload.get("source_locators", []) or []
+        if isinstance(row, Mapping)
+    ]
+    quantitative = payload.get("quantitative_result")
+    if isinstance(quantitative, Mapping):
+        payload["quantitative_result"] = {
+            **dict(quantitative),
+            "source_id": source_id,
+            "evidence_anchor_id": anchor_id,
+        }
+    return payload
+
+
 def _canonicalize_anchor_ids(anchors: list[EvidenceAnchor]) -> list[EvidenceAnchor]:
     canonical: list[tuple[EvidenceAnchor, str]] = []
     for anchor in anchors:
         base = EvidenceAnchor.from_dict(
-            {
-                **anchor.to_dict(),
-                "evidence_anchor_id": "",
-                "revision_hash": "",
-            }
+            _anchor_payload_with_bound_nested_ids(anchor, "")
         )
         span_identity = {
             "locators": _locator_identity(base.locator, base.locators),
@@ -1655,7 +1676,7 @@ def _canonicalize_anchor_ids(anchors: list[EvidenceAnchor]) -> list[EvidenceAnch
             anchor_id = f"{anchor_id}-{span_hash[:12]}"
         result.append(
             EvidenceAnchor.from_dict(
-                {**anchor.to_dict(), "evidence_anchor_id": anchor_id}
+                _anchor_payload_with_bound_nested_ids(anchor, anchor_id)
             )
         )
     return _dedupe_anchors(result)
@@ -2159,7 +2180,7 @@ class RelationshipPairJob:
     graph_context: dict[str, Any] = field(default_factory=dict)
     candidate_basis: list[dict[str, Any]] = field(default_factory=list)
     prior_pair_memory: dict[str, Any] = field(default_factory=dict)
-    output_contract: str = "relationship-decision-v6"
+    output_contract: str = "relationship-decision-v7"
 
     def __post_init__(self) -> None:
         if (
@@ -2172,6 +2193,7 @@ class RelationshipPairJob:
             "relationship-decision-v4",
             "relationship-decision-v5",
             "relationship-decision-v6",
+            "relationship-decision-v7",
         }:
             raise ValueError("relationship pair job output contract is invalid")
         left, right = sorted((self.left_source_id, self.right_source_id))
@@ -2351,11 +2373,13 @@ class RelationshipDecision:
     inverse_label: str = ""
     comparison_proposition: str = ""
     reason: str = ""
+    left_endpoint_claim: str = ""
+    right_endpoint_claim: str = ""
     left_evidence_anchor_ids: list[str] = field(default_factory=list)
     right_evidence_anchor_ids: list[str] = field(default_factory=list)
     boundary_or_qualification: str = ""
     confidence: str = ""
-    output_contract: str = "relationship-decision-v6"
+    output_contract: str = "relationship-decision-v7"
 
     def __post_init__(self) -> None:
         if self.decision not in {
@@ -2368,6 +2392,7 @@ class RelationshipDecision:
             "relationship-decision-v4",
             "relationship-decision-v5",
             "relationship-decision-v6",
+            "relationship-decision-v7",
         }:
             raise ValueError("relationship decision output contract is invalid")
         pair = {self.left_source_id, self.right_source_id}
@@ -2415,6 +2440,16 @@ class RelationshipDecision:
                     self.inverse_label,
                     self.comparison_proposition,
                     self.reason,
+                    (
+                        self.left_endpoint_claim
+                        if self.output_contract == "relationship-decision-v7"
+                        else "legacy"
+                    ),
+                    (
+                        self.right_endpoint_claim
+                        if self.output_contract == "relationship-decision-v7"
+                        else "legacy"
+                    ),
                     self.left_evidence_anchor_ids,
                     self.right_evidence_anchor_ids,
                 )
@@ -2456,6 +2491,8 @@ class RelationshipDecision:
             "inverse_label": self.inverse_label,
             "comparison_proposition": self.comparison_proposition,
             "reason": self.reason,
+            "left_endpoint_claim": self.left_endpoint_claim,
+            "right_endpoint_claim": self.right_endpoint_claim,
             "left_evidence_anchor_ids": list(self.left_evidence_anchor_ids),
             "right_evidence_anchor_ids": list(self.right_evidence_anchor_ids),
             "boundary_or_qualification": self.boundary_or_qualification,
@@ -4096,6 +4133,7 @@ class CoverageRecord:
     terminal_state: Literal[
         "validated_note",
         "limited_note",
+        "duplicate_alias",
         "parked_for_review",
         "exhausted",
         "partial",
@@ -4119,6 +4157,7 @@ class CoverageRecord:
         if self.terminal_state not in {
             "validated_note",
             "limited_note",
+            "duplicate_alias",
             "parked_for_review",
             "exhausted",
             "partial",
@@ -5449,6 +5488,7 @@ class RunReport:
     inventory_count: int = 0
     validated_note_count: int = 0
     limited_note_count: int = 0
+    duplicate_alias_count: int = 0
     parked_for_review_count: int = 0
     # Constructor compatibility for v0.12 callers; omitted from v0.13 output.
     exhausted_count: int = 0
@@ -5508,6 +5548,7 @@ class RunReport:
         return (
             self.validated_note_count
             + self.limited_note_count
+            + self.duplicate_alias_count
             + max(self.parked_for_review_count, self.exhausted_count)
         )
 

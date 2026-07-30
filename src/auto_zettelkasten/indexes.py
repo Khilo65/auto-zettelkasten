@@ -7,13 +7,38 @@ import json
 from pathlib import Path
 import re
 from typing import Any, Mapping, Sequence
+import unicodedata
 
 from .files import atomic_write_text, now_iso, read_yaml, sha256_text, slugify, write_yaml
 from .notes import read_note
 
-SOURCE_CATALOGUE_SCHEMA_VERSION = "4"
+SOURCE_CATALOGUE_SCHEMA_VERSION = "5"
 SOURCE_CATALOGUE_SHARD_MAX_CHARS = 36_000
 SOURCE_CATALOGUE_ROUTING_CARD_MAX_CHARS = 1_500
+
+_VIRTUAL_TOPIC_FACET_ORDER = (
+    "mechanism",
+    "outcome",
+    "concept",
+    "subject",
+    "case",
+    "population",
+    "dataset",
+    "method",
+    "period",
+)
+_GENERIC_VIRTUAL_TOPICS = {
+    "analysis",
+    "article",
+    "conflict",
+    "data",
+    "document",
+    "general",
+    "none",
+    "other topics",
+    "research",
+    "study",
+}
 
 TYPED_RELATIONS = {
     "cites",
@@ -233,6 +258,7 @@ def write_source_set(
         for status in (
             "validated_note",
             "limited_note",
+            "duplicate_alias",
             "parked_for_review",
             "partial",
             "pending",
@@ -251,9 +277,11 @@ def write_source_set(
         "inventory_count": len(items),
         "terminal_count": status_counts["validated_note"]
         + status_counts["limited_note"]
+        + status_counts["duplicate_alias"]
         + status_counts["parked_for_review"],
         "validated_note_count": status_counts["validated_note"],
         "limited_note_count": status_counts["limited_note"],
+        "duplicate_alias_count": status_counts["duplicate_alias"],
         "parked_for_review_count": status_counts["parked_for_review"],
         "partial_count": status_counts["partial"],
         "pending_count": status_counts["pending"],
@@ -459,6 +487,11 @@ def build_source_catalogue(
         for row in (collection_snapshot or {}).get("items", []) or []
         if isinstance(row, Mapping) and row.get("key")
     }
+    snapshot_items = {
+        str(row.get("key")).upper(): row
+        for row in (collection_snapshot or {}).get("items", []) or []
+        if isinstance(row, Mapping) and row.get("key")
+    }
     if collection_snapshot:
         available_zotero_keys = set(snapshot_memberships)
         for entry in entries:
@@ -478,6 +511,13 @@ def build_source_catalogue(
                 for key in collection_keys
                 if key in snapshot_collections
             )
+    for entry in entries:
+        _refresh_catalogue_sections(
+            entry,
+            snapshot_items.get(str(entry.get("zotero_key") or "").upper(), {}),
+        )
+
+    virtual_projection = _virtual_catalogue_projection(entries)
 
     entry_by_identity = {
         (entry["source_id"], entry["note_id"]): entry for entry in entries
@@ -593,6 +633,24 @@ def build_source_catalogue(
         ],
         "clusters": compact_clusters,
         "collections": collection_projection["catalogue"],
+        "virtual_topics": virtual_projection["catalogue"],
+        "virtual_shards": [
+            {
+                key: row[key]
+                for key in (
+                    "topic_id",
+                    "shard_id",
+                    "title",
+                    "path",
+                    "source_count",
+                    "source_ids",
+                    "note_ids",
+                    "routing_card",
+                    "revision_hash",
+                )
+            }
+            for row in virtual_projection["shards"]
+        ],
         "collection_snapshot_fingerprint": str(
             (collection_snapshot or {}).get("fingerprint") or ""
         ),
@@ -602,20 +660,49 @@ def build_source_catalogue(
         json.dumps(semantic_payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     )
     routing_payload = {
-        **semantic_payload,
-        "clusters": [
+        "schema_version": SOURCE_CATALOGUE_SCHEMA_VERSION,
+        "literatures": compact_literatures,
+        "shards": semantic_payload["shards"],
+        "collections": [
             {
-                key: value
-                for key, value in cluster.items()
-                if key != "refresh_pending"
+                key: row.get(key)
+                for key in (
+                    "key",
+                    "name",
+                    "parent_key",
+                    "child_keys",
+                    "direct_source_count",
+                    "descendant_source_count",
+                    "direct_source_ids",
+                )
             }
-            for cluster in compact_clusters
+            | {
+                "routing_card": {
+                    key: value
+                    for key, value in dict(row.get("routing_card") or {}).items()
+                    if key
+                    not in {
+                        "active_cluster_ids",
+                        "cross_collection_relationship_count",
+                        "revision_hash",
+                    }
+                }
+            }
+            for row in collection_projection["catalogue"]
+        ],
+        "virtual_topics": virtual_projection["catalogue"],
+        "virtual_shards": semantic_payload["virtual_shards"],
+        "collection_snapshot_fingerprint": semantic_payload[
+            "collection_snapshot_fingerprint"
         ],
         "sources": [
             {
-                key: value
-                for key, value in entry.items()
-                if key != "relationship_ids"
+                "source_id": entry["source_id"],
+                "note_id": entry["note_id"],
+                "identity": entry["identity"],
+                "navigation": entry["navigation"],
+                "literature_ids": entry["literature_ids"],
+                "collection_keys": entry.get("collection_keys", []),
             }
             for entry in entries
         ],
@@ -677,6 +764,15 @@ def build_source_catalogue(
                 f"{int(card.get('descendant_source_count', 0) or 0)} descendant"
             )
         master_lines.append("")
+    if virtual_projection["shards"]:
+        master_lines.extend(
+            [
+                "## Virtual topic indexes",
+                "",
+                "- [[by_topic/INDEX|Browse context-bounded topic indexes]]",
+                "",
+            ]
+        )
     master_text = "\n".join(master_lines).rstrip() + "\n"
     cluster_semantic = {
         "schema_version": SOURCE_CATALOGUE_SCHEMA_VERSION,
@@ -730,6 +826,10 @@ def build_source_catalogue(
             (workspace / str(spec["path"]), str(spec["text"]))
             for spec in collection_projection["files"]
         ),
+        *(
+            (workspace / str(spec["path"]), str(spec["text"]))
+            for spec in virtual_projection["files"]
+        ),
         (workspace / "02_source_memory" / "indexes" / "source_catalogue.yml", catalogue_text),
         (workspace / "02_source_memory" / "indexes" / "INDEX.md", master_text),
         (
@@ -750,6 +850,15 @@ def build_source_catalogue(
     }
     for stale in sorted(shard_root.glob("*.md")):
         if stale.resolve() not in expected_shards:
+            stale.unlink()
+            changed_paths.append(str(stale))
+    virtual_root = workspace / "02_source_memory" / "indexes" / "by_topic"
+    expected_virtual_files = {
+        (workspace / str(row["path"])).resolve()
+        for row in virtual_projection["files"]
+    }
+    for stale in sorted(virtual_root.glob("*.md")):
+        if stale.resolve() not in expected_virtual_files:
             stale.unlink()
             changed_paths.append(str(stale))
     if collection_snapshot is not None:
@@ -773,6 +882,13 @@ def build_source_catalogue(
         ),
         "cluster_revision_hash": cluster_revision,
         "shard_paths": [str(workspace / str(row["path"])) for row in shard_specs],
+        "virtual_index_path": str(
+            workspace / "02_source_memory" / "indexes" / "by_topic" / "INDEX.md"
+        ),
+        "virtual_shard_paths": [
+            str(workspace / str(row["path"]))
+            for row in virtual_projection["shards"]
+        ],
         "collection_index_paths": [
             str(workspace / str(row["path"]))
             for row in collection_projection["files"]
@@ -788,6 +904,7 @@ def build_source_catalogue(
         "source_count": len(entries),
         "literature_count": len(compact_literatures),
         "shard_count": len(shard_specs),
+        "virtual_shard_count": len(virtual_projection["shards"]),
         "collection_count": len(collection_projection["catalogue"]),
         "changed_paths": changed_paths,
     }
@@ -1604,12 +1721,15 @@ def _catalogue_entry(profile: Mapping[str, Any], note: Mapping[str, Any]) -> dic
     facets_by_type = {
         facet_type: _bounded_profile_values(profile, fields)
         for facet_type, fields in (
+            ("concept", ("concepts", "concept", "topics", "topic")),
             ("mechanism", ("mechanisms", "mechanism")),
             ("outcome", ("outcomes", "outcome")),
             ("case", ("cases", "case", "geography")),
             ("population", ("populations", "population")),
             ("period", ("periods", "period")),
             ("dataset", ("datasets", "dataset", "data")),
+            ("method", ("methods", "method", "methodology")),
+            ("subject", ("normalized_tags",)),
         )
     }
     facets: list[str] = []
@@ -1646,7 +1766,7 @@ def _catalogue_entry(profile: Mapping[str, Any], note: Mapping[str, Any]) -> dic
     zotero_key = str(note.get("zotero_item_key") or "").strip().upper()
     if not zotero_key and source_id.startswith("source-zotero-"):
         zotero_key = source_id.removeprefix("source-zotero-").upper()
-    return {
+    entry = {
         "source_id": source_id,
         "zotero_key": zotero_key,
         "note_id": str(profile.get("note_id") or note.get("note_id") or ""),
@@ -1668,6 +1788,332 @@ def _catalogue_entry(profile: Mapping[str, Any], note: Mapping[str, Any]) -> dic
         },
         "note_link": note_link,
         "profile_hash": profile_hash,
+    }
+    entry["identity"] = _catalogue_identity(entry, note)
+    entry["navigation"] = _catalogue_navigation(entry)
+    return entry
+
+
+def _catalogue_identity(
+    entry: Mapping[str, Any], source: Mapping[str, Any]
+) -> dict[str, Any]:
+    current = (
+        dict(entry.get("identity") or {})
+        if isinstance(entry.get("identity"), Mapping)
+        else {}
+    )
+    supplied = (
+        dict(source.get("identity") or {})
+        if isinstance(source.get("identity"), Mapping)
+        else {}
+    )
+
+    def first(*values: Any) -> str:
+        return next((str(value).strip() for value in values if str(value or "").strip()), "")
+
+    canonical_key = first(
+        supplied.get("canonical_zotero_key"),
+        source.get("canonical_zotero_key"),
+        current.get("canonical_zotero_key"),
+        entry.get("zotero_key"),
+        source.get("key"),
+        source.get("zotero_item_key"),
+    ).upper()
+    item_keys = {
+        str(value).strip().upper()
+        for value in [
+            *(
+                current.get("zotero_item_keys", [])
+                if isinstance(current.get("zotero_item_keys"), Sequence)
+                and not isinstance(current.get("zotero_item_keys"), (str, bytes))
+                else []
+            ),
+            *(
+                supplied.get("zotero_item_keys", [])
+                if isinstance(supplied.get("zotero_item_keys"), Sequence)
+                and not isinstance(supplied.get("zotero_item_keys"), (str, bytes))
+                else []
+            ),
+            *(
+                source.get("zotero_item_keys", [])
+                if isinstance(source.get("zotero_item_keys"), Sequence)
+                and not isinstance(source.get("zotero_item_keys"), (str, bytes))
+                else []
+            ),
+            canonical_key,
+        ]
+        if str(value or "").strip()
+    }
+    doi = first(
+        supplied.get("doi"),
+        source.get("doi"),
+        source.get("DOI"),
+        current.get("doi"),
+    ).casefold()
+    if doi.startswith("https://doi.org/"):
+        doi = doi.removeprefix("https://doi.org/")
+    isbn = re.sub(
+        r"[^0-9Xx]",
+        "",
+        first(
+            supplied.get("isbn"),
+            source.get("isbn"),
+            source.get("ISBN"),
+            current.get("isbn"),
+        ),
+    ).upper()
+    title = first(
+        supplied.get("normalized_title"),
+        source.get("title"),
+        current.get("normalized_title"),
+        entry.get("title"),
+    )
+    creator_surnames = [
+        str(creator.get("lastName") or creator.get("name") or "").strip()
+        for creator in source.get("creators", []) or []
+        if isinstance(creator, Mapping)
+        and str(creator.get("lastName") or creator.get("name") or "").strip()
+    ]
+    author_values = (
+        supplied.get("normalized_author_surnames")
+        or creator_surnames
+        or current.get("normalized_author_surnames")
+        or str(entry.get("author") or "").split(",")
+    )
+    author_surnames = sorted(
+        {
+            _normalize_identity_text(value)
+            for value in author_values
+            if _normalize_identity_text(value)
+        }
+    )
+    year_text = first(
+        supplied.get("year"),
+        source.get("year"),
+        source.get("date"),
+        current.get("year"),
+        entry.get("year"),
+    )
+    year_match = re.search(r"(?:19|20)\d{2}", year_text)
+    relations = next(
+        (
+            dict(value)
+            for value in (
+                supplied.get("zotero_relations"),
+                source.get("zotero_relations"),
+                source.get("relations"),
+                current.get("zotero_relations"),
+            )
+            if isinstance(value, Mapping)
+        ),
+        {},
+    )
+    return {
+        "canonical_zotero_key": canonical_key,
+        "zotero_item_keys": sorted(item_keys),
+        "doi": doi,
+        "isbn": isbn,
+        "url": first(
+            supplied.get("url"),
+            source.get("url"),
+            source.get("URL"),
+            current.get("url"),
+        ),
+        "normalized_title": _normalize_identity_text(title),
+        "normalized_author_surnames": author_surnames,
+        "year": year_match.group(0) if year_match else "n.d.",
+        "zotero_relations": relations,
+    }
+
+
+def _normalize_identity_text(value: Any) -> str:
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return re.sub(r"\s+", " ", re.sub(r"[^\w]+", " ", text)).strip()
+
+
+def _catalogue_navigation(entry: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "title": str(entry.get("title") or ""),
+        "author": str(entry.get("author") or ""),
+        "year": str(entry.get("year") or ""),
+        "thesis": str(entry.get("thesis") or ""),
+        "method": str(entry.get("method") or ""),
+        "source_scope": str(entry.get("source_scope") or ""),
+        "evidence_eligibility": str(entry.get("evidence_eligibility") or ""),
+        "facets_by_type": dict(entry.get("facets_by_type") or {}),
+        "collections": list(entry.get("collections", []) or []),
+        "virtual_topic_ids": list(entry.get("virtual_topic_ids", []) or []),
+    }
+
+
+def _refresh_catalogue_sections(
+    entry: dict[str, Any], snapshot_item: Mapping[str, Any]
+) -> None:
+    entry["identity"] = _catalogue_identity(entry, snapshot_item)
+    entry["navigation"] = _catalogue_navigation(entry)
+
+
+def _virtual_catalogue_projection(
+    entries: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    candidates_by_source: dict[str, list[tuple[str, str, str]]] = {}
+    topic_counts: Counter[str] = Counter()
+    for entry in entries:
+        candidates: list[tuple[str, str, str]] = []
+        seen: set[str] = set()
+        facets_by_type = (
+            entry.get("facets_by_type")
+            if isinstance(entry.get("facets_by_type"), Mapping)
+            else {}
+        )
+        for facet_type in _VIRTUAL_TOPIC_FACET_ORDER:
+            for raw_label in facets_by_type.get(facet_type, []) or []:
+                label = _compact_catalogue_text(raw_label, 80)
+                normalized = _normalize_identity_text(label)
+                if (
+                    not normalized
+                    or normalized in _GENERIC_VIRTUAL_TOPICS
+                    or normalized in seen
+                ):
+                    continue
+                seen.add(normalized)
+                topic_id = f"topic-{slugify(facet_type)}-{slugify(normalized)}"
+                candidates.append((topic_id, facet_type, label))
+        source_id = str(entry.get("source_id") or entry.get("note_id") or "")
+        candidates_by_source[source_id] = candidates
+        topic_counts.update(topic_id for topic_id, _facet_type, _label in candidates)
+
+    topic_rows: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        source_id = str(entry.get("source_id") or entry.get("note_id") or "")
+        memberships = [
+            candidate
+            for candidate in candidates_by_source.get(source_id, [])
+            if topic_counts[candidate[0]] >= 2
+        ][:3]
+        if not memberships:
+            memberships = [("topic-catch-all", "catch_all", "Other sources")]
+        entry["virtual_topic_ids"] = [topic_id for topic_id, _facet, _label in memberships]
+        entry["navigation"] = _catalogue_navigation(entry)
+        for topic_id, facet_type, label in memberships:
+            topic = topic_rows.setdefault(
+                topic_id,
+                {
+                    "topic_id": topic_id,
+                    "facet_type": facet_type,
+                    "label": label,
+                    "entries": [],
+                },
+            )
+            topic["entries"].append(entry)
+
+    shards: list[dict[str, Any]] = []
+    catalogue: list[dict[str, Any]] = []
+    for topic_id in sorted(topic_rows):
+        topic = topic_rows[topic_id]
+        topic_entries = sorted(
+            topic["entries"],
+            key=lambda row: (
+                str(row.get("author") or "").casefold(),
+                str(row.get("year") or ""),
+                str(row.get("title") or "").casefold(),
+                str(row.get("source_id") or ""),
+            ),
+        )
+        chunks = _meaningful_catalogue_chunks(topic_entries)
+        shard_ids: list[str] = []
+        for number, (_group, chunk_entries) in enumerate(chunks, start=1):
+            shard_id = (
+                topic_id
+                if len(chunks) == 1
+                else f"{topic_id}-part-{number:02d}"
+            )
+            shard_ids.append(shard_id)
+            heading = (
+                str(topic["label"])
+                if len(chunks) == 1
+                else f"{topic['label']} — part {number}"
+            )
+            body = (
+                f"# Virtual topic: {heading}\n\n"
+                "Navigation only; this index makes no synthesis claim.\n\n"
+                + "".join(_render_catalogue_source(entry) for entry in chunk_entries)
+            )
+            revision_hash = sha256_text(body)
+            shards.append(
+                {
+                    "topic_id": topic_id,
+                    "shard_id": shard_id,
+                    "title": heading,
+                    "path": f"02_source_memory/indexes/by_topic/{shard_id}.md",
+                    "source_count": len(chunk_entries),
+                    "source_ids": [
+                        str(entry.get("source_id") or "")
+                        for entry in chunk_entries
+                        if entry.get("source_id")
+                    ],
+                    "note_ids": [
+                        str(entry.get("note_id") or "")
+                        for entry in chunk_entries
+                        if entry.get("note_id")
+                    ],
+                    "routing_card": _catalogue_shard_routing_card(
+                        shard_id=shard_id,
+                        title=heading,
+                        scope=f"Sources indexed under {topic['label']}.",
+                        entries=chunk_entries,
+                    ),
+                    "revision_hash": revision_hash,
+                    "text": f"{body}\nCatalogue revision: `{revision_hash}`\n",
+                }
+            )
+        catalogue.append(
+            {
+                "topic_id": topic_id,
+                "facet_type": topic["facet_type"],
+                "label": topic["label"],
+                "source_count": len(topic_entries),
+                "source_ids": [
+                    str(entry.get("source_id") or "")
+                    for entry in topic_entries
+                    if entry.get("source_id")
+                ],
+                "shard_ids": shard_ids,
+                "routing_card": _catalogue_shard_routing_card(
+                    shard_id=topic_id,
+                    title=str(topic["label"]),
+                    scope=f"Sources indexed under {topic['label']}.",
+                    entries=topic_entries,
+                ),
+            }
+        )
+
+    index_lines = [
+        "# Virtual Topic Indexes",
+        "",
+        "Navigation only; these shards are not literature-synthesis clusters.",
+        "",
+    ]
+    for shard in shards:
+        index_lines.append(
+            f"- [[{Path(str(shard['path'])).stem}|{shard['title']}]] "
+            f"— {shard['source_count']} sources"
+        )
+    index_body = "\n".join(index_lines).rstrip() + "\n"
+    files = [
+        *(
+            {"path": str(shard["path"]), "text": str(shard["text"])}
+            for shard in shards
+        ),
+        {
+            "path": "02_source_memory/indexes/by_topic/INDEX.md",
+            "text": index_body,
+        },
+    ]
+    return {
+        "catalogue": catalogue,
+        "shards": shards,
+        "files": files,
     }
 
 

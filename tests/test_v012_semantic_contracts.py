@@ -285,7 +285,7 @@ def test_catalogue_routing_cards_are_bounded_and_semantically_compact(
 def test_builtin_reader_exposes_v2_bridge_and_verification_contracts() -> None:
     assert callable(getattr(DeepSeekReader, "select_relationship_bridge_shards"))
     assert callable(getattr(DeepSeekReader, "verify_relationships"))
-    assert "relationship prompt v2" in _relationship_bridge_shard_system_prompt()
+    assert "relationship prompt v10" in _relationship_bridge_shard_system_prompt()
     assert "preliminary decision as a claim to audit" in (
         _relationship_verification_system_prompt()
     )
