@@ -134,28 +134,29 @@ def test_semantic_prompts_allow_neutral_nonmembership_and_bounded_relations() ->
     assert "one consistent direction" in relationships
 
 
-def test_matched_literature_position_projects_explicit_citation(tmp_path: Path) -> None:
-    write_yaml(
-        tmp_path / "02_source_memory" / "indexes" / "literature_positions.yml",
-        {
-            "positions": [
-                {
-                    "current_source_id": "A",
-                    "matched_source_id": "B",
-                    "match_status": "matched",
-                }
-            ]
-        },
-    )
+def test_mapped_literature_position_projects_explicit_citation(tmp_path: Path) -> None:
+    for match_status in ("mapped", "matched"):
+        write_yaml(
+            tmp_path / "02_source_memory" / "indexes" / "literature_positions.yml",
+            {
+                "positions": [
+                    {
+                        "current_source_id": "A",
+                        "matched_source_id": "B",
+                        "match_status": match_status,
+                    }
+                ]
+            },
+        )
 
-    notes = _source_notes_with_custody_relations(
-        tmp_path,
-        [{"source_id": "A"}, {"source_id": "B"}],
-    )
-    by_source = {row["source_id"]: row for row in notes}
+        notes = _source_notes_with_custody_relations(
+            tmp_path,
+            [{"source_id": "A"}, {"source_id": "B"}],
+        )
+        by_source = {row["source_id"]: row for row in notes}
 
-    assert by_source["A"]["custody_relations"]["cites"] == ["B"]
-    assert by_source["B"]["custody_relations"]["cited_by"] == ["A"]
+        assert by_source["A"]["custody_relations"]["cites"] == ["B"]
+        assert by_source["B"]["custody_relations"]["cited_by"] == ["A"]
 
 
 def test_streamlined_cluster_normalizes_harmless_mode_formatting() -> None:

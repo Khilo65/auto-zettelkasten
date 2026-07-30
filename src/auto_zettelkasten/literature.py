@@ -15661,7 +15661,7 @@ def _source_notes_with_custody_relations(
             continue
         source_id = str(position.get("current_source_id") or "")
         target_id = str(position.get("matched_source_id") or "")
-        if str(position.get("match_status") or "") == "matched":
+        if str(position.get("match_status") or "") in {"mapped", "matched"}:
             add_relation(source_id, target_id, "cites")
             add_relation(target_id, source_id, "cited_by")
     return rows
