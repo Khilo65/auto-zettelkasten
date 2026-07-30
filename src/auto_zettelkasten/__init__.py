@@ -1,6 +1,6 @@
 """Public package metadata and collection-mapping contracts."""
 
-ENGINE_VERSION = "0.18.0"
+ENGINE_VERSION = "0.19.0"
 ARTIFACT_SCHEMA_VERSION = "1.14"
 __version__ = ENGINE_VERSION
 

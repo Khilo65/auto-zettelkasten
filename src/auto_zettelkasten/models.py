@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
-CURRENT_ENGINE_VERSION = "0.18.0"
+CURRENT_ENGINE_VERSION = "0.19.0"
 CURRENT_ARTIFACT_SCHEMA_VERSION = "1.14"
 CURRENT_PROFILE_SCHEMA_VERSION = "1.3"
 
@@ -2159,7 +2159,7 @@ class RelationshipPairJob:
     graph_context: dict[str, Any] = field(default_factory=dict)
     candidate_basis: list[dict[str, Any]] = field(default_factory=list)
     prior_pair_memory: dict[str, Any] = field(default_factory=dict)
-    output_contract: str = "relationship-decision-v5"
+    output_contract: str = "relationship-decision-v6"
 
     def __post_init__(self) -> None:
         if (
@@ -2171,6 +2171,7 @@ class RelationshipPairJob:
         if self.output_contract not in {
             "relationship-decision-v4",
             "relationship-decision-v5",
+            "relationship-decision-v6",
         }:
             raise ValueError("relationship pair job output contract is invalid")
         left, right = sorted((self.left_source_id, self.right_source_id))
@@ -2354,7 +2355,7 @@ class RelationshipDecision:
     right_evidence_anchor_ids: list[str] = field(default_factory=list)
     boundary_or_qualification: str = ""
     confidence: str = ""
-    output_contract: str = "relationship-decision-v5"
+    output_contract: str = "relationship-decision-v6"
 
     def __post_init__(self) -> None:
         if self.decision not in {
@@ -2366,6 +2367,7 @@ class RelationshipDecision:
         if self.output_contract not in {
             "relationship-decision-v4",
             "relationship-decision-v5",
+            "relationship-decision-v6",
         }:
             raise ValueError("relationship decision output contract is invalid")
         pair = {self.left_source_id, self.right_source_id}

@@ -2590,7 +2590,62 @@ def _run_relationship_reasoning(
     entry_by_source = {
         str(row["source_id"]): row for row in entries if row.get("source_id")
     }
-    catalogue_revision = stable_hash(entries)
+    collection_structure = {
+        "literatures": [
+            {
+                "literature_id": str(row.get("literature_id") or ""),
+                "title": str(row.get("title") or ""),
+                "scope": str(row.get("scope") or ""),
+                "source_count": int(row.get("source_count", 0) or 0),
+            }
+            for row in catalogue_payload.get("literatures", []) or []
+            if isinstance(row, Mapping)
+        ],
+        "collections": [
+            {
+                "key": str(row.get("key") or ""),
+                "parent_key": str(row.get("parent_key") or ""),
+                "direct_source_ids": sorted(
+                    str(value)
+                    for value in row.get("direct_source_ids", []) or []
+                    if str(value) in profile_by_source
+                ),
+                "routing_card": {
+                    str(key): value
+                    for key, value in dict(
+                        row.get("routing_card") or {}
+                    ).items()
+                    if str(key)
+                    not in {
+                        "active_cluster_ids",
+                        "cross_collection_relationship_count",
+                        "relationship_count",
+                        "relationship_view_revisions",
+                        "revision_hash",
+                    }
+                },
+            }
+            for row in catalogue_payload.get("collections", []) or []
+            if isinstance(row, Mapping)
+        ],
+        "shards": [
+            {
+                "shard_id": str(row.get("shard_id") or ""),
+                "literature_id": str(row.get("literature_id") or ""),
+                "source_ids": sorted(
+                    str(value)
+                    for value in row.get("source_ids", []) or []
+                    if str(value) in profile_by_source
+                ),
+                "routing_card": dict(row.get("routing_card") or {}),
+            }
+            for row in catalogue_payload.get("shards", []) or []
+            if isinstance(row, Mapping)
+        ],
+    }
+    catalogue_revision = stable_hash(
+        {"entries": entries, "collection_structure": collection_structure}
+    )
     current_hashes = {
         source_id: stable_hash(profile_to_dict(profile))
         for source_id, profile in sorted(profile_by_source.items())
@@ -2981,7 +3036,7 @@ def _run_relationship_reasoning(
         (2 if collection_cards else 1) if requires_routing else 0
     )
     bridge_routing_call_count = int(len(literature_ids) > 2)
-    discovery_call_count = 2 + routing_call_count + bridge_routing_call_count
+    discovery_call_count = 3 + routing_call_count + bridge_routing_call_count
     can_discover = (
         remaining_calls >= mandatory_call_count + discovery_call_count + 1
     )
@@ -3001,7 +3056,7 @@ def _run_relationship_reasoning(
         if can_discover
         else 0
     )
-    general_capacity = min(72, inferred_capacity)
+    general_capacity = min(72, (inferred_capacity * 3 + 4) // 5)
     bridge_capacity = min(48, max(0, inferred_capacity - general_capacity))
     discovery_completed = False
     discovery_terminal = False
@@ -3201,9 +3256,11 @@ def _run_relationship_reasoning(
             )
             discovery_terminal = True
 
-    bridge_source_sets: list[set[str]] = []
+    bridge_source_sets: list[tuple[set[str], tuple[str, str]]] = []
     if can_discover and bridge_capacity and len(literature_ids) == 2:
-        bridge_source_sets = [set(profile_by_source)]
+        bridge_source_sets = [
+            (set(profile_by_source), (literature_ids[0], literature_ids[1]))
+        ]
     elif can_discover and bridge_capacity and len(literature_ids) > 2:
         bridge_selector = getattr(
             reasoner, "select_relationship_bridge_shards", None
@@ -3230,17 +3287,36 @@ def _run_relationship_reasoning(
                     for row in catalogue_payload.get("shards", []) or []
                     if isinstance(row, Mapping) and row.get("shard_id")
                 }
-                bridge_source_sets = [
-                    shard_sources.get(str(row.get("left_shard_id") or ""), set())
-                    | shard_sources.get(
-                        str(row.get("right_shard_id") or ""), set()
+                shard_literatures = {
+                    str(row.get("shard_id") or ""): str(
+                        row.get("literature_id") or ""
                     )
-                    for row in routed.get("shard_pairs", []) or []
-                    if isinstance(row, Mapping)
-                ]
+                    for row in catalogue_payload.get("shards", []) or []
+                    if isinstance(row, Mapping) and row.get("shard_id")
+                }
+                bridge_source_sets = []
+                for row in routed.get("shard_pairs", []) or []:
+                    if not isinstance(row, Mapping):
+                        continue
+                    left_shard_id = str(row.get("left_shard_id") or "")
+                    right_shard_id = str(row.get("right_shard_id") or "")
+                    pair = (
+                        shard_literatures.get(left_shard_id, ""),
+                        shard_literatures.get(right_shard_id, ""),
+                    )
+                    source_ids = shard_sources.get(
+                        left_shard_id, set()
+                    ) | shard_sources.get(right_shard_id, set())
+                    if (
+                        len(source_ids) >= 2
+                        and pair[0]
+                        and pair[1]
+                        and pair[0] != pair[1]
+                    ):
+                        bridge_source_sets.append((source_ids, pair))
                 bridge_source_sets = [
-                    source_ids
-                    for source_ids in bridge_source_sets
+                    (source_ids, pair)
+                    for source_ids, pair in bridge_source_sets
                     if len(source_ids) >= 2
                 ]
             except Exception as exc:
@@ -3263,9 +3339,12 @@ def _run_relationship_reasoning(
                 }
             )
 
-    packed_bridge_source_sets: list[set[str]] = []
+    packed_bridge_source_sets: list[
+        tuple[set[str], list[tuple[str, str]]]
+    ] = []
     current_bridge_sources: set[str] = set()
-    for source_ids in bridge_source_sets:
+    current_bridge_pairs: list[tuple[str, str]] = []
+    for source_ids, literature_pair in bridge_source_sets:
         candidate_sources = current_bridge_sources | source_ids
         candidate_entries = [
             row
@@ -3308,19 +3387,31 @@ def _run_relationship_reasoning(
             )
             > catalogue_char_budget
         ):
-            packed_bridge_source_sets.append(current_bridge_sources)
+            packed_bridge_source_sets.append(
+                (current_bridge_sources, current_bridge_pairs)
+            )
             current_bridge_sources = set(source_ids)
+            current_bridge_pairs = [literature_pair]
         else:
             current_bridge_sources = candidate_sources
+            if literature_pair not in current_bridge_pairs:
+                current_bridge_pairs.append(literature_pair)
     if current_bridge_sources:
-        packed_bridge_source_sets.append(current_bridge_sources)
+        packed_bridge_source_sets.append(
+            (current_bridge_sources, current_bridge_pairs)
+        )
 
-    seen_bridge_packets: set[tuple[str, ...]] = set()
-    for packet_index, source_ids in enumerate(packed_bridge_source_sets):
+    seen_bridge_packets: set[
+        tuple[tuple[str, ...], tuple[tuple[str, str], ...]]
+    ] = set()
+    for packet_index, (source_ids, literature_pairs) in enumerate(
+        packed_bridge_source_sets
+    ):
         packet_ids = tuple(sorted(source_ids))
-        if packet_ids in seen_bridge_packets:
+        packet_key = (packet_ids, tuple(sorted(literature_pairs)))
+        if packet_key in seen_bridge_packets:
             continue
-        seen_bridge_packets.add(packet_ids)
+        seen_bridge_packets.add(packet_key)
         packet_entries = [
             row
             for row in entries
@@ -3346,7 +3437,7 @@ def _run_relationship_reasoning(
                 if str(card.get("literature_id") or "")
                 in packet_literature_ids
             ],
-            "max_inferred_pairs": bridge_capacity,
+            "max_inferred_pairs": min(32, bridge_capacity),
             "reserved_bridge_fraction": 1.0,
             "literature_positions": [
                 row
@@ -3370,15 +3461,107 @@ def _run_relationship_reasoning(
                 }
             )
             continue
-        candidate_tasks.append(
-            (
-                "relationship_bridge_candidate_selection",
-                f"bridge-{catalogue_revision[:16]}-{packet_index + 1}",
-                [],
-                bridge_context,
-                "bridge",
+        for orientation in ("forward", "reverse"):
+            oriented_pairs = [
+                {
+                    "focal_literature_id": (
+                        pair[0] if orientation == "forward" else pair[1]
+                    ),
+                    "comparison_literature_id": (
+                        pair[1] if orientation == "forward" else pair[0]
+                    ),
+                }
+                for pair in literature_pairs
+            ]
+            singular_context = (
+                {
+                    "focal_literature_id": oriented_pairs[0][
+                        "focal_literature_id"
+                    ],
+                    "comparison_literature_ids": [
+                        oriented_pairs[0]["comparison_literature_id"]
+                    ],
+                }
+                if len(oriented_pairs) == 1
+                else {}
             )
+            candidate_tasks.append(
+                (
+                    "relationship_bridge_candidate_selection",
+                    (
+                        f"bridge-{catalogue_revision[:16]}-"
+                        f"{packet_index + 1}-{orientation}"
+                    ),
+                    [],
+                    {
+                        **bridge_context,
+                        "bridge_orientation": orientation,
+                        "oriented_literature_pairs": oriented_pairs,
+                        **singular_context,
+                    },
+                    "bridge",
+                )
+            )
+
+    current_remaining_calls = (
+        remaining_calls
+        if configured_max_calls is None
+        else max(
+            0,
+            int(configured_max_calls or 0)
+            - int(
+                getattr(reasoner_calls, "cumulative_provider_calls", 0) or 0
+            ),
         )
+    )
+    available_discovery_calls = max(
+        0, current_remaining_calls - mandatory_call_count - 2
+    )
+    if len(candidate_tasks) > available_discovery_calls:
+        discovery_terminal = True
+        discovery_parked.append(
+            {
+                "reason": "relationship_discovery_budget_conflict",
+                "required_calls": len(candidate_tasks),
+                "available_calls": available_discovery_calls,
+                "retry_on_resume": False,
+            }
+        )
+        candidate_tasks = []
+    else:
+        adjudication_call_capacity = min(
+            20,
+            max(
+                mandatory_call_count,
+                current_remaining_calls - len(candidate_tasks) - 1,
+            ),
+        )
+        pair_capacity = adjudication_call_capacity * batch_max_jobs
+        inferred_capacity = min(
+            max(0, 120 - len(mandatory_basis)),
+            max(0, pair_capacity - len(mandatory_basis)),
+        )
+        general_capacity = min(
+            72, (inferred_capacity * 3 + 4) // 5
+        )
+        bridge_capacity = min(
+            48, max(0, inferred_capacity - general_capacity)
+        )
+        candidate_tasks = [
+            (
+                stage,
+                key,
+                task_profiles,
+                {
+                    **task_context,
+                    "max_inferred_pairs": (
+                        bridge_capacity if pool == "bridge" else general_capacity
+                    ),
+                },
+                pool,
+            )
+            for stage, key, task_profiles, task_context, pool in candidate_tasks
+        ]
 
     candidate_results: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
 
@@ -3444,6 +3627,26 @@ def _run_relationship_reasoning(
             for row in response.get("candidates", []) or []
         ]
     }
+    if configured_max_calls is not None:
+        post_discovery_remaining = max(
+            0,
+            int(configured_max_calls or 0)
+            - int(
+                getattr(reasoner_calls, "cumulative_provider_calls", 0) or 0
+            ),
+        )
+        adjudication_call_capacity = min(
+            20, max(0, post_discovery_remaining - 1)
+        )
+        pair_capacity = adjudication_call_capacity * batch_max_jobs
+        inferred_capacity = min(
+            max(0, 120 - len(mandatory_basis)),
+            max(0, pair_capacity - len(mandatory_basis)),
+        )
+        general_capacity = min(72, (inferred_capacity * 3 + 4) // 5)
+        bridge_capacity = min(
+            48, max(0, inferred_capacity - general_capacity)
+        )
     excluded_pairs = set(mandatory_basis) | negative_pairs
     bridge_rows = _ranked_relationship_candidates(
         bridge_payload,
@@ -3578,7 +3781,9 @@ def _run_relationship_reasoning(
                 "description": " ".join(
                     str(
                         row.get("reason")
+                        or row.get("why_compare")
                         or row.get("why_relevant")
+                        or row.get("comparison_proposition")
                         or row.get("engagement")
                         or ""
                     ).split()
@@ -3935,9 +4140,17 @@ def _run_relationship_reasoning(
             if response_or_error is None:
                 raise RuntimeError("relationship_batch_was_not_scheduled")
             response = response_or_error
+            raw_decisions = response.get("decisions", []) or []
+            if isinstance(raw_decisions, Mapping):
+                raw_decisions = [
+                    {**dict(value), "pair_job_id": str(job_id)}
+                    if isinstance(value, Mapping)
+                    else value
+                    for job_id, value in raw_decisions.items()
+                ]
             rows = [
                 dict(row)
-                for row in response.get("decisions", []) or []
+                for row in raw_decisions
                 if isinstance(row, Mapping)
             ]
             by_job: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -4169,9 +4382,14 @@ def _ranked_relationship_candidates(
         if not isinstance(raw, Mapping):
             continue
         row = dict(raw)
-        source_id = str(row.get("source_id") or "")
+        source_id = str(
+            row.get("left_source_id") or row.get("source_id") or ""
+        )
         target_id = str(
-            row.get("target_id") or row.get("target_source_id") or ""
+            row.get("right_source_id")
+            or row.get("target_id")
+            or row.get("target_source_id")
+            or ""
         )
         pair = canonical_pair(source_id, target_id)
         if (
@@ -4183,8 +4401,7 @@ def _ranked_relationship_candidates(
         ):
             continue
         seen.add(pair)
-        row["source_id"] = source_id
-        row["target_id"] = target_id
+        row["source_id"], row["target_id"] = pair
         row["_model_rank"] = int(row.get("rank") or row.get("priority") or index + 1)
         left_collections = set(
             entry_by_source.get(source_id, {}).get("literature_ids", [])
@@ -7981,11 +8198,20 @@ def _content_candidate(
     }
 
 
-_BOUNDED_ATTACHMENT_RE = re.compile(
-    r"\b(?:chapter\s+(?:\d+|[ivxlcdm]+)|introduction|appendix|excerpt|"
-    r"foreword|preface)\b",
+_EXPLICIT_BOUNDED_ATTACHMENT_RE = re.compile(
+    r"\b(?:chapter\s+(?:\d+|[ivxlcdm]+)|appendix|excerpt)\b",
     flags=re.IGNORECASE,
 )
+_EXPLICIT_CHAPTER_LABEL_RE = re.compile(
+    r"^\s*chapter(?:\s+(?:\d+|[ivxlcdm]+|one|two|three|four|five|six|"
+    r"seven|eight|nine|ten|[a-z][\w'-]*))?(?:\s*[:.-].*)?\s*$",
+    flags=re.IGNORECASE,
+)
+_WEAK_BOUNDED_ATTACHMENT_RE = re.compile(
+    r"\b(?:introduction|foreword|preface)\b",
+    flags=re.IGNORECASE,
+)
+_WEAK_BOUNDED_ATTACHMENT_PAGE_LIMIT = 100
 _GENERIC_ATTACHMENT_LABEL_RE = re.compile(
     r"^(?:pdf|full\s*text|attachment|download(?:_file)?(?:\.pdf)?)$",
     flags=re.IGNORECASE,
@@ -8012,9 +8238,32 @@ def _apply_bibliographic_scope(
     first_page = str(row.get("text") or "")[:8_000]
     metrics = dict(row.get("coverage_metrics", {}) or {})
     page_count = int(metrics.get("page_count", 0) or 0)
+    recovered_pages = metrics.get("recovered_pages", ()) or ()
+    recovered_page_count = (
+        len(recovered_pages)
+        if isinstance(recovered_pages, (list, tuple, set))
+        else page_count
+    )
+    if recovered_page_count <= 0:
+        recovered_page_count = page_count
+    plausibly_short = (
+        0
+        < recovered_page_count
+        <= _WEAK_BOUNDED_ATTACHMENT_PAGE_LIMIT
+    )
     parent_type = str(parent.get("itemType") or "")
     bounded_match = (
-        _BOUNDED_ATTACHMENT_RE.search(label) if meaningful_label else None
+        _EXPLICIT_BOUNDED_ATTACHMENT_RE.search(label)
+        if meaningful_label
+        else None
+    ) or (
+        _EXPLICIT_CHAPTER_LABEL_RE.fullmatch(label)
+        if meaningful_label
+        else None
+    ) or (
+        _WEAK_BOUNDED_ATTACHMENT_RE.search(label)
+        if meaningful_label and plausibly_short
+        else None
     ) or re.search(
         r"(?im)^(?:--- Page 1 ---\s*)?(?:chapter\s+(?:\d+|[ivxlcdm]+)"
         r"(?:\s*[:.-]\s*|\s+)|appendix\s+[a-z0-9]+)",

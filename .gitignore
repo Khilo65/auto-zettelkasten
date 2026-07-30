@@ -8,3 +8,4 @@ build/
 dist/
 .venv/
 auto-zettelkasten.yml
+.DS_Store

@@ -12,6 +12,7 @@ from auto_zettelkasten.models import RelationshipPairJob
 from auto_zettelkasten.readers import (
     RELATIONSHIP_MAX_OUTPUT_TOKENS,
     _relationship_candidate_system_prompt,
+    _validate_relationship_response,
 )
 from auto_zettelkasten.relationships import (
     RELATIONSHIP_DECISION_CONTRACT,
@@ -22,19 +23,64 @@ from auto_zettelkasten.relationships import (
 )
 
 
-def test_relationship_discovery_uses_one_bridge_aware_prompt_identity() -> None:
+def test_relationship_discovery_uses_lean_recall_first_prompt() -> None:
     prompt = _relationship_candidate_system_prompt()
 
     assert LITERATURE_RELATIONSHIP_PROMPT_VERSION == RELATIONSHIP_PROMPT_VERSION
-    assert "optimizes recall" in prompt
+    assert "optimize recall" in prompt
     assert "not a published relationship" in prompt
     assert "max_inferred_pairs" in prompt
-    assert "cross_literature" in prompt
-    assert "target 32 to 48" in prompt
-    assert "multiple bridge families" in prompt
-    assert "left_evidence_anchor_ids" in prompt
-    assert "right_evidence_anchor_ids" in prompt
+    assert "bridge_orientation" in prompt
+    assert "Target 24 to 32" in prompt
+    assert "left_source_id" in prompt
+    assert "right_source_id" in prompt
+    assert "why_compare" in prompt
+    assert "evidence_anchor_ids" not in prompt
     assert RELATIONSHIP_MAX_OUTPUT_TOKENS == 128_000
+
+
+def test_v6_keyed_provider_envelope_normalizes_to_rows() -> None:
+    normalized = _validate_relationship_response(
+        {
+            "decisions": {
+                "job-a-b": {
+                    "decision": "no_relationship",
+                    "reason": "The apparent overlap is only topical.",
+                    "confidence": 0.8,
+                }
+            }
+        },
+        kind="relationship_adjudication",
+    )
+
+    assert normalized == {
+        "decisions": [
+            {
+                "pair_job_id": "job-a-b",
+                "decision": "no_relationship",
+                "reason": "The apparent overlap is only topical.",
+                "confidence": 0.8,
+            }
+        ]
+    }
+
+
+def test_v6_keyed_provider_envelope_uses_the_mapping_key_as_job_id() -> None:
+    normalized = _validate_relationship_response(
+        {
+            "decisions": {
+                "job-a-b": {
+                    "pair_job_id": "wrong-job",
+                    "decision": "no_relationship",
+                    "reason": "The apparent overlap is only topical.",
+                    "confidence": 0.8,
+                }
+            }
+        },
+        kind="relationship_adjudication",
+    )
+
+    assert normalized["decisions"][0]["pair_job_id"] == "job-a-b"
 
 
 def _profile(source_id: str) -> dict[str, Any]:
@@ -103,22 +149,12 @@ def _relationship_row(
         if actor == job.left_source_id
         else job.left_source_id
     )
-    labels = {
-        "supports": ("supports", "supported by"),
-        "extends": ("extends", "extended by"),
-    }[relation_type]
     return {
         "pair_job_id": job.pair_job_id,
         "decision": "relationship",
-        "pair": {
-            "left_source_id": job.left_source_id,
-            "right_source_id": job.right_source_id,
-        },
         "relation_type": relation_type,
         "actor_source_id": actor,
         "reference_source_id": reference,
-        "forward_label": labels[0],
-        "inverse_label": labels[1],
         "comparison_proposition": "The works address the same bounded claim.",
         "reason": "Related.",
         "left_evidence_anchor_ids": [
@@ -128,7 +164,6 @@ def _relationship_row(
             f"anchor-{job.right_source_id.lower()}"
         ],
         "confidence": "",
-        "output_contract": RELATIONSHIP_DECISION_CONTRACT,
     }
 
 
@@ -136,7 +171,7 @@ def _profiles(*source_ids: str) -> list[dict[str, Any]]:
     return [_profile(source_id) for source_id in source_ids]
 
 
-def test_complete_decision_v4_accepts_model_direction_without_semantic_veto() -> None:
+def test_complete_v6_decision_accepts_model_direction_without_semantic_veto() -> None:
     job = _job("A", "B")
     result = validate_relationship_decision_rows(
         {
@@ -160,6 +195,119 @@ def test_complete_decision_v4_accepts_model_direction_without_semantic_veto() ->
     assert relation["inverse_label"] == "extended by"
     assert relation["reason"] == "Related."
     assert relation["confidence"] == ""
+
+
+def test_v6_symmetric_relationship_uses_canonical_registry_direction() -> None:
+    job = _job("A", "B")
+    row = _relationship_row(job)
+    row.update(
+        {
+            "relation_type": "contextual_connection",
+            "comparison_proposition": "The works illuminate adjacent stages.",
+            "reason": "Joint reading is useful without a shared tested proposition.",
+        }
+    )
+    row.pop("actor_source_id")
+    row.pop("reference_source_id")
+
+    relation = validate_relationship_decision_rows(
+        {"decisions": {job.pair_job_id: row}},
+        jobs=[job],
+        profiles=_profiles("A", "B"),
+    )["accepted"][0]
+
+    assert relation["source_id"] == "A"
+    assert relation["target_source_id"] == "B"
+    assert relation["relationship_tier"] == "contextual"
+
+
+def test_v6_repartitions_known_evidence_anchors_by_owner() -> None:
+    job = _job("A", "B")
+    row = _relationship_row(job)
+    row["left_evidence_anchor_ids"] = ["anchor-b"]
+    row["right_evidence_anchor_ids"] = ["anchor-a"]
+
+    relation = validate_relationship_decision_rows(
+        {"decisions": {job.pair_job_id: row}},
+        jobs=[job],
+        profiles=_profiles("A", "B"),
+    )["accepted"][0]
+
+    assert relation["left_evidence_anchor_ids"] == ["anchor-a"]
+    assert relation["right_evidence_anchor_ids"] == ["anchor-b"]
+    assert relation["contract_warnings"] == [
+        "anchor_repartitioned:anchor-b:left_to_right",
+        "anchor_repartitioned:anchor-a:right_to_left",
+    ]
+
+
+def test_legacy_v5_decision_remains_compatible() -> None:
+    job = RelationshipPairJob.from_dict(
+        {
+            **_job("A", "B").to_dict(),
+            "output_contract": "relationship-decision-v5",
+        }
+    )
+    row = {
+        **_relationship_row(job),
+        "pair": {
+            "left_source_id": job.left_source_id,
+            "right_source_id": job.right_source_id,
+        },
+        "relationship_tier": "direct",
+        "forward_label": "supports",
+        "inverse_label": "supported by",
+        "output_contract": "relationship-decision-v5",
+    }
+
+    relation = validate_relationship_decision_rows(
+        {"decisions": [row]},
+        jobs=[job],
+        profiles=_profiles("A", "B"),
+    )["accepted"][0]
+
+    assert relation["output_contract"] == "relationship-decision-v5"
+    assert relation["decision_schema_version"] == "5"
+
+
+def test_legacy_v5_decision_persists_and_projects(tmp_path: Path) -> None:
+    job = RelationshipPairJob.from_dict(
+        {
+            **_job("A", "B").to_dict(),
+            "output_contract": "relationship-decision-v5",
+        }
+    )
+    profiles = _profiles("A", "B")
+    accepted = validate_relationship_decision_rows(
+        {
+            "decisions": [
+                {
+                    **_relationship_row(job),
+                    "pair": {
+                        "left_source_id": "A",
+                        "right_source_id": "B",
+                    },
+                    "relationship_tier": "direct",
+                    "forward_label": "supports",
+                    "inverse_label": "supported by",
+                    "output_contract": "relationship-decision-v5",
+                }
+            ]
+        },
+        jobs=[job],
+        profiles=profiles,
+    )["accepted"]
+
+    registry = persist_relationship_registry(
+        tmp_path,
+        structural_relations=[],
+        accepted_relations=accepted,
+    )
+
+    assert accepted[0]["active"] is True
+    assert projected_related_links(
+        "A", profiles, registry["links"], max_inferred_links=0
+    )[0]["primary_relation_type"] == "supports"
 
 
 def test_imported_relationship_result_preserves_harness_provenance() -> None:
@@ -186,15 +334,15 @@ def test_malformed_decision_rows_are_isolated_from_valid_siblings() -> None:
     jobs = [_job("A", "B"), _job("A", "C"), _job("A", "D")]
     bad_anchor = _relationship_row(jobs[1])
     bad_anchor["left_evidence_anchor_ids"] = ["anchor-c"]
-    bad_label = _relationship_row(jobs[2])
-    bad_label["inverse_label"] = "supports"
+    model_label_noise = _relationship_row(jobs[2])
+    model_label_noise["inverse_label"] = "supports"
 
     result = validate_relationship_decision_rows(
         {
             "decisions": [
                 _relationship_row(jobs[0]),
                 bad_anchor,
-                bad_label,
+                model_label_noise,
             ]
         },
         jobs=jobs,
@@ -207,7 +355,7 @@ def test_malformed_decision_rows_are_isolated_from_valid_siblings() -> None:
     ]
     assert result["accepted"][1]["inverse_label"] == "supported by"
     assert {row["reason"] for row in result["parked"]} == {
-        "left_anchor_not_owned_by_left_source",
+        "missing_endpoint_evidence",
     }
 
 

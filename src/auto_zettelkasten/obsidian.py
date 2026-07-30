@@ -222,7 +222,14 @@ def _missing_links_from_contents(export_root: Path, contents: dict[Path, str]) -
     stems = {link_key(path.stem) for path in contents}
     missing: list[dict[str, str]] = []
     for path, text in contents.items():
-        for match in re.finditer(r"\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]", text):
+        body = re.sub(
+            r"\A---[ \t]*\r?\n.*?^---[ \t]*(?:\r?\n|$)",
+            "",
+            text,
+            count=1,
+            flags=re.DOTALL | re.MULTILINE,
+        )
+        for match in re.finditer(r"\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]", body):
             target = match.group(1).strip()
             normalized = link_key(target.removesuffix(".md"))
             if normalized not in relative_targets and link_key(Path(normalized).name) not in stems:

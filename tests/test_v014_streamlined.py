@@ -130,7 +130,7 @@ def test_semantic_prompts_allow_neutral_nonmembership_and_bounded_relations() ->
     assert "broad topic" in relationships
     assert "extends requires explicit intellectual lineage" in relationships
     assert "dataset reuse" in relationships
-    assert "does not establish substantive support" in relationships
+    assert "do not establish substantive support" in relationships
     assert "one consistent direction" in relationships
 
 

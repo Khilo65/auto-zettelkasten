@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+import auto_zettelkasten.pipeline as pipeline_module
 from auto_zettelkasten.files import read_yaml, write_yaml
 from auto_zettelkasten.models import (
     EvidenceAnchor,
@@ -43,7 +44,18 @@ class _RoutedReasoner(_Reasoner):
         pass
 
 
+class _V6Reasoner(_Reasoner):
+    relationship_decision_contract = "relationship-decision-v6"
+
+
 class _BridgeRoutedReasoner(_Reasoner):
+    def select_relationship_bridge_shards(
+        self, *_args: Any, **_kwargs: Any
+    ) -> None:
+        pass
+
+
+class _V6BridgeRoutedReasoner(_V6Reasoner):
     def select_relationship_bridge_shards(
         self, *_args: Any, **_kwargs: Any
     ) -> None:
@@ -71,6 +83,8 @@ class _Calls:
         context: Mapping[str, Any],
     ) -> Mapping[str, Any]:
         self.seen.append((stage, key, context))
+        if hasattr(self, "cumulative_provider_calls"):
+            self.cumulative_provider_calls += 1
         return self.handler(stage, profiles, context)
 
 
@@ -105,10 +119,13 @@ def _candidate(
     rank: int = 1,
     cross_literature: bool = False,
 ) -> dict[str, Any]:
+    left, right = sorted((source_id, target_id))
     return {
-        "source_id": source_id,
-        "target_id": target_id,
-        "why_relevant": "The sources address the same substantive proposition.",
+        "left_source_id": left,
+        "right_source_id": right,
+        "comparison_proposition": "The sources address the same proposition.",
+        "why_compare": "A full-note comparison may clarify the proposition.",
+        "bridge_family": "shared proposition",
         "rank": rank,
         "cross_literature": cross_literature,
     }
@@ -145,6 +162,27 @@ def _decision(
         "right_evidence_anchor_ids": [right_anchor_id],
         "confidence": "high",
         "output_contract": "relationship-decision-v4",
+    }
+
+
+def _v6_decision(job: Mapping[str, Any]) -> dict[str, Any]:
+    pair = dict(job["pair"])
+    left = str(pair["left_source_id"])
+    right = str(pair["right_source_id"])
+    return {
+        "decision": "relationship",
+        "relation_type": "supports",
+        "actor_source_id": left,
+        "reference_source_id": right,
+        "comparison_proposition": "The works support the same bounded proposition.",
+        "reason": "Both sources independently support the proposition.",
+        "left_evidence_anchor_ids": [
+            job["selected_evidence"]["left"][0]["evidence_anchor_id"]
+        ],
+        "right_evidence_anchor_ids": [
+            job["selected_evidence"]["right"][0]["evidence_anchor_id"]
+        ],
+        "confidence": "high",
     }
 
 
@@ -374,6 +412,43 @@ def test_candidate_cap_reserves_bridge_slots_and_keeps_model_rank() -> None:
     ]
 
 
+def test_v6_keyed_batch_parks_only_an_omitted_pair(tmp_path: Path) -> None:
+    profiles = [_profile("A"), _profile("B"), _profile("C")]
+
+    def handler(
+        stage: str,
+        _profiles: Sequence[Any],
+        context: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if stage == "relationship_candidate_selection":
+            return {
+                "candidates": [
+                    _candidate("A", "B"),
+                    _candidate("A", "C", rank=2),
+                ]
+            }
+        jobs = context["pair_jobs"]
+        assert list(context["source_documents"]) == ["A", "B", "C"]
+        assert all(job["output_contract"] == "relationship-decision-v6" for job in jobs)
+        return {
+            "decisions": {
+                jobs[0]["pair_job_id"]: _v6_decision(jobs[0]),
+            }
+        }
+
+    result = _run(
+        tmp_path,
+        profiles,
+        _Calls(handler),
+        reasoner=_V6Reasoner(),
+    )
+
+    assert len(result["accepted"]) == 1
+    assert len(result["parked"]) == 1
+    assert result["parked"][0]["reason"] == "provider_batch_missing_pair_row"
+    assert result["accounted_pair_job_count"] == 2
+
+
 def test_general_and_bridge_discovery_use_separate_candidate_pools(
     tmp_path: Path,
 ) -> None:
@@ -393,7 +468,9 @@ def test_general_and_bridge_discovery_use_separate_candidate_pools(
             return {"candidates": []}
         assert stage == "relationship_bridge_candidate_selection"
         assert context["discovery_mode"] == "bridge_only"
-        assert context["max_inferred_pairs"] == 48
+        assert context["max_inferred_pairs"] == 32
+        assert context["bridge_orientation"] in {"forward", "reverse"}
+        assert len(context["oriented_literature_pairs"]) == 1
         assert provider_profiles == []
         assert {
             row["literature_id"] for row in context["collection_index_cards"]
@@ -414,7 +491,182 @@ def test_general_and_bridge_discovery_use_separate_candidate_pools(
         "relationship_candidate_selection",
         "relationship_bridge_candidate_selection",
     }
+    bridge_contexts = [
+        context
+        for stage, _key, context in calls.seen
+        if stage == "relationship_bridge_candidate_selection"
+    ]
+    assert {row["bridge_orientation"] for row in bridge_contexts} == {
+        "forward",
+        "reverse",
+    }
+    assert {
+        (
+            row["focal_literature_id"],
+            tuple(row["comparison_literature_ids"]),
+        )
+        for row in bridge_contexts
+    } == {
+        ("mediation", ("relapse",)),
+        ("relapse", ("mediation",)),
+    }
     assert result["pair_job_count"] == 0
+
+
+def test_multi_collection_bridge_packet_preserves_every_routed_pair(
+    tmp_path: Path,
+) -> None:
+    profiles = [
+        _profile(source_id, collection=collection)
+        for source_id, collection in zip(
+            ("A", "B", "C", "D"), ("one", "two", "three", "four"), strict=True
+        )
+    ]
+    shards = [
+        {
+            "shard_id": f"shard-{collection}",
+            "literature_id": collection,
+            "source_ids": [source_id],
+            "routing_card": {"title": collection},
+        }
+        for source_id, collection in zip(
+            ("A", "B", "C", "D"), ("one", "two", "three", "four"), strict=True
+        )
+    ]
+    catalogue = _catalogue(tmp_path, profiles, shards=shards)
+
+    def handler(
+        stage: str,
+        _profiles: Sequence[Any],
+        _context: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if stage == "relationship_bridge_shard_selection":
+            return {
+                "shard_pairs": [
+                    {
+                        "left_shard_id": "shard-one",
+                        "right_shard_id": "shard-two",
+                    },
+                    {
+                        "left_shard_id": "shard-three",
+                        "right_shard_id": "shard-four",
+                    },
+                ]
+            }
+        if "candidate_selection" in stage:
+            return {"candidates": []}
+        return {"decisions": []}
+
+    calls = _Calls(handler)
+    _run(
+        tmp_path,
+        profiles,
+        calls,
+        reasoner=_V6BridgeRoutedReasoner(),
+        catalogue=catalogue,
+    )
+    contexts = [
+        context
+        for stage, _key, context in calls.seen
+        if stage == "relationship_bridge_candidate_selection"
+    ]
+
+    assert len(contexts) == 2
+    assert {
+        (
+            row["focal_literature_id"],
+            row["comparison_literature_id"],
+        )
+        for context in contexts
+        for row in context["oriented_literature_pairs"]
+    } == {
+        ("one", "two"),
+        ("two", "one"),
+        ("three", "four"),
+        ("four", "three"),
+    }
+
+
+def test_multi_packet_discovery_reserves_actual_call_count(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    profiles = [
+        _profile(source_id, collection=collection)
+        for source_id, collection in zip(
+            ("A", "B", "C", "D"), ("one", "two", "three", "four"), strict=True
+        )
+    ]
+    shards = [
+        {
+            "shard_id": f"shard-{collection}",
+            "literature_id": collection,
+            "source_ids": [source_id],
+            "routing_card": {"title": collection},
+        }
+        for source_id, collection in zip(
+            ("A", "B", "C", "D"), ("one", "two", "three", "four"), strict=True
+        )
+    ]
+    catalogue = _catalogue(tmp_path, profiles, shards=shards)
+    monkeypatch.setattr(
+        pipeline_module,
+        "_reasoner_packet_chars",
+        lambda _profiles, context: (
+            10_000_000
+            if context.get("discovery_mode") == "bridge_only"
+            and len(context.get("catalogue", [])) > 2
+            else 1
+        ),
+    )
+
+    def handler(
+        stage: str,
+        _profiles: Sequence[Any],
+        _context: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if stage == "relationship_bridge_shard_selection":
+            return {
+                "shard_pairs": [
+                    {
+                        "left_shard_id": "shard-one",
+                        "right_shard_id": "shard-two",
+                    },
+                    {
+                        "left_shard_id": "shard-three",
+                        "right_shard_id": "shard-four",
+                    },
+                ]
+            }
+        if "candidate_selection" in stage:
+            return {"candidates": []}
+        return {"decisions": []}
+
+    calls = _Calls(handler)
+    calls.max_calls = 8
+    calls.cumulative_provider_calls = 0
+    result = _run(
+        tmp_path,
+        profiles,
+        calls,
+        reasoner=_V6BridgeRoutedReasoner(),
+        catalogue=catalogue,
+    )
+    candidate_contexts = [
+        context
+        for stage, _key, context in calls.seen
+        if "candidate_selection" in stage
+    ]
+
+    assert len(candidate_contexts) == 5
+    assert {
+        context["max_inferred_pairs"] for context in candidate_contexts
+    } == {12, 18}
+    assert calls.cumulative_provider_calls == 6
+    assert not any(
+        row.get("reason") == "relationship_discovery_budget_conflict"
+        for row in result["parked"]
+    )
 
 
 def test_bridge_only_ranking_rejects_same_literature_pairs() -> None:
@@ -991,6 +1243,107 @@ def test_committed_selection_state_makes_unchanged_replay_call_free(
     assert replay_calls.seen == []
     assert replay["pair_job_count"] == 0
     assert replay["provider_batch_count"] == 0
+
+
+def test_changed_collection_routing_card_invalidates_discovery(
+    tmp_path: Path,
+) -> None:
+    profiles = [
+        _profile("A", collection="mediation"),
+        _profile("B", collection="relapse"),
+    ]
+    catalogue = _catalogue(tmp_path, profiles)
+
+    def handler(
+        stage: str,
+        _profiles: Sequence[Any],
+        context: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if "candidate_selection" in stage:
+            return {"candidates": []}
+        return {"decisions": []}
+
+    first = _run(
+        tmp_path,
+        profiles,
+        _Calls(handler),
+        catalogue=catalogue,
+    )
+    _commit_relationship_selection_state(
+        tmp_path,
+        first,
+        catalogue_revision=first["reconciled_catalogue_revision"],
+    )
+    payload = read_yaml(Path(str(catalogue["catalogue_path"])))
+    payload["literatures"][0]["scope"] = "Changed upstream collection scope."
+    write_yaml(Path(str(catalogue["catalogue_path"])), payload)
+
+    calls = _Calls(handler)
+    _run(tmp_path, profiles, calls, catalogue=catalogue)
+
+    assert any("candidate_selection" in stage for stage, _key, _ in calls.seen)
+
+
+def test_graph_only_collection_card_changes_do_not_invalidate_discovery(
+    tmp_path: Path,
+) -> None:
+    profiles = [
+        _profile("A", collection="mediation"),
+        _profile("B", collection="relapse"),
+    ]
+    catalogue = _catalogue(tmp_path, profiles)
+    path = Path(str(catalogue["catalogue_path"]))
+    payload = read_yaml(path)
+    payload["collections"] = [
+        {
+            "key": "mediation",
+            "parent_key": "",
+            "direct_source_ids": ["A"],
+            "routing_card": {
+                "name": "Mediation",
+                "scope": "Mediation studies.",
+                "active_cluster_ids": ["cluster-old"],
+                "cross_collection_relationship_count": 1,
+                "revision_hash": "old",
+            },
+        }
+    ]
+    write_yaml(path, payload)
+
+    first = _run(
+        tmp_path,
+        profiles,
+        _Calls(
+            lambda stage, _profiles, _context: (
+                {"candidates": []}
+                if "candidate_selection" in stage
+                else {"decisions": []}
+            )
+        ),
+        catalogue=catalogue,
+    )
+    _commit_relationship_selection_state(
+        tmp_path,
+        first,
+        catalogue_revision=first["reconciled_catalogue_revision"],
+    )
+    payload = read_yaml(path)
+    payload["collections"][0]["routing_card"].update(
+        active_cluster_ids=["cluster-new"],
+        cross_collection_relationship_count=9,
+        revision_hash="new",
+    )
+    write_yaml(path, payload)
+    calls = _Calls(
+        lambda stage, _profiles, _context: (_ for _ in ()).throw(
+            AssertionError(f"unexpected provider call: {stage}")
+        )
+    )
+
+    replay = _run(tmp_path, profiles, calls, catalogue=catalogue)
+
+    assert calls.seen == []
+    assert replay["pair_job_count"] == 0
 
 
 def test_changed_literature_position_reopens_pair_without_reusing_decision(

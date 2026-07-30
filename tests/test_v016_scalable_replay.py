@@ -128,7 +128,7 @@ def test_relationship_packet_deduplicates_shared_source_documents() -> None:
 
     packet = _relationship_transport_context(
         [job("A", "B"), job("A", "C")],
-        decision_contract="relationship-decision-v5",
+        decision_contract="relationship-decision-v6",
     )
 
     assert list(packet["source_documents"]) == ["A", "B", "C"]
@@ -224,27 +224,16 @@ def test_contextual_relationship_projects_reciprocally(tmp_path: Path) -> None:
     )
     accepted = validate_relationship_decision_rows(
         {
-            "decisions": [
-                {
-                    "pair_job_id": job.pair_job_id,
+            "decisions": {
+                job.pair_job_id: {
                     "decision": "relationship",
-                    "pair": {
-                        "left_source_id": "A",
-                        "right_source_id": "B",
-                    },
                     "relation_type": "contextual_connection",
-                    "relationship_tier": "contextual",
-                    "actor_source_id": "A",
-                    "reference_source_id": "B",
-                    "forward_label": "is contextually connected to",
-                    "inverse_label": "is contextually connected to",
                     "comparison_proposition": "The studies concern adjacent stages.",
                     "reason": "Useful context without a shared tested proposition.",
                     "left_evidence_anchor_ids": ["anchor-a"],
                     "right_evidence_anchor_ids": ["anchor-b"],
-                    "output_contract": "relationship-decision-v5",
                 }
-            ]
+            }
         },
         jobs=[job],
         profiles=profiles,

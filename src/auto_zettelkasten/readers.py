@@ -141,7 +141,7 @@ class _CapabilityAwareReader:
     chunk_output_tokens: int
     timeout: float
     request_deadline: float | None
-    relationship_decision_contract = "relationship-decision-v5"
+    relationship_decision_contract = "relationship-decision-v6"
 
     def _record_transport_attempt(self) -> None:
         self.transport_attempt_count = (
@@ -1646,85 +1646,72 @@ def _relationship_bridge_shard_system_prompt() -> str:
 
 def _relationship_candidate_system_prompt() -> str:
     return (
-        "You retrieve source comparisons for Auto-Zettelkasten relationship prompt v8. Return exactly one JSON "
-        "object with a candidates array. Each row must contain source_id, target_kind, target_id, why_relevant, "
-        "comparison_unit, candidate_class, likely_relation_type, requested_evidence_depth, confidence, rank, cross_literature, "
-        "discovery_route, left_evidence_anchor_ids, and right_evidence_anchor_ids. target_kind must be source. "
-        "requested_evidence_depth is profile, atomic_note, or source_passage. confidence is a number from 0 to 1. "
-        "Use the supplied max_inferred_pairs as a global output ceiling. Candidate generation optimizes recall, thematic "
-        "coverage, diversity, and useful navigation; a candidate requests later full-note comparison and is not a published "
-        "relationship. A candidate requires a concrete shared proposition, mechanism, outcome, debate, sequence, or boundary, "
-        "but it does not require proof of a final relationship. Use the supplied reserved_bridge_fraction for cross-collection "
-        "comparisons; same-collection pairs cannot consume that capacity. cross_literature is true "
-        "only when the supplied collection memberships are disjoint, never merely because topics differ. When "
-        "discovery_mode is bridge_only, return only cross-literature pairs from distinct supplied literature "
-        "memberships, examine multiple bridge families rather than stopping after citations or the first obvious theme, "
-        "and target 32 to 48 concrete candidates for two substantial related collections. Return fewer only when additional "
-        "pairs would be purely superficial. Evidence-anchor "
-        "arrays may contain only supplied IDs owned by the corresponding canonical pair "
-        "side; order source_id and target_id lexicographically so source_id is the canonical left side, and leave "
-        "anchor arrays empty when no supplied anchor is task-relevant. discovery_route is source_led, "
-        "cross_literature_bridge, citation_match, or graph_neighbor. Choose works "
-        "that may support, undermine, qualify, extend, complement, offer a rival explanation, expose a boundary or "
-        "methodological fault line, form a sequence, or express an interpretive disagreement. Before returning, separately "
-        "audit within-collection and cross-collection coverage so bridge families are not crowded out. Shared vocabulary, "
-        "method, case, tag, or collection alone is only a retrieval clue. Use only supplied IDs and do not classify or filter "
-        "the final relationship; full-note adjudication does that later. candidate_class is direct_intellectual, contextual, "
-        "or citation and is only a retrieval hint."
+        "You retrieve comparisons for Auto-Zettelkasten relationship prompt v9. "
+        "Return exactly one JSON object with a candidates array. Each candidate "
+        "contains only left_source_id, right_source_id, comparison_proposition, "
+        "why_compare, bridge_family, and rank. Use only supplied IDs, put the "
+        "canonical lexicographically earlier ID on the left, and never repeat a "
+        "pair. A candidate is a request for later full-note comparison, not a "
+        "published relationship, so optimize recall, coverage, diversity, and "
+        "useful navigation. Require a concrete shared proposition, mechanism, "
+        "outcome, debate, sequence, implementation problem, or boundary; shared "
+        "vocabulary alone is insufficient. Use max_inferred_pairs as a hard "
+        "ceiling. When discovery_mode is bridge_only, return only pairs whose "
+        "supplied collection memberships are disjoint. Follow bridge_orientation "
+        "and oriented_literature_pairs; each pair names one focal literature and "
+        "one comparison literature for this call. When the singular "
+        "focal_literature_id and comparison_literature_ids fields are present, "
+        "they are the same authoritative one-pair instruction. Target 24 to 32 "
+        "candidates per "
+        "orientation, no more "
+        "than two per focal source, unless further pairs would be purely "
+        "superficial. Cover multiple theoretical, mechanistic, empirical, "
+        "institutional, implementation, outcome, sequence, and boundary families "
+        "rather than stopping after citations or one theme. Full-note "
+        "adjudication later decides whether and how the works relate."
     )
 
 
 def _relationship_adjudication_system_prompt() -> str:
     return (
         "You adjudicate immutable relationship pair jobs for Auto-Zettelkasten "
-        "relationship prompt v8 and output contract relationship-decision-v5. "
-        "Read both complete atomic-note bodies supplied in source_documents before "
-        "deciding; compact profiles and selected anchors are navigation aids, not "
-        "substitutes for the notes. "
-        "Return exactly one JSON object with a decisions array and exactly one "
-        "complete row per supplied pair_job_id. Copy pair_job_id and the canonical "
-        "pair.left_source_id and pair.right_source_id exactly. Each row contains "
-        "pair_job_id, decision, pair, relation_type, relationship_tier, actor_source_id, "
-        "reference_source_id, forward_label, inverse_label, "
-        "comparison_proposition, reason, left_evidence_anchor_ids, "
-        "right_evidence_anchor_ids, boundary_or_qualification, confidence, and "
-        "output_contract. decision is relationship, no_relationship, or "
-        "needs_more_context; output_contract is relationship-decision-v5. For "
-        "no_relationship and needs_more_context, leave relation_type, direction, "
-        "labels, relationship_tier, and anchor arrays empty but give a reason. For relationship, "
-        "actor_source_id is the work doing the intellectual action and "
-        "reference_source_id is the work acted on; do not infer direction from "
-        "pair ordering or chronology. Use only supplied evidence IDs owned by the "
-        "corresponding left or right source. relation_type and exact labels are: "
-        "supports/supports/supported by; undermines/undermines/undermined by; "
-        "qualifies/qualifies/qualified by; extends/extends/extended by; "
-        "complements/complements/complements; contrasts/contrasts with/contrasts "
-        "with; rival_explanation/offers a rival explanation to/has a rival "
-        "explanation from; boundary_contrast/contrasts in scope with/contrasts in "
-        "scope with; methodological_fault_line/differs methodologically "
-        "from/differs methodologically from; sequential_relationship/precedes in "
-        "sequence/follows in sequence; "
-        "interpretive_or_normative_disagreement/disagrees interpretively "
-        "with/disagrees interpretively with; contextual_connection/is contextually connected to/is contextually connected to. "
-        "relationship_tier is direct for every direct intellectual relation and contextual only for contextual_connection. "
-        "Use contextual_connection when the works illuminate distinct dimensions, stages, cases, or evidence bases that are "
-        "useful to inspect together without claiming agreement or direct evidentiary support. Its reason must name each work's "
-        "distinct contribution, why joint reading is useful, and the boundary preventing a stronger direct label. "
-        "Compare the actual claims, findings, arguments, methods, scope, and causal language. "
-        "extends requires explicit intellectual lineage: the actor builds on, tests, refines, applies, or generalizes the "
-        "reference work. Citation, coding reuse, dataset reuse, chronology, thematic proximity, or a shared broad topic alone "
-        "does not establish substantive support. supports requires evidence that "
-        "bears directly on the same proposition; qualifies requires a stated boundary "
-        "or condition on the reference claim; and complements "
-        "requires a shared bounded question or proposition whose answer is sharpened "
-        "by both works, not mere adjacency. contrasts requires incompatible findings or "
-        "claims about a sufficiently comparable proposition; different interventions, "
-        "outcomes, methods, or cases without contradiction require a contextual, boundary, "
-        "or complementary relation instead. For every directional relation, explicitly "
-        "identify the intellectual actor and reference. If A cites B as evidence for A's "
-        "claim, B normally supports A, not the reverse. Before returning, self-check that actor, reference, relation type, "
-        "comparison proposition, evidence, and rationale express one consistent direction. Never invent "
-        "IDs, anchors, locators, provenance, timestamps, or Markdown."
+        "relationship prompt v9 and provider contract relationship-decision-v6. "
+        "Read both complete atomic-note bodies in source_documents. Return exactly "
+        "one JSON object whose decisions value is an object keyed by every supplied "
+        "pair_job_id, with no missing or additional keys. A relationship value "
+        "contains decision, relation_type, actor_source_id, reference_source_id, "
+        "comparison_proposition, reason, boundary_or_qualification, "
+        "left_evidence_anchor_ids, right_evidence_anchor_ids, and confidence. A "
+        "no_relationship or needs_more_context value contains only decision, reason, "
+        "and confidence. Use only supplied source and evidence-anchor IDs. "
+        "First identify the bounded proposition, question, mechanism, outcome, or "
+        "sequence. If the works share only a broad topic, return no_relationship. "
+        "If joint reading is useful but they examine different propositions, stages, "
+        "outcomes, methods, or cases, use contextual_connection and explain the "
+        "boundary preventing a stronger label. Use a direct relation only for the "
+        "same bounded proposition or explicit intellectual lineage: supports means "
+        "compatible evidence on that proposition; qualifies adds a condition, "
+        "subgroup, or boundary; undermines weakens the reference claim; contrasts "
+        "requires incompatible findings or claims on a sufficiently comparable "
+        "proposition; extends requires explicit intellectual lineage through "
+        "building on, testing, refining, applying, or generalizing the reference; "
+        "complements requires distinct "
+        "contributions to the same bounded question. rival_explanation, "
+        "boundary_contrast, methodological_fault_line, sequential_relationship, and "
+        "interpretive_or_normative_disagreement remain available when their literal "
+        "meaning is established. Citation, chronology, dataset reuse, coding reuse, and "
+        "thematic proximity alone do not establish substantive support or "
+        "extension. For "
+        "directional relations, actor_source_id is the work doing the intellectual "
+        "action and reference_source_id is the work acted on; do not infer direction "
+        "from pair order or chronology. If A cites B as evidence for A's claim, B "
+        "normally supports A. Actor and reference may be omitted only for a symmetric "
+        "relation. State the relevant claim from each work and why the selected type "
+        "follows. Treat limited notes only as evidence for what their supplied text "
+        "establishes. Before returning, self-check that every pair job has one keyed "
+        "decision and that type, actor, reference, proposition, evidence, and "
+        "reason express one consistent direction. "
+        "Never invent IDs, anchors, locators, provenance, timestamps, or Markdown."
     )
 
 
@@ -1859,7 +1846,7 @@ def _debate_system_prompt() -> str:
 def _cluster_synthesis_system_prompt() -> str:
     return (
         "You are the full-note cluster writer for Auto-Zettelkasten cluster "
-        "synthesis prompt v27. Read every supplied atomic_note_markdown before "
+        "synthesis prompt v28. Read every supplied atomic_note_markdown before "
         "drafting. Copy cluster_id exactly from context.cluster.cluster_id. Return "
         "exactly one JSON object with cluster_id, status, title, "
         "organizing_mode, organizing_problem, optional guiding_question, optional "
@@ -1896,10 +1883,15 @@ def _cluster_synthesis_system_prompt() -> str:
         "problem, reject an incoherent cluster, or propose splits, but cannot "
         "silently add a source whose full note was not supplied. In the same call, "
         "review attribution, direction, raw numbers, percentage-point versus relative "
-        "percentage language, statistical scale, membership, and inferential scope before returning. Check every includes, "
-        "excludes, all-sources, consensus, disagreement, and boundary claim against the final retained-member list; preserve "
-        "the direction and denominator of every quantitative comparison; and distinguish association, author argument, "
-        "practitioner recommendation, and causal evidence. "
+        "percentage language, statistical scale, membership, and inferential scope "
+        "before returning. Prefer named-source attribution for findings, disagreement, "
+        "and boundaries. Use all, most, none, consensus, includes, or excludes only "
+        "when the final retained-member findings establish the relevant numerator and "
+        "denominator. Preserve each source's statistic, scale, comparison, denominator, "
+        "and direction; do not create cross-study conversions or treat relative risk, "
+        "odds, hazards, probabilities, and percentage points as interchangeable. "
+        "Distinguish association, author argument, practitioner recommendation, and "
+        "causal evidence. "
         "Do not generate research gaps or administrative diagnostics."
     )
 
@@ -3846,6 +3838,15 @@ def _validate_relationship_response(
         values = payload.get("relationships")
     if values is None and kind == "relationship_verification":
         values = payload.get("decisions")
+    if kind == "relationship_adjudication" and isinstance(values, Mapping):
+        return {
+            "decisions": [
+                {**dict(value), "pair_job_id": str(job_id)}
+                if isinstance(value, Mapping)
+                else value
+                for job_id, value in values.items()
+            ]
+        }
     if not isinstance(values, list):
         raise ProviderError(f"{kind.replace('_', ' ')} response must contain a {key} list")
     return {key: [dict(value) if isinstance(value, Mapping) else value for value in values]}

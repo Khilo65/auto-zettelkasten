@@ -104,6 +104,100 @@ def test_complete_thesis_introduction_is_not_misclassified_as_an_excerpt() -> No
     assert scoped["source_scope"] == "full_document"
 
 
+def test_long_report_introduction_label_is_not_treated_as_an_excerpt() -> None:
+    scoped = _apply_bibliographic_scope(
+        {
+            "source_scope": "full_document",
+            "source_coverage": {
+                "source_scope": "full_document",
+                "coverage_gate": "passed",
+            },
+            "coverage_metrics": {
+                "page_count": 337,
+                "recovered_pages": list(range(1, 338)),
+            },
+            "text": "--- Page 1 ---\nPathways for Peace\nInclusive Approaches.",
+            "rank": 100,
+        },
+        {"itemType": "report", "title": "Pathways for Peace"},
+        {"itemType": "attachment", "title": "Introduction"},
+    )
+
+    assert scoped["source_scope"] == "full_document"
+
+
+def test_short_report_preface_label_is_treated_as_an_excerpt() -> None:
+    scoped = _apply_bibliographic_scope(
+        {
+            "source_scope": "full_document",
+            "source_coverage": {
+                "source_scope": "full_document",
+                "coverage_gate": "passed",
+            },
+            "coverage_metrics": {
+                "page_count": 40,
+                "recovered_pages": list(range(1, 41)),
+            },
+            "text": "--- Page 1 ---\nPreface\nOpening context.",
+            "rank": 100,
+        },
+        {"itemType": "report", "title": "Longer Parent Report"},
+        {"itemType": "attachment", "title": "Preface"},
+    )
+
+    assert scoped["source_scope"] == "partial_document"
+    assert scoped["coverage_reason"] == "bounded_attachment_excerpt"
+
+
+def test_explicit_appendix_label_remains_authoritative_when_long() -> None:
+    scoped = _apply_bibliographic_scope(
+        {
+            "source_scope": "full_document",
+            "source_coverage": {
+                "source_scope": "full_document",
+                "coverage_gate": "passed",
+            },
+            "coverage_metrics": {
+                "page_count": 337,
+                "recovered_pages": list(range(1, 338)),
+            },
+            "text": "--- Page 1 ---\nAppendix materials.",
+            "rank": 100,
+        },
+        {"itemType": "report", "title": "Longer Parent Report"},
+        {"itemType": "attachment", "title": "Appendix A"},
+    )
+
+    assert scoped["source_scope"] == "partial_document"
+    assert scoped["bounded_source_object"] == "Appendix"
+
+
+def test_spelled_book_chapter_label_remains_authoritative_when_long() -> None:
+    scoped = _apply_bibliographic_scope(
+        {
+            "source_scope": "full_document",
+            "source_coverage": {
+                "source_scope": "full_document",
+                "coverage_gate": "passed",
+            },
+            "coverage_metrics": {
+                "page_count": 140,
+                "recovered_pages": list(range(1, 141)),
+            },
+            "text": "--- Page 1 ---\nDurable Peace\nChapter argument.",
+            "rank": 100,
+        },
+        {"itemType": "book", "title": "Parent Book"},
+        {
+            "itemType": "attachment",
+            "title": "Chapter Four - Durable Peace",
+        },
+    )
+
+    assert scoped["source_scope"] == "partial_document"
+    assert scoped["coverage_reason"] == "bounded_attachment_excerpt"
+
+
 def test_thesis_excerpt_with_missing_contents_span_is_partial() -> None:
     scoped = _apply_bibliographic_scope(
         {

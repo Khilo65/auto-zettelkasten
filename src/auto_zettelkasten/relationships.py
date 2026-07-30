@@ -10,10 +10,10 @@ from .models import RelationshipDecision, RelationshipPairJob
 from .navigation import TYPED_SOURCE_RELATIONS, rank_human_related_links
 
 
-RELATIONSHIP_PROMPT_VERSION = "8"
+RELATIONSHIP_PROMPT_VERSION = "9"
 RELATIONSHIP_REGISTRY_SCHEMA_VERSION = "6"
-RELATIONSHIP_DECISION_SCHEMA_VERSION = "5"
-RELATIONSHIP_DECISION_CONTRACT = "relationship-decision-v5"
+RELATIONSHIP_DECISION_SCHEMA_VERSION = "6"
+RELATIONSHIP_DECISION_CONTRACT = "relationship-decision-v6"
 SUBSTANTIVE_RELATION_TYPES = frozenset(
     {
         "supports",
@@ -67,6 +67,16 @@ RELATIONSHIP_PROJECTION_LABELS = {
         "is contextually connected to",
     ),
 }
+SYMMETRIC_RELATION_TYPES = frozenset(
+    {
+        "complements",
+        "contrasts",
+        "boundary_contrast",
+        "methodological_fault_line",
+        "interpretive_or_normative_disagreement",
+        "contextual_connection",
+    }
+)
 _LIMITED_STATUSES = {
     "abstract_only_atomic_note",
     "metadata_only_source_note",
@@ -291,6 +301,82 @@ def validate_bridge_shard_pairs(
     return accepted, parked
 
 
+def _normalize_provider_decision_row(
+    row: Mapping[str, Any],
+    *,
+    job: RelationshipPairJob,
+    left_anchors: Mapping[str, Mapping[str, Any]],
+    right_anchors: Mapping[str, Mapping[str, Any]],
+) -> tuple[dict[str, Any], list[str]]:
+    """Fill job-owned v6 structure and normalize anchor ownership."""
+
+    normalized = dict(row)
+    contract = str(job.output_contract or "")
+    if contract != RELATIONSHIP_DECISION_CONTRACT:
+        if str(normalized.get("decision") or "") == "relationship":
+            labels = RELATIONSHIP_PROJECTION_LABELS.get(
+                str(normalized.get("relation_type") or "")
+            )
+            if labels:
+                normalized["forward_label"], normalized["inverse_label"] = labels
+        return normalized, []
+
+    normalized["pair_job_id"] = job.pair_job_id
+    normalized["pair"] = {
+        "left_source_id": job.left_source_id,
+        "right_source_id": job.right_source_id,
+    }
+    normalized["output_contract"] = RELATIONSHIP_DECISION_CONTRACT
+    if str(normalized.get("decision") or "") != "relationship":
+        return normalized, []
+
+    relation_type = str(normalized.get("relation_type") or "")
+    labels = RELATIONSHIP_PROJECTION_LABELS.get(relation_type)
+    if labels:
+        normalized["forward_label"], normalized["inverse_label"] = labels
+    normalized["relationship_tier"] = (
+        "contextual" if relation_type == "contextual_connection" else "direct"
+    )
+    if relation_type in SYMMETRIC_RELATION_TYPES:
+        normalized["actor_source_id"] = job.left_source_id
+        normalized["reference_source_id"] = job.right_source_id
+
+    raw_left = normalized.get("left_evidence_anchor_ids", [])
+    raw_right = normalized.get("right_evidence_anchor_ids", [])
+    if not isinstance(raw_left, list) or not isinstance(raw_right, list):
+        return normalized, []
+
+    warnings: list[str] = []
+    left_ids: list[str] = []
+    right_ids: list[str] = []
+    seen: set[str] = set()
+    for supplied_side, value in [
+        *(("left", anchor_id) for anchor_id in raw_left),
+        *(("right", anchor_id) for anchor_id in raw_right),
+    ]:
+        anchor_id = str(value)
+        if not anchor_id or anchor_id in seen:
+            continue
+        seen.add(anchor_id)
+        if anchor_id in left_anchors and anchor_id not in right_anchors:
+            left_ids.append(anchor_id)
+            if supplied_side != "left":
+                warnings.append(
+                    f"anchor_repartitioned:{anchor_id}:right_to_left"
+                )
+        elif anchor_id in right_anchors and anchor_id not in left_anchors:
+            right_ids.append(anchor_id)
+            if supplied_side != "right":
+                warnings.append(
+                    f"anchor_repartitioned:{anchor_id}:left_to_right"
+                )
+        else:
+            warnings.append(f"anchor_dropped_unknown:{anchor_id}")
+    normalized["left_evidence_anchor_ids"] = left_ids
+    normalized["right_evidence_anchor_ids"] = right_ids
+    return normalized, warnings
+
+
 def ingest_relationship_decision_batch(
     response: Mapping[str, Any],
     *,
@@ -301,7 +387,7 @@ def ingest_relationship_decision_batch(
     reasoner_backend: str = "",
     prompt_version: str = RELATIONSHIP_PROMPT_VERSION,
 ) -> dict[str, list[dict[str, Any]]]:
-    """Validate independent decision-v4 rows without rejudging their semantics."""
+    """Validate independent provider decisions without rejudging their semantics."""
 
     jobs: dict[str, tuple[RelationshipPairJob, dict[str, Any]]] = {}
     for value in pair_jobs:
@@ -319,10 +405,19 @@ def ingest_relationship_decision_batch(
         if row.get("source_id")
     }
 
-    raw_rows = response.get("decisions", []) or []
-    if not isinstance(raw_rows, Sequence) or isinstance(
-        raw_rows, (str, bytes, bytearray)
+    raw_values = response.get("decisions", []) or []
+    if isinstance(raw_values, Mapping):
+        raw_rows: list[Any] = [
+            {**dict(value), "pair_job_id": str(job_id)}
+            if isinstance(value, Mapping)
+            else value
+            for job_id, value in raw_values.items()
+        ]
+    elif isinstance(raw_values, Sequence) and not isinstance(
+        raw_values, (str, bytes, bytearray)
     ):
+        raw_rows = list(raw_values)
+    else:
         raw_rows = []
     job_counts: dict[str, int] = {}
     for value in raw_rows:
@@ -352,12 +447,6 @@ def ingest_relationship_decision_batch(
         row_backend = str(
             row.pop("reasoner_backend", "") or reasoner_backend or row_provider
         )
-        if str(row.get("decision") or "") == "relationship":
-            labels = RELATIONSHIP_PROJECTION_LABELS.get(
-                str(row.get("relation_type") or "")
-            )
-            if labels:
-                row["forward_label"], row["inverse_label"] = labels
         job_id = str(row.get("pair_job_id") or "").strip()
         if job_id not in jobs:
             parked.append(
@@ -382,6 +471,43 @@ def ingest_relationship_decision_batch(
 
         job, job_row = jobs[job_id]
         reasons: list[str] = []
+        left_anchors = _job_anchor_rows(
+            job_row,
+            side="left",
+            source_id=job.left_source_id,
+            profile=profiles_by_source.get(job.left_source_id, {}),
+        )
+        right_anchors = _job_anchor_rows(
+            job_row,
+            side="right",
+            source_id=job.right_source_id,
+            profile=profiles_by_source.get(job.right_source_id, {}),
+        )
+        row, contract_warnings = _normalize_provider_decision_row(
+            row,
+            job=job,
+            left_anchors=left_anchors,
+            right_anchors=right_anchors,
+        )
+        if (
+            str(row.get("decision") or "") == "relationship"
+            and (
+                not row.get("left_evidence_anchor_ids")
+                or not row.get("right_evidence_anchor_ids")
+            )
+        ):
+            parked.append(
+                {
+                    "row_index": index,
+                    "pair_job_id": job_id,
+                    "source_id": job.left_source_id,
+                    "target_source_id": job.right_source_id,
+                    "reason": "missing_endpoint_evidence",
+                    "contract_warnings": contract_warnings,
+                    "raw": row,
+                }
+            )
+            continue
         try:
             decision = RelationshipDecision.from_dict(row)
         except (TypeError, ValueError) as exc:
@@ -402,18 +528,6 @@ def ingest_relationship_decision_batch(
         ):
             reasons.append("decision_pair_does_not_match_job")
 
-        left_anchors = _job_anchor_rows(
-            job_row,
-            side="left",
-            source_id=job.left_source_id,
-            profile=profiles_by_source.get(job.left_source_id, {}),
-        )
-        right_anchors = _job_anchor_rows(
-            job_row,
-            side="right",
-            source_id=job.right_source_id,
-            profile=profiles_by_source.get(job.right_source_id, {}),
-        )
         if decision.decision == "relationship":
             if decision.relation_type not in SUBSTANTIVE_RELATION_TYPES:
                 reasons.append("unsupported_relation_type")
@@ -453,6 +567,8 @@ def ingest_relationship_decision_batch(
             prompt_version=prompt_version,
             profiles_by_source=profiles_by_source,
         )
+        if contract_warnings:
+            normalized["contract_warnings"] = contract_warnings
         if decision.decision == "relationship":
             accepted.append(normalized)
         elif decision.decision == "no_relationship":
@@ -1371,11 +1487,7 @@ def _normalized_v4_decision(
         )
     )
     common = {
-        "decision_schema_version": (
-            RELATIONSHIP_DECISION_SCHEMA_VERSION
-            if decision.output_contract == RELATIONSHIP_DECISION_CONTRACT
-            else "4"
-        ),
+        "decision_schema_version": decision.output_contract.rsplit("v", 1)[-1],
         "output_contract": decision.output_contract,
         "pair_job_id": job.pair_job_id,
         "catalogue_revision": job.catalogue_revision,
@@ -1456,9 +1568,8 @@ def _normalized_v4_decision(
             decision.reference_source_id, target_anchor_ids[0], target_anchor
         ),
         "provenance": (
-            "probabilistic_relationship_adjudication_v5"
-            if decision.output_contract == RELATIONSHIP_DECISION_CONTRACT
-            else "probabilistic_relationship_adjudication_v4"
+            "probabilistic_relationship_adjudication_"
+            + decision.output_contract.rsplit("-", 1)[-1]
         ),
         "cluster_evidence_eligible": True,
         "inferred": True,
@@ -1623,9 +1734,14 @@ def _final_v4_relation(row: Mapping[str, Any]) -> bool:
                 == RELATIONSHIP_DECISION_SCHEMA_VERSION
             )
             or (
-                str(row.get("output_contract") or "")
-                == "relationship-decision-v4"
-                and str(row.get("decision_schema_version") or "") == "4"
+                (
+                    str(row.get("output_contract") or ""),
+                    str(row.get("decision_schema_version") or ""),
+                )
+                in {
+                    ("relationship-decision-v4", "4"),
+                    ("relationship-decision-v5", "5"),
+                }
             )
         )
         and str(row.get("decision_status") or "") == "accepted"
@@ -1645,9 +1761,14 @@ def _final_v4_decision(
                 == RELATIONSHIP_DECISION_SCHEMA_VERSION
             )
             or (
-                str(row.get("output_contract") or "")
-                == "relationship-decision-v4"
-                and str(row.get("decision_schema_version") or "") == "4"
+                (
+                    str(row.get("output_contract") or ""),
+                    str(row.get("decision_schema_version") or ""),
+                )
+                in {
+                    ("relationship-decision-v4", "4"),
+                    ("relationship-decision-v5", "5"),
+                }
             )
         )
         and str(row.get("decision") or row.get("decision_status") or "")
@@ -1664,7 +1785,7 @@ def _publishable_machine_relation(row: Mapping[str, Any]) -> bool:
             str(row.get("relationship_tier") or "")
             in {"direct", "legacy_unclassified"}
             and str(row.get("output_contract") or "")
-            == "relationship-decision-v4"
+            in {"relationship-decision-v4", "relationship-decision-v5"}
             and str(row.get("verification_status") or "") == "final"
         )
     )

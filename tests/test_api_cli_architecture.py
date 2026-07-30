@@ -18,6 +18,7 @@ from auto_zettelkasten.api import (
 from auto_zettelkasten.cli import main
 from auto_zettelkasten.files import read_yaml, write_yaml
 from auto_zettelkasten.models import LiteratureMapRequest
+from auto_zettelkasten.obsidian import _missing_links_from_contents
 
 from conftest import FakeZotero
 
@@ -51,7 +52,7 @@ def test_release_metadata_matches_engine_version() -> None:
     pyproject = Path(__file__).parents[1] / "pyproject.toml"
     payload = tomllib.loads(pyproject.read_text(encoding="utf-8"))
 
-    assert payload["project"]["version"] == "0.18.0"
+    assert payload["project"]["version"] == "0.19.0"
 
 
 def test_standalone_literature_map_forwards_provider_concurrency(
@@ -165,6 +166,26 @@ def test_obsidian_export_of_canonical_literature_map_has_no_missing_wikilinks(
         "Literature Neighborhoods" not in path
         for path in result.metadata["planned_files"]
     )
+
+
+def test_obsidian_missing_link_scan_ignores_yaml_frontmatter(tmp_path: Path) -> None:
+    export_root = tmp_path / "vault"
+    source = export_root / "Sources" / "What's in a Figure.md"
+    contents = {
+        source: (
+            "---\n"
+            "related_notes:\n"
+            "  - wikilink: '[[What''s in a Figure]]'\n"
+            "---\n"
+            "# What's in a Figure\n\n"
+            "See [[Cluster A]] and [[Actually Missing]].\n"
+        ),
+        export_root / "Clusters" / "Cluster A.md": "# Cluster A\n",
+    }
+
+    assert _missing_links_from_contents(export_root, contents) == [
+        {"source": "Sources/What's in a Figure.md", "target": "Actually Missing"}
+    ]
 
 
 def test_obsidian_replace_rejects_symlink_escape(tmp_path: Path) -> None:
