@@ -158,6 +158,7 @@ _RELATIONSHIP_GENERAL_CANDIDATE_MAX = 64
 _RELATIONSHIP_BRIDGE_CANDIDATE_MAX = 96
 _RELATIONSHIP_CANDIDATE_MAX = 160
 _LITERATURE_MEMORY_LOCK = threading.Lock()
+_AUTO_SOURCE_WORKER_LIMIT = 32
 
 
 def _analytical_profile_source_ids(profiles: Sequence[Any]) -> set[str]:
@@ -863,7 +864,7 @@ def run_pipeline(
 
     requested_concurrency = request.provider_concurrency
     automatic_workers = (
-        (len(pending) or 1)
+        min(len(pending) or 1, _AUTO_SOURCE_WORKER_LIMIT)
         if bool(getattr(reader, "is_cloud", False))
         else request.parallel
     )

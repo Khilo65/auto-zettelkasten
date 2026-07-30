@@ -903,6 +903,52 @@ def test_auto_provider_concurrency_runs_all_ready_source_calls(
     assert report.source_stage_wall_seconds > 0
 
 
+def test_auto_source_concurrency_is_bounded_for_local_extraction_safety(
+    tmp_path,
+) -> None:
+    barrier = threading.Barrier(32)
+
+    class CloudBundleReader(BundleReader):
+        is_cloud = True
+
+        def read_source_bundle(self, text, metadata, question=None):
+            if self.calls < 32:
+                barrier.wait(timeout=5)
+            return super().read_source_bundle(text, metadata, question)
+
+    items = [
+        {
+            "key": f"ITEM{index}",
+            "data": {
+                "key": f"ITEM{index}",
+                "itemType": "journalArticle",
+                "title": f"Source {index}",
+                "date": "2024",
+                "creators": [
+                    {"creatorType": "author", "lastName": f"Author{index}"}
+                ],
+            },
+        }
+        for index in range(33)
+    ]
+
+    report = run_map(
+        MapRequest(
+            tmp_path,
+            provider="deepseek",
+            model="bundle-v1",
+            allow_cloud=True,
+            provider_concurrency="auto",
+        ),
+        client=FakeZotero(items),
+        reader=CloudBundleReader(),
+        run_id="bounded-concurrent-source-bundles",
+    )
+
+    assert report.validated_note_count == 33
+    assert report.source_peak_concurrency == 32
+
+
 def test_truncated_direct_bundle_does_not_start_hierarchical_calls(tmp_path) -> None:
     class TruncatedReader:
         name = "truncated"
