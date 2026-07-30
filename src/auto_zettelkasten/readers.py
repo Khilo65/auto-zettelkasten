@@ -24,9 +24,11 @@ from .files import require_loopback_http_url
 from .models import (
     ClusterProposal,
     ClusterSynthesis,
+    EvidenceAnchor,
     EvidenceProfile,
     GapRationale,
     LiteratureMapRequest,
+    QuantitativeResult,
     SourceAnalysisBundle,
     SynthesisAssertion,
 )
@@ -111,6 +113,37 @@ PROVIDER_CONTEXT_WINDOW_DEFAULTS: Mapping[str, int] = {
 _REASONING_EFFORT: ContextVar[str | None] = ContextVar(
     "auto_zettelkasten_reasoning_effort", default=None
 )
+
+_EVIDENCE_ANCHOR_TEXT_FIELDS = frozenset(
+    {
+        field_name
+        for field_name in EvidenceAnchor.__dataclass_fields__
+        if field_name
+        not in {
+            "conditions",
+            "locators",
+            "source_locators",
+            "qualifiers",
+            "planning_roles",
+            "salience_priority",
+            "support_envelope",
+            "quantitative_result",
+        }
+    }
+)
+_QUANTITATIVE_RESULT_FIELDS = frozenset(QuantitativeResult.__dataclass_fields__)
+_GENERATED_QUANTITATIVE_RESULT_FIELDS = frozenset(
+    {"quantitative_result_id", "source_id", "evidence_anchor_id"}
+)
+_SALIENCE_LABELS = {
+    "critical": 10,
+    "high": 10,
+    "primary": 10,
+    "medium": 5,
+    "moderate": 5,
+    "low": 1,
+    "minor": 1,
+}
 
 
 def provider_from_name(name: str, model: str, *, allow_cloud: bool):
@@ -2844,46 +2877,12 @@ def _provider_source_bundle_payload(
         if not isinstance(value, Mapping):
             anchors.append(value)
             continue
-        row = dict(value)
-        row.pop("evidence_anchor_id", None)
-        row.pop("finding_id", None)
-        row.pop("claim_id", None)
-        row["source_id"] = source_id
-        if isinstance(row.get("planning_roles"), str):
-            row["planning_roles"] = [str(row["planning_roles"])]
-        if isinstance(row.get("salience_priority"), str):
-            try:
-                row["salience_priority"] = int(float(row["salience_priority"]))
-            except ValueError:
-                pass
+        row = _normalize_provider_evidence_anchor(
+            value,
+            expected_source_id=source_id,
+            discard_generated_ids=True,
+        )
         role = str(row.get("evidence_role") or "").strip().casefold()
-        quantitative = row.get("quantitative_result")
-        if isinstance(quantitative, Mapping):
-            quantitative = {
-                str(key): (
-                    ""
-                    if value is None
-                    else str(value)
-                )
-                for key, value in quantitative.items()
-                if not isinstance(value, (Mapping, list, tuple, set))
-            }
-            for generated_key in (
-                "quantitative_result_id",
-                "source_id",
-                "evidence_anchor_id",
-            ):
-                quantitative.pop(generated_key, None)
-            if quantitative:
-                if quantitative.get("provenance") not in {
-                    "source_reported",
-                    "system_derived",
-                    "unknown",
-                }:
-                    quantitative["provenance"] = "source_reported"
-                row["quantitative_result"] = quantitative
-        elif quantitative not in (None, ""):
-            row.pop("quantitative_result", None)
         row["support_envelope"] = {
             "empirical_role": (
                 "causal"
@@ -2964,6 +2963,87 @@ def _provider_source_bundle_payload(
         )
     normalized["component_diagnostics"] = diagnostics
     return normalized
+
+
+def _normalize_provider_evidence_anchor(
+    value: Mapping[str, Any],
+    *,
+    expected_source_id: str,
+    discard_generated_ids: bool = False,
+) -> dict[str, Any]:
+    """Coerce mechanical provider shapes without changing evidence meaning."""
+
+    row = dict(value)
+    returned_owner = str(row.get("source_id") or "")
+    if returned_owner and returned_owner != expected_source_id:
+        raise ValueError(
+            "evidence_anchors.source_id does not match requested source"
+        )
+    row["source_id"] = expected_source_id
+    if discard_generated_ids:
+        row.pop("evidence_anchor_id", None)
+        row.pop("finding_id", None)
+        row.pop("claim_id", None)
+
+    for field_name in _EVIDENCE_ANCHOR_TEXT_FIELDS:
+        if field_name not in row:
+            continue
+        field_value = row[field_name]
+        if field_value is None:
+            row[field_name] = ""
+        elif isinstance(field_value, (str, int, float, bool)):
+            row[field_name] = str(field_value)
+
+    for field_name in ("conditions", "locators", "qualifiers", "planning_roles"):
+        field_value = row.get(field_name)
+        if field_value is None:
+            row[field_name] = []
+        elif not isinstance(field_value, (Mapping, list, tuple, set)):
+            row[field_name] = [str(field_value)]
+
+    salience = row.get("salience_priority", 0)
+    if isinstance(salience, bool):
+        row["salience_priority"] = 0
+    elif isinstance(salience, (int, float)):
+        row["salience_priority"] = max(0, int(salience))
+    elif isinstance(salience, str):
+        normalized_salience = salience.strip().casefold()
+        try:
+            row["salience_priority"] = max(0, int(float(normalized_salience)))
+        except ValueError:
+            row["salience_priority"] = _SALIENCE_LABELS.get(
+                normalized_salience, 0
+            )
+    else:
+        row["salience_priority"] = 0
+
+    quantitative = row.get("quantitative_result")
+    if isinstance(quantitative, Mapping):
+        normalized_quantitative: dict[str, str] = {}
+        for key, field_value in quantitative.items():
+            field_name = str(key)
+            if (
+                field_name not in _QUANTITATIVE_RESULT_FIELDS
+                or field_name in _GENERATED_QUANTITATIVE_RESULT_FIELDS
+                or isinstance(field_value, (Mapping, list, tuple, set))
+            ):
+                continue
+            normalized_quantitative[field_name] = (
+                "" if field_value is None else str(field_value)
+            )
+        if normalized_quantitative:
+            if normalized_quantitative.get("provenance") not in {
+                "source_reported",
+                "system_derived",
+                "unknown",
+            }:
+                normalized_quantitative["provenance"] = "source_reported"
+            row["quantitative_result"] = normalized_quantitative
+        else:
+            row.pop("quantitative_result", None)
+    elif quantitative not in (None, ""):
+        row.pop("quantitative_result", None)
+    return row
 
 
 def _parse_source_bundle_response(

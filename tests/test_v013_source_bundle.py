@@ -264,6 +264,37 @@ def test_source_bundle_repairs_only_lexical_json_defects() -> None:
     )
 
 
+def test_source_bundle_coerces_optional_evidence_scalars_without_losing_anchor() -> None:
+    payload = _bundle_payload()
+    payload["evidence_anchors"][0]["salience_priority"] = "high"
+    payload["evidence_anchors"][0]["quantitative_result"] = {
+        "statistic": -2.4,
+        "estimate": 0.42,
+        "baseline": 0,
+        "sample": 1093,
+        "provenance": "Reported in the source's regression table.",
+        "provider_comment": "not part of the quantitative-result contract",
+    }
+
+    recovered = _parse_source_bundle_response(
+        payload,
+        label="bundle",
+        expected_identity={
+            "source_id": "source-zotero-A1",
+            "zotero_key": "A1",
+        },
+    )
+
+    anchor = recovered["evidence_anchors"][0]
+    assert anchor["salience_priority"] == 10
+    assert anchor["quantitative_result"]["statistic"] == "-2.4"
+    assert anchor["quantitative_result"]["estimate"] == "0.42"
+    assert anchor["quantitative_result"]["baseline"] == "0"
+    assert anchor["quantitative_result"]["sample"] == "1093"
+    assert anchor["quantitative_result"]["provenance"] == "source_reported"
+    assert "provider_comment" not in anchor["quantitative_result"]
+
+
 def test_saved_source_failure_reparses_locally_without_provider_call(
     tmp_path,
 ) -> None:
@@ -514,6 +545,37 @@ def test_literature_match_normalizes_doi_urls() -> None:
     assert match["basis"] == "doi"
 
 
+def test_literature_match_rejects_container_doi_with_different_work_title() -> None:
+    match = _match_literature_position_detail(
+        {
+            "title": "Chapter Two",
+            "author": "Author",
+            "year": "2020",
+            "identifiers": {"doi": "10.4324/9781003048404"},
+        },
+        {
+            "by_source_id": {
+                "source-chapter-one": {
+                    "source_id": "source-chapter-one",
+                    "zotero_key": "CHAPTER1",
+                    "title": "chapter one",
+                    "author": "author",
+                    "author_surnames": ["author"],
+                    "year": "2020",
+                    "item_type": "booksection",
+                }
+            },
+            "by_zotero_key": {},
+            "by_doi": {"10.4324/9781003048404": ["source-chapter-one"]},
+            "by_isbn": {},
+            "by_url": {},
+            "known_zotero_items": [],
+        },
+    )
+
+    assert match["status"] == "not_in_snapshot"
+
+
 def test_remediation_ledgers_record_creator_and_scope_discrepancies(
     tmp_path,
 ) -> None:
@@ -654,6 +716,58 @@ def test_pipeline_does_not_reinsert_rejected_optional_rows() -> None:
     assert bundle.component_diagnostics[0]["raw"]["source_id"] == (
         "source-zotero-wrong"
     )
+
+
+def test_pipeline_rehydrates_safe_same_source_evidence_diagnostics_idempotently() -> None:
+    payload = _bundle_payload()
+    payload["evidence_anchors"] = []
+    payload["component_diagnostics"] = [
+        {
+            "component": "evidence_anchors",
+            "row_index": 0,
+            "reason": "ValueError:quantitative result.estimate must be string",
+            "raw": {
+                "source_id": "source-zotero-A1",
+                "claim": "Monitoring changes implementation.",
+                "locator": "p. 12",
+                "planning_roles": "major_finding",
+                "salience_priority": "critical",
+                "quantitative_result": {
+                    "estimate": 42,
+                    "baseline": None,
+                    "provenance": "Reported by the article.",
+                    "unknown_provider_field": "ignored",
+                },
+            },
+        }
+    ]
+    row = {
+        "source_id": "source-zotero-A1",
+        "zotero_item_key": "A1",
+    }
+
+    recovered = _source_bundle_from_result(payload, row, "full_document")
+
+    assert recovered is not None
+    assert len(recovered.evidence_anchors) == 1
+    anchor = recovered.evidence_anchors[0]
+    assert anchor.source_id == "source-zotero-A1"
+    assert anchor.planning_roles == ["major_finding"]
+    assert anchor.salience_priority == 10
+    assert anchor.quantitative_result is not None
+    assert anchor.quantitative_result.estimate == "42"
+    assert anchor.quantitative_result.baseline == ""
+    assert anchor.quantitative_result.provenance == "source_reported"
+
+    replayed = _source_bundle_from_result(
+        recovered.to_dict(),
+        row,
+        "full_document",
+    )
+
+    assert replayed is not None
+    assert replayed.semantic_dict() == recovered.semantic_dict()
+    assert len(replayed.evidence_anchors) == 1
 
 
 def test_bundle_normalizes_provider_helper_shapes_without_dropping_rows() -> None:
@@ -940,6 +1054,71 @@ def test_unchanged_source_bundle_reuses_committed_note(tmp_path) -> None:
 
     assert reader.calls == 1
     assert replay.reused_count == 1
+
+
+def test_old_bundle_diagnostics_migrate_locally_without_rewriting_note(
+    tmp_path,
+) -> None:
+    item = {
+        "key": "ITEMA",
+        "data": {
+            "key": "ITEMA",
+            "itemType": "journalArticle",
+            "title": "Institutions and Reform",
+            "date": "2024",
+            "creators": [{"creatorType": "author", "lastName": "One"}],
+        },
+    }
+    reader = BundleReader()
+    request = MapRequest(
+        tmp_path, provider="ollama", model="bundle-v1", parallel=1
+    )
+    first = run_map(
+        request,
+        client=FakeZotero([item]),
+        reader=reader,
+        run_id="bundle-local-migration-one",
+    )
+    note_path = tmp_path / first.items[0]["note_path"]
+    note_before = note_path.read_text(encoding="utf-8")
+    bundle_path = next(
+        (tmp_path / "02_source_memory" / "bundles").glob("*.yml")
+    )
+    sidecar = read_yaml(bundle_path)
+    raw_anchor = dict(sidecar["bundle"]["evidence_anchors"][0])
+    raw_anchor["salience_priority"] = "high"
+    raw_anchor["quantitative_result"] = {
+        "estimate": 42,
+        "provenance": "Reported in the source.",
+    }
+    sidecar["bundle"]["evidence_anchors"] = []
+    sidecar["bundle"]["component_diagnostics"] = [
+        {
+            "component": "evidence_anchors",
+            "reason": "legacy optional-row parse failure",
+            "raw": raw_anchor,
+        }
+    ]
+    sidecar["dependency_fingerprint"] = "legacy-normalization-v8"
+    write_yaml(bundle_path, sidecar)
+
+    replay = run_map(
+        request,
+        client=FakeZotero([item]),
+        reader=reader,
+        run_id="bundle-local-migration-two",
+    )
+
+    migrated = read_yaml(bundle_path)
+    assert reader.calls == 1
+    assert replay.reused_count == 1
+    assert migrated["dependency_fingerprint"] != "legacy-normalization-v8"
+    assert len(migrated["bundle"]["evidence_anchors"]) == 1
+    assert (
+        migrated["bundle"]["evidence_anchors"][0]["quantitative_result"]["estimate"]
+        == "42"
+    )
+    assert note_path.read_text(encoding="utf-8") == note_before
 
 
 def test_auto_provider_concurrency_runs_all_ready_source_calls(

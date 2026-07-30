@@ -369,6 +369,121 @@ def test_duplicate_work_identity_reuses_one_canonical_note(
     assert note["frontmatter"]["zotero_item_keys"] == ["ITEMA", "OTHER"]
 
 
+def test_shared_container_doi_does_not_merge_distinct_chapters(
+    tmp_path: Path, sample_items
+) -> None:
+    first = {
+        **sample_items[0],
+        "data": {
+            **sample_items[0]["data"],
+            "itemType": "bookSection",
+            "title": "Chapter One",
+            "DOI": "10.4324/9781003048404",
+        },
+    }
+    second = {
+        **first,
+        "key": "OTHER",
+        "data": {
+            **first["data"],
+            "key": "OTHER",
+            "title": "Chapter Two",
+        },
+    }
+    reader = FakeReader()
+
+    report = run_map(
+        MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=2),
+        client=FakeZotero([first, second]),
+        reader=reader,
+        run_id="shared-container-doi",
+    )
+
+    assert report.validated_note_count == 2
+    assert report.duplicate_alias_count == 0
+    assert reader.calls == 2
+    assert len(list((tmp_path / "02_source_memory" / "notes").glob("*.md"))) == 2
+
+
+def test_shared_container_doi_does_not_merge_incremental_chapter(
+    tmp_path: Path, sample_items
+) -> None:
+    first = {
+        **sample_items[0],
+        "data": {
+            **sample_items[0]["data"],
+            "itemType": "bookSection",
+            "title": "Chapter One",
+            "DOI": "10.4324/9781003048404",
+        },
+    }
+    second = {
+        **first,
+        "key": "OTHER",
+        "data": {
+            **first["data"],
+            "key": "OTHER",
+            "title": "Chapter Two",
+        },
+    }
+    run_map(
+        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        client=FakeZotero([first]),
+        reader=FakeReader(),
+        run_id="first-chapter",
+    )
+    reader = FakeReader()
+
+    report = run_map(
+        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        client=FakeZotero([second]),
+        reader=reader,
+        run_id="second-chapter",
+    )
+
+    assert report.validated_note_count == 1
+    assert report.duplicate_alias_count == 0
+    assert reader.calls == 1
+    assert len(list((tmp_path / "02_source_memory" / "notes").glob("*.md"))) == 2
+
+
+def test_explicit_same_work_relation_merges_duplicate_records(
+    tmp_path: Path, sample_items
+) -> None:
+    relation = {
+        "owl:sameAs": ["http://zotero.org/groups/123/items/CANONICAL"]
+    }
+    first = {
+        **sample_items[0],
+        "data": {
+            **sample_items[0]["data"],
+            "relations": relation,
+        },
+    }
+    second = {
+        **sample_items[0],
+        "key": "OTHER",
+        "data": {
+            **sample_items[0]["data"],
+            "key": "OTHER",
+            "title": "A harmless metadata variant",
+            "relations": relation,
+        },
+    }
+    reader = FakeReader()
+
+    report = run_map(
+        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        client=FakeZotero([first, second]),
+        reader=reader,
+        run_id="same-work-relation",
+    )
+
+    assert report.validated_note_count == 1
+    assert report.duplicate_alias_count == 1
+    assert reader.calls == 1
+
+
 def test_alias_only_collection_source_set_includes_canonical_note(
     tmp_path: Path, sample_items
 ) -> None:

@@ -133,6 +133,7 @@ from .readers import (
     SOURCE_BUNDLE_PROMPT_VERSION,
     SOURCE_CHUNK_MAX_OUTPUT_TOKENS,
     _normalize_source_bundle_payload,
+    _normalize_provider_evidence_anchor,
     _parse_source_bundle_response,
     provider_from_name,
 )
@@ -1728,7 +1729,7 @@ def _source_bundle_dependency_fingerprint(
             "model": request.model,
             "prompt_version": request.prompt_version,
             "source_bundle_prompt_version": SOURCE_BUNDLE_PROMPT_VERSION,
-            "source_bundle_normalization_version": "8",
+            "source_bundle_normalization_version": "9",
         }
     )
 
@@ -2217,7 +2218,11 @@ def _match_literature_position_detail(
         str(identifiers.get("doi") or identifiers.get("DOI") or "")
     )
     if doi:
-        matches = _unique_index_matches(source_index.get("by_doi", {}), doi)
+        matches = _compatible_citation_matches(
+            position,
+            _unique_index_matches(source_index.get("by_doi", {}), doi),
+            source_index,
+        )
         if len(matches) == 1:
             return _mapped_literature_match(matches[0], "doi", source_index)
         if len(matches) > 1:
@@ -2230,8 +2235,12 @@ def _match_literature_position_detail(
     ):
         value = normalizer(str(identifiers.get(identifier) or ""))
         if value:
-            matches = _unique_index_matches(
-                source_index.get(index_name, {}), value
+            matches = _compatible_citation_matches(
+                position,
+                _unique_index_matches(
+                    source_index.get(index_name, {}), value
+                ),
+                source_index,
             )
             if len(matches) == 1:
                 return _mapped_literature_match(
@@ -2340,6 +2349,25 @@ def _unique_index_matches(index: Any, key: str) -> list[str]:
     return []
 
 
+def _compatible_citation_matches(
+    position: Mapping[str, Any],
+    matches: Sequence[str],
+    source_index: Mapping[str, Any],
+) -> list[str]:
+    title = _normalized_match_text(str(position.get("title") or ""))
+    if not title:
+        return list(matches)
+    sources = dict(source_index.get("by_source_id", {}))
+    return [
+        source_id
+        for source_id in matches
+        if _normalized_match_text(
+            str(dict(sources.get(source_id, {}) or {}).get("title") or "")
+        )
+        == title
+    ]
+
+
 def _mapped_literature_match(
     source_id: str,
     basis: str,
@@ -2394,9 +2422,17 @@ def _known_or_absent_literature_match(
         for row in source_index.get("known_zotero_items", []) or []
         if isinstance(row, Mapping)
         and (
-            (doi and str(row.get("doi") or "") == doi)
-            or (isbn and str(row.get("isbn") or "") == isbn)
-            or (url and str(row.get("url") or "") == url)
+            (
+                (
+                    (doi and str(row.get("doi") or "") == doi)
+                    or (isbn and str(row.get("isbn") or "") == isbn)
+                    or (url and str(row.get("url") or "") == url)
+                )
+                and (
+                    not title
+                    or _normalized_match_text(str(row.get("title") or "")) == title
+                )
+            )
             or (
                 title
                 and str(row.get("title") or "") == title
@@ -8061,7 +8097,6 @@ def _source_bundle_from_result(
     if str(result.get("bundle_schema_version") or "") != "1":
         return None
     payload = dict(result)
-    payload = _normalize_source_bundle_payload(payload)
     expected_source_id = str(row.get("source_id") or "")
     expected_zotero_key = str(row.get("zotero_item_key") or "")
     identity = (
@@ -8085,27 +8120,66 @@ def _source_bundle_from_result(
         }
     )
     payload["source_identity"] = identity
-    for field_name, owner_field in (
-        ("evidence_anchors", "source_id"),
-        ("literature_positions", "current_source_id"),
-    ):
-        values = payload.get(field_name, [])
-        if not isinstance(values, list):
-            continue
-        normalized = []
+    values = payload.get("evidence_anchors", [])
+    if isinstance(values, list):
+        payload["evidence_anchors"] = [
+            _normalize_provider_evidence_anchor(
+                value,
+                expected_source_id=expected_source_id,
+            )
+            if isinstance(value, Mapping)
+            else value
+            for value in values
+        ]
+    values = payload.get("literature_positions", [])
+    if isinstance(values, list):
+        normalized_positions = []
         for value in values:
             if not isinstance(value, Mapping):
-                normalized.append(value)
+                normalized_positions.append(value)
                 continue
             owned = dict(value)
-            returned_owner = str(owned.get(owner_field) or "")
+            returned_owner = str(owned.get("current_source_id") or "")
             if returned_owner and returned_owner != expected_source_id:
                 raise ValueError(
-                    f"{field_name}.{owner_field} does not match requested source"
+                    "literature_positions.current_source_id does not match "
+                    "requested source"
                 )
-            owned[owner_field] = expected_source_id
-            normalized.append(owned)
-        payload[field_name] = normalized
+            owned["current_source_id"] = expected_source_id
+            normalized_positions.append(owned)
+        payload["literature_positions"] = normalized_positions
+
+    diagnostics = payload.get("component_diagnostics", [])
+    if isinstance(diagnostics, list):
+        anchors = (
+            list(payload.get("evidence_anchors", []))
+            if isinstance(payload.get("evidence_anchors"), list)
+            else []
+        )
+        for diagnostic in diagnostics:
+            if (
+                not isinstance(diagnostic, Mapping)
+                or diagnostic.get("component") != "evidence_anchors"
+                or not isinstance(diagnostic.get("raw"), Mapping)
+            ):
+                continue
+            raw = dict(diagnostic["raw"])
+            if str(raw.get("source_id") or "") != expected_source_id:
+                continue
+            try:
+                recovered = _normalized_bundle_evidence_anchor(
+                    raw,
+                    expected_source_id=expected_source_id,
+                    source_scope=source_scope,
+                    discard_generated_ids=True,
+                )
+                EvidenceAnchor.from_dict(recovered)
+            except (TypeError, ValueError):
+                continue
+            anchors.append(recovered)
+        payload["evidence_anchors"] = anchors
+
+    payload = _normalize_source_bundle_payload(payload)
     scope = (
         dict(payload.get("scope_assessment") or {})
         if isinstance(payload.get("scope_assessment"), Mapping)
@@ -8133,29 +8207,12 @@ def _source_bundle_from_result(
             if not isinstance(value, Mapping):
                 normalized_anchors.append(value)
                 continue
-            anchor = dict(value)
-            planning_roles = anchor.get("planning_roles")
-            if isinstance(planning_roles, str):
-                anchor["planning_roles"] = [planning_roles]
-            envelope = anchor.get("support_envelope")
-            if isinstance(envelope, str):
-                boundary = envelope.strip()
-                anchor["support_envelope"] = {
-                    "coverage": (
-                        "limited_text"
-                        if source_scope == "partial_document"
-                        else "full_text"
-                    ),
-                    "restrictions": [boundary] if boundary else [],
-                    "support_status": "supported",
-                }
-            elif isinstance(envelope, Mapping):
-                anchor["support_envelope"] = _normalized_support_envelope(
-                    envelope, source_scope
-                )
-            anchor_key = str(anchor.get("evidence_anchor_id") or "") or stable_hash(
-                anchor
+            anchor = _normalized_bundle_evidence_anchor(
+                value,
+                expected_source_id=expected_source_id,
+                source_scope=source_scope,
             )
+            anchor_key = _evidence_anchor_semantic_key(anchor)
             if anchor_key in seen_anchors:
                 continue
             seen_anchors.add(anchor_key)
@@ -8201,6 +8258,70 @@ def _source_bundle_from_result(
             for value in recommendations
         ]
     return SourceAnalysisBundle.from_dict(payload)
+
+
+def _normalized_bundle_evidence_anchor(
+    value: Mapping[str, Any],
+    *,
+    expected_source_id: str,
+    source_scope: str,
+    discard_generated_ids: bool = False,
+) -> dict[str, Any]:
+    anchor = _normalize_provider_evidence_anchor(
+        value,
+        expected_source_id=expected_source_id,
+        discard_generated_ids=discard_generated_ids,
+    )
+    envelope = anchor.get("support_envelope")
+    if isinstance(envelope, str):
+        boundary = envelope.strip()
+        anchor["support_envelope"] = {
+            "coverage": (
+                "limited_text"
+                if source_scope == "partial_document"
+                else "full_text"
+            ),
+            "restrictions": [boundary] if boundary else [],
+            "support_status": "supported",
+        }
+    elif isinstance(envelope, Mapping):
+        anchor["support_envelope"] = _normalized_support_envelope(
+            envelope, source_scope
+        )
+    elif envelope in (None, ""):
+        anchor["support_envelope"] = _normalized_support_envelope(
+            {}, source_scope
+        )
+    return anchor
+
+
+def _evidence_anchor_semantic_key(value: Mapping[str, Any]) -> str:
+    canonical = EvidenceAnchor.from_dict(value).to_dict()
+    canonical.pop("evidence_anchor_id", None)
+    canonical.pop("revision_hash", None)
+    quantitative = canonical.get("quantitative_result")
+    if isinstance(quantitative, Mapping):
+        normalized_quantitative = dict(quantitative)
+        for key in (
+            "quantitative_result_id",
+            "source_id",
+            "evidence_anchor_id",
+        ):
+            normalized_quantitative.pop(key, None)
+        canonical["quantitative_result"] = normalized_quantitative
+    source_locators = canonical.get("source_locators")
+    if isinstance(source_locators, list):
+        canonical["source_locators"] = [
+            {
+                key: item
+                for key, item in source_locator.items()
+                if key not in {"locator_id", "evidence_anchor_id"}
+            }
+            if isinstance(source_locator, Mapping)
+            else source_locator
+            for source_locator in source_locators
+        ]
+    return stable_hash(canonical)
 
 
 def _normalized_support_envelope(
@@ -9506,20 +9627,34 @@ def _duplicate_result(index: int, item: Mapping[str, Any]) -> dict[str, Any]:
 
 def _inventory_work_identity(item: Mapping[str, Any]) -> tuple[str, ...]:
     data = item_data(item)
+    relations = (
+        dict(data.get("relations") or {})
+        if isinstance(data.get("relations"), Mapping)
+        else {}
+    )
+    same_as = sorted(
+        {
+            _normalized_url_identifier(str(value))
+            for value in relations.get("owl:sameAs", []) or []
+            if _normalized_url_identifier(str(value))
+        }
+    )
+    if len(same_as) == 1:
+        return ("zotero_same_as", same_as[0])
     doi = _normalized_doi_identifier(
         str(data.get("DOI") or data.get("doi") or "")
     )
-    if doi:
-        return ("doi", doi)
+    title = _normalized_match_text(str(data.get("title") or ""))
+    item_type = str(data.get("itemType") or "").casefold()
+    if doi and title:
+        return ("doi", doi, title, item_type)
     isbn = _normalized_strong_identifier(
         str(data.get("ISBN") or data.get("isbn") or "")
     )
-    title = _normalized_match_text(str(data.get("title") or ""))
     if isbn and title:
-        return ("isbn", isbn, title)
+        return ("isbn", isbn, title, item_type)
     surnames = tuple(_creator_surnames(list(data.get("creators", []) or [])))
     year_match = re.search(r"(?:19|20)\d{2}", str(data.get("date") or ""))
-    item_type = str(data.get("itemType") or "").casefold()
     if title and surnames and year_match and item_type:
         return (
             "bibliographic",
@@ -9529,6 +9664,20 @@ def _inventory_work_identity(item: Mapping[str, Any]) -> tuple[str, ...]:
             item_type,
         )
     return ("zotero_key", item_key(item).upper())
+
+
+def _compatible_work_identity(
+    item: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+) -> bool:
+    data = item_data(item)
+    item_title = _normalized_match_text(str(data.get("title") or ""))
+    candidate_title = _normalized_match_text(str(candidate.get("title") or ""))
+    if not item_title or not candidate_title or item_title != candidate_title:
+        return False
+    item_type = str(data.get("itemType") or "").casefold()
+    candidate_type = str(candidate.get("item_type") or "").casefold()
+    return not item_type or not candidate_type or item_type == candidate_type
 
 
 def _existing_canonical_for_item(
@@ -9549,8 +9698,18 @@ def _existing_canonical_for_item(
         if not value:
             continue
         matches = _unique_index_matches(source_index.get(index_name, {}), value)
-        if len(matches) == 1:
-            return dict(source_index.get("by_source_id", {})).get(matches[0])
+        compatible = [
+            dict(source_index.get("by_source_id", {})).get(source_id)
+            for source_id in matches
+        ]
+        compatible = [
+            candidate
+            for candidate in compatible
+            if isinstance(candidate, Mapping)
+            and _compatible_work_identity(item, candidate)
+        ]
+        if len(compatible) == 1:
+            return dict(compatible[0])
     title = _normalized_match_text(str(data.get("title") or ""))
     surnames = _creator_surnames(list(data.get("creators", []) or []))
     year_match = re.search(r"(?:19|20)\d{2}", str(data.get("date") or ""))
