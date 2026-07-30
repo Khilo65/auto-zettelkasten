@@ -79,7 +79,7 @@ GAP_RULES = (
 LITERATURE_ALGORITHM_VERSION = "36"
 CLUSTER_PLAN_PROMPT_VERSION = "5"
 CLUSTER_PROPOSAL_PROMPT_VERSION = "17"
-CLUSTER_SYNTHESIS_PROMPT_VERSION = "26"
+CLUSTER_SYNTHESIS_PROMPT_VERSION = "27"
 GAP_REASONING_PROMPT_VERSION = "12"
 ANCHOR_ALGORITHM_VERSION = "3"
 SUPPORT_ENVELOPE_VERSION = "2"
@@ -1931,6 +1931,10 @@ class _CheckpointedReasonerCalls:
                 failure_class=failure_class,
                 terminal=terminal,
             )
+            if terminal and failure_class == "transport":
+                raise LiteratureSynthesisPartialError(
+                    f"literature_synthesis_terminal_failure:{stage}:{key}"
+                ) from exc
             raise
         finally:
             self._progress(stage, path, active=False)
@@ -18195,6 +18199,9 @@ def build_literature_report(
                     try:
                         local_by_index[index] = future.result()
                     except BaseException as exc:
+                        retry_on_resume = (
+                            _synthesis_failure_class(exc) == "transport"
+                        )
                         source_ids = sorted(
                             str(card.get("source_id") or "")
                             for card in packet.get("cards", []) or []
@@ -18221,6 +18228,7 @@ def build_literature_report(
                                         f"{type(exc).__name__}"
                                     ),
                                     "failed_source_ids": source_ids,
+                                    "retry_on_resume": retry_on_resume,
                                 }
                             ],
                         }
@@ -19221,6 +19229,7 @@ def build_literature_report(
         except Exception as exc:
             if not uses_global_cluster_plan:
                 raise
+            retry_on_resume = _synthesis_failure_class(exc) == "transport"
             synthesis_response = {}
             validated_synthesis = validate_cluster_synthesis(
                 {},
@@ -19239,6 +19248,7 @@ def build_literature_report(
             )
             validated_synthesis["status"] = "partial"
             validated_synthesis["parked_for_review"] = True
+            validated_synthesis["retry_on_resume"] = retry_on_resume
         if (
             not uses_global_cluster_plan
             and validated_synthesis.get("status") == "partial"
@@ -19787,6 +19797,15 @@ def build_literature_report(
         packet.update(
             {
                 "status": "partial",
+                "retry_on_resume": any(
+                    bool(row.get("retry_on_resume"))
+                    for row in global_plan_parked
+                )
+                or any(
+                    bool(row.get("retry_on_resume"))
+                    for row in cluster_syntheses.values()
+                    if isinstance(row, Mapping)
+                ),
                 "partial_reason": (
                     "cluster_plan_packet_failed:"
                     if failed_plan_source_ids

@@ -362,6 +362,45 @@ def test_transport_failure_gets_one_checkpointed_resume_retry(
     assert resumed.cumulative_provider_calls == 2
 
 
+def test_second_transport_failure_becomes_immediately_terminal(
+    tmp_path: Path,
+) -> None:
+    reasoner = _CallReasoner(failure=TimeoutError("provider request timed out"))
+    request = _request(tmp_path, max_calls=3)
+
+    with pytest.raises(TimeoutError):
+        _CheckpointedReasonerCalls(
+            tmp_path, "run", reasoner, request
+        )("cluster_proposal", "one", "propose_clusters", [], {})
+    resumed = _CheckpointedReasonerCalls(tmp_path, "run", reasoner, request)
+    with pytest.raises(
+        LiteratureSynthesisPartialError,
+        match="literature_synthesis_terminal_failure:cluster_proposal:one",
+    ):
+        resumed("cluster_proposal", "one", "propose_clusters", [], {})
+    checkpoint = read_yaml(
+        tmp_path
+        / "11_state"
+        / "runs"
+        / "run"
+        / "literature"
+        / "synthesis"
+        / "cluster_proposal"
+        / "one.yml",
+        {},
+    )
+    assert checkpoint["terminal"] is True
+    assert checkpoint["retry_on_resume"] is False
+
+    final = _CheckpointedReasonerCalls(tmp_path, "run", reasoner, request)
+    with pytest.raises(
+        LiteratureSynthesisPartialError,
+        match="literature_synthesis_terminal_failure:cluster_proposal:one",
+    ):
+        final("cluster_proposal", "one", "propose_clusters", [], {})
+    assert reasoner.calls == 2
+
+
 def test_contract_failure_is_terminal_without_paid_resume_retry(
     tmp_path: Path,
 ) -> None:

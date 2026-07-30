@@ -136,6 +136,45 @@ def test_relationship_packet_deduplicates_shared_source_documents() -> None:
     assert all("atomic_notes" not in row for row in packet["pair_jobs"])
 
 
+def test_pair_context_changes_relationship_job_identity() -> None:
+    common = {
+        "left_source_id": "A",
+        "right_source_id": "B",
+        "atomic_notes": {
+            "left": {"semantic_hash": "note-a"},
+            "right": {"semantic_hash": "note-b"},
+        },
+    }
+    first = RelationshipPairJob(
+        **common,
+        graph_context={
+            "pair_context": {
+                "endpoint_profiles": {"A": {"year": "2020"}, "B": {"year": "2021"}}
+            }
+        },
+    )
+    changed = RelationshipPairJob(
+        **common,
+        graph_context={
+            "pair_context": {
+                "endpoint_profiles": {"A": {"year": "2022"}, "B": {"year": "2021"}}
+            }
+        },
+    )
+    downstream_only = RelationshipPairJob(
+        **common,
+        graph_context={
+            "pair_context": {
+                "endpoint_profiles": {"A": {"year": "2020"}, "B": {"year": "2021"}}
+            },
+            "existing_neighbors": [{"relation_id": "machine-output"}],
+        },
+    )
+
+    assert first.pair_job_id != changed.pair_job_id
+    assert first.pair_job_id == downstream_only.pair_job_id
+
+
 def test_contextual_relationship_has_an_explicit_non_direct_tier() -> None:
     decision = RelationshipDecision(
         decision="relationship",

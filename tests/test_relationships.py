@@ -260,8 +260,8 @@ def test_registry_retires_stale_machine_prompt_edges_only(
     )["accepted"]
     accepted = _verified_relations(decisions, profiles)
     for row in accepted[:2]:
-        row["prompt_version"] = "6"
-    accepted[2]["prompt_version"] = "7"
+        row["prompt_version"] = "7"
+    accepted[2]["prompt_version"] = "8"
     human = {
         "relation_id": "human-g-h",
         "source_id": "G",
@@ -284,12 +284,12 @@ def test_registry_retires_stale_machine_prompt_edges_only(
         accepted_relations=[*accepted, human],
     )
 
-    replacement = dict(accepted[0], prompt_version="7")
+    replacement = dict(accepted[0], prompt_version="8")
     reconciled = persist_relationship_registry(
         tmp_path,
         structural_relations=[citation],
         accepted_relations=[replacement],
-        reconcile_machine_prompt_version="7",
+        reconcile_machine_prompt_version="8",
     )
     rows = {
         row["relation_id"]: row for row in reconciled["relations"]
@@ -298,7 +298,7 @@ def test_registry_retires_stale_machine_prompt_edges_only(
     assert stale["active"] is False
     assert stale["decision_status"] == "retired"
     assert stale["retirement_reason"] == "relationship_prompt_changed"
-    assert stale["retirement_prompt_version"] == "7"
+    assert stale["retirement_prompt_version"] == "8"
     assert rows[replacement["relation_id"]]["active"] is True
     assert rows[accepted[2]["relation_id"]]["active"] is True
     assert rows["human-g-h"]["active"] is True
@@ -310,7 +310,7 @@ def test_registry_retires_stale_machine_prompt_edges_only(
         tmp_path,
         structural_relations=[citation],
         accepted_relations=[replacement],
-        reconcile_machine_prompt_version="7",
+        reconcile_machine_prompt_version="8",
     )
     assert replay["revision_hash"] == reconciled["revision_hash"]
     assert registry.read_bytes() == original

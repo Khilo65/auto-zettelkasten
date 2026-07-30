@@ -1560,8 +1560,10 @@ def build_map(
         for row in relationship_result.get("parked", []) or []
         if isinstance(row, Mapping)
     )
+    if bool(result["literature_packet"].get("retry_on_resume")):
+        semantic_replayable = False
     partial_text = str(result.get("partial_reason") or "").casefold()
-    if any(
+    if "retry_on_resume" not in result["literature_packet"] and any(
         token in partial_text
         for token in ("timeout", "timed out", "connection", "transport")
     ):

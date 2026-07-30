@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
-CURRENT_ENGINE_VERSION = "0.17.0"
+CURRENT_ENGINE_VERSION = "0.18.0"
 CURRENT_ARTIFACT_SCHEMA_VERSION = "1.14"
 CURRENT_PROFILE_SCHEMA_VERSION = "1.3"
 
@@ -2245,6 +2245,9 @@ class RelationshipPairJob:
                             "literature_positions": self.literature_positions,
                             "selected_evidence": self.selected_evidence,
                             "candidate_basis": self.candidate_basis,
+                            "pair_context": self.graph_context.get(
+                                "pair_context", {}
+                            ),
                         },
                         "output_contract": self.output_contract,
                     }

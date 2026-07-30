@@ -26,9 +26,12 @@ def test_relationship_discovery_uses_one_bridge_aware_prompt_identity() -> None:
     prompt = _relationship_candidate_system_prompt()
 
     assert LITERATURE_RELATIONSHIP_PROMPT_VERSION == RELATIONSHIP_PROMPT_VERSION
-    assert "globally rank" in prompt
+    assert "optimizes recall" in prompt
+    assert "not a published relationship" in prompt
     assert "max_inferred_pairs" in prompt
     assert "cross_literature" in prompt
+    assert "target 32 to 48" in prompt
+    assert "multiple bridge families" in prompt
     assert "left_evidence_anchor_ids" in prompt
     assert "right_evidence_anchor_ids" in prompt
     assert RELATIONSHIP_MAX_OUTPUT_TOKENS == 128_000
@@ -198,12 +201,13 @@ def test_malformed_decision_rows_are_isolated_from_valid_siblings() -> None:
         profiles=_profiles("A", "B", "C", "D"),
     )
 
-    assert [row["pair_job_id"] for row in result["accepted"]] == ["job-a-b"]
-    assert {
-        row["reason"] for row in result["parked"]
-    } == {
+    assert [row["pair_job_id"] for row in result["accepted"]] == [
+        "job-a-b",
+        "job-a-d",
+    ]
+    assert result["accepted"][1]["inverse_label"] == "supported by"
+    assert {row["reason"] for row in result["parked"]} == {
         "left_anchor_not_owned_by_left_source",
-        "relation_labels_do_not_match_type",
     }
 
 

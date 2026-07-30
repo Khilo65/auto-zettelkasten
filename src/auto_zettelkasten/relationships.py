@@ -10,7 +10,7 @@ from .models import RelationshipDecision, RelationshipPairJob
 from .navigation import TYPED_SOURCE_RELATIONS, rank_human_related_links
 
 
-RELATIONSHIP_PROMPT_VERSION = "7"
+RELATIONSHIP_PROMPT_VERSION = "8"
 RELATIONSHIP_REGISTRY_SCHEMA_VERSION = "6"
 RELATIONSHIP_DECISION_SCHEMA_VERSION = "5"
 RELATIONSHIP_DECISION_CONTRACT = "relationship-decision-v5"
@@ -352,6 +352,12 @@ def ingest_relationship_decision_batch(
         row_backend = str(
             row.pop("reasoner_backend", "") or reasoner_backend or row_provider
         )
+        if str(row.get("decision") or "") == "relationship":
+            labels = RELATIONSHIP_PROJECTION_LABELS.get(
+                str(row.get("relation_type") or "")
+            )
+            if labels:
+                row["forward_label"], row["inverse_label"] = labels
         job_id = str(row.get("pair_job_id") or "").strip()
         if job_id not in jobs:
             parked.append(
@@ -416,16 +422,6 @@ def ingest_relationship_decision_batch(
                 decision.reference_source_id,
             } != {job.left_source_id, job.right_source_id}:
                 reasons.append("direction_does_not_use_job_pair")
-            expected_labels = RELATIONSHIP_PROJECTION_LABELS.get(
-                decision.relation_type
-            )
-            if expected_labels and (
-                _normalized_label(decision.forward_label)
-                != _normalized_label(expected_labels[0])
-                or _normalized_label(decision.inverse_label)
-                != _normalized_label(expected_labels[1])
-            ):
-                reasons.append("relation_labels_do_not_match_type")
             if not set(decision.left_evidence_anchor_ids) <= set(left_anchors):
                 reasons.append("left_anchor_not_owned_by_left_source")
             if not set(decision.right_evidence_anchor_ids) <= set(right_anchors):
@@ -1347,10 +1343,6 @@ def _job_profile(
         return profile_row(value)
     except ValueError:
         return {}
-
-
-def _normalized_label(value: str) -> str:
-    return " ".join(str(value).strip().lower().replace("_", " ").split())
 
 
 def _normalized_v4_decision(

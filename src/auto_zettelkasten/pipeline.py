@@ -2693,6 +2693,9 @@ def _run_relationship_reasoning(
         and not catalogue_changed
         and not bool(getattr(request, "retry_terminal_failures", False))
     ):
+        prior_stage_complete = bool(
+            prior_state.get("relationship_stage_complete", True)
+        )
         return {
             "accepted": [],
             "no_relationship": [],
@@ -2703,6 +2706,11 @@ def _run_relationship_reasoning(
             "selection_identity": selection_identity,
             "state_path": str(state_path),
             "pair_job_count": 0,
+            "accounted_pair_job_count": 0,
+            "relationship_stage_complete": prior_stage_complete,
+            "relationship_retry_on_resume": bool(
+                prior_state.get("relationship_retry_on_resume", False)
+            ),
             "provider_batch_count": 0,
         }
     mandatory_basis: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
@@ -2814,11 +2822,15 @@ def _run_relationship_reasoning(
                 for pair in sorted(mandatory_basis)
             ],
             "cluster_candidates": [],
-            "selected_profile_hashes": {},
-            "reconciled_catalogue_revision": "",
+            "selected_profile_hashes": current_hashes,
+            "selected_relationship_memory_hashes": current_memory_hashes,
+            "reconciled_catalogue_revision": catalogue_revision,
             "selection_identity": selection_identity,
             "state_path": str(state_path),
             "pair_job_count": len(mandatory_basis),
+            "accounted_pair_job_count": len(mandatory_basis),
+            "relationship_stage_complete": False,
+            "relationship_retry_on_resume": False,
             "provider_batch_count": 0,
         }
     catalogue_char_budget = _relationship_context_char_budget(reasoner, request)
@@ -2855,6 +2867,45 @@ def _run_relationship_reasoning(
         for row in collection_rows
         if isinstance(row.get("routing_card"), Mapping)
     ]
+    collection_index_cards = [
+        {
+            "literature_id": str(row.get("literature_id") or ""),
+            "title": " ".join(str(row.get("title") or "").split())[:240],
+            "scope": " ".join(str(row.get("scope") or "").split())[:360],
+            "source_count": int(row.get("source_count", 0) or 0),
+        }
+        for row in catalogue_payload.get("literatures", []) or []
+        if isinstance(row, Mapping) and row.get("literature_id")
+    ]
+    if not collection_index_cards:
+        collection_index_cards = [
+            {
+                "literature_id": literature_id,
+                "title": literature_id,
+                "scope": "",
+                "source_count": sum(
+                    literature_id
+                    in set(
+                        entry.get("literature_ids", [])
+                        or entry.get("collections", [])
+                        or []
+                    )
+                    for entry in entries
+                ),
+            }
+            for literature_id in sorted(
+                {
+                    str(value)
+                    for entry in entries
+                    for value in (
+                        entry.get("literature_ids", [])
+                        or entry.get("collections", [])
+                        or []
+                    )
+                    if str(value)
+                }
+            )
+        ]
     position_context = [
         {
             "literature_position_id": str(
@@ -2868,9 +2919,24 @@ def _run_relationship_reasoning(
         }
         for row in positions.get("positions", []) or []
         if isinstance(row, Mapping)
-        and (
-            str(row.get("current_source_id") or "") in profile_by_source
-            or str(row.get("matched_source_id") or "") in profile_by_source
+        and str(row.get("current_source_id") or "") in profile_by_source
+        and str(row.get("matched_source_id") or "") in profile_by_source
+    ]
+    memberships_by_source = {
+        source_id: set(
+            entry.get("literature_ids", [])
+            or entry.get("collections", [])
+            or []
+        )
+        for source_id, entry in entry_by_source.items()
+    }
+    bridge_position_context = [
+        row
+        for row in position_context
+        if memberships_by_source.get(row["current_source_id"])
+        and memberships_by_source.get(row["matched_source_id"])
+        and memberships_by_source[row["current_source_id"]].isdisjoint(
+            memberships_by_source[row["matched_source_id"]]
         )
     ]
     def discovery_memory(source_ids: set[str]) -> dict[str, Any]:
@@ -3206,25 +3272,38 @@ def _run_relationship_reasoning(
             for row in entries
             if str(row.get("source_id") or "") in candidate_sources
         ]
-        candidate_profiles = [
-            _relationship_evidence_projection(
-                profile_by_source[source_id],
-                entry_by_source.get(source_id, {}),
-                include_anchors=True,
+        candidate_literature_ids = {
+            str(value)
+            for row in candidate_entries
+            for value in (
+                row.get("literature_ids", [])
+                or row.get("collections", [])
+                or []
             )
-            for source_id in sorted(candidate_sources)
-        ]
+            if str(value)
+        }
         candidate_context = {
             **base_discovery_context,
             "discovery_mode": "bridge_only",
             "catalogue": candidate_entries,
+            "collection_index_cards": [
+                card
+                for card in collection_index_cards
+                if str(card.get("literature_id") or "")
+                in candidate_literature_ids
+            ],
             "max_inferred_pairs": bridge_capacity,
             "reserved_bridge_fraction": 1.0,
-            **discovery_memory(candidate_sources),
+            "literature_positions": [
+                row
+                for row in bridge_position_context
+                if row["current_source_id"] in candidate_sources
+                and row["matched_source_id"] in candidate_sources
+            ],
         }
         if current_bridge_sources and (
             _reasoner_packet_chars(
-                [profile_to_dict(profile) for profile in candidate_profiles],
+                [],
                 candidate_context,
             )
             > catalogue_char_budget
@@ -3247,25 +3326,38 @@ def _run_relationship_reasoning(
             for row in entries
             if str(row.get("source_id") or "") in source_ids
         ]
-        packet_profiles = [
-            _relationship_evidence_projection(
-                profile_by_source[source_id],
-                entry_by_source.get(source_id, {}),
-                include_anchors=True,
+        packet_literature_ids = {
+            str(value)
+            for row in packet_entries
+            for value in (
+                row.get("literature_ids", [])
+                or row.get("collections", [])
+                or []
             )
-            for source_id in packet_ids
-        ]
+            if str(value)
+        }
         bridge_context = {
             **base_discovery_context,
             "discovery_mode": "bridge_only",
             "catalogue": packet_entries,
+            "collection_index_cards": [
+                card
+                for card in collection_index_cards
+                if str(card.get("literature_id") or "")
+                in packet_literature_ids
+            ],
             "max_inferred_pairs": bridge_capacity,
             "reserved_bridge_fraction": 1.0,
-            **discovery_memory(set(packet_ids)),
+            "literature_positions": [
+                row
+                for row in bridge_position_context
+                if row["current_source_id"] in source_ids
+                and row["matched_source_id"] in source_ids
+            ],
         }
         if (
             _reasoner_packet_chars(
-                [profile_to_dict(profile) for profile in packet_profiles],
+                [],
                 bridge_context,
             )
             > catalogue_char_budget
@@ -3282,7 +3374,7 @@ def _run_relationship_reasoning(
             (
                 "relationship_bridge_candidate_selection",
                 f"bridge-{catalogue_revision[:16]}-{packet_index + 1}",
-                packet_profiles,
+                [],
                 bridge_context,
                 "bridge",
             )
@@ -3436,6 +3528,68 @@ def _run_relationship_reasoning(
             }
             == set(pair)
         ]
+        explicit_pair_rows = [
+            dict(row)
+            for row in (
+                registry.get("relations", [])
+                or registry.get("links", [])
+                or []
+            )
+            if isinstance(row, Mapping)
+            and str(row.get("relation_type") or "")
+            in {"cites", "cited_by", "zotero_related"}
+            and canonical_pair(
+                str(row.get("source_id") or ""),
+                str(row.get("target_source_id") or ""),
+            )
+            == pair
+        ]
+        citation_direction = [
+            {
+                "citing_source_id": str(row.get("current_source_id") or ""),
+                "cited_source_id": str(row.get("matched_source_id") or ""),
+                "basis": "matched_literature_position",
+            }
+            for row in literature_rows
+        ]
+        for row in explicit_pair_rows:
+            relation_type = str(row.get("relation_type") or "")
+            source_id = str(row.get("source_id") or "")
+            target_source_id = str(row.get("target_source_id") or "")
+            if relation_type == "cites":
+                citation_direction.append(
+                    {
+                        "citing_source_id": source_id,
+                        "cited_source_id": target_source_id,
+                        "basis": "explicit_citation",
+                    }
+                )
+            elif relation_type == "cited_by":
+                citation_direction.append(
+                    {
+                        "citing_source_id": target_source_id,
+                        "cited_source_id": source_id,
+                        "basis": "explicit_citation",
+                    }
+                )
+        reuse_signals = [
+            {
+                "source": str(row.get("discovery_route") or "candidate"),
+                "description": " ".join(
+                    str(
+                        row.get("reason")
+                        or row.get("why_relevant")
+                        or row.get("engagement")
+                        or ""
+                    ).split()
+                )[:500],
+            }
+            for row in [*candidate_by_pair[pair], *literature_rows]
+            if any(
+                token in str(row).casefold()
+                for token in ("dataset", "coding reuse", "coded data", "reuses")
+            )
+        ]
         job = RelationshipPairJob(
             catalogue_revision=catalogue_revision,
             left_source_id=pair[0],
@@ -3465,9 +3619,35 @@ def _run_relationship_reasoning(
             literature_positions=literature_rows,
             selected_evidence=selected,
             graph_context={
+                "pair_context": {
+                    "canonical_pair": {
+                        "left_source_id": pair[0],
+                        "right_source_id": pair[1],
+                    },
+                    "endpoint_profiles": {
+                        source_id: {
+                            "title": str(
+                                entry_by_source.get(source_id, {}).get("title")
+                                or ""
+                            ),
+                            "author": str(
+                                entry_by_source.get(source_id, {}).get("author")
+                                or ""
+                            ),
+                            "year": str(
+                                entry_by_source.get(source_id, {}).get("year")
+                                or ""
+                            ),
+                            "profile_hash": current_hashes[source_id],
+                        }
+                        for source_id in pair
+                    },
+                    "citation_direction": citation_direction,
+                    "reuse_signals": reuse_signals,
+                },
                 "existing_neighbors": _relationship_neighbors(
                     pair, registry.get("links", []) or []
-                )
+                ),
             },
             candidate_basis=candidate_by_pair[pair],
             prior_pair_memory={
@@ -3760,18 +3940,25 @@ def _run_relationship_reasoning(
                 for row in response.get("decisions", []) or []
                 if isinstance(row, Mapping)
             ]
-            by_job = {
-                str(row.get("pair_job_id") or ""): row for row in rows
-            }
+            by_job: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for row in rows:
+                by_job[str(row.get("pair_job_id") or "")].append(row)
             for job in packet:
-                row = by_job.get(job.pair_job_id)
+                job_rows = by_job.get(job.pair_job_id, [])
                 status_path = job_root / job.pair_job_id / "status.yml"
-                if row is None:
+                if len(job_rows) != 1:
+                    reason = (
+                        "provider_batch_missing_pair_row"
+                        if not job_rows
+                        else "duplicate_pair_job_decision"
+                    )
                     preparked.append(
                         {
                             "pair_job_id": job.pair_job_id,
+                            "source_id": job.left_source_id,
+                            "target_source_id": job.right_source_id,
                             "status": "parked_for_review",
-                            "reason": "provider_batch_missing_pair_row",
+                            "reason": reason,
                         }
                     )
                     write_yaml(
@@ -3779,11 +3966,12 @@ def _run_relationship_reasoning(
                         {
                             "pair_job_id": job.pair_job_id,
                             "status": "parked_for_review",
-                            "reason": "provider_batch_missing_pair_row",
+                            "reason": reason,
                             "decision_identity": decision_identity,
                         },
                     )
                     continue
+                row = job_rows[0]
                 row = {
                     **row,
                     "reasoner_backend": reasoner_backend,
@@ -3823,29 +4011,46 @@ def _run_relationship_reasoning(
                 {**batch.to_dict(), "status": "completed"},
             )
         except Exception as exc:
+            failure_class = _synthesis_failure_class(exc)
+            retry_on_resume = failure_class == "transport"
             write_yaml(
                 batch_root / "batch.yml",
                 {
                     **batch.to_dict(),
-                    "status": "parked_for_review",
+                    "status": (
+                        "pending" if retry_on_resume else "parked_for_review"
+                    ),
                     "reason": f"{type(exc).__name__}:{exc}",
+                    "retry_on_resume": retry_on_resume,
                 },
             )
             for job in packet:
                 preparked.append(
                     {
                         "pair_job_id": job.pair_job_id,
-                        "status": "parked_for_review",
+                        "source_id": job.left_source_id,
+                        "target_source_id": job.right_source_id,
+                        "status": (
+                            "pending"
+                            if retry_on_resume
+                            else "parked_for_review"
+                        ),
                         "reason": "provider_batch_failed",
+                        "retry_on_resume": retry_on_resume,
                     }
                 )
                 write_yaml(
                     job_root / job.pair_job_id / "status.yml",
                     {
                         "pair_job_id": job.pair_job_id,
-                        "status": "parked_for_review",
+                        "status": (
+                            "pending"
+                            if retry_on_resume
+                            else "parked_for_review"
+                        ),
                         "reason": "provider_batch_failed",
                         "decision_identity": decision_identity,
+                        "retry_on_resume": retry_on_resume,
                     },
                 )
     from .relationships import validate_relationship_decision_rows
@@ -3859,9 +4064,15 @@ def _run_relationship_reasoning(
         reasoner_backend=reasoner_backend,
         prompt_version=RELATIONSHIP_PROMPT_VERSION,
     )
+    preparked_job_ids = {
+        str(row.get("pair_job_id") or "")
+        for row in preparked
+        if row.get("pair_job_id")
+    }
     terminal_rows = [
-        *validated["needs_more_context"],
-        *validated["parked"],
+        row
+        for row in [*validated["needs_more_context"], *validated["parked"]]
+        if str(row.get("pair_job_id") or "") not in preparked_job_ids
     ]
     for row in terminal_rows:
         pair_job_id = str(row.get("pair_job_id") or "")
@@ -3879,26 +4090,59 @@ def _run_relationship_reasoning(
                 "decision_identity": decision_identity,
             },
         )
+    accounted_job_ids = {
+        str(row.get("pair_job_id") or "")
+        for row in [
+            *validated["accepted"],
+            *validated["no_relationship"],
+            *preparked,
+            *terminal_rows,
+        ]
+        if row.get("pair_job_id")
+    }
+    retryable_relationship_failure = any(
+        bool(row.get("retry_on_resume"))
+        for row in [*preparked, *terminal_rows]
+    )
+    relationship_retry_on_resume = bool(
+        retryable_relationship_failure
+        or any(
+            bool(row.get("retry_on_resume"))
+            for row in discovery_parked
+        )
+    )
+    selection_settled = bool(
+        not relationship_retry_on_resume
+        and (
+            discovery_completed
+            or discovery_terminal
+            or not can_discover
+        )
+    )
+    relationship_stage_complete = bool(
+        discovery_completed
+        and len(accounted_job_ids) == len(jobs)
+        and not relationship_retry_on_resume
+    )
     return {
         "accepted": validated["accepted"],
         "no_relationship": validated["no_relationship"],
         "parked": [*preparked, *terminal_rows],
         "cluster_candidates": [],
         "selected_profile_hashes": (
-            current_hashes if discovery_completed or discovery_terminal else {}
+            current_hashes if selection_settled else {}
         ),
         "selected_relationship_memory_hashes": (
-            current_memory_hashes
-            if discovery_completed or discovery_terminal
-            else {}
+            current_memory_hashes if selection_settled else {}
         ),
         "reconciled_catalogue_revision": (
-            catalogue_revision
-            if discovery_completed or discovery_terminal
-            else ""
+            catalogue_revision if selection_settled else ""
         ),
         "selection_identity": selection_identity,
         "pair_job_count": len(jobs),
+        "accounted_pair_job_count": len(accounted_job_ids),
+        "relationship_stage_complete": relationship_stage_complete,
+        "relationship_retry_on_resume": relationship_retry_on_resume,
         "provider_batch_count": provider_batch_count,
         "relationship_stage_wall_seconds": relationship_stage_seconds,
         "state_path": str(
@@ -4237,6 +4481,8 @@ def _commit_relationship_selection_state(
     *,
     catalogue_revision: str,
 ) -> Path | None:
+    if bool(result.get("relationship_retry_on_resume")):
+        return None
     selected = dict(result.get("selected_profile_hashes", {}) or {})
     selected_memory = dict(
         result.get("selected_relationship_memory_hashes", {}) or {}
@@ -4274,6 +4520,22 @@ def _commit_relationship_selection_state(
         "selection_identity": selection_identity
         or str(existing.get("selection_identity") or ""),
     }
+    if (
+        "relationship_stage_complete" in result
+        or "relationship_stage_complete" in existing
+    ):
+        payload["relationship_stage_complete"] = bool(
+            result.get(
+                "relationship_stage_complete",
+                existing.get("relationship_stage_complete", True),
+            )
+        )
+        payload["relationship_retry_on_resume"] = bool(
+            result.get(
+                "relationship_retry_on_resume",
+                existing.get("relationship_retry_on_resume", False),
+            )
+        )
     if existing != payload:
         write_yaml(path, payload)
     return path
@@ -5133,6 +5395,66 @@ def rebuild_map(
         *graph_note_paths,
         *([selection_state_path] if selection_state_path is not None else []),
     ]
+    if not bool(
+        relationship_result.get("relationship_stage_complete", True)
+    ):
+        retry_on_resume = bool(
+            relationship_result.get("relationship_retry_on_resume")
+        )
+        reason = (
+            "relationship_stage_partial:retryable_incomplete_pair_jobs"
+            if retry_on_resume
+            else "relationship_stage_partial:terminal_incomplete_relationships"
+        )
+        if progress is not None:
+            progress.update_literature(literature_failure_count=1)
+        return {
+            "source_set": dict(source_set),
+            "cluster_map": {
+                "status": "partial",
+                "clusters": [],
+                "relations": [],
+                "unclustered_sources": [],
+            },
+            "gap_map": {
+                "status": "partial",
+                "gap_candidates": [],
+                "novelty_claimed": False,
+            },
+            "literature_packet": {
+                "status": "partial",
+                "reason": reason,
+                "retry_on_resume": retry_on_resume,
+                "synthesis_call_count": int(
+                    getattr(reasoner_calls, "cumulative_provider_calls", 0)
+                    or 0
+                ),
+                "synthesis_new_call_count": int(
+                    getattr(reasoner_calls, "provider_calls", 0) or 0
+                ),
+                "synthesis_checkpoint_hit_count": int(
+                    getattr(reasoner_calls, "checkpoint_hits", 0) or 0
+                ),
+                "synthesis_failure_count": int(
+                    getattr(reasoner_calls, "failures", 0) or 0
+                ),
+            },
+            "typed_links": typed,
+            "relationship_result": relationship_result,
+            "profiles": profiles,
+            "profile_result": {
+                key: value
+                for key, value in profile_result.items()
+                if key != "profiles"
+            },
+            "migration": migration,
+            "partial_reason": reason,
+            "paths": [
+                *graph_paths,
+                *profile_result["paths"],
+                *_existing_source_set_paths(workspace, source_set),
+            ],
+        }
     literature_note_rows = list(workspace_note_rows)
     literature_profiles = list(workspace_profiles)
     try:
@@ -5177,6 +5499,7 @@ def rebuild_map(
         )
     except Exception as exc:
         reason = f"literature_synthesis_partial:{type(exc).__name__}:{exc}"
+        retry_on_resume = _synthesis_failure_class(exc) == "transport"
         if profile_partial_reason:
             reason = f"{profile_partial_reason};{reason}"
         preserved_clusters, refresh_paths = (
@@ -5234,6 +5557,7 @@ def rebuild_map(
             "literature_packet": {
                 "status": "partial",
                 "reason": reason,
+                "retry_on_resume": retry_on_resume,
                 "synthesis_call_count": synthesis_calls,
                 "synthesis_new_call_count": synthesis_new_calls,
                 "synthesis_checkpoint_hit_count": synthesis_hits,
