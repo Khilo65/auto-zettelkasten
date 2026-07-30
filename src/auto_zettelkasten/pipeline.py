@@ -48,8 +48,8 @@ from .literature import (
     _CheckpointedReasonerCalls,
     _preserve_last_valid_clusters_on_refresh_failure,
     _provider_worker_count,
-    _reasoner_context_char_budget,
     _reasoner_packet_chars,
+    _synthesis_failure_class,
     build_navigation_projection,
     build_literature_map,
     cluster_display_title,
@@ -127,6 +127,7 @@ from .relationships import (
 )
 from .readers import (
     SECTION_KEYS,
+    SOURCE_BUNDLE_MAX_OUTPUT_TOKENS,
     SOURCE_BUNDLE_PROMPT_VERSION,
     _normalize_source_bundle_payload,
     provider_from_name,
@@ -2500,7 +2501,7 @@ def _run_relationship_reasoning(
             "parked": [],
             "cluster_candidates": [],
             "selected_profile_hashes": {},
-            "reconciled_catalogue_revision": catalogue_revision,
+            "reconciled_catalogue_revision": "",
         }
     decision_contract = str(
         getattr(reasoner, "relationship_decision_contract", "")
@@ -2686,7 +2687,11 @@ def _run_relationship_reasoning(
         )
         != catalogue_revision
     )
-    if not focus_source_ids and not catalogue_changed:
+    if (
+        not focus_source_ids
+        and not catalogue_changed
+        and not bool(getattr(request, "retry_terminal_failures", False))
+    ):
         return {
             "accepted": [],
             "no_relationship": [],
@@ -2849,23 +2854,6 @@ def _run_relationship_reasoning(
         for row in collection_rows
         if isinstance(row.get("routing_card"), Mapping)
     ]
-    graph_context = [
-        {
-            "relation_id": str(row.get("relation_id") or ""),
-            "source_id": str(row.get("source_id") or ""),
-            "target_source_id": str(row.get("target_source_id") or ""),
-            "relation_type": str(row.get("relation_type") or ""),
-            "reason": " ".join(str(row.get("reason") or "").split())[:400],
-            "comparison_proposition": " ".join(
-                str(row.get("comparison_proposition") or "").split()
-            )[:400],
-        }
-        for row in registry.get("relations", []) or registry.get("links", []) or []
-        if isinstance(row, Mapping)
-        and row.get("active", True)
-        and str(row.get("source_id") or "") in profile_by_source
-        and str(row.get("target_source_id") or "") in profile_by_source
-    ]
     position_context = [
         {
             "literature_position_id": str(
@@ -2884,30 +2872,13 @@ def _run_relationship_reasoning(
             or str(row.get("matched_source_id") or "") in profile_by_source
         )
     ]
-    cluster_context = [
-        row
-        for row in _cluster_catalogue_rows(workspace)
-        if set(row.get("source_ids", []) or []) & set(profile_by_source)
-    ]
-
     def discovery_memory(source_ids: set[str]) -> dict[str, Any]:
         return {
-            "existing_graph_neighbors": [
-                row
-                for row in graph_context
-                if row["source_id"] in source_ids
-                or row["target_source_id"] in source_ids
-            ],
             "literature_positions": [
                 row
                 for row in position_context
                 if row["current_source_id"] in source_ids
                 or row["matched_source_id"] in source_ids
-            ],
-            "cluster_summaries": [
-                row
-                for row in cluster_context
-                if set(row.get("source_ids", []) or []) & source_ids
             ],
         }
 
@@ -2931,10 +2902,19 @@ def _run_relationship_reasoning(
         )
         > catalogue_char_budget
     )
+    literature_ids = sorted(
+        {
+            str(value)
+            for entry in entries
+            for value in entry.get("literature_ids", []) or []
+            if str(value)
+        }
+    )
     routing_call_count = (
         (2 if collection_cards else 1) if requires_routing else 0
     )
-    discovery_call_count = 1 + routing_call_count
+    bridge_routing_call_count = int(len(literature_ids) > 2)
+    discovery_call_count = 2 + routing_call_count + bridge_routing_call_count
     can_discover = (
         remaining_calls >= mandatory_call_count + discovery_call_count + 1
     )
@@ -2947,12 +2927,17 @@ def _run_relationship_reasoning(
     )
     pair_capacity = adjudication_call_capacity * batch_max_jobs
     inferred_capacity = (
-        min(120, max(0, pair_capacity - len(mandatory_basis)))
+        min(
+            max(0, 120 - len(mandatory_basis)),
+            max(0, pair_capacity - len(mandatory_basis)),
+        )
         if can_discover
         else 0
     )
-    discovery: Mapping[str, Any] = {}
+    general_capacity = min(72, inferred_capacity)
+    bridge_capacity = min(48, max(0, inferred_capacity - general_capacity))
     discovery_completed = False
+    discovery_terminal = False
     if can_discover and requires_routing:
         selected_collection_source_ids = set(profile_by_source)
         if collection_cards:
@@ -2971,11 +2956,14 @@ def _run_relationship_reasoning(
                 )
             except Exception as exc:
                 collection_routing = {}
+                failure_class = _synthesis_failure_class(exc)
+                discovery_terminal |= failure_class != "transport"
                 discovery_parked.append(
                     {
                         "reason": "relationship_collection_routing_failed",
                         "error_type": type(exc).__name__,
                         "error": str(exc),
+                        "retry_on_resume": failure_class == "transport",
                     }
                 )
             selected_collection_keys = {
@@ -3040,7 +3028,7 @@ def _run_relationship_reasoning(
             > catalogue_char_budget
         ):
             can_discover = False
-            inferred_capacity = 0
+            general_capacity = 0
             discovery_parked.append(
                 {
                     "reason": "relationship_catalogue_routing_unavailable",
@@ -3059,12 +3047,15 @@ def _run_relationship_reasoning(
             except Exception as exc:
                 routing = {}
                 can_discover = False
-                inferred_capacity = 0
+                general_capacity = 0
+                failure_class = _synthesis_failure_class(exc)
+                discovery_terminal |= failure_class != "transport"
                 discovery_parked.append(
                     {
                         "reason": "relationship_catalogue_routing_failed",
                         "error_type": type(exc).__name__,
                         "error": str(exc),
+                        "retry_on_resume": failure_class == "transport",
                     }
                 )
             selected_shards = {
@@ -3096,11 +3087,14 @@ def _run_relationship_reasoning(
             ]
             if not discovery_profiles:
                 can_discover = False
-                inferred_capacity = 0
+                general_capacity = 0
                 discovery_parked.append(
                     {"reason": "relationship_catalogue_routing_selected_no_sources"}
                 )
-    if can_discover:
+    candidate_tasks: list[
+        tuple[str, str, Sequence[Any], dict[str, Any], str]
+    ] = []
+    if can_discover and general_capacity:
         discovery_source_ids = {
             str(row.get("source_id") or "")
             for row in discovery_entries
@@ -3112,7 +3106,7 @@ def _run_relationship_reasoning(
                 "routed_shards" if requires_routing else "global"
             ),
             "catalogue": discovery_entries,
-            "max_inferred_pairs": inferred_capacity,
+            "max_inferred_pairs": general_capacity,
             **discovery_memory(discovery_source_ids),
         }
         if (
@@ -3120,40 +3114,266 @@ def _run_relationship_reasoning(
                 [profile_to_dict(profile) for profile in discovery_profiles],
                 discovery_context,
             )
-            > catalogue_char_budget
+            <= catalogue_char_budget
         ):
+            candidate_tasks.append(
+                (
+                    "relationship_candidate_selection",
+                    f"global-{catalogue_revision[:16]}",
+                    discovery_profiles,
+                    discovery_context,
+                    "general",
+                )
+            )
+        else:
             discovery_parked.append(
                 {
                     "reason": "relationship_catalogue_partition_exceeds_context_budget",
                     "retry_on_resume": False,
                 }
             )
-        else:
+            discovery_terminal = True
+
+    bridge_source_sets: list[set[str]] = []
+    if can_discover and bridge_capacity and len(literature_ids) == 2:
+        bridge_source_sets = [set(profile_by_source)]
+    elif can_discover and bridge_capacity and len(literature_ids) > 2:
+        bridge_selector = getattr(
+            reasoner, "select_relationship_bridge_shards", None
+        )
+        if callable(bridge_selector) and routing_cards:
             try:
-                discovery = reasoner_calls(
-                    "relationship_candidate_selection",
-                    f"global-{catalogue_revision[:16]}",
-                    "select_relationship_candidates",
-                    discovery_profiles,
-                    discovery_context,
+                routed = reasoner_calls(
+                    "relationship_bridge_shard_selection",
+                    f"bridge-{catalogue_revision[:16]}",
+                    "select_relationship_bridge_shards",
+                    [],
+                    {
+                        "catalogue_revision": catalogue_revision,
+                        "routing_cards": routing_cards,
+                        "discovery_mode": "bridge_shard_routing",
+                    },
                 )
-                discovery_completed = True
+                shard_sources = {
+                    str(row.get("shard_id") or ""): {
+                        str(source_id)
+                        for source_id in row.get("source_ids", []) or []
+                        if str(source_id) in profile_by_source
+                    }
+                    for row in catalogue_payload.get("shards", []) or []
+                    if isinstance(row, Mapping) and row.get("shard_id")
+                }
+                bridge_source_sets = [
+                    shard_sources.get(str(row.get("left_shard_id") or ""), set())
+                    | shard_sources.get(
+                        str(row.get("right_shard_id") or ""), set()
+                    )
+                    for row in routed.get("shard_pairs", []) or []
+                    if isinstance(row, Mapping)
+                ]
+                bridge_source_sets = [
+                    source_ids
+                    for source_ids in bridge_source_sets
+                    if len(source_ids) >= 2
+                ]
             except Exception as exc:
+                failure_class = _synthesis_failure_class(exc)
+                discovery_terminal |= failure_class != "transport"
                 discovery_parked.append(
                     {
-                        "reason": "relationship_candidate_discovery_failed",
+                        "reason": "relationship_bridge_routing_failed",
                         "error_type": type(exc).__name__,
                         "error": str(exc),
+                        "retry_on_resume": failure_class == "transport",
                     }
                 )
-    inferred_rows = _ranked_relationship_candidates(
-        discovery,
+        else:
+            discovery_terminal = True
+            discovery_parked.append(
+                {
+                    "reason": "relationship_bridge_routing_unavailable",
+                    "retry_on_resume": False,
+                }
+            )
+
+    packed_bridge_source_sets: list[set[str]] = []
+    current_bridge_sources: set[str] = set()
+    for source_ids in bridge_source_sets:
+        candidate_sources = current_bridge_sources | source_ids
+        candidate_entries = [
+            row
+            for row in entries
+            if str(row.get("source_id") or "") in candidate_sources
+        ]
+        candidate_profiles = [
+            _relationship_evidence_projection(
+                profile_by_source[source_id],
+                entry_by_source.get(source_id, {}),
+                include_anchors=True,
+            )
+            for source_id in sorted(candidate_sources)
+        ]
+        candidate_context = {
+            **base_discovery_context,
+            "discovery_mode": "bridge_only",
+            "catalogue": candidate_entries,
+            "max_inferred_pairs": bridge_capacity,
+            "reserved_bridge_fraction": 1.0,
+            **discovery_memory(candidate_sources),
+        }
+        if current_bridge_sources and (
+            _reasoner_packet_chars(
+                [profile_to_dict(profile) for profile in candidate_profiles],
+                candidate_context,
+            )
+            > catalogue_char_budget
+        ):
+            packed_bridge_source_sets.append(current_bridge_sources)
+            current_bridge_sources = set(source_ids)
+        else:
+            current_bridge_sources = candidate_sources
+    if current_bridge_sources:
+        packed_bridge_source_sets.append(current_bridge_sources)
+
+    seen_bridge_packets: set[tuple[str, ...]] = set()
+    for packet_index, source_ids in enumerate(packed_bridge_source_sets):
+        packet_ids = tuple(sorted(source_ids))
+        if packet_ids in seen_bridge_packets:
+            continue
+        seen_bridge_packets.add(packet_ids)
+        packet_entries = [
+            row
+            for row in entries
+            if str(row.get("source_id") or "") in source_ids
+        ]
+        packet_profiles = [
+            _relationship_evidence_projection(
+                profile_by_source[source_id],
+                entry_by_source.get(source_id, {}),
+                include_anchors=True,
+            )
+            for source_id in packet_ids
+        ]
+        bridge_context = {
+            **base_discovery_context,
+            "discovery_mode": "bridge_only",
+            "catalogue": packet_entries,
+            "max_inferred_pairs": bridge_capacity,
+            "reserved_bridge_fraction": 1.0,
+            **discovery_memory(set(packet_ids)),
+        }
+        if (
+            _reasoner_packet_chars(
+                [profile_to_dict(profile) for profile in packet_profiles],
+                bridge_context,
+            )
+            > catalogue_char_budget
+        ):
+            discovery_terminal = True
+            discovery_parked.append(
+                {
+                    "reason": "relationship_bridge_packet_exceeds_context_budget",
+                    "retry_on_resume": False,
+                }
+            )
+            continue
+        candidate_tasks.append(
+            (
+                "relationship_bridge_candidate_selection",
+                f"bridge-{catalogue_revision[:16]}-{packet_index + 1}",
+                packet_profiles,
+                bridge_context,
+                "bridge",
+            )
+        )
+
+    candidate_results: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+
+    def run_candidate_task(
+        task: tuple[str, str, Sequence[Any], dict[str, Any], str]
+    ) -> tuple[str, Mapping[str, Any]]:
+        stage, key, task_profiles, task_context, pool = task
+        return (
+            pool,
+            reasoner_calls(
+                stage,
+                key,
+                "select_relationship_candidates",
+                task_profiles,
+                task_context,
+            ),
+        )
+
+    if candidate_tasks:
+        with ThreadPoolExecutor(
+            max_workers=_provider_worker_count(request, len(candidate_tasks)),
+            thread_name_prefix="auto-zettelkasten-discovery",
+        ) as executor:
+            futures = {
+                executor.submit(run_candidate_task, task): task
+                for task in candidate_tasks
+            }
+            for future in as_completed(futures):
+                task = futures[future]
+                try:
+                    pool, response = future.result()
+                    candidate_results[pool].append(response)
+                except Exception as exc:
+                    failure_class = _synthesis_failure_class(exc)
+                    discovery_terminal |= failure_class != "transport"
+                    discovery_parked.append(
+                        {
+                            "reason": (
+                                "relationship_bridge_candidate_discovery_failed"
+                                if task[4] == "bridge"
+                                else "relationship_candidate_discovery_failed"
+                            ),
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                            "retry_on_resume": failure_class == "transport",
+                        }
+                    )
+        discovery_completed = sum(
+            len(rows) for rows in candidate_results.values()
+        ) == len(candidate_tasks)
+
+    general_payload = {
+        "candidates": [
+            row
+            for response in candidate_results.get("general", [])
+            for row in response.get("candidates", []) or []
+        ]
+    }
+    bridge_payload = {
+        "candidates": [
+            row
+            for response in candidate_results.get("bridge", [])
+            for row in response.get("candidates", []) or []
+        ]
+    }
+    excluded_pairs = set(mandatory_basis) | negative_pairs
+    bridge_rows = _ranked_relationship_candidates(
+        bridge_payload,
         available_source_ids=set(profile_by_source),
         entry_by_source=entry_by_source,
-        excluded_pairs=set(mandatory_basis) | negative_pairs,
-        maximum=inferred_capacity,
+        excluded_pairs=excluded_pairs,
+        maximum=bridge_capacity,
+        bridge_fraction=1.0,
+        scope="bridge",
+    )
+    bridge_pairs = {
+        canonical_pair(str(row["source_id"]), str(row["target_id"]))
+        for row in bridge_rows
+    }
+    general_rows = _ranked_relationship_candidates(
+        general_payload,
+        available_source_ids=set(profile_by_source),
+        entry_by_source=entry_by_source,
+        excluded_pairs=excluded_pairs | bridge_pairs,
+        maximum=general_capacity,
         bridge_fraction=0.4,
     )
+    inferred_rows = [*bridge_rows, *general_rows][:inferred_capacity]
     if focus_source_ids and not catalogue_changed:
         focus = set(focus_source_ids)
         inferred_rows = [
@@ -3663,12 +3883,18 @@ def _run_relationship_reasoning(
         "no_relationship": validated["no_relationship"],
         "parked": [*preparked, *terminal_rows],
         "cluster_candidates": [],
-        "selected_profile_hashes": current_hashes if discovery_completed else {},
+        "selected_profile_hashes": (
+            current_hashes if discovery_completed or discovery_terminal else {}
+        ),
         "selected_relationship_memory_hashes": (
-            current_memory_hashes if discovery_completed else {}
+            current_memory_hashes
+            if discovery_completed or discovery_terminal
+            else {}
         ),
         "reconciled_catalogue_revision": (
-            catalogue_revision if discovery_completed else ""
+            catalogue_revision
+            if discovery_completed or discovery_terminal
+            else ""
         ),
         "selection_identity": selection_identity,
         "pair_job_count": len(jobs),
@@ -3689,6 +3915,7 @@ def _ranked_relationship_candidates(
     excluded_pairs: set[tuple[str, str]],
     maximum: int,
     bridge_fraction: float,
+    scope: str = "all",
 ) -> list[dict[str, Any]]:
     seen: set[tuple[str, str]] = set()
     within: list[dict[str, Any]] = []
@@ -3715,10 +3942,14 @@ def _ranked_relationship_candidates(
         row["target_id"] = target_id
         row["_model_rank"] = int(row.get("rank") or row.get("priority") or index + 1)
         left_collections = set(
-            entry_by_source.get(source_id, {}).get("collections", []) or []
+            entry_by_source.get(source_id, {}).get("literature_ids", [])
+            or entry_by_source.get(source_id, {}).get("collections", [])
+            or []
         )
         right_collections = set(
-            entry_by_source.get(target_id, {}).get("collections", []) or []
+            entry_by_source.get(target_id, {}).get("literature_ids", [])
+            or entry_by_source.get(target_id, {}).get("collections", [])
+            or []
         )
         bridge = (
             left_collections.isdisjoint(right_collections)
@@ -3728,6 +3959,10 @@ def _ranked_relationship_candidates(
                 or row.get("discovery_route") == "cross_literature_bridge"
             )
         )
+        if scope == "bridge" and not bridge:
+            continue
+        if scope == "within" and bridge:
+            continue
         (bridges if bridge else within).append(row)
     bridges.sort(key=lambda row: (row["_model_rank"], row["source_id"], row["target_id"]))
     within.sort(key=lambda row: (row["_model_rank"], row["source_id"], row["target_id"]))
@@ -3907,6 +4142,11 @@ def _compact_relationship_catalogue_entry(
         "collections": [
             " ".join(str(value).split())[:120]
             for value in entry.get("collections", [])[:2]
+            if str(value).strip()
+        ],
+        "literature_ids": [
+            " ".join(str(value).split())[:120]
+            for value in entry.get("literature_ids", [])[:3]
             if str(value).strip()
         ],
     }
@@ -4998,6 +5238,7 @@ def rebuild_map(
                 "synthesis_failure_count": synthesis_failures,
             },
             "typed_links": typed,
+            "relationship_result": relationship_result,
             "profiles": profiles,
             "profile_result": {
                 key: value for key, value in profile_result.items() if key != "profiles"
@@ -5248,6 +5489,7 @@ def rebuild_map(
             key: value for key, value in profile_result.items() if key != "profiles"
         },
         "migration": migration,
+        "relationship_result": relationship_result,
         "paths": result_paths,
     }
     partial_reasons = [
@@ -6519,6 +6761,26 @@ def _prepare_item(
         )
         return base
     except Exception as exc:
+        raw_response = str(getattr(exc, "raw_response", "") or "")
+        write_yaml(
+            checkpoint_root / "source_failure.yml",
+            {
+                "source_id": str(base.get("source_id") or ""),
+                "zotero_item_key": key,
+                "fingerprint": fingerprint,
+                "status": "parked_for_review",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "raw_response": raw_response,
+                "raw_response_hash": (
+                    sha256_text(raw_response) if raw_response else ""
+                ),
+                "provider_completion": dict(
+                    getattr(exc, "provider_completion", {}) or {}
+                ),
+                "updated_at": now_iso(),
+            },
+        )
         base["attempts"].append(
             _attempt(
                 base, f"{reader.name}_text", "failed", f"{type(exc).__name__}:{exc}"
@@ -6529,6 +6791,21 @@ def _prepare_item(
     try:
         bundle = _source_bundle_from_result(source_result, base, source_scope)
     except ValueError as exc:
+        write_yaml(
+            checkpoint_root / "source_failure.yml",
+            {
+                "source_id": str(base.get("source_id") or ""),
+                "zotero_item_key": key,
+                "fingerprint": fingerprint,
+                "status": "parked_for_review",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "raw_response": dict(source_result),
+                "raw_response_hash": stable_hash(source_result),
+                "provider_completion": {},
+                "updated_at": now_iso(),
+            },
+        )
         base["reason"] = f"source_bundle_ownership_invalid:{exc}"
         base["attempts"].append(
             _attempt(base, reader_route, "failed", base["reason"])
@@ -8296,7 +8573,14 @@ def _read_document(
         "chunk_output_tokens": policy.chunk_output_tokens,
         "synthesis_output_tokens": policy.synthesis_output_tokens,
     }
-    if len(text) <= direct_limit:
+    bundle_reader = getattr(reader, "read_source_bundle", None)
+    bundle_fit = getattr(reader, "should_read_source_bundle_directly", None)
+    direct_admitted = len(text) <= direct_limit and (
+        not callable(bundle_reader)
+        or not callable(bundle_fit)
+        or bool(bundle_fit(text, metadata, question))
+    )
+    if direct_admitted:
         direct_path = checkpoint_root / "direct.yml"
         direct_checkpoint = (
             read_yaml(direct_path, {}) or {} if checkpoint_enabled else {}
@@ -8333,7 +8617,6 @@ def _read_document(
         try:
             if progress is not None:
                 progress.record_source_provider_call()
-            bundle_reader = getattr(reader, "read_source_bundle", None)
             if callable(bundle_reader):
                 analysis = dict(bundle_reader(text, metadata, question))
                 SourceAnalysisBundle.from_dict(analysis)
@@ -8368,6 +8651,7 @@ def _read_document(
                     "context window",
                     "input token",
                     "maximum context",
+                    "context budget",
                     "prompt too long",
                     "too large",
                     "request size",
@@ -8521,7 +8805,7 @@ def _read_document(
                             analyses,
                             metadata,
                             question,
-                            max_output_tokens=policy.synthesis_output_tokens,
+                            max_output_tokens=SOURCE_BUNDLE_MAX_OUTPUT_TOKENS,
                             deadline_seconds=policy.request_deadline_seconds,
                         )
                     )

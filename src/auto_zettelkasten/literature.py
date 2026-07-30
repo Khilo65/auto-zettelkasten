@@ -10174,12 +10174,14 @@ def validate_streamlined_cluster_synthesis(
             reverse=True,
         )
         return _evidence_ref(ranked[0][3]) if ranked and ranked[0][0] else None
-    retained = {
+    raw_retained = {
         str(value)
         for value in response.get("retained_member_ids", []) or []
-        if str(value)
+        if isinstance(value, (str, int)) and str(value)
     }
-    dropped = {
+    unknown_retained = raw_retained - proposed_ids
+    retained = raw_retained & proposed_ids
+    raw_dropped = {
         str(row.get("source_id") or "")
         for row in response.get("dropped_members", []) or []
         if isinstance(row, Mapping) and row.get("source_id")
@@ -10194,14 +10196,17 @@ def validate_streamlined_cluster_synthesis(
         }
     errors: list[str] = []
     warnings: list[str] = []
+    if any(
+        not isinstance(value, (str, int))
+        for value in response.get("retained_member_ids", []) or []
+    ):
+        warnings.append("malformed_retained_member_ignored")
     if str(response.get("cluster_id") or "") != cluster_id:
         errors.append("cluster_id_mismatch")
-    if len(retained) < 2:
-        errors.append("cluster_requires_two_retained_members")
-    if not retained.issubset(proposed_ids):
-        errors.append("retained_member_not_supplied")
-    if dropped - proposed_ids:
-        errors.append("dropped_member_not_supplied")
+    if unknown_retained:
+        warnings.append("unknown_retained_member_ignored")
+    if raw_dropped - proposed_ids:
+        warnings.append("unknown_dropped_member_ignored")
     for field in ("title", "organizing_problem", "bottom_line"):
         if not str(response.get(field) or "").strip():
             errors.append(f"cluster_requires_{field}")
@@ -10229,13 +10234,13 @@ def validate_streamlined_cluster_synthesis(
                 continue
             source_id = str(finding.get("source_id") or "")
             if source_id not in retained:
-                errors.append("study_finding_source_not_retained")
+                warnings.append("study_finding_source_not_retained_ignored")
                 continue
             line_source_ids.append(source_id)
             finding_complete = True
             for field in ("finding", "method_scope", "relation_to_line"):
                 if not str(finding.get(field) or "").strip():
-                    errors.append(f"study_finding_requires_{field}")
+                    warnings.append(f"study_finding_requires_{field}")
                     finding_complete = False
             valid_evidence: list[dict[str, Any]] = []
             raw_evidence = finding.get("evidence", []) or []
@@ -10311,12 +10316,54 @@ def validate_streamlined_cluster_synthesis(
         )
     missing = retained - finding_source_ids
     if missing:
-        errors.append(
-            "retained_members_without_specific_findings:"
-            + ",".join(sorted(missing))
-        )
+        warnings.append("retained_member_without_specific_finding_removed")
+        retained -= missing
+    if len(retained) < 2:
+        errors.append("cluster_requires_two_retained_members")
+    source_contributions = [
+        row for row in source_contributions if row["source_id"] in retained
+    ]
+    supporting_evidence = [
+        row
+        for row in supporting_evidence
+        if str(row.get("source_id") or "") in retained
+    ]
+    evidence_threads = [
+        {
+            **row,
+            "source_ids": [
+                source_id
+                for source_id in row.get("source_ids", []) or []
+                if source_id in retained
+            ],
+            "evidence": [
+                evidence
+                for evidence in row.get("evidence", []) or []
+                if str(evidence.get("source_id") or "") in retained
+            ],
+        }
+        for row in evidence_threads
+    ]
+    returned_drops = [
+        dict(row)
+        for row in response.get("dropped_members", []) or []
+        if isinstance(row, Mapping)
+        and str(row.get("source_id") or "") in proposed_ids
+    ]
+    existing_drop_ids = {
+        str(row.get("source_id") or "") for row in returned_drops
+    }
+    returned_drops.extend(
+        {
+            "source_id": source_id,
+            "reason": "writer_omitted_specific_contribution",
+        }
+        for source_id in sorted(missing - existing_drop_ids)
+    )
     return {
         **dict(response),
+        "retained_member_ids": sorted(retained),
+        "dropped_members": returned_drops,
         "scope": str(response.get("organizing_problem") or ""),
         "boundaries": list(response.get("limits", []) or []),
         "coherence_rationale": str(

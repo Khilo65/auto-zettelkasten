@@ -391,8 +391,10 @@ def test_streamlined_cluster_requires_one_specific_finding_per_member() -> None:
 
     assert complete["status"] == "reasoned"
     assert incomplete["status"] == "partial"
-    assert "retained_members_without_specific_findings:B" in incomplete[
-        "quality_errors"
+    assert incomplete["retained_member_ids"] == ["A"]
+    assert "cluster_requires_two_retained_members" in incomplete["quality_errors"]
+    assert "retained_member_without_specific_finding_removed" in incomplete[
+        "quality_warnings"
     ]
 
     empty_response = _streamlined_response(cluster, profiles)
@@ -404,7 +406,34 @@ def test_streamlined_cluster_requires_one_specific_finding_per_member() -> None:
         profiles,
     )
     assert "cluster_requires_bottom_line" in empty["quality_errors"]
-    assert "study_finding_requires_finding" in empty["quality_errors"]
+    assert "study_finding_requires_finding" in empty["quality_warnings"]
+
+
+def test_streamlined_cluster_publishes_valid_members_when_one_contribution_is_missing() -> None:
+    profiles = normalize_evidence_profiles(
+        [_profile("A"), _profile("B"), _profile("C")]
+    )
+    cluster = {"cluster_id": "cluster-one", "source_ids": ["A", "B", "C"]}
+    response = _streamlined_response(cluster, profiles)
+    response["lines_of_inquiry"][0]["study_findings"] = [
+        row
+        for row in response["lines_of_inquiry"][0]["study_findings"]
+        if row["source_id"] != "C"
+    ]
+
+    result = validate_streamlined_cluster_synthesis(
+        response, cluster, profiles
+    )
+
+    assert result["status"] == "reasoned"
+    assert result["retained_member_ids"] == ["A", "B"]
+    assert result["dropped_members"] == [
+        {
+            "source_id": "C",
+            "reason": "writer_omitted_specific_contribution",
+        }
+    ]
+    assert result["quality_errors"] == []
 
 
 def test_streamlined_markdown_is_source_specific_and_has_no_gap_boilerplate() -> None:

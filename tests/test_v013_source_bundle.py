@@ -24,7 +24,11 @@ from auto_zettelkasten.pipeline import (
     _read_document,
     _source_bundle_from_result,
 )
-from auto_zettelkasten.readers import DeepSeekReader
+from auto_zettelkasten.readers import (
+    DeepSeekReader,
+    ProviderError,
+    _parse_source_bundle_response,
+)
 
 from conftest import FakeZotero
 
@@ -105,6 +109,35 @@ def test_bundle_is_source_owned_and_optional_rows_are_isolated() -> None:
         "thesis",
         "major_finding",
     ]
+
+
+def test_source_bundle_envelope_recovery_is_unambiguous_and_source_owned() -> None:
+    payload = _bundle_payload()
+    expected = {"source_id": "source-zotero-A1", "zotero_key": "A1"}
+
+    assert _parse_source_bundle_response(
+        [payload], label="bundle", expected_identity=expected
+    )["source_identity"]["source_id"] == "source-zotero-A1"
+    assert _parse_source_bundle_response(
+        f'preface {{"noise": true}} middle {json.dumps(payload)} epilogue',
+        label="bundle",
+        expected_identity=expected,
+    )["source_identity"]["source_id"] == "source-zotero-A1"
+
+    with pytest.raises(ProviderError, match="multiple valid"):
+        _parse_source_bundle_response(
+            f"{json.dumps(payload)}\n{json.dumps(payload | {'self_review': {'passed': False}})}",
+            label="bundle",
+            expected_identity=expected,
+        )
+    with pytest.raises(ProviderError, match="no complete source-owned"):
+        _parse_source_bundle_response(
+            json.dumps(payload).replace(
+                "source-zotero-A1", "source-zotero-wrong"
+            ),
+            label="bundle",
+            expected_identity=expected,
+        )
 
 
 def test_missing_source_memory_retains_retrieval_context_and_strong_ids() -> None:
@@ -602,6 +635,92 @@ def test_truncated_direct_bundle_does_not_start_hierarchical_calls(tmp_path) -> 
         )
 
 
+def test_bundle_preflight_routes_directly_to_one_chunk_and_bundle_synthesis(
+    tmp_path,
+) -> None:
+    class HierarchicalBundleReader(BundleReader):
+        def __init__(self) -> None:
+            super().__init__()
+            self.chunk_calls = 0
+            self.synthesis_tokens = 0
+
+        def should_read_source_bundle_directly(self, *_args, **_kwargs):
+            return False
+
+        def read_source_bundle(self, *_args, **_kwargs):
+            raise AssertionError("direct bundle call must be skipped")
+
+        def summarize_chunk(self, *_args, **_kwargs):
+            self.chunk_calls += 1
+            return {"summary": "Grounded chunk evidence."}
+
+        def synthesize_document_bundle(
+            self, _chunks, metadata, _question=None, **kwargs
+        ):
+            self.synthesis_tokens = kwargs["max_output_tokens"]
+            payload = _bundle_payload()
+            payload["source_identity"] = {
+                "source_id": metadata["_source_context"]["source_id"],
+                "zotero_key": metadata["_source_context"]["zotero_key"],
+            }
+            return payload
+
+    reader = HierarchicalBundleReader()
+    result, route, _reason = _read_document(
+        reader,
+        "A report that the exact bundle prompt budget rejects.",
+        {
+            "_source_context": {
+                "source_id": "source-zotero-A1",
+                "zotero_key": "A1",
+            }
+        },
+        None,
+        request=MapRequest(tmp_path, provider="ollama", model="bundle-v1"),
+        checkpoint_root=tmp_path / "checkpoint",
+    )
+
+    assert result["bundle_schema_version"] == "1"
+    assert route == "bundle-reader_hierarchical_text"
+    assert reader.chunk_calls == 1
+    assert reader.synthesis_tokens == 64_000
+
+
+def test_context_budget_admission_error_falls_back_to_hierarchical_reading(
+    tmp_path,
+) -> None:
+    class AdmissionReader:
+        name = "admission"
+        model = "bundle-v1"
+        is_cloud = False
+
+        def read_source_bundle(self, *_args, **_kwargs):
+            raise ProviderError("source analysis bundle exceeds context budget")
+
+        def summarize_chunk(self, *_args, **_kwargs):
+            return {"summary": "Grounded chunk evidence."}
+
+        def synthesize_document_bundle(self, _chunks, _metadata, *_args, **_kwargs):
+            return _bundle_payload()
+
+    result, route, _reason = _read_document(
+        AdmissionReader(),
+        "A short source.",
+        {
+            "_source_context": {
+                "source_id": "source-zotero-A1",
+                "zotero_key": "A1",
+            }
+        },
+        None,
+        request=MapRequest(tmp_path, provider="ollama", model="bundle-v1"),
+        checkpoint_root=tmp_path / "checkpoint",
+    )
+
+    assert result["bundle_schema_version"] == "1"
+    assert route == "admission_hierarchical_text"
+
+
 def test_hierarchical_bundle_honors_the_supported_32k_output(
     monkeypatch,
 ) -> None:
@@ -659,6 +778,56 @@ def test_wrong_source_bundle_is_parked_without_publishing_a_note(tmp_path) -> No
         "source_bundle_ownership_invalid:evidence_anchors.source_id"
     )
     assert list((tmp_path / "01_atomic_notes").glob("*.md")) == []
+    failure = read_yaml(
+        tmp_path
+        / "11_state"
+        / "runs"
+        / "wrong-source-bundle"
+        / "items"
+        / "ITEMA"
+        / "source_failure.yml"
+    )
+    assert failure["status"] == "parked_for_review"
+    assert failure["raw_response"]["bundle_schema_version"] == "1"
+
+
+def test_reader_failure_checkpoint_preserves_raw_response_and_completion(
+    tmp_path,
+) -> None:
+    class RawFailureReader(BundleReader):
+        def read_source_bundle(self, *_args, **_kwargs):
+            exc = ProviderError("invalid source bundle")
+            exc.raw_response = '{"truncated":'
+            exc.provider_completion = {"finish_reason": "length"}
+            raise exc
+
+    item = {
+        "key": "ITEMA",
+        "data": {
+            "key": "ITEMA",
+            "itemType": "report",
+            "title": "A report",
+        },
+    }
+    report = run_map(
+        MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1),
+        client=FakeZotero([item]),
+        reader=RawFailureReader(),
+        run_id="raw-failure",
+    )
+
+    assert report.parked_for_review_count == 1
+    failure = read_yaml(
+        tmp_path
+        / "11_state"
+        / "runs"
+        / "raw-failure"
+        / "items"
+        / "ITEMA"
+        / "source_failure.yml"
+    )
+    assert failure["raw_response"] == '{"truncated":'
+    assert failure["provider_completion"]["finish_reason"] == "length"
 
 
 @pytest.mark.parametrize("component", ["identity", "literature"])

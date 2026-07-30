@@ -38,6 +38,19 @@ class CloudPermissionError(ProviderError):
     pass
 
 
+class _ProviderText(str):
+    """Provider text with completion metadata preserved for failure checkpoints."""
+
+    completion: Mapping[str, Any]
+
+    def __new__(
+        cls, value: str, completion: Mapping[str, Any] | None = None
+    ) -> _ProviderText:
+        instance = super().__new__(cls, value)
+        instance.completion = dict(completion or {})
+        return instance
+
+
 SECTION_KEYS = (
     "thesis",
     "method_and_research_design",
@@ -218,6 +231,22 @@ class _CapabilityAwareReader:
             self.max_output_tokens,
         )
 
+    def should_read_source_bundle_directly(
+        self,
+        text: str,
+        metadata: Mapping[str, Any],
+        question: str | None = None,
+    ) -> bool:
+        output_tokens = min(
+            int(self.capabilities["supported_output_tokens"]),
+            SOURCE_BUNDLE_MAX_OUTPUT_TOKENS,
+        )
+        return self._prompt_fits(
+            _source_bundle_system_prompt(),
+            _source_bundle_prompt(text, metadata, question),
+            output_tokens,
+        )
+
     def can_read_directly(
         self,
         text: str,
@@ -278,17 +307,22 @@ class _CapabilityAwareReader:
         self._ensure_prompt_fits(
             system_prompt, user_prompt, output_tokens, label="source analysis bundle"
         )
-        payload = _normalize_source_bundle_payload(_parse_json_object(
-            self._generate_with_reasoning(
+        raw = self._generate_with_reasoning(
                 system_prompt,
                 user_prompt,
                 output_tokens,
                 self._request_deadline_seconds(),
                 reasoning_effort="high",
-            ),
-            label="source analysis bundle response",
-        ))
-        return SourceAnalysisBundle.from_dict(payload).to_dict()
+            )
+        try:
+            return _parse_source_bundle_response(
+                raw,
+                label="source analysis bundle response",
+                expected_identity=_source_bundle_expected_identity(metadata),
+            )
+        except Exception as exc:
+            _preserve_provider_failure(exc, raw)
+            raise
 
     def verify_atomic_claims(
         self,
@@ -893,17 +927,22 @@ class _CapabilityAwareReader:
             output_tokens,
             label="hierarchical source analysis bundle",
         )
-        payload = _normalize_source_bundle_payload(_parse_json_object(
-            self._generate_with_reasoning(
+        raw = self._generate_with_reasoning(
                 system_prompt,
                 user_prompt,
                 output_tokens,
                 request_deadline,
                 reasoning_effort="high",
-            ),
-            label="hierarchical source analysis bundle response",
-        ))
-        return SourceAnalysisBundle.from_dict(payload).to_dict()
+            )
+        try:
+            return _parse_source_bundle_response(
+                raw,
+                label="hierarchical source analysis bundle response",
+                expected_identity=_source_bundle_expected_identity(metadata),
+            )
+        except Exception as exc:
+            _preserve_provider_failure(exc, raw)
+            raise
 
     def _generate_with_reasoning(
         self,
@@ -1067,11 +1106,24 @@ class _OpenAICompatibleReader(_CapabilityAwareReader):
         try:
             choice = payload["choices"][0]
             finish_reason = str(choice.get("finish_reason") or "")
+            content = str(choice["message"]["content"])
+            completion = {
+                "provider": self.name,
+                "model": self.model,
+                "finish_reason": finish_reason or "stop",
+                "max_output_tokens": output_tokens,
+                "response_id": str(payload.get("id") or ""),
+                "usage": dict(payload.get("usage") or {}),
+            }
             if finish_reason and finish_reason != "stop":
-                raise ProviderError(
+                exc = ProviderError(
                     f"{self.name} response incomplete: finish_reason={finish_reason}"
                 )
-            return choice["message"]["content"]
+                _preserve_provider_failure(
+                    exc, _ProviderText(content, completion)
+                )
+                raise exc
+            return _ProviderText(content, completion)
         except (KeyError, IndexError, TypeError) as exc:
             raise ProviderError(f"{self.name} returned an unexpected response") from exc
 
@@ -1593,7 +1645,7 @@ def _relationship_bridge_shard_system_prompt() -> str:
 
 def _relationship_candidate_system_prompt() -> str:
     return (
-        "You globally rank source comparisons for Auto-Zettelkasten relationship prompt v6. Return exactly one JSON "
+        "You globally rank source comparisons for Auto-Zettelkasten relationship prompt v7. Return exactly one JSON "
         "object with a candidates array. Each row must contain source_id, target_kind, target_id, why_relevant, "
         "comparison_unit, candidate_class, likely_relation_type, requested_evidence_depth, confidence, rank, cross_literature, "
         "discovery_route, left_evidence_anchor_ids, and right_evidence_anchor_ids. target_kind must be source. "
@@ -1601,7 +1653,9 @@ def _relationship_candidate_system_prompt() -> str:
         "Use the supplied max_inferred_pairs as a global output ceiling, rank the strongest comparisons across the "
         "whole packet. Use the supplied reserved_bridge_fraction for the strongest genuine cross-collection comparisons "
         "when the evidence supports them; same-collection pairs cannot consume that capacity. cross_literature is true "
-        "only when the supplied collection memberships are disjoint, never merely because topics differ. Evidence-anchor "
+        "only when the supplied collection memberships are disjoint, never merely because topics differ. When "
+        "discovery_mode is bridge_only, return only cross-literature pairs from distinct supplied literature "
+        "memberships. Evidence-anchor "
         "arrays may contain only supplied IDs owned by the corresponding canonical pair "
         "side; order source_id and target_id lexicographically so source_id is the canonical left side, and leave "
         "anchor arrays empty when no supplied anchor is task-relevant. discovery_route is source_led, "
@@ -1617,7 +1671,7 @@ def _relationship_candidate_system_prompt() -> str:
 def _relationship_adjudication_system_prompt() -> str:
     return (
         "You adjudicate immutable relationship pair jobs for Auto-Zettelkasten "
-        "relationship prompt v6 and output contract relationship-decision-v5. "
+        "relationship prompt v7 and output contract relationship-decision-v5. "
         "Read both complete atomic-note bodies supplied in source_documents before "
         "deciding; compact profiles and selected anchors are navigation aids, not "
         "substitutes for the notes. "
@@ -1657,7 +1711,12 @@ def _relationship_adjudication_system_prompt() -> str:
         "or condition on the reference claim; extends requires a genuine new application, "
         "test, or development rather than a suggestion for future use; and complements "
         "requires a shared bounded question or proposition whose answer is sharpened "
-        "by both works, not mere adjacency. Self-review the direction, labels, "
+        "by both works, not mere adjacency. contrasts requires incompatible findings or "
+        "claims about a sufficiently comparable proposition; different interventions, "
+        "outcomes, methods, or cases without contradiction require a contextual, boundary, "
+        "or complementary relation instead. For every directional relation, explicitly "
+        "identify the intellectual actor and reference. If A cites B as evidence for A's "
+        "claim, B normally supports A, not the reverse. Self-review the direction, labels, "
         "rationale, and evidence ownership inside this same call. Never invent "
         "IDs, anchors, locators, provenance, timestamps, or Markdown."
     )
@@ -2628,6 +2687,128 @@ def _parse_analysis(value: Any) -> Mapping[str, Any]:
 
 def _parse_chunk_evidence(value: Any) -> Mapping[str, Any]:
     return _parse_required_mapping(value, CHUNK_EVIDENCE_KEYS, label="chunk response")
+
+
+def _preserve_provider_failure(exc: BaseException, raw: Any) -> None:
+    """Attach private diagnostic material without changing provider exceptions."""
+
+    if not hasattr(exc, "raw_response"):
+        setattr(exc, "raw_response", str(raw))
+    completion = getattr(raw, "completion", None)
+    if completion and not hasattr(exc, "provider_completion"):
+        setattr(exc, "provider_completion", dict(completion))
+
+
+def _source_bundle_expected_identity(
+    metadata: Mapping[str, Any],
+) -> dict[str, str]:
+    context = (
+        metadata.get("_source_context", {})
+        if isinstance(metadata.get("_source_context"), Mapping)
+        else {}
+    )
+    return {
+        key: str(context.get(key) or "")
+        for key in ("source_id", "zotero_key", "attachment_key")
+        if str(context.get(key) or "")
+    }
+
+
+def _parse_source_bundle_response(
+    value: Any,
+    *,
+    label: str,
+    expected_identity: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Recover exactly one complete, source-owned bundle from a response."""
+
+    candidates: list[Mapping[str, Any]] = []
+    if isinstance(value, Mapping):
+        candidates.append(value)
+    elif isinstance(value, list):
+        if len(value) == 1 and isinstance(value[0], Mapping):
+            candidates.append(value[0])
+    else:
+        text = str(value).strip()
+        fenced = re.match(
+            r"^```(?:json)?\s*(.*?)\s*```$",
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        if fenced:
+            text = fenced.group(1)
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            decoder = json.JSONDecoder()
+            index = 0
+            while (start := text.find("{", index)) >= 0:
+                try:
+                    candidate, end = decoder.raw_decode(text, start)
+                except json.JSONDecodeError:
+                    index = start + 1
+                    continue
+                if isinstance(candidate, Mapping):
+                    candidates.append(candidate)
+                elif (
+                    isinstance(candidate, list)
+                    and len(candidate) == 1
+                    and isinstance(candidate[0], Mapping)
+                ):
+                    candidates.append(candidate[0])
+                index = max(start + 1, end)
+        else:
+            if isinstance(payload, Mapping):
+                candidates.append(payload)
+            elif (
+                isinstance(payload, list)
+                and len(payload) == 1
+                and isinstance(payload[0], Mapping)
+            ):
+                candidates.append(payload[0])
+
+    expected = {
+        str(key): str(item)
+        for key, item in (expected_identity or {}).items()
+        if str(item)
+    }
+    valid: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            normalized = _normalize_source_bundle_payload(candidate)
+            bundle = SourceAnalysisBundle.from_dict(normalized).to_dict()
+            identity = dict(bundle.get("source_identity") or {})
+            if any(
+                str(identity.get(key) or "")
+                and str(identity.get(key) or "").casefold()
+                != expected_value.casefold()
+                for key, expected_value in expected.items()
+            ):
+                continue
+            expected_source_id = expected.get("source_id", "")
+            if expected_source_id and any(
+                str(row.get(owner_field) or "")
+                and str(row.get(owner_field) or "") != expected_source_id
+                for field_name, owner_field in (
+                    ("evidence_anchors", "source_id"),
+                    ("literature_positions", "current_source_id"),
+                )
+                for row in bundle.get(field_name, []) or []
+                if isinstance(row, Mapping)
+            ):
+                continue
+        except (TypeError, ValueError, ProviderError):
+            continue
+        identity_key = json.dumps(bundle, sort_keys=True, ensure_ascii=False)
+        if identity_key not in seen:
+            seen.add(identity_key)
+            valid.append(bundle)
+    if len(valid) == 1:
+        return valid[0]
+    if len(valid) > 1:
+        raise ProviderError(f"{label} contained multiple valid source bundles")
+    raise ProviderError(f"{label} contained no complete source-owned bundle")
 
 
 def _parse_json_object(

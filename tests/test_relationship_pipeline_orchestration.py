@@ -43,6 +43,13 @@ class _RoutedReasoner(_Reasoner):
         pass
 
 
+class _BridgeRoutedReasoner(_Reasoner):
+    def select_relationship_bridge_shards(
+        self, *_args: Any, **_kwargs: Any
+    ) -> None:
+        pass
+
+
 class _Calls:
     run_id = "relationship-run"
 
@@ -156,6 +163,9 @@ def _catalogue(
                     "source_id": profile.source_id,
                     "title": f"Source {profile.source_id}",
                     "collections": list(profile.context.get("collections", [])),
+                    "literature_ids": list(
+                        profile.context.get("collections", [])
+                    ),
                 }
                 for profile in profiles
             ],
@@ -230,11 +240,11 @@ def test_global_discovery_creates_immutable_pair_job(
             assert context["discovery_mode"] == "global"
             assert {profile.source_id for profile in provider_profiles} == {"A", "B"}
             assert all(profile.evidence_anchors for profile in provider_profiles)
-            assert context["max_inferred_pairs"] == 120
+            assert context["max_inferred_pairs"] == 72
             assert context["reserved_bridge_fraction"] == 0.4
-            assert "existing_graph_neighbors" in context
             assert "literature_positions" in context
-            assert "cluster_summaries" in context
+            assert "existing_graph_neighbors" not in context
+            assert "cluster_summaries" not in context
             return {"candidates": [_candidate("A", "B")]}
         assert stage == "relationship_adjudication"
         jobs = context["pair_jobs"]
@@ -327,6 +337,137 @@ def test_candidate_cap_reserves_bridge_slots_and_keeps_model_rank() -> None:
         ("W0", "W5"),
         ("W0", "W6"),
     ]
+
+
+def test_general_and_bridge_discovery_use_separate_candidate_pools(
+    tmp_path: Path,
+) -> None:
+    profiles = [
+        _profile("A", collection="mediation"),
+        _profile("B", collection="relapse"),
+    ]
+
+    def handler(
+        stage: str,
+        _profiles: Sequence[Any],
+        context: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if stage == "relationship_candidate_selection":
+            assert context["discovery_mode"] == "global"
+            assert context["max_inferred_pairs"] == 72
+            return {"candidates": []}
+        assert stage == "relationship_bridge_candidate_selection"
+        assert context["discovery_mode"] == "bridge_only"
+        assert context["max_inferred_pairs"] == 48
+        return {"candidates": []}
+
+    calls = _Calls(handler)
+    result = _run(tmp_path, profiles, calls)
+
+    assert {
+        stage for stage, _key, _context in calls.seen
+    } == {
+        "relationship_candidate_selection",
+        "relationship_bridge_candidate_selection",
+    }
+    assert result["pair_job_count"] == 0
+
+
+def test_bridge_only_ranking_rejects_same_literature_pairs() -> None:
+    response = {
+        "candidates": [
+            _candidate("A", "B", cross_literature=True),
+            _candidate("A", "C", rank=2, cross_literature=True),
+        ]
+    }
+    entries = {
+        "A": {"literature_ids": ["one"]},
+        "B": {"literature_ids": ["one"]},
+        "C": {"literature_ids": ["two"]},
+    }
+
+    selected = _ranked_relationship_candidates(
+        response,
+        available_source_ids=set(entries),
+        entry_by_source=entries,
+        excluded_pairs=set(),
+        maximum=48,
+        bridge_fraction=1.0,
+        scope="bridge",
+    )
+
+    assert [(row["source_id"], row["target_id"]) for row in selected] == [
+        ("A", "C")
+    ]
+
+
+def test_more_than_two_literatures_use_existing_bridge_shard_router(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile(source_id) for source_id in ("A", "B", "C")]
+    catalogue_path = (
+        tmp_path / "02_source_memory" / "indexes" / "source_catalogue.yml"
+    )
+    write_yaml(
+        catalogue_path,
+        {
+            "sources": [
+                {
+                    "source_id": source_id,
+                    "title": f"Source {source_id}",
+                    "literature_ids": [f"lit-{source_id.lower()}"],
+                }
+                for source_id in ("A", "B", "C")
+            ],
+            "shards": [
+                {
+                    "shard_id": f"shard-{source_id.lower()}",
+                    "literature_id": f"lit-{source_id.lower()}",
+                    "source_ids": [source_id],
+                    "routing_card": {"title": f"Literature {source_id}"},
+                }
+                for source_id in ("A", "B", "C")
+            ],
+        },
+    )
+
+    def handler(
+        stage: str,
+        _profiles: Sequence[Any],
+        context: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if stage == "relationship_bridge_shard_selection":
+            return {
+                "shard_pairs": [
+                    {
+                        "left_shard_id": "shard-a",
+                        "right_shard_id": "shard-b",
+                    }
+                ]
+            }
+        if stage in {
+            "relationship_candidate_selection",
+            "relationship_bridge_candidate_selection",
+        }:
+            return {"candidates": []}
+        raise AssertionError((stage, context))
+
+    calls = _Calls(handler)
+    _run(
+        tmp_path,
+        profiles,
+        calls,
+        reasoner=_BridgeRoutedReasoner(),
+        catalogue={"catalogue_path": str(catalogue_path)},
+    )
+
+    assert {
+        stage for stage, _key, _context in calls.seen
+    } == {
+        "relationship_candidate_selection",
+        "relationship_bridge_shard_selection",
+        "relationship_bridge_candidate_selection",
+    }
 
 
 def test_known_collection_membership_overrides_false_model_bridge_flag() -> None:

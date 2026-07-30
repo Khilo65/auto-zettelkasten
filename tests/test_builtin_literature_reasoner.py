@@ -880,6 +880,11 @@ def test_unchanged_workspace_replay_makes_no_new_relationship_or_cluster_calls(
         path: path.read_bytes()
         for path in (tmp_path / "02_source_memory" / "notes").glob("*.md")
     }
+    before_files = {
+        path: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
 
     replay = build_map(
         tmp_path,
@@ -900,6 +905,11 @@ def test_unchanged_workspace_replay_makes_no_new_relationship_or_cluster_calls(
     assert {
         path: path.read_bytes() for path in before_notes
     } == before_notes
+    assert {
+        path: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    } == before_files
     assert source_report.validated_note_count == len(before_notes)
 
 

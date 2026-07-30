@@ -11,7 +11,15 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from . import ARTIFACT_SCHEMA_VERSION, ENGINE_VERSION
-from .files import now_iso, read_yaml, sha256_text, slugify, write_json, write_yaml
+from .files import (
+    now_iso,
+    read_yaml,
+    sha256_file,
+    sha256_text,
+    slugify,
+    write_json,
+    write_yaml,
+)
 from .indexes import write_source_set
 from .literature import run_literature_map as run_profile_literature_map
 from .migration import migrate_workspace
@@ -47,6 +55,8 @@ from .ports import (
     ZoteroClient,
 )
 from .readers import provider_from_name
+from .relationships import RELATIONSHIP_PROMPT_VERSION
+from .profiles import profile_sidecar_path
 from .workspace import (
     IncompatibleArtifactSchemaError,
     artifact_rows,
@@ -1101,6 +1111,227 @@ def _progress_items_from_source_set(
     ]
 
 
+def _build_map_semantic_fingerprint(
+    root: Path,
+    *,
+    note_rows: Sequence[Mapping[str, Any]],
+    source_set: Mapping[str, Any],
+    provider: str,
+    model: str,
+    question: str | None,
+    policy: LiteratureMappingPolicy,
+    navigation: NavigationPolicy,
+) -> str:
+    """Hash only upstream semantic inputs to a global map build."""
+
+    profiles = []
+    for row in note_rows:
+        path = profile_sidecar_path(
+            root / "02_source_memory" / "profiles",
+            str(row.get("note_id") or ""),
+        )
+        profiles.append(
+            {
+                "note_id": str(row.get("note_id") or ""),
+                "source_id": str(row.get("source_id") or ""),
+                "sha256": sha256_file(path) if path.is_file() else "",
+            }
+        )
+    source_sets = []
+    for path in sorted(
+        (root / "02_source_memory" / "indexes" / "source_sets").glob("*.yml")
+    ):
+        payload = read_yaml(path, {}) or {}
+        if not isinstance(payload, Mapping):
+            continue
+        source_sets.append(
+            {
+                "source_set_alias": str(
+                    payload.get("source_set_alias")
+                    or payload.get("source_set_id")
+                    or path.stem
+                ),
+                "collection_key": str(
+                    payload.get("zotero_collection_key") or ""
+                ),
+                "collection_name": str(payload.get("collection_name") or ""),
+                "source_ids": sorted(
+                    str(value)
+                    for value in payload.get("source_ids", []) or []
+                    if str(value)
+                ),
+                "note_ids": sorted(
+                    str(value)
+                    for value in payload.get("note_ids", []) or []
+                    if str(value)
+                ),
+            }
+        )
+    positions_payload = read_yaml(
+        root / "02_source_memory" / "indexes" / "literature_positions.yml",
+        {},
+    ) or {}
+    positions = [
+        {
+            key: value
+            for key, value in row.items()
+            if key not in {"updated_at", "created_at"}
+        }
+        for row in positions_payload.get("positions", []) or []
+        if isinstance(row, Mapping)
+    ]
+    registry = read_yaml(
+        root / "02_source_memory" / "indexes" / "typed_links.yml", {}
+    ) or {}
+    human_relations = [
+        {
+            key: row.get(key)
+            for key in (
+                "source_id",
+                "target_source_id",
+                "relation_type",
+                "reason",
+                "active",
+                "provenance",
+            )
+        }
+        for row in registry.get("relations", []) or registry.get("links", []) or []
+        if isinstance(row, Mapping)
+        and str(row.get("provenance") or "").casefold().startswith("human")
+    ]
+    negative_pairs = [
+        {
+            "source_id": str(
+                row.get("source_id") or row.get("left_source_id") or ""
+            ),
+            "target_source_id": str(
+                row.get("target_source_id")
+                or row.get("right_source_id")
+                or ""
+            ),
+            "decision_key": str(row.get("decision_key") or ""),
+        }
+        for row in registry.get("pair_decisions", []) or []
+        if isinstance(row, Mapping)
+        and str(
+            row.get("status")
+            or row.get("decision_status")
+            or row.get("decision")
+            or ""
+        )
+        == "no_relationship"
+    ]
+    payload = {
+        "engine_version": ENGINE_VERSION,
+        "relationship_prompt_version": RELATIONSHIP_PROMPT_VERSION,
+        "provider": provider,
+        "model": model,
+        "question": question or "",
+        "literature_policy": policy.to_dict(),
+        "navigation_policy": navigation.to_dict(),
+        "selection": {
+            "source_set_id": str(source_set.get("source_set_id") or ""),
+            "source_ids": sorted(
+                str(value)
+                for value in source_set.get("source_ids", []) or []
+                if str(value)
+            ),
+            "note_ids": sorted(
+                str(value)
+                for value in source_set.get("note_ids", []) or []
+                if str(value)
+            ),
+        },
+        "notes": sorted(
+            (
+                {
+                    "note_id": str(row.get("note_id") or ""),
+                    "source_id": str(row.get("source_id") or ""),
+                    "semantic_note_hash": str(
+                        row.get("semantic_note_hash") or ""
+                    ),
+                    "zotero_relations": dict(
+                        row.get("zotero_relations", {}) or {}
+                    ),
+                }
+                for row in note_rows
+            ),
+            key=lambda row: (row["source_id"], row["note_id"]),
+        ),
+        "profiles": sorted(
+            profiles, key=lambda row: (row["source_id"], row["note_id"])
+        ),
+        "collection_source_sets": source_sets,
+        "literature_positions": sorted(
+            positions,
+            key=lambda row: json.dumps(
+                row, sort_keys=True, ensure_ascii=False, default=str
+            ),
+        ),
+        "human_relations": sorted(
+            human_relations,
+            key=lambda row: json.dumps(
+                row, sort_keys=True, ensure_ascii=False, default=str
+            ),
+        ),
+        "negative_pair_memory": sorted(
+            negative_pairs,
+            key=lambda row: (
+                row["source_id"],
+                row["target_source_id"],
+                row["decision_key"],
+            ),
+        ),
+    }
+    return sha256_text(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    )
+
+
+def _reusable_build_map_manifest(
+    root: Path, run_id: str, fingerprint: str
+) -> ArtifactManifest | None:
+    path = run_directory(root, run_id) / "build_map_manifest.yml"
+    payload = read_yaml(path, {}) or {}
+    metadata = payload.get("metadata", {}) if isinstance(payload, Mapping) else {}
+    if (
+        not isinstance(payload, Mapping)
+        or not isinstance(metadata, Mapping)
+        or str(metadata.get("semantic_build_fingerprint") or "")
+        != fingerprint
+        or not bool(metadata.get("semantic_replayable", False))
+    ):
+        return None
+    for row in payload.get("artifacts", []) or []:
+        if not isinstance(row, Mapping) or not row.get("path"):
+            return None
+        artifact_path = Path(str(row["path"]))
+        if not artifact_path.is_absolute():
+            artifact_path = root / artifact_path
+        if (
+            not artifact_path.is_file()
+            or sha256_file(artifact_path) != str(row.get("sha256") or "")
+        ):
+            return None
+    return ArtifactManifest(
+        status=str(payload.get("status") or "partial"),
+        workspace=root,
+        artifacts=[
+            dict(row)
+            for row in payload.get("artifacts", []) or []
+            if isinstance(row, Mapping)
+        ],
+        run_id=str(payload.get("run_id") or run_id),
+        created_at=str(payload.get("created_at") or ""),
+        engine_version=str(payload.get("engine_version") or ENGINE_VERSION),
+        artifact_schema_version=str(
+            payload.get("artifact_schema_version")
+            or ARTIFACT_SCHEMA_VERSION
+        ),
+        metadata=dict(metadata),
+    )
+
+
 def build_map(
     workspace: Path | str,
     *,
@@ -1160,12 +1391,25 @@ def build_map(
     validate_opaque_id(run_id, field="run_id")
     note_rows = all_workspace_note_rows(root)
     selected_source_set = _resolve_source_set(root, source_set)
+    explicit_source_set = bool(selected_source_set)
     if selected_source_set:
         allowed_note_ids = {str(value) for value in selected_source_set.get("note_ids", []) or []}
         if allowed_note_ids:
             note_rows = [row for row in note_rows if str(row.get("note_id") or "") in allowed_note_ids]
     else:
-        selected_source_set = workspace_source_set(root, note_rows, run_id=run_id)
+        selected_source_set = {
+            "source_set_id": "source-set-auto-zettelkasten-workspace",
+            "source_ids": sorted(
+                str(row.get("source_id") or "")
+                for row in note_rows
+                if row.get("source_id")
+            ),
+            "note_ids": sorted(
+                str(row.get("note_id") or "")
+                for row in note_rows
+                if row.get("note_id")
+            ),
+        }
     extraction_config = (
         config.get("extraction", {})
         if isinstance(config.get("extraction", {}), Mapping)
@@ -1207,6 +1451,27 @@ def build_map(
                     literature_request_deadline,
                 ),
             ),
+        )
+    receipt_source_set = dict(selected_source_set)
+    semantic_fingerprint = _build_map_semantic_fingerprint(
+        root,
+        note_rows=note_rows,
+        source_set=receipt_source_set,
+        provider=provider,
+        model=model,
+        question=question,
+        policy=policy,
+        navigation=navigation,
+    )
+    if not retry_terminal_failures:
+        reusable_manifest = _reusable_build_map_manifest(
+            root, run_id, semantic_fingerprint
+        )
+        if reusable_manifest is not None:
+            return reusable_manifest
+    if not explicit_source_set:
+        selected_source_set = workspace_source_set(
+            root, note_rows, run_id=run_id
         )
     progress_items = _progress_items_from_source_set(selected_source_set)
     progress = _RunProgress(
@@ -1285,6 +1550,32 @@ def build_map(
             progress.literature.get("cluster_stage_wall_seconds", 0.0) or 0.0
         ),
     }
+    relationship_result = (
+        result.get("relationship_result", {})
+        if isinstance(result.get("relationship_result"), Mapping)
+        else {}
+    )
+    semantic_replayable = not any(
+        bool(row.get("retry_on_resume"))
+        for row in relationship_result.get("parked", []) or []
+        if isinstance(row, Mapping)
+    )
+    partial_text = str(result.get("partial_reason") or "").casefold()
+    if any(
+        token in partial_text
+        for token in ("timeout", "timed out", "connection", "transport")
+    ):
+        semantic_replayable = False
+    semantic_fingerprint = _build_map_semantic_fingerprint(
+        root,
+        note_rows=all_workspace_note_rows(root),
+        source_set=receipt_source_set,
+        provider=provider,
+        model=model,
+        question=question,
+        policy=policy,
+        navigation=navigation,
+    )
     manifest = ArtifactManifest(
         status="partial" if result.get("partial_reason") else "built",
         workspace=root,
@@ -1297,6 +1588,8 @@ def build_map(
             "gap_map": result["gap_map"],
             "literature_packet": result["literature_packet"],
             "literature_map": literature_summary,
+            "semantic_build_fingerprint": semantic_fingerprint,
+            "semantic_replayable": semantic_replayable,
         },
     )
     run_dir = run_directory(root, run_id)

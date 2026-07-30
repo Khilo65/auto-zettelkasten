@@ -10,7 +10,7 @@ from .models import RelationshipDecision, RelationshipPairJob
 from .navigation import TYPED_SOURCE_RELATIONS, rank_human_related_links
 
 
-RELATIONSHIP_PROMPT_VERSION = "6"
+RELATIONSHIP_PROMPT_VERSION = "7"
 RELATIONSHIP_REGISTRY_SCHEMA_VERSION = "6"
 RELATIONSHIP_DECISION_SCHEMA_VERSION = "5"
 RELATIONSHIP_DECISION_CONTRACT = "relationship-decision-v5"
