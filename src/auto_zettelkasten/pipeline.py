@@ -839,6 +839,7 @@ def run_pipeline(
         workspace / "01_custody" / "read_attempts" / f"{slugify(run_id)}.jsonl"
     )
     pending, duplicate_aliases = _canonical_inventory_plan(workspace, items)
+    source_match_index = _source_match_index(workspace)
 
     def commit_result(row: dict[str, Any]) -> None:
         prepared.append(row)
@@ -848,6 +849,7 @@ def run_pipeline(
             controller,
             row,
             attempt_path,
+            source_match_index=source_match_index,
         )
         terminal_rows.append(public_row)
         if note_row:
@@ -904,6 +906,7 @@ def run_pipeline(
                 vision,
                 progress,
                 profile_budget,
+                source_match_index,
             )
         finally:
             with concurrency_lock:
@@ -1465,6 +1468,8 @@ def _finalize_prepared_row(
     controller: ControllerPort,
     row: dict[str, Any],
     attempt_path: Path,
+    *,
+    source_match_index: Mapping[str, Any] | None = None,
 ) -> tuple[
     dict[str, Any], dict[str, Any] | None, list[dict[str, Any]], list[dict[str, Any]]
 ]:
@@ -1563,7 +1568,13 @@ def _finalize_prepared_row(
     )
     row.update(terminal_status=terminal_status, note_path=relative_path)
     if isinstance(row.get("source_analysis_bundle"), Mapping):
-        _commit_source_bundle(workspace, row, path, request)
+        _commit_source_bundle(
+            workspace,
+            row,
+            path,
+            request,
+            source_match_index=source_match_index,
+        )
     if row.get("quality_diagnostics"):
         write_yaml(
             workspace
@@ -1598,6 +1609,8 @@ def _commit_source_bundle(
     row: Mapping[str, Any],
     note_path: Path,
     request: MapRequest,
+    *,
+    source_match_index: Mapping[str, Any] | None = None,
 ) -> None:
     bundle = SourceAnalysisBundle.from_dict(
         dict(row["source_analysis_bundle"])
@@ -1714,7 +1727,12 @@ def _commit_source_bundle(
     }
     save_profile(workspace / "02_source_memory" / "profiles", profile)
     with _LITERATURE_MEMORY_LOCK:
-        _commit_literature_memory(workspace, bundle, note_path)
+        _commit_literature_memory(
+            workspace,
+            bundle,
+            note_path,
+            source_index=source_match_index,
+        )
         _commit_remediation_ledgers(workspace, row, bundle)
 
 
@@ -1738,6 +1756,8 @@ def _commit_literature_memory(
     workspace: Path,
     bundle: SourceAnalysisBundle,
     note_path: Path,
+    *,
+    source_index: Mapping[str, Any] | None = None,
 ) -> None:
     index_root = workspace / "02_source_memory" / "indexes"
     positions_path = index_root / "literature_positions.yml"
@@ -1756,7 +1776,7 @@ def _commit_literature_memory(
         for key, value in by_id.items()
         if str(value.get("current_source_id") or "") != current_source_id
     }
-    source_index = _source_match_index(workspace)
+    source_index = source_index or _source_match_index(workspace)
     wikilinks: dict[str, str] = {}
     projected_positions = []
     for position in bundle.literature_positions:
@@ -7720,6 +7740,7 @@ def _prepare_item(
     vision: VisionProvider | None,
     progress: _RunProgress | None = None,
     profile_budget: _ProfileProviderBudget | None = None,
+    source_match_index: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     key = item_key(item)
     base = {
@@ -7789,7 +7810,12 @@ def _prepare_item(
         or {}
     )
     prior_path = workspace / str(prior.get("note_path", ""))
-    if prior.get("note_path") and _reusable_note(prior_path, base, request):
+    if prior.get("note_path") and _reusable_note(
+        prior_path,
+        base,
+        request,
+        source_match_index=source_match_index,
+    ):
         prior_frontmatter = read_note(prior_path)["frontmatter"]
         prior_status = str(
             prior_frontmatter.get("note_status") or "analytical_atomic_note"
@@ -7818,7 +7844,12 @@ def _prepare_item(
             )
         )
         return base
-    compatible_path = _compatible_committed_note(workspace, base, request)
+    compatible_path = _compatible_committed_note(
+        workspace,
+        base,
+        request,
+        source_match_index=source_match_index,
+    )
     if compatible_path is not None:
         prior_frontmatter = read_note(compatible_path)["frontmatter"]
         prior_status = str(
@@ -9894,7 +9925,13 @@ def _fulltext_value(value: Mapping[str, Any] | None) -> str:
     return ""
 
 
-def _reusable_note(path: Path, row: Mapping[str, Any], request: MapRequest) -> bool:
+def _reusable_note(
+    path: Path,
+    row: Mapping[str, Any],
+    request: MapRequest,
+    *,
+    source_match_index: Mapping[str, Any] | None = None,
+) -> bool:
     if not path.exists() or not path.is_file():
         return False
     try:
@@ -9984,6 +10021,7 @@ def _reusable_note(path: Path, row: Mapping[str, Any], request: MapRequest) -> b
         {**dict(row), "source_analysis_bundle": normalized.to_dict()},
         path,
         request,
+        source_match_index=source_match_index,
     )
     return True
 
@@ -9992,6 +10030,8 @@ def _compatible_committed_note(
     workspace: Path,
     row: Mapping[str, Any],
     request: MapRequest,
+    *,
+    source_match_index: Mapping[str, Any] | None = None,
 ) -> Path | None:
     """Reuse a current-schema note when only the processing budget changed.
 
@@ -10022,7 +10062,12 @@ def _compatible_committed_note(
         if note_path.is_file():
             candidates.append(note_path)
     for note_path in sorted(set(candidates), key=lambda path: str(path)):
-        if _reusable_note(note_path, row, request):
+        if _reusable_note(
+            note_path,
+            row,
+            request,
+            source_match_index=source_match_index,
+        ):
             return note_path
     return None
 
