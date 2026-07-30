@@ -1138,9 +1138,11 @@ def test_hierarchical_source_synthesis_returns_the_canonical_bundle(tmp_path) ->
         name = "hierarchical"
         model = "bundle-v1"
         is_cloud = False
+        chunk_output_tokens = []
 
         def summarize_chunk(self, text, metadata, question=None, **kwargs):
-            del text, metadata, question, kwargs
+            del text, metadata, question
+            self.chunk_output_tokens.append(kwargs["max_output_tokens"])
             return {"claim": "Bounded chunk evidence."}
 
         def synthesize_document_bundle(
@@ -1186,3 +1188,4 @@ def test_hierarchical_source_synthesis_returns_the_canonical_bundle(tmp_path) ->
 
     assert result["bundle_schema_version"] == "1"
     assert route == "hierarchical_hierarchical_text"
+    assert set(HierarchicalReader.chunk_output_tokens) == {8_000}

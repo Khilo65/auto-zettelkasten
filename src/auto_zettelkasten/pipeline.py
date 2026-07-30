@@ -129,6 +129,7 @@ from .readers import (
     SECTION_KEYS,
     SOURCE_BUNDLE_MAX_OUTPUT_TOKENS,
     SOURCE_BUNDLE_PROMPT_VERSION,
+    SOURCE_CHUNK_MAX_OUTPUT_TOKENS,
     _normalize_source_bundle_payload,
     provider_from_name,
 )
@@ -8560,6 +8561,9 @@ def _read_document(
     document_hash = sha256_text(text)
     checkpoint_enabled = checkpoint_root is not None
     checkpoint_root = checkpoint_root or Path()
+    source_chunk_output_tokens = max(
+        policy.chunk_output_tokens, SOURCE_CHUNK_MAX_OUTPUT_TOKENS
+    )
     common_identity = {
         "document_hash": document_hash,
         "provider": str(getattr(reader, "name", "unknown")),
@@ -8570,7 +8574,7 @@ def _read_document(
         "content_classifier_version": CONTENT_CLASSIFIER_VERSION,
         "question_hash": sha256_text(question or ""),
         "metadata_hash": _source_read_metadata_hash(metadata),
-        "chunk_output_tokens": policy.chunk_output_tokens,
+        "chunk_output_tokens": source_chunk_output_tokens,
         "synthesis_output_tokens": policy.synthesis_output_tokens,
     }
     bundle_reader = getattr(reader, "read_source_bundle", None)
@@ -8723,7 +8727,7 @@ def _read_document(
                         question,
                         chunk_id=f"chunk-{index + 1:04d}",
                         locator=locator,
-                        max_output_tokens=policy.chunk_output_tokens,
+                        max_output_tokens=source_chunk_output_tokens,
                         deadline_seconds=policy.request_deadline_seconds,
                     )
                 else:
