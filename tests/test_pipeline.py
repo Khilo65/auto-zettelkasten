@@ -484,6 +484,37 @@ def test_explicit_same_work_relation_merges_duplicate_records(
     assert reader.calls == 1
 
 
+def test_unique_same_as_does_not_hide_duplicate_work_identity(
+    tmp_path: Path, sample_items
+) -> None:
+    first = {
+        **sample_items[0],
+        "data": {
+            **sample_items[0]["data"],
+            "relations": {
+                "owl:sameAs": ["https://example.org/record/first"]
+            },
+        },
+    }
+    second = {
+        **sample_items[0],
+        "key": "OTHER",
+        "data": {**sample_items[0]["data"], "key": "OTHER"},
+    }
+    reader = FakeReader()
+
+    report = run_map(
+        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        client=FakeZotero([first, second]),
+        reader=reader,
+        run_id="unique-same-as",
+    )
+
+    assert report.validated_note_count == 1
+    assert report.duplicate_alias_count == 1
+    assert reader.calls == 1
+
+
 def test_alias_only_collection_source_set_includes_canonical_note(
     tmp_path: Path, sample_items
 ) -> None:

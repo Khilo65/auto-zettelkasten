@@ -349,28 +349,26 @@ def _normalize_provider_decision_row(
     raw_left = normalized.get("left_evidence_anchor_ids", [])
     raw_right = normalized.get("right_evidence_anchor_ids", [])
     if contract == RELATIONSHIP_DECISION_CONTRACT:
-        raw_left = [
-            normalized.pop("left_evidence_anchor_id", ""),
-            *(
-                normalized.pop("left_additional_evidence_anchor_ids", [])
-                if isinstance(
-                    normalized.get("left_additional_evidence_anchor_ids", []),
-                    list,
-                )
-                else []
-            ),
-        ]
-        raw_right = [
-            normalized.pop("right_evidence_anchor_id", ""),
-            *(
-                normalized.pop("right_additional_evidence_anchor_ids", [])
-                if isinstance(
-                    normalized.get("right_additional_evidence_anchor_ids", []),
-                    list,
-                )
-                else []
-            ),
-        ]
+        for side in ("left", "right"):
+            primary = normalized.pop(f"{side}_evidence_anchor_id", "")
+            additional = normalized.pop(
+                f"{side}_additional_evidence_anchor_ids", []
+            )
+            supplied = normalized.get(f"{side}_evidence_anchor_ids", [])
+            values = [
+                primary,
+                *(additional if isinstance(additional, list) else []),
+            ]
+            if (
+                not any(str(value) for value in values)
+                and isinstance(supplied, list)
+            ):
+                values = supplied
+                warnings.append(f"normalized_v7_plural_{side}_anchors")
+            if side == "left":
+                raw_left = values
+            else:
+                raw_right = values
     if not isinstance(raw_left, list) or not isinstance(raw_right, list):
         return normalized, []
 

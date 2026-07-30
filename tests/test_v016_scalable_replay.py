@@ -165,6 +165,38 @@ def test_v7_relationship_packet_deduplicates_shared_source_evidence() -> None:
     assert all("selected_evidence" not in row for row in packet["pair_jobs"])
 
 
+def test_v7_relationship_packet_excludes_stale_machine_decisions() -> None:
+    job = RelationshipPairJob(
+        left_source_id="A",
+        right_source_id="B",
+        graph_context={
+            "pair_context": {"citation_direction": []},
+            "existing_neighbors": [{"left_evidence_anchor_ids": ["stale"]}],
+        },
+        prior_pair_memory={
+            "decisions": [{"left_evidence_anchor_ids": ["stale"]}]
+        },
+        selected_evidence={
+            "left": [{"evidence_anchor_id": "anchor-a"}],
+            "right": [{"evidence_anchor_id": "anchor-b"}],
+        },
+        output_contract="relationship-decision-v7",
+    )
+
+    packet = _relationship_transport_context(
+        [job],
+        decision_contract="relationship-decision-v7",
+    )
+
+    assert packet["pair_jobs"][0]["graph_context"] == {
+        "pair_context": {"citation_direction": []}
+    }
+    assert "prior_pair_memory" not in packet["pair_jobs"][0]
+    assert packet["source_evidence"]["A"] == [
+        {"evidence_anchor_id": "anchor-a"}
+    ]
+
+
 def test_pair_context_changes_relationship_job_identity() -> None:
     common = {
         "left_source_id": "A",

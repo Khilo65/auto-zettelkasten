@@ -82,6 +82,49 @@ def test_v7_relationship_requires_claim_owned_primary_anchor_per_endpoint() -> N
     assert "left_evidence_anchor_id" in prompt
 
 
+def test_v7_relationship_accepts_unambiguous_plural_anchor_fields() -> None:
+    profiles = {source_id: _profile(source_id) for source_id in ("A", "B")}
+    job = RelationshipPairJob(
+        left_source_id="A",
+        right_source_id="B",
+        profiles={"left": profiles["A"], "right": profiles["B"]},
+        selected_evidence={
+            "left": [profiles["A"]["evidence_anchors"][0]],
+            "right": [profiles["B"]["evidence_anchors"][0]],
+        },
+    )
+
+    result = validate_relationship_decision_rows(
+        {
+            "decisions": {
+                job.pair_job_id: {
+                    "decision": "relationship",
+                    "relation_type": "qualifies",
+                    "actor_source_id": "A",
+                    "reference_source_id": "B",
+                    "comparison_proposition": "A narrows B's bounded claim.",
+                    "left_endpoint_claim": "Claim A",
+                    "left_evidence_anchor_ids": ["anchor-a"],
+                    "right_endpoint_claim": "Claim B",
+                    "right_evidence_anchor_ids": ["anchor-b"],
+                    "reason": "The endpoint claims establish the qualification.",
+                    "boundary_or_qualification": "The qualification applies to one case.",
+                    "confidence": "high",
+                }
+            }
+        },
+        jobs=[job],
+        profiles=list(profiles.values()),
+    )
+
+    assert result["parked"] == []
+    assert result["accepted"][0]["left_evidence_anchor_ids"] == ["anchor-a"]
+    assert result["accepted"][0]["contract_warnings"] == [
+        "normalized_v7_plural_left_anchors",
+        "normalized_v7_plural_right_anchors",
+    ]
+
+
 def test_v7_contextual_decision_shorthand_is_normalized() -> None:
     profiles = {source_id: _profile(source_id) for source_id in ("A", "B")}
     job = RelationshipPairJob(

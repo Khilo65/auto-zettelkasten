@@ -4334,6 +4334,7 @@ def _run_relationship_reasoning(
             "model": model_name,
             "prompt_version": RELATIONSHIP_PROMPT_VERSION,
             "output_contract": decision_contract,
+            "transport_policy": "source-evidence-only-v2",
         }
     )
     jobs: list[RelationshipPairJob] = []
@@ -5238,6 +5239,10 @@ def _relationship_transport_context(
     pair_jobs: list[dict[str, Any]] = []
     for job in jobs:
         row = job.to_dict()
+        row.pop("prior_pair_memory", None)
+        graph_context = dict(row.get("graph_context") or {})
+        graph_context.pop("existing_neighbors", None)
+        row["graph_context"] = graph_context
         profiles = row.pop("profiles", {})
         atomic_notes = row.pop("atomic_notes", {})
         selected_evidence = (
@@ -9659,7 +9664,11 @@ def _duplicate_result(index: int, item: Mapping[str, Any]) -> dict[str, Any]:
     )
 
 
-def _inventory_work_identity(item: Mapping[str, Any]) -> tuple[str, ...]:
+def _inventory_work_identity(
+    item: Mapping[str, Any],
+    *,
+    shared_same_as: set[str] | None = None,
+) -> tuple[str, ...]:
     data = item_data(item)
     relations = (
         dict(data.get("relations") or {})
@@ -9673,7 +9682,9 @@ def _inventory_work_identity(item: Mapping[str, Any]) -> tuple[str, ...]:
             if _normalized_url_identifier(str(value))
         }
     )
-    if len(same_as) == 1:
+    if len(same_as) == 1 and (
+        shared_same_as is None or same_as[0] in shared_same_as
+    ):
         return ("zotero_same_as", same_as[0])
     doi = _normalized_doi_identifier(
         str(data.get("DOI") or data.get("doi") or "")
@@ -9795,9 +9806,25 @@ def _canonical_inventory_plan(
     grouped: dict[tuple[str, ...], list[tuple[int, dict[str, Any]]]] = defaultdict(
         list
     )
+    same_as_counts: dict[str, int] = defaultdict(int)
+    for raw in items:
+        relations = item_data(raw).get("relations")
+        if not isinstance(relations, Mapping):
+            continue
+        for value in {
+            _normalized_url_identifier(str(value))
+            for value in relations.get("owl:sameAs", []) or []
+            if _normalized_url_identifier(str(value))
+        }:
+            same_as_counts[value] += 1
+    shared_same_as = {
+        value for value, count in same_as_counts.items() if count > 1
+    }
     for index, raw in enumerate(items):
         item = dict(raw)
-        grouped[_inventory_work_identity(item)].append((index, item))
+        grouped[
+            _inventory_work_identity(item, shared_same_as=shared_same_as)
+        ].append((index, item))
 
     pending: list[tuple[int, dict[str, Any]]] = []
     aliases: list[dict[str, Any]] = []
