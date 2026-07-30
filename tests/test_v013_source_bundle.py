@@ -13,7 +13,7 @@ from auto_zettelkasten.models import (
     ProcessingPolicy,
     SourceAnalysisBundle,
 )
-from auto_zettelkasten.api import run_map
+from auto_zettelkasten.api import resume_map, run_map
 from auto_zettelkasten.files import read_yaml, write_yaml
 from auto_zettelkasten.notes import read_note
 from auto_zettelkasten.pipeline import (
@@ -228,6 +228,42 @@ observed_bibliographic_identity:
     )
 
 
+def test_source_bundle_repairs_only_lexical_json_defects() -> None:
+    payload = _bundle_payload()
+    payload["evidence_anchors"][0]["uncertainty"] = (
+        'Low; "positive association" but no effect size.'
+    )
+    payload["evidence_anchors"][0]["quantitative_result"] = {
+        "sample": "1093 (same model sample)",
+    }
+    raw = json.dumps(payload, indent=2)
+    raw = raw.replace(
+        '\\"positive association\\"',
+        '"positive association"',
+    ).replace(
+        '"sample": "1093 (same model sample)"',
+        '"sample": 1093 (same model sample)',
+    )
+
+    recovered = _parse_source_bundle_response(
+        raw,
+        label="bundle",
+        expected_identity={
+            "source_id": "source-zotero-A1",
+            "zotero_key": "A1",
+        },
+    )
+
+    assert recovered["analysis_sections"]["thesis"]
+    assert recovered["evidence_anchors"][0]["quantitative_result"]["sample"] == (
+        "1093 (same model sample)"
+    )
+    assert any(
+        row.get("reason") == "conservative_json_lexical_recovery"
+        for row in recovered["component_diagnostics"]
+    )
+
+
 def test_saved_source_failure_reparses_locally_without_provider_call(
     tmp_path,
 ) -> None:
@@ -270,6 +306,53 @@ observed_bibliographic_identity: {}
     assert recovered["analysis_sections"]["thesis"]
     recovery = read_yaml(checkpoint / "source_recovery.yml")
     assert recovery["provider_calls"] == 0
+
+
+def test_unchanged_source_contract_failure_is_not_retried(tmp_path) -> None:
+    class InvalidEnvelopeReader(BundleReader):
+        is_cloud = True
+
+        def read_source_bundle(self, text, metadata, question=None):
+            del text, metadata, question
+            self.calls += 1
+            error = ProviderError("invalid source envelope")
+            error.raw_response = '{"analysis_sections":'
+            raise error
+
+    item = {
+        "key": "A1",
+        "data": {
+            "key": "A1",
+            "itemType": "journalArticle",
+            "title": "Source A",
+            "date": "2024",
+            "creators": [{"creatorType": "author", "lastName": "Author"}],
+        },
+    }
+    reader = InvalidEnvelopeReader()
+    request = MapRequest(
+        tmp_path,
+        provider="deepseek",
+        model="bundle-v1",
+        allow_cloud=True,
+    )
+
+    first = run_map(
+        request,
+        client=FakeZotero([item]),
+        reader=reader,
+        run_id="terminal-contract",
+    )
+    resumed = resume_map(
+        tmp_path,
+        "terminal-contract",
+        client=FakeZotero([item]),
+        reader=reader,
+    )
+
+    assert first.parked_for_review_count == resumed.parked_for_review_count == 1
+    assert reader.calls == 1
+    assert resumed.items[0]["reason"] == "terminal_source_contract_failure"
 
 
 @pytest.mark.parametrize(

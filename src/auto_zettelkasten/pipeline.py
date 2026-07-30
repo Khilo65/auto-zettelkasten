@@ -7837,6 +7837,32 @@ def _prepare_item(
         zotero_key=key,
         fingerprint=fingerprint,
     )
+    saved_source_failure = read_yaml(
+        checkpoint_root / "source_failure.yml", {}
+    ) or {}
+    unchanged_contract_failure = (
+        recovered_source_result is None
+        and isinstance(saved_source_failure, Mapping)
+        and str(saved_source_failure.get("fingerprint") or "") == fingerprint
+        and str(
+            saved_source_failure.get("source_bundle_envelope_contract") or ""
+        )
+        == SOURCE_BUNDLE_ENVELOPE_CONTRACT
+        and str(saved_source_failure.get("error_type") or "")
+        in {"ProviderError", "ValueError"}
+        and saved_source_failure.get("raw_response") not in (None, "", {}, [])
+    )
+    if unchanged_contract_failure:
+        base["reason"] = "terminal_source_contract_failure"
+        base["attempts"].append(
+            _attempt(
+                base,
+                "source_failure_checkpoint",
+                "skipped",
+                "unchanged_contract_failure_not_retried",
+            )
+        )
+        return base
     if (
         recovered_source_result is None
         and bool(getattr(reader, "is_cloud", True))

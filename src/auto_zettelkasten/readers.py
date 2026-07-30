@@ -2738,11 +2738,80 @@ def _conservative_json_superset_mapping(text: str) -> dict[str, Any] | None:
     return {str(key): value for key, value in documents[0].items()}
 
 
+def _conservative_json_repair_mapping(text: str) -> dict[str, Any] | None:
+    """Repair only lexical JSON defects without guessing structure or content."""
+
+    field_pattern = re.compile(
+        r'^(\s*"(?:\\.|[^"\\])*"\s*:\s*)(.*?)(,?)\s*$'
+    )
+    normalized_lines: list[str] = []
+    for line in text.splitlines():
+        match = field_pattern.match(line)
+        if not match:
+            normalized_lines.append(line)
+            continue
+        prefix, raw_value, comma = match.groups()
+        value = raw_value.strip()
+        if value and value[:1] not in {'"', "{", "["}:
+            try:
+                json.loads(value)
+            except (json.JSONDecodeError, ValueError):
+                if value.endswith('"'):
+                    value = value[:-1].rstrip()
+                value = json.dumps(value, ensure_ascii=False)
+            line = f"{prefix}{value}{comma}"
+        normalized_lines.append(line)
+    text = "\n".join(normalized_lines)
+
+    escaped: list[str] = []
+    in_string = False
+    backslashes = 0
+    for index, char in enumerate(text):
+        if char == "\\":
+            escaped.append(char)
+            backslashes += 1
+            continue
+        if char != '"' or backslashes % 2:
+            escaped.append(char)
+            backslashes = 0
+            continue
+        backslashes = 0
+        if not in_string:
+            in_string = True
+            escaped.append(char)
+            continue
+        following = text[index + 1 :].lstrip()[:1]
+        if not following or following in {":", ",", "}", "]"}:
+            in_string = False
+            escaped.append(char)
+        else:
+            escaped.append('\\"')
+    if in_string:
+        return None
+
+    def unique_object(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    try:
+        payload = json.loads(
+            "".join(escaped),
+            object_pairs_hook=unique_object,
+        )
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return dict(payload) if isinstance(payload, Mapping) else None
+
+
 def _provider_source_bundle_payload(
     payload: Mapping[str, Any],
     *,
     expected_identity: Mapping[str, str],
-    locally_recovered: bool = False,
+    local_recovery_reason: str = "",
 ) -> dict[str, Any]:
     """Normalize the lean provider envelope into the existing internal bundle."""
 
@@ -2788,6 +2857,33 @@ def _provider_source_bundle_payload(
             except ValueError:
                 pass
         role = str(row.get("evidence_role") or "").strip().casefold()
+        quantitative = row.get("quantitative_result")
+        if isinstance(quantitative, Mapping):
+            quantitative = {
+                str(key): (
+                    ""
+                    if value is None
+                    else str(value)
+                )
+                for key, value in quantitative.items()
+                if not isinstance(value, (Mapping, list, tuple, set))
+            }
+            for generated_key in (
+                "quantitative_result_id",
+                "source_id",
+                "evidence_anchor_id",
+            ):
+                quantitative.pop(generated_key, None)
+            if quantitative:
+                if quantitative.get("provenance") not in {
+                    "source_reported",
+                    "system_derived",
+                    "unknown",
+                }:
+                    quantitative["provenance"] = "source_reported"
+                row["quantitative_result"] = quantitative
+        elif quantitative not in (None, ""):
+            row.pop("quantitative_result", None)
         row["support_envelope"] = {
             "empirical_role": (
                 "causal"
@@ -2857,11 +2953,11 @@ def _provider_source_bundle_payload(
         for row in normalized.get("component_diagnostics", []) or []
         if isinstance(row, Mapping)
     ]
-    if locally_recovered:
+    if local_recovery_reason:
         diagnostics.append(
             {
                 "component": "provider_envelope",
-                "reason": "conservative_json_superset_recovery",
+                "reason": local_recovery_reason,
                 "severity": "advisory",
                 "contract": SOURCE_BUNDLE_ENVELOPE_CONTRACT,
             }
@@ -2879,7 +2975,7 @@ def _parse_source_bundle_response(
     """Recover exactly one complete, source-owned bundle from a response."""
 
     candidates: list[Mapping[str, Any]] = []
-    recovered_candidate_ids: set[int] = set()
+    recovered_candidate_reasons: dict[int, str] = {}
     if isinstance(value, Mapping):
         candidates.append(value)
     elif isinstance(value, list):
@@ -2917,7 +3013,15 @@ def _parse_source_bundle_response(
             recovered = _conservative_json_superset_mapping(text)
             if recovered is not None:
                 candidates.append(recovered)
-                recovered_candidate_ids.add(id(recovered))
+                recovered_candidate_reasons[id(recovered)] = (
+                    "conservative_json_superset_recovery"
+                )
+            repaired = _conservative_json_repair_mapping(text)
+            if repaired is not None:
+                candidates.append(repaired)
+                recovered_candidate_reasons[id(repaired)] = (
+                    "conservative_json_lexical_recovery"
+                )
         else:
             if isinstance(payload, Mapping):
                 candidates.append(payload)
@@ -2940,7 +3044,9 @@ def _parse_source_bundle_response(
             provider_payload = _provider_source_bundle_payload(
                 candidate,
                 expected_identity=expected,
-                locally_recovered=id(candidate) in recovered_candidate_ids,
+                local_recovery_reason=recovered_candidate_reasons.get(
+                    id(candidate), ""
+                ),
             )
             normalized = _normalize_source_bundle_payload(provider_payload)
             bundle = SourceAnalysisBundle.from_dict(normalized).to_dict()
