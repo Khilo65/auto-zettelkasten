@@ -243,6 +243,79 @@ def test_registry_is_idempotent_preserves_substance_and_repairs_compatibility(
     assert read_yaml(compatibility) == read_yaml(registry)
 
 
+def test_registry_retires_stale_machine_prompt_edges_only(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile(source_id) for source_id in "ABCDEFGHIJ"]
+    decisions = validate_decisions(
+        {
+            "decisions": [
+                _decision("A", "B"),
+                _decision("C", "D"),
+                _decision("E", "F"),
+            ]
+        },
+        offered_pairs=[("A", "B"), ("C", "D"), ("E", "F")],
+        profiles=profiles,
+    )["accepted"]
+    accepted = _verified_relations(decisions, profiles)
+    for row in accepted[:2]:
+        row["prompt_version"] = "6"
+    accepted[2]["prompt_version"] = "7"
+    human = {
+        "relation_id": "human-g-h",
+        "source_id": "G",
+        "target_source_id": "H",
+        "relation_type": "supports",
+        "provenance": "human_authored",
+        "active": True,
+    }
+    citation = {
+        "relation_id": "citation-i-j",
+        "source_id": "I",
+        "target_source_id": "J",
+        "relation_type": "cites",
+        "provenance": "explicit_citation",
+        "active": True,
+    }
+    persist_relationship_registry(
+        tmp_path,
+        structural_relations=[citation],
+        accepted_relations=[*accepted, human],
+    )
+
+    replacement = dict(accepted[0], prompt_version="7")
+    reconciled = persist_relationship_registry(
+        tmp_path,
+        structural_relations=[citation],
+        accepted_relations=[replacement],
+        reconcile_machine_prompt_version="7",
+    )
+    rows = {
+        row["relation_id"]: row for row in reconciled["relations"]
+    }
+    stale = rows[accepted[1]["relation_id"]]
+    assert stale["active"] is False
+    assert stale["decision_status"] == "retired"
+    assert stale["retirement_reason"] == "relationship_prompt_changed"
+    assert stale["retirement_prompt_version"] == "7"
+    assert rows[replacement["relation_id"]]["active"] is True
+    assert rows[accepted[2]["relation_id"]]["active"] is True
+    assert rows["human-g-h"]["active"] is True
+    assert rows["citation-i-j"]["active"] is True
+
+    registry = Path(reconciled["path"])
+    original = registry.read_bytes()
+    replay = persist_relationship_registry(
+        tmp_path,
+        structural_relations=[citation],
+        accepted_relations=[replacement],
+        reconcile_machine_prompt_version="7",
+    )
+    assert replay["revision_hash"] == reconciled["revision_hash"]
+    assert registry.read_bytes() == original
+
+
 def test_projection_uses_reciprocal_relationship_type() -> None:
     profiles = [_profile("A"), _profile("B")]
     relation = validate_decisions(

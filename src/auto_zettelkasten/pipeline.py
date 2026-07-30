@@ -5086,6 +5086,7 @@ def rebuild_map(
         parked_rows=relationship_result.get("parked", []) or [],
         preserve_unmentioned_structural=True,
         orphaned_source_ids=orphaned_source_ids,
+        reconcile_machine_prompt_version=RELATIONSHIP_PROMPT_VERSION,
     )
     global_source_set["rejected_pair_memory"] = [
         {

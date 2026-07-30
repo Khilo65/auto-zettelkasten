@@ -870,6 +870,7 @@ def persist_relationship_registry(
     parked_rows: Sequence[Mapping[str, Any]] = (),
     preserve_unmentioned_structural: bool = False,
     orphaned_source_ids: Sequence[str] = (),
+    reconcile_machine_prompt_version: str | None = None,
 ) -> dict[str, Any]:
     path = workspace / "02_source_memory" / "indexes" / "typed_links.yml"
     compatibility_path = (
@@ -971,6 +972,20 @@ def persist_relationship_registry(
             row.get("relation_id") or row.get("link_id") or stable_hash(row)
         )
         rows_by_id[identity] = row
+    if reconcile_machine_prompt_version:
+        for row in rows_by_id.values():
+            if (
+                bool(row.get("active", True))
+                and _machine_substantive(row)
+                and str(row.get("prompt_version") or "")
+                != reconcile_machine_prompt_version
+            ):
+                row.update(
+                    active=False,
+                    decision_status="retired",
+                    retirement_reason="relationship_prompt_changed",
+                    retirement_prompt_version=reconcile_machine_prompt_version,
+                )
     orphaned = {str(value) for value in orphaned_source_ids if str(value)}
     if orphaned:
         for row in rows_by_id.values():
