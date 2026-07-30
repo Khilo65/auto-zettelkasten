@@ -8885,6 +8885,11 @@ def _apply_bibliographic_scope(
     ).strip()
     meaningful_label = label and not _GENERIC_ATTACHMENT_LABEL_RE.fullmatch(label)
     first_page = str(row.get("text") or "")[:8_000]
+    scope_probe = re.split(
+        r"(?im)^\s*(?:table\s+of\s+)?contents\s*$",
+        first_page,
+        maxsplit=1,
+    )[0]
     metrics = dict(row.get("coverage_metrics", {}) or {})
     page_count = int(metrics.get("page_count", 0) or 0)
     recovered_pages = metrics.get("recovered_pages", ()) or ()
@@ -8916,12 +8921,12 @@ def _apply_bibliographic_scope(
     ) or re.search(
         r"(?im)^(?:--- Page 1 ---\s*)?(?:chapter\s+(?:\d+|[ivxlcdm]+)"
         r"(?:\s*[:.-]\s*|\s+)|appendix\s+[a-z0-9]+)",
-        first_page,
+        scope_probe,
     ) or (
         re.search(
             r"(?im)^(?:--- Page 1 ---\s*)?(?:chapter\s+)?"
             r"(?:one|two|three|four|five|six|seven|eight|nine|ten)\s*$",
-            first_page,
+            scope_probe,
         )
         if parent_type == "book" and 0 < page_count <= 100
         else None

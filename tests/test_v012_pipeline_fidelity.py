@@ -157,6 +157,34 @@ def test_pathways_for_peace_introduction_label_is_not_treated_as_excerpt() -> No
     assert scoped["source_scope"] == "full_document"
 
 
+def test_pathways_for_peace_contents_does_not_make_full_book_an_excerpt() -> None:
+    scoped = _apply_bibliographic_scope(
+        {
+            "source_scope": "full_document",
+            "source_coverage": {
+                "source_scope": "full_document",
+                "coverage_gate": "passed",
+            },
+            "coverage_metrics": {
+                "page_count": 337,
+                "recovered_pages": list(range(1, 338)),
+            },
+            "text": (
+                "--- Page 1 ---\nPathways for Peace\n"
+                "--- Page 7 ---\nContents\nIntroduction 1\nAppendix A 295\n"
+            ),
+            "rank": 100,
+        },
+        {"itemType": "book", "title": "Pathways for Peace"},
+        {
+            "itemType": "attachment",
+            "title": "World Bank Group_United Nations_2018_Pathways for Peace.pdf",
+        },
+    )
+
+    assert scoped["source_scope"] == "full_document"
+
+
 def test_short_report_preface_label_is_treated_as_an_excerpt() -> None:
     scoped = _apply_bibliographic_scope(
         {
