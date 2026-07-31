@@ -868,6 +868,7 @@ def test_unchanged_workspace_replay_makes_no_new_relationship_or_cluster_calls(
         provider="ollama",
         model="fake-1",
         reasoner=reasoner,
+        comparison_collection_keys=("C1", "C2"),
     )
     assert first.status == "built"
     before_calls = (
@@ -892,6 +893,7 @@ def test_unchanged_workspace_replay_makes_no_new_relationship_or_cluster_calls(
         provider="ollama",
         model="fake-1",
         reasoner=reasoner,
+        comparison_collection_keys=("C1", "C2"),
         resume=True,
     )
 

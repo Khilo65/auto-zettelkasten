@@ -1569,6 +1569,7 @@ def build_map(
         question=question,
         policy=policy,
         navigation=navigation,
+        comparison_collection_keys=comparison_collection_keys,
     )
     manifest = ArtifactManifest(
         status="partial" if result.get("partial_reason") else "built",
