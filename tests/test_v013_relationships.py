@@ -78,8 +78,9 @@ def test_v7_relationship_requires_claim_owned_primary_anchor_per_endpoint() -> N
     assert result["accepted"][0]["left_endpoint_claim"] == "Claim A"
     assert result["accepted"][0]["left_evidence_anchor_ids"] == ["anchor-a"]
     prompt = _relationship_adjudication_system_prompt()
-    assert "left_endpoint_claim" in prompt
-    assert "left_evidence_anchor_id" in prompt
+    assert "source_a_basis" in prompt
+    assert "source_b_basis" in prompt
+    assert "anchor IDs are optional" in prompt
 
 
 def test_v7_relationship_accepts_unambiguous_plural_anchor_fields() -> None:
@@ -634,7 +635,7 @@ def test_schema_three_visible_machine_edges_become_legacy_review_pending(
     result = persist_relationship_registry(tmp_path, structural_relations=[])
     relation = result["relations"][0]
 
-    assert read_yaml(path)["registry_schema_version"] == "6"
+    assert read_yaml(path)["registry_schema_version"] == "7"
     assert relation["active"] is True
     assert relation["decision_status"] == "legacy_review_pending"
     assert relation["cluster_evidence_eligible"] is False

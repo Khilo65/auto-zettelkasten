@@ -132,6 +132,13 @@ def build_parser() -> argparse.ArgumentParser:
     build_parser_command.add_argument("--workspace", type=Path, required=True)
     build_parser_command.add_argument("--run-id", default="")
     build_parser_command.add_argument("--source-set", default="")
+    build_parser_command.add_argument(
+        "--compare-collection",
+        action="append",
+        default=[],
+        dest="comparison_collection_keys",
+        help="Zotero collection key to compare directly; repeat for each collection.",
+    )
     build_parser_command.add_argument("--question", default="")
     build_parser_command.add_argument("--provider", choices=("deepseek", "openrouter", "gemini", "ollama"), default=None)
     build_parser_command.add_argument("--model", default=None)
@@ -277,6 +284,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.provider_concurrency,
                     config.get("provider_concurrency"),
                 ),
+                comparison_collection_keys=args.comparison_collection_keys,
                 literature_policy=_literature_policy(args, config),
                 navigation_policy=_navigation_policy(args, config),
                 resume=args.resume,

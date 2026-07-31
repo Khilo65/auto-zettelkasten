@@ -1121,6 +1121,7 @@ def _build_map_semantic_fingerprint(
     question: str | None,
     policy: LiteratureMappingPolicy,
     navigation: NavigationPolicy,
+    comparison_collection_keys: Sequence[str] = (),
 ) -> str:
     """Hash only upstream semantic inputs to a global map build."""
 
@@ -1199,28 +1200,6 @@ def _build_map_semantic_fingerprint(
         if isinstance(row, Mapping)
         and str(row.get("provenance") or "").casefold().startswith("human")
     ]
-    negative_pairs = [
-        {
-            "source_id": str(
-                row.get("source_id") or row.get("left_source_id") or ""
-            ),
-            "target_source_id": str(
-                row.get("target_source_id")
-                or row.get("right_source_id")
-                or ""
-            ),
-            "decision_key": str(row.get("decision_key") or ""),
-        }
-        for row in registry.get("pair_decisions", []) or []
-        if isinstance(row, Mapping)
-        and str(
-            row.get("status")
-            or row.get("decision_status")
-            or row.get("decision")
-            or ""
-        )
-        == "no_relationship"
-    ]
     payload = {
         "engine_version": ENGINE_VERSION,
         "relationship_prompt_version": RELATIONSHIP_PROMPT_VERSION,
@@ -1274,13 +1253,8 @@ def _build_map_semantic_fingerprint(
                 row, sort_keys=True, ensure_ascii=False, default=str
             ),
         ),
-        "negative_pair_memory": sorted(
-            negative_pairs,
-            key=lambda row: (
-                row["source_id"],
-                row["target_source_id"],
-                row["decision_key"],
-            ),
+        "comparison_collection_keys": sorted(
+            {str(value) for value in comparison_collection_keys if str(value)}
         ),
     }
     return sha256_text(
@@ -1343,6 +1317,7 @@ def build_map(
     model: str | None = None,
     allow_cloud: bool = False,
     provider_concurrency: int | str | None = None,
+    comparison_collection_keys: Sequence[str] = (),
     literature_policy: LiteratureMappingPolicy | Mapping[str, Any] | None = None,
     navigation_policy: NavigationPolicy | Mapping[str, Any] | None = None,
     reasoner: LiteratureReasoner | None = None,
@@ -1353,6 +1328,15 @@ def build_map(
     del controller  # synthesis consumes validated notes and accepted typed-link evidence only
     if not isinstance(allow_cloud, bool):
         raise ValueError("allow_cloud must be a boolean")
+    comparison_collection_keys = tuple(
+        sorted(
+            {
+                str(value).strip()
+                for value in comparison_collection_keys
+                if str(value).strip()
+            }
+        )
+    )
     root = resolve_workspace(workspace)
     assert_compatible(root)
     config = load_config(root)
@@ -1453,6 +1437,9 @@ def build_map(
             ),
         )
     receipt_source_set = dict(selected_source_set)
+    receipt_source_set["comparison_collection_keys"] = list(
+        comparison_collection_keys
+    )
     semantic_fingerprint = _build_map_semantic_fingerprint(
         root,
         note_rows=note_rows,
@@ -1462,6 +1449,7 @@ def build_map(
         question=question,
         policy=policy,
         navigation=navigation,
+        comparison_collection_keys=comparison_collection_keys,
     )
     if not retry_terminal_failures:
         reusable_manifest = _reusable_build_map_manifest(
@@ -1473,6 +1461,10 @@ def build_map(
         selected_source_set = workspace_source_set(
             root, note_rows, run_id=run_id
         )
+    selected_source_set = {
+        **dict(selected_source_set),
+        "comparison_collection_keys": list(comparison_collection_keys),
+    }
     progress_items = _progress_items_from_source_set(selected_source_set)
     progress = _RunProgress(
         run_directory(root, run_id) / "progress.yml",

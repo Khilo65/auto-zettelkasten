@@ -7,8 +7,8 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
-CURRENT_ENGINE_VERSION = "0.20.0"
-CURRENT_ARTIFACT_SCHEMA_VERSION = "1.15"
+CURRENT_ENGINE_VERSION = "0.21.0"
+CURRENT_ARTIFACT_SCHEMA_VERSION = "1.16"
 CURRENT_PROFILE_SCHEMA_VERSION = "1.3"
 
 
@@ -2180,7 +2180,7 @@ class RelationshipPairJob:
     graph_context: dict[str, Any] = field(default_factory=dict)
     candidate_basis: list[dict[str, Any]] = field(default_factory=list)
     prior_pair_memory: dict[str, Any] = field(default_factory=dict)
-    output_contract: str = "relationship-decision-v7"
+    output_contract: str = "relationship-decision-v8"
 
     def __post_init__(self) -> None:
         if (
@@ -2194,6 +2194,7 @@ class RelationshipPairJob:
             "relationship-decision-v5",
             "relationship-decision-v6",
             "relationship-decision-v7",
+            "relationship-decision-v8",
         }:
             raise ValueError("relationship pair job output contract is invalid")
         left, right = sorted((self.left_source_id, self.right_source_id))
@@ -2366,6 +2367,7 @@ class RelationshipDecision:
     left_source_id: str = ""
     right_source_id: str = ""
     relation_type: str = ""
+    secondary_relation_types: list[str] = field(default_factory=list)
     relationship_tier: str = ""
     actor_source_id: str = ""
     reference_source_id: str = ""
@@ -2379,7 +2381,8 @@ class RelationshipDecision:
     right_evidence_anchor_ids: list[str] = field(default_factory=list)
     boundary_or_qualification: str = ""
     confidence: str = ""
-    output_contract: str = "relationship-decision-v7"
+    connection_id: str = ""
+    output_contract: str = "relationship-decision-v8"
 
     def __post_init__(self) -> None:
         if self.decision not in {
@@ -2393,6 +2396,7 @@ class RelationshipDecision:
             "relationship-decision-v5",
             "relationship-decision-v6",
             "relationship-decision-v7",
+            "relationship-decision-v8",
         }:
             raise ValueError("relationship decision output contract is invalid")
         pair = {self.left_source_id, self.right_source_id}
@@ -2414,7 +2418,22 @@ class RelationshipDecision:
                 field="relationship decision.right_evidence_anchor_ids",
             ),
         )
+        object.__setattr__(
+            self,
+            "secondary_relation_types",
+            _string_list(
+                self.secondary_relation_types,
+                field="relationship decision.secondary_relation_types",
+            ),
+        )
         if self.decision == "relationship":
+            if any(
+                relation_type == self.relation_type
+                for relation_type in self.secondary_relation_types
+            ):
+                raise ValueError(
+                    "secondary relationship types cannot repeat the primary type"
+                )
             expected_tier = (
                 "contextual"
                 if self.relation_type == "contextual_connection"
@@ -2442,16 +2461,26 @@ class RelationshipDecision:
                     self.reason,
                     (
                         self.left_endpoint_claim
-                        if self.output_contract == "relationship-decision-v7"
+                        if self.output_contract
+                        in {"relationship-decision-v7", "relationship-decision-v8"}
                         else "legacy"
                     ),
                     (
                         self.right_endpoint_claim
-                        if self.output_contract == "relationship-decision-v7"
+                        if self.output_contract
+                        in {"relationship-decision-v7", "relationship-decision-v8"}
                         else "legacy"
                     ),
-                    self.left_evidence_anchor_ids,
-                    self.right_evidence_anchor_ids,
+                    (
+                        self.left_evidence_anchor_ids
+                        if self.output_contract != "relationship-decision-v8"
+                        else ["optional"]
+                    ),
+                    (
+                        self.right_evidence_anchor_ids
+                        if self.output_contract != "relationship-decision-v8"
+                        else ["optional"]
+                    ),
                 )
             ):
                 raise ValueError(
@@ -2460,6 +2489,7 @@ class RelationshipDecision:
         elif any(
             (
                 self.relation_type,
+                self.secondary_relation_types,
                 self.relationship_tier,
                 self.actor_source_id,
                 self.reference_source_id,
@@ -2484,6 +2514,7 @@ class RelationshipDecision:
                 "right_source_id": self.right_source_id,
             },
             "relation_type": self.relation_type,
+            "secondary_relation_types": list(self.secondary_relation_types),
             "relationship_tier": self.relationship_tier,
             "actor_source_id": self.actor_source_id,
             "reference_source_id": self.reference_source_id,
@@ -2497,6 +2528,7 @@ class RelationshipDecision:
             "right_evidence_anchor_ids": list(self.right_evidence_anchor_ids),
             "boundary_or_qualification": self.boundary_or_qualification,
             "confidence": self.confidence,
+            "connection_id": self.connection_id,
             "output_contract": self.output_contract,
         }
 
@@ -5330,6 +5362,7 @@ class LiteratureMapRequest:
     model: str = "deepseek-v4-flash"
     allow_cloud: bool = False
     provider_concurrency: int | Literal["auto"] = "auto"
+    comparison_collection_keys: list[str] = field(default_factory=list)
     literature_policy: LiteratureMappingPolicy = field(
         default_factory=LiteratureMappingPolicy
     )
@@ -5349,6 +5382,18 @@ class LiteratureMapRequest:
             raise ValueError(
                 "provider_concurrency must be auto or a positive integer"
             )
+        object.__setattr__(
+            self,
+            "comparison_collection_keys",
+            sorted(
+                set(
+                    _string_list(
+                        self.comparison_collection_keys,
+                        field="literature map request.comparison_collection_keys",
+                    )
+                )
+            ),
+        )
         if not isinstance(self.literature_policy, LiteratureMappingPolicy):
             if isinstance(self.literature_policy, Mapping):
                 object.__setattr__(
@@ -5383,6 +5428,10 @@ class LiteratureMapRequest:
                 "auto"
                 if payload.get("provider_concurrency", "auto") == "auto"
                 else int(payload["provider_concurrency"])
+            ),
+            comparison_collection_keys=_string_list(
+                payload.get("comparison_collection_keys"),
+                field="literature map request.comparison_collection_keys",
             ),
             literature_policy=payload.get(
                 "literature_policy", LiteratureMappingPolicy()

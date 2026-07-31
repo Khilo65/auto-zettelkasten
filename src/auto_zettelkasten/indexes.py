@@ -12,7 +12,7 @@ import unicodedata
 from .files import atomic_write_text, now_iso, read_yaml, sha256_text, slugify, write_yaml
 from .notes import read_note
 
-SOURCE_CATALOGUE_SCHEMA_VERSION = "5"
+SOURCE_CATALOGUE_SCHEMA_VERSION = "6"
 SOURCE_CATALOGUE_SHARD_MAX_CHARS = 36_000
 SOURCE_CATALOGUE_ROUTING_CARD_MAX_CHARS = 1_500
 
@@ -1402,6 +1402,105 @@ def _catalogue_profile_rows(profiles: Sequence[Any] | Mapping[str, Any]) -> list
         else:
             raise TypeError("profiles must contain mappings or dataclasses")
     return rows
+
+
+def lean_discovery_projection(
+    profiles: Sequence[Any] | Mapping[str, Any],
+    catalogue: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Render the complete, graph-free model index from canonical source rows."""
+
+    entries = {
+        str(row.get("source_id") or ""): row
+        for row in catalogue.get("sources", []) or []
+        if isinstance(row, Mapping) and row.get("source_id")
+    }
+    projected: dict[str, dict[str, Any]] = {}
+    for profile in _catalogue_profile_rows(profiles):
+        source_id = str(profile.get("source_id") or "")
+        entry = entries.get(source_id)
+        if not source_id or entry is None:
+            continue
+        context = (
+            profile.get("context")
+            if isinstance(profile.get("context"), Mapping)
+            else {}
+        )
+        metadata = (
+            context.get("metadata")
+            if isinstance(context.get("metadata"), Mapping)
+            else {}
+        )
+        thesis = context.get("thesis") or profile.get("thesis") or entry.get("thesis")
+        method = (
+            context.get("method_or_knowledge_basis")
+            or profile.get("method")
+            or next(iter(profile.get("methods", []) or []), "")
+            or entry.get("method")
+        )
+        facets = {
+            facet_type: sorted(
+                {
+                    _normalized_discovery_text(value)
+                    for field in fields
+                    for value in (
+                        profile.get(field, [])
+                        if isinstance(profile.get(field), Sequence)
+                        and not isinstance(profile.get(field), (str, bytes))
+                        else [profile.get(field)]
+                    )
+                    if _normalized_discovery_text(value)
+                },
+                key=str.casefold,
+            )
+            for facet_type, fields in (
+                ("concept", ("concepts",)),
+                ("mechanism", ("mechanisms",)),
+                ("outcome", ("outcomes",)),
+                ("case", ("cases",)),
+                ("population", ("populations",)),
+                ("period", ("periods",)),
+                ("dataset", ("datasets",)),
+            )
+        }
+        projected[source_id] = {
+            "source_id": source_id,
+            "zotero_key": str(
+                entry.get("zotero_key")
+                or metadata.get("zotero_item_key")
+                or ""
+            ),
+            "title": _normalized_discovery_text(
+                entry.get("title") or context.get("title")
+            ),
+            "author": _normalized_discovery_text(entry.get("author")),
+            "year": str(entry.get("year") or context.get("date") or ""),
+            "thesis": _normalized_discovery_text(thesis),
+            "method": _normalized_discovery_text(method),
+            "source_scope": str(
+                profile.get("source_scope")
+                or context.get("source_scope")
+                or entry.get("source_scope")
+                or "unknown"
+            ),
+            "evidence_eligibility": str(
+                profile.get("evidence_eligibility")
+                or context.get("evidence_eligibility")
+                or entry.get("evidence_eligibility")
+                or ""
+            ),
+            "collection_keys": sorted(
+                {str(value) for value in entry.get("collection_keys", []) or [] if str(value)}
+            ),
+            "facets": {
+                key: values for key, values in facets.items() if values
+            },
+        }
+    return [projected[source_id] for source_id in sorted(projected)]
+
+
+def _normalized_discovery_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
 def _catalogue_relationship_rows(workspace: Path) -> list[dict[str, Any]]:

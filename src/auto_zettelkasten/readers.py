@@ -91,6 +91,7 @@ LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
 GAP_ADJUDICATION_MAX_OUTPUT_TOKENS = 32_000
 RELATIONSHIP_ROUTING_MAX_OUTPUT_TOKENS = 8_000
+LITERATURE_FAMILY_PLAN_MAX_OUTPUT_TOKENS = 64_000
 RELATIONSHIP_CANDIDATE_MAX_OUTPUT_TOKENS = 32_000
 RELATIONSHIP_MAX_OUTPUT_TOKENS = 128_000
 CLUSTER_SYNTHESIS_MAX_OUTPUT_TOKENS = 128_000
@@ -177,7 +178,7 @@ class _CapabilityAwareReader:
     chunk_output_tokens: int
     timeout: float
     request_deadline: float | None
-    relationship_decision_contract = "relationship-decision-v7"
+    relationship_decision_contract = "relationship-decision-v8"
 
     def _record_transport_attempt(self) -> None:
         self.transport_attempt_count = (
@@ -473,6 +474,48 @@ class _CapabilityAwareReader:
                 list_key="shard_ids",
             ),
             kind="shard_selection",
+        )
+
+    def literature_family_plan_fits(
+        self,
+        profiles: Sequence[Mapping[str, Any]],
+        request: LiteratureMapRequest,
+        *,
+        context: Mapping[str, Any] | None = None,
+    ) -> bool:
+        return self._prompt_fits(
+            _literature_family_plan_system_prompt(),
+            _literature_prompt(
+                profiles,
+                request,
+                context,
+                instruction="Plan shared, overlapping literature families and bounded discovery jobs.",
+            ),
+            LITERATURE_FAMILY_PLAN_MAX_OUTPUT_TOKENS,
+            context_fraction=0.8,
+        )
+
+    def plan_literature_families(
+        self,
+        profiles: Sequence[EvidenceProfile],
+        request: LiteratureMapRequest,
+        *,
+        context: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        """Plan shared relationship and cluster families from the complete lean index."""
+
+        self._authorize_request()
+        return self._literature_json_call(
+            _literature_family_plan_system_prompt(),
+            _literature_prompt(
+                profiles,
+                request,
+                context,
+                instruction="Plan shared, overlapping literature families and bounded discovery jobs.",
+            ),
+            label="literature family plan",
+            reasoning_effort="high",
+            output_tokens=LITERATURE_FAMILY_PLAN_MAX_OUTPUT_TOKENS,
         )
 
     def select_relationship_bridge_shards(
@@ -845,17 +888,22 @@ class _CapabilityAwareReader:
             label=label,
             context_fraction=0.8,
         )
-        response = _parse_json_object(
-            self._generate_with_reasoning(
+        raw = self._generate_with_reasoning(
                 system_prompt,
                 user_prompt,
                 output_tokens,
                 deadline_seconds,
                 reasoning_effort=reasoning_effort,
-            ),
-            label=f"{label} response",
-            list_key=list_key,
-        )
+            )
+        try:
+            response = _parse_json_object(
+                raw,
+                label=f"{label} response",
+                list_key=list_key,
+            )
+        except Exception as exc:
+            _preserve_provider_failure(exc, raw)
+            raise
         self.last_literature_response = response
         return response
 
@@ -1668,48 +1716,35 @@ def _relationship_candidate_system_prompt() -> str:
 def _relationship_adjudication_system_prompt() -> str:
     return (
         "You adjudicate immutable relationship pair jobs for Auto-Zettelkasten "
-        "relationship prompt v10 and provider contract relationship-decision-v7. "
-        "Read both complete atomic-note bodies in source_documents and use the "
-        "source-owned anchors in source_evidence. Return exactly "
-        "one JSON object whose decisions value is an object keyed by every supplied "
-        "pair_job_id, with no missing or additional keys. A relationship value "
-        "contains decision, relation_type, actor_source_id, reference_source_id, "
-        "comparison_proposition, reason, boundary_or_qualification, "
-        "left_endpoint_claim, left_evidence_anchor_id, right_endpoint_claim, "
-        "right_evidence_anchor_id, optional left_additional_evidence_anchor_ids and "
-        "right_additional_evidence_anchor_ids, and confidence. A "
-        "no_relationship or needs_more_context value contains only decision, reason, "
-        "and confidence. Use only supplied source and evidence-anchor IDs. "
-        "First identify the bounded proposition, question, mechanism, outcome, or "
-        "sequence. If the works share only a broad topic, return no_relationship. "
-        "If joint reading is useful but they examine different propositions, stages, "
-        "outcomes, methods, or cases, use contextual_connection and explain the "
-        "boundary preventing a stronger label. Use a direct relation only for the "
-        "same bounded proposition or explicit intellectual lineage: supports means "
-        "compatible evidence on that proposition; qualifies adds a condition, "
-        "subgroup, or boundary; undermines weakens the reference claim; contrasts "
-        "requires incompatible findings or claims on a sufficiently comparable "
-        "proposition; extends requires explicit intellectual lineage through "
-        "building on, testing, refining, applying, or generalizing the reference; "
-        "complements requires distinct "
-        "contributions to the same bounded question. rival_explanation, "
-        "boundary_contrast, methodological_fault_line, sequential_relationship, and "
-        "interpretive_or_normative_disagreement remain available when their literal "
-        "meaning is established. Citation, chronology, dataset reuse, coding reuse, and "
-        "thematic proximity alone do not establish substantive support or "
-        "extension. For "
-        "directional relations, actor_source_id is the work doing the intellectual "
-        "action and reference_source_id is the work acted on; do not infer direction "
-        "from pair order or chronology. If A cites B as evidence for A's claim, B "
-        "normally supports A. Actor and reference may be omitted only for a symmetric "
-        "relation. State the exact claim used from each endpoint, then select the "
-        "source-owned anchor that establishes that claim. The rationale, relationship "
-        "type, and direction must connect those two claims. Treat partial or limited "
-        "notes only as evidence for what their supplied text establishes, and state "
-        "that boundary. Before returning, self-check that every pair job has one "
-        "keyed decision and that type, actor, reference, proposition, endpoint claims, "
-        "anchors, and reason express one consistent direction. "
-        "Never invent IDs, anchors, locators, provenance, timestamps, or Markdown."
+        "relationship prompt v11 and contract relationship-decision-v8. Read both "
+        "complete atomic notes. Return one JSON object whose decisions object is keyed "
+        "by every supplied pair_job_id, with no missing or extra keys. Each value is "
+        "either {decision:no_relationship, reason, confidence} or "
+        "{decision:relationship, connections:[...]}. Return one connection normally "
+        "and at most two only when the same pair has two genuinely distinct bounded "
+        "propositions. Every connection contains comparison_proposition, "
+        "primary_relation_type, secondary_relation_types, actor_source_id, "
+        "reference_source_id, source_a_basis, source_b_basis, reason, "
+        "boundary_or_qualification, confidence, and optional source_a_anchor_ids and "
+        "source_b_anchor_ids. The two basis fields must state specifically what each "
+        "endpoint note establishes; anchor IDs are optional and must be real when used. "
+        "Use supports, undermines, qualifies, extends, complements, contrasts, "
+        "rival_explanation, boundary_contrast, methodological_fault_line, "
+        "sequential_relationship, interpretive_or_normative_disagreement, or "
+        "contextual_connection. A shared broad topic alone is no_relationship. Use "
+        "contextual_connection when joint reading is useful but construct, stage, "
+        "outcome, method, case, or scope prevents a stronger claim. Contrasts requires "
+        "incompatible claims on a comparable proposition. extends requires explicit "
+        "intellectual lineage through building on, testing, refining, applying, or generalizing. "
+        "Citation, chronology, coding or dataset reuse, and proximity alone do not "
+        "establish substantive support or extension. For directional types, actor_source_id is the "
+        "work doing the intellectual action and reference_source_id is the work acted "
+        "on; never infer direction from pair order. If A cites B as evidence for A's "
+        "claim, B normally supports A. Treat limited notes only within their visible "
+        "scope. Before returning, self-check that proposition, primary type, actor, "
+        "reference, both endpoint bases, rationale, and boundary express one consistent "
+        "direction. Never write display labels, Markdown, invented IDs, locators, "
+        "provenance, or timestamps."
     )
 
 
@@ -1792,6 +1827,35 @@ def _cluster_proposal_system_prompt() -> str:
     )
 
 
+def _literature_family_plan_system_prompt() -> str:
+    return (
+        "You are the shared literature-family planner for Auto-Zettelkasten "
+        "cluster plan prompt v6. Read the complete lean source index. Return one "
+        "JSON object with literature_families, discovery_jobs, and "
+        "neighboring_families arrays. A family has family_id, label, "
+        "organizing_problem, source_ids, proposed_roles, and candidate_cluster. "
+        "Roles are core, supporting, mechanism, boundary, practitioner, or partial. "
+        "A discovery job has job_id, family, left_source_ids, right_source_ids, "
+        "requested_collection_pair, discovery_goal, and candidate_quota. A "
+        "neighbor row has left_family_id, right_family_id, and reason. Use only "
+        "supplied source and collection IDs. Families and memberships may overlap. "
+        "Inspect the whole inventory and identify specific research problems, "
+        "debates, mechanisms, outcomes, sequences, methods, cases, and practice "
+        "questions; do not use shared words alone. Plan both within-literature and "
+        "cross-literature discovery. Every explicitly requested collection pair "
+        "must receive a direct discovery job, while other useful comparisons may be "
+        "added. Divide discovery into distinct intellectual families with "
+        "non-duplicative pair quotas. Candidate discovery should optimize recall; "
+        "the later full-note call decides whether a relationship exists. Citation "
+        "and literature-position records are routing signals, not evidence of "
+        "agreement. When planning_mode is incremental_patch, return only affected "
+        "or replacement families and discovery jobs, retain existing family IDs "
+        "when their organizing problem still applies, and do not reshuffle "
+        "unaffected families. Do not adjudicate relationships, summarize findings, write "
+        "clusters, invent IDs, or force every source into a family."
+    )
+
+
 def _cluster_plan_system_prompt() -> str:
     return (
         "You are the global collection-clustering reasoner for Auto-Zettelkasten "
@@ -1844,18 +1908,21 @@ def _debate_system_prompt() -> str:
 def _cluster_synthesis_system_prompt() -> str:
     return (
         "You are the full-note cluster writer for Auto-Zettelkasten cluster "
-        "synthesis prompt v29. Read every supplied atomic_note_markdown before "
+        "synthesis prompt v30. Read every supplied atomic_note_markdown before "
         "drafting. Copy cluster_id exactly from context.cluster.cluster_id. Return "
         "exactly one JSON object with cluster_id, status, title, "
         "organizing_mode, organizing_problem, optional guiding_question, optional "
         "central_tension, bottom_line, lines_of_inquiry, differences, limits, "
-        "related_clusters, retained_member_ids, dropped_members, optional "
-        "split_proposals, and optional missing_member_ids. status is accepted or "
+        "related_clusters, retained_member_ids, optional dropped_members, optional "
+        "material_exclusions, optional important_cited_works_not_yet_mapped, optional "
+        "split_proposals, and optional missing_member_ids. Status is accepted or "
         "rejected; it is the writer decision, not a copied planning or registry "
         "status. Each line of inquiry contains title, synthesis, and "
         "study_findings. Each study finding contains source_id, finding, "
         "method_scope, relation_to_line, and evidence, plus technical_result and "
-        "plain_english_meaning when it reports an important quantitative result. relation_to_line is supports, "
+        "plain_english_meaning only when it reports a technical statistic whose "
+        "meaning is not already intuitive. Do not add a plain-English duplicate of "
+        "ordinary prose or an already clear percentage. relation_to_line is supports, "
         "qualifies, contrasts, extends, applies, or contextualizes. Evidence uses "
         "an array of objects; every object copies source_id, evidence_anchor_id, "
         "and locator exactly from a supplied source-owned anchor. Every retained member must "
@@ -1866,10 +1933,11 @@ def _cluster_synthesis_system_prompt() -> str:
         "or boundary contribution. State that contribution and its available-content "
         "boundary, and do not present unavailable findings as empirical support. Do "
         "not remove a central work solely because its contribution is non-empirical. "
-        "State what each study actually finds or argues, "
-        "not generic thematic boilerplate. Preserve the source-reported statistic and "
-        "its scale in technical_result, then explain its substantive meaning for a "
-        "non-specialist in plain_english_meaning. Distinguish percentage points from "
+        "State what each study actually finds or argues, including the important data, "
+        "examples, historical analogies, mechanisms, or recommendations appropriate to "
+        "its method; state specific contributions, not generic thematic boilerplate. Preserve a source-reported "
+        "technical statistic and its scale in technical_result. When interpretation is "
+        "needed, explain its substantive meaning without merely restating it. Distinguish percentage points from "
         "relative percentage change; odds, hazards, risks, and probabilities; and "
         "coefficients from predicted probabilities or marginal effects. Do not turn "
         "an interaction coefficient into a percentage without the required reported "
@@ -1895,6 +1963,14 @@ def _cluster_synthesis_system_prompt() -> str:
         "odds, hazards, probabilities, and percentage points as interchangeable. "
         "Distinguish association, author argument, practitioner recommendation, and "
         "causal evidence. "
+        "Use the supplied literature_positions to consider important mapped works as "
+        "possible members, but retain them only when their complete note is supplied "
+        "and makes a material cluster contribution. An important cited work without a "
+        "mapped note may appear only in important_cited_works_not_yet_mapped with the "
+        "citing source, that source's characterization, why it matters here, and its "
+        "unmapped status; it is not independent evidence or a member. "
+        "Return material_exclusions only for intellectually important boundary cases; "
+        "you need not explain every unretained candidate. "
         "Do not generate research gaps or administrative diagnostics."
     )
 
@@ -2253,6 +2329,9 @@ def _literature_prompt(
             "provider": str(getattr(request, "provider", "") or ""),
             "model": str(getattr(request, "model", "") or ""),
             "policy": getattr(request, "literature_policy").to_dict(),
+            "comparison_collection_keys": list(
+                getattr(request, "comparison_collection_keys", []) or []
+            ),
         },
         "profiles": [serializable(profile) for profile in profiles],
         "context": serializable(dict(context or {})),

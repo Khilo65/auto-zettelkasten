@@ -77,9 +77,10 @@ GAP_RULES = (
     "author_stated_gap",
 )
 LITERATURE_ALGORITHM_VERSION = "36"
+LITERATURE_FAMILY_PLAN_PROMPT_VERSION = "6"
 CLUSTER_PLAN_PROMPT_VERSION = "5"
 CLUSTER_PROPOSAL_PROMPT_VERSION = "17"
-CLUSTER_SYNTHESIS_PROMPT_VERSION = "29"
+CLUSTER_SYNTHESIS_PROMPT_VERSION = "30"
 GAP_REASONING_PROMPT_VERSION = "12"
 ANCHOR_ALGORITHM_VERSION = "3"
 SUPPORT_ENVELOPE_VERSION = "2"
@@ -1418,6 +1419,22 @@ class _CheckpointedReasonerCalls:
             and isinstance(enriched_context.get("cluster_plan_settings"), Mapping)
             else _reasoner_context_char_budget(self.reasoner, self.request)
         )
+        if stage == "literature_family_plan":
+            exact_fit = getattr(
+                self.reasoner, "literature_family_plan_fits", None
+            )
+            if callable(exact_fit):
+                context_char_budget = (
+                    packet_chars
+                    if bool(
+                        exact_fit(
+                            profiles,
+                            self.request,
+                            context=enriched_context,
+                        )
+                    )
+                    else 0
+                )
         dependency = {
             "stage": stage,
             "key": key,
@@ -1661,7 +1678,7 @@ class _CheckpointedReasonerCalls:
             )
             if isinstance(checkpoint, Mapping)
             and checkpoint.get("fingerprint") == fingerprint
-            and isinstance(checkpoint.get("raw_response"), Mapping)
+            and isinstance(checkpoint.get("raw_response"), (Mapping, str))
         ]
         for failed_checkpoint in failed_checkpoints:
             recovered_response = _revalidate_raw_synthesis_response(
@@ -1856,7 +1873,7 @@ class _CheckpointedReasonerCalls:
                 },
             )
         self._progress(stage, path, active=True)
-        raw_response_for_failure: Mapping[str, Any] | None = None
+        raw_response_for_failure: Any = None
         try:
             response = method(profiles, self.request, context=enriched_context)
             if is_dataclass(response):
@@ -1895,9 +1912,12 @@ class _CheckpointedReasonerCalls:
             self._record_failure()
             failure_class = _synthesis_failure_class(exc)
             terminal = failure_class != "transport" or attempt_number >= 2
-            raw_response = raw_response_for_failure or getattr(
-                exc, "raw_response", None
+            raw_response = (
+                raw_response_for_failure
+                if raw_response_for_failure is not None
+                else getattr(exc, "raw_response", None)
             )
+            provider_completion = getattr(exc, "provider_completion", None)
             failure_payload = {
                 "checkpoint_schema_version": "1",
                 "fingerprint": fingerprint,
@@ -1921,6 +1941,12 @@ class _CheckpointedReasonerCalls:
             }
             if isinstance(raw_response, Mapping):
                 failure_payload["raw_response"] = dict(raw_response)
+            elif isinstance(raw_response, str):
+                failure_payload["raw_response"] = raw_response
+            if isinstance(provider_completion, Mapping):
+                failure_payload["provider_completion"] = dict(
+                    provider_completion
+                )
             target = (
                 failure_path if isinstance(existing.get("response"), Mapping) else path
             )
@@ -2211,6 +2237,7 @@ def _legacy_synthesis_usage(root: Path, *, max_calls: int) -> dict[str, Any]:
 
 def _synthesis_stage_prompt_version(stage: str) -> str:
     return {
+        "literature_family_plan": LITERATURE_FAMILY_PLAN_PROMPT_VERSION,
         "cluster_plan": CLUSTER_PLAN_PROMPT_VERSION,
         "cluster_proposal": CLUSTER_PROPOSAL_PROMPT_VERSION,
         "cluster_reconciliation": CLUSTER_PROPOSAL_PROMPT_VERSION,
@@ -2227,6 +2254,8 @@ def _synthesis_stage_prompt_version(stage: str) -> str:
 
 
 def _synthesis_stage_budget_group(stage: str, key: str = "") -> str:
+    if stage == "literature_family_plan":
+        return "literature_family_plan"
     if stage in {
         "relationship_shard_selection",
         "relationship_candidate_selection",
@@ -2257,10 +2286,148 @@ def _synthesis_stage_budget_group(stage: str, key: str = "") -> str:
     }.get(stage, stage or "unknown")
 
 
+def _validate_literature_family_plan_response(
+    raw_response: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Normalize the shared plan without making intellectual judgments."""
+
+    def mapping_rows(field: str) -> list[dict[str, Any]]:
+        value = raw_response.get(field, [])
+        if not isinstance(value, list):
+            raise ValueError(f"literature family plan {field} must be a list")
+        if any(not isinstance(row, Mapping) for row in value):
+            raise ValueError(
+                f"literature family plan {field} rows must be mappings"
+            )
+        return [dict(row) for row in value]
+
+    families: list[dict[str, Any]] = []
+    for row in mapping_rows("literature_families"):
+        family_id = str(row.get("family_id") or "").strip()
+        label = str(row.get("label") or "").strip()
+        organizing_problem = str(
+            row.get("organizing_problem") or ""
+        ).strip()
+        source_ids = sorted(
+            {
+                str(value).strip()
+                for value in row.get("source_ids", []) or []
+                if str(value).strip()
+            }
+        )
+        roles = row.get("proposed_roles", {})
+        if isinstance(roles, Sequence) and not isinstance(
+            roles, (str, bytes, bytearray)
+        ):
+            roles = {
+                str(item.get("source_id") or ""): str(
+                    item.get("role") or ""
+                )
+                for item in roles
+                if isinstance(item, Mapping) and item.get("source_id")
+            }
+        if not isinstance(roles, Mapping):
+            roles = {}
+        normalized_roles = {
+            source_id: str(roles.get(source_id) or "supporting")
+            .strip()
+            .casefold()
+            for source_id in source_ids
+        }
+        if not family_id or not label or not organizing_problem:
+            raise ValueError("literature family row is incomplete")
+        families.append(
+            {
+                "family_id": family_id,
+                "label": label,
+                "organizing_problem": organizing_problem,
+                "source_ids": source_ids,
+                "proposed_roles": normalized_roles,
+                "candidate_cluster": bool(
+                    row.get("candidate_cluster", True)
+                ),
+            }
+        )
+
+    jobs: list[dict[str, Any]] = []
+    for row in mapping_rows("discovery_jobs"):
+        job_id = str(row.get("job_id") or "").strip()
+        if not job_id:
+            raise ValueError("literature family discovery job requires job_id")
+        jobs.append(
+            {
+                "job_id": job_id,
+                "family": str(row.get("family") or "").strip(),
+                "left_source_ids": sorted(
+                    {
+                        str(value).strip()
+                        for value in row.get("left_source_ids", []) or []
+                        if str(value).strip()
+                    }
+                ),
+                "right_source_ids": sorted(
+                    {
+                        str(value).strip()
+                        for value in row.get("right_source_ids", []) or []
+                        if str(value).strip()
+                    }
+                ),
+                "requested_collection_pair": [
+                    str(value).strip()
+                    for value in row.get("requested_collection_pair", []) or []
+                    if str(value).strip()
+                ],
+                "discovery_goal": str(
+                    row.get("discovery_goal") or ""
+                ).strip(),
+                "candidate_quota": max(
+                    0, int(row.get("candidate_quota", 0) or 0)
+                ),
+            }
+        )
+
+    neighbors: list[dict[str, str]] = []
+    for row in mapping_rows("neighboring_families"):
+        left = str(row.get("left_family_id") or "").strip()
+        right = str(row.get("right_family_id") or "").strip()
+        reason = str(row.get("reason") or "").strip()
+        if not left or not right or left == right or not reason:
+            raise ValueError("literature family neighbor row is incomplete")
+        neighbors.append(
+            {
+                "left_family_id": left,
+                "right_family_id": right,
+                "reason": reason,
+            }
+        )
+    return {
+        "literature_families": families,
+        "discovery_jobs": jobs,
+        "neighboring_families": neighbors,
+    }
+
+
 def _revalidate_raw_synthesis_response(
     stage: str,
-    raw_response: Mapping[str, Any],
+    raw_response: Any,
 ) -> dict[str, Any] | None:
+    try:
+        if isinstance(raw_response, Mapping):
+            payload = dict(raw_response)
+        else:
+            from .readers import _parse_json_object
+
+            payload = _parse_json_object(
+                raw_response,
+                label=f"{stage} response",
+            )
+    except (TypeError, ValueError, RuntimeError):
+        return None
+    if stage == "literature_family_plan":
+        try:
+            return _validate_literature_family_plan_response(payload)
+        except (TypeError, ValueError, RuntimeError):
+            return None
     kind = {
         "cluster_plan": "cluster_plan",
         "cluster_proposal": "cluster_proposal",
@@ -2282,7 +2449,7 @@ def _revalidate_raw_synthesis_response(
 
         try:
             return _validate_relationship_response(
-                raw_response, kind=relationship_kind
+                payload, kind=relationship_kind
             )
         except (TypeError, ValueError, RuntimeError):
             return None
@@ -2293,7 +2460,7 @@ def _revalidate_raw_synthesis_response(
     from .readers import _validate_literature_response
 
     try:
-        return _validate_literature_response(raw_response, kind=kind)
+        return _validate_literature_response(payload, kind=kind)
     except (TypeError, ValueError, RuntimeError):
         return None
 
@@ -2322,6 +2489,7 @@ def _same_provider_inputs(
     # richer local context gained projection-only records.
     if (
         stage not in {
+            "literature_family_plan",
             "cluster_plan",
             "cluster_proposal",
             "cluster_reconciliation",
@@ -2341,6 +2509,17 @@ def _same_provider_inputs(
         return False
     visible_context_components = (
         (
+            "planning_mode",
+            "collections",
+            "requested_collection_keys",
+            "mapped_citations",
+            "mapped_literature_positions",
+            "human_relationship_pairs",
+            "global_spine",
+            "local_family_plans",
+        )
+        if stage == "literature_family_plan"
+        else (
             "accepted_relationships",
             "literature_positions",
             "collection_identity",
@@ -10090,6 +10269,8 @@ def validate_streamlined_cluster_synthesis(
     response: Mapping[str, Any],
     cluster: Mapping[str, Any],
     profiles: Sequence[Mapping[str, Any]],
+    *,
+    candidate_input_receipt: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Mechanically validate full-note synthesis without re-judging its prose."""
 
@@ -10293,9 +10474,7 @@ def validate_streamlined_cluster_synthesis(
                         or ""
                     ),
                     "plain_english_meaning": str(
-                        finding.get("plain_english_meaning")
-                        or finding.get("finding")
-                        or ""
+                        finding.get("plain_english_meaning") or ""
                     ),
                     "relation_to_cluster_question": str(
                         finding.get("relation_to_line") or ""
@@ -10311,7 +10490,7 @@ def validate_streamlined_cluster_synthesis(
                 "title": str(line.get("title") or ""),
                 "question": "",
                 "summary": str(line.get("synthesis") or ""),
-                "plain_english_meaning": str(line.get("synthesis") or ""),
+                "plain_english_meaning": "",
                 "relationship": "",
                 "source_ids": sorted(set(line_source_ids)),
                 "proposition_ids": [],
@@ -10364,10 +10543,97 @@ def validate_streamlined_cluster_synthesis(
         }
         for source_id in sorted(missing - existing_drop_ids)
     )
+    material_exclusions: list[dict[str, Any]] = []
+    raw_exclusions = response.get("material_exclusions", []) or []
+    if isinstance(raw_exclusions, Mapping):
+        raw_exclusions = [raw_exclusions]
+    if isinstance(raw_exclusions, list):
+        for row in raw_exclusions:
+            if not isinstance(row, Mapping):
+                continue
+            source_id = str(row.get("source_id") or "")
+            boundary = str(
+                row.get("boundary") or row.get("reason") or ""
+            ).strip()
+            if (
+                source_id not in proposed_ids
+                or source_id in retained
+                or not boundary
+            ):
+                continue
+            material_exclusions.append(
+                {
+                    "source_id": source_id,
+                    "boundary": boundary,
+                }
+            )
+
+    important_cited_works: list[dict[str, Any]] = []
+    raw_cited_works = response.get(
+        "important_cited_works_not_yet_mapped", []
+    ) or []
+    if isinstance(raw_cited_works, Mapping):
+        raw_cited_works = [raw_cited_works]
+    if isinstance(raw_cited_works, list):
+        seen_cited: set[str] = set()
+        for row in raw_cited_works:
+            if not isinstance(row, Mapping):
+                continue
+            status = str(row.get("status") or "")
+            invoked_by = sorted(
+                {
+                    str(value)
+                    for value in row.get(
+                        "invoked_by_source_ids", []
+                    )
+                    or []
+                    if str(value) in proposed_ids
+                }
+            )
+            cited_work = str(
+                row.get("cited_work")
+                or row.get("raw_citation")
+                or ""
+            ).strip()
+            if (
+                status
+                not in {"known_zotero_unmapped", "not_in_snapshot"}
+                or not invoked_by
+                or not cited_work
+            ):
+                continue
+            identity = str(
+                row.get("external_source_id")
+                or _stable_hash([cited_work, invoked_by])
+            )
+            if identity in seen_cited:
+                continue
+            seen_cited.add(identity)
+            important_cited_works.append(
+                {
+                    "external_source_id": identity,
+                    "cited_work": cited_work,
+                    "invoked_by_source_ids": invoked_by,
+                    "characterization": str(
+                        row.get("characterization") or ""
+                    ).strip(),
+                    "why_it_matters": str(
+                        row.get("why_it_matters") or ""
+                    ).strip(),
+                    "status": status,
+                }
+            )
     return {
         **dict(response),
         "retained_member_ids": sorted(retained),
         "dropped_members": returned_drops,
+        "material_exclusions": material_exclusions,
+        "important_cited_works_not_yet_mapped": important_cited_works,
+        "candidate_input_receipt": (
+            dict(candidate_input_receipt)
+            if isinstance(candidate_input_receipt, Mapping)
+            else {}
+        ),
         "scope": str(response.get("organizing_problem") or ""),
         "boundaries": list(response.get("limits", []) or []),
         "coherence_rationale": str(
@@ -16918,7 +17184,19 @@ def _global_plan_proposals(
     profile_by_source = {
         str(profile.get("source_id") or ""): profile
         for profile in profiles
-        if profile.get("analytical") and profile.get("source_id")
+        if (
+            profile.get("analytical")
+            or (
+                profile.get("note_status") == "partial_document_atomic_note"
+                and profile.get("evidence_eligibility") == "substantive_bounded"
+                and any(
+                    _anchor_is_synthesis_eligible(anchor)
+                    for anchor in profile.get("claims", []) or []
+                    if isinstance(anchor, Mapping)
+                )
+            )
+        )
+        and profile.get("source_id")
     }
     anchors_by_source = {
         source_id: {
@@ -16949,15 +17227,27 @@ def _global_plan_proposals(
         ]
         supporting_evidence: list[dict[str, Any]] = []
         roles: dict[str, str] = {}
+        candidate_roles: dict[str, str] = {}
         membership_reasons: list[str] = []
         for member in members:
             source_id = str(member.get("source_id") or "")
+            proposed_role = str(
+                member.get("proposed_role")
+                or member.get("role")
+                or "supporting"
+            ).strip().casefold()
             anchor_ids = [
                 str(value)
                 for value in member.get("evidence_anchor_ids", []) or []
                 if str(value)
             ]
             if source_id not in profile_by_source:
+                continue
+            is_partial = (
+                profile_by_source[source_id].get("note_status")
+                == "partial_document_atomic_note"
+            )
+            if is_partial and proposed_role not in {"partial", "boundary"}:
                 continue
             anchor_ids = [
                 anchor_id
@@ -16977,10 +17267,23 @@ def _global_plan_proposals(
                 ][:1]
             if not anchor_ids:
                 continue
+            candidate_roles[source_id] = (
+                proposed_role
+                if proposed_role
+                in {
+                    "core",
+                    "supporting",
+                    "mechanism",
+                    "boundary",
+                    "practitioner",
+                    "partial",
+                }
+                else "supporting"
+            )
             # Legacy admission code still expects a core/context role. v0.14
             # treats every planner-retained member as evidentiary; role labels
             # are descriptive and cannot suppress a source's findings.
-            roles[source_id] = "core"
+            roles[source_id] = "context" if is_partial else "core"
             membership_reasons.append(str(member.get("membership_reason") or ""))
             for anchor_id in anchor_ids:
                 anchor = anchors_by_source[source_id][anchor_id]
@@ -17044,6 +17347,10 @@ def _global_plan_proposals(
                 "coherence_rationale": rationale,
                 "source_ids": sorted(roles),
                 "source_roles": roles,
+                "candidate_roles": {
+                    source_id: candidate_roles.get(source_id, "supporting")
+                    for source_id in sorted(roles)
+                },
                 "supporting_evidence": supporting_evidence,
                 "propositions": [],
                 "family_relations": [
@@ -17099,6 +17406,154 @@ def _global_plan_proposals(
     # Non-membership is current map state, not a model-authored negative
     # judgment. Final reconciliation computes the neutral snapshot.
     return proposals, parked, neighbors, []
+
+
+def _shared_family_cluster_plan(
+    shared_literature_plan: Mapping[str, Any],
+    profiles: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Adapt one validated shared family plan to the existing cluster planner."""
+
+    profile_by_source = {
+        str(profile.get("source_id") or ""): profile
+        for profile in profiles
+        if profile.get("source_id")
+    }
+    clusters: list[dict[str, Any]] = []
+    parked: list[dict[str, Any]] = []
+    family_ids: set[str] = set()
+    for index, raw_family in enumerate(
+        shared_literature_plan.get("literature_families", []) or []
+    ):
+        if not isinstance(raw_family, Mapping):
+            parked.append(
+                {
+                    "cluster_id": f"shared-family-{index}",
+                    "reason": "shared_family_row_not_mapping",
+                }
+            )
+            continue
+        family_id = str(raw_family.get("family_id") or "").strip()
+        if not family_id or raw_family.get("candidate_cluster") is False:
+            continue
+        supplied_roles = raw_family.get("proposed_roles", {})
+        roles = (
+            {
+                str(source_id): str(role).strip().casefold()
+                for source_id, role in supplied_roles.items()
+            }
+            if isinstance(supplied_roles, Mapping)
+            else {}
+        )
+        source_ids = sorted(
+            {
+                str(value)
+                for value in raw_family.get("source_ids", []) or []
+                if str(value) in profile_by_source
+                and (
+                    profile_by_source[str(value)].get("analytical")
+                    or (
+                        profile_by_source[str(value)].get("note_status")
+                        == "partial_document_atomic_note"
+                        and profile_by_source[str(value)].get(
+                            "evidence_eligibility"
+                        )
+                        == "substantive_bounded"
+                        and roles.get(str(value)) in {"partial", "boundary"}
+                        and any(
+                            _anchor_is_synthesis_eligible(anchor)
+                            for anchor in profile_by_source[str(value)].get(
+                                "claims", []
+                            )
+                            or []
+                            if isinstance(anchor, Mapping)
+                        )
+                    )
+                )
+            }
+        )
+        if len(source_ids) < 2:
+            parked.append(
+                {
+                    "cluster_id": family_id,
+                    "reason": "shared_family_requires_two_available_sources",
+                }
+            )
+            continue
+        relevance_reasons = raw_family.get("relevance_reasons", {})
+        reasons = (
+            {
+                str(source_id): str(reason).strip()
+                for source_id, reason in relevance_reasons.items()
+            }
+            if isinstance(relevance_reasons, Mapping)
+            else {}
+        )
+        organizing_problem = str(
+            raw_family.get("organizing_problem")
+            or raw_family.get("label")
+            or ""
+        ).strip()
+        clusters.append(
+            {
+                "cluster_id": family_id,
+                "title": str(
+                    raw_family.get("label") or organizing_problem
+                ).strip(),
+                "semantic_identity": str(
+                    raw_family.get("semantic_identity")
+                    or raw_family.get("label")
+                    or organizing_problem
+                ).strip(),
+                "organizing_mode": str(
+                    raw_family.get("organizing_mode") or "question"
+                ).strip(),
+                "organizing_problem": organizing_problem,
+                "guiding_question": str(
+                    raw_family.get("guiding_question") or ""
+                ).strip(),
+                "central_tension": str(
+                    raw_family.get("central_tension") or ""
+                ).strip(),
+                "coherence_rationale": str(
+                    raw_family.get("coherence_rationale")
+                    or organizing_problem
+                ).strip(),
+                "members": [
+                    {
+                        "source_id": source_id,
+                        "role": roles.get(source_id, "supporting"),
+                        "proposed_role": roles.get(
+                            source_id, "supporting"
+                        ),
+                        "membership_reason": reasons.get(
+                            source_id, organizing_problem
+                        ),
+                        "evidence_anchor_ids": [],
+                    }
+                    for source_id in source_ids
+                ],
+            }
+        )
+        family_ids.add(family_id)
+    return {
+        "clusters": clusters,
+        # Shared neighboring-family cards route synthesis but do not become
+        # evidence-backed projected cluster edges by themselves.
+        "neighbor_relationships": [],
+        "unclustered_sources": [],
+        "parked_clusters": parked,
+        "shared_neighboring_families": [
+            dict(row)
+            for row in shared_literature_plan.get(
+                "neighboring_families", []
+            )
+            or []
+            if isinstance(row, Mapping)
+            and str(row.get("left_family_id") or "") in family_ids
+            and str(row.get("right_family_id") or "") in family_ids
+        ],
+    }
 
 
 def _cluster_plan_packets(
@@ -17866,6 +18321,9 @@ def build_literature_report(
     accepted_relationships: Sequence[Mapping[str, Any]] = (),
     relationship_candidates: Sequence[Mapping[str, Any]] = (),
     catalogue_shards: Sequence[Mapping[str, Any]] = (),
+    shared_literature_plan: Mapping[str, Any] | None = None,
+    literature_positions: Sequence[Mapping[str, Any]] = (),
+    missing_sources: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """Pure end-to-end mapper over already-built evidence profiles."""
     normalized = normalize_evidence_profiles(profiles)
@@ -17885,12 +18343,28 @@ def build_literature_report(
         for row in normalized
         if row.get("analytical")
     }
-    uses_global_cluster_plan = callable(getattr(reasoner, "plan_clusters", None))
+    shared_plan = (
+        dict(shared_literature_plan)
+        if isinstance(shared_literature_plan, Mapping)
+        and isinstance(
+            shared_literature_plan.get("literature_families"), list
+        )
+        else {}
+    )
+    uses_global_cluster_plan = bool(shared_plan) or callable(
+        getattr(reasoner, "plan_clusters", None)
+    )
     global_plan_parked: list[dict[str, Any]] = []
     global_plan_neighbors: list[dict[str, Any]] = []
     global_plan_unclustered: list[dict[str, Any]] = []
     combined_proposals: list[dict[str, Any]] = []
     cluster_plan_state: dict[str, Any] = {}
+    resolved_literature_positions: list[dict[str, Any]] = []
+    canonical_missing_sources = [
+        dict(row)
+        for row in missing_sources
+        if isinstance(row, Mapping)
+    ]
     if uses_global_cluster_plan and len(analytical_families) >= 2:
         collection_memberships = _as_mapping(
             (source_set or {}).get("collection_memberships")
@@ -17914,7 +18388,7 @@ def build_literature_report(
             for row in normalized
             if row.get("analytical") and row.get("source_id")
         }
-        literature_positions = [
+        profile_literature_positions = [
             {
                 "source_id": str(row.get("source_id") or ""),
                 **dict(position),
@@ -17926,6 +18400,42 @@ def build_literature_report(
                 position.get("matched_source_id")
                 or position.get("target_source_id")
             )
+        ]
+        resolved_literature_positions = [
+            {
+                **dict(position),
+                "source_id": str(
+                    position.get("source_id")
+                    or position.get("current_source_id")
+                    or ""
+                ),
+                "current_source_id": str(
+                    position.get("current_source_id")
+                    or position.get("source_id")
+                    or ""
+                ),
+                "matched_source_id": str(
+                    position.get("matched_source_id")
+                    or position.get("target_source_id")
+                    or ""
+                ),
+            }
+            for position in (
+                literature_positions or profile_literature_positions
+            )
+            if isinstance(position, Mapping)
+            and str(
+                position.get("matched_source_id")
+                or position.get("target_source_id")
+                or ""
+            )
+            in analytical_source_ids
+            and str(
+                position.get("current_source_id")
+                or position.get("source_id")
+                or ""
+            )
+            in analytical_source_ids
         ]
         collection_identity = {
             key: source_set.get(key)
@@ -17954,7 +18464,11 @@ def build_literature_report(
         }
         source_state_hash = _stable_hash(source_card_hashes)
         planning_identity = {
-            "prompt_version": CLUSTER_PLAN_PROMPT_VERSION,
+            "prompt_version": (
+                LITERATURE_FAMILY_PLAN_PROMPT_VERSION
+                if shared_plan
+                else CLUSTER_PLAN_PROMPT_VERSION
+            ),
             "algorithm_version": LITERATURE_ALGORITHM_VERSION,
             "provider": str(getattr(reasoner, "name", "") or ""),
             "model": str(getattr(reasoner, "model", "") or ""),
@@ -17966,9 +18480,12 @@ def build_literature_report(
         planning_context_hash = _stable_hash(
             {
                 "accepted_relationships": accepted_plan_relationships,
-                "literature_positions": literature_positions,
+                "literature_positions": resolved_literature_positions,
                 "collection_identity": collection_identity,
                 "rejected_pair_memory": rejected_pair_memory,
+                "shared_literature_plan": (
+                    _stable_hash(shared_plan) if shared_plan else ""
+                ),
             }
         )
         prior_plan_state = _as_mapping(
@@ -17992,7 +18509,7 @@ def build_literature_report(
         )
         plan_context = {
             "accepted_relationships": accepted_plan_relationships,
-            "literature_positions": literature_positions,
+            "literature_positions": resolved_literature_positions,
             "collection_identity": collection_identity,
             "rejected_pair_memory": rejected_pair_memory,
             "cluster_plan_mode": "global",
@@ -18055,7 +18572,11 @@ def build_literature_report(
                 planning_cards, plan_context
             ),
         }
-        if reuse_prior_plan:
+        if shared_plan:
+            plan_response = _shared_family_cluster_plan(
+                shared_plan, normalized
+            )
+        elif reuse_prior_plan:
             plan_response = dict(prior_plan_response)
         elif (
             _reasoner_packet_chars(planning_cards, plan_context)
@@ -18102,7 +18623,7 @@ def build_literature_report(
                     ),
                     "literature_positions": [
                         dict(position)
-                        for position in literature_positions
+                        for position in resolved_literature_positions
                         if str(position.get("source_id") or "")
                         in packet_source_ids
                         or str(
@@ -18270,7 +18791,7 @@ def build_literature_report(
                 )
                 bridge_context = {
                     "accepted_relationships": bridge_relations,
-                    "literature_positions": literature_positions,
+                    "literature_positions": resolved_literature_positions,
                     "collection_identity": collection_identity,
                     "rejected_pair_memory": list(
                         (source_set or {}).get("rejected_pair_memory", []) or []
@@ -18471,8 +18992,28 @@ def build_literature_report(
         combined_proposals = _cluster_proposals_from_responses(
             proposal_responses
         )
+    clustering_profiles = normalized
+    if shared_plan:
+        bounded_partial_ids = {
+            str(source_id)
+            for proposal in combined_proposals
+            for source_id, role in _as_mapping(
+                proposal.get("candidate_roles")
+            ).items()
+            if str(role) in {"partial", "boundary"}
+        }
+        clustering_profiles = [
+            (
+                {**row, "analytical": True, "limited": False}
+                if str(row.get("source_id") or "") in bounded_partial_ids
+                and row.get("note_status") == "partial_document_atomic_note"
+                and row.get("evidence_eligibility") == "substantive_bounded"
+                else row
+            )
+            for row in normalized
+        ]
     clustered = map_overlapping_clusters(
-        normalized,
+        clustering_profiles,
         relations,
         policy=policy,
         proposals=combined_proposals,
@@ -18498,6 +19039,9 @@ def build_literature_report(
                 "central_tension",
             ):
                 cluster[field] = str(proposal.get(field) or "")
+            cluster["candidate_roles"] = dict(
+                proposal.get("candidate_roles", {}) or {}
+            )
     failed_plan_source_ids = {
         str(source_id)
         for row in global_plan_parked
@@ -18999,6 +19543,100 @@ def build_literature_report(
             )
             for row in member_profiles
         ]
+        candidate_roles = {
+            str(source_id): str(role)
+            for source_id, role in _as_mapping(
+                cluster.get("candidate_roles")
+            ).items()
+            if str(source_id) in member_ids
+        }
+        candidate_input_receipt = {
+            "receipt_schema_version": "1",
+            "cluster_id": cluster_id,
+            "candidate_source_ids": sorted(member_ids),
+            "sources": [
+                {
+                    "source_id": str(profile.get("source_id") or ""),
+                    "atomic_note_semantic_hash": _stable_hash(
+                        str(profile.get("atomic_note_markdown") or "")
+                    ),
+                    "candidate_role": candidate_roles.get(
+                        str(profile.get("source_id") or ""),
+                        "supporting",
+                    ),
+                    "source_scope": str(
+                        profile.get("source_scope") or ""
+                    ),
+                    "complete_atomic_note_supplied": bool(
+                        str(profile.get("atomic_note_markdown") or "").strip()
+                    ),
+                }
+                for profile in sorted(
+                    synthesis_profiles,
+                    key=lambda row: str(row.get("source_id") or ""),
+                )
+            ],
+        }
+        member_literature_positions = [
+            dict(position)
+            for position in resolved_literature_positions
+            if {
+                str(
+                    position.get("current_source_id")
+                    or position.get("source_id")
+                    or ""
+                ),
+                str(
+                    position.get("matched_source_id")
+                    or position.get("target_source_id")
+                    or ""
+                ),
+            }.issubset(member_ids)
+        ]
+        important_unmapped_by_id: dict[str, dict[str, Any]] = {}
+        for row in canonical_missing_sources:
+            status = str(row.get("match_status") or "")
+            if status not in {
+                "known_zotero_unmapped",
+                "not_in_snapshot",
+            }:
+                continue
+            invoking_sources = sorted(
+                {
+                    str(value)
+                    for value in row.get(
+                        "discussed_by_source_ids", []
+                    )
+                    or []
+                    if str(value) in member_ids
+                }
+            )
+            if not invoking_sources:
+                continue
+            identity = str(
+                row.get("external_source_id")
+                or _stable_hash(
+                    {
+                        "citation": row.get("raw_citation", ""),
+                        "identifiers": row.get("identifiers", {}),
+                    }
+                )
+            )
+            important_unmapped_by_id[identity] = {
+                "external_source_id": identity,
+                "raw_citation": str(row.get("raw_citation") or ""),
+                "normalized_citation": dict(
+                    _as_mapping(row.get("normalized_citation"))
+                ),
+                "identifiers": dict(
+                    _as_mapping(row.get("identifiers"))
+                ),
+                "invoked_by_source_ids": invoking_sources,
+                "characterization": str(
+                    row.get("importance") or ""
+                ),
+                "status": status,
+            }
         planned_neighbors = list(
             cluster.get("planned_neighbor_relationships", []) or []
         )
@@ -19043,6 +19681,7 @@ def build_literature_report(
                 cluster.get("coherence_rationale") or ""
             ),
             "source_ids": sorted(member_ids),
+            "candidate_roles": candidate_roles,
             "proposition_ids": list(cluster.get("proposition_ids", []) or []),
             "propositions": [
                 dict(row)
@@ -19052,9 +19691,15 @@ def build_literature_report(
         }
         return synthesis_profiles, {
             "cluster": cluster_card,
+            "candidate_input_receipt": candidate_input_receipt,
             "accepted_relationships": _cluster_relationship_context(
                 accepted_relationships, member_ids
             ),
+            "literature_positions": member_literature_positions,
+            "important_unmapped_literature": [
+                important_unmapped_by_id[key]
+                for key in sorted(important_unmapped_by_id)
+            ],
             "neighbor_clusters": [
                 row
                 for row in cluster_context_catalog
@@ -19179,6 +19824,9 @@ def build_literature_report(
                     synthesis_response,
                     cluster,
                     normalized,
+                    candidate_input_receipt=synthesis_context.get(
+                        "candidate_input_receipt"
+                    ),
                 )
                 if synthesis_response.get("cluster_contract")
                 == "streamlined-full-note-v1"
@@ -20943,6 +21591,7 @@ def _streamlined_cluster_markdown(
         sections.append(f"## Bottom line\n\n{bottom_line}")
 
     line_sections: list[str] = []
+    primary_line_by_source: dict[str, str] = {}
     for line in synthesis.get("lines_of_inquiry", []) or []:
         if not isinstance(line, Mapping):
             continue
@@ -20951,43 +21600,78 @@ def _streamlined_cluster_markdown(
         rows = [f"### {heading}"]
         if prose:
             rows.append(prose)
+        findings_by_source: dict[str, list[Mapping[str, Any]]] = defaultdict(
+            list
+        )
+        source_order: list[str] = []
         for finding in line.get("study_findings", []) or []:
             if not isinstance(finding, Mapping):
                 continue
             source_id = str(finding.get("source_id") or "")
+            if not source_id:
+                continue
+            if source_id not in findings_by_source:
+                source_order.append(source_id)
+            findings_by_source[source_id].append(finding)
+        for source_id in source_order:
             source = profile_by_source.get(source_id, {"source_id": source_id})
-            text = _human_projection_text(finding.get("finding") or "")
-            method_scope = _human_projection_text(
-                finding.get("method_scope") or ""
-            )
-            technical_result = _human_technical_result(
-                finding.get("technical_result") or ""
-            )
-            plain_english = _human_projection_text(
-                finding.get("plain_english_meaning") or ""
-            )
-            locators = [
-                _human_locator_text(reference.get("locator") or "")
-                for reference in finding.get("evidence", []) or []
-                if isinstance(reference, Mapping)
-            ]
-            suffix = "; ".join(value for value in locators if value)
-            detail = text
-            if method_scope:
-                detail += f" ({method_scope})"
-            if suffix:
-                detail += f" — {suffix}"
-            rows.append(f"- {_obsidian_note_link(source)}: {detail}")
-            if technical_result and technical_result.casefold() not in {
-                "not reported",
-                "not_reported",
-            }:
-                rows.append(f"  - Technical result: {technical_result}")
-            if (
-                plain_english
-                and plain_english.casefold() not in text.casefold()
-            ):
-                rows.append(f"  - In plain English: {plain_english}")
+            source_link = _obsidian_note_link(source)
+            primary_line = primary_line_by_source.get(source_id)
+            findings = findings_by_source[source_id]
+            if primary_line is None:
+                primary_line_by_source[source_id] = heading
+                rows.append(f"#### {source_link}")
+                method_scope = next(
+                    (
+                        _human_projection_text(
+                            finding.get("method_scope") or ""
+                        )
+                        for finding in findings
+                        if _human_projection_text(
+                            finding.get("method_scope") or ""
+                        )
+                    ),
+                    "",
+                )
+                if method_scope:
+                    rows.append(f"*Method: {method_scope}*")
+            else:
+                rows.append(
+                    f"- See the primary {source_link} discussion under "
+                    f"**{primary_line}**."
+                )
+            for finding in findings:
+                text = _human_projection_text(
+                    finding.get("finding") or ""
+                )
+                technical_result = _human_technical_result(
+                    finding.get("technical_result") or ""
+                )
+                plain_english = _human_projection_text(
+                    finding.get("plain_english_meaning") or ""
+                )
+                locators = [
+                    _human_locator_text(reference.get("locator") or "")
+                    for reference in finding.get("evidence", []) or []
+                    if isinstance(reference, Mapping)
+                ]
+                suffix = "; ".join(value for value in locators if value)
+                detail = text + (f" — {suffix}" if suffix else "")
+                rows.append(f"- {detail}")
+                if technical_result and technical_result.casefold() not in {
+                    "not reported",
+                    "not_reported",
+                }:
+                    rows.append(
+                        f"  - Technical result: {technical_result}"
+                    )
+                    if (
+                        plain_english
+                        and plain_english.casefold() not in text.casefold()
+                    ):
+                        rows.append(
+                            f"  - In plain English: {plain_english}"
+                        )
         line_sections.append("\n\n".join(rows))
     if line_sections:
         sections.append("## Main lines of inquiry\n\n" + "\n\n".join(line_sections))
@@ -21006,6 +21690,69 @@ def _streamlined_cluster_markdown(
             differences.append(f"- {text}")
     if differences:
         sections.append("## How the findings relate\n\n" + "\n".join(differences))
+    cited_works = []
+    for row in synthesis.get(
+        "important_cited_works_not_yet_mapped", []
+    ) or []:
+        if not isinstance(row, Mapping):
+            continue
+        cited_work = _human_projection_text(
+            row.get("cited_work") or row.get("raw_citation") or ""
+        )
+        invoked_by = [
+            _obsidian_note_link(
+                profile_by_source.get(
+                    str(source_id), {"source_id": str(source_id)}
+                )
+            )
+            for source_id in row.get("invoked_by_source_ids", []) or []
+            if str(source_id)
+        ]
+        characterization = _human_projection_text(
+            row.get("characterization") or ""
+        )
+        why_it_matters = _human_projection_text(
+            row.get("why_it_matters") or ""
+        )
+        status = str(row.get("status") or "")
+        if not cited_work or not invoked_by:
+            continue
+        detail = (
+            f"**{cited_work}** — invoked by {', '.join(invoked_by)}"
+        )
+        if characterization:
+            detail += f": {characterization}"
+        if why_it_matters:
+            detail += f" Why it matters: {why_it_matters}"
+        if status:
+            detail += f" _Status: {status}._"
+        cited_works.append(f"- {detail}")
+    if cited_works:
+        sections.append(
+            "## Important cited works not yet mapped\n\n"
+            + "\n".join(cited_works)
+        )
+    material_exclusions = []
+    for row in synthesis.get("material_exclusions", []) or []:
+        if not isinstance(row, Mapping):
+            continue
+        source_id = str(row.get("source_id") or "")
+        boundary = _human_projection_text(
+            row.get("boundary") or row.get("reason") or ""
+        )
+        if not source_id or not boundary:
+            continue
+        source = profile_by_source.get(
+            source_id, {"source_id": source_id}
+        )
+        material_exclusions.append(
+            f"- {_obsidian_note_link(source)}: {boundary}"
+        )
+    if material_exclusions:
+        sections.append(
+            "## Material exclusions\n\n"
+            + "\n".join(material_exclusions)
+        )
     limits = [
         f"- {_human_projection_text(value)}"
         for value in synthesis.get("limits", []) or []
@@ -24499,6 +25246,9 @@ def build_literature_map(
     accepted_relationships: Sequence[Mapping[str, Any]] = (),
     relationship_candidates: Sequence[Mapping[str, Any]] = (),
     catalogue_shards: Sequence[Mapping[str, Any]] = (),
+    shared_literature_plan: Mapping[str, Any] | None = None,
+    literature_positions: Sequence[Mapping[str, Any]] | None = None,
+    missing_sources: Sequence[Mapping[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], list[Path]]:
     """Compatibility entry point for current pipeline callers."""
     request_values = _as_mapping(request) if request is not None else {}
@@ -24525,6 +25275,32 @@ def build_literature_map(
         else None
     )
     navigation_source_notes = _source_notes_with_custody_relations(workspace, notes)
+    if literature_positions is None:
+        position_payload = read_yaml(
+            workspace
+            / "02_source_memory"
+            / "indexes"
+            / "literature_positions.yml",
+            {},
+        ) or {}
+        literature_positions = [
+            dict(row)
+            for row in position_payload.get("positions", []) or []
+            if isinstance(row, Mapping)
+        ]
+    if missing_sources is None:
+        missing_payload = read_yaml(
+            workspace
+            / "02_source_memory"
+            / "indexes"
+            / "missing_sources.yml",
+            {},
+        ) or {}
+        missing_sources = [
+            dict(row)
+            for row in missing_payload.get("sources", []) or []
+            if isinstance(row, Mapping)
+        ]
     report = build_literature_report(
         profiles if profiles is not None else notes,
         previous_registry=previous_registry,
@@ -24540,6 +25316,9 @@ def build_literature_map(
         accepted_relationships=accepted_relationships,
         relationship_candidates=relationship_candidates,
         catalogue_shards=catalogue_shards,
+        shared_literature_plan=shared_literature_plan,
+        literature_positions=literature_positions,
+        missing_sources=missing_sources,
     )
     if reasoner_calls is not None:
         report["manifest"].update(

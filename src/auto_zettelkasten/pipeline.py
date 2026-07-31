@@ -40,6 +40,7 @@ from .indexes import (
     accepted_tags_by_note,
     build_source_catalogue,
     commit_tag_reviews,
+    lean_discovery_projection,
     update_source_set_map,
     write_source_set,
 )
@@ -125,6 +126,7 @@ from .relationships import (
     RELATIONSHIP_DECISION_NORMALIZATION_VERSION,
     RELATIONSHIP_PROMPT_VERSION,
     stable_hash,
+    validate_relationship_decision_rows,
 )
 from .readers import (
     ProviderError,
@@ -3001,6 +3003,622 @@ def _cluster_membership_relations(
     return relations
 
 
+def _plan_literature_families(
+    workspace: Path,
+    *,
+    profiles: Sequence[Any],
+    catalogue: Mapping[str, Any],
+    reasoner: LiteratureReasoner | None,
+    reasoner_calls: _CheckpointedReasonerCalls | None,
+    request: LiteratureMapRequest,
+) -> dict[str, Any] | None:
+    planner = getattr(reasoner, "plan_literature_families", None)
+    if reasoner_calls is None or not callable(planner):
+        return None
+    catalogue_path = Path(str(catalogue.get("catalogue_path") or ""))
+    catalogue_payload = read_yaml(catalogue_path, {}) or {}
+    lean_rows = lean_discovery_projection(profiles, catalogue_payload)
+    if len(lean_rows) < 2:
+        return None
+    plan_path = (
+        workspace
+        / "02_source_memory"
+        / "indexes"
+        / "literature_family_plan.yml"
+    )
+    prior_plan = read_yaml(plan_path, {}) or {}
+    lean_source_hashes = {
+        str(row["source_id"]): stable_hash(row) for row in lean_rows
+    }
+    planning_identity = stable_hash(
+        {
+            "provider": str(getattr(reasoner, "name", "")),
+            "model": str(getattr(reasoner, "model", "")),
+            "prompt_version": "6",
+            "policy": request.literature_policy.to_dict(),
+            "requested_collection_keys": list(
+                request.comparison_collection_keys
+            ),
+        }
+    )
+    prior_source_hashes = dict(prior_plan.get("lean_source_hashes", {}) or {})
+    incremental_source_ids = sorted(
+        {
+            source_id
+            for source_id, source_hash in lean_source_hashes.items()
+            if str(prior_source_hashes.get(source_id) or "") != source_hash
+        }
+        | (set(prior_source_hashes) - set(lean_source_hashes))
+    )
+    incremental_mode = bool(
+        prior_plan.get("literature_families")
+        and prior_source_hashes
+        and str(prior_plan.get("planning_identity") or "")
+        == planning_identity
+        and incremental_source_ids
+    )
+    source_ids = {str(row["source_id"]) for row in lean_rows}
+    positions_payload = read_yaml(
+        workspace / "02_source_memory" / "indexes" / "literature_positions.yml",
+        {},
+    ) or {}
+    mapped_positions = [
+        {
+            key: row.get(key)
+            for key in (
+                "literature_position_id",
+                "current_source_id",
+                "matched_source_id",
+                "engagement",
+                "relation_label",
+                "locator",
+            )
+        }
+        for row in positions_payload.get("positions", []) or []
+        if isinstance(row, Mapping)
+        and str(row.get("current_source_id") or "") in source_ids
+        and str(row.get("matched_source_id") or "") in source_ids
+    ]
+    registry = read_yaml(
+        workspace / "02_source_memory" / "indexes" / "typed_links.yml", {}
+    ) or {}
+    mapped_citations = [
+        {
+            "source_id": str(row.get("source_id") or ""),
+            "target_source_id": str(row.get("target_source_id") or ""),
+            "relation_type": str(row.get("relation_type") or ""),
+        }
+        for row in registry.get("links", []) or []
+        if isinstance(row, Mapping)
+        and str(row.get("relation_type") or "") in {"cites", "cited_by"}
+        and str(row.get("source_id") or "") in source_ids
+        and str(row.get("target_source_id") or "") in source_ids
+    ]
+    human_relationship_pairs = [
+        {
+            "source_id": str(row.get("source_id") or ""),
+            "target_source_id": str(row.get("target_source_id") or ""),
+            "relation_type": str(row.get("relation_type") or ""),
+        }
+        for row in registry.get("links", []) or []
+        if isinstance(row, Mapping)
+        and str(row.get("provenance") or "").casefold().startswith("human")
+        and str(row.get("source_id") or "") in source_ids
+        and str(row.get("target_source_id") or "") in source_ids
+    ]
+    collections = [
+        {
+            "key": str(row.get("key") or ""),
+            "name": str(row.get("name") or ""),
+            "parent_key": str(row.get("parent_key") or ""),
+            "source_ids": sorted(
+                str(value)
+                for value in row.get("direct_source_ids", []) or []
+                if str(value) in source_ids
+            ),
+        }
+        for row in catalogue_payload.get("collections", []) or []
+        if isinstance(row, Mapping)
+        and row.get("key")
+        and any(str(value) in source_ids for value in row.get("direct_source_ids", []) or [])
+    ]
+    requested_keys = list(request.comparison_collection_keys)
+    known_collection_keys = {str(row["key"]) for row in collections}
+    unknown_requested = sorted(set(requested_keys) - known_collection_keys)
+    if unknown_requested:
+        raise ValueError(
+            "unknown comparison collection keys: " + ", ".join(unknown_requested)
+        )
+    context = {
+        "planning_mode": (
+            "incremental_patch" if incremental_mode else "initial_global"
+        ),
+        "collections": collections,
+        "requested_collection_keys": requested_keys,
+        "mapped_citations": mapped_citations,
+        "mapped_literature_positions": mapped_positions,
+        "human_relationship_pairs": human_relationship_pairs,
+    }
+    planner_rows = lean_rows
+    if incremental_mode:
+        changed = set(incremental_source_ids)
+        changed_rows = [
+            row for row in lean_rows if str(row["source_id"]) in changed
+        ]
+        changed_collections = {
+            str(value)
+            for row in changed_rows
+            for value in row.get("collection_keys", []) or []
+        }
+        changed_facets = {
+            str(value).casefold()
+            for row in changed_rows
+            for values in (row.get("facets", {}) or {}).values()
+            for value in values
+        }
+        neighboring_rows = [
+            row
+            for row in lean_rows
+            if str(row["source_id"]) not in changed
+            and (
+                bool(
+                    changed_collections
+                    & {
+                        str(value)
+                        for value in row.get("collection_keys", []) or []
+                    }
+                )
+                or bool(
+                    changed_facets
+                    & {
+                        str(value).casefold()
+                        for values in (row.get("facets", {}) or {}).values()
+                        for value in values
+                    }
+                )
+            )
+        ]
+        # ponytail: bounded deterministic retrieval; switch to indexed search
+        # only if incremental packets become a measured bottleneck.
+        planner_rows = sorted(
+            [*changed_rows, *neighboring_rows[:300]],
+            key=lambda row: str(row["source_id"]),
+        )
+        context.update(
+            {
+                "changed_source_ids": incremental_source_ids,
+                "removed_source_ids": sorted(
+                    set(prior_source_hashes) - set(lean_source_hashes)
+                ),
+                "existing_family_cards": [
+                    {
+                        key: row.get(key)
+                        for key in (
+                            "family_id",
+                            "label",
+                            "organizing_problem",
+                            "source_ids",
+                            "proposed_roles",
+                            "candidate_cluster",
+                        )
+                    }
+                    for row in prior_plan.get("literature_families", []) or []
+                    if isinstance(row, Mapping)
+                ],
+            }
+        )
+    fits = getattr(reasoner, "literature_family_plan_fits", None)
+    flat_path = (
+        bool(fits(planner_rows, request, context=context))
+        if callable(fits)
+        else _reasoner_packet_chars(planner_rows, context)
+        <= _relationship_context_char_budget(reasoner, request)
+    )
+    if flat_path:
+        plan = reasoner_calls(
+            "literature_family_plan",
+            str(context["planning_mode"])
+            + "-"
+            + stable_hash({"index": planner_rows, "context": context})[:16],
+            "plan_literature_families",
+            planner_rows,
+            context,
+        )
+        planning_path = (
+            "incremental_patch"
+            if incremental_mode
+            else "flat_complete_index"
+        )
+        packet_source_ids = [
+            sorted(str(row["source_id"]) for row in planner_rows)
+        ]
+    else:
+        global_spine = [
+            {
+                key: row[key]
+                for key in ("source_id", "title", "author", "year")
+            }
+            for row in planner_rows
+        ]
+        chunk_context = {
+            **context,
+            "planning_mode": "chunk",
+            "global_spine": global_spine,
+        }
+        chunks = _lean_family_plan_chunks(
+            planner_rows,
+            request=request,
+            context=chunk_context,
+            fits=fits,
+        )
+        local_plans = []
+        for index, chunk in enumerate(chunks, start=1):
+            local_context = {
+                **chunk_context,
+                "chunk_id": f"chunk-{index}",
+            }
+            local_plans.append(
+                reasoner_calls(
+                    "literature_family_plan",
+                    f"chunk-{index}-" + stable_hash(chunk)[:16],
+                    "plan_literature_families",
+                    chunk,
+                    local_context,
+                )
+            )
+        compact_local_plans = [
+            {
+                "literature_families": list(
+                    value.get("literature_families", []) or []
+                ),
+                "neighboring_families": list(
+                    value.get("neighboring_families", []) or []
+                ),
+            }
+            for value in local_plans
+        ]
+        plan = reasoner_calls(
+            "literature_family_plan",
+            "reconcile-" + stable_hash(compact_local_plans)[:16],
+            "plan_literature_families",
+            [],
+            {
+                **context,
+                "planning_mode": "chunk_reconciliation",
+                "global_spine": global_spine,
+                "local_family_plans": compact_local_plans,
+            },
+        )
+        planning_path = (
+            "incremental_chunked_reconciliation"
+            if incremental_mode
+            else "chunked_index_reconciliation"
+        )
+        packet_source_ids = [
+            [str(row["source_id"]) for row in chunk] for chunk in chunks
+        ]
+    if incremental_mode:
+        affected = set(incremental_source_ids)
+        patch_families = [
+            dict(row)
+            for row in plan.get("literature_families", []) or []
+            if isinstance(row, Mapping)
+        ]
+        patch_family_ids = {
+            str(row.get("family_id") or "") for row in patch_families
+        }
+        retained_families = [
+            dict(row)
+            for row in prior_plan.get("literature_families", []) or []
+            if isinstance(row, Mapping)
+            and str(row.get("family_id") or "") not in patch_family_ids
+            and affected.isdisjoint(
+                {
+                    str(value)
+                    for value in row.get("source_ids", []) or []
+                }
+            )
+        ]
+        patch_jobs = [
+            dict(row)
+            for row in plan.get("discovery_jobs", []) or []
+            if isinstance(row, Mapping)
+        ]
+        patch_job_ids = {str(row.get("job_id") or "") for row in patch_jobs}
+        retained_jobs = [
+            dict(row)
+            for row in prior_plan.get("discovery_jobs", []) or []
+            if isinstance(row, Mapping)
+            and str(row.get("job_id") or "") not in patch_job_ids
+            and affected.isdisjoint(
+                {
+                    str(value)
+                    for side in ("left_source_ids", "right_source_ids")
+                    for value in row.get(side, []) or []
+                }
+            )
+        ]
+        merged_families = [*retained_families, *patch_families]
+        merged_family_ids = {
+            str(row.get("family_id") or "") for row in merged_families
+        }
+        merged_neighbors: dict[tuple[str, str], dict[str, Any]] = {}
+        for raw in [
+            *(prior_plan.get("neighboring_families", []) or []),
+            *(plan.get("neighboring_families", []) or []),
+        ]:
+            if not isinstance(raw, Mapping):
+                continue
+            left = str(raw.get("left_family_id") or "")
+            right = str(raw.get("right_family_id") or "")
+            if (
+                left in merged_family_ids
+                and right in merged_family_ids
+                and left != right
+            ):
+                merged_neighbors[tuple(sorted((left, right)))] = dict(raw)
+        plan = {
+            "literature_families": merged_families,
+            "discovery_jobs": [*retained_jobs, *patch_jobs],
+            "neighboring_families": list(merged_neighbors.values()),
+        }
+    validated = _validate_literature_family_plan(
+        plan,
+        lean_rows=lean_rows,
+        requested_collection_keys=requested_keys,
+    )
+    lean_serialized = json.dumps(
+        lean_rows,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    result = {
+        **validated,
+        "planning_path": planning_path,
+        "planning_mode": str(context["planning_mode"]),
+        "planning_identity": planning_identity,
+        "incremental_source_ids": incremental_source_ids,
+        "lean_source_hashes": lean_source_hashes,
+        "lean_index_hash": stable_hash(lean_rows),
+        "lean_index_source_count": len(lean_rows),
+        "lean_index_serialized_chars": len(lean_serialized),
+        "estimated_input_tokens": max(1, len(lean_serialized) // 4),
+        "packet_source_ids": packet_source_ids,
+        "requested_collection_keys": requested_keys,
+    }
+    receipt_path = (
+        workspace
+        / "02_source_memory"
+        / "indexes"
+        / "lean_discovery_receipt.yml"
+    )
+    receipt = {
+        key: result[key]
+        for key in (
+            "planning_path",
+            "planning_mode",
+            "incremental_source_ids",
+            "lean_index_hash",
+            "lean_index_source_count",
+            "lean_index_serialized_chars",
+            "estimated_input_tokens",
+            "packet_source_ids",
+            "requested_collection_keys",
+        )
+    }
+    if (read_yaml(receipt_path, {}) or {}) != receipt:
+        write_yaml(receipt_path, receipt)
+    persisted_plan = {
+        key: result[key]
+        for key in (
+            "literature_families",
+            "discovery_jobs",
+            "neighboring_families",
+            "planning_path",
+            "planning_identity",
+            "incremental_source_ids",
+            "lean_source_hashes",
+            "lean_index_hash",
+            "requested_collection_keys",
+        )
+    }
+    if (read_yaml(plan_path, {}) or {}) != persisted_plan:
+        write_yaml(plan_path, persisted_plan)
+    result["receipt_path"] = str(receipt_path)
+    result["plan_path"] = str(plan_path)
+    return result
+
+
+def _lean_family_plan_chunks(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    request: LiteratureMapRequest,
+    context: Mapping[str, Any],
+    fits: Any,
+) -> list[list[dict[str, Any]]]:
+    chunks: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for raw in rows:
+        row = dict(raw)
+        candidate = [*current, row]
+        candidate_fits = (
+            bool(fits(candidate, request, context=context))
+            if callable(fits)
+            else _reasoner_packet_chars(candidate, context)
+            <= 1_200_000
+        )
+        if current and not candidate_fits:
+            chunks.append(current)
+            current = [row]
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    if any(
+        callable(fits) and not fits(chunk, request, context=context)
+        for chunk in chunks
+    ):
+        raise ValueError("one complete lean index record exceeds the planning context")
+    return chunks
+
+
+def _validate_literature_family_plan(
+    response: Mapping[str, Any],
+    *,
+    lean_rows: Sequence[Mapping[str, Any]],
+    requested_collection_keys: Sequence[str],
+) -> dict[str, Any]:
+    available = {str(row.get("source_id") or "") for row in lean_rows}
+    memberships = {
+        str(row.get("source_id") or ""): {
+            str(value) for value in row.get("collection_keys", []) or []
+        }
+        for row in lean_rows
+    }
+    raw_families = response.get("literature_families")
+    raw_jobs = response.get("discovery_jobs")
+    raw_neighbors = response.get("neighboring_families", [])
+    if not isinstance(raw_families, list) or not isinstance(raw_jobs, list):
+        raise ValueError("literature family plan requires family and discovery lists")
+    if not isinstance(raw_neighbors, list):
+        raise ValueError("literature family plan neighboring_families must be a list")
+    families = []
+    family_ids: set[str] = set()
+    for raw in raw_families:
+        if not isinstance(raw, Mapping):
+            continue
+        family_id = str(raw.get("family_id") or "").strip()
+        source_ids = sorted(
+            {
+                str(value)
+                for value in raw.get("source_ids", []) or []
+                if str(value) in available
+            }
+        )
+        if not family_id or family_id in family_ids or len(source_ids) < 2:
+            continue
+        family_ids.add(family_id)
+        roles = (
+            dict(raw.get("proposed_roles") or {})
+            if isinstance(raw.get("proposed_roles"), Mapping)
+            else {}
+        )
+        families.append(
+            {
+                "family_id": family_id,
+                "label": str(raw.get("label") or family_id).strip(),
+                "organizing_problem": str(
+                    raw.get("organizing_problem") or ""
+                ).strip(),
+                "source_ids": source_ids,
+                "proposed_roles": {
+                    source_id: str(roles.get(source_id) or "supporting")
+                    for source_id in source_ids
+                },
+                "candidate_cluster": bool(raw.get("candidate_cluster", True)),
+            }
+        )
+    if not families:
+        raise ValueError("literature family plan contained no valid families")
+    jobs = []
+    seen_jobs: set[str] = set()
+    for raw in raw_jobs:
+        if not isinstance(raw, Mapping):
+            continue
+        job_id = str(raw.get("job_id") or "").strip()
+        left = sorted(
+            {str(value) for value in raw.get("left_source_ids", []) or [] if str(value) in available}
+        )
+        right = sorted(
+            {str(value) for value in raw.get("right_source_ids", []) or [] if str(value) in available}
+        )
+        if not job_id or job_id in seen_jobs or not left or not right:
+            continue
+        seen_jobs.add(job_id)
+        requested_pair = sorted(
+            {
+                str(value)
+                for value in raw.get("requested_collection_pair", []) or []
+                if str(value)
+            }
+        )
+        try:
+            quota = max(1, min(120, int(raw.get("candidate_quota", 24) or 24)))
+        except (TypeError, ValueError):
+            quota = 24
+        jobs.append(
+            {
+                "job_id": job_id,
+                "family": str(raw.get("family") or ""),
+                "left_source_ids": left,
+                "right_source_ids": right,
+                "requested_collection_pair": requested_pair,
+                "discovery_goal": str(raw.get("discovery_goal") or "").strip(),
+                "candidate_quota": quota,
+            }
+        )
+    requested_pairs = {
+        tuple(sorted(pair))
+        for index, left_key in enumerate(requested_collection_keys)
+        for pair in (
+            (left_key, right_key)
+            for right_key in requested_collection_keys[index + 1 :]
+        )
+    }
+    covered_pairs = {
+        tuple(row["requested_collection_pair"])
+        for row in jobs
+        if len(row["requested_collection_pair"]) == 2
+    }
+    for pair in sorted(requested_pairs - covered_pairs):
+        left = sorted(
+            source_id for source_id, keys in memberships.items() if pair[0] in keys
+        )
+        right = sorted(
+            source_id for source_id, keys in memberships.items() if pair[1] in keys
+        )
+        overlap = set(left) & set(right)
+        left = [value for value in left if value not in overlap]
+        right = [value for value in right if value not in overlap]
+        if not left or not right:
+            raise ValueError(
+                "requested collection comparison has no distinct mapped endpoints: "
+                + " / ".join(pair)
+            )
+        jobs.append(
+            {
+                "job_id": "requested-comparison-" + stable_hash(pair)[:12],
+                "family": "explicit_requested_collection_comparison",
+                "left_source_ids": left,
+                "right_source_ids": right,
+                "requested_collection_pair": list(pair),
+                "discovery_goal": "Compare the explicitly requested collections across distinct literature families.",
+                "candidate_quota": 40,
+            }
+        )
+    if not jobs:
+        raise ValueError("literature family plan contained no valid discovery jobs")
+    neighbors = [
+        {
+            "left_family_id": str(row.get("left_family_id") or ""),
+            "right_family_id": str(row.get("right_family_id") or ""),
+            "reason": str(row.get("reason") or "").strip(),
+        }
+        for row in raw_neighbors
+        if isinstance(row, Mapping)
+        and str(row.get("left_family_id") or "") in family_ids
+        and str(row.get("right_family_id") or "") in family_ids
+        and str(row.get("left_family_id") or "")
+        != str(row.get("right_family_id") or "")
+    ]
+    return {
+        "literature_families": families,
+        "discovery_jobs": jobs,
+        "neighboring_families": neighbors,
+    }
+
+
 def _run_relationship_reasoning(
     workspace: Path,
     *,
@@ -3010,6 +3628,7 @@ def _run_relationship_reasoning(
     reasoner: LiteratureReasoner | None,
     reasoner_calls: _CheckpointedReasonerCalls | None,
     request: LiteratureMapRequest,
+    shared_family_plan: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run global discovery and one complete decision per immutable pair job."""
 
@@ -3181,8 +3800,28 @@ def _run_relationship_reasoning(
             if isinstance(row, Mapping)
         ],
     }
+    shared_plan_active = bool(
+        shared_family_plan
+        and shared_family_plan.get("discovery_jobs")
+        and shared_family_plan.get("literature_families")
+    )
     catalogue_revision = stable_hash(
-        {"entries": entries, "collection_structure": collection_structure}
+        {
+            "lean_index_hash": str(
+                shared_family_plan.get("lean_index_hash") or ""
+            ),
+            "literature_families": list(
+                shared_family_plan.get("literature_families", []) or []
+            ),
+            "discovery_jobs": list(
+                shared_family_plan.get("discovery_jobs", []) or []
+            ),
+            "requested_collection_keys": list(
+                shared_family_plan.get("requested_collection_keys", []) or []
+            ),
+        }
+        if shared_plan_active
+        else {"entries": entries, "collection_structure": collection_structure}
     )
     current_hashes = {
         source_id: stable_hash(profile_to_dict(profile))
@@ -3387,6 +4026,10 @@ def _run_relationship_reasoning(
             negative_pairs.add(pair)
     for pair in negative_pairs:
         mandatory_basis.pop(pair, None)
+    if shared_plan_active:
+        # Structural citations remain visible without consuming full-note
+        # adjudication capacity. The shared plan chooses which pairs merit it.
+        mandatory_basis.clear()
 
     configured_max_calls = getattr(reasoner_calls, "max_calls", None)
     remaining_calls = (
@@ -3613,6 +4256,8 @@ def _run_relationship_reasoning(
     )
     discovery_completed = False
     discovery_terminal = False
+    if shared_plan_active:
+        can_discover = False
     if can_discover and requires_routing:
         selected_collection_source_ids = set(profile_by_source)
         if collection_cards:
@@ -4087,6 +4732,191 @@ def _run_relationship_reasoning(
             )
         )
 
+    if shared_plan_active:
+        lean_by_source = {
+            str(row.get("source_id") or ""): row
+            for row in lean_discovery_projection(
+                profiles,
+                catalogue_payload,
+            )
+            if str(row.get("source_id") or "") in profile_by_source
+        }
+        shared_job_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for raw_job in shared_family_plan.get("discovery_jobs", []) or []:
+            if not isinstance(raw_job, Mapping):
+                continue
+            left_ids = sorted(
+                {
+                    str(value)
+                    for value in raw_job.get("left_source_ids", []) or []
+                    if str(value) in lean_by_source
+                }
+            )
+            right_ids = sorted(
+                {
+                    str(value)
+                    for value in raw_job.get("right_source_ids", []) or []
+                    if str(value) in lean_by_source
+                }
+            )
+            overlap = set(left_ids) & set(right_ids)
+            left_ids = [value for value in left_ids if value not in overlap]
+            right_ids = [value for value in right_ids if value not in overlap]
+            if not left_ids or not right_ids:
+                continue
+            pool = (
+                "bridge"
+                if raw_job.get("requested_collection_pair")
+                else "general"
+            )
+            shared_job_groups[pool].append(
+                {
+                    "bridge_job_id": str(
+                        raw_job.get("job_id")
+                        or "family-job-" + stable_hash(raw_job)[:12]
+                    ),
+                    "left_source_ids": left_ids,
+                    "right_source_ids": right_ids,
+                    "bridge_family": str(raw_job.get("family") or ""),
+                    "why_examine": str(
+                        raw_job.get("discovery_goal") or ""
+                    ),
+                    "target_candidate_count": int(
+                        raw_job.get("candidate_quota", 24) or 24
+                    ),
+                    "requested_collection_pair": list(
+                        raw_job.get("requested_collection_pair", []) or []
+                    ),
+                }
+            )
+        candidate_tasks = []
+        family_rows = {
+            str(row.get("family_id") or ""): dict(row)
+            for row in shared_family_plan.get("literature_families", []) or []
+            if isinstance(row, Mapping) and row.get("family_id")
+        }
+        context_budget = _relationship_context_char_budget(reasoner, request)
+        for pool, shared_jobs in sorted(shared_job_groups.items()):
+            ordered_jobs = sorted(
+                shared_jobs,
+                key=lambda row: (
+                    -int(row.get("target_candidate_count", 24) or 24),
+                    str(row.get("bridge_job_id") or ""),
+                ),
+            )
+            packet_count = min(2, len(ordered_jobs))
+            packets: list[list[dict[str, Any]]] = [
+                [] for _ in range(packet_count)
+            ]
+            packet_loads = [0] * packet_count
+            for job in ordered_jobs:
+                index = min(
+                    range(packet_count),
+                    key=lambda value: (packet_loads[value], value),
+                )
+                packets[index].append(job)
+                packet_loads[index] += int(
+                    job.get("target_candidate_count", 24) or 24
+                )
+            while True:
+                oversized_index = next(
+                    (
+                        index
+                        for index, jobs in enumerate(packets)
+                        if len(jobs) > 1
+                        and _reasoner_packet_chars(
+                            [
+                                lean_by_source[source_id]
+                                for source_id in sorted(
+                                    {
+                                        source_id
+                                        for job in jobs
+                                        for side in (
+                                            "left_source_ids",
+                                            "right_source_ids",
+                                        )
+                                        for source_id in job[side]
+                                    }
+                                )
+                            ],
+                            {"bridge_jobs": jobs},
+                        )
+                        > context_budget
+                    ),
+                    None,
+                )
+                if oversized_index is None:
+                    break
+                jobs = packets.pop(oversized_index)
+                packets.extend([jobs[::2], jobs[1::2]])
+            for packet_index, packet_jobs in enumerate(packets, start=1):
+                source_ids = {
+                    source_id
+                    for job in packet_jobs
+                    for side in ("left_source_ids", "right_source_ids")
+                    for source_id in job[side]
+                }
+                task_profiles = [
+                    _relationship_evidence_projection(
+                        profile_by_source[source_id],
+                        lean_by_source[source_id],
+                        include_anchors=False,
+                    )
+                    for source_id in sorted(source_ids)
+                ]
+                relevant_families = [
+                    family_rows[family_id]
+                    for family_id in sorted(
+                        {
+                            str(job.get("bridge_family") or "")
+                            for job in packet_jobs
+                        }
+                        & set(family_rows)
+                    )
+                ]
+                stage = (
+                    "relationship_bridge_candidate_selection"
+                    if pool == "bridge"
+                    else "relationship_candidate_selection"
+                )
+                candidate_tasks.append(
+                    (
+                        stage,
+                        "shared-plan-"
+                        + pool
+                        + f"-{packet_index}-"
+                        + stable_hash(packet_jobs)[:16],
+                        task_profiles,
+                        {
+                            **base_discovery_context,
+                            "discovery_mode": (
+                                "bridge_only"
+                                if pool == "bridge"
+                                else "shared_family_plan"
+                            ),
+                            "catalogue": [
+                                lean_by_source[source_id]
+                                for source_id in sorted(source_ids)
+                            ],
+                            "bridge_jobs": packet_jobs,
+                            "literature_families": relevant_families,
+                            "max_inferred_pairs": min(
+                                _RELATIONSHIP_CANDIDATE_MAX,
+                                sum(
+                                    int(
+                                        row.get(
+                                            "target_candidate_count", 24
+                                        )
+                                        or 24
+                                    )
+                                    for row in packet_jobs
+                                ),
+                            ),
+                        },
+                        pool,
+                    )
+                )
+
     current_remaining_calls = (
         remaining_calls
         if configured_max_calls is None
@@ -4525,6 +5355,24 @@ def _run_relationship_reasoning(
             )
         jobs.append(job)
 
+    def validate_cached_job(
+        job: RelationshipPairJob,
+        payload: Mapping[str, Any],
+    ) -> tuple[bool, dict[str, list[dict[str, Any]]]]:
+        validation = validate_relationship_decision_rows(
+            {"decisions": [dict(payload)]},
+            jobs=[job],
+            profiles=list(profile_by_source.values()),
+            provider=provider_name,
+            model=model_name,
+            reasoner_backend=reasoner_backend,
+            prompt_version=RELATIONSHIP_PROMPT_VERSION,
+        )
+        valid = bool(
+            validation["accepted"] or validation["no_relationship"]
+        ) and not bool(validation["needs_more_context"])
+        return valid, validation
+
     responses: list[dict[str, Any]] = []
     unresolved: list[RelationshipPairJob] = []
     preparked: list[dict[str, Any]] = list(discovery_parked)
@@ -4572,6 +5420,21 @@ def _run_relationship_reasoning(
                 unresolved.append(job)
                 continue
             if isinstance(payload, Mapping):
+                valid, validation = validate_cached_job(job, payload)
+                if not valid:
+                    preparked.extend(
+                        {
+                            **dict(row),
+                            "pair_job_id": job.pair_job_id,
+                            "source_id": job.left_source_id,
+                            "target_source_id": job.right_source_id,
+                        }
+                        for row in [
+                            *validation["needs_more_context"],
+                            *validation["parked"],
+                        ]
+                    )
+                    continue
                 responses.append(
                     {
                         **dict(payload),
@@ -4786,6 +5649,7 @@ def _run_relationship_reasoning(
             if response_or_error is None:
                 raise RuntimeError("relationship_batch_was_not_scheduled")
             response = response_or_error
+            write_json(batch_root / "provider_result.json", dict(response))
             raw_decisions = response.get("decisions", []) or []
             if isinstance(raw_decisions, Mapping):
                 raw_decisions = [
@@ -4837,6 +5701,50 @@ def _run_relationship_reasoning(
                     "provider": provider_name,
                     "model": model_name,
                 }
+                write_json(
+                    job_root / job.pair_job_id / "provider_result.json",
+                    row,
+                )
+                write_json(
+                    global_job_root
+                    / job.pair_job_id
+                    / "provider_result.json",
+                    row,
+                )
+                valid, validation = validate_cached_job(job, row)
+                if not valid:
+                    reason_rows = [
+                        *validation["needs_more_context"],
+                        *validation["parked"],
+                    ]
+                    reason = ",".join(
+                        sorted(
+                            {
+                                str(value.get("reason") or "")
+                                for value in reason_rows
+                                if str(value.get("reason") or "")
+                            }
+                        )
+                    ) or "relationship_decision_needs_review"
+                    preparked.append(
+                        {
+                            "pair_job_id": job.pair_job_id,
+                            "source_id": job.left_source_id,
+                            "target_source_id": job.right_source_id,
+                            "status": "parked_for_review",
+                            "reason": reason,
+                        }
+                    )
+                    write_yaml(
+                        status_path,
+                        {
+                            "pair_job_id": job.pair_job_id,
+                            "status": "parked_for_review",
+                            "reason": reason,
+                            "decision_identity": decision_identity,
+                        },
+                    )
+                    continue
                 write_json(job_root / job.pair_job_id / "result.json", row)
                 write_json(
                     global_job_root / job.pair_job_id / "result.json", row
@@ -4912,8 +5820,6 @@ def _run_relationship_reasoning(
                         "retry_on_resume": retry_on_resume,
                     },
                 )
-    from .relationships import validate_relationship_decision_rows
-
     validated = validate_relationship_decision_rows(
         {"decisions": responses},
         jobs=jobs,
@@ -5246,6 +6152,7 @@ def _relationship_transport_context(
 ) -> dict[str, Any]:
     if decision_contract not in {
         "relationship-decision-v6",
+        "relationship-decision-v7",
         RELATIONSHIP_DECISION_CONTRACT,
     }:
         return {"pair_jobs": [job.to_dict() for job in jobs]}
@@ -5263,7 +6170,8 @@ def _relationship_transport_context(
         atomic_notes = row.pop("atomic_notes", {})
         selected_evidence = (
             row.pop("selected_evidence", {})
-            if decision_contract == RELATIONSHIP_DECISION_CONTRACT
+            if decision_contract
+            in {"relationship-decision-v7", RELATIONSHIP_DECISION_CONTRACT}
             else {}
         )
         for side, source_id in (
@@ -5283,7 +6191,8 @@ def _relationship_transport_context(
                     or {}
                 )
             if (
-                decision_contract == RELATIONSHIP_DECISION_CONTRACT
+                decision_contract
+                in {"relationship-decision-v7", RELATIONSHIP_DECISION_CONTRACT}
                 and source_id not in source_evidence
             ):
                 source_evidence[source_id] = list(
@@ -5301,7 +6210,10 @@ def _relationship_transport_context(
         },
         "pair_jobs": pair_jobs,
     }
-    if decision_contract == RELATIONSHIP_DECISION_CONTRACT:
+    if decision_contract in {
+        "relationship-decision-v7",
+        RELATIONSHIP_DECISION_CONTRACT,
+    }:
         payload["source_evidence"] = {
             key: source_evidence[key] for key in sorted(source_evidence)
         }
@@ -6107,6 +7019,9 @@ def rebuild_map(
         provider_concurrency=(
             effective_request.provider_concurrency or effective_request.parallel
         ),
+        comparison_collection_keys=list(
+            source_set.get("comparison_collection_keys", []) or []
+        ),
         literature_policy=effective_request.literature_policy,
     )
     reasoner_calls = (
@@ -6177,30 +7092,50 @@ def rebuild_map(
         for row in collection_rows
     ]
     try:
-        relationship_result = _run_relationship_reasoning(
+        shared_family_plan = _plan_literature_families(
             workspace,
             profiles=workspace_profiles,
-            source_set=source_set,
             catalogue=catalogue,
             reasoner=reasoner,
             reasoner_calls=reasoner_calls,
             request=base_literature_request,
         )
+        relationship_result = _run_relationship_reasoning(
+            workspace,
+            profiles=workspace_profiles,
+            source_set=global_source_set,
+            catalogue=catalogue,
+            reasoner=reasoner,
+            reasoner_calls=reasoner_calls,
+            request=base_literature_request,
+            shared_family_plan=shared_family_plan,
+        )
     except Exception as exc:
+        failure_reason = (
+            "literature_family_planning_failure"
+            if "shared_family_plan" not in locals()
+            else "relationship_stage_failure"
+        )
         relationship_result = {
             "accepted": [],
             "no_relationship": [],
             "parked": [
                 {
-                    "reason": "relationship_stage_failure",
+                    "reason": failure_reason,
                     "error_type": type(exc).__name__,
                     "error": str(exc),
-                    "retry_on_resume": True,
+                    "retry_on_resume": _synthesis_failure_class(exc) == "transport",
                 }
             ],
             "cluster_candidates": [],
             "selected_profile_hashes": {},
             "reconciled_catalogue_revision": "",
+            "relationship_stage_complete": False,
+            "relationship_retry_on_resume": (
+                _synthesis_failure_class(exc) == "transport"
+            ),
+            "planning_failed": failure_reason
+            == "literature_family_planning_failure",
         }
     relationship_ledger_path = _write_relationship_run_ledger(
         workspace, run_id, relationship_result
@@ -6223,7 +7158,11 @@ def rebuild_map(
         parked_rows=relationship_result.get("parked", []) or [],
         preserve_unmentioned_structural=True,
         orphaned_source_ids=orphaned_source_ids,
-        reconcile_machine_prompt_version=RELATIONSHIP_PROMPT_VERSION,
+        reconcile_machine_prompt_version=(
+            None
+            if relationship_result.get("planning_failed")
+            else RELATIONSHIP_PROMPT_VERSION
+        ),
     )
     global_source_set["rejected_pair_memory"] = [
         {
@@ -6283,13 +7222,24 @@ def rebuild_map(
         )
         if progress is not None:
             progress.update_literature(literature_failure_count=1)
+        preserved_clusters, refresh_paths = (
+            _preserve_last_valid_clusters_on_refresh_failure(
+                workspace,
+                global_map_id,
+                reason,
+            )
+        )
         return {
             "source_set": dict(source_set),
             "cluster_map": {
                 "status": "partial",
-                "clusters": [],
+                "clusters": preserved_clusters,
                 "relations": [],
                 "unclustered_sources": [],
+                "refresh_pending_cluster_count": len(preserved_clusters),
+                "planning_refresh_pending": bool(
+                    relationship_result.get("planning_failed")
+                ),
             },
             "gap_map": {
                 "status": "partial",
@@ -6328,6 +7278,7 @@ def rebuild_map(
                 *graph_paths,
                 *profile_result["paths"],
                 *_existing_source_set_paths(workspace, source_set),
+                *refresh_paths,
             ],
         }
     literature_note_rows = list(workspace_note_rows)
@@ -6351,6 +7302,7 @@ def rebuild_map(
                 "cluster_candidates", []
             )
             or [],
+            shared_literature_plan=shared_family_plan,
             catalogue_shards=[
                 *[
                     {

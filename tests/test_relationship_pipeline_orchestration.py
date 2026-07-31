@@ -272,6 +272,7 @@ def _run(
     *,
     reasoner: _Reasoner | None = None,
     catalogue: Mapping[str, Any] | None = None,
+    shared_family_plan: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     return _run_relationship_reasoning(
         workspace,
@@ -281,6 +282,7 @@ def _run(
         reasoner=reasoner or _Reasoner(),
         reasoner_calls=calls,  # type: ignore[arg-type]
         request=_request(workspace),
+        shared_family_plan=shared_family_plan,
     )
 
 
@@ -383,6 +385,62 @@ def test_global_discovery_creates_immutable_pair_job(
     ] == ["relationship_candidate_selection"]
     assert replay["provider_batch_count"] == 0
     assert job_path.read_bytes() == before
+
+
+def test_shared_plan_keeps_family_discovery_in_separate_packets(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile(source_id) for source_id in "ABCDEFGH"]
+    calls = _Calls(
+        lambda stage, _profiles, _context: (
+            {"candidates": []}
+            if stage.endswith("candidate_selection")
+            else {"decisions": []}
+        )
+    )
+    families = [
+        {
+            "family_id": f"family-{index}",
+            "source_ids": [left, right],
+        }
+        for index, (left, right) in enumerate(
+            (("A", "B"), ("C", "D"), ("E", "F"), ("G", "H")),
+            start=1,
+        )
+    ]
+    jobs = [
+        {
+            "job_id": f"job-{index}",
+            "family": f"family-{index}",
+            "left_source_ids": [left],
+            "right_source_ids": [right],
+            "candidate_quota": 12,
+            "requested_collection_pair": (
+                ["C1", "C2"] if index > 2 else []
+            ),
+        }
+        for index, (left, right) in enumerate(
+            (("A", "B"), ("C", "D"), ("E", "F"), ("G", "H")),
+            start=1,
+        )
+    ]
+
+    _run(
+        tmp_path,
+        profiles,
+        calls,
+        shared_family_plan={
+            "lean_index_hash": "lean",
+            "literature_families": families,
+            "discovery_jobs": jobs,
+        },
+    )
+
+    discovery_calls = [
+        row for row in calls.seen if row[0].endswith("candidate_selection")
+    ]
+    assert len(discovery_calls) == 4
+    assert all(len(row[2]["bridge_jobs"]) == 1 for row in discovery_calls)
 
 
 def test_candidate_cap_reserves_bridge_slots_and_keeps_model_rank() -> None:

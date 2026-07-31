@@ -1814,7 +1814,11 @@ def migrate_v016_metadata(
             relations.append(row)
         updated = {
             **dict(value),
-            "registry_schema_version": "6",
+            "registry_schema_version": (
+                "7"
+                if str(value.get("registry_schema_version") or "") == "7"
+                else "6"
+            ),
             "relations": relations,
             "links": [
                 row for row in relations if bool(row.get("active", True))
