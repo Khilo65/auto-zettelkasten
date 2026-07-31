@@ -180,6 +180,50 @@ def test_shared_family_plan_bypasses_cluster_planner_and_supplies_receipt() -> N
     assert synthesis["candidate_input_receipt"] == receipt
 
 
+def test_one_malformed_shared_plan_cluster_is_parked_without_partial_map() -> None:
+    profiles = [_profile("A"), _profile("B")]
+
+    class Reasoner:
+        name = "local"
+        model = "test"
+
+        def synthesize_cluster(self, projected, request, *, context=None):
+            return {}
+
+    report = build_literature_report(
+        profiles,
+        reasoner=Reasoner(),
+        request=LiteratureMapRequest(Path(".")),
+        source_notes=[
+            {
+                "source_id": source_id,
+                "title": f"Source {source_id}",
+                "source_scope": "full_document",
+                "body": f"# Source {source_id}\n\nFull note.",
+            }
+            for source_id in ("A", "B")
+        ],
+        shared_literature_plan={
+            "literature_families": [
+                {
+                    "family_id": "shared-family",
+                    "label": "Shared family",
+                    "organizing_problem": "A bounded problem",
+                    "source_ids": ["A", "B"],
+                    "proposed_roles": {"A": "core", "B": "supporting"},
+                    "candidate_cluster": True,
+                }
+            ],
+            "discovery_jobs": [],
+            "neighboring_families": [],
+        },
+    )
+
+    assert report["packet"]["status"] == "complete"
+    assert report["cluster_registry"]["clusters"] == []
+    assert len(report["packet"]["parked_cluster_ids"]) == 1
+
+
 def test_shared_family_admits_only_bounded_partial_with_partial_role() -> None:
     partial = _profile("P")
     partial.update(

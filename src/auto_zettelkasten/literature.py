@@ -20022,6 +20022,53 @@ def build_literature_report(
             cluster["refresh_pending"] = False
             validated_synthesis["refresh_pending"] = False
         cluster_syntheses[cluster_id] = validated_synthesis
+    previous_cluster_ids = {
+        str(row.get("cluster_id") or "")
+        for row in (previous_registry or {}).get("clusters", []) or []
+        if isinstance(row, Mapping) and row.get("cluster_id")
+    }
+    parked_new_cluster_ids = {
+        cluster_id
+        for cluster_id, synthesis in cluster_syntheses.items()
+        if synthesis.get("status") == "partial"
+        and cluster_id not in previous_cluster_ids
+    } if shared_plan else set()
+    if parked_new_cluster_ids:
+        parked_clusters = [
+            dict(cluster)
+            for cluster in registry["clusters"]
+            if str(cluster.get("cluster_id") or "") in parked_new_cluster_ids
+        ]
+        registry["clusters"] = [
+            cluster
+            for cluster in registry["clusters"]
+            if str(cluster.get("cluster_id") or "") not in parked_new_cluster_ids
+        ]
+        for cluster in parked_clusters:
+            cluster_id = str(cluster["cluster_id"])
+            registry["pending_revisions"].append(
+                {
+                    "cluster_id": cluster_id,
+                    "pending_revision_hash": str(
+                        cluster.get("revision_hash") or ""
+                    ),
+                    "last_good_revision_hash": "",
+                    "refresh_pending_source_ids": list(
+                        cluster.get("source_ids", []) or []
+                    ),
+                    "cluster": cluster,
+                    "synthesis": dict(cluster_syntheses[cluster_id]),
+                }
+            )
+            registry["ledger"].append(
+                {
+                    "event": "cluster_parked_by_writer",
+                    "cluster_id": cluster_id,
+                    "revision_hash": str(cluster.get("revision_hash") or ""),
+                }
+            )
+        clustered["clusters"] = list(registry["clusters"])
+        reverted_refresh = True
     rejected_cluster_ids = {
         cluster_id
         for cluster_id, synthesis in cluster_syntheses.items()
@@ -20070,6 +20117,17 @@ def build_literature_report(
         **registry,
         **final_lifecycle,
     }
+    current_or_parked_ids = {
+        str(row.get("cluster_id") or "")
+        for row in registry["clusters"]
+        if row.get("cluster_id")
+    } | parked_new_cluster_ids
+    registry["pending_revisions"] = [
+        row
+        for row in registry.get("pending_revisions", []) or []
+        if isinstance(row, Mapping)
+        and str(row.get("cluster_id") or "") in current_or_parked_ids
+    ]
     if reverted_refresh or writer_membership_changed:
         clustered["clusters"] = list(registry["clusters"])
         clustered["unclustered_sources"] = _reconcile_final_unclustered_sources(
@@ -20437,7 +20495,10 @@ def build_literature_report(
         if isinstance(row, Mapping) and row.get("cluster_id")
     }
     partial_cluster_ids = sorted(incomplete_synthesis_ids | refresh_pending_ids)
-    if partial_cluster_ids or failed_plan_source_ids:
+    if (
+        not shared_plan
+        and (partial_cluster_ids or failed_plan_source_ids)
+    ) or failed_plan_source_ids:
         packet.update(
             {
                 "status": "partial",
@@ -20472,6 +20533,10 @@ def build_literature_report(
         )
     else:
         packet["status"] = "complete"
+        packet["parked_cluster_ids"] = sorted(parked_new_cluster_ids)
+        packet["refresh_pending_cluster_ids"] = sorted(
+            refresh_pending_ids - parked_new_cluster_ids
+        )
     return {
         "manifest": manifest,
         "profiles": normalized,
