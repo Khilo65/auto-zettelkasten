@@ -5,6 +5,7 @@ from pathlib import Path
 
 from auto_zettelkasten.files import write_yaml
 from auto_zettelkasten.models import RelationshipPairJob
+from auto_zettelkasten.readers import _relationship_adjudication_system_prompt
 from auto_zettelkasten.relationships import (
     RELATIONSHIP_DECISION_CONTRACT,
     ingest_relationship_decision_batch,
@@ -80,6 +81,14 @@ def test_v8_salvages_valid_connections_and_keeps_anchors_optional() -> None:
     assert accepted["source_evidence_anchor_ids"] == []
     assert accepted["secondary_relation_types"] == ["complements"]
     assert accepted["connection_id"].startswith("relationship-connection-")
+
+
+def test_v12_defines_endpoint_basis_ownership() -> None:
+    prompt = _relationship_adjudication_system_prompt()
+
+    assert "relationship prompt v12" in prompt
+    assert "source_a_basis always describes the supplied left_source_id note" in prompt
+    assert "source_b_basis always describes the supplied right_source_id note" in prompt
 
 
 def test_v8_accepts_prose_wrapped_singleton_and_relation_shorthand() -> None:
@@ -266,6 +275,7 @@ def test_schema6_migration_keeps_one_provisional_effective_decision(
     migrated = persist_relationship_registry(
         tmp_path,
         structural_relations=[],
+        reconcile_machine_prompt_version="12",
     )
 
     active_machine = [
@@ -283,3 +293,20 @@ def test_schema6_migration_keeps_one_provisional_effective_decision(
     assert current["status"] == "reconciliation_pending"
     assert current["relation_ids"] == [active_machine[0]["relation_id"]]
     assert current["reconciliation_pending"] is True
+
+    replay = persist_relationship_registry(
+        tmp_path,
+        structural_relations=[],
+        reconcile_machine_prompt_version="12",
+    )
+    replay_machine = [
+        row
+        for row in replay["links"]
+        if str(row.get("provenance", "")).startswith(
+            "probabilistic_relationship_"
+        )
+    ]
+    assert [row["relation_id"] for row in replay_machine] == [
+        active_machine[0]["relation_id"]
+    ]
+    assert replay_machine[0]["active"] is True

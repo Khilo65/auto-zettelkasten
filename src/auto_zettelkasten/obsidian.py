@@ -77,10 +77,30 @@ def export_obsidian(
         if latest_map is not None and (latest_map / "clusters").is_dir()
         else root / "03_literature_synthesis" / "clusters"
     )
+    current_cluster_names: set[str] | None = None
+    cluster_registry_path = (
+        latest_map / "cluster_registry.yml"
+        if latest_map is not None
+        else root / "03_literature_synthesis" / "cluster_registry.yml"
+    )
+    if cluster_registry_path.is_file():
+        from .literature import cluster_note_stem
+
+        cluster_registry = read_yaml(cluster_registry_path, {}) or {}
+        if isinstance(cluster_registry.get("clusters"), list):
+            current_cluster_names = {
+                f"{cluster_note_stem(cluster)}.md"
+                for cluster in cluster_registry["clusters"]
+                if isinstance(cluster, dict) and cluster.get("cluster_id")
+            }
     projections.extend(
         (path, Path("Clusters") / path.name)
         for path in sorted(cluster_root.glob("*.md"))
         if path.name != "INDEX.md"
+        and (
+            current_cluster_names is None
+            or path.name in current_cluster_names
+        )
     )
     if (cluster_root / "INDEX.md").exists():
         projections.append((cluster_root / "INDEX.md", Path("Indexes") / "Cluster Index.md"))

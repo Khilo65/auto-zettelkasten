@@ -1716,7 +1716,7 @@ def _relationship_candidate_system_prompt() -> str:
 def _relationship_adjudication_system_prompt() -> str:
     return (
         "You adjudicate immutable relationship pair jobs for Auto-Zettelkasten "
-        "relationship prompt v11 and contract relationship-decision-v8. Read both "
+        "relationship prompt v12 and contract relationship-decision-v8. Read both "
         "complete atomic notes. Return one JSON object whose decisions object is keyed "
         "by every supplied pair_job_id, with no missing or extra keys. Each value is "
         "either {decision:no_relationship, reason, confidence} or "
@@ -1727,7 +1727,10 @@ def _relationship_adjudication_system_prompt() -> str:
         "reference_source_id, source_a_basis, source_b_basis, reason, "
         "boundary_or_qualification, confidence, and optional source_a_anchor_ids and "
         "source_b_anchor_ids. The two basis fields must state specifically what each "
-        "endpoint note establishes; anchor IDs are optional and must be real when used. "
+        "endpoint note establishes. source_a_basis always describes the supplied "
+        "left_source_id note, and source_b_basis always describes the supplied "
+        "right_source_id note, regardless of actor/reference direction; anchor IDs are "
+        "optional and must be real when used. "
         "Use supports, undermines, qualifies, extends, complements, contrasts, "
         "rival_explanation, boundary_contrast, methodological_fault_line, "
         "sequential_relationship, interpretive_or_normative_disagreement, or "
@@ -1737,7 +1740,10 @@ def _relationship_adjudication_system_prompt() -> str:
         "incompatible claims on a comparable proposition. extends requires explicit "
         "intellectual lineage through building on, testing, refining, applying, or generalizing. "
         "Citation, chronology, coding or dataset reuse, and proximity alone do not "
-        "establish substantive support or extension. For directional types, actor_source_id is the "
+        "establish substantive support or extension. Prefer contextual_connection when "
+        "a stronger label depends on an inferred practical implication, different "
+        "objectives or stages, or intellectual lineage not explicit in either note. "
+        "For directional types, actor_source_id is the "
         "work doing the intellectual action and reference_source_id is the work acted "
         "on; never infer direction from pair order. If A cites B as evidence for A's "
         "claim, B normally supports A. Treat limited notes only within their visible "
@@ -3328,6 +3334,17 @@ def _parse_json_object(
     try:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
+        # Recover a common otherwise-valid model response where JavaScript-style
+        # call punctuation appears between a completed string value and JSON
+        # delimiter. The repaired object still passes the normal stage contract.
+        repaired_text = re.sub(r'(?<=")\s*\);(?=\s*[,}])', "", text)
+        if repaired_text != text:
+            try:
+                payload = json.loads(repaired_text)
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, dict):
+                return payload
         # OpenAI-compatible reasoning providers occasionally wrap an otherwise
         # valid JSON object in a short sentence even when JSON-only output was
         # requested. Recover exactly one embedded object, but keep rejecting

@@ -10,7 +10,7 @@ from .models import RelationshipDecision, RelationshipPairJob
 from .navigation import TYPED_SOURCE_RELATIONS, rank_human_related_links
 
 
-RELATIONSHIP_PROMPT_VERSION = "11"
+RELATIONSHIP_PROMPT_VERSION = "12"
 RELATIONSHIP_REGISTRY_SCHEMA_VERSION = "7"
 RELATIONSHIP_DECISION_SCHEMA_VERSION = "8"
 RELATIONSHIP_DECISION_CONTRACT = "relationship-decision-v8"
@@ -1285,11 +1285,37 @@ def persist_relationship_registry(
         if isinstance(existing, Mapping)
         else ""
     )
+    schema7_provisional_relation_ids = {
+        str(relation_id)
+        for current in (
+            existing.get("current_pair_decisions", []) or []
+            if existing_schema == RELATIONSHIP_REGISTRY_SCHEMA_VERSION
+            and isinstance(existing, Mapping)
+            else []
+        )
+        if isinstance(current, Mapping)
+        and bool(current.get("active", True))
+        and bool(current.get("reconciliation_pending"))
+        for relation_id in current.get("relation_ids", []) or []
+        if str(relation_id)
+    }
     migrated_rows: list[dict[str, Any]] = []
     for raw in existing_rows:
         if not isinstance(raw, Mapping):
             continue
         row = dict(raw)
+        relation_id = str(
+            row.get("relation_id") or row.get("link_id") or ""
+        )
+        if relation_id in schema7_provisional_relation_ids:
+            row.update(
+                active=True,
+                decision_status="reconciliation_pending",
+                reconciliation_pending=True,
+                cluster_evidence_eligible=False,
+            )
+            row.pop("retirement_reason", None)
+            row.pop("retirement_prompt_version", None)
         if (
             existing_schema == "3"
             and _machine_substantive(row)
@@ -1433,6 +1459,8 @@ def persist_relationship_registry(
                 and _machine_substantive(row)
                 and str(row.get("prompt_version") or "")
                 != reconcile_machine_prompt_version
+                and str(row.get("decision_status") or "")
+                != "reconciliation_pending"
             ):
                 row.update(
                     active=False,

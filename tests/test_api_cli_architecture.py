@@ -168,6 +168,42 @@ def test_obsidian_export_of_canonical_literature_map_has_no_missing_wikilinks(
     )
 
 
+def test_obsidian_export_omits_cluster_files_not_in_current_registry(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    initialize_workspace(workspace)
+    map_root = workspace / "03_literature_synthesis" / "maps" / "map-v5"
+    cluster_root = map_root / "clusters"
+    cluster_root.mkdir(parents=True)
+    current = {
+        "cluster_id": "current",
+        "label": "Current",
+    }
+    current_name = "Cluster - Current [current].md"
+    (cluster_root / current_name).write_text("# Current\n", encoding="utf-8")
+    (cluster_root / "Cluster - Stale [stale].md").write_text(
+        "<!-- auto-zettelkasten:cluster:start -->\n# Stale\n",
+        encoding="utf-8",
+    )
+    write_yaml(map_root / "cluster_registry.yml", {"clusters": [current]})
+    write_yaml(
+        map_root / "manifest.yml",
+        {"updated_at": "2026-07-21T00:00:00Z", "artifacts": {}},
+    )
+
+    result = export_to_obsidian(
+        workspace,
+        tmp_path / "vault",
+        dry_run=True,
+        new_vault=True,
+    )
+
+    planned = set(result.metadata["planned_files"])
+    assert f"Clusters/{current_name}" in planned
+    assert "Clusters/Cluster - Stale [stale].md" not in planned
+
+
 def test_obsidian_missing_link_scan_ignores_yaml_frontmatter(tmp_path: Path) -> None:
     export_root = tmp_path / "vault"
     source = export_root / "Sources" / "What's in a Figure.md"

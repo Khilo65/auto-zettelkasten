@@ -19945,6 +19945,7 @@ def build_literature_report(
         if (
             validated_synthesis.get("status") == "partial"
             and prior_cluster is not None
+            and _cluster_projection_is_publishable(prior_synthesis)
         ):
             attempted_cluster = dict(cluster)
             pending_source_ids = sorted(
@@ -19991,25 +19992,15 @@ def build_literature_report(
                 }
             )
             reverted_refresh = True
-            if _cluster_projection_is_publishable(prior_synthesis):
-                validated_synthesis = {
-                    **dict(prior_synthesis),
-                    "refresh_pending": True,
-                    "last_good_revision_hash": str(
-                        prior_cluster.get("revision_hash") or ""
-                    ),
-                    "pending_revision_hash": pending_revision_hash,
-                    "refresh_pending_source_ids": pending_source_ids,
-                }
-            else:
-                validated_synthesis.update(
-                    refresh_pending=True,
-                    last_good_revision_hash=str(
-                        prior_cluster.get("revision_hash") or ""
-                    ),
-                    pending_revision_hash=pending_revision_hash,
-                    refresh_pending_source_ids=pending_source_ids,
-                )
+            validated_synthesis = {
+                **dict(prior_synthesis),
+                "refresh_pending": True,
+                "last_good_revision_hash": str(
+                    prior_cluster.get("revision_hash") or ""
+                ),
+                "pending_revision_hash": pending_revision_hash,
+                "refresh_pending_source_ids": pending_source_ids,
+            }
         else:
             registry["pending_revisions"] = [
                 row
@@ -20022,16 +20013,24 @@ def build_literature_report(
             cluster["refresh_pending"] = False
             validated_synthesis["refresh_pending"] = False
         cluster_syntheses[cluster_id] = validated_synthesis
-    previous_cluster_ids = {
+    previous_publishable_cluster_ids = {
         str(row.get("cluster_id") or "")
         for row in (previous_registry or {}).get("clusters", []) or []
-        if isinstance(row, Mapping) and row.get("cluster_id")
+        if isinstance(row, Mapping)
+        and row.get("cluster_id")
+        and _cluster_projection_is_publishable(
+            _as_mapping(
+                _as_mapping(
+                    (previous_registry or {}).get("cluster_syntheses")
+                ).get(str(row.get("cluster_id") or ""))
+            )
+        )
     }
     parked_new_cluster_ids = {
         cluster_id
         for cluster_id, synthesis in cluster_syntheses.items()
         if synthesis.get("status") == "partial"
-        and cluster_id not in previous_cluster_ids
+        and cluster_id not in previous_publishable_cluster_ids
     } if shared_plan else set()
     if parked_new_cluster_ids:
         parked_clusters = [
@@ -24803,13 +24802,12 @@ def persist_literature_report(
         )
         if path.is_file():
             paths.append(path)
-    if projection_publishable:
-        _prune_stale_generated_markdown(
-            cluster_root,
-            keep_names=[
-                f"{cluster_note_stem(cluster)}.md" for cluster in clusters
-            ],
-        )
+    _prune_stale_generated_markdown(
+        cluster_root,
+        keep_names=[
+            f"{cluster_note_stem(cluster)}.md" for cluster in clusters
+        ],
+    )
     cluster_index_path = cluster_root / "INDEX.md"
     _write_markdown_with_quality_ratchet(
         cluster_index_path,
@@ -25132,13 +25130,12 @@ def persist_literature_report(
         )
         if canonical_cluster_path.is_file():
             paths.append(canonical_cluster_path)
-    if projection_publishable:
-        _prune_stale_generated_markdown(
-            canonical_cluster_root,
-            keep_names=[
-                f"{cluster_note_stem(cluster)}.md" for cluster in clusters
-            ],
-        )
+    _prune_stale_generated_markdown(
+        canonical_cluster_root,
+        keep_names=[
+            f"{cluster_note_stem(cluster)}.md" for cluster in clusters
+        ],
+    )
     canonical_cluster_index_path = canonical_cluster_root / "INDEX.md"
     _write_markdown_with_quality_ratchet(
         canonical_cluster_index_path,
