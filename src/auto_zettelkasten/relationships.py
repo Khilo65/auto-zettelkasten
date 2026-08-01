@@ -11,6 +11,7 @@ from .navigation import TYPED_SOURCE_RELATIONS, rank_human_related_links
 
 
 RELATIONSHIP_PROMPT_VERSION = "12"
+RELATIONSHIP_DISCOVERY_PROMPT_VERSION = "13"
 RELATIONSHIP_REGISTRY_SCHEMA_VERSION = "7"
 RELATIONSHIP_DECISION_SCHEMA_VERSION = "8"
 RELATIONSHIP_DECISION_CONTRACT = "relationship-decision-v8"
@@ -126,6 +127,7 @@ def relationship_decision_key(
     provider: str,
     model: str,
     prompt_version: str = RELATIONSHIP_PROMPT_VERSION,
+    policy_identity: str = "",
 ) -> str:
     profiles = sorted(
         (
@@ -133,14 +135,15 @@ def relationship_decision_key(
             (str(target_source_id), str(target_profile_hash)),
         )
     )
-    return stable_hash(
-        {
-            "profiles": profiles,
-            "provider": str(provider),
-            "model": str(model),
-            "prompt_version": str(prompt_version),
-        }
-    )
+    payload = {
+        "profiles": profiles,
+        "provider": str(provider),
+        "model": str(model),
+        "prompt_version": str(prompt_version),
+    }
+    if policy_identity:
+        payload["policy_identity"] = str(policy_identity)
+    return stable_hash(payload)
 
 
 def candidate_rows(
@@ -1569,6 +1572,7 @@ def persist_relationship_registry(
                 prompt_version=str(
                     row.get("prompt_version") or RELATIONSHIP_PROMPT_VERSION
                 ),
+                policy_identity=str(row.get("relationship_policy_identity") or ""),
             )
             if row.get("connection_id"):
                 decision_key = stable_hash(
@@ -1879,6 +1883,24 @@ def persist_relationship_registry(
         if event.get("event_type") == "parked"
         and isinstance(event.get("payload"), Mapping)
     ]
+    active_relation_ids = {
+        str(row.get("relation_id") or "")
+        for row in relations
+        if bool(row.get("active", True)) and row.get("relation_id")
+    }
+    for current in current_pair_decisions.values():
+        if str(current.get("status") or "") not in {
+            "accepted",
+            "reconciliation_pending",
+        }:
+            continue
+        visible = bool(
+            active_relation_ids
+            & {str(value) for value in current.get("relation_ids", []) or []}
+        )
+        current["active"] = visible
+        if not visible:
+            current["refresh_pending"] = True
     semantic = {
         "registry_schema_version": RELATIONSHIP_REGISTRY_SCHEMA_VERSION,
         "relations": relations,

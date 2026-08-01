@@ -55,7 +55,10 @@ from .ports import (
     ZoteroClient,
 )
 from .readers import provider_from_name
-from .relationships import RELATIONSHIP_PROMPT_VERSION
+from .relationships import (
+    RELATIONSHIP_DISCOVERY_PROMPT_VERSION,
+    RELATIONSHIP_PROMPT_VERSION,
+)
 from .profiles import profile_sidecar_path
 from .workspace import (
     IncompatibleArtifactSchemaError,
@@ -1202,6 +1205,7 @@ def _build_map_semantic_fingerprint(
     ]
     payload = {
         "engine_version": ENGINE_VERSION,
+        "relationship_discovery_prompt_version": RELATIONSHIP_DISCOVERY_PROMPT_VERSION,
         "relationship_prompt_version": RELATIONSHIP_PROMPT_VERSION,
         "provider": provider,
         "model": model,

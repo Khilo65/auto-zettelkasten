@@ -32,7 +32,10 @@ from .models import (
     FAMILY_RELATION_TYPES,
 )
 from .notes import source_note_semantic_components
-from .relationships import RELATIONSHIP_PROMPT_VERSION
+from .relationships import (
+    RELATIONSHIP_DISCOVERY_PROMPT_VERSION,
+    RELATIONSHIP_PROMPT_VERSION,
+)
 
 from .navigation import (
     build_navigation_graph,
@@ -77,10 +80,10 @@ GAP_RULES = (
     "author_stated_gap",
 )
 LITERATURE_ALGORITHM_VERSION = "36"
-LITERATURE_FAMILY_PLAN_PROMPT_VERSION = "6"
+LITERATURE_FAMILY_PLAN_PROMPT_VERSION = "7"
 CLUSTER_PLAN_PROMPT_VERSION = "5"
 CLUSTER_PROPOSAL_PROMPT_VERSION = "17"
-CLUSTER_SYNTHESIS_PROMPT_VERSION = "30"
+CLUSTER_SYNTHESIS_PROMPT_VERSION = "31"
 GAP_REASONING_PROMPT_VERSION = "12"
 ANCHOR_ALGORITHM_VERSION = "3"
 SUPPORT_ENVELOPE_VERSION = "2"
@@ -2243,10 +2246,10 @@ def _synthesis_stage_prompt_version(stage: str) -> str:
         "cluster_reconciliation": CLUSTER_PROPOSAL_PROMPT_VERSION,
         "cluster_synthesis": CLUSTER_SYNTHESIS_PROMPT_VERSION,
         "gap_adjudication": GAP_REASONING_PROMPT_VERSION,
-        "relationship_shard_selection": RELATIONSHIP_PROMPT_VERSION,
-        "relationship_bridge_shard_selection": RELATIONSHIP_PROMPT_VERSION,
-        "relationship_candidate_selection": RELATIONSHIP_PROMPT_VERSION,
-        "relationship_bridge_candidate_selection": RELATIONSHIP_PROMPT_VERSION,
+        "relationship_shard_selection": RELATIONSHIP_DISCOVERY_PROMPT_VERSION,
+        "relationship_bridge_shard_selection": RELATIONSHIP_DISCOVERY_PROMPT_VERSION,
+        "relationship_candidate_selection": RELATIONSHIP_DISCOVERY_PROMPT_VERSION,
+        "relationship_bridge_candidate_selection": RELATIONSHIP_DISCOVERY_PROMPT_VERSION,
         "relationship_adjudication": RELATIONSHIP_PROMPT_VERSION,
         "relationship_verification": RELATIONSHIP_PROMPT_VERSION,
         "relationship_verification_escalation": RELATIONSHIP_PROMPT_VERSION,
@@ -10271,6 +10274,7 @@ def validate_streamlined_cluster_synthesis(
     profiles: Sequence[Mapping[str, Any]],
     *,
     candidate_input_receipt: Mapping[str, Any] | None = None,
+    important_unmapped_literature: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """Mechanically validate full-note synthesis without re-judging its prose."""
 
@@ -10568,6 +10572,11 @@ def validate_streamlined_cluster_synthesis(
                 }
             )
 
+    allowed_cited_works = {
+        str(row.get("external_source_id") or ""): dict(row)
+        for row in important_unmapped_literature
+        if isinstance(row, Mapping) and row.get("external_source_id")
+    }
     important_cited_works: list[dict[str, Any]] = []
     raw_cited_works = response.get(
         "important_cited_works_not_yet_mapped", []
@@ -10579,48 +10588,46 @@ def validate_streamlined_cluster_synthesis(
         for row in raw_cited_works:
             if not isinstance(row, Mapping):
                 continue
-            status = str(row.get("status") or "")
-            invoked_by = sorted(
-                {
-                    str(value)
-                    for value in row.get(
-                        "invoked_by_source_ids", []
-                    )
-                    or []
-                    if str(value) in proposed_ids
-                }
-            )
-            cited_work = str(
-                row.get("cited_work")
-                or row.get("raw_citation")
-                or ""
-            ).strip()
-            if (
-                status
-                not in {"known_zotero_unmapped", "not_in_snapshot"}
-                or not invoked_by
-                or not cited_work
-            ):
+            identity = str(row.get("external_source_id") or "")
+            canonical = allowed_cited_works.get(identity)
+            if canonical is None:
+                warnings.append("unknown_cited_unmapped_work_ignored")
                 continue
-            identity = str(
-                row.get("external_source_id")
-                or _stable_hash([cited_work, invoked_by])
-            )
             if identity in seen_cited:
+                continue
+            selected_attribution_ids = {
+                str(value)
+                for value in (
+                    row.get("selected_attribution_ids")
+                    or row.get("attribution_ids")
+                    or []
+                )
+                if str(value)
+            }
+            attributions = [
+                dict(attribution)
+                for attribution in canonical.get("attributions", []) or []
+                if isinstance(attribution, Mapping)
+                and str(attribution.get("current_source_id") or "") in retained
+                and (
+                    not selected_attribution_ids
+                    or str(attribution.get("literature_position_id") or "")
+                    in selected_attribution_ids
+                )
+            ]
+            why_it_matters = str(row.get("why_it_matters") or "").strip()
+            if not attributions or not why_it_matters:
+                warnings.append("incomplete_cited_unmapped_work_ignored")
                 continue
             seen_cited.add(identity)
             important_cited_works.append(
                 {
                     "external_source_id": identity,
-                    "cited_work": cited_work,
-                    "invoked_by_source_ids": invoked_by,
-                    "characterization": str(
-                        row.get("characterization") or ""
-                    ).strip(),
-                    "why_it_matters": str(
-                        row.get("why_it_matters") or ""
-                    ).strip(),
-                    "status": status,
+                    "cited_work": str(canonical.get("raw_citation") or ""),
+                    "identifiers": dict(canonical.get("identifiers") or {}),
+                    "attributions": attributions,
+                    "why_it_matters": why_it_matters,
+                    "status": str(canonical.get("status") or ""),
                 }
             )
     return {
@@ -19622,6 +19629,42 @@ def build_literature_report(
                     }
                 )
             )
+            attributions = [
+                {
+                    "literature_position_id": str(
+                        position.get("literature_position_id") or ""
+                    ),
+                    "current_source_id": str(
+                        position.get("current_source_id")
+                        or position.get("source_id")
+                        or ""
+                    ),
+                    "characterization": str(
+                        position.get("engagement") or ""
+                    ),
+                    "locator": str(position.get("locator") or ""),
+                }
+                for position in literature_positions
+                if isinstance(position, Mapping)
+                and str(
+                    position.get("current_source_id")
+                    or position.get("source_id")
+                    or ""
+                )
+                in invoking_sources
+                and str(position.get("raw_citation") or "")
+                == str(row.get("raw_citation") or "")
+            ]
+            if not attributions:
+                attributions = [
+                    {
+                        "literature_position_id": "",
+                        "current_source_id": source_id,
+                        "characterization": str(row.get("importance") or ""),
+                        "locator": "",
+                    }
+                    for source_id in invoking_sources
+                ]
             important_unmapped_by_id[identity] = {
                 "external_source_id": identity,
                 "raw_citation": str(row.get("raw_citation") or ""),
@@ -19631,10 +19674,7 @@ def build_literature_report(
                 "identifiers": dict(
                     _as_mapping(row.get("identifiers"))
                 ),
-                "invoked_by_source_ids": invoking_sources,
-                "characterization": str(
-                    row.get("importance") or ""
-                ),
+                "attributions": attributions,
                 "status": status,
             }
         planned_neighbors = list(
@@ -19826,6 +19866,9 @@ def build_literature_report(
                     normalized,
                     candidate_input_receipt=synthesis_context.get(
                         "candidate_input_receipt"
+                    ),
+                    important_unmapped_literature=synthesis_context.get(
+                        "important_unmapped_literature", []
                     ),
                 )
                 if synthesis_response.get("cluster_contract")
@@ -21763,38 +21806,49 @@ def _streamlined_cluster_markdown(
         cited_work = _human_projection_text(
             row.get("cited_work") or row.get("raw_citation") or ""
         )
-        invoked_by = [
-            _obsidian_note_link(
-                profile_by_source.get(
-                    str(source_id), {"source_id": str(source_id)}
-                )
-            )
-            for source_id in row.get("invoked_by_source_ids", []) or []
-            if str(source_id)
-        ]
-        characterization = _human_projection_text(
-            row.get("characterization") or ""
-        )
         why_it_matters = _human_projection_text(
             row.get("why_it_matters") or ""
         )
         status = str(row.get("status") or "")
-        if not cited_work or not invoked_by:
+        attributions = [
+            dict(value)
+            for value in row.get("attributions", []) or []
+            if isinstance(value, Mapping)
+            and str(value.get("current_source_id") or "")
+        ]
+        if not cited_work or not attributions:
             continue
-        detail = (
-            f"**{cited_work}** — invoked by {', '.join(invoked_by)}"
-        )
-        if characterization:
-            detail += f": {characterization}"
+        detail = [f"### {cited_work}"]
+        for attribution in attributions:
+            source_id = str(attribution.get("current_source_id") or "")
+            source_link = _obsidian_note_link(
+                profile_by_source.get(source_id, {"source_id": source_id})
+            )
+            characterization = _human_projection_text(
+                attribution.get("characterization") or ""
+            )
+            locator = _human_locator_text(attribution.get("locator") or "")
+            line = f"- Cited by {source_link}"
+            if characterization:
+                line += f": {characterization}"
+            if locator:
+                line += f" ({locator})"
+            detail.append(line)
         if why_it_matters:
-            detail += f" Why it matters: {why_it_matters}"
-        if status:
-            detail += f" _Status: {status}._"
-        cited_works.append(f"- {detail}")
+            detail.append(f"- Relevance: {why_it_matters}")
+        detail.append(
+            "- Library status: "
+            + (
+                "in Zotero; atomic note not yet mapped."
+                if status == "known_zotero_unmapped"
+                else "not in the current Zotero snapshot."
+            )
+        )
+        cited_works.append("\n".join(detail))
     if cited_works:
         sections.append(
             "## Important cited works not yet mapped\n\n"
-            + "\n".join(cited_works)
+            + "\n\n".join(cited_works)
         )
     material_exclusions = []
     for row in synthesis.get("material_exclusions", []) or []:

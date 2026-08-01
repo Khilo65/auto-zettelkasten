@@ -324,7 +324,7 @@ def test_global_discovery_creates_immutable_pair_job(
             assert context["discovery_mode"] == "global"
             assert {profile.source_id for profile in provider_profiles} == {"A", "B"}
             assert all(not profile.evidence_anchors for profile in provider_profiles)
-            assert context["max_inferred_pairs"] == 64
+            assert context["max_inferred_pairs"] == 48
             assert context["reserved_bridge_fraction"] == 0.4
             assert "literature_positions" in context
             assert "existing_graph_neighbors" not in context
@@ -439,8 +439,74 @@ def test_shared_plan_keeps_family_discovery_in_separate_packets(
     discovery_calls = [
         row for row in calls.seen if row[0].endswith("candidate_selection")
     ]
-    assert len(discovery_calls) == 4
-    assert all(len(row[2]["bridge_jobs"]) == 1 for row in discovery_calls)
+    assert len(discovery_calls) == 2
+    assert [row[2]["discovery_pass"] for row in discovery_calls] == [
+        "broad",
+        "complement",
+    ]
+    assert discovery_calls[1][2]["prior_candidate_pairs"] == []
+
+
+def test_shared_plan_runs_broad_before_complement_and_passes_prior_pairs(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile(source_id) for source_id in "ABCD"]
+    jobs = [
+        {
+            "job_id": "requested",
+            "family": "explicit_requested_collection_comparison",
+            "left_source_ids": ["A"],
+            "right_source_ids": ["B"],
+            "requested_collection_pair": ["C1", "C2"],
+            "candidate_quota": 40,
+        },
+        {
+            "job_id": "family-cd",
+            "family": "family-cd",
+            "left_source_ids": ["C"],
+            "right_source_ids": ["D"],
+            "candidate_quota": 12,
+        },
+    ]
+
+    def handler(stage, _profiles, context):
+        if stage == "relationship_bridge_candidate_selection":
+            assert context["discovery_pass"] == "broad"
+            return {
+                "candidates": [
+                    {**_candidate("A", "B"), "bridge_job_id": "requested"}
+                ]
+            }
+        if stage == "relationship_candidate_selection":
+            assert context["discovery_pass"] == "complement"
+            assert context["prior_candidate_pairs"] == [("A", "B")]
+            return {
+                "candidates": [
+                    {**_candidate("C", "D"), "bridge_job_id": "family-cd"}
+                ]
+            }
+        return {"decisions": [_decision(job) for job in context["pair_jobs"]]}
+
+    calls = _Calls(handler)
+    result = _run(
+        tmp_path,
+        profiles,
+        calls,
+        shared_family_plan={
+            "lean_index_hash": "lean",
+            "literature_families": [
+                {"family_id": "family-cd", "source_ids": ["C", "D"]}
+            ],
+            "discovery_jobs": jobs,
+        },
+    )
+
+    assert result["pair_job_count"] == 2
+    assert [
+        context["discovery_pass"]
+        for stage, _key, context in calls.seen
+        if stage.endswith("candidate_selection")
+    ] == ["broad", "complement"]
 
 
 def test_candidate_cap_reserves_bridge_slots_and_keeps_model_rank() -> None:
@@ -486,6 +552,38 @@ def test_candidate_cap_reserves_bridge_slots_and_keeps_model_rank() -> None:
         ("W0", "W5"),
         ("W0", "W6"),
     ]
+
+
+def test_candidate_ranking_is_fair_across_jobs_and_merges_provenance() -> None:
+    entries = {
+        source_id: {"collections": ["one" if source_id.startswith("A") else "two"]}
+        for source_id in ("A1", "A2", "A3", "B1", "B2")
+    }
+    candidates = [
+        {**_candidate("A1", "B1", rank=1, cross_literature=True), "discovery_job_id": "job-a"},
+        {**_candidate("A2", "B1", rank=2, cross_literature=True), "discovery_job_id": "job-a"},
+        {**_candidate("A3", "B2", rank=10, cross_literature=True), "discovery_job_id": "job-b"},
+        {**_candidate("A1", "B1", rank=1, cross_literature=True), "discovery_job_id": "job-b"},
+    ]
+    dispositions: list[dict[str, Any]] = []
+
+    selected = _ranked_relationship_candidates(
+        {"candidates": candidates},
+        available_source_ids=set(entries),
+        entry_by_source=entries,
+        excluded_pairs=set(),
+        maximum=2,
+        bridge_fraction=1.0,
+        scope="bridge",
+        dispositions=dispositions,
+    )
+
+    assert {(row["source_id"], row["target_id"]) for row in selected} == {
+        ("A1", "B1"),
+        ("A3", "B2"),
+    }
+    assert len(selected[0]["discovery_provenance"]) == 2
+    assert any(row["disposition"] == "duplicate_merged" for row in dispositions)
 
 
 def test_v6_keyed_batch_parks_only_an_omitted_pair(tmp_path: Path) -> None:
@@ -551,11 +649,11 @@ def test_general_and_bridge_discovery_use_separate_candidate_pools(
             }
         if stage == "relationship_candidate_selection":
             assert context["discovery_mode"] == "global"
-            assert context["max_inferred_pairs"] == 64
+            assert context["max_inferred_pairs"] == 48
             return {"candidates": []}
         assert stage == "relationship_bridge_candidate_selection"
         assert context["discovery_mode"] == "bridge_only"
-        assert context["max_inferred_pairs"] == 96
+        assert context["max_inferred_pairs"] == 72
         assert len(context["bridge_jobs"]) == 1
         assert provider_profiles == []
         assert {
@@ -1670,6 +1768,22 @@ def test_unchanged_negative_pair_memory_skips_readjudication(
             ]
         },
     )
+    write_yaml(
+        tmp_path
+        / "02_source_memory"
+        / "indexes"
+        / "relationship_selection_state.yml",
+        {
+            "selection_identity": "older-discovery-prompt",
+            "profile_hashes": {
+                profile.source_id: stable_hash(profile_to_dict(profile))
+                for profile in profiles
+            },
+            "relationship_memory_hashes": {
+                profile.source_id: stable_hash([]) for profile in profiles
+            },
+        },
+    )
 
     def handler(
         stage: str,
@@ -1686,8 +1800,53 @@ def test_unchanged_negative_pair_memory_skips_readjudication(
         "relationship_candidate_selection"
     ]
     assert result["pair_job_count"] == 0
-    assert result["accepted"] == []
-    assert result["no_relationship"] == []
+
+
+def test_only_active_current_relationship_satisfies_a_discovered_pair(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile("A"), _profile("B")]
+    for active, expected_jobs in ((True, 0), (False, 1)):
+        workspace = tmp_path / ("active" if active else "inactive")
+        write_yaml(
+            workspace
+            / "02_source_memory"
+            / "indexes"
+            / "typed_links.yml",
+            {
+                "relations": [
+                    {
+                        "relation_id": "current-relation",
+                        "source_id": "A",
+                        "target_source_id": "B",
+                        "relation_type": "supports",
+                        "active": active,
+                    }
+                ],
+                "current_pair_decisions": [
+                    {
+                        "source_ids": ["A", "B"],
+                        "status": "accepted",
+                        "relation_ids": ["current-relation"],
+                    }
+                ],
+            },
+        )
+
+        def handler(stage, _profiles, context):
+            if stage == "relationship_candidate_selection":
+                return {"candidates": [_candidate("A", "B")]}
+            return {"decisions": [_decision(job) for job in context["pair_jobs"]]}
+
+        result = _run(workspace, profiles, _Calls(handler))
+
+        assert result["pair_job_count"] == expected_jobs
+        if not active:
+            assert any(
+                row.get("reconsideration") == "inactive_or_retired_reconsidered"
+                for row in result["candidate_dispositions"]
+            )
+            assert len(result["accepted"]) == 1
 
 
 def test_cluster_membership_relations_are_reciprocal() -> None:

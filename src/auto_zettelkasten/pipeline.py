@@ -46,6 +46,7 @@ from .indexes import (
 )
 from .navigation import build_typed_source_relations
 from .literature import (
+    LITERATURE_FAMILY_PLAN_PROMPT_VERSION,
     _CheckpointedReasonerCalls,
     _preserve_last_valid_clusters_on_refresh_failure,
     _provider_worker_count,
@@ -64,6 +65,7 @@ from .models import (
     ArtifactManifest,
     EvidenceAnchor,
     EvidenceProfile,
+    LiteratureMappingPolicy,
     LiteratureMapRequest,
     MapRequest,
     ProcessingPolicy,
@@ -124,6 +126,7 @@ from .relationships import (
     relationship_decision_key,
     RELATIONSHIP_DECISION_CONTRACT,
     RELATIONSHIP_DECISION_NORMALIZATION_VERSION,
+    RELATIONSHIP_DISCOVERY_PROMPT_VERSION,
     RELATIONSHIP_PROMPT_VERSION,
     stable_hash,
     validate_relationship_decision_rows,
@@ -158,9 +161,9 @@ CHUNKING_VERSION = "2"
 CONTENT_CLASSIFIER_VERSION = "4"
 _RELATIONSHIP_BATCH_MAX_JOBS = 30
 _LEGACY_RELATIONSHIP_BATCH_MAX_JOBS = 8
-_RELATIONSHIP_GENERAL_CANDIDATE_MAX = 64
-_RELATIONSHIP_BRIDGE_CANDIDATE_MAX = 96
-_RELATIONSHIP_CANDIDATE_MAX = 160
+_RELATIONSHIP_GENERAL_CANDIDATE_MAX = 48
+_RELATIONSHIP_BRIDGE_CANDIDATE_MAX = 72
+_RELATIONSHIP_CANDIDATE_MAX = 120
 _LITERATURE_MEMORY_LOCK = threading.Lock()
 _AUTO_SOURCE_WORKER_LIMIT = 32
 
@@ -2110,6 +2113,41 @@ def _reconcile_literature_memory(workspace: Path) -> None:
     )
 
 
+def _reconcile_cluster_acquisition_recommendations(
+    workspace: Path,
+    cluster_syntheses: Mapping[str, Any],
+) -> Path | None:
+    path = workspace / "02_source_memory" / "indexes" / "missing_sources.yml"
+    existing = read_yaml(path, {}) or {}
+    if not isinstance(existing, Mapping):
+        return None
+    relevant: dict[str, set[str]] = defaultdict(set)
+    for cluster_id, synthesis in cluster_syntheses.items():
+        if not isinstance(synthesis, Mapping) or synthesis.get("parked_for_review"):
+            continue
+        for row in synthesis.get("important_cited_works_not_yet_mapped", []) or []:
+            if isinstance(row, Mapping) and row.get("external_source_id"):
+                relevant[str(row["external_source_id"])].add(str(cluster_id))
+    rows = []
+    for raw in existing.get("sources", []) or []:
+        if not isinstance(raw, Mapping):
+            continue
+        row = dict(raw)
+        row["relevant_clusters"] = sorted(
+            relevant.get(str(row.get("external_source_id") or ""), set())
+        )
+        rows.append(row)
+    rows.sort(key=lambda row: str(row.get("external_source_id") or ""))
+    payload = {
+        **dict(existing),
+        "sources": rows,
+        "revision_hash": stable_hash(rows),
+    }
+    if payload != existing:
+        write_yaml(path, payload)
+    return path
+
+
 def _source_match_index(workspace: Path) -> dict[str, Any]:
     by_source_id: dict[str, dict[str, Any]] = {}
     by_zotero_key: dict[str, list[str]] = defaultdict(list)
@@ -3034,7 +3072,7 @@ def _plan_literature_families(
         {
             "provider": str(getattr(reasoner, "name", "")),
             "model": str(getattr(reasoner, "model", "")),
-            "prompt_version": "6",
+            "prompt_version": LITERATURE_FAMILY_PLAN_PROMPT_VERSION,
             "policy": request.literature_policy.to_dict(),
             "requested_collection_keys": list(
                 request.comparison_collection_keys
@@ -3058,54 +3096,6 @@ def _plan_literature_families(
         and incremental_source_ids
     )
     source_ids = {str(row["source_id"]) for row in lean_rows}
-    positions_payload = read_yaml(
-        workspace / "02_source_memory" / "indexes" / "literature_positions.yml",
-        {},
-    ) or {}
-    mapped_positions = [
-        {
-            key: row.get(key)
-            for key in (
-                "literature_position_id",
-                "current_source_id",
-                "matched_source_id",
-                "engagement",
-                "relation_label",
-                "locator",
-            )
-        }
-        for row in positions_payload.get("positions", []) or []
-        if isinstance(row, Mapping)
-        and str(row.get("current_source_id") or "") in source_ids
-        and str(row.get("matched_source_id") or "") in source_ids
-    ]
-    registry = read_yaml(
-        workspace / "02_source_memory" / "indexes" / "typed_links.yml", {}
-    ) or {}
-    mapped_citations = [
-        {
-            "source_id": str(row.get("source_id") or ""),
-            "target_source_id": str(row.get("target_source_id") or ""),
-            "relation_type": str(row.get("relation_type") or ""),
-        }
-        for row in registry.get("links", []) or []
-        if isinstance(row, Mapping)
-        and str(row.get("relation_type") or "") in {"cites", "cited_by"}
-        and str(row.get("source_id") or "") in source_ids
-        and str(row.get("target_source_id") or "") in source_ids
-    ]
-    human_relationship_pairs = [
-        {
-            "source_id": str(row.get("source_id") or ""),
-            "target_source_id": str(row.get("target_source_id") or ""),
-            "relation_type": str(row.get("relation_type") or ""),
-        }
-        for row in registry.get("links", []) or []
-        if isinstance(row, Mapping)
-        and str(row.get("provenance") or "").casefold().startswith("human")
-        and str(row.get("source_id") or "") in source_ids
-        and str(row.get("target_source_id") or "") in source_ids
-    ]
     collections = [
         {
             "key": str(row.get("key") or ""),
@@ -3135,9 +3125,6 @@ def _plan_literature_families(
         ),
         "collections": collections,
         "requested_collection_keys": requested_keys,
-        "mapped_citations": mapped_citations,
-        "mapped_literature_positions": mapped_positions,
-        "human_relationship_pairs": human_relationship_pairs,
     }
     planner_rows = lean_rows
     if incremental_mode:
@@ -3219,7 +3206,13 @@ def _plan_literature_families(
             "literature_family_plan",
             str(context["planning_mode"])
             + "-"
-            + stable_hash({"index": planner_rows, "context": context})[:16],
+            + stable_hash(
+                {
+                    "index": planner_rows,
+                    "planning_identity": planning_identity,
+                    "incremental_source_ids": incremental_source_ids,
+                }
+            )[:16],
             "plan_literature_families",
             planner_rows,
             context,
@@ -3367,6 +3360,64 @@ def _plan_literature_families(
         lean_rows=lean_rows,
         requested_collection_keys=requested_keys,
     )
+    completion_status = "not_needed_incremental" if incremental_mode else "completed"
+    if not incremental_mode:
+        represented = {
+            str(source_id)
+            for family in validated["literature_families"]
+            for source_id in family.get("source_ids", []) or []
+        }
+        completion_context = {
+            **context,
+            "planning_mode": "coverage_completion",
+            "existing_family_cards": validated["literature_families"],
+            "covered_source_ids": sorted(represented),
+            "unassigned_source_ids": sorted(source_ids - represented),
+        }
+        completion_rows = (
+            planner_rows
+            if flat_path
+            else [
+                row
+                for row in planner_rows
+                if str(row["source_id"]) not in represented
+            ]
+        )
+        if not flat_path:
+            completion_context["global_spine"] = [
+                {
+                    key: row[key]
+                    for key in ("source_id", "title", "author", "year")
+                }
+                for row in lean_rows
+            ]
+            completion_context["local_family_cards"] = validated[
+                "literature_families"
+            ]
+        try:
+            completion = reasoner_calls(
+                "literature_family_plan",
+                "coverage-"
+                + stable_hash(
+                    {
+                        "index": lean_source_hashes,
+                        "primary": validated,
+                    }
+                )[:16],
+                "plan_literature_families",
+                completion_rows,
+                completion_context,
+            )
+            additions = _validate_literature_family_plan(
+                completion,
+                lean_rows=lean_rows,
+                requested_collection_keys=requested_keys,
+                allow_empty=True,
+                add_requested_jobs=False,
+            )
+            validated = _merge_literature_family_plans(validated, additions)
+        except Exception as exc:
+            completion_status = f"advisory_failure:{type(exc).__name__}"
     lean_serialized = json.dumps(
         lean_rows,
         ensure_ascii=False,
@@ -3386,6 +3437,7 @@ def _plan_literature_families(
         "estimated_input_tokens": max(1, len(lean_serialized) // 4),
         "packet_source_ids": packet_source_ids,
         "requested_collection_keys": requested_keys,
+        "coverage_completion_status": completion_status,
     }
     receipt_path = (
         workspace
@@ -3405,6 +3457,7 @@ def _plan_literature_families(
             "estimated_input_tokens",
             "packet_source_ids",
             "requested_collection_keys",
+            "coverage_completion_status",
         )
     }
     if (read_yaml(receipt_path, {}) or {}) != receipt:
@@ -3421,6 +3474,7 @@ def _plan_literature_families(
             "lean_source_hashes",
             "lean_index_hash",
             "requested_collection_keys",
+            "coverage_completion_status",
         )
     }
     if (read_yaml(plan_path, {}) or {}) != persisted_plan:
@@ -3428,6 +3482,64 @@ def _plan_literature_families(
     result["receipt_path"] = str(receipt_path)
     result["plan_path"] = str(plan_path)
     return result
+
+
+def _merge_literature_family_plans(
+    primary: Mapping[str, Any], additions: Mapping[str, Any]
+) -> dict[str, Any]:
+    families = {
+        str(row["family_id"]): dict(row)
+        for row in primary.get("literature_families", []) or []
+    }
+    for raw in additions.get("literature_families", []) or []:
+        row = dict(raw)
+        family_id = str(row["family_id"])
+        if family_id not in families:
+            families[family_id] = row
+            continue
+        current = families[family_id]
+        source_ids = sorted(
+            set(current.get("source_ids", []) or [])
+            | set(row.get("source_ids", []) or [])
+        )
+        current["source_ids"] = source_ids
+        current["proposed_roles"] = {
+            source_id: str(
+                (row.get("proposed_roles", {}) or {}).get(source_id)
+                or (current.get("proposed_roles", {}) or {}).get(source_id)
+                or "supporting"
+            )
+            for source_id in source_ids
+        }
+        current["candidate_cluster"] = bool(
+            current.get("candidate_cluster") or row.get("candidate_cluster")
+        )
+    jobs = {
+        str(row["job_id"]): dict(row)
+        for row in primary.get("discovery_jobs", []) or []
+    }
+    for row in additions.get("discovery_jobs", []) or []:
+        jobs.setdefault(str(row["job_id"]), dict(row))
+    neighbors: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in [
+        *(primary.get("neighboring_families", []) or []),
+        *(additions.get("neighboring_families", []) or []),
+    ]:
+        pair = tuple(
+            sorted(
+                (
+                    str(row.get("left_family_id") or ""),
+                    str(row.get("right_family_id") or ""),
+                )
+            )
+        )
+        if pair[0] in families and pair[1] in families and pair[0] != pair[1]:
+            neighbors.setdefault(pair, dict(row))
+    return {
+        "literature_families": [families[key] for key in sorted(families)],
+        "discovery_jobs": [jobs[key] for key in sorted(jobs)],
+        "neighboring_families": [neighbors[key] for key in sorted(neighbors)],
+    }
 
 
 def _lean_family_plan_chunks(
@@ -3468,6 +3580,8 @@ def _validate_literature_family_plan(
     *,
     lean_rows: Sequence[Mapping[str, Any]],
     requested_collection_keys: Sequence[str],
+    allow_empty: bool = False,
+    add_requested_jobs: bool = True,
 ) -> dict[str, Any]:
     available = {str(row.get("source_id") or "") for row in lean_rows}
     memberships = {
@@ -3519,8 +3633,13 @@ def _validate_literature_family_plan(
                 "candidate_cluster": bool(raw.get("candidate_cluster", True)),
             }
         )
-    if not families:
+    if not families and not allow_empty:
         raise ValueError("literature family plan contained no valid families")
+    requested_pairs = {
+        tuple(sorted((left_key, right_key)))
+        for index, left_key in enumerate(requested_collection_keys)
+        for right_key in requested_collection_keys[index + 1 :]
+    }
     jobs = []
     seen_jobs: set[str] = set()
     for raw in raw_jobs:
@@ -3536,13 +3655,22 @@ def _validate_literature_family_plan(
         if not job_id or job_id in seen_jobs or not left or not right:
             continue
         seen_jobs.add(job_id)
-        requested_pair = sorted(
+        requested_pair = tuple(sorted(
             {
                 str(value)
                 for value in raw.get("requested_collection_pair", []) or []
                 if str(value)
             }
-        )
+        ))
+        if requested_pair not in requested_pairs:
+            requested_pair = ()
+        elif not (
+            all(requested_pair[0] in memberships[source_id] for source_id in left)
+            and all(requested_pair[1] in memberships[source_id] for source_id in right)
+            or all(requested_pair[1] in memberships[source_id] for source_id in left)
+            and all(requested_pair[0] in memberships[source_id] for source_id in right)
+        ):
+            requested_pair = ()
         try:
             quota = max(1, min(120, int(raw.get("candidate_quota", 24) or 24)))
         except (TypeError, ValueError):
@@ -3553,25 +3681,33 @@ def _validate_literature_family_plan(
                 "family": str(raw.get("family") or ""),
                 "left_source_ids": left,
                 "right_source_ids": right,
-                "requested_collection_pair": requested_pair,
+                "requested_collection_pair": list(requested_pair),
                 "discovery_goal": str(raw.get("discovery_goal") or "").strip(),
                 "candidate_quota": quota,
             }
         )
-    requested_pairs = {
-        tuple(sorted(pair))
-        for index, left_key in enumerate(requested_collection_keys)
-        for pair in (
-            (left_key, right_key)
-            for right_key in requested_collection_keys[index + 1 :]
-        )
+    collection_sources = {
+        key: {
+            source_id
+            for source_id, keys in memberships.items()
+            if key in keys
+        }
+        for key in requested_collection_keys
     }
-    covered_pairs = {
-        tuple(row["requested_collection_pair"])
-        for row in jobs
-        if len(row["requested_collection_pair"]) == 2
-    }
-    for pair in sorted(requested_pairs - covered_pairs):
+    covered_pairs: set[tuple[str, str]] = set()
+    for row in jobs:
+        pair = tuple(row["requested_collection_pair"])
+        if len(pair) != 2:
+            continue
+        left = set(row["left_source_ids"])
+        right = set(row["right_source_ids"])
+        first = collection_sources[pair[0]] - collection_sources[pair[1]]
+        second = collection_sources[pair[1]] - collection_sources[pair[0]]
+        if (left == first and right == second) or (
+            left == second and right == first
+        ):
+            covered_pairs.add(pair)
+    for pair in sorted(requested_pairs - covered_pairs) if add_requested_jobs else []:
         left = sorted(
             source_id for source_id, keys in memberships.items() if pair[0] in keys
         )
@@ -3597,7 +3733,7 @@ def _validate_literature_family_plan(
                 "candidate_quota": 40,
             }
         )
-    if not jobs:
+    if not jobs and not allow_empty:
         raise ValueError("literature family plan contained no valid discovery jobs")
     neighbors = [
         {
@@ -3882,13 +4018,18 @@ def _run_relationship_reasoning(
         )
         for source_id in sorted(profile_by_source)
     }
+    relationship_policy_identity = stable_hash(
+        request.literature_policy.to_dict()
+    )
     selection_identity = stable_hash(
         {
             "provider": str(getattr(reasoner, "name", "")),
             "model": str(getattr(reasoner, "model", "")),
-            "prompt_version": RELATIONSHIP_PROMPT_VERSION,
+            "discovery_prompt_version": RELATIONSHIP_DISCOVERY_PROMPT_VERSION,
+            "adjudication_prompt_version": RELATIONSHIP_PROMPT_VERSION,
             "output_contract": decision_contract,
             "decision_normalization_version": RELATIONSHIP_DECISION_NORMALIZATION_VERSION,
+            "policy_identity": relationship_policy_identity,
         }
     )
     state_path = (
@@ -3991,6 +4132,31 @@ def _run_relationship_reasoning(
     ]
     relationship_provider = str(getattr(reasoner, "name", ""))
     relationship_model = str(getattr(reasoner, "model", ""))
+    active_relation_ids = {
+        str(row.get("relation_id") or "")
+        for row in registry.get("relations", []) or []
+        if isinstance(row, Mapping)
+        and bool(row.get("active", True))
+        and row.get("relation_id")
+    }
+    visible_pairs: set[tuple[str, str]] = set()
+    inactive_accepted_pairs: set[tuple[str, str]] = set()
+    for row in registry.get("current_pair_decisions", []) or []:
+        if not isinstance(row, Mapping) or str(row.get("status") or "") not in {
+            "accepted",
+            "reconciliation_pending",
+        }:
+            continue
+        pair_values = list(row.get("source_ids", []) or [])
+        if len(pair_values) != 2:
+            continue
+        pair = canonical_pair(str(pair_values[0]), str(pair_values[1]))
+        if active_relation_ids & {
+            str(value) for value in row.get("relation_ids", []) or []
+        }:
+            visible_pairs.add(pair)
+        else:
+            inactive_accepted_pairs.add(pair)
     negative_pairs: set[tuple[str, str]] = set()
     for row in prior_decisions:
         if (
@@ -4013,6 +4179,12 @@ def _run_relationship_reasoning(
         )
         if pair[0] not in current_hashes or pair[1] not in current_hashes:
             continue
+        if prior_state and any(
+            str(prior_memory_hashes.get(source_id) or "")
+            != current_memory_hashes[source_id]
+            for source_id in pair
+        ):
+            continue
         expected_key = relationship_decision_key(
             pair[0],
             pair[1],
@@ -4021,8 +4193,25 @@ def _run_relationship_reasoning(
             provider=relationship_provider,
             model=relationship_model,
             prompt_version=RELATIONSHIP_PROMPT_VERSION,
+            policy_identity=relationship_policy_identity,
         )
-        if str(row.get("decision_key") or "") == expected_key:
+        matches_current = str(row.get("decision_key") or "") == expected_key
+        matches_legacy_default = bool(
+            not row.get("relationship_policy_identity")
+            and relationship_policy_identity
+            == stable_hash(LiteratureMappingPolicy().to_dict())
+            and str(row.get("decision_key") or "")
+            == relationship_decision_key(
+                pair[0],
+                pair[1],
+                current_hashes[pair[0]],
+                current_hashes[pair[1]],
+                provider=relationship_provider,
+                model=relationship_model,
+                prompt_version=RELATIONSHIP_PROMPT_VERSION,
+            )
+        )
+        if matches_current or matches_legacy_default:
             negative_pairs.add(pair)
     for pair in negative_pairs:
         mandatory_basis.pop(pair, None)
@@ -4256,7 +4445,7 @@ def _run_relationship_reasoning(
     )
     discovery_completed = False
     discovery_terminal = False
-    if shared_plan_active:
+    if shared_plan_active and not requires_routing:
         can_discover = False
     if can_discover and requires_routing:
         selected_collection_source_ids = set(profile_by_source)
@@ -4733,6 +4922,8 @@ def _run_relationship_reasoning(
         )
 
     if shared_plan_active:
+        routed_fallback_tasks = list(candidate_tasks)
+        shared_packet_overflow = False
         lean_by_source = {
             str(row.get("source_id") or ""): row
             for row in lean_discovery_projection(
@@ -4741,7 +4932,8 @@ def _run_relationship_reasoning(
             )
             if str(row.get("source_id") or "") in profile_by_source
         }
-        shared_job_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        broad_jobs: list[dict[str, Any]] = []
+        complement_jobs: list[dict[str, Any]] = []
         for raw_job in shared_family_plan.get("discovery_jobs", []) or []:
             if not isinstance(raw_job, Mapping):
                 continue
@@ -4764,158 +4956,113 @@ def _run_relationship_reasoning(
             right_ids = [value for value in right_ids if value not in overlap]
             if not left_ids or not right_ids:
                 continue
-            pool = (
-                "bridge"
-                if raw_job.get("requested_collection_pair")
-                else "general"
-            )
-            shared_job_groups[pool].append(
-                {
-                    "bridge_job_id": str(
-                        raw_job.get("job_id")
-                        or "family-job-" + stable_hash(raw_job)[:12]
-                    ),
-                    "left_source_ids": left_ids,
-                    "right_source_ids": right_ids,
-                    "bridge_family": str(raw_job.get("family") or ""),
-                    "why_examine": str(
-                        raw_job.get("discovery_goal") or ""
-                    ),
-                    "target_candidate_count": int(
-                        raw_job.get("candidate_quota", 24) or 24
-                    ),
-                    "requested_collection_pair": list(
-                        raw_job.get("requested_collection_pair", []) or []
-                    ),
-                }
-            )
+            job = {
+                "bridge_job_id": str(
+                    raw_job.get("job_id")
+                    or "family-job-" + stable_hash(raw_job)[:12]
+                ),
+                "left_source_ids": left_ids,
+                "right_source_ids": right_ids,
+                "bridge_family": str(raw_job.get("family") or ""),
+                "why_examine": str(raw_job.get("discovery_goal") or ""),
+                "target_candidate_count": int(
+                    raw_job.get("candidate_quota", 24) or 24
+                ),
+                "requested_collection_pair": list(
+                    raw_job.get("requested_collection_pair", []) or []
+                ),
+            }
+            (
+                broad_jobs
+                if job["requested_collection_pair"]
+                else complement_jobs
+            ).append(job)
         candidate_tasks = []
         family_rows = {
             str(row.get("family_id") or ""): dict(row)
             for row in shared_family_plan.get("literature_families", []) or []
             if isinstance(row, Mapping) and row.get("family_id")
         }
-        context_budget = _relationship_context_char_budget(reasoner, request)
-        for pool, shared_jobs in sorted(shared_job_groups.items()):
-            ordered_jobs = sorted(
-                shared_jobs,
-                key=lambda row: (
-                    -int(row.get("target_candidate_count", 24) or 24),
-                    str(row.get("bridge_job_id") or ""),
-                ),
-            )
-            packet_count = min(2, len(ordered_jobs))
-            packets: list[list[dict[str, Any]]] = [
-                [] for _ in range(packet_count)
+        for pass_name, pool, packet_jobs in (
+            ("broad", "bridge", broad_jobs),
+            ("complement", "general", complement_jobs),
+        ):
+            if not packet_jobs:
+                continue
+            source_ids = {
+                source_id
+                for job in packet_jobs
+                for side in ("left_source_ids", "right_source_ids")
+                for source_id in job[side]
+            }
+            task_profiles = [
+                _relationship_evidence_projection(
+                    profile_by_source[source_id],
+                    lean_by_source[source_id],
+                    include_anchors=False,
+                )
+                for source_id in sorted(source_ids)
             ]
-            packet_loads = [0] * packet_count
-            for job in ordered_jobs:
-                index = min(
-                    range(packet_count),
-                    key=lambda value: (packet_loads[value], value),
+            relevant_families = [
+                family_rows[family_id]
+                for family_id in sorted(
+                    {
+                        str(job.get("bridge_family") or "")
+                        for job in packet_jobs
+                    }
+                    & set(family_rows)
                 )
-                packets[index].append(job)
-                packet_loads[index] += int(
-                    job.get("target_candidate_count", 24) or 24
-                )
-            while True:
-                oversized_index = next(
-                    (
-                        index
-                        for index, jobs in enumerate(packets)
-                        if len(jobs) > 1
-                        and _reasoner_packet_chars(
-                            [
-                                lean_by_source[source_id]
-                                for source_id in sorted(
-                                    {
-                                        source_id
-                                        for job in jobs
-                                        for side in (
-                                            "left_source_ids",
-                                            "right_source_ids",
-                                        )
-                                        for source_id in job[side]
-                                    }
-                                )
-                            ],
-                            {"bridge_jobs": jobs},
-                        )
-                        > context_budget
-                    ),
-                    None,
-                )
-                if oversized_index is None:
-                    break
-                jobs = packets.pop(oversized_index)
-                packets.extend([jobs[::2], jobs[1::2]])
-            for packet_index, packet_jobs in enumerate(packets, start=1):
-                source_ids = {
-                    source_id
-                    for job in packet_jobs
-                    for side in ("left_source_ids", "right_source_ids")
-                    for source_id in job[side]
-                }
-                task_profiles = [
-                    _relationship_evidence_projection(
-                        profile_by_source[source_id],
-                        lean_by_source[source_id],
-                        include_anchors=False,
-                    )
+            ]
+            stage = (
+                "relationship_bridge_candidate_selection"
+                if pool == "bridge"
+                else "relationship_candidate_selection"
+            )
+            task_context = {
+                **base_discovery_context,
+                "discovery_mode": (
+                    "bridge_only"
+                    if pass_name == "broad"
+                    else "complementary_family_discovery"
+                ),
+                "discovery_pass": pass_name,
+                "catalogue": [
+                    lean_by_source[source_id]
                     for source_id in sorted(source_ids)
-                ]
-                relevant_families = [
-                    family_rows[family_id]
-                    for family_id in sorted(
-                        {
-                            str(job.get("bridge_family") or "")
-                            for job in packet_jobs
-                        }
-                        & set(family_rows)
-                    )
-                ]
-                stage = (
-                    "relationship_bridge_candidate_selection"
+                ],
+                "collection_index_cards": collection_index_cards,
+                "bridge_jobs": packet_jobs,
+                "literature_families": relevant_families,
+                "max_inferred_pairs": min(
+                    _RELATIONSHIP_BRIDGE_CANDIDATE_MAX
                     if pool == "bridge"
-                    else "relationship_candidate_selection"
-                )
+                    else _RELATIONSHIP_GENERAL_CANDIDATE_MAX,
+                    sum(
+                        int(row.get("target_candidate_count", 24) or 24)
+                        for row in packet_jobs
+                    ),
+                ),
+            }
+            if (
+                _reasoner_packet_chars(task_profiles, task_context)
+                <= _relationship_context_char_budget(reasoner, request)
+            ):
                 candidate_tasks.append(
                     (
                         stage,
                         "shared-plan-"
-                        + pool
-                        + f"-{packet_index}-"
+                        + pass_name
+                        + "-"
                         + stable_hash(packet_jobs)[:16],
                         task_profiles,
-                        {
-                            **base_discovery_context,
-                            "discovery_mode": (
-                                "bridge_only"
-                                if pool == "bridge"
-                                else "shared_family_plan"
-                            ),
-                            "catalogue": [
-                                lean_by_source[source_id]
-                                for source_id in sorted(source_ids)
-                            ],
-                            "bridge_jobs": packet_jobs,
-                            "literature_families": relevant_families,
-                            "max_inferred_pairs": min(
-                                _RELATIONSHIP_CANDIDATE_MAX,
-                                sum(
-                                    int(
-                                        row.get(
-                                            "target_candidate_count", 24
-                                        )
-                                        or 24
-                                    )
-                                    for row in packet_jobs
-                                ),
-                            ),
-                        },
+                        task_context,
                         pool,
                     )
                 )
+            else:
+                shared_packet_overflow = True
+        if shared_packet_overflow:
+            candidate_tasks = routed_fallback_tasks
 
     current_remaining_calls = (
         remaining_calls
@@ -4970,8 +5117,9 @@ def _run_relationship_reasoning(
                 task_profiles,
                 {
                     **task_context,
-                    "max_inferred_pairs": (
-                        bridge_capacity if pool == "bridge" else general_capacity
+                    "max_inferred_pairs": min(
+                        int(task_context.get("max_inferred_pairs", 0) or 0),
+                        bridge_capacity if pool == "bridge" else general_capacity,
                     ),
                 },
                 pool,
@@ -4979,7 +5127,9 @@ def _run_relationship_reasoning(
             for stage, key, task_profiles, task_context, pool in candidate_tasks
         ]
 
-    candidate_results: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    candidate_results: dict[
+        str, list[tuple[str, Mapping[str, Any]]]
+    ] = defaultdict(list)
 
     def run_candidate_task(
         task: tuple[str, str, Sequence[Any], dict[str, Any], str]
@@ -4992,7 +5142,7 @@ def _run_relationship_reasoning(
             task_profiles,
             task_context,
         )
-        if pool == "bridge":
+        if task_context.get("bridge_jobs"):
             jobs = {
                 str(row.get("bridge_job_id") or ""): row
                 for row in task_context.get("bridge_jobs", []) or []
@@ -5005,6 +5155,8 @@ def _run_relationship_reasoning(
                 row = dict(raw)
                 job = jobs.get(str(row.get("bridge_job_id") or ""))
                 if not job:
+                    row["_candidate_disposition"] = "parked_contract_failure"
+                    candidates.append(row)
                     continue
                 left_source_id = str(
                     row.get("left_source_id") or row.get("source_id") or ""
@@ -5028,8 +5180,25 @@ def _run_relationship_reasoning(
                         and right_source_id in left_side
                     )
                 ):
+                    row["_candidate_disposition"] = "wrong_scope"
+                    candidates.append(row)
                     continue
                 row["discovery_route"] = "routed_cross_collection_bridge"
+                row["discovery_job_id"] = str(
+                    job.get("bridge_job_id") or ""
+                )
+                row["discovery_family"] = str(
+                    job.get("bridge_family") or ""
+                )
+                row["discovery_job_quota"] = int(
+                    job.get("target_candidate_count", 24) or 24
+                )
+                row["requested_collection_pair"] = list(
+                    job.get("requested_collection_pair", []) or []
+                )
+                row["discovery_pass"] = str(
+                    task_context.get("discovery_pass") or ""
+                )
                 candidates.append(row)
             response = {**dict(response), "candidates": candidates}
         return (
@@ -5037,20 +5206,27 @@ def _run_relationship_reasoning(
             response,
         )
 
-    if candidate_tasks:
+    def execute_candidate_tasks(
+        tasks: Sequence[
+            tuple[str, str, Sequence[Any], dict[str, Any], str]
+        ],
+    ) -> None:
+        nonlocal discovery_terminal
+        if not tasks:
+            return
         with ThreadPoolExecutor(
-            max_workers=_provider_worker_count(request, len(candidate_tasks)),
+            max_workers=_provider_worker_count(request, len(tasks)),
             thread_name_prefix="auto-zettelkasten-discovery",
         ) as executor:
             futures = {
                 executor.submit(run_candidate_task, task): task
-                for task in candidate_tasks
+                for task in tasks
             }
             for future in as_completed(futures):
                 task = futures[future]
                 try:
                     pool, response = future.result()
-                    candidate_results[pool].append(response)
+                    candidate_results[pool].append((task[1], response))
                 except Exception as exc:
                     failure_class = _synthesis_failure_class(exc)
                     discovery_terminal |= failure_class != "transport"
@@ -5066,21 +5242,60 @@ def _run_relationship_reasoning(
                             "retry_on_resume": failure_class == "transport",
                         }
                     )
-        discovery_completed = sum(
-            len(rows) for rows in candidate_results.values()
-        ) == len(candidate_tasks)
+    broad_tasks = [
+        task
+        for task in candidate_tasks
+        if task[3].get("discovery_pass") != "complement"
+    ]
+    complement_tasks = [
+        task
+        for task in candidate_tasks
+        if task[3].get("discovery_pass") == "complement"
+    ]
+    execute_candidate_tasks(broad_tasks)
+    prior_candidate_pairs = sorted(
+        {
+            canonical_pair(
+                str(row.get("left_source_id") or row.get("source_id") or ""),
+                str(
+                    row.get("right_source_id")
+                    or row.get("target_source_id")
+                    or row.get("target_id")
+                    or ""
+                ),
+            )
+            for rows in candidate_results.values()
+            for _key, response in rows
+            for row in response.get("candidates", []) or []
+            if isinstance(row, Mapping)
+        }
+    )
+    complement_tasks = [
+        (
+            stage,
+            key,
+            task_profiles,
+            {**task_context, "prior_candidate_pairs": prior_candidate_pairs},
+            pool,
+        )
+        for stage, key, task_profiles, task_context, pool in complement_tasks
+    ]
+    execute_candidate_tasks(complement_tasks)
+    discovery_completed = sum(
+        len(rows) for rows in candidate_results.values()
+    ) == len(candidate_tasks)
 
     general_payload = {
         "candidates": [
             row
-            for response in candidate_results.get("general", [])
+            for _key, response in sorted(candidate_results.get("general", []))
             for row in response.get("candidates", []) or []
         ]
     }
     bridge_payload = {
         "candidates": [
             row
-            for response in candidate_results.get("bridge", [])
+            for _key, response in sorted(candidate_results.get("bridge", []))
             for row in response.get("candidates", []) or []
         ]
     }
@@ -5108,7 +5323,12 @@ def _run_relationship_reasoning(
             _RELATIONSHIP_BRIDGE_CANDIDATE_MAX,
             max(0, inferred_capacity - general_capacity),
         )
-    excluded_pairs = set(mandatory_basis) | negative_pairs
+    excluded_pairs = set(mandatory_basis) | negative_pairs | visible_pairs
+    excluded_pair_reasons = {
+        **{pair: "current_no_relationship" for pair in negative_pairs},
+        **{pair: "already_visible" for pair in visible_pairs},
+    }
+    candidate_dispositions: list[dict[str, Any]] = []
     bridge_rows = _ranked_relationship_candidates(
         bridge_payload,
         available_source_ids=set(profile_by_source),
@@ -5117,6 +5337,8 @@ def _run_relationship_reasoning(
         maximum=bridge_capacity,
         bridge_fraction=1.0,
         scope="bridge",
+        dispositions=candidate_dispositions,
+        excluded_pair_reasons=excluded_pair_reasons,
     )
     bridge_pairs = {
         canonical_pair(str(row["source_id"]), str(row["target_id"]))
@@ -5129,8 +5351,23 @@ def _run_relationship_reasoning(
         excluded_pairs=excluded_pairs | bridge_pairs,
         maximum=general_capacity,
         bridge_fraction=0.4,
+        dispositions=candidate_dispositions,
+        excluded_pair_reasons={
+            **excluded_pair_reasons,
+            **{pair: "duplicate_merged" for pair in bridge_pairs},
+        },
     )
     inferred_rows = [*bridge_rows, *general_rows][:inferred_capacity]
+    for row in candidate_dispositions:
+        pair_values = list(row.get("pair", []) or [])
+        if len(pair_values) != 2:
+            continue
+        pair = canonical_pair(str(pair_values[0]), str(pair_values[1]))
+        if (
+            pair in inactive_accepted_pairs
+            and row.get("disposition") == "selected_for_adjudication"
+        ):
+            row["reconsideration"] = "inactive_or_retired_reconsidered"
     if focus_source_ids and not identity_changed:
         focus = set(focus_source_ids)
         inferred_rows = [
@@ -5139,11 +5376,46 @@ def _run_relationship_reasoning(
             if str(row.get("source_id") or "") in focus
             or str(row.get("target_id") or "") in focus
         ]
+    final_inferred_pairs = {
+        canonical_pair(str(row["source_id"]), str(row["target_id"]))
+        for row in inferred_rows
+    }
+    for disposition in candidate_dispositions:
+        pair_values = list(disposition.get("pair", []) or [])
+        if (
+            len(pair_values) == 2
+            and disposition.get("disposition") == "selected_for_adjudication"
+            and canonical_pair(str(pair_values[0]), str(pair_values[1]))
+            not in final_inferred_pairs
+        ):
+            disposition["disposition"] = "deferred_capacity"
+    candidate_basis_by_pair: dict[
+        tuple[str, str], list[dict[str, Any]]
+    ] = defaultdict(list)
+    for raw in [
+        *(bridge_payload.get("candidates", []) or []),
+        *(general_payload.get("candidates", []) or []),
+    ]:
+        if not isinstance(raw, Mapping):
+            continue
+        pair = canonical_pair(
+            str(raw.get("left_source_id") or raw.get("source_id") or ""),
+            str(
+                raw.get("right_source_id")
+                or raw.get("target_id")
+                or raw.get("target_source_id")
+                or ""
+            ),
+        )
+        if pair[0] in profile_by_source and pair[1] in profile_by_source:
+            candidate_basis_by_pair[pair].append(dict(raw))
     candidate_by_pair = {
-        canonical_pair(
-            str(row.get("source_id") or ""),
-            str(row.get("target_id") or row.get("target_source_id") or ""),
-        ): [dict(row)]
+        canonical_pair(str(row["source_id"]), str(row["target_id"])): list(
+            candidate_basis_by_pair.get(
+                canonical_pair(str(row["source_id"]), str(row["target_id"])),
+                [dict(row)],
+            )
+        )
         for row in inferred_rows
     }
     for pair, basis in mandatory_basis.items():
@@ -5167,6 +5439,7 @@ def _run_relationship_reasoning(
             "prompt_version": RELATIONSHIP_PROMPT_VERSION,
             "output_contract": decision_contract,
             "transport_policy": "source-evidence-only-v2",
+            "policy_identity": relationship_policy_identity,
         }
     )
     jobs: list[RelationshipPairJob] = []
@@ -5829,6 +6102,8 @@ def _run_relationship_reasoning(
         reasoner_backend=reasoner_backend,
         prompt_version=RELATIONSHIP_PROMPT_VERSION,
     )
+    for row in [*validated["accepted"], *validated["no_relationship"]]:
+        row["relationship_policy_identity"] = relationship_policy_identity
     preparked_job_ids = {
         str(row.get("pair_job_id") or "")
         for row in preparked
@@ -5889,6 +6164,42 @@ def _run_relationship_reasoning(
         and len(accounted_job_ids) == len(jobs)
         and not relationship_retry_on_resume
     )
+    disposition_priority = {
+        "selected_for_adjudication": 0,
+        "already_visible": 1,
+        "current_no_relationship": 2,
+        "wrong_scope": 3,
+        "deferred_capacity": 4,
+        "parked_contract_failure": 5,
+        "duplicate_merged": 6,
+    }
+    dispositions_by_pair: dict[tuple[str, str], dict[str, Any]] = {}
+    for raw in candidate_dispositions:
+        pair_values = list(raw.get("pair", []) or [])
+        pair = canonical_pair(
+            str(pair_values[0]) if pair_values else "",
+            str(pair_values[1]) if len(pair_values) > 1 else "",
+        )
+        disposition = str(raw.get("disposition") or "parked_contract_failure")
+        current = dispositions_by_pair.get(pair)
+        if current is None:
+            current = {
+                **dict(raw),
+                "pair": list(pair),
+                "raw_candidate_count": 0,
+                "observed_dispositions": [],
+            }
+            dispositions_by_pair[pair] = current
+        current["raw_candidate_count"] += 1
+        current["observed_dispositions"] = sorted(
+            set(current["observed_dispositions"]) | {disposition}
+        )
+        if disposition_priority.get(disposition, 99) < disposition_priority.get(
+            str(current.get("disposition") or ""), 99
+        ):
+            current["disposition"] = disposition
+        if raw.get("reconsideration"):
+            current["reconsideration"] = raw["reconsideration"]
     return {
         "accepted": validated["accepted"],
         "no_relationship": validated["no_relationship"],
@@ -5909,6 +6220,9 @@ def _run_relationship_reasoning(
         "relationship_stage_complete": relationship_stage_complete,
         "relationship_retry_on_resume": relationship_retry_on_resume,
         "provider_batch_count": provider_batch_count,
+        "candidate_dispositions": [
+            dispositions_by_pair[pair] for pair in sorted(dispositions_by_pair)
+        ],
         "relationship_stage_wall_seconds": relationship_stage_seconds,
         "state_path": str(
             state_path
@@ -5926,8 +6240,11 @@ def _ranked_relationship_candidates(
     maximum: int,
     bridge_fraction: float,
     scope: str = "all",
+    dispositions: list[dict[str, Any]] | None = None,
+    excluded_pair_reasons: Mapping[tuple[str, str], str] | None = None,
 ) -> list[dict[str, Any]]:
-    seen: set[tuple[str, str]] = set()
+    excluded_pair_reasons = excluded_pair_reasons or {}
+    seen: dict[tuple[str, str], dict[str, Any]] = {}
     within: list[dict[str, Any]] = []
     bridges: list[dict[str, Any]] = []
     for index, raw in enumerate(response.get("candidates", []) or []):
@@ -5944,17 +6261,48 @@ def _ranked_relationship_candidates(
             or ""
         )
         pair = canonical_pair(source_id, target_id)
+        forced_disposition = str(row.get("_candidate_disposition") or "")
+        if forced_disposition:
+            if dispositions is not None:
+                dispositions.append(
+                    {"pair": list(pair), "disposition": forced_disposition}
+                )
+            continue
         if (
-            pair in seen
-            or pair in excluded_pairs
-            or source_id not in available_source_ids
+            source_id not in available_source_ids
             or target_id not in available_source_ids
             or source_id == target_id
         ):
+            if dispositions is not None:
+                dispositions.append(
+                    {"pair": list(pair), "disposition": "parked_contract_failure"}
+                )
             continue
-        seen.add(pair)
-        row["source_id"], row["target_id"] = pair
-        row["_model_rank"] = int(row.get("rank") or row.get("priority") or index + 1)
+        if pair in excluded_pairs:
+            if dispositions is not None:
+                dispositions.append(
+                    {
+                        "pair": list(pair),
+                        "disposition": excluded_pair_reasons.get(
+                            pair, "current_no_relationship"
+                        ),
+                    }
+                )
+            continue
+        provenance = {
+            key: row.get(key)
+            for key in (
+                "discovery_job_id",
+                "discovery_family",
+                "discovery_job_quota",
+                "discovery_pass",
+                "requested_collection_pair",
+                "rank",
+                "comparison_proposition",
+                "why_compare",
+            )
+            if row.get(key) not in (None, "", [])
+        }
         left_collections = set(
             entry_by_source.get(source_id, {}).get("literature_ids", [])
             or entry_by_source.get(source_id, {}).get("collections", [])
@@ -5965,7 +6313,7 @@ def _ranked_relationship_candidates(
             or entry_by_source.get(target_id, {}).get("collections", [])
             or []
         )
-        bridge = (
+        bridge = bool(row.get("requested_collection_pair")) or (
             left_collections.isdisjoint(right_collections)
             if left_collections and right_collections
             else bool(
@@ -5974,18 +6322,88 @@ def _ranked_relationship_candidates(
             )
         )
         if scope == "bridge" and not bridge:
+            if dispositions is not None:
+                dispositions.append(
+                    {"pair": list(pair), "disposition": "wrong_scope"}
+                )
             continue
         if scope == "within" and bridge:
+            if dispositions is not None:
+                dispositions.append(
+                    {"pair": list(pair), "disposition": "wrong_scope"}
+                )
             continue
+        if pair in seen:
+            seen[pair].setdefault("discovery_provenance", []).append(provenance)
+            if dispositions is not None:
+                dispositions.append(
+                    {"pair": list(pair), "disposition": "duplicate_merged"}
+                )
+            continue
+        row["source_id"], row["target_id"] = pair
+        try:
+            row["_model_rank"] = int(
+                row.get("rank") or row.get("priority") or index + 1
+            )
+        except (TypeError, ValueError):
+            row["_model_rank"] = index + 1
+        row["discovery_provenance"] = [provenance]
+        seen[pair] = row
         (bridges if bridge else within).append(row)
-    bridges.sort(key=lambda row: (row["_model_rank"], row["source_id"], row["target_id"]))
-    within.sort(key=lambda row: (row["_model_rank"], row["source_id"], row["target_id"]))
+
+    def fair_take(rows: Sequence[dict[str, Any]], count: int) -> list[dict[str, Any]]:
+        buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in rows:
+            buckets[
+                str(row.get("discovery_job_id") or row.get("discovery_route") or "global")
+            ].append(row)
+        for values in buckets.values():
+            values.sort(
+                key=lambda value: (
+                    value["_model_rank"],
+                    value["source_id"],
+                    value["target_id"],
+                )
+            )
+        selected: list[dict[str, Any]] = []
+        while len(selected) < count:
+            progressed = False
+            for key in sorted(buckets):
+                if buckets[key] and len(selected) < count:
+                    selected.append(buckets[key].pop(0))
+                    progressed = True
+            if not progressed:
+                break
+        return selected
+
     bridge_slots = min(len(bridges), int(maximum * bridge_fraction + 0.999))
     within_slots = min(len(within), maximum - bridge_slots)
-    selected = bridges[:bridge_slots] + within[:within_slots]
+    selected = fair_take(bridges, bridge_slots) + fair_take(within, within_slots)
     remaining = maximum - len(selected)
     if remaining:
-        selected.extend(bridges[bridge_slots : bridge_slots + remaining])
+        leftovers = [row for row in [*bridges, *within] if row not in selected]
+        selected.extend(fair_take(leftovers, remaining))
+    selected_pairs = {
+        canonical_pair(str(row["source_id"]), str(row["target_id"]))
+        for row in selected
+    }
+    if dispositions is not None:
+        dispositions.extend(
+            {
+                "pair": list(pair),
+                "disposition": (
+                    "selected_for_adjudication"
+                    if pair in selected_pairs
+                    else "deferred_capacity"
+                ),
+            }
+            for pair in sorted(seen)
+            if not any(
+                row.get("pair") == list(pair)
+                and row.get("disposition") in {"wrong_scope", "current_no_relationship"}
+                for row in dispositions
+            )
+        )
     for row in selected:
         row.pop("_model_rank", None)
     return selected
@@ -6301,6 +6719,14 @@ def _commit_relationship_selection_state(
         "selection_identity": selection_identity
         or str(existing.get("selection_identity") or ""),
     }
+    if "candidate_dispositions" in result or "candidate_dispositions" in existing:
+        payload["candidate_dispositions"] = list(
+            result.get(
+                "candidate_dispositions",
+                existing.get("candidate_dispositions", []),
+            )
+            or []
+        )
     if (
         "relationship_stage_complete" in result
         or "relationship_stage_complete" in existing
@@ -6358,6 +6784,9 @@ def _write_relationship_run_ledger(
                 model=str(payload.get("model") or ""),
                 prompt_version=str(
                     payload.get("prompt_version") or RELATIONSHIP_PROMPT_VERSION
+                ),
+                policy_identity=str(
+                    payload.get("relationship_policy_identity") or ""
                 ),
             )
         event_id = _relationship_event_id(event_type, payload)
@@ -7325,6 +7754,12 @@ def rebuild_map(
                 *list(catalogue_payload.get("virtual_shards", []) or []),
             ],
         )
+        acquisition_ledger_path = _reconcile_cluster_acquisition_recommendations(
+            workspace,
+            cluster_map.get("cluster_syntheses", {}) or {},
+        )
+        if acquisition_ledger_path is not None:
+            paths = [*paths, acquisition_ledger_path]
     except Exception as exc:
         reason = f"literature_synthesis_partial:{type(exc).__name__}:{exc}"
         retry_on_resume = _synthesis_failure_class(exc) == "transport"

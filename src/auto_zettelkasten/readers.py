@@ -505,13 +505,20 @@ class _CapabilityAwareReader:
         """Plan shared relationship and cluster families from the complete lean index."""
 
         self._authorize_request()
+        mode = str((context or {}).get("planning_mode") or "initial_global")
+        instruction = (
+            "Audit the primary family plan for omitted or underrepresented coherent "
+            "families and return additions only."
+            if mode == "coverage_completion"
+            else "Plan shared, overlapping literature families and bounded discovery jobs."
+        )
         return self._literature_json_call(
             _literature_family_plan_system_prompt(),
             _literature_prompt(
                 profiles,
                 request,
                 context,
-                instruction="Plan shared, overlapping literature families and bounded discovery jobs.",
+                instruction=instruction,
             ),
             label="literature family plan",
             reasoning_effort="high",
@@ -1691,7 +1698,7 @@ def _relationship_bridge_shard_system_prompt() -> str:
 
 def _relationship_candidate_system_prompt() -> str:
     return (
-        "You retrieve comparisons for Auto-Zettelkasten relationship prompt v10. "
+        "You retrieve comparisons for Auto-Zettelkasten relationship discovery prompt v13. "
         "Return exactly one JSON object with a candidates array. Each candidate "
         "contains only left_source_id, right_source_id, comparison_proposition, "
         "why_compare, bridge_family, bridge_job_id, and rank. Use only supplied IDs, put the "
@@ -1705,8 +1712,10 @@ def _relationship_candidate_system_prompt() -> str:
         "supplied collection memberships are disjoint. For bridge_only packets, "
         "each candidate must name a supplied bridge_job_id and place one endpoint "
         "on each of that job's source sides. Meet each job's target_candidate_count "
-        "when useful, with no more than two candidates per source unless further pairs would be purely "
-        "superficial. Cover multiple theoretical, mechanistic, empirical, "
+        "when useful. A source may appear in several genuinely useful comparisons. "
+        "When discovery_mode is complementary_family_discovery, do not repeat "
+        "prior_candidate_pairs and concentrate on underrepresented supplied families. "
+        "Cover multiple theoretical, mechanistic, empirical, "
         "institutional, implementation, outcome, sequence, and boundary families "
         "rather than stopping after citations or one theme. Full-note "
         "adjudication later decides whether and how the works relate."
@@ -1836,7 +1845,7 @@ def _cluster_proposal_system_prompt() -> str:
 def _literature_family_plan_system_prompt() -> str:
     return (
         "You are the shared literature-family planner for Auto-Zettelkasten "
-        "cluster plan prompt v6. Read the complete lean source index. Return one "
+        "cluster plan prompt v7. Read the complete lean source index. Return one "
         "JSON object with literature_families, discovery_jobs, and "
         "neighboring_families arrays. A family has family_id, label, "
         "organizing_problem, source_ids, proposed_roles, and candidate_cluster. "
@@ -1854,7 +1863,10 @@ def _literature_family_plan_system_prompt() -> str:
         "non-duplicative pair quotas. Candidate discovery should optimize recall; "
         "the later full-note call decides whether a relationship exists. Citation "
         "and literature-position records are routing signals, not evidence of "
-        "agreement. When planning_mode is incremental_patch, return only affected "
+        "agreement. When planning_mode is coverage_completion, preserve the supplied "
+        "existing family cards and return only omitted or underrepresented coherent "
+        "families and jobs; three empty arrays are valid when none are missing. When "
+        "planning_mode is incremental_patch, return only affected "
         "or replacement families and discovery jobs, retain existing family IDs "
         "when their organizing problem still applies, and do not reshuffle "
         "unaffected families. Do not adjudicate relationships, summarize findings, write "
@@ -1914,7 +1926,7 @@ def _debate_system_prompt() -> str:
 def _cluster_synthesis_system_prompt() -> str:
     return (
         "You are the full-note cluster writer for Auto-Zettelkasten cluster "
-        "synthesis prompt v30. Read every supplied atomic_note_markdown before "
+        "synthesis prompt v31. Read every supplied atomic_note_markdown before "
         "drafting. Copy cluster_id exactly from context.cluster.cluster_id. Return "
         "exactly one JSON object with cluster_id, status, title, "
         "organizing_mode, organizing_problem, optional guiding_question, optional "
@@ -1972,9 +1984,11 @@ def _cluster_synthesis_system_prompt() -> str:
         "Use the supplied literature_positions to consider important mapped works as "
         "possible members, but retain them only when their complete note is supplied "
         "and makes a material cluster contribution. An important cited work without a "
-        "mapped note may appear only in important_cited_works_not_yet_mapped with the "
-        "citing source, that source's characterization, why it matters here, and its "
-        "unmapped status; it is not independent evidence or a member. "
+        "mapped note may appear only in important_cited_works_not_yet_mapped. Copy its "
+        "external_source_id from important_unmapped_literature and supply only "
+        "why_it_matters plus optional selected attribution IDs. Local code restores "
+        "citation, status, and citing-source characterizations; the work is not "
+        "independent evidence or a member. "
         "Return material_exclusions only for intellectually important boundary cases; "
         "you need not explain every unretained candidate. "
         "Do not generate research gaps or administrative diagnostics."
@@ -4310,6 +4324,10 @@ def _validate_streamlined_cluster_response(
             dropped_members
             if isinstance(dropped_members, list)
             else mapping_rows("dropped_members")
+        ),
+        "material_exclusions": mapping_rows("material_exclusions"),
+        "important_cited_works_not_yet_mapped": mapping_rows(
+            "important_cited_works_not_yet_mapped"
         ),
         "split_proposals": mapping_rows("split_proposals"),
         "missing_member_ids": [

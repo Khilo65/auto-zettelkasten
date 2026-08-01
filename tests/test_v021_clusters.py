@@ -7,7 +7,7 @@ from typing import Any, Mapping, Sequence
 
 import pytest
 
-from auto_zettelkasten.files import read_yaml
+from auto_zettelkasten.files import read_yaml, write_yaml
 from auto_zettelkasten.literature import (
     _CheckpointedReasonerCalls,
     _streamlined_cluster_markdown,
@@ -17,6 +17,8 @@ from auto_zettelkasten.literature import (
     validate_streamlined_cluster_synthesis,
 )
 from auto_zettelkasten.models import LiteratureMapRequest
+from auto_zettelkasten.pipeline import _reconcile_cluster_acquisition_recommendations
+from auto_zettelkasten.readers import _validate_streamlined_cluster_response
 
 
 def _profile(source_id: str) -> dict[str, Any]:
@@ -421,6 +423,21 @@ def test_streamlined_validation_keeps_optional_fields_and_no_plain_fallback() ->
             "candidate_source_ids": ["A", "B", "C"],
             "sources": [],
         },
+        important_unmapped_literature=[
+            {
+                "external_source_id": "missing-1",
+                "raw_citation": "Absent 1999",
+                "status": "not_in_snapshot",
+                "attributions": [
+                    {
+                        "literature_position_id": "position-1",
+                        "current_source_id": "A",
+                        "characterization": "A identifies it as the origin of the mechanism.",
+                        "locator": "p. 4",
+                    }
+                ],
+            }
+        ],
     )
 
     assert validated["source_contributions"][0]["plain_english_meaning"] == ""
@@ -432,8 +449,8 @@ def test_streamlined_validation_keeps_optional_fields_and_no_plain_fallback() ->
         }
     ]
     assert validated["important_cited_works_not_yet_mapped"][0][
-        "invoked_by_source_ids"
-    ] == ["A"]
+        "attributions"
+    ][0]["current_source_id"] == "A"
     assert validated["candidate_input_receipt"]["candidate_source_ids"] == [
         "A",
         "B",
@@ -480,8 +497,13 @@ def test_streamlined_markdown_groups_repeated_findings_under_one_source_block() 
     synthesis["important_cited_works_not_yet_mapped"] = [
         {
             "cited_work": "Absent 1999",
-            "invoked_by_source_ids": ["A"],
-            "characterization": "A treats this as foundational.",
+            "attributions": [
+                {
+                    "current_source_id": "A",
+                    "characterization": "A treats this as foundational.",
+                    "locator": "p. 4",
+                }
+            ],
             "why_it_matters": "It explains the mechanism's origin.",
             "status": "not_in_snapshot",
         }
@@ -502,8 +524,64 @@ def test_streamlined_markdown_groups_repeated_findings_under_one_source_block() 
     assert "In plain English:" not in markdown
 
 
+def test_builtin_cluster_parser_preserves_acquisition_fields() -> None:
+    payload = _response(
+        {"cluster_id": "cluster-one"},
+        [_profile("A"), _profile("B")],
+    )
+    payload["material_exclusions"] = [{"source_id": "C", "boundary": "Outside scope."}]
+    payload["important_cited_works_not_yet_mapped"] = [
+        {"external_source_id": "missing-1", "why_it_matters": "Foundational."}
+    ]
+
+    parsed = _validate_streamlined_cluster_response(payload)
+
+    assert parsed["material_exclusions"][0]["source_id"] == "C"
+    assert parsed["important_cited_works_not_yet_mapped"] == [
+        {"external_source_id": "missing-1", "why_it_matters": "Foundational."}
+    ]
+
+
+def test_acquisition_reconciliation_is_additive_and_idempotent(tmp_path: Path) -> None:
+    path = tmp_path / "02_source_memory" / "indexes" / "missing_sources.yml"
+    write_yaml(
+        path,
+        {
+            "missing_source_registry_schema_version": "1",
+            "sources": [
+                {
+                    "external_source_id": "missing-1",
+                    "raw_citation": "Absent 1999",
+                    "acquisition_priority": "high",
+                    "retrieval_status": "not_requested",
+                    "relevant_clusters": [],
+                }
+            ],
+            "revision_hash": "old",
+        },
+    )
+    syntheses = {
+        "cluster-one": {
+            "status": "reasoned",
+            "important_cited_works_not_yet_mapped": [
+                {"external_source_id": "missing-1"}
+            ],
+        }
+    }
+
+    _reconcile_cluster_acquisition_recommendations(tmp_path, syntheses)
+    first = path.read_bytes()
+    _reconcile_cluster_acquisition_recommendations(tmp_path, syntheses)
+
+    row = read_yaml(path)["sources"][0]
+    assert row["relevant_clusters"] == ["cluster-one"]
+    assert row["acquisition_priority"] == "high"
+    assert row["retrieval_status"] == "not_requested"
+    assert path.read_bytes() == first
+
+
 def test_literature_family_stage_has_explicit_checkpoint_mappings() -> None:
-    assert _synthesis_stage_prompt_version("literature_family_plan") == "6"
+    assert _synthesis_stage_prompt_version("literature_family_plan") == "7"
     assert (
         _synthesis_stage_budget_group("literature_family_plan")
         == "literature_family_plan"

@@ -242,3 +242,200 @@ def test_incremental_family_plan_preserves_unaffected_families(
         row["family_id"]: row["label"]
         for row in second["literature_families"]
     } == {"family-ab": "AB revised", "family-cd": "CD"}
+
+
+def test_initial_family_plan_adds_coverage_completion_family(
+    tmp_path: Path,
+) -> None:
+    class Reasoner:
+        name = "local"
+        model = "test"
+
+        def literature_family_plan_fits(self, profiles, request, *, context=None):
+            return True
+
+        def plan_literature_families(self, profiles, request, *, context=None):
+            raise AssertionError("checkpoint wrapper supplies responses")
+
+    class Calls:
+        def __init__(self) -> None:
+            self.contexts = []
+
+        def __call__(self, _stage, _key, _method, _profiles, context):
+            self.contexts.append(context)
+            if context["planning_mode"] == "coverage_completion":
+                return {
+                    "literature_families": [
+                        {
+                            "family_id": "ceasefire-peacekeeping",
+                            "label": "Ceasefire design and peacekeeping",
+                            "organizing_problem": "How ceasefire design and peacekeeping shape durability",
+                            "source_ids": ["C", "D"],
+                            "proposed_roles": {"C": "core", "D": "supporting"},
+                        }
+                    ],
+                    "discovery_jobs": [
+                        {
+                            "job_id": "discover-ceasefire",
+                            "family": "ceasefire-peacekeeping",
+                            "left_source_ids": ["C"],
+                            "right_source_ids": ["D"],
+                        }
+                    ],
+                    "neighboring_families": [],
+                }
+            return {
+                "literature_families": [
+                    {
+                        "family_id": "mediation",
+                        "label": "Mediation",
+                        "organizing_problem": "How mediation operates",
+                        "source_ids": ["A", "B"],
+                        "proposed_roles": {"A": "core", "B": "supporting"},
+                    }
+                ],
+                "discovery_jobs": [
+                    {
+                        "job_id": "discover-mediation",
+                        "family": "mediation",
+                        "left_source_ids": ["A"],
+                        "right_source_ids": ["B"],
+                    }
+                ],
+                "neighboring_families": [],
+            }
+
+    catalogue_path = tmp_path / "02_source_memory" / "indexes" / "catalogue.yml"
+    write_yaml(
+        catalogue_path,
+        {
+            "sources": [
+                {
+                    "source_id": source_id,
+                    "zotero_key": source_id,
+                    "title": f"Source {source_id}",
+                    "author": "Author",
+                    "year": "2020",
+                    "collection_keys": ["C1"],
+                }
+                for source_id in "ABCD"
+            ],
+            "collections": [
+                {"key": "C1", "name": "Collection", "direct_source_ids": list("ABCD")}
+            ],
+        },
+    )
+    profiles = [
+        {
+            "source_id": source_id,
+            "context": {
+                "thesis": f"Thesis {source_id}",
+                "method_or_knowledge_basis": "Comparative analysis",
+            },
+        }
+        for source_id in "ABCD"
+    ]
+    calls = Calls()
+
+    result = _plan_literature_families(
+        tmp_path,
+        profiles=profiles,
+        catalogue={"catalogue_path": str(catalogue_path)},
+        reasoner=Reasoner(),
+        reasoner_calls=calls,
+        request=LiteratureMapRequest(tmp_path),
+    )
+
+    assert [row["family_id"] for row in result["literature_families"]] == [
+        "ceasefire-peacekeeping",
+        "mediation",
+    ]
+    assert [context["planning_mode"] for context in calls.contexts] == [
+        "initial_global",
+        "coverage_completion",
+    ]
+    assert calls.contexts[1]["unassigned_source_ids"] == ["C", "D"]
+
+
+def test_family_plan_discards_placeholder_requested_pair() -> None:
+    result = _validate_literature_family_plan(
+        {
+            "literature_families": [
+                {
+                    "family_id": "family",
+                    "label": "Family",
+                    "organizing_problem": "A bounded problem",
+                    "source_ids": ["A", "B"],
+                }
+            ],
+            "discovery_jobs": [
+                {
+                    "job_id": "placeholder",
+                    "family": "family",
+                    "left_source_ids": ["A"],
+                    "right_source_ids": ["B"],
+                    "requested_collection_pair": [
+                        "left_collection_key",
+                        "right_collection_key",
+                    ],
+                }
+            ],
+            "neighboring_families": [],
+        },
+        lean_rows=[
+            {"source_id": "A", "collection_keys": ["C1"]},
+            {"source_id": "B", "collection_keys": ["C2"]},
+        ],
+        requested_collection_keys=["C1", "C2"],
+    )
+
+    jobs = {row["job_id"]: row for row in result["discovery_jobs"]}
+    assert jobs["placeholder"]["requested_collection_pair"] == []
+    assert any(
+        row["requested_collection_pair"] == ["C1", "C2"]
+        for row in result["discovery_jobs"]
+    )
+
+
+def test_narrow_family_job_does_not_replace_full_requested_comparison() -> None:
+    result = _validate_literature_family_plan(
+        {
+            "literature_families": [
+                {
+                    "family_id": "narrow",
+                    "label": "Narrow family",
+                    "organizing_problem": "One part of the comparison",
+                    "source_ids": ["A", "B"],
+                }
+            ],
+            "discovery_jobs": [
+                {
+                    "job_id": "narrow-job",
+                    "family": "narrow",
+                    "left_source_ids": ["A"],
+                    "right_source_ids": ["B"],
+                    "requested_collection_pair": ["C1", "C2"],
+                }
+            ],
+            "neighboring_families": [],
+        },
+        lean_rows=[
+            {"source_id": "A", "collection_keys": ["C1"]},
+            {"source_id": "B", "collection_keys": ["C2"]},
+            {"source_id": "C", "collection_keys": ["C1"]},
+            {"source_id": "D", "collection_keys": ["C2"]},
+        ],
+        requested_collection_keys=["C1", "C2"],
+    )
+
+    requested_jobs = [
+        row
+        for row in result["discovery_jobs"]
+        if row["requested_collection_pair"] == ["C1", "C2"]
+    ]
+    assert len(requested_jobs) == 2
+    assert any(
+        row["left_source_ids"] == ["A", "C"]
+        and row["right_source_ids"] == ["B", "D"]
+        for row in requested_jobs
+    )
