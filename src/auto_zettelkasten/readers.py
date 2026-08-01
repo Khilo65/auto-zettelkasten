@@ -38,6 +38,10 @@ class ProviderError(RuntimeError):
     pass
 
 
+class ProviderEmptyResponse(ProviderError):
+    """The provider completed without any visible answer content."""
+
+
 class CloudPermissionError(ProviderError):
     pass
 
@@ -557,17 +561,24 @@ class _CapabilityAwareReader:
         """Select intellectually consequential source or cluster comparisons."""
 
         self._authorize_request()
-        return _validate_relationship_response(
-            self._literature_json_call(
-                _relationship_candidate_system_prompt(),
-                _relationship_prompt(profiles, request, context),
-                label="relationship candidate selection",
-                reasoning_effort="high",
-                output_tokens=RELATIONSHIP_CANDIDATE_MAX_OUTPUT_TOKENS,
-                list_key="candidates",
-            ),
-            kind="candidate_selection",
+        raw_response = self._literature_json_call(
+            _relationship_candidate_system_prompt(),
+            _relationship_prompt(profiles, request, context),
+            label="relationship candidate selection",
+            reasoning_effort="high",
+            output_tokens=RELATIONSHIP_CANDIDATE_MAX_OUTPUT_TOKENS,
+            list_key="candidates",
         )
+        try:
+            return _validate_relationship_response(
+                raw_response, kind="candidate_selection"
+            )
+        except ProviderError as exc:
+            exc.raw_response = raw_response
+            completion = getattr(self, "last_literature_completion", {})
+            if completion:
+                exc.provider_completion = dict(completion)
+            raise
 
     def adjudicate_relationships(
         self,
@@ -579,17 +590,24 @@ class _CapabilityAwareReader:
         """Return one complete v4 decision for every immutable pair job."""
 
         self._authorize_request()
-        return _validate_relationship_response(
-            self._literature_json_call(
-                _relationship_adjudication_system_prompt(),
-                _relationship_prompt(profiles, request, context),
-                label="relationship adjudication",
-                reasoning_effort="max",
-                output_tokens=RELATIONSHIP_MAX_OUTPUT_TOKENS,
-                list_key="decisions",
-            ),
-            kind="relationship_adjudication",
+        raw_response = self._literature_json_call(
+            _relationship_adjudication_system_prompt(),
+            _relationship_prompt(profiles, request, context),
+            label="relationship adjudication",
+            reasoning_effort="max",
+            output_tokens=RELATIONSHIP_MAX_OUTPUT_TOKENS,
+            list_key="decisions",
         )
+        try:
+            return _validate_relationship_response(
+                raw_response, kind="relationship_adjudication"
+            )
+        except ProviderError as exc:
+            exc.raw_response = raw_response
+            completion = getattr(self, "last_literature_completion", {})
+            if completion:
+                exc.provider_completion = dict(completion)
+            raise
 
     def verify_relationships(
         self,
@@ -601,17 +619,24 @@ class _CapabilityAwareReader:
         """Independently verify tentative relationship decisions."""
 
         self._authorize_request()
-        return _validate_relationship_response(
-            self._literature_json_call(
-                _relationship_verification_system_prompt(),
-                _relationship_prompt(profiles, request, context),
-                label="relationship verification",
-                reasoning_effort="max",
-                output_tokens=RELATIONSHIP_MAX_OUTPUT_TOKENS,
-                list_key="verifications",
-            ),
-            kind="relationship_verification",
+        raw_response = self._literature_json_call(
+            _relationship_verification_system_prompt(),
+            _relationship_prompt(profiles, request, context),
+            label="relationship verification",
+            reasoning_effort="max",
+            output_tokens=RELATIONSHIP_MAX_OUTPUT_TOKENS,
+            list_key="verifications",
         )
+        try:
+            return _validate_relationship_response(
+                raw_response, kind="relationship_verification"
+            )
+        except ProviderError as exc:
+            exc.raw_response = raw_response
+            completion = getattr(self, "last_literature_completion", {})
+            if completion:
+                exc.provider_completion = dict(completion)
+            raise
 
     def propose_clusters(
         self,
@@ -825,6 +850,9 @@ class _CapabilityAwareReader:
             )
         except ProviderError as exc:
             exc.raw_response = raw_response
+            completion = getattr(self, "last_literature_completion", {})
+            if completion:
+                exc.provider_completion = dict(completion)
             raise
 
     def detect_gaps(
@@ -873,6 +901,7 @@ class _CapabilityAwareReader:
         deadline_seconds: float | None = None,
     ) -> Mapping[str, Any]:
         self.last_literature_response = None
+        self.last_literature_completion = {}
         output_tokens = int(
             output_tokens
             if output_tokens is not None
@@ -911,6 +940,9 @@ class _CapabilityAwareReader:
         except Exception as exc:
             _preserve_provider_failure(exc, raw)
             raise
+        self.last_literature_completion = dict(
+            getattr(raw, "completion", {}) or {}
+        )
         self.last_literature_response = response
         return response
 
@@ -1186,15 +1218,27 @@ class _OpenAICompatibleReader(_CapabilityAwareReader):
             body["reasoning_effort"] = _REASONING_EFFORT.get() or "high"
         else:
             body["temperature"] = 0
-        payload = _post_json(
-            self.endpoint,
-            body,
-            headers={"Authorization": f"Bearer {os.environ[self.api_key_env]}"},
-            timeout=deadline_seconds,
-            response_byte_limit=_stream_response_byte_limit(output_tokens),
-            on_attempt=self._record_transport_attempt,
-            response_reader=_read_openai_stream_response,
-        )
+        try:
+            payload = _post_json(
+                self.endpoint,
+                body,
+                headers={"Authorization": f"Bearer {os.environ[self.api_key_env]}"},
+                timeout=deadline_seconds,
+                response_byte_limit=_stream_response_byte_limit(output_tokens),
+                on_attempt=self._record_transport_attempt,
+                response_reader=_read_openai_stream_response,
+            )
+        except ProviderError as exc:
+            completion = dict(getattr(exc, "provider_completion", {}) or {})
+            completion.update(
+                {
+                    "provider": self.name,
+                    "model": completion.get("model") or self.model,
+                    "max_output_tokens": output_tokens,
+                }
+            )
+            exc.provider_completion = completion
+            raise
         try:
             choice = payload["choices"][0]
             finish_reason = str(choice.get("finish_reason") or "")
@@ -1207,6 +1251,13 @@ class _OpenAICompatibleReader(_CapabilityAwareReader):
                 "response_id": str(payload.get("id") or ""),
                 "usage": dict(payload.get("usage") or {}),
             }
+            completion.update(dict(payload.get("_stream_diagnostics") or {}))
+            if not content.strip():
+                exc = ProviderEmptyResponse(
+                    f"{self.name} returned an empty response"
+                )
+                _preserve_provider_failure(exc, _ProviderText(content, completion))
+                raise exc
             if finish_reason and finish_reason != "stop":
                 exc = ProviderError(
                     f"{self.name} response incomplete: finish_reason={finish_reason}"
@@ -1698,8 +1749,8 @@ def _relationship_bridge_shard_system_prompt() -> str:
 
 def _relationship_candidate_system_prompt() -> str:
     return (
-        "You retrieve comparisons for Auto-Zettelkasten relationship discovery prompt v14. "
-        "Return exactly one JSON object with a candidates array. Each candidate "
+        "You retrieve comparisons for Auto-Zettelkasten relationship discovery prompt v15. "
+        "Return exactly one JSON object with candidates and optional job_outcomes arrays. Each candidate "
         "contains only left_source_id, right_source_id, comparison_proposition, "
         "bridge_job_id, and rank. Use only supplied IDs, put the "
         "canonical lexicographically earlier ID on the left, and never repeat a "
@@ -1715,6 +1766,11 @@ def _relationship_candidate_system_prompt() -> str:
         "when useful. A source may appear in several genuinely useful comparisons. "
         "When discovery_mode is complementary_family_discovery, do not repeat "
         "prior_candidate_pairs and fulfill each supplied family job independently. "
+        "For built-in complementary-family packets, return exactly one job_outcomes "
+        "row for every supplied bridge_job_id, using status completed when more useful "
+        "comparisons may exist or no_more_candidates only after exhausting that job's "
+        "non-trivial comparisons. A candidate floor is a minimum coverage target, not "
+        "a cap; return additional useful candidates while global capacity remains. "
         "Cover multiple theoretical, mechanistic, empirical, "
         "institutional, implementation, outcome, sequence, and boundary families "
         "rather than stopping after citations or one theme. Full-note "
@@ -1725,7 +1781,7 @@ def _relationship_candidate_system_prompt() -> str:
 def _relationship_adjudication_system_prompt() -> str:
     return (
         "You adjudicate immutable relationship pair jobs for Auto-Zettelkasten "
-        "relationship prompt v12 and contract relationship-decision-v8. Read both "
+        "relationship prompt v13 and contract relationship-decision-v8. Read both "
         "complete atomic notes. Return one JSON object whose decisions object is keyed "
         "by every supplied pair_job_id, with no missing or extra keys. Each value is "
         "either {decision:no_relationship, reason, confidence} or "
@@ -1745,7 +1801,11 @@ def _relationship_adjudication_system_prompt() -> str:
         "sequential_relationship, interpretive_or_normative_disagreement, or "
         "contextual_connection. A shared broad topic alone is no_relationship. Use "
         "contextual_connection when joint reading is useful but construct, stage, "
-        "outcome, method, case, or scope prevents a stronger claim. Contrasts requires "
+        "outcome, method, case, or scope prevents a stronger claim. "
+        "Use complements only when both works contribute to the same sufficiently "
+        "specific proposition, mechanism, or outcome; use contextual_connection when "
+        "the useful connection combines adjacent but different objects or outcomes. "
+        "Contrasts requires "
         "incompatible claims on a comparable proposition. extends requires explicit "
         "intellectual lineage through building on, testing, refining, applying, or generalizing. "
         "Citation, chronology, coding or dataset reuse, and proximity alone do not "
@@ -1845,7 +1905,7 @@ def _cluster_proposal_system_prompt() -> str:
 def _literature_family_plan_system_prompt() -> str:
     return (
         "You are the shared literature-family planner for Auto-Zettelkasten "
-        "cluster plan prompt v7. Read the complete lean source index. Return one "
+        "cluster plan prompt v8. Read the complete lean source index. Return one "
         "JSON object with literature_families, discovery_jobs, and "
         "neighboring_families arrays. A family has family_id, label, "
         "organizing_problem, source_ids, proposed_roles, and candidate_cluster. "
@@ -1860,7 +1920,7 @@ def _literature_family_plan_system_prompt() -> str:
         "cross-literature discovery. Every explicitly requested collection pair "
         "must receive a direct discovery job, while other useful comparisons may be "
         "added. Divide discovery into distinct intellectual families with "
-        "non-duplicative pair quotas. Candidate discovery should optimize recall; "
+        "non-duplicative candidate targets. Candidate discovery should optimize recall; "
         "the later full-note call decides whether a relationship exists. Citation "
         "and literature-position records are routing signals, not evidence of "
         "agreement. When planning_mode is coverage_completion, preserve the supplied "
@@ -1926,13 +1986,13 @@ def _debate_system_prompt() -> str:
 def _cluster_synthesis_system_prompt() -> str:
     return (
         "You are the full-note cluster writer for Auto-Zettelkasten cluster "
-        "synthesis prompt v31. Read every supplied atomic_note_markdown before "
+        "synthesis prompt v32 and contract streamlined-full-note-v2. Read every supplied atomic_note_markdown before "
         "drafting. Copy cluster_id exactly from context.cluster.cluster_id. Return "
         "exactly one JSON object with cluster_id, status, title, "
         "organizing_mode, organizing_problem, optional guiding_question, optional "
         "central_tension, bottom_line, lines_of_inquiry, differences, limits, "
         "related_clusters, retained_member_ids, optional dropped_members, optional "
-        "material_exclusions, optional important_cited_works_not_yet_mapped, optional "
+        "material_exclusions, acquisition_candidate_dispositions, optional "
         "split_proposals, and optional missing_member_ids. Status is accepted or "
         "rejected; it is the writer decision, not a copied planning or registry "
         "status. Each line of inquiry contains title, synthesis, and "
@@ -1984,11 +2044,13 @@ def _cluster_synthesis_system_prompt() -> str:
         "Use the supplied literature_positions to consider important mapped works as "
         "possible members, but retain them only when their complete note is supplied "
         "and makes a material cluster contribution. An important cited work without a "
-        "mapped note may appear only in important_cited_works_not_yet_mapped. Copy its "
-        "external_source_id from important_unmapped_literature and supply only "
-        "why_it_matters plus optional selected attribution IDs. Local code restores "
-        "citation, status, and citing-source characterizations; the work is not "
-        "independent evidence or a member. "
+        "mapped note is not independent evidence or a member. Return exactly one compact "
+        "acquisition_candidate_dispositions row for every supplied "
+        "important_unmapped_literature external_source_id. Use decision recommend, "
+        "relevant_secondary, or not_relevant_to_cluster; why_it_matters is required only "
+        "for recommend, and selected_attribution_ids is optional. Do not generate a second "
+        "independent recommendation list. Local code restores identity, citation, action "
+        "status, and citing-source characterizations. "
         "Return material_exclusions only for intellectually important boundary cases; "
         "you need not explain every unretained candidate. "
         "Do not generate research gaps or administrative diagnostics."
@@ -3378,8 +3440,11 @@ def _parse_json_object(
         if len(recovered) != 1:
             raise ProviderError(f"{label} was not valid JSON") from exc
         payload = recovered[0]
-    if isinstance(payload, list) and list_key:
-        return {list_key: payload}
+    if isinstance(payload, list):
+        if list_key:
+            return {list_key: payload}
+        if len(payload) == 1 and isinstance(payload[0], Mapping):
+            return dict(payload[0])
     if not isinstance(payload, dict):
         raise ProviderError(f"{label} must be a JSON object")
     return payload
@@ -4188,7 +4253,7 @@ def _validate_streamlined_cluster_response(
         or ""
     ).strip()
     result = {
-        "cluster_contract": "streamlined-full-note-v1",
+        "cluster_contract": "streamlined-full-note-v2",
         "cluster_id": str(payload.get("cluster_id") or "").strip(),
         "status": str(payload.get("status") or "accepted").strip().casefold(),
         "title": str(payload.get("title") or organizing_problem).strip(),
@@ -4326,6 +4391,10 @@ def _validate_streamlined_cluster_response(
             else mapping_rows("dropped_members")
         ),
         "material_exclusions": mapping_rows("material_exclusions"),
+        "acquisition_candidate_dispositions": mapping_rows(
+            "acquisition_candidate_dispositions"
+        ),
+        # Legacy built-in responses remain inspectable during lazy migration.
         "important_cited_works_not_yet_mapped": mapping_rows(
             "important_cited_works_not_yet_mapped"
         ),
@@ -4385,7 +4454,20 @@ def _validate_relationship_response(
         }
     if not isinstance(values, list):
         raise ProviderError(f"{kind.replace('_', ' ')} response must contain a {key} list")
-    return {key: [dict(value) if isinstance(value, Mapping) else value for value in values]}
+    result = {
+        key: [dict(value) if isinstance(value, Mapping) else value for value in values]
+    }
+    if kind == "candidate_selection" and "job_outcomes" in payload:
+        outcomes = payload["job_outcomes"]
+        if not isinstance(outcomes, list):
+            raise ProviderError(
+                "relationship candidate response job_outcomes must be a list"
+            )
+        result["job_outcomes"] = [
+            dict(value) if isinstance(value, Mapping) else value
+            for value in outcomes
+        ]
+    return result
 
 
 def _cluster_boundary_text(value: Any) -> str:
@@ -4539,42 +4621,138 @@ def _read_openai_stream_response(
     content: list[str] = []
     finish_reason = ""
     total = 0
+    event_count = 0
+    content_fragment_count = 0
+    reasoning_fragment_count = 0
+    response_id = ""
+    model = ""
+    usage: dict[str, Any] = {}
+    stream_hash = hashlib.sha256()
+
+    def diagnostics(visible_content: str) -> dict[str, Any]:
+        return {
+            "response_id": response_id,
+            "usage": usage,
+            "finish_reason": finish_reason or "stop",
+            "model": model,
+            "event_count": event_count,
+            "response_bytes": total,
+            "content_fragment_count": content_fragment_count,
+            "content_characters": len(visible_content),
+            "reasoning_fragment_count": reasoning_fragment_count,
+            "stream_sha256": stream_hash.hexdigest(),
+            "content_sha256": hashlib.sha256(
+                visible_content.encode("utf-8")
+            ).hexdigest(),
+        }
+
+    def preserve_stream_failure(error: ProviderError) -> ProviderError:
+        visible_content = "".join(content)
+        _preserve_provider_failure(
+            error, _ProviderText(visible_content, diagnostics(visible_content))
+        )
+        return error
+
     while True:
-        remaining = _remaining_seconds(deadline)
-        _set_stream_timeout(response, remaining)
-        line = response.readline()
-        _remaining_seconds(deadline)
+        try:
+            remaining = _remaining_seconds(deadline)
+            _set_stream_timeout(response, remaining)
+            line = response.readline()
+            _remaining_seconds(deadline)
+        except ProviderError as exc:
+            preserve_stream_failure(exc)
+            raise
+        except (OSError, http.client.HTTPException) as exc:
+            raise preserve_stream_failure(
+                ProviderError("provider stream read failed")
+            ) from exc
         if not line:
             break
         total += len(line)
+        stream_hash.update(line)
         if total > byte_limit:
-            raise ProviderError(
-                "provider response exceeded the configured output bound"
+            raise preserve_stream_failure(
+                ProviderError(
+                    "provider response exceeded the configured output bound"
+                )
             )
-        decoded = line.decode("utf-8", errors="strict").strip()
+        try:
+            decoded = line.decode("utf-8", errors="strict").strip()
+        except UnicodeDecodeError as exc:
+            error = preserve_stream_failure(
+                ProviderError("provider stream contained invalid UTF-8")
+            )
+            error.provider_completion["malformed_event_sha256"] = hashlib.sha256(
+                line
+            ).hexdigest()
+            raise error from exc
         if not decoded or decoded.startswith(":") or not decoded.startswith("data:"):
             continue
         data = decoded[5:].strip()
         if data == "[DONE]":
             break
+        event_count += 1
         try:
             event = json.loads(data)
-            choice = event["choices"][0]
+            if not isinstance(event, Mapping):
+                raise TypeError("stream event must be an object")
+            choices = event.get("choices")
+            if choices == [] and isinstance(event.get("usage"), Mapping):
+                if event.get("id"):
+                    response_id = str(event["id"])
+                if event.get("model"):
+                    model = str(event["model"])
+                usage = dict(event["usage"])
+                continue
+            choice = choices[0]
         except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
-            raise ProviderError("provider stream contained an invalid event") from exc
+            error = ProviderError("provider stream contained an invalid event")
+            visible_content = "".join(content)
+            completion = diagnostics(visible_content)
+            completion["malformed_event_sha256"] = hashlib.sha256(
+                data.encode("utf-8")
+            ).hexdigest()
+            if "reasoning_content" not in data:
+                completion["malformed_event_excerpt"] = data[:512]
+            _preserve_provider_failure(
+                error, _ProviderText(visible_content, completion)
+            )
+            raise error from exc
+        if event.get("id"):
+            response_id = str(event["id"])
+        if event.get("model"):
+            model = str(event["model"])
+        if isinstance(event.get("usage"), Mapping):
+            usage = dict(event["usage"])
         delta = choice.get("delta") or choice.get("message") or {}
         piece = delta.get("content") if isinstance(delta, Mapping) else None
-        if isinstance(piece, str):
+        if isinstance(piece, str) and piece:
             content.append(piece)
+            content_fragment_count += 1
+        reasoning_piece = (
+            delta.get("reasoning_content") if isinstance(delta, Mapping) else None
+        )
+        if isinstance(reasoning_piece, str) and reasoning_piece:
+            reasoning_fragment_count += 1
         if choice.get("finish_reason"):
             finish_reason = str(choice["finish_reason"])
-    if not content:
-        raise ProviderError("provider stream ended without response content")
+    visible_content = "".join(content)
+    stream_diagnostics = diagnostics(visible_content)
+    if not visible_content.strip():
+        error = ProviderEmptyResponse("provider stream ended without response content")
+        _preserve_provider_failure(
+            error, _ProviderText(visible_content, stream_diagnostics)
+        )
+        raise error
     return {
+        "id": response_id,
+        "model": model,
+        "usage": usage,
+        "_stream_diagnostics": stream_diagnostics,
         "choices": [
             {
                 "finish_reason": finish_reason or "stop",
-                "message": {"content": "".join(content)},
+                "message": {"content": visible_content},
             }
         ]
     }

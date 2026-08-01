@@ -39,7 +39,26 @@ def test_relationship_discovery_uses_lean_recall_first_prompt() -> None:
     assert "why_compare" not in prompt
     assert "bridge_family" not in prompt
     assert "evidence_anchor_ids" not in prompt
+    assert "job_outcomes" in prompt
+    assert "no_more_candidates" in prompt
     assert RELATIONSHIP_MAX_OUTPUT_TOKENS == 128_000
+
+
+def test_candidate_validation_preserves_optional_job_outcomes() -> None:
+    assert _validate_relationship_response(
+        {
+            "candidates": [],
+            "job_outcomes": [
+                {"bridge_job_id": "job-a", "status": "no_more_candidates"}
+            ],
+        },
+        kind="candidate_selection",
+    ) == {
+        "candidates": [],
+        "job_outcomes": [
+            {"bridge_job_id": "job-a", "status": "no_more_candidates"}
+        ],
+    }
 
 
 def test_v7_relationship_requires_claim_owned_primary_anchor_per_endpoint() -> None:

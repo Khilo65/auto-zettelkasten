@@ -107,7 +107,7 @@ def test_partial_source_prompt_prohibits_complete_document_inference() -> None:
 def test_cluster_prompt_preserves_inference_and_case_evidence() -> None:
     prompt = _cluster_synthesis_system_prompt()
 
-    assert "cluster synthesis prompt v31" in prompt
+    assert "cluster synthesis prompt v32" in prompt
     assert "Read every supplied atomic_note_markdown" in prompt
     assert "Every retained member" in prompt
     assert "specific study finding" in prompt
@@ -118,6 +118,8 @@ def test_cluster_prompt_preserves_inference_and_case_evidence() -> None:
     assert "numerator and denominator" in prompt
     assert "named-source attribution" in prompt
     assert "do not create cross-study conversions" in prompt
+    assert "acquisition_candidate_dispositions" in prompt
+    assert "Do not generate a second independent recommendation list" in prompt
     assert "practitioner recommendation" in prompt
 
 

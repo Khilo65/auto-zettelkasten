@@ -129,6 +129,11 @@ def test_literature_json_parser_recovers_one_object_wrapped_in_provider_prose() 
             label="gap adjudication response",
         )
 
+    assert _parse_json_object(
+        '[{"gaps": [], "rejected": []}]',
+        label="gap adjudication response",
+    ) == {"gaps": [], "rejected": []}
+
 
 def test_relationship_response_accepts_bare_lists_and_preserves_malformed_rows() -> None:
     assert _parse_json_object(
@@ -140,6 +145,50 @@ def test_relationship_response_accepts_bare_lists_and_preserves_malformed_rows()
         {"decisions": [{"source_id": "a"}, "malformed"]},
         kind="relationship_adjudication",
     ) == {"decisions": [{"source_id": "a"}, "malformed"]}
+
+
+def test_wrong_shape_candidate_mapping_preserves_raw_response_and_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    reader = DeepSeekReader(allow_cloud=True)
+    monkeypatch.setattr(
+        reader,
+        "_generate_text",
+        lambda *args: reader_module._ProviderText(
+            '{"unexpected": []}', {"response_id": "response-1"}
+        ),
+    )
+
+    with pytest.raises(ProviderError) as raised:
+        reader.select_relationship_candidates(
+            [], LiteratureMapRequest(tmp_path, allow_cloud=True)
+        )
+
+    assert raised.value.raw_response == {"unexpected": []}
+    assert raised.value.provider_completion["response_id"] == "response-1"
+
+
+def test_wrong_shape_cluster_mapping_preserves_raw_response_and_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    reader = DeepSeekReader(allow_cloud=True)
+    monkeypatch.setattr(
+        reader,
+        "_generate_text",
+        lambda *args: reader_module._ProviderText(
+            '{"unexpected": []}', {"response_id": "response-2"}
+        ),
+    )
+
+    with pytest.raises(ProviderError) as raised:
+        reader.synthesize_cluster([], LiteratureMapRequest(tmp_path, allow_cloud=True))
+
+    assert raised.value.raw_response == {"unexpected": []}
+    assert raised.value.provider_completion["response_id"] == "response-2"
 
 
 def test_builtin_gap_response_normalizes_optional_model_shape_errors_per_candidate() -> (
@@ -1698,9 +1747,9 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
         "Temporal: 2000-2020",
         "Regional: African civil wars",
     ]
-    assert synthesis["cluster_contract"] == "streamlined-full-note-v1"
+    assert synthesis["cluster_contract"] == "streamlined-full-note-v2"
     assert synthesis["lines_of_inquiry"][0]["study_findings"][0]["source_id"] == "source-a"
-    assert "cluster synthesis prompt v31" in system_prompts["full-note cluster writer"]
+    assert "cluster synthesis prompt v32" in system_prompts["full-note cluster writer"]
     assert "Read every supplied atomic_note_markdown" in system_prompts[
         "full-note cluster writer"
     ]

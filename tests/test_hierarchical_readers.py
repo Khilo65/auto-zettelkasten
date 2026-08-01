@@ -18,8 +18,10 @@ from auto_zettelkasten.readers import (
     GeminiReader,
     OllamaReader,
     OpenRouterReader,
+    ProviderEmptyResponse,
     ProviderError,
     _post_json,
+    _read_openai_stream_response,
 )
 
 
@@ -73,6 +75,13 @@ class _SseResponse:
         if self.on_read:
             self.on_read()
         return self.lines.pop(0) if self.lines else b""
+
+
+class _InterruptedSseResponse(_SseResponse):
+    def readline(self) -> bytes:
+        if self.lines:
+            return self.lines.pop(0)
+        raise OSError("connection reset")
 
 
 def _analysis() -> dict[str, str]:
@@ -435,6 +444,157 @@ def test_deepseek_uses_streaming_json_and_reassembles_sse(monkeypatch: pytest.Mo
 
     assert DeepSeekReader(allow_cloud=True).read_source("source text", {"title": "Study"}) == _analysis()
     assert captured[0]["stream"] is True
+
+
+def test_deepseek_empty_stream_preserves_diagnostics_without_reasoning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "auto_zettelkasten.readers.urllib.request.urlopen",
+        lambda request, timeout: _SseResponse(
+            [
+                {
+                    "id": "response-1",
+                    "model": "deepseek-v4-flash",
+                    "choices": [
+                        {
+                            "delta": {
+                                "reasoning_content": "private reasoning",
+                                "content": "",
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
+                },
+                {
+                    "id": "response-1",
+                    "model": "deepseek-v4-flash",
+                    "choices": [
+                        {"delta": {"content": ""}, "finish_reason": "stop"}
+                    ],
+                },
+                {
+                    "id": "response-1",
+                    "model": "deepseek-v4-flash",
+                    "usage": {"completion_tokens": 17},
+                    "choices": [],
+                },
+                "[DONE]",
+            ]
+        ),
+    )
+
+    with pytest.raises(ProviderEmptyResponse) as raised:
+        DeepSeekReader(allow_cloud=True).read_source(
+            "source text", {"title": "Study"}
+        )
+
+    assert raised.value.raw_response == ""
+    completion = raised.value.provider_completion
+    assert completion["response_id"] == "response-1"
+    assert completion["usage"] == {"completion_tokens": 17}
+    assert completion["finish_reason"] == "stop"
+    assert completion["event_count"] == 3
+    assert completion["content_fragment_count"] == 0
+    assert completion["content_characters"] == 0
+    assert completion["reasoning_fragment_count"] == 1
+    assert completion["response_bytes"] > 0
+    assert len(completion["stream_sha256"]) == 64
+    assert len(completion["content_sha256"]) == 64
+    assert "private reasoning" not in json.dumps(completion)
+
+
+def test_deepseek_malformed_stream_event_preserves_bounded_transport_excerpt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    malformed = "not-json-" + "x" * 1_000
+    monkeypatch.setattr(
+        "auto_zettelkasten.readers.urllib.request.urlopen",
+        lambda request, timeout: _SseResponse(
+            [
+                {"choices": [{"delta": {"content": "{"}}]},
+                malformed,
+            ]
+        ),
+    )
+
+    with pytest.raises(ProviderError, match="invalid event") as raised:
+        DeepSeekReader(allow_cloud=True).read_source(
+            "source text", {"title": "Study"}
+        )
+
+    assert raised.value.raw_response == "{"
+    completion = raised.value.provider_completion
+    assert completion["event_count"] == 2
+    assert len(completion["malformed_event_excerpt"]) == 512
+    assert len(completion["malformed_event_sha256"]) == 64
+
+
+def test_stream_byte_limit_preserves_accumulated_diagnostics() -> None:
+    response = _SseResponse(
+        [
+            {
+                "id": "response-1",
+                "choices": [{"delta": {"content": "{"}}],
+            },
+            {"choices": [{"delta": {"content": "x" * 1_000}}]},
+        ]
+    )
+    byte_limit = len(response.lines[0]) + 10
+
+    with pytest.raises(ProviderError, match="configured output bound") as raised:
+        _read_openai_stream_response(response, 10**12, byte_limit)
+
+    assert raised.value.raw_response == "{"
+    completion = raised.value.provider_completion
+    assert completion["response_id"] == "response-1"
+    assert completion["event_count"] == 1
+    assert completion["content_fragment_count"] == 1
+    assert completion["response_bytes"] > byte_limit
+
+
+def test_stream_invalid_utf8_preserves_safe_diagnostics_without_excerpt() -> None:
+    response = _SseResponse(
+        [
+            {
+                "id": "response-1",
+                "choices": [{"delta": {"content": "{"}}],
+            }
+        ]
+    )
+    response.lines.append(b"data: \xff\n\n")
+
+    with pytest.raises(ProviderError, match="invalid UTF-8") as raised:
+        _read_openai_stream_response(response, 10**12, 10_000)
+
+    assert raised.value.raw_response == "{"
+    completion = raised.value.provider_completion
+    assert completion["response_id"] == "response-1"
+    assert completion["event_count"] == 1
+    assert len(completion["malformed_event_sha256"]) == 64
+    assert "malformed_event_excerpt" not in completion
+
+
+def test_interrupted_stream_preserves_accumulated_safe_diagnostics() -> None:
+    response = _InterruptedSseResponse(
+        [
+            {
+                "id": "response-1",
+                "choices": [{"delta": {"content": "{"}}],
+            }
+        ]
+    )
+
+    with pytest.raises(ProviderError, match="stream read failed") as raised:
+        _read_openai_stream_response(response, 10**12, 10_000)
+
+    assert raised.value.raw_response == "{"
+    completion = raised.value.provider_completion
+    assert completion["response_id"] == "response-1"
+    assert completion["event_count"] == 1
+    assert completion["content_fragment_count"] == 1
 
 
 def test_deepseek_stream_trickle_cannot_bypass_absolute_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
