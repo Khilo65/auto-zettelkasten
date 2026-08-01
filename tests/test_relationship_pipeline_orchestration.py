@@ -18,6 +18,8 @@ from auto_zettelkasten.relationships import (
     stable_hash,
 )
 from auto_zettelkasten.pipeline import (
+    _allocate_complementary_candidate_quotas,
+    _balance_complementary_jobs,
     _cluster_membership_relations,
     _commit_relationship_selection_state,
     _ranked_relationship_candidates,
@@ -445,6 +447,199 @@ def test_shared_plan_keeps_family_discovery_in_separate_packets(
         "complement",
     ]
     assert discovery_calls[1][2]["prior_candidate_pairs"] == []
+
+
+def test_complementary_quota_allocation_covers_every_family_stably() -> None:
+    jobs = [
+        {
+            "bridge_job_id": f"job-{index:02d}",
+            "target_candidate_count": 10 + index,
+        }
+        for index in range(15)
+    ]
+
+    allocated = _allocate_complementary_candidate_quotas(jobs, capacity=48)
+
+    assert sum(allocated.values()) == 48
+    assert set(allocated) == {row["bridge_job_id"] for row in jobs}
+    assert min(allocated.values()) >= 2
+    assert allocated == _allocate_complementary_candidate_quotas(
+        list(reversed(jobs)), capacity=48
+    )
+
+
+def test_complementary_overflow_repartitions_all_jobs_into_three_packets() -> None:
+    jobs = [
+        {"bridge_job_id": f"job-{index:02d}", "target_candidate_count": 3}
+        for index in range(15)
+    ]
+
+    packets = _balance_complementary_jobs(
+        jobs,
+        measured_sizes={row["bridge_job_id"]: 100 for row in jobs},
+        packet_count=3,
+    )
+
+    assert len(packets) == 3
+    scheduled = [row["bridge_job_id"] for packet in packets for row in packet]
+    assert sorted(scheduled) == sorted(row["bridge_job_id"] for row in jobs)
+    assert len(scheduled) == len(set(scheduled))
+
+
+def test_shared_plan_balances_many_complementary_jobs_across_two_packets(
+    tmp_path: Path,
+) -> None:
+    source_ids = [f"S{index:02d}" for index in range(30)]
+    profiles = [_profile(source_id) for source_id in source_ids]
+    requested_job = {
+        "job_id": "requested",
+        "family": "explicit_requested_collection_comparison",
+        "left_source_ids": source_ids[:15],
+        "right_source_ids": source_ids[15:],
+        "requested_collection_pair": ["C1", "C2"],
+        "candidate_quota": 40,
+    }
+    complementary_jobs = [
+        {
+            "job_id": f"family-{index:02d}",
+            "family": f"family-{index:02d}",
+            "left_source_ids": [source_ids[index]],
+            "right_source_ids": [source_ids[index + 15]],
+            "candidate_quota": 10,
+        }
+        for index in range(15)
+    ]
+    calls = _Calls(
+        lambda stage, _profiles, _context: (
+            {"candidates": []}
+            if stage.endswith("candidate_selection")
+            else {"decisions": []}
+        )
+    )
+
+    _run(
+        tmp_path,
+        profiles,
+        calls,
+        shared_family_plan={
+            "lean_index_hash": "lean",
+            "literature_families": [
+                {
+                    "family_id": f"family-{index:02d}",
+                    "source_ids": [source_ids[index], source_ids[index + 15]],
+                }
+                for index in range(15)
+            ],
+            "discovery_jobs": [requested_job, *complementary_jobs],
+        },
+    )
+
+    discovery = [
+        context
+        for stage, _key, context in calls.seen
+        if stage.endswith("candidate_selection")
+    ]
+    assert [row["discovery_pass"] for row in discovery].count("broad") == 1
+    assert next(
+        row for row in discovery if row["discovery_pass"] == "broad"
+    )["max_inferred_pairs"] == 50
+    complement = [
+        row for row in discovery if row["discovery_pass"] == "complement"
+    ]
+    assert len(complement) == 2
+    scheduled = [
+        job["bridge_job_id"]
+        for packet in complement
+        for job in packet["bridge_jobs"]
+    ]
+    assert sorted(scheduled) == sorted(
+        row["job_id"] for row in complementary_jobs
+    )
+    assert len(scheduled) == len(set(scheduled))
+    assert sum(
+        int(packet["max_inferred_pairs"]) for packet in complement
+    ) == 48
+    assert all(packet["prior_candidate_pairs"] == [] for packet in complement)
+
+
+def test_terminal_complement_packet_does_not_discard_successful_graph_work(
+    tmp_path: Path,
+) -> None:
+    source_ids = [f"S{index:02d}" for index in range(16)]
+    profiles = [_profile(source_id) for source_id in source_ids]
+    jobs = [
+        {
+            "job_id": "requested",
+            "family": "explicit_requested_collection_comparison",
+            "left_source_ids": source_ids[:8],
+            "right_source_ids": source_ids[8:],
+            "requested_collection_pair": ["C1", "C2"],
+            "candidate_quota": 40,
+        },
+        *[
+            {
+                "job_id": f"family-{index:02d}",
+                "family": f"family-{index:02d}",
+                "left_source_ids": [source_ids[index]],
+                "right_source_ids": [source_ids[index + 8]],
+                "candidate_quota": 6,
+            }
+            for index in range(8)
+        ],
+    ]
+
+    def handler(stage, _profiles, context):
+        if stage == "relationship_bridge_candidate_selection":
+            return {
+                "candidates": [
+                    {
+                        **_candidate("S00", "S08"),
+                        "bridge_job_id": "requested",
+                    }
+                ]
+            }
+        if stage == "relationship_candidate_selection":
+            packet_job_ids = {
+                row["bridge_job_id"] for row in context["bridge_jobs"]
+            }
+            if "family-00" in packet_job_ids:
+                raise ValueError("malformed complementary packet")
+            job = context["bridge_jobs"][0]
+            return {
+                "candidates": [
+                    {
+                        **_candidate(
+                            job["left_source_ids"][0],
+                            job["right_source_ids"][0],
+                        ),
+                        "bridge_job_id": job["bridge_job_id"],
+                    }
+                ]
+            }
+        return {"decisions": [_decision(job) for job in context["pair_jobs"]]}
+
+    result = _run(
+        tmp_path,
+        profiles,
+        _Calls(handler),
+        shared_family_plan={
+            "lean_index_hash": "lean",
+            "literature_families": [
+                {
+                    "family_id": f"family-{index:02d}",
+                    "source_ids": [source_ids[index], source_ids[index + 8]],
+                }
+                for index in range(8)
+            ],
+            "discovery_jobs": jobs,
+        },
+    )
+
+    assert result["relationship_stage_complete"] is True
+    assert result["relationship_discovery_status"] == "partial"
+    assert "family-00" in result["relationship_discovery_incomplete_jobs"]
+    assert result["accounted_pair_job_count"] == result["pair_job_count"]
+    assert result["accepted"]
 
 
 def test_shared_plan_runs_broad_before_complement_and_passes_prior_pairs(

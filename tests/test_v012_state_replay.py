@@ -12,6 +12,7 @@ from auto_zettelkasten.literature import (
     _CheckpointedReasonerCalls,
     _preserve_last_valid_clusters_on_refresh_failure,
     _same_provider_inputs,
+    _recover_candidate_prefix,
     cluster_note_stem,
 )
 from auto_zettelkasten.models import (
@@ -170,6 +171,138 @@ def test_synthesis_call_ceiling_is_cumulative_across_resume(tmp_path: Path) -> N
     usage = read_yaml(exhausted.usage_path, {})
     assert usage["provider_call_count"] == 2
     assert usage["stage_call_counts"] == {"cluster_proposal": 2}
+
+
+def test_truncated_candidate_prefix_recovers_only_complete_owned_rows() -> None:
+    raw = """{"candidates":[
+      {"left_source_id":"A","right_source_id":"B","comparison_proposition":"A and B address recurrence.","bridge_job_id":"job-ab","rank":1},
+      {"left_source_id":"A","right_source_id":"C","comparison_proposition":"wrong job side","bridge_job_id":"job-ab","rank":2},
+      {"left_source_id":"A","right_source_id":"B","comparison_proposition":"duplicate","bridge_job_id":"job-ab","rank":3},
+      {"left_source_id":"A","right_source_id":"D","comparison_proposition":"cut off"""  # noqa: E501
+    context = {
+        "bridge_jobs": [
+            {
+                "bridge_job_id": "job-ab",
+                "left_source_ids": ["A"],
+                "right_source_ids": ["B"],
+            }
+        ]
+    }
+
+    recovered = _recover_candidate_prefix(raw, context)
+
+    assert recovered is not None
+    response, metadata = recovered
+    assert response["candidates"] == [
+        {
+            "left_source_id": "A",
+            "right_source_id": "B",
+            "comparison_proposition": "A and B address recurrence.",
+            "bridge_job_id": "job-ab",
+            "rank": 1,
+        }
+    ]
+    assert metadata == {
+        "method": "complete_candidate_prefix",
+        "recovered_candidate_count": 1,
+        "discarded_candidate_count": 2,
+    }
+
+
+def test_candidate_prefix_recovery_ignores_nested_example_arrays() -> None:
+    raw = (
+        '{"debug":{"candidates":['
+        '{"left_source_id":"A","right_source_id":"B",'
+        '"comparison_proposition":"example",'
+        '"bridge_job_id":"job-ab","rank":1}'
+        ']},"candidates":['
+        '{"left_source_id":"A","right_source_id":"B",'
+        '"comparison_proposition":"real candidate",'
+        '"bridge_job_id":"job-ab","rank":1},'
+        '{"left_source_id":"A"'
+    )
+    context = {
+        "bridge_jobs": [
+            {
+                "bridge_job_id": "job-ab",
+                "left_source_ids": ["A"],
+                "right_source_ids": ["B"],
+            }
+        ]
+    }
+
+    recovered = _recover_candidate_prefix(raw, context)
+
+    assert recovered is not None
+    assert recovered[0]["candidates"][0]["comparison_proposition"] == (
+        "real candidate"
+    )
+
+
+def test_truncated_candidate_checkpoint_recovers_without_retry(
+    tmp_path: Path,
+) -> None:
+    class CandidateReasoner:
+        name = "test-provider"
+        model = "test-model"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def select_relationship_candidates(
+            self, _profiles, _request, *, context=None
+        ):
+            self.calls += 1
+            exc = RuntimeError("response incomplete")
+            exc.raw_response = (
+                '{"candidates":['
+                '{"left_source_id":"A","right_source_id":"B",'
+                '"comparison_proposition":"A and B overlap",'
+                '"bridge_job_id":"job-ab","rank":1},'
+                '{"left_source_id":"A"'
+            )
+            exc.provider_completion = {"finish_reason": "length"}
+            raise exc
+
+    reasoner = CandidateReasoner()
+    request = _request(tmp_path)
+    context = {
+        "bridge_jobs": [
+            {
+                "bridge_job_id": "job-ab",
+                "left_source_ids": ["A"],
+                "right_source_ids": ["B"],
+            }
+        ]
+    }
+    calls = _CheckpointedReasonerCalls(tmp_path, "run", reasoner, request)
+
+    response = calls(
+        "relationship_candidate_selection",
+        "packet",
+        "select_relationship_candidates",
+        [],
+        context,
+    )
+
+    assert len(response["candidates"]) == 1
+    assert reasoner.calls == 1
+    checkpoint = read_yaml(
+        calls.root / "relationship_candidate_selection" / "packet.yml"
+    )
+    assert checkpoint["status"] == "completed"
+    assert checkpoint["local_recovery"]["recovered_candidate_count"] == 1
+    assert checkpoint["provider_completion"]["finish_reason"] == "length"
+
+    replay = _CheckpointedReasonerCalls(tmp_path, "run", reasoner, request)
+    assert replay(
+        "relationship_candidate_selection",
+        "packet",
+        "select_relationship_candidates",
+        [],
+        context,
+    ) == response
+    assert reasoner.calls == 1
 
 
 def test_unchanged_source_set_replay_is_byte_stable(tmp_path: Path) -> None:

@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
-CURRENT_ENGINE_VERSION = "0.22.0"
+CURRENT_ENGINE_VERSION = "0.23.0"
 CURRENT_ARTIFACT_SCHEMA_VERSION = "1.16"
 CURRENT_PROFILE_SCHEMA_VERSION = "1.3"
 

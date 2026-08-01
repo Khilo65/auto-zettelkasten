@@ -168,6 +168,104 @@ _LITERATURE_MEMORY_LOCK = threading.Lock()
 _AUTO_SOURCE_WORKER_LIMIT = 32
 
 
+def _allocate_complementary_candidate_quotas(
+    jobs: Sequence[Mapping[str, Any]],
+    *,
+    capacity: int,
+) -> dict[str, int]:
+    """Give every planned family a small chance, then honor planner weights."""
+
+    ordered = sorted(
+        (
+            str(job.get("bridge_job_id") or ""),
+            max(0, int(job.get("target_candidate_count", 0) or 0)),
+        )
+        for job in jobs
+        if str(job.get("bridge_job_id") or "")
+    )
+    if not ordered or capacity <= 0:
+        return {}
+    planned_by_id = dict(ordered)
+    quotas = {
+        job_id: min(planned, 2)
+        for job_id, planned in ordered
+    }
+    remaining = max(
+        0,
+        min(capacity, sum(planned_by_id.values())) - sum(quotas.values()),
+    )
+    rooms = {
+        job_id: planned - quotas[job_id]
+        for job_id, planned in ordered
+        if planned > quotas[job_id]
+    }
+    room_total = sum(rooms.values())
+    if remaining and room_total:
+        shares = {
+            job_id: (remaining * room) // room_total
+            for job_id, room in rooms.items()
+        }
+        for job_id, value in shares.items():
+            quotas[job_id] += value
+        leftover = remaining - sum(shares.values())
+        for job_id in sorted(
+            rooms,
+            key=lambda value: (
+                -((remaining * rooms[value]) % room_total),
+                value,
+            ),
+        )[:leftover]:
+            quotas[job_id] += 1
+    return quotas
+
+
+def _balance_complementary_jobs(
+    jobs: Sequence[Mapping[str, Any]],
+    *,
+    measured_sizes: Mapping[str, int],
+    packet_count: int | None = None,
+) -> list[list[dict[str, Any]]]:
+    """Place whole family jobs into two stable, roughly equal packets."""
+
+    if not jobs:
+        return []
+    packet_count = min(
+        len(jobs),
+        packet_count if packet_count is not None else 2 if len(jobs) > 6 else 1,
+    )
+    packets: list[list[dict[str, Any]]] = [[] for _ in range(packet_count)]
+    packet_sizes = [0] * packet_count
+    packet_quotas = [0] * packet_count
+    ordered = sorted(
+        (dict(job) for job in jobs),
+        key=lambda job: (
+            -int(measured_sizes.get(str(job.get("bridge_job_id") or ""), 0)),
+            str(job.get("bridge_job_id") or ""),
+        ),
+    )
+    for job in ordered:
+        packet_index = min(
+            range(packet_count),
+            key=lambda index: (
+                packet_sizes[index],
+                packet_quotas[index],
+                index,
+            ),
+        )
+        packets[packet_index].append(job)
+        packet_sizes[packet_index] += int(
+            measured_sizes.get(str(job.get("bridge_job_id") or ""), 0)
+        )
+        packet_quotas[packet_index] += int(
+            job.get("target_candidate_count", 0) or 0
+        )
+    return [
+        sorted(packet, key=lambda job: str(job.get("bridge_job_id") or ""))
+        for packet in packets
+        if packet
+    ]
+
+
 def _analytical_profile_source_ids(profiles: Sequence[Any]) -> set[str]:
     source_ids: set[str] = set()
     for profile in profiles:
@@ -4085,6 +4183,13 @@ def _run_relationship_reasoning(
             "relationship_retry_on_resume": bool(
                 prior_state.get("relationship_retry_on_resume", False)
             ),
+            "relationship_discovery_status": str(
+                prior_state.get("relationship_discovery_status") or "complete"
+            ),
+            "relationship_discovery_incomplete_jobs": list(
+                prior_state.get("relationship_discovery_incomplete_jobs", [])
+                or []
+            ),
             "provider_batch_count": 0,
         }
     mandatory_basis: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
@@ -4983,12 +5088,13 @@ def _run_relationship_reasoning(
             for row in shared_family_plan.get("literature_families", []) or []
             if isinstance(row, Mapping) and row.get("family_id")
         }
-        for pass_name, pool, packet_jobs in (
-            ("broad", "bridge", broad_jobs),
-            ("complement", "general", complement_jobs),
-        ):
-            if not packet_jobs:
-                continue
+
+        def shared_plan_task(
+            pass_name: str,
+            pool: str,
+            packet_jobs: Sequence[Mapping[str, Any]],
+            packet_index: int,
+        ) -> tuple[str, str, Sequence[Any], dict[str, Any], str]:
             source_ids = {
                 source_id
                 for job in packet_jobs
@@ -5033,34 +5139,97 @@ def _run_relationship_reasoning(
                 "collection_index_cards": collection_index_cards,
                 "bridge_jobs": packet_jobs,
                 "literature_families": relevant_families,
-                "max_inferred_pairs": min(
-                    _RELATIONSHIP_BRIDGE_CANDIDATE_MAX
-                    if pool == "bridge"
-                    else _RELATIONSHIP_GENERAL_CANDIDATE_MAX,
-                    sum(
-                        int(row.get("target_candidate_count", 24) or 24)
-                        for row in packet_jobs
-                    ),
+                "max_inferred_pairs": (
+                    50
+                    if pass_name == "broad"
+                    else min(
+                        _RELATIONSHIP_GENERAL_CANDIDATE_MAX,
+                        sum(
+                            int(row.get("target_candidate_count", 24) or 24)
+                            for row in packet_jobs
+                        ),
+                    )
                 ),
             }
-            if (
-                _reasoner_packet_chars(task_profiles, task_context)
-                <= _relationship_context_char_budget(reasoner, request)
-            ):
-                candidate_tasks.append(
-                    (
-                        stage,
-                        "shared-plan-"
-                        + pass_name
-                        + "-"
-                        + stable_hash(packet_jobs)[:16],
-                        task_profiles,
-                        task_context,
-                        pool,
-                    )
+            return (
+                stage,
+                "shared-plan-"
+                + pass_name
+                + f"-{packet_index}-"
+                + stable_hash(list(packet_jobs))[:16],
+                task_profiles,
+                task_context,
+                pool,
+            )
+
+        if broad_jobs:
+            candidate_tasks.append(
+                shared_plan_task("broad", "bridge", broad_jobs, 1)
+            )
+
+        complementary_allocations = _allocate_complementary_candidate_quotas(
+            complement_jobs,
+            capacity=_RELATIONSHIP_GENERAL_CANDIDATE_MAX,
+        )
+        allocated_complement_jobs = [
+            {
+                **job,
+                "target_candidate_count": complementary_allocations.get(
+                    str(job.get("bridge_job_id") or ""), 0
+                ),
+            }
+            for job in complement_jobs
+            if complementary_allocations.get(
+                str(job.get("bridge_job_id") or ""), 0
+            )
+        ]
+        measured_job_sizes: dict[str, int] = {}
+        for job in allocated_complement_jobs:
+            measurement_task = shared_plan_task(
+                "complement", "general", [job], 0
+            )
+            measured_job_sizes[str(job.get("bridge_job_id") or "")] = (
+                _reasoner_packet_chars(
+                    measurement_task[2], measurement_task[3]
                 )
-            else:
-                shared_packet_overflow = True
+            )
+        complement_packets = _balance_complementary_jobs(
+            allocated_complement_jobs,
+            measured_sizes=measured_job_sizes,
+        )
+        context_budget = _relationship_context_char_budget(reasoner, request)
+        complement_tasks = [
+            shared_plan_task(
+                "complement", "general", packet_jobs, packet_index
+            )
+            for packet_index, packet_jobs in enumerate(
+                complement_packets, start=1
+            )
+        ]
+        oversized = [
+            index
+            for index, task in enumerate(complement_tasks)
+            if _reasoner_packet_chars(task[2], task[3]) > context_budget
+        ]
+        if oversized and len(complement_packets) == 2:
+            complement_packets = _balance_complementary_jobs(
+                allocated_complement_jobs,
+                measured_sizes=measured_job_sizes,
+                packet_count=3,
+            )
+            complement_tasks = [
+                shared_plan_task(
+                    "complement", "general", packet_jobs, packet_index
+                )
+                for packet_index, packet_jobs in enumerate(
+                    complement_packets, start=1
+                )
+            ]
+        shared_packet_overflow = any(
+            _reasoner_packet_chars(task[2], task[3]) > context_budget
+            for task in [*candidate_tasks, *complement_tasks]
+        ) or len(complement_tasks) > 3
+        candidate_tasks.extend(complement_tasks)
         if shared_packet_overflow:
             candidate_tasks = routed_fallback_tasks
 
@@ -5239,6 +5408,16 @@ def _run_relationship_reasoning(
                             ),
                             "error_type": type(exc).__name__,
                             "error": str(exc),
+                            "discovery_pass": str(
+                                task[3].get("discovery_pass") or ""
+                            ),
+                            "discovery_task_key": task[1],
+                            "affected_job_ids": sorted(
+                                str(row.get("bridge_job_id") or "")
+                                for row in task[3].get("bridge_jobs", []) or []
+                                if isinstance(row, Mapping)
+                                and row.get("bridge_job_id")
+                            ),
                             "retry_on_resume": failure_class == "transport",
                         }
                     )
@@ -5281,9 +5460,30 @@ def _run_relationship_reasoning(
         for stage, key, task_profiles, task_context, pool in complement_tasks
     ]
     execute_candidate_tasks(complement_tasks)
-    discovery_completed = sum(
+    successful_discovery_tasks = sum(
         len(rows) for rows in candidate_results.values()
-    ) == len(candidate_tasks)
+    )
+    discovery_retryable = any(
+        bool(row.get("retry_on_resume")) for row in discovery_parked
+    )
+    discovery_completed = bool(candidate_tasks) and bool(
+        successful_discovery_tasks == len(candidate_tasks)
+        and not discovery_parked
+    )
+    discovery_usable = bool(
+        discovery_completed
+        or (
+            successful_discovery_tasks > 0
+            and not discovery_retryable
+        )
+    )
+    discovery_status = (
+        "complete"
+        if discovery_completed
+        else "partial"
+        if discovery_usable
+        else "failed"
+    )
 
     general_payload = {
         "candidates": [
@@ -6160,7 +6360,7 @@ def _run_relationship_reasoning(
         )
     )
     relationship_stage_complete = bool(
-        discovery_completed
+        discovery_usable
         and len(accounted_job_ids) == len(jobs)
         and not relationship_retry_on_resume
     )
@@ -6219,6 +6419,15 @@ def _run_relationship_reasoning(
         "accounted_pair_job_count": len(accounted_job_ids),
         "relationship_stage_complete": relationship_stage_complete,
         "relationship_retry_on_resume": relationship_retry_on_resume,
+        "relationship_discovery_status": discovery_status,
+        "relationship_discovery_incomplete_jobs": sorted(
+            {
+                str(job_id)
+                for row in discovery_parked
+                for job_id in row.get("affected_job_ids", []) or []
+                if str(job_id)
+            }
+        ),
         "provider_batch_count": provider_batch_count,
         "candidate_dispositions": [
             dispositions_by_pair[pair] for pair in sorted(dispositions_by_pair)
@@ -6742,6 +6951,26 @@ def _commit_relationship_selection_state(
                 "relationship_retry_on_resume",
                 existing.get("relationship_retry_on_resume", False),
             )
+        )
+    if (
+        "relationship_discovery_status" in result
+        or "relationship_discovery_status" in existing
+    ):
+        payload["relationship_discovery_status"] = str(
+            result.get(
+                "relationship_discovery_status",
+                existing.get("relationship_discovery_status", "complete"),
+            )
+            or "complete"
+        )
+        payload["relationship_discovery_incomplete_jobs"] = sorted(
+            str(value)
+            for value in result.get(
+                "relationship_discovery_incomplete_jobs",
+                existing.get("relationship_discovery_incomplete_jobs", []),
+            )
+            or []
+            if str(value)
         )
     if existing != payload:
         write_yaml(path, payload)

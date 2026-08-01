@@ -35,7 +35,9 @@ def test_relationship_discovery_uses_lean_recall_first_prompt() -> None:
     assert "target_candidate_count" in prompt
     assert "left_source_id" in prompt
     assert "right_source_id" in prompt
-    assert "why_compare" in prompt
+    assert "comparison_proposition" in prompt
+    assert "why_compare" not in prompt
+    assert "bridge_family" not in prompt
     assert "evidence_anchor_ids" not in prompt
     assert RELATIONSHIP_MAX_OUTPUT_TOKENS == 128_000
 

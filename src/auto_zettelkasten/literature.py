@@ -1688,6 +1688,23 @@ class _CheckpointedReasonerCalls:
                 stage,
                 failed_checkpoint["raw_response"],
             )
+            recovery_metadata: Mapping[str, Any] | None = None
+            completion = failed_checkpoint.get("provider_completion", {})
+            if (
+                recovered_response is None
+                and stage
+                in {
+                    "relationship_candidate_selection",
+                    "relationship_bridge_candidate_selection",
+                }
+                and isinstance(completion, Mapping)
+                and str(completion.get("finish_reason") or "") == "length"
+            ):
+                recovered = _recover_candidate_prefix(
+                    failed_checkpoint["raw_response"], enriched_context
+                )
+                if recovered is not None:
+                    recovered_response, recovery_metadata = recovered
             if recovered_response is None:
                 continue
             write_yaml(
@@ -1705,6 +1722,22 @@ class _CheckpointedReasonerCalls:
                     "dependency_context_item_hashes": dependency_context_item_hashes,
                     "response": recovered_response,
                     "recovered_from_failed_raw_response": True,
+                    **(
+                        {"local_recovery": dict(recovery_metadata)}
+                        if recovery_metadata is not None
+                        else {}
+                    ),
+                    **(
+                        {"raw_response": failed_checkpoint["raw_response"]}
+                        if recovery_metadata is not None
+                        else {}
+                    ),
+                    **(
+                        {"provider_completion": dict(completion)}
+                        if recovery_metadata is not None
+                        and isinstance(completion, Mapping)
+                        else {}
+                    ),
                     "updated_at": now_iso(),
                 },
             )
@@ -1912,15 +1945,52 @@ class _CheckpointedReasonerCalls:
             self._finish_provider_attempt(attempt_id, status="completed")
             return validated_response
         except Exception as exc:
-            self._record_failure()
-            failure_class = _synthesis_failure_class(exc)
-            terminal = failure_class != "transport" or attempt_number >= 2
             raw_response = (
                 raw_response_for_failure
                 if raw_response_for_failure is not None
                 else getattr(exc, "raw_response", None)
             )
             provider_completion = getattr(exc, "provider_completion", None)
+            recovered = (
+                _recover_candidate_prefix(raw_response, enriched_context)
+                if stage
+                in {
+                    "relationship_candidate_selection",
+                    "relationship_bridge_candidate_selection",
+                }
+                and isinstance(provider_completion, Mapping)
+                and str(provider_completion.get("finish_reason") or "")
+                == "length"
+                else None
+            )
+            if recovered is not None:
+                recovered_response, recovery_metadata = recovered
+                payload = {
+                    "checkpoint_schema_version": "1",
+                    "fingerprint": fingerprint,
+                    "stage": stage,
+                    "key": key,
+                    "status": "completed",
+                    "provider": str(getattr(self.reasoner, "name", "")),
+                    "model": str(getattr(self.reasoner, "model", "")),
+                    "dependency_component_hashes": dependency_component_hashes,
+                    "dependency_context_hashes": dependency_context_hashes,
+                    "dependency_context_item_hashes": dependency_context_item_hashes,
+                    "response": recovered_response,
+                    "raw_response": raw_response,
+                    "provider_completion": dict(provider_completion),
+                    "local_recovery": recovery_metadata,
+                    "updated_at": now_iso(),
+                }
+                write_yaml(path, payload)
+                write_yaml(semantic_path, payload)
+                if failure_path.exists():
+                    failure_path.unlink()
+                self._finish_provider_attempt(attempt_id, status="completed")
+                return recovered_response
+            self._record_failure()
+            failure_class = _synthesis_failure_class(exc)
+            terminal = failure_class != "transport" or attempt_number >= 2
             failure_payload = {
                 "checkpoint_schema_version": "1",
                 "fingerprint": fingerprint,
@@ -2466,6 +2536,120 @@ def _revalidate_raw_synthesis_response(
         return _validate_literature_response(payload, kind=kind)
     except (TypeError, ValueError, RuntimeError):
         return None
+
+
+def _recover_candidate_prefix(
+    raw_response: Any,
+    context: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Recover only complete, owned candidate rows before a truncated tail."""
+
+    if not isinstance(raw_response, str):
+        return None
+    decoder = json.JSONDecoder()
+    object_start = raw_response.find("{")
+    if object_start < 0:
+        return None
+    depth = 0
+    index = object_start
+    array_start: int | None = None
+    while index < len(raw_response):
+        char = raw_response[index]
+        if char == '"':
+            try:
+                value, end = decoder.raw_decode(raw_response, index)
+            except json.JSONDecodeError:
+                return None
+            if depth == 1 and value == "candidates":
+                cursor = end
+                while cursor < len(raw_response) and raw_response[cursor].isspace():
+                    cursor += 1
+                if cursor >= len(raw_response) or raw_response[cursor] != ":":
+                    index = end
+                    continue
+                cursor += 1
+                while cursor < len(raw_response) and raw_response[cursor].isspace():
+                    cursor += 1
+                if cursor < len(raw_response) and raw_response[cursor] == "[":
+                    array_start = cursor + 1
+                    break
+            index = end
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth <= 0:
+                break
+        index += 1
+    if array_start is None:
+        return None
+    jobs = {
+        str(row.get("bridge_job_id") or ""): row
+        for row in context.get("bridge_jobs", []) or []
+        if isinstance(row, Mapping) and row.get("bridge_job_id")
+    }
+    if not jobs:
+        return None
+    index = array_start
+    candidates: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    discarded = 0
+    while index < len(raw_response):
+        while index < len(raw_response) and raw_response[index] in " \t\r\n,":
+            index += 1
+        if index >= len(raw_response) or raw_response[index] == "]":
+            break
+        try:
+            value, end = decoder.raw_decode(raw_response, index)
+        except json.JSONDecodeError:
+            break
+        index = end
+        if not isinstance(value, Mapping):
+            discarded += 1
+            continue
+        row = dict(value)
+        left = str(row.get("left_source_id") or "").strip()
+        right = str(row.get("right_source_id") or "").strip()
+        proposition = str(row.get("comparison_proposition") or "").strip()
+        job_id = str(row.get("bridge_job_id") or "").strip()
+        job = jobs.get(job_id)
+        if not left or not right or left == right or not proposition or job is None:
+            discarded += 1
+            continue
+        left_side = {
+            str(source_id) for source_id in job.get("left_source_ids", []) or []
+        }
+        right_side = {
+            str(source_id) for source_id in job.get("right_source_ids", []) or []
+        }
+        if not (
+            (left in left_side and right in right_side)
+            or (left in right_side and right in left_side)
+        ):
+            discarded += 1
+            continue
+        pair = tuple(sorted((left, right)))
+        if pair in seen:
+            discarded += 1
+            continue
+        seen.add(pair)
+        candidates.append(row)
+    if not candidates:
+        return None
+    from .readers import _validate_relationship_response
+
+    try:
+        response = _validate_relationship_response(
+            {"candidates": candidates}, kind="candidate_selection"
+        )
+    except (TypeError, ValueError, RuntimeError):
+        return None
+    return response, {
+        "method": "complete_candidate_prefix",
+        "recovered_candidate_count": len(candidates),
+        "discarded_candidate_count": discarded,
+    }
 
 
 def _same_provider_inputs(

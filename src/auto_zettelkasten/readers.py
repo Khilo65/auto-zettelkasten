@@ -1698,10 +1698,10 @@ def _relationship_bridge_shard_system_prompt() -> str:
 
 def _relationship_candidate_system_prompt() -> str:
     return (
-        "You retrieve comparisons for Auto-Zettelkasten relationship discovery prompt v13. "
+        "You retrieve comparisons for Auto-Zettelkasten relationship discovery prompt v14. "
         "Return exactly one JSON object with a candidates array. Each candidate "
         "contains only left_source_id, right_source_id, comparison_proposition, "
-        "why_compare, bridge_family, bridge_job_id, and rank. Use only supplied IDs, put the "
+        "bridge_job_id, and rank. Use only supplied IDs, put the "
         "canonical lexicographically earlier ID on the left, and never repeat a "
         "pair. A candidate is a request for later full-note comparison, not a "
         "published relationship, so optimize recall, coverage, diversity, and "
@@ -1714,7 +1714,7 @@ def _relationship_candidate_system_prompt() -> str:
         "on each of that job's source sides. Meet each job's target_candidate_count "
         "when useful. A source may appear in several genuinely useful comparisons. "
         "When discovery_mode is complementary_family_discovery, do not repeat "
-        "prior_candidate_pairs and concentrate on underrepresented supplied families. "
+        "prior_candidate_pairs and fulfill each supplied family job independently. "
         "Cover multiple theoretical, mechanistic, empirical, "
         "institutional, implementation, outcome, sequence, and boundary families "
         "rather than stopping after citations or one theme. Full-note "
