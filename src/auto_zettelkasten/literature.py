@@ -1334,6 +1334,24 @@ def _provider_worker_count(request: Any, ready_jobs: int) -> int:
     return max(1, min(ready_jobs or 1, int(configured)))
 
 
+def _schedule_cluster_writers(
+    reasoner_call: Any,
+    runnable: Sequence[Mapping[str, Any]],
+) -> tuple[list[Mapping[str, Any]], list[Mapping[str, Any]]]:
+    """Leave a small cumulative-call reserve for provider-empty retries."""
+
+    if not isinstance(reasoner_call, _CheckpointedReasonerCalls):
+        return list(runnable), []
+    reserve = (reasoner_call.max_calls + 4) // 5
+    available = max(
+        0,
+        reasoner_call.max_calls
+        - reasoner_call.cumulative_provider_calls
+        - reserve,
+    )
+    return list(runnable[:available]), list(runnable[available:])
+
+
 class _CheckpointedReasonerCalls:
     """Budgeted, resumable provider calls for collection-level reasoning."""
 
@@ -2341,6 +2359,7 @@ def _synthesis_failure_class(exc: BaseException) -> str:
             "deadline exceeded",
             "unavailable",
             "connection interrupted",
+            "provider stream read failed",
             "http 429",
             "http 500",
             "http 502",
@@ -20276,6 +20295,15 @@ def build_literature_report(
 
     concurrent_results: dict[str, Mapping[str, Any] | BaseException] = {}
     if uses_global_cluster_plan and runnable:
+        scheduled, deferred = _schedule_cluster_writers(reasoner_call, runnable)
+        concurrent_results.update(
+            {
+                str(cluster.get("cluster_id") or ""): LiteratureSynthesisPartialError(
+                    "cluster_synthesis_deferred_budget"
+                )
+                for cluster in deferred
+            }
+        )
         active_jobs = 0
         peak_jobs = 0
         job_lock = threading.Lock()
@@ -20307,14 +20335,14 @@ def build_literature_report(
 
         synthesis_started = time.monotonic()
         with ThreadPoolExecutor(
-            max_workers=_provider_worker_count(request, len(runnable)),
+            max_workers=_provider_worker_count(request, len(scheduled)),
             thread_name_prefix="auto-zettelkasten-cluster",
         ) as executor:
             future_map = {
                 executor.submit(run_cluster_job, cluster): str(
                     cluster.get("cluster_id") or ""
                 )
-                for cluster in runnable
+                for cluster in scheduled
             }
             for future in as_completed(future_map):
                 cluster_id = future_map[future]
@@ -20489,6 +20517,15 @@ def build_literature_report(
             if "context_budget" in str(exc).casefold():
                 acquisition_default_dispositions[cluster_id] = (
                     "deferred_context_capacity"
+                )
+            elif "deferred_budget" in str(exc).casefold():
+                acquisition_default_dispositions[cluster_id] = "deferred_budget"
+                validated_synthesis["deferred_reason"] = "deferred_budget"
+                validated_synthesis["quality_errors"] = sorted(
+                    {
+                        *validated_synthesis.get("quality_errors", []),
+                        "cluster_synthesis_deferred_budget",
+                    }
                 )
         if (
             not uses_global_cluster_plan

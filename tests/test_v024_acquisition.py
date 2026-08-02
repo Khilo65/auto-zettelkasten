@@ -10,6 +10,8 @@ from auto_zettelkasten.literature import (
     _CheckpointedReasonerCalls,
     _cluster_acquisition_revision,
     _persist_cluster_acquisition_revisions,
+    _schedule_cluster_writers,
+    _synthesis_failure_class,
     build_literature_report,
     validate_streamlined_cluster_synthesis,
 )
@@ -474,6 +476,69 @@ def test_two_empty_literature_responses_are_terminal_after_two_attempts(
     assert failure["attempt_count"] == 2
     assert failure["failure_class"] == "provider_empty_response"
     assert failure["raw_response"] == ""
+
+
+def test_cluster_scheduler_reserves_retry_capacity_and_accounts_deferrals(
+    tmp_path: Path,
+) -> None:
+    class Reasoner:
+        name = "local"
+        model = "test"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def propose_clusters(self, profiles, request, *, context=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise ProviderEmptyResponse()
+            return {"clusters": []}
+
+    request = LiteratureMapRequest(
+        tmp_path,
+        literature_policy=LiteratureMappingPolicy(max_synthesis_calls=32),
+    )
+    reasoner = Reasoner()
+    calls = _CheckpointedReasonerCalls(
+        tmp_path, "cluster-reserve", reasoner, request
+    )
+    calls.cumulative_provider_calls = 10
+    runnable = [
+        {"cluster_id": f"cluster-{index}", "revision_hash": f"revision-{index}"}
+        for index in range(22)
+    ]
+
+    scheduled, deferred = _schedule_cluster_writers(calls, runnable)
+
+    assert len(scheduled) == 15
+    assert len(deferred) == 7
+    assert all(
+        _cluster_acquisition_revision(
+            cluster,
+            [
+                {
+                    "external_source_id": f"missing-{index}",
+                    "status": "not_in_snapshot",
+                }
+            ],
+            state="failure",
+            default_disposition="deferred_budget",
+        )["candidates"][0]["writer_disposition"]
+        == "deferred_budget"
+        for index, cluster in enumerate(deferred)
+    )
+
+    calls.cumulative_provider_calls = 25
+    assert calls("cluster_proposal", "retry", "propose_clusters", [], {}) == {
+        "clusters": []
+    }
+    assert calls.cumulative_provider_calls == 27
+
+
+def test_stream_read_failure_is_transport() -> None:
+    assert _synthesis_failure_class(RuntimeError("provider stream read failed")) == (
+        "transport"
+    )
 
 
 def test_empty_retry_defers_when_call_ceiling_is_exhausted(tmp_path: Path) -> None:
