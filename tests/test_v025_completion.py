@@ -17,11 +17,11 @@ from auto_zettelkasten.pipeline import (
 from auto_zettelkasten.readers import _relationship_adjudication_system_prompt
 
 
-def test_v25_relationship_prompt_and_packet_limit() -> None:
+def test_v26_relationship_prompt_and_packet_limit() -> None:
     prompt = _relationship_adjudication_system_prompt()
-    assert "relationship prompt v14" in prompt
-    assert "same sufficiently specific proposition" in prompt
-    assert "prefer contextual_connection" in prompt
+    assert "relationship prompt v15" in prompt
+    assert "one sufficiently specific proposition" in prompt
+    assert "Use contextual_connection" in prompt
     assert _RELATIONSHIP_BATCH_MAX_JOBS == 15
 
     rows = list(range(31))

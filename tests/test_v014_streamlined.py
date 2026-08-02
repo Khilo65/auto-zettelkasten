@@ -127,11 +127,11 @@ def test_semantic_prompts_allow_neutral_nonmembership_and_bounded_relations() ->
     assert "do not create weak clusters or memberships" in planning.casefold()
     assert "Do not stop after the first few families" in planning
     assert "statistical significance" in synthesis
-    assert "broad topic" in relationships
-    assert "extends requires explicit intellectual lineage" in relationships
-    assert "dataset reuse" in relationships
-    assert "do not establish substantive support" in relationships
-    assert "one consistent direction" in relationships
+    assert "topical, lexical, or generic" in relationships
+    assert "extends requires explicit building on" in relationships
+    assert "shared data" in relationships
+    assert "Do not infer intellectual direction or support" in relationships
+    assert "self-review once" in relationships
 
 
 def test_mapped_literature_position_projects_explicit_citation(tmp_path: Path) -> None:

@@ -83,15 +83,21 @@ def test_v8_salvages_valid_connections_and_keeps_anchors_optional() -> None:
     assert accepted["connection_id"].startswith("relationship-connection-")
 
 
-def test_v14_defines_ordered_taxonomy_and_endpoint_basis_ownership() -> None:
+def test_v15_is_compact_domain_neutral_and_source_owned() -> None:
     prompt = _relationship_adjudication_system_prompt()
 
-    assert "relationship prompt v14" in prompt
-    assert "source_a_basis always describes the supplied left_source_id note" in prompt
-    assert "source_b_basis always describes the supplied right_source_id note" in prompt
-    assert "Choose the primary type in this order" in prompt
-    assert "same sufficiently specific proposition" in prompt
-    assert "adjacent mechanisms, outcomes, stages" in prompt
+    assert "relationship prompt v15" in prompt
+    assert "source_a_basis must describe only the supplied left_source_id" in prompt
+    assert "source_b_basis only the supplied right_source_id" in prompt
+    assert "without widening, recasting, or exchanging" in prompt
+    assert "joint-reading or system-level inference" in prompt
+    assert "supports is directional" in prompt
+    assert "complements is symmetric" in prompt
+    assert len(prompt) <= 3_367
+    assert not any(
+        name in prompt.casefold()
+        for name in ("svensson", "mediation", "civil war", "peacekeeping")
+    )
 
 
 def test_v8_accepts_prose_wrapped_singleton_and_relation_shorthand() -> None:

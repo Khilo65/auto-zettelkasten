@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from auto_zettelkasten.files import read_yaml, write_yaml
 from auto_zettelkasten.literature import _reasoner_context_char_budget
 from auto_zettelkasten.literature import (
@@ -18,6 +20,7 @@ from auto_zettelkasten.readers import (
 from auto_zettelkasten.relationships import (
     RELATIONSHIP_DECISION_CONTRACT,
     RELATIONSHIP_PROMPT_VERSION,
+    SYMMETRIC_RELATION_TYPES,
     persist_relationship_registry,
     projected_related_links,
     validate_relationship_decision_rows,
@@ -101,7 +104,7 @@ def test_v7_relationship_requires_claim_owned_primary_anchor_per_endpoint() -> N
     prompt = _relationship_adjudication_system_prompt()
     assert "source_a_basis" in prompt
     assert "source_b_basis" in prompt
-    assert "anchor IDs are optional" in prompt
+    assert "source_a_anchor_ids" not in prompt
 
 
 def test_v7_relationship_accepts_unambiguous_plural_anchor_fields() -> None:
@@ -411,6 +414,168 @@ def test_v6_symmetric_relationship_uses_canonical_registry_direction() -> None:
     assert relation["source_id"] == "A"
     assert relation["target_source_id"] == "B"
     assert relation["relationship_tier"] == "contextual"
+
+
+def test_v8_accepts_short_anchor_aliases_and_canonicalizes_symmetric_pair() -> None:
+    job = RelationshipPairJob.from_dict(
+        {
+            **_job("A", "B").to_dict(),
+            "output_contract": RELATIONSHIP_DECISION_CONTRACT,
+        }
+    )
+    result = validate_relationship_decision_rows(
+        {
+            "decisions": {
+                job.pair_job_id: {
+                    "decision": "relationship",
+                    "connections": [
+                        {
+                            "comparison_proposition": "Joint reading is useful.",
+                            "primary_relation_type": "contextual_connection",
+                            "actor_source_id": None,
+                            "reference_source_id": None,
+                            "source_a_basis": "A establishes its bounded claim.",
+                            "source_b_basis": "B establishes its bounded claim.",
+                            "reason": "The claims illuminate adjacent questions.",
+                            "source_a_anchor_ids": ["anchor-a"],
+                            "source_b_anchor_ids": ["anchor-b"],
+                        }
+                    ],
+                }
+            }
+        },
+        jobs=[job],
+        profiles=_profiles("A", "B"),
+    )
+
+    assert result["parked"] == []
+    relation = result["accepted"][0]
+    assert relation["source_id"] == "A"
+    assert relation["target_source_id"] == "B"
+    assert relation["left_evidence_anchor_ids"] == ["anchor-a"]
+    assert relation["right_evidence_anchor_ids"] == ["anchor-b"]
+
+
+def test_v8_directional_relationship_without_endpoints_is_parked() -> None:
+    job = RelationshipPairJob.from_dict(
+        {
+            **_job("A", "B").to_dict(),
+            "output_contract": RELATIONSHIP_DECISION_CONTRACT,
+        }
+    )
+    result = validate_relationship_decision_rows(
+        {
+            "decisions": {
+                job.pair_job_id: {
+                    "decision": "relationship",
+                    "connections": [
+                        {
+                            "comparison_proposition": "A bears on B's claim.",
+                            "primary_relation_type": "supports",
+                            "actor_source_id": None,
+                            "reference_source_id": None,
+                            "source_a_basis": "A establishes its bounded claim.",
+                            "source_b_basis": "B advances the reference claim.",
+                            "reason": "The proposed support is directional.",
+                        }
+                    ],
+                }
+            }
+        },
+        jobs=[job],
+        profiles=_profiles("A", "B"),
+    )
+
+    assert result["accepted"] == []
+    assert any(
+        "direction must use both pair endpoints"
+        in str(row.get("error") or "")
+        for row in result["parked"]
+    )
+
+
+@pytest.mark.parametrize("relation_type", sorted(SYMMETRIC_RELATION_TYPES))
+def test_v8_all_symmetric_relationships_accept_null_endpoints(
+    relation_type: str,
+) -> None:
+    job = RelationshipPairJob.from_dict(
+        {
+            **_job("A", "B").to_dict(),
+            "output_contract": RELATIONSHIP_DECISION_CONTRACT,
+        }
+    )
+    result = validate_relationship_decision_rows(
+        {
+            "decisions": {
+                job.pair_job_id: {
+                    "decision": "relationship",
+                    "connections": [
+                        {
+                            "comparison_proposition": "The bounded comparison is useful.",
+                            "primary_relation_type": relation_type,
+                            "actor_source_id": None,
+                            "reference_source_id": None,
+                            "source_a_basis": "A establishes its bounded claim.",
+                            "source_b_basis": "B establishes its bounded claim.",
+                            "reason": "The pair supports the stated comparison.",
+                        }
+                    ],
+                }
+            }
+        },
+        jobs=[job],
+        profiles=_profiles("A", "B"),
+    )
+
+    assert result["parked"] == []
+    assert result["accepted"][0]["relation_type"] == relation_type
+
+
+@pytest.mark.parametrize(
+    "relation_type",
+    [
+        "supports",
+        "undermines",
+        "qualifies",
+        "extends",
+        "rival_explanation",
+        "sequential_relationship",
+    ],
+)
+def test_v8_all_directional_relationships_require_endpoints(
+    relation_type: str,
+) -> None:
+    job = RelationshipPairJob.from_dict(
+        {
+            **_job("A", "B").to_dict(),
+            "output_contract": RELATIONSHIP_DECISION_CONTRACT,
+        }
+    )
+    result = validate_relationship_decision_rows(
+        {
+            "decisions": {
+                job.pair_job_id: {
+                    "decision": "relationship",
+                    "connections": [
+                        {
+                            "comparison_proposition": "A bears on B's claim.",
+                            "primary_relation_type": relation_type,
+                            "actor_source_id": None,
+                            "reference_source_id": None,
+                            "source_a_basis": "A establishes its bounded claim.",
+                            "source_b_basis": "B establishes its bounded claim.",
+                            "reason": "The proposed relationship is directional.",
+                        }
+                    ],
+                }
+            }
+        },
+        jobs=[job],
+        profiles=_profiles("A", "B"),
+    )
+
+    assert result["accepted"] == []
+    assert result["parked"]
 
 
 def test_v6_repartitions_known_evidence_anchors_by_owner() -> None:

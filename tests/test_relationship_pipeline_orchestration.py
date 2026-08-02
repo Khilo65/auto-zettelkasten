@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -9,6 +10,7 @@ from auto_zettelkasten.models import (
     EvidenceAnchor,
     EvidenceProfile,
     LiteratureMapRequest,
+    LiteratureMappingPolicy,
     RelationshipPairJob,
 )
 from auto_zettelkasten.profiles import profile_to_dict
@@ -48,6 +50,10 @@ class _RoutedReasoner(_Reasoner):
 
 class _V6Reasoner(_Reasoner):
     relationship_decision_contract = "relationship-decision-v6"
+
+
+class _V8Reasoner(_Reasoner):
+    relationship_decision_contract = "relationship-decision-v8"
 
 
 class _BuiltInDeepSeekReasoner(_Reasoner):
@@ -280,6 +286,8 @@ def _run(
     reasoner: _Reasoner | None = None,
     catalogue: Mapping[str, Any] | None = None,
     shared_family_plan: Mapping[str, Any] | None = None,
+    request: LiteratureMapRequest | None = None,
+    frozen_pair_jobs: Sequence[RelationshipPairJob] | None = None,
 ) -> dict[str, Any]:
     return _run_relationship_reasoning(
         workspace,
@@ -288,8 +296,9 @@ def _run(
         catalogue=catalogue or _catalogue(workspace, profiles),
         reasoner=reasoner or _Reasoner(),
         reasoner_calls=calls,  # type: ignore[arg-type]
-        request=_request(workspace),
+        request=request or _request(workspace),
         shared_family_plan=shared_family_plan,
+        frozen_pair_jobs=frozen_pair_jobs,
     )
 
 
@@ -1928,8 +1937,301 @@ def test_committed_selection_state_makes_unchanged_replay_call_free(
     replay = _run(tmp_path, profiles, replay_calls)
 
     assert replay_calls.seen == []
+    assert replay["semantic_noop"] is True
     assert replay["pair_job_count"] == 0
     assert replay["provider_batch_count"] == 0
+
+
+def test_adjudication_prompt_change_reuses_selected_pool_without_discovery(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    profiles = [_profile("A"), _profile("B")]
+
+    def first_handler(
+        stage: str,
+        _profiles: Sequence[Any],
+        context: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if stage == "relationship_candidate_selection":
+            return {"candidates": [_candidate("A", "B")]}
+        return {"decisions": [_decision(context["pair_jobs"][0])]}
+
+    first = _run(tmp_path, profiles, _Calls(first_handler))
+    state_path = _commit_relationship_selection_state(
+        tmp_path,
+        first,
+        catalogue_revision=first["reconciled_catalogue_revision"],
+    )
+    assert state_path is not None
+    state = read_yaml(state_path)
+    assert state["state_schema_version"] == "4"
+    assert len(state["selected_candidates"]) == 1
+    assert state["selected_candidate_pool_hash"] == stable_hash(
+        state["selected_candidates"]
+    )
+
+    monkeypatch.setattr(pipeline_module, "RELATIONSHIP_PROMPT_VERSION", "16")
+    calls = _Calls(
+        lambda stage, _profiles, context: {
+            "decisions": [_decision(context["pair_jobs"][0])]
+        }
+    )
+    second = _run(tmp_path, profiles, calls)
+
+    assert [stage for stage, _key, _context in calls.seen] == [
+        "relationship_adjudication"
+    ]
+    assert second["pair_job_count"] == 1
+    assert second["selected_candidate_pool_hash"] == state[
+        "selected_candidate_pool_hash"
+    ]
+    _commit_relationship_selection_state(
+        tmp_path,
+        second,
+        catalogue_revision=second["reconciled_catalogue_revision"],
+    )
+
+    before = state_path.read_bytes()
+    before_mtime = state_path.stat().st_mtime_ns
+    replay_calls = _Calls(
+        lambda stage, _profiles, _context: (_ for _ in ()).throw(
+            AssertionError(f"unexpected replay call: {stage}")
+        )
+    )
+    replay = _run(tmp_path, profiles, replay_calls)
+    _commit_relationship_selection_state(
+        tmp_path,
+        replay,
+        catalogue_revision=replay["reconciled_catalogue_revision"],
+    )
+
+    assert replay_calls.seen == []
+    assert state_path.read_bytes() == before
+    assert state_path.stat().st_mtime_ns == before_mtime
+
+
+def test_schema3_selected_dispositions_migrate_without_discovery(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile("A"), _profile("B")]
+    map_request = _request(tmp_path)
+    first = _run(
+        tmp_path,
+        profiles,
+        _Calls(
+            lambda stage, _profiles, context: (
+                {"candidates": [_candidate("A", "B")]}
+                if stage == "relationship_candidate_selection"
+                else {"decisions": [_decision(context["pair_jobs"][0])]}
+            )
+        ),
+        request=map_request,
+    )
+    state_path = _commit_relationship_selection_state(
+        tmp_path,
+        first,
+        catalogue_revision=first["reconciled_catalogue_revision"],
+    )
+    assert state_path is not None
+    state = read_yaml(state_path)
+    state["state_schema_version"] = "3"
+    state["selection_identity"] = stable_hash(
+        {
+            "provider": "test-provider",
+            "model": "test-model",
+            "discovery_prompt_version": pipeline_module.RELATIONSHIP_DISCOVERY_PROMPT_VERSION,
+            "adjudication_prompt_version": "14",
+            "output_contract": "relationship-decision-v4",
+            "decision_normalization_version": pipeline_module.RELATIONSHIP_DECISION_NORMALIZATION_VERSION,
+            "policy_identity": stable_hash(map_request.literature_policy.to_dict()),
+        }
+    )
+    state["candidate_dispositions"] = [
+        {
+            "pair": ["A", "B"],
+            "disposition": "selected_for_adjudication",
+        }
+    ]
+    for key in (
+        "selected_candidates",
+        "selected_candidate_pool_hash",
+        "discovery_identity",
+        "adjudication_identity",
+    ):
+        state.pop(key, None)
+    write_yaml(state_path, state)
+
+    calls = _Calls(
+        lambda stage, _profiles, context: {
+            "decisions": [_decision(context["pair_jobs"][0])]
+        }
+    )
+    migrated = _run(
+        tmp_path,
+        profiles,
+        calls,
+        request=map_request,
+    )
+
+    assert [stage for stage, _key, _context in calls.seen] == [
+        "relationship_adjudication"
+    ]
+    assert migrated["pair_job_count"] == 1
+    assert migrated["selected_candidates"][0]["candidate_basis"][0][
+        "provenance"
+    ] == "legacy_selected_disposition"
+
+
+def test_prompt_change_readjudicates_frozen_negative_pair_without_discovery(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    profiles = [_profile("A"), _profile("B")]
+
+    def no_relationship(context: Mapping[str, Any]) -> Mapping[str, Any]:
+        job = context["pair_jobs"][0]
+        return {
+            "decisions": [
+                {
+                    "pair_job_id": job["pair_job_id"],
+                    "decision": "no_relationship",
+                    "reason": "The overlap is only topical.",
+                    "confidence": "high",
+                }
+            ]
+        }
+
+    first = _run(
+        tmp_path,
+        profiles,
+        _Calls(
+            lambda stage, _profiles, context: (
+                {"candidates": [_candidate("A", "B")]}
+                if stage == "relationship_candidate_selection"
+                else no_relationship(context)
+            )
+        ),
+        reasoner=_V8Reasoner(),
+    )
+    _commit_relationship_selection_state(
+        tmp_path,
+        first,
+        catalogue_revision=first["reconciled_catalogue_revision"],
+    )
+    input_path = next(
+        (
+            tmp_path
+            / "11_state"
+            / "runs"
+            / "relationship-run"
+            / "relationship_jobs"
+        ).glob("*/input.json")
+    )
+    frozen_job = RelationshipPairJob.from_dict(
+        json.loads(input_path.read_text(encoding="utf-8"))
+    )
+    monkeypatch.setattr(pipeline_module, "RELATIONSHIP_PROMPT_VERSION", "16")
+    calls = _Calls(
+        lambda stage, _profiles, context: no_relationship(context)
+    )
+
+    second = _run(
+        tmp_path,
+        profiles,
+        calls,
+        reasoner=_V8Reasoner(),
+        frozen_pair_jobs=[frozen_job],
+    )
+
+    assert [stage for stage, _key, _context in calls.seen] == [
+        "relationship_adjudication"
+    ]
+    assert second["pair_job_count"] == 1
+    assert second["no_relationship"][0]["pair_job_id"] == frozen_job.pair_job_id
+
+
+def test_operational_policy_changes_do_not_invalidate_relationship_state(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile("A"), _profile("B")]
+
+    def first_handler(
+        stage: str,
+        _profiles: Sequence[Any],
+        context: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if stage == "relationship_candidate_selection":
+            return {"candidates": [_candidate("A", "B")]}
+        return {"decisions": [_decision(context["pair_jobs"][0])]}
+
+    first = _run(tmp_path, profiles, _Calls(first_handler))
+    _commit_relationship_selection_state(
+        tmp_path,
+        first,
+        catalogue_revision=first["reconciled_catalogue_revision"],
+    )
+    changed_request = LiteratureMapRequest(
+        workspace=tmp_path,
+        provider="test-provider",
+        model="test-model",
+        provider_concurrency=9,
+        literature_policy=LiteratureMappingPolicy(
+            max_synthesis_calls=99,
+            profile_workers=12,
+            literature_deadline_seconds=9_999,
+        ),
+    )
+    calls = _Calls(
+        lambda stage, _profiles, _context: (_ for _ in ()).throw(
+            AssertionError(f"unexpected provider call: {stage}")
+        )
+    )
+
+    replay = _run(tmp_path, profiles, calls, request=changed_request)
+
+    assert calls.seen == []
+    assert replay["pair_job_count"] == 0
+
+
+def test_corrupt_selected_pool_hash_falls_back_to_discovery(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile("A"), _profile("B")]
+    first = _run(
+        tmp_path,
+        profiles,
+        _Calls(
+            lambda stage, _profiles, context: (
+                {"candidates": [_candidate("A", "B")]}
+                if stage == "relationship_candidate_selection"
+                else {"decisions": [_decision(context["pair_jobs"][0])]}
+            )
+        ),
+    )
+    state_path = _commit_relationship_selection_state(
+        tmp_path,
+        first,
+        catalogue_revision=first["reconciled_catalogue_revision"],
+    )
+    assert state_path is not None
+    state = read_yaml(state_path)
+    state["selected_candidate_pool_hash"] = "corrupt"
+    write_yaml(state_path, state)
+    calls = _Calls(
+        lambda stage, _profiles, context: (
+            {"candidates": [_candidate("A", "B")]}
+            if stage == "relationship_candidate_selection"
+            else {"decisions": [_decision(context["pair_jobs"][0])]}
+        )
+    )
+
+    _run(tmp_path, profiles, calls)
+
+    assert any(
+        stage == "relationship_candidate_selection"
+        for stage, _key, _context in calls.seen
+    )
 
 
 def test_changed_collection_routing_card_invalidates_discovery(
@@ -2244,6 +2546,9 @@ def test_unchanged_negative_pair_memory_skips_readjudication(
     tmp_path: Path,
 ) -> None:
     profiles = [_profile("A"), _profile("B")]
+    relationship_policy_identity = stable_hash(
+        {"relationship_semantic_policy": "source-owned-bases-v26"}
+    )
     decision_key = relationship_decision_key(
         "A",
         "B",
@@ -2251,6 +2556,7 @@ def test_unchanged_negative_pair_memory_skips_readjudication(
         stable_hash(profile_to_dict(profiles[1])),
         provider="test-provider",
         model="test-model",
+        policy_identity=relationship_policy_identity,
     )
     write_yaml(
         tmp_path / "02_source_memory" / "indexes" / "typed_links.yml",
@@ -2260,7 +2566,8 @@ def test_unchanged_negative_pair_memory_skips_readjudication(
                     "decision_key": decision_key,
                     "source_id": "A",
                     "target_source_id": "B",
-                    "status": "no_relationship",
+                        "status": "no_relationship",
+                        "relationship_policy_identity": relationship_policy_identity,
                 }
             ]
         },

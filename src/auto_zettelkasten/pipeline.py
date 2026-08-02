@@ -164,6 +164,9 @@ _LEGACY_RELATIONSHIP_BATCH_MAX_JOBS = 8
 _RELATIONSHIP_GENERAL_CANDIDATE_MAX = 70
 _RELATIONSHIP_BRIDGE_CANDIDATE_MAX = 50
 _RELATIONSHIP_CANDIDATE_MAX = 120
+_RELATIONSHIP_SELECTION_STATE_SCHEMA_VERSION = "4"
+_RELATIONSHIP_DISCOVERY_POLICY_VERSION = "family-coverage-v24"
+_RELATIONSHIP_SEMANTIC_POLICY_VERSION = "source-owned-bases-v26"
 _LITERATURE_MEMORY_LOCK = threading.Lock()
 _AUTO_SOURCE_WORKER_LIMIT = 32
 
@@ -4209,6 +4212,173 @@ def _validate_literature_family_plan(
     }
 
 
+def _selected_candidate_rows(
+    candidate_by_pair: Mapping[
+        tuple[str, str], Sequence[Mapping[str, Any]]
+    ],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "pair": list(pair),
+            "candidate_basis": sorted(
+                (dict(row) for row in basis if isinstance(row, Mapping)),
+                key=stable_hash,
+            ),
+        }
+        for pair, basis in sorted(candidate_by_pair.items())
+    ]
+
+
+def _relationship_discovery_identity(provider: str, model: str) -> str:
+    return stable_hash(
+        {
+            "provider": provider,
+            "model": model,
+            "discovery_prompt_version": RELATIONSHIP_DISCOVERY_PROMPT_VERSION,
+            "discovery_policy": _RELATIONSHIP_DISCOVERY_POLICY_VERSION,
+            "candidate_limits": {
+                "total": _RELATIONSHIP_CANDIDATE_MAX,
+                "general": _RELATIONSHIP_GENERAL_CANDIDATE_MAX,
+                "bridge": _RELATIONSHIP_BRIDGE_CANDIDATE_MAX,
+            },
+        }
+    )
+
+
+def _relationship_adjudication_identity(
+    provider: str,
+    model: str,
+    decision_contract: str,
+    atomic_note_hashes: Mapping[str, str],
+) -> tuple[str, str]:
+    policy_identity = stable_hash(
+        {"relationship_semantic_policy": _RELATIONSHIP_SEMANTIC_POLICY_VERSION}
+    )
+    return (
+        stable_hash(
+            {
+                "provider": provider,
+                "model": model,
+                "adjudication_prompt_version": RELATIONSHIP_PROMPT_VERSION,
+                "output_contract": decision_contract,
+                "decision_normalization_version": (
+                    RELATIONSHIP_DECISION_NORMALIZATION_VERSION
+                ),
+                "semantic_policy_identity": policy_identity,
+                "atomic_note_hashes": dict(sorted(atomic_note_hashes.items())),
+            }
+        ),
+        policy_identity,
+    )
+
+
+def _selected_candidates_from_state(
+    state: Mapping[str, Any],
+) -> dict[tuple[str, str], list[dict[str, Any]]] | None:
+    if str(state.get("state_schema_version") or "") not in {
+        "1",
+        "2",
+        "3",
+        _RELATIONSHIP_SELECTION_STATE_SCHEMA_VERSION,
+    }:
+        return None
+    raw_rows = state.get("selected_candidates")
+    if not isinstance(raw_rows, list):
+        return None
+    rows: list[dict[str, Any]] = []
+    candidate_by_pair: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for raw in raw_rows:
+        if not isinstance(raw, Mapping):
+            return None
+        pair_values = list(raw.get("pair", []) or [])
+        basis_values = raw.get("candidate_basis", [])
+        if (
+            len(pair_values) != 2
+            or not all(str(value) for value in pair_values)
+            or str(pair_values[0]) == str(pair_values[1])
+            or not isinstance(basis_values, list)
+            or not basis_values
+            or not all(isinstance(value, Mapping) for value in basis_values)
+        ):
+            return None
+        pair = canonical_pair(str(pair_values[0]), str(pair_values[1]))
+        if pair in candidate_by_pair:
+            return None
+        basis = sorted((dict(value) for value in basis_values), key=stable_hash)
+        candidate_by_pair[pair] = basis
+        rows.append({"pair": list(pair), "candidate_basis": basis})
+    rows.sort(key=lambda row: tuple(row["pair"]))
+    if str(state.get("selected_candidate_pool_hash") or "") != stable_hash(rows):
+        return None
+    return candidate_by_pair
+
+
+def _legacy_selected_candidates_from_state(
+    state: Mapping[str, Any],
+) -> dict[tuple[str, str], list[dict[str, Any]]] | None:
+    if str(state.get("state_schema_version") or "") not in {"1", "2", "3"}:
+        return None
+    candidates: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for raw in state.get("candidate_dispositions", []) or []:
+        if not isinstance(raw, Mapping):
+            return None
+        if str(raw.get("disposition") or "") != "selected_for_adjudication":
+            continue
+        pair_values = list(raw.get("pair", []) or [])
+        if (
+            len(pair_values) != 2
+            or not all(str(value) for value in pair_values)
+            or str(pair_values[0]) == str(pair_values[1])
+        ):
+            return None
+        pair = canonical_pair(str(pair_values[0]), str(pair_values[1]))
+        if pair in candidates:
+            return None
+        candidates[pair] = [
+            {
+                "left_source_id": pair[0],
+                "right_source_id": pair[1],
+                "provenance": "legacy_selected_disposition",
+            }
+        ]
+    return candidates or None
+
+
+def _legacy_selection_identity_matches(
+    state: Mapping[str, Any],
+    *,
+    provider: str,
+    model: str,
+    decision_contract: str,
+    policy: LiteratureMappingPolicy,
+) -> bool:
+    prior = str(state.get("selection_identity") or "")
+    if not prior or str(state.get("state_schema_version") or "") not in {
+        "1",
+        "2",
+        "3",
+    }:
+        return False
+    policy_identity = stable_hash(policy.to_dict())
+    return any(
+        prior
+        == stable_hash(
+            {
+                "provider": provider,
+                "model": model,
+                "discovery_prompt_version": RELATIONSHIP_DISCOVERY_PROMPT_VERSION,
+                "adjudication_prompt_version": str(prompt_version),
+                "output_contract": decision_contract,
+                "decision_normalization_version": (
+                    RELATIONSHIP_DECISION_NORMALIZATION_VERSION
+                ),
+                "policy_identity": policy_identity,
+            }
+        )
+        for prompt_version in range(1, 15)
+    )
+
+
 def _run_relationship_reasoning(
     workspace: Path,
     *,
@@ -4219,6 +4389,9 @@ def _run_relationship_reasoning(
     reasoner_calls: _CheckpointedReasonerCalls | None,
     request: LiteratureMapRequest,
     shared_family_plan: Mapping[str, Any] | None = None,
+    frozen_pair_jobs: Sequence[RelationshipPairJob] | None = None,
+    require_reused_discovery: bool = False,
+    verify_reuse_only: bool = False,
 ) -> dict[str, Any]:
     """Run global discovery and one complete decision per immutable pair job."""
 
@@ -4483,20 +4656,24 @@ def _run_relationship_reasoning(
         )
         for source_id in sorted(profile_by_source)
     }
-    relationship_policy_identity = stable_hash(
-        request.literature_policy.to_dict()
+    relationship_provider = str(getattr(reasoner, "name", ""))
+    relationship_model = str(getattr(reasoner, "model", ""))
+    discovery_identity = _relationship_discovery_identity(
+        relationship_provider, relationship_model
     )
-    selection_identity = stable_hash(
-        {
-            "provider": str(getattr(reasoner, "name", "")),
-            "model": str(getattr(reasoner, "model", "")),
-            "discovery_prompt_version": RELATIONSHIP_DISCOVERY_PROMPT_VERSION,
-            "adjudication_prompt_version": RELATIONSHIP_PROMPT_VERSION,
-            "output_contract": decision_contract,
-            "decision_normalization_version": RELATIONSHIP_DECISION_NORMALIZATION_VERSION,
-            "policy_identity": relationship_policy_identity,
-        }
+    current_atomic_hashes = {
+        source_id: str(row.get("semantic_hash") or "")
+        for source_id, row in sorted(atomic_note_by_source.items())
+    }
+    adjudication_identity, relationship_policy_identity = (
+        _relationship_adjudication_identity(
+            relationship_provider,
+            relationship_model,
+            decision_contract,
+            current_atomic_hashes,
+        )
     )
+    selection_identity = discovery_identity
     state_path = (
         workspace
         / "02_source_memory"
@@ -4508,16 +4685,39 @@ def _run_relationship_reasoning(
     prior_memory_hashes = dict(
         prior_state.get("relationship_memory_hashes", {}) or {}
     )
-    identity_changed = (
-        str(prior_state.get("selection_identity") or "") != selection_identity
+    prior_selected_candidates = _selected_candidates_from_state(prior_state)
+    legacy_identity_matches = _legacy_selection_identity_matches(
+        prior_state,
+        provider=relationship_provider,
+        model=relationship_model,
+        decision_contract=decision_contract,
+        policy=request.literature_policy,
     )
-    focus_source_ids = sorted(
+    if prior_selected_candidates is None and legacy_identity_matches:
+        prior_selected_candidates = _legacy_selected_candidates_from_state(
+            prior_state
+        )
+    discovery_identity_changed = not legacy_identity_matches and (
+        str(
+            prior_state.get("discovery_identity")
+            or prior_state.get("selection_identity")
+            or ""
+        )
+        != discovery_identity
+    )
+    profile_focus_source_ids = sorted(
         source_id
         for source_id, profile_hash in current_hashes.items()
-        if identity_changed
-        or str(prior_hashes.get(source_id) or "") != profile_hash
-        or str(prior_memory_hashes.get(source_id) or "")
+        if str(prior_hashes.get(source_id) or "") != profile_hash
+    )
+    memory_focus_source_ids = sorted(
+        source_id
+        for source_id in current_hashes
+        if str(prior_memory_hashes.get(source_id) or "")
         != current_memory_hashes[source_id]
+    )
+    focus_source_ids = sorted(
+        set(profile_focus_source_ids) | set(memory_focus_source_ids)
     )
     catalogue_changed = (
         str(
@@ -4527,15 +4727,65 @@ def _run_relationship_reasoning(
         )
         != catalogue_revision
     )
+    discovery_changed = bool(
+        discovery_identity_changed
+        or focus_source_ids
+        or catalogue_changed
+        or prior_selected_candidates is None
+    )
     if (
-        not focus_source_ids
+        require_reused_discovery
+        and frozen_pair_jobs is not None
+        and not discovery_identity_changed
+        and not profile_focus_source_ids
         and not catalogue_changed
-        and not bool(getattr(request, "retry_terminal_failures", False))
+        and prior_selected_candidates is not None
+    ):
+        # The frozen pool is the explicit evaluation input. Later graph-memory
+        # projection must not trigger discovery during the paired prompt test.
+        discovery_changed = False
+    adjudication_changed = (
+        str(prior_state.get("adjudication_identity") or "")
+        != adjudication_identity
+    )
+    retry_terminal_failures = bool(
+        getattr(request, "retry_terminal_failures", False)
+    )
+    reuse_selected_pool = bool(
+        not discovery_changed
+        and prior_selected_candidates is not None
+        and (adjudication_changed or retry_terminal_failures)
+    )
+    if require_reused_discovery and discovery_changed:
+        raise RuntimeError(
+            "relationship discovery reuse precondition failed: "
+            f"identity_changed={discovery_identity_changed},"
+            f"focus_source_count={len(focus_source_ids)},"
+            f"focus_source_ids={focus_source_ids[:10]},"
+            f"profile_focus_source_count={len(profile_focus_source_ids)},"
+            f"memory_focus_source_count={len(memory_focus_source_ids)},"
+            f"catalogue_changed={catalogue_changed},"
+            f"selected_pool_valid={prior_selected_candidates is not None}"
+        )
+    if verify_reuse_only:
+        if not reuse_selected_pool:
+            raise RuntimeError("relationship selected pool is not reusable")
+        return {
+            "discovery_reused": True,
+            "selected_candidate_count": len(prior_selected_candidates or {}),
+            "discovery_identity": discovery_identity,
+            "adjudication_identity": adjudication_identity,
+        }
+    if (
+        not discovery_changed
+        and not adjudication_changed
+        and not retry_terminal_failures
     ):
         prior_stage_complete = bool(
             prior_state.get("relationship_stage_complete", True)
         )
         return {
+            "semantic_noop": True,
             "accepted": [],
             "no_relationship": [],
             "parked": [],
@@ -4543,6 +4793,8 @@ def _run_relationship_reasoning(
             "selected_profile_hashes": {},
             "reconciled_catalogue_revision": "",
             "selection_identity": selection_identity,
+            "discovery_identity": discovery_identity,
+            "adjudication_identity": adjudication_identity,
             "state_path": str(state_path),
             "pair_job_count": 0,
             "accounted_pair_job_count": 0,
@@ -4742,7 +4994,15 @@ def _run_relationship_reasoning(
     ]
     discovery_entries = entries
     discovery_parked: list[dict[str, Any]] = []
-    discovery_job_accounting: dict[str, dict[str, Any]] = {}
+    discovery_job_accounting: dict[str, dict[str, Any]] = (
+        {
+            str(row.get("bridge_job_id") or ""): dict(row)
+            for row in prior_state.get("relationship_discovery_jobs", []) or []
+            if isinstance(row, Mapping) and row.get("bridge_job_id")
+        }
+        if reuse_selected_pool
+        else {}
+    )
     routing_cards = [
         {
             **dict(row.get("routing_card") or {}),
@@ -4890,7 +5150,8 @@ def _run_relationship_reasoning(
     bridge_routing_call_count = int(bool(collection_cards or virtual_cards))
     discovery_call_count = 2 + routing_call_count + bridge_routing_call_count
     can_discover = (
-        remaining_calls >= mandatory_call_count + discovery_call_count + 1
+        not reuse_selected_pool
+        and remaining_calls >= mandatory_call_count + discovery_call_count + 1
     )
     adjudication_call_capacity = min(
         20,
@@ -5394,7 +5655,7 @@ def _run_relationship_reasoning(
             )
         )
 
-    if shared_plan_active:
+    if shared_plan_active and not reuse_selected_pool:
         shared_discovery_active = True
         routed_fallback_tasks = list(candidate_tasks)
         shared_packet_overflow = False
@@ -6194,17 +6455,21 @@ def _run_relationship_reasoning(
     discovery_retryable = any(
         bool(row.get("retry_on_resume")) for row in discovery_parked
     )
-    discovery_completed = bool(candidate_tasks) and bool(
-        (
-            all(
-                row.get("status")
-                in {"completed", "insufficient_analytical_endpoints"}
-                for row in discovery_job_accounting.values()
+    discovery_completed = bool(
+        reuse_selected_pool
+        or (
+            candidate_tasks
+            and (
+                all(
+                    row.get("status")
+                    in {"completed", "insufficient_analytical_endpoints"}
+                    for row in discovery_job_accounting.values()
+                )
+                if shared_discovery_active
+                else successful_discovery_tasks == len(candidate_tasks)
             )
-            if shared_discovery_active
-            else successful_discovery_tasks == len(candidate_tasks)
+            and not discovery_parked
         )
-        and not discovery_parked
     )
     discovery_usable = bool(
         discovery_completed
@@ -6349,7 +6614,15 @@ def _run_relationship_reasoning(
         **{pair: "current_no_relationship" for pair in negative_pairs},
         **{pair: "already_visible" for pair in visible_pairs},
     }
-    candidate_dispositions: list[dict[str, Any]] = []
+    candidate_dispositions: list[dict[str, Any]] = (
+        [
+            dict(row)
+            for row in prior_state.get("candidate_dispositions", []) or []
+            if isinstance(row, Mapping)
+        ]
+        if reuse_selected_pool
+        else []
+    )
     bridge_rows = _ranked_relationship_candidates(
         bridge_payload,
         available_source_ids=set(profile_by_source),
@@ -6390,6 +6663,11 @@ def _run_relationship_reasoning(
         else None,
     )
     inferred_rows = [*bridge_rows, *general_rows][:inferred_capacity]
+    if reuse_selected_pool and prior_selected_candidates is not None:
+        inferred_rows = [
+            {"source_id": pair[0], "target_id": pair[1]}
+            for pair in sorted(prior_selected_candidates)
+        ]
     for row in candidate_dispositions:
         pair_values = list(row.get("pair", []) or [])
         if len(pair_values) != 2:
@@ -6400,7 +6678,11 @@ def _run_relationship_reasoning(
             and row.get("disposition") == "selected_for_adjudication"
         ):
             row["reconsideration"] = "inactive_or_retired_reconsidered"
-    if focus_source_ids and not identity_changed:
+    if (
+        focus_source_ids
+        and not discovery_identity_changed
+        and not reuse_selected_pool
+    ):
         focus = set(focus_source_ids)
         inferred_rows = [
             row
@@ -6452,6 +6734,14 @@ def _run_relationship_reasoning(
     }
     for pair, basis in mandatory_basis.items():
         candidate_by_pair[pair] = list(basis)
+    if reuse_selected_pool and prior_selected_candidates is not None:
+        candidate_by_pair = {
+            pair: [dict(row) for row in basis]
+            for pair, basis in sorted(prior_selected_candidates.items())
+        }
+
+    selected_candidates = _selected_candidate_rows(candidate_by_pair)
+    selected_candidate_pool_hash = stable_hash(selected_candidates)
 
     run_id = str(getattr(reasoner_calls, "run_id", "") or "")
     job_root = (
@@ -6475,7 +6765,9 @@ def _run_relationship_reasoning(
         }
     )
     jobs: list[RelationshipPairJob] = []
-    for pair in sorted(candidate_by_pair):
+    for pair in (
+        [] if frozen_pair_jobs is not None else sorted(candidate_by_pair)
+    ):
         selected = {
             side: _selected_relationship_evidence(
                 profile_by_source[source_id],
@@ -6659,6 +6951,37 @@ def _run_relationship_reasoning(
                 },
             )
         jobs.append(job)
+
+    if frozen_pair_jobs is not None:
+        frozen_by_pair = {
+            canonical_pair(job.left_source_id, job.right_source_id): job
+            for job in frozen_pair_jobs
+        }
+        if set(frozen_by_pair) != set(candidate_by_pair):
+            raise ValueError(
+                "frozen relationship jobs do not match the selected candidate pool"
+            )
+        if any(job.output_contract != decision_contract for job in frozen_pair_jobs):
+            raise ValueError(
+                "frozen relationship jobs do not match the decision contract"
+            )
+        jobs = [frozen_by_pair[pair] for pair in sorted(frozen_by_pair)]
+        for job in jobs:
+            path = job_root / job.pair_job_id
+            write_json(path / "input.json", job.to_dict())
+            if not (path / "status.yml").is_file():
+                write_yaml(
+                    path / "status.yml",
+                    {
+                        "pair_job_id": job.pair_job_id,
+                        "status": "pending",
+                        "output_contract": job.output_contract,
+                        "decision_identity": decision_identity,
+                        "reasoner_backend": reasoner_backend,
+                        "provider": provider_name,
+                        "model": model_name,
+                    },
+                )
 
     def validate_cached_job(
         job: RelationshipPairJob,
@@ -7280,6 +7603,10 @@ def _run_relationship_reasoning(
             catalogue_revision if selection_settled else ""
         ),
         "selection_identity": selection_identity,
+        "discovery_identity": discovery_identity,
+        "adjudication_identity": adjudication_identity,
+        "selected_candidates": selected_candidates,
+        "selected_candidate_pool_hash": selected_candidate_pool_hash,
         "pair_job_count": len(jobs),
         "accounted_pair_job_count": len(accounted_job_ids),
         "relationship_stage_complete": relationship_stage_complete,
@@ -7849,6 +8176,15 @@ def _commit_relationship_selection_state(
         )
     )
     existing = read_yaml(path, {}) or {}
+    if (
+        str(existing.get("state_schema_version") or "")
+        != _RELATIONSHIP_SELECTION_STATE_SCHEMA_VERSION
+        and not selected
+        and not reconciled
+        and "selected_candidates" not in result
+        and not result.get("adjudication_identity")
+    ):
+        return path
     profile_hashes = dict(existing.get("profile_hashes", {}) or {})
     profile_hashes.update(selected)
     relationship_memory_hashes = dict(
@@ -7856,7 +8192,7 @@ def _commit_relationship_selection_state(
     )
     relationship_memory_hashes.update(selected_memory)
     payload = {
-        "state_schema_version": "3",
+        "state_schema_version": _RELATIONSHIP_SELECTION_STATE_SCHEMA_VERSION,
         "profile_hashes": dict(sorted(profile_hashes.items())),
         "relationship_memory_hashes": dict(
             sorted(relationship_memory_hashes.items())
@@ -7867,7 +8203,30 @@ def _commit_relationship_selection_state(
         or str(existing.get("catalogue_revision") or ""),
         "selection_identity": selection_identity
         or str(existing.get("selection_identity") or ""),
+        "discovery_identity": str(
+            result.get("discovery_identity")
+            or existing.get("discovery_identity")
+            or selection_identity
+            or existing.get("selection_identity")
+            or ""
+        ),
+        "adjudication_identity": str(
+            result.get("adjudication_identity")
+            or existing.get("adjudication_identity")
+            or ""
+        ),
     }
+    selected_candidates = result.get(
+        "selected_candidates", existing.get("selected_candidates")
+    )
+    selected_candidate_pool_hash = str(
+        result.get("selected_candidate_pool_hash")
+        or existing.get("selected_candidate_pool_hash")
+        or ""
+    )
+    if isinstance(selected_candidates, list) and selected_candidate_pool_hash:
+        payload["selected_candidates"] = selected_candidates
+        payload["selected_candidate_pool_hash"] = selected_candidate_pool_hash
     if "candidate_dispositions" in result or "candidate_dispositions" in existing:
         payload["candidate_dispositions"] = list(
             result.get(
@@ -7937,6 +8296,8 @@ def _write_relationship_run_ledger(
         / "relationships"
         / "parked.yml"
     )
+    if result.get("semantic_noop") and path.is_file():
+        return path
     existing = read_yaml(path, {}) or {}
     registry = read_yaml(
         workspace / "02_source_memory" / "indexes" / "typed_links.yml", {}

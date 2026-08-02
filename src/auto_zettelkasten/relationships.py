@@ -10,7 +10,7 @@ from .models import RelationshipDecision, RelationshipPairJob
 from .navigation import TYPED_SOURCE_RELATIONS, rank_human_related_links
 
 
-RELATIONSHIP_PROMPT_VERSION = "14"
+RELATIONSHIP_PROMPT_VERSION = "15"
 RELATIONSHIP_DISCOVERY_PROMPT_VERSION = "15"
 RELATIONSHIP_REGISTRY_SCHEMA_VERSION = "7"
 RELATIONSHIP_DECISION_SCHEMA_VERSION = "8"
@@ -523,6 +523,7 @@ def _v8_connection_rows(
             actor, reference = job.left_source_id, job.right_source_id
         left_ids = _string_list(
             connection.get("source_a_evidence_anchor_ids")
+            or connection.get("source_a_anchor_ids")
             or connection.get("left_evidence_anchor_ids")
             or connection.get("source_a_evidence_anchor_id")
             or connection.get("left_evidence_anchor_id")
@@ -530,6 +531,7 @@ def _v8_connection_rows(
         )
         right_ids = _string_list(
             connection.get("source_b_evidence_anchor_ids")
+            or connection.get("source_b_anchor_ids")
             or connection.get("right_evidence_anchor_ids")
             or connection.get("source_b_evidence_anchor_id")
             or connection.get("right_evidence_anchor_id")
