@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from auto_zettelkasten.files import read_yaml
+from auto_zettelkasten.files import read_yaml, write_yaml
 from auto_zettelkasten.relationships import (
     candidate_rows,
     persist_relationship_registry,
@@ -243,7 +243,7 @@ def test_registry_is_idempotent_preserves_substance_and_repairs_compatibility(
     assert read_yaml(compatibility) == read_yaml(registry)
 
 
-def test_registry_retires_stale_machine_prompt_edges_only(
+def test_registry_keeps_stale_machine_prompt_edges_pending_until_readjudicated(
     tmp_path: Path,
 ) -> None:
     profiles = [_profile(source_id) for source_id in "ABCDEFGHIJ"]
@@ -295,10 +295,15 @@ def test_registry_retires_stale_machine_prompt_edges_only(
         row["relation_id"]: row for row in reconciled["relations"]
     }
     stale = rows[accepted[1]["relation_id"]]
-    assert stale["active"] is False
-    assert stale["decision_status"] == "retired"
-    assert stale["retirement_reason"] == "relationship_prompt_changed"
-    assert stale["retirement_prompt_version"] == "8"
+    assert stale["active"] is True
+    assert stale["decision_status"] == "reconciliation_pending"
+    assert stale["pending_prompt_version"] == "8"
+    current = {
+        tuple(row["source_ids"]): row
+        for row in reconciled["current_pair_decisions"]
+    }
+    assert current[("C", "D")]["status"] == "reconciliation_pending"
+    assert current[("C", "D")]["refresh_pending"] is True
     assert rows[replacement["relation_id"]]["active"] is True
     assert rows[accepted[2]["relation_id"]]["active"] is True
     assert rows["human-g-h"]["active"] is True
@@ -314,6 +319,55 @@ def test_registry_retires_stale_machine_prompt_edges_only(
     )
     assert replay["revision_hash"] == reconciled["revision_hash"]
     assert registry.read_bytes() == original
+
+
+def test_registry_recovers_prompt_edges_retired_before_reconciliation(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile(source_id) for source_id in "ABCD"]
+    accepted = _verified_relations(
+        validate_decisions(
+            {"decisions": [_decision("A", "B"), _decision("C", "D")]},
+            offered_pairs=[("A", "B"), ("C", "D")],
+            profiles=profiles,
+        )["accepted"],
+        profiles,
+    )
+    for row in accepted:
+        row["prompt_version"] = "7"
+    persisted = persist_relationship_registry(
+        tmp_path,
+        structural_relations=[],
+        accepted_relations=accepted,
+    )
+    payload = read_yaml(Path(persisted["path"]))
+    payload["relations"][0].update(
+        active=False,
+        decision_status="retired",
+        retirement_reason="relationship_prompt_changed",
+        retirement_prompt_version="8",
+    )
+    historical = dict(
+        payload["relations"][0],
+        relation_id="historical-a-b",
+        decision_status="retired",
+    )
+    payload["relations"].append(historical)
+    write_yaml(Path(persisted["path"]), payload)
+
+    reconciled = persist_relationship_registry(
+        tmp_path,
+        structural_relations=[],
+        accepted_relations=[dict(accepted[1], prompt_version="8")],
+        reconcile_machine_prompt_version="8",
+    )
+    rows = {row["relation_id"]: row for row in reconciled["relations"]}
+    recovered = rows[accepted[0]["relation_id"]]
+    assert recovered["active"] is True
+    assert recovered["decision_status"] == "reconciliation_pending"
+    assert recovered["pending_prompt_version"] == "8"
+    assert rows["historical-a-b"]["active"] is False
+    assert rows[accepted[1]["relation_id"]]["prompt_version"] == "8"
 
 
 def test_projection_uses_reciprocal_relationship_type() -> None:

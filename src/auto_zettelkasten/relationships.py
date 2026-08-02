@@ -1456,21 +1456,85 @@ def persist_relationship_registry(
         )
         rows_by_id[identity] = row
     if reconcile_machine_prompt_version:
+        stale_current_relation_ids = {
+            str(relation_id)
+            for row in (
+                existing.get("current_pair_decisions", []) or []
+                if isinstance(existing, Mapping)
+                else []
+            )
+            if isinstance(row, Mapping)
+            and str(row.get("prompt_version") or "")
+            != reconcile_machine_prompt_version
+            and str(row.get("status") or "")
+            in {"accepted", "reconciliation_pending"}
+            for relation_id in row.get("relation_ids", []) or []
+            if relation_id
+        }
+        reconciled_pairs = {
+            canonical_pair(*[str(value) for value in row.get("source_ids", [])])
+            for row in (
+                existing.get("current_pair_decisions", []) or []
+                if isinstance(existing, Mapping)
+                else []
+            )
+            if isinstance(row, Mapping)
+            and len(row.get("source_ids", []) or []) == 2
+            and bool(row.get("active", True))
+            and str(row.get("prompt_version") or "")
+            == reconcile_machine_prompt_version
+            and str(row.get("status") or "") in {"accepted", "no_relationship"}
+        }
+        reconciled_pairs.update(
+            canonical_pair(
+                str(row.get("source_id") or ""),
+                str(row.get("target_source_id") or ""),
+            )
+            for row in [
+                *final_accepted_relations,
+                *verified_no_relationship_decisions,
+            ]
+        )
+        reconciled_pairs.update(
+            canonical_pair(
+                str(row.get("source_id") or ""),
+                str(row.get("target_source_id") or ""),
+            )
+            for row in rows_by_id.values()
+            if bool(row.get("active", True))
+            and _machine_substantive(row)
+            and str(row.get("prompt_version") or "")
+            == reconcile_machine_prompt_version
+        )
         for row in rows_by_id.values():
+            pair = canonical_pair(
+                str(row.get("source_id") or ""),
+                str(row.get("target_source_id") or ""),
+            )
             if (
-                bool(row.get("active", True))
-                and _machine_substantive(row)
+                _machine_substantive(row)
                 and str(row.get("prompt_version") or "")
                 != reconcile_machine_prompt_version
-                and str(row.get("decision_status") or "")
-                != "reconciliation_pending"
+                and pair not in reconciled_pairs
+                and (
+                    bool(row.get("active", True))
+                    or (
+                        str(row.get("retirement_reason") or "")
+                        == "relationship_prompt_changed"
+                        and str(row.get("relation_id") or "")
+                        in stale_current_relation_ids
+                    )
+                )
             ):
                 row.update(
-                    active=False,
-                    decision_status="retired",
-                    retirement_reason="relationship_prompt_changed",
-                    retirement_prompt_version=reconcile_machine_prompt_version,
+                    active=True,
+                    decision_status="reconciliation_pending",
+                    reconciliation_pending=True,
+                    cluster_evidence_eligible=False,
+                    pending_prompt_version=reconcile_machine_prompt_version,
                 )
+                row.pop("retirement_reason", None)
+                row.pop("retirement_prompt_version", None)
     orphaned = {str(value) for value in orphaned_source_ids if str(value)}
     if orphaned:
         for row in rows_by_id.values():
@@ -1685,6 +1749,24 @@ def persist_relationship_registry(
                 "reconciliation_pending": True,
                 "refresh_pending": False,
             }
+
+    pending_relation_ids = {
+        str(row.get("relation_id") or "")
+        for row in relations
+        if bool(row.get("active", True))
+        and str(row.get("decision_status") or "") == "reconciliation_pending"
+        and row.get("relation_id")
+    }
+    for current in current_pair_decisions.values():
+        if pending_relation_ids & {
+            str(value) for value in current.get("relation_ids", []) or []
+        }:
+            current.update(
+                status="reconciliation_pending",
+                active=True,
+                reconciliation_pending=True,
+                refresh_pending=True,
+            )
 
     accepted_by_pair: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for row in final_accepted_relations:
@@ -2488,9 +2570,15 @@ def _publishable_machine_relation(row: Mapping[str, Any]) -> bool:
         or _verified_machine_relation(row)
         or (
             str(row.get("decision_status") or "") == "reconciliation_pending"
+            and str(row.get("verification_status") or "") == "final"
             and str(row.get("output_contract") or "")
-            == "relationship-decision-v7"
-            and str(row.get("decision_schema_version") or "") == "7"
+            in {
+                "relationship-decision-v4",
+                "relationship-decision-v5",
+                "relationship-decision-v6",
+                "relationship-decision-v7",
+                RELATIONSHIP_DECISION_CONTRACT,
+            }
         )
         or (
             str(row.get("relationship_tier") or "")
