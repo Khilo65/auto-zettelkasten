@@ -149,6 +149,13 @@ def test_v2_acquisition_dispositions_derive_visible_recommendations() -> None:
     assert validated["important_cited_works_not_yet_mapped"][0]["action"] == (
         "map_existing"
     )
+    assert [
+        row["external_source_id"]
+        for row in validated["additional_cited_works_worth_mapping"]
+    ] == ["secondary"]
+    assert validated["additional_cited_works_worth_mapping"][0]["action"] == (
+        "acquire"
+    )
     assert {
         row["decision"] for row in validated["acquisition_candidate_dispositions"]
     } == {
@@ -508,10 +515,10 @@ def test_cluster_scheduler_reserves_retry_capacity_and_accounts_deferrals(
         for index in range(22)
     ]
 
-    scheduled, deferred = _schedule_cluster_writers(calls, runnable)
+    scheduled, completion_pending = _schedule_cluster_writers(calls, runnable)
 
     assert len(scheduled) == 15
-    assert len(deferred) == 7
+    assert len(completion_pending) == 7
     assert all(
         _cluster_acquisition_revision(
             cluster,
@@ -525,7 +532,7 @@ def test_cluster_scheduler_reserves_retry_capacity_and_accounts_deferrals(
             default_disposition="deferred_budget",
         )["candidates"][0]["writer_disposition"]
         == "deferred_budget"
-        for index, cluster in enumerate(deferred)
+        for index, cluster in enumerate(completion_pending)
     )
 
     calls.cumulative_provider_calls = 25

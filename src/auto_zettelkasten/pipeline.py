@@ -6,7 +6,7 @@ import os
 import re
 import threading
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -159,7 +159,7 @@ from .zotero import (
 
 CHUNKING_VERSION = "2"
 CONTENT_CLASSIFIER_VERSION = "4"
-_RELATIONSHIP_BATCH_MAX_JOBS = 30
+_RELATIONSHIP_BATCH_MAX_JOBS = 15
 _LEGACY_RELATIONSHIP_BATCH_MAX_JOBS = 8
 _RELATIONSHIP_GENERAL_CANDIDATE_MAX = 70
 _RELATIONSHIP_BRIDGE_CANDIDATE_MAX = 50
@@ -2255,9 +2255,13 @@ def _reconcile_cluster_acquisition_recommendations(
     for cluster_id, synthesis in cluster_syntheses.items():
         if not isinstance(synthesis, Mapping) or synthesis.get("parked_for_review"):
             continue
-        for row in synthesis.get("important_cited_works_not_yet_mapped", []) or []:
-            if isinstance(row, Mapping) and row.get("external_source_id"):
-                relevant[str(row["external_source_id"])].add(str(cluster_id))
+        for field in (
+            "important_cited_works_not_yet_mapped",
+            "additional_cited_works_worth_mapping",
+        ):
+            for row in synthesis.get(field, []) or []:
+                if isinstance(row, Mapping) and row.get("external_source_id"):
+                    relevant[str(row["external_source_id"])].add(str(cluster_id))
     rows = []
     for raw in existing.get("sources", []) or []:
         if not isinstance(raw, Mapping):
@@ -2982,6 +2986,294 @@ def _workspace_graph_inputs(
     return note_rows, profiles
 
 
+def _snapshot_identity_item(row: Mapping[str, Any]) -> dict[str, Any]:
+    identity = (
+        dict(row.get("identity") or {})
+        if isinstance(row.get("identity"), Mapping)
+        else {}
+    )
+    return {
+        "key": str(row.get("key") or ""),
+        "itemType": str(row.get("item_type") or ""),
+        "title": str(identity.get("title") or ""),
+        "creators": list(identity.get("creators") or []),
+        "date": str(identity.get("year") or ""),
+        "DOI": str(identity.get("doi") or ""),
+        "ISBN": str(identity.get("isbn") or ""),
+        "url": str(identity.get("url") or ""),
+        "relations": dict(identity.get("relations") or {}),
+    }
+
+
+def _canonical_workspace_graph_inputs(
+    workspace: Path,
+    note_rows: Sequence[Mapping[str, Any]],
+    profiles: Sequence[Any],
+    collection_snapshot: Mapping[str, Any] | None,
+) -> tuple[
+    list[dict[str, Any]],
+    list[Any],
+    list[dict[str, Any]],
+    list[Any],
+    dict[str, Any],
+    list[dict[str, Any]],
+]:
+    """Collapse only strongly identical mapped works before semantic reasoning."""
+
+    profile_rows = [
+        dict(profile) if isinstance(profile, Mapping) else profile_to_dict(profile)
+        for profile in profiles
+    ]
+    profile_by_source = {
+        str(row.get("source_id") or ""): row
+        for row in profile_rows
+        if row.get("source_id")
+    }
+    snapshot_by_key = {
+        str(row.get("key") or "").upper(): dict(row)
+        for row in (collection_snapshot or {}).get("items", []) or []
+        if isinstance(row, Mapping) and row.get("key")
+    }
+    same_as_counts: dict[str, int] = defaultdict(int)
+    url_counts: dict[str, int] = defaultdict(int)
+    identity_items: dict[str, dict[str, Any]] = {}
+    for note in note_rows:
+        source_id = str(note.get("source_id") or "")
+        snapshot = snapshot_by_key.get(
+            str(note.get("zotero_item_key") or "").upper(), {}
+        )
+        item = _snapshot_identity_item(snapshot) if snapshot else {
+            "key": str(note.get("zotero_item_key") or ""),
+            "itemType": str(note.get("item_type") or ""),
+            "title": str(note.get("title") or ""),
+            "creators": list(note.get("creators") or []),
+            "date": str(note.get("date") or ""),
+            "DOI": str(note.get("doi") or ""),
+            "ISBN": str(note.get("isbn") or ""),
+            "url": str(note.get("url") or ""),
+            "relations": dict(note.get("zotero_relations") or {}),
+        }
+        identity_items[source_id] = item
+        for value in item_data(item).get("relations", {}).get("owl:sameAs", []) or []:
+            normalized = _normalized_url_identifier(str(value))
+            if normalized:
+                same_as_counts[normalized] += 1
+        url = _normalized_url_identifier(str(item_data(item).get("url") or ""))
+        if url:
+            url_counts[url] += 1
+    shared_same_as = {value for value, count in same_as_counts.items() if count > 1}
+    shared_urls = {value for value, count in url_counts.items() if count > 1}
+    hash_counts = Counter(
+        str(row.get("source_hash") or "")
+        for row in profile_rows
+        if str(row.get("source_hash") or "")
+    )
+    groups: dict[tuple[str, ...], list[str]] = defaultdict(list)
+    for note in note_rows:
+        source_id = str(note.get("source_id") or "")
+        profile = profile_by_source.get(source_id, {})
+        source_hash = str(profile.get("source_hash") or "")
+        identity = (
+            ("document_hash", source_hash)
+            if source_hash and hash_counts[source_hash] > 1
+            else _inventory_work_identity(
+                identity_items[source_id],
+                shared_same_as=shared_same_as,
+                shared_urls=shared_urls,
+            )
+        )
+        groups[identity].append(source_id)
+
+    note_by_source = {
+        str(row.get("source_id") or ""): dict(row)
+        for row in note_rows
+        if row.get("source_id")
+    }
+    canonical_by_source: dict[str, str] = {}
+    identity_rule_by_source: dict[str, str] = {}
+    aliases_by_canonical: dict[str, list[str]] = defaultdict(list)
+    for identity, source_ids in groups.items():
+        canonical = min(
+            source_ids,
+            key=lambda source_id: (
+                *_canonical_item_rank(identity_items[source_id]),
+                source_id,
+            ),
+        )
+        for source_id in source_ids:
+            canonical_by_source[source_id] = canonical
+            identity_rule_by_source[source_id] = str(identity[0])
+            if source_id != canonical:
+                aliases_by_canonical[canonical].append(source_id)
+
+    annotated_notes: list[dict[str, Any]] = []
+    for note in note_rows:
+        source_id = str(note.get("source_id") or "")
+        canonical = canonical_by_source.get(source_id, source_id)
+        alias_ids = sorted(aliases_by_canonical.get(canonical, []))
+        zotero_keys = sorted(
+            {
+                str(note_by_source[value].get("zotero_item_key") or "")
+                for value in [canonical, *alias_ids]
+                if value in note_by_source
+                and str(note_by_source[value].get("zotero_item_key") or "")
+            }
+        )
+        annotated_notes.append(
+            {
+                **dict(note),
+                "canonical_source_id": canonical,
+                "alias_source_ids": alias_ids if source_id == canonical else [],
+                "zotero_item_keys": zotero_keys,
+                "identity_rule": identity_rule_by_source.get(source_id, "zotero_key"),
+            }
+        )
+    canonical_ids = {
+        source_id
+        for source_id, canonical in canonical_by_source.items()
+        if source_id == canonical
+    }
+    canonical_notes = [
+        row for row in annotated_notes if str(row.get("source_id") or "") in canonical_ids
+    ]
+    canonical_profiles = [
+        profile
+        for profile, row in zip(profiles, profile_rows, strict=True)
+        if str(row.get("source_id") or "") in canonical_ids
+    ]
+    alias_relations = [
+        {
+            "relation_id": "identity-alias-" + stable_hash([alias, canonical])[:16],
+            "source_id": alias,
+            "target_source_id": canonical,
+            "source_note_id": str(note_by_source[alias].get("note_id") or ""),
+            "target_note_id": str(note_by_source[canonical].get("note_id") or ""),
+            "relation_type": "alias_of",
+            "forward_label": "alias of",
+            "inverse_label": "has alias",
+            "reason": "These Zotero records resolve to the same canonical work.",
+            "provenance": "deterministic_work_identity",
+            "identity_rule": identity_rule_by_source.get(alias, ""),
+            "active": True,
+            "inferred": False,
+            "strength": 120,
+        }
+        for canonical, aliases in sorted(aliases_by_canonical.items())
+        for alias in sorted(aliases)
+    ]
+    identity_projection = {
+        "canonical_by_source": dict(sorted(canonical_by_source.items())),
+        "aliases_by_canonical": {
+            key: sorted(values) for key, values in sorted(aliases_by_canonical.items())
+        },
+        "identity_rule_by_source": dict(sorted(identity_rule_by_source.items())),
+        "stored_source_record_count": len(annotated_notes),
+        "canonical_work_count": len(canonical_ids),
+        "duplicate_alias_count": len(alias_relations),
+    }
+    return (
+        annotated_notes,
+        list(profiles),
+        canonical_notes,
+        canonical_profiles,
+        identity_projection,
+        alias_relations,
+    )
+
+
+def _persist_duplicate_work_issues(
+    workspace: Path,
+    identity_projection: Mapping[str, Any],
+    note_rows: Sequence[Mapping[str, Any]],
+) -> Path | None:
+    aliases_by_canonical = dict(
+        identity_projection.get("aliases_by_canonical", {}) or {}
+    )
+    if not aliases_by_canonical:
+        return None
+    note_by_source = {
+        str(row.get("source_id") or ""): row
+        for row in note_rows
+        if row.get("source_id")
+    }
+    path = workspace / "01_custody" / "zotero" / "zotero_metadata_issues.yml"
+    existing = read_yaml(path, {}) or {}
+    issues = {
+        str(row.get("issue_id") or ""): dict(row)
+        for row in existing.get("issues", []) or []
+        if isinstance(row, Mapping) and row.get("issue_id")
+    }
+    rules = dict(identity_projection.get("identity_rule_by_source", {}) or {})
+    for canonical, aliases in sorted(aliases_by_canonical.items()):
+        alias_ids = sorted(str(value) for value in aliases if str(value))
+        issue_id = "zotero-duplicate-" + stable_hash([canonical, alias_ids])[:16]
+        prior = issues.get(issue_id, {})
+        source_ids = [canonical, *alias_ids]
+        issues[issue_id] = {
+            "issue_id": issue_id,
+            "issue_types": ["duplicate_zotero_work"],
+            "canonical_source_id": canonical,
+            "alias_source_ids": alias_ids,
+            "zotero_item_keys": sorted(
+                str(note_by_source[source_id].get("zotero_item_key") or "")
+                for source_id in source_ids
+                if source_id in note_by_source
+                and str(note_by_source[source_id].get("zotero_item_key") or "")
+            ),
+            "identity_rule": str(rules.get(alias_ids[0]) or "strong_identity"),
+            "recommended_correction": "Review and merge duplicate Zotero records.",
+            "status": str(prior.get("status") or "open"),
+        }
+    payload = {**dict(existing), "issues": [issues[key] for key in sorted(issues)]}
+    if payload != existing:
+        write_yaml(path, payload)
+    return path
+
+
+def _retire_duplicate_alias_relationships(
+    workspace: Path, alias_source_ids: Sequence[str]
+) -> None:
+    aliases = {str(value) for value in alias_source_ids if str(value)}
+    if not aliases:
+        return
+    path = workspace / "02_source_memory" / "indexes" / "typed_links.yml"
+    payload = read_yaml(path, {}) or {}
+    if not isinstance(payload, Mapping):
+        return
+    updated = dict(payload)
+    relations = []
+    for raw in payload.get("relations", []) or []:
+        if not isinstance(raw, Mapping):
+            continue
+        row = dict(raw)
+        if (
+            {str(row.get("source_id") or ""), str(row.get("target_source_id") or "")}
+            & aliases
+            and str(row.get("provenance") or "").startswith(
+                "probabilistic_relationship"
+            )
+        ):
+            row.update(
+                active=False,
+                decision_status="superseded_duplicate_alias",
+                retirement_reason="duplicate_alias_reconciled",
+            )
+        relations.append(row)
+    updated["relations"] = relations
+    updated["links"] = [row for row in relations if bool(row.get("active", True))]
+    current = []
+    for raw in payload.get("current_pair_decisions", []) or []:
+        if not isinstance(raw, Mapping):
+            continue
+        row = dict(raw)
+        if set(str(value) for value in row.get("source_ids", []) or []) & aliases:
+            row.update(active=False, status="superseded_duplicate_alias")
+        current.append(row)
+    updated["current_pair_decisions"] = current
+    if updated != payload:
+        write_yaml(path, updated)
+
+
 def _source_set_graph_inputs(
     source_set: Mapping[str, Any],
     note_rows: Sequence[Mapping[str, Any]],
@@ -3017,13 +3309,20 @@ def _source_set_graph_inputs(
 
 
 def _literature_position_relations(
-    workspace: Path, profiles: Sequence[Any]
+    workspace: Path,
+    profiles: Sequence[Any],
+    canonical_by_source: Mapping[str, str] | None = None,
 ) -> list[dict[str, Any]]:
+    profile_rows = [
+        dict(profile) if isinstance(profile, Mapping) else profile_to_dict(profile)
+        for profile in profiles
+    ]
     note_id_by_source = {
         str(row.get("source_id") or ""): str(row.get("note_id") or "")
-        for row in (profile_to_dict(profile) for profile in profiles)
+        for row in profile_rows
         if row.get("source_id")
     }
+    canonical_by_source = dict(canonical_by_source or {})
     payload = read_yaml(
         workspace / "02_source_memory" / "indexes" / "literature_positions.yml",
         {},
@@ -3032,8 +3331,14 @@ def _literature_position_relations(
     for row in payload.get("positions", []) or []:
         if not isinstance(row, Mapping):
             continue
-        source_id = str(row.get("current_source_id") or "")
-        target_id = str(row.get("matched_source_id") or "")
+        source_id = canonical_by_source.get(
+            str(row.get("current_source_id") or ""),
+            str(row.get("current_source_id") or ""),
+        )
+        target_id = canonical_by_source.get(
+            str(row.get("matched_source_id") or ""),
+            str(row.get("matched_source_id") or ""),
+        )
         if (
             source_id == target_id
             or source_id not in note_id_by_source
@@ -4123,12 +4428,23 @@ def _run_relationship_reasoning(
         }
         for source_id in pair:
             memory_rows[source_id].append(memory)
+    canonical_source_ids = dict(
+        source_set.get("canonical_source_ids", {}) or {}
+    )
     for row in positions.get("positions", []) or []:
         if not isinstance(row, Mapping) or not row.get("matched_source_id"):
             continue
         pair = canonical_pair(
-            str(row.get("current_source_id") or ""),
-            str(row.get("matched_source_id") or ""),
+            str(
+                canonical_source_ids.get(str(row.get("current_source_id") or ""))
+                or row.get("current_source_id")
+                or ""
+            ),
+            str(
+                canonical_source_ids.get(str(row.get("matched_source_id") or ""))
+                or row.get("matched_source_id")
+                or ""
+            ),
         )
         if pair[0] not in profile_by_source or pair[1] not in profile_by_source:
             continue
@@ -8258,8 +8574,32 @@ def rebuild_map(
             literature_provider_call_count=int(profile_result["provider_calls"]),
             literature_failure_count=int(profile_result["failure_count"]),
         )
-    workspace_note_rows, workspace_profiles = _workspace_graph_inputs(
+    raw_workspace_note_rows, raw_workspace_profiles = _workspace_graph_inputs(
         workspace, profiles
+    )
+    (
+        full_workspace_note_rows,
+        full_workspace_profiles,
+        workspace_note_rows,
+        workspace_profiles,
+        identity_projection,
+        alias_relations,
+    ) = _canonical_workspace_graph_inputs(
+        workspace,
+        raw_workspace_note_rows,
+        raw_workspace_profiles,
+        collection_snapshot,
+    )
+    alias_source_ids = sorted(
+        source_id
+        for source_id, canonical in dict(
+            identity_projection.get("canonical_by_source", {}) or {}
+        ).items()
+        if source_id != canonical
+    )
+    _retire_duplicate_alias_relationships(workspace, alias_source_ids)
+    duplicate_issue_path = _persist_duplicate_work_issues(
+        workspace, identity_projection, full_workspace_note_rows
     )
     global_source_ids = sorted(
         {
@@ -8279,6 +8619,38 @@ def rebuild_map(
             if row.get("note_id")
         ),
         "dependency_hash": stable_hash(global_source_ids),
+        "canonical_source_ids": dict(
+            identity_projection.get("canonical_by_source", {}) or {}
+        ),
+        "stored_source_record_count": int(
+            identity_projection.get("stored_source_record_count", 0) or 0
+        ),
+        "canonical_work_count": int(
+            identity_projection.get("canonical_work_count", 0) or 0
+        ),
+        "duplicate_alias_count": int(
+            identity_projection.get("duplicate_alias_count", 0) or 0
+        ),
+        "rows": [
+            {
+                "source_id": str(row.get("source_id") or ""),
+                "note_id": str(row.get("note_id") or ""),
+                "zotero_item_key": str(row.get("zotero_item_key") or ""),
+                "terminal_status": (
+                    "duplicate_alias"
+                    if str(row.get("source_id") or "") in alias_source_ids
+                    else "validated_note"
+                    if str(row.get("note_status") or "")
+                    in {"analytical_atomic_note", "verified_atomic_note"}
+                    else "limited_note"
+                ),
+                "canonical_source_id": str(
+                    row.get("canonical_source_id") or row.get("source_id") or ""
+                ),
+                "attempted_route": ["not_recorded_legacy"],
+            }
+            for row in full_workspace_note_rows
+        ],
     }
     global_map_id = stable_literature_map_id(global_source_set)
     base_literature_request = LiteratureMapRequest(
@@ -8313,9 +8685,23 @@ def rebuild_map(
         else None
     )
     orphaned_source_ids = _orphaned_source_ids(
-        workspace_note_rows, collection_snapshot
+        full_workspace_note_rows, collection_snapshot
     )
-    existing_clusters = _cluster_catalogue_rows(workspace)
+    canonical_by_source = dict(
+        identity_projection.get("canonical_by_source", {}) or {}
+    )
+    existing_clusters = []
+    for raw_cluster in _cluster_catalogue_rows(workspace):
+        cluster = dict(raw_cluster)
+        for field in ("source_ids", "core_source_ids"):
+            cluster[field] = sorted(
+                {
+                    str(canonical_by_source.get(str(value)) or value)
+                    for value in cluster.get(field, []) or []
+                    if str(value)
+                }
+            )
+        existing_clusters.append(cluster)
     navigation = build_navigation_projection(
         workspace,
         workspace_profiles,
@@ -8323,23 +8709,29 @@ def rebuild_map(
         navigation_policy=effective_request.navigation_policy,
     )
     citation_relations = _literature_position_relations(
-        workspace, workspace_profiles
+        workspace,
+        workspace_profiles,
+        canonical_by_source=dict(
+            identity_projection.get("canonical_by_source", {}) or {}
+        ),
     )
     persist_relationship_registry(
         workspace,
         structural_relations=[
             *(navigation.get("typed_relations", []) or []),
             *citation_relations,
+            *alias_relations,
         ],
-        preserve_unmentioned_structural=True,
+        preserve_unmentioned_structural=False,
         orphaned_source_ids=orphaned_source_ids,
     )
     catalogue = build_source_catalogue(
         workspace,
-        workspace_profiles,
-        workspace_note_rows,
+        full_workspace_profiles,
+        full_workspace_note_rows,
         existing_clusters,
         collection_snapshot=collection_snapshot,
+        identity_projection=identity_projection,
     )
     catalogue_payload = read_yaml(Path(str(catalogue["catalogue_path"])), {}) or {}
     collection_rows = [
@@ -8423,14 +8815,18 @@ def rebuild_map(
         )
     typed = persist_relationship_registry(
         workspace,
-        structural_relations=navigation.get("typed_relations", []) or [],
+        structural_relations=[
+            *(navigation.get("typed_relations", []) or []),
+            *citation_relations,
+            *alias_relations,
+        ],
         accepted_relations=relationship_result.get("accepted", []) or [],
         no_relationship_decisions=relationship_result.get(
             "no_relationship", []
         )
         or [],
         parked_rows=relationship_result.get("parked", []) or [],
-        preserve_unmentioned_structural=True,
+        preserve_unmentioned_structural=False,
         orphaned_source_ids=orphaned_source_ids,
         reconcile_machine_prompt_version=(
             None
@@ -8457,8 +8853,8 @@ def rebuild_map(
     ]
     graph_note_paths = _project_atomic_graph(
         workspace,
-        note_rows=workspace_note_rows,
-        profiles=workspace_profiles,
+        note_rows=full_workspace_note_rows,
+        profiles=full_workspace_profiles,
         relations=typed.get("links", []) or [],
         navigation=navigation,
         navigation_policy=effective_request.navigation_policy,
@@ -8481,6 +8877,7 @@ def rebuild_map(
         *(Path(path) for path in catalogue.get("shard_paths", []) or []),
         relationship_ledger_path,
         *graph_note_paths,
+        *([duplicate_issue_path] if duplicate_issue_path is not None else []),
         *([selection_state_path] if selection_state_path is not None else []),
     ]
     if not bool(
@@ -8704,6 +9101,8 @@ def rebuild_map(
         ): dict(row)
         for row in [
             *(navigation.get("typed_relations", []) or []),
+            *citation_relations,
+            *alias_relations,
             *(
                 build_navigation_projection(
                     workspace,
@@ -8723,6 +9122,7 @@ def rebuild_map(
     typed = persist_relationship_registry(
         workspace,
         structural_relations=combined_structural.values(),
+        preserve_unmentioned_structural=False,
         orphaned_source_ids=orphaned_source_ids,
     )
     profile_packet_paths = [
@@ -8842,7 +9242,7 @@ def rebuild_map(
         )
     current_note_ids = [
         str(row.get("note_id") or "")
-        for row in workspace_note_rows
+        for row in full_workspace_note_rows
         if row.get("note_id")
     ]
     catalogue_clusters = {
@@ -8852,15 +9252,16 @@ def rebuild_map(
     }
     catalogue = build_source_catalogue(
         workspace,
-        workspace_profiles,
-        workspace_note_rows,
+        full_workspace_profiles,
+        full_workspace_note_rows,
         catalogue_clusters.values(),
         collection_snapshot=collection_snapshot,
+        identity_projection=identity_projection,
     )
     note_paths = _project_atomic_graph(
         workspace,
-        note_rows=workspace_note_rows,
-        profiles=workspace_profiles,
+        note_rows=full_workspace_note_rows,
+        profiles=full_workspace_profiles,
         relations=typed.get("links", []) or [],
         navigation=navigation,
         navigation_policy=effective_request.navigation_policy,
@@ -11916,6 +12317,7 @@ def _inventory_work_identity(
     item: Mapping[str, Any],
     *,
     shared_same_as: set[str] | None = None,
+    shared_urls: set[str] | None = None,
 ) -> tuple[str, ...]:
     data = item_data(item)
     relations = (
@@ -11934,6 +12336,22 @@ def _inventory_work_identity(
         shared_same_as is None or same_as[0] in shared_same_as
     ):
         return ("zotero_same_as", same_as[0])
+    url = _normalized_url_identifier(str(data.get("url") or ""))
+    persistent_object = re.search(
+        r"(?:^|//)([^/]+)/objects/(uuid:[0-9a-f-]{16,})",
+        url,
+        flags=re.I,
+    )
+    if persistent_object:
+        return (
+            "persistent_object",
+            f"{persistent_object.group(1)}/objects/{persistent_object.group(2)}",
+        )
+    if url and shared_urls is not None and url in shared_urls:
+        title = _normalized_match_text(str(data.get("title") or ""))
+        item_type = str(data.get("itemType") or "").casefold()
+        if title:
+            return ("stable_url", url, title, item_type)
     doi = _normalized_doi_identifier(
         str(data.get("DOI") or data.get("doi") or "")
     )
@@ -12055,23 +12473,33 @@ def _canonical_inventory_plan(
         list
     )
     same_as_counts: dict[str, int] = defaultdict(int)
+    url_counts: dict[str, int] = defaultdict(int)
     for raw in items:
         relations = item_data(raw).get("relations")
-        if not isinstance(relations, Mapping):
-            continue
-        for value in {
-            _normalized_url_identifier(str(value))
-            for value in relations.get("owl:sameAs", []) or []
-            if _normalized_url_identifier(str(value))
-        }:
-            same_as_counts[value] += 1
+        if isinstance(relations, Mapping):
+            for value in {
+                _normalized_url_identifier(str(value))
+                for value in relations.get("owl:sameAs", []) or []
+                if _normalized_url_identifier(str(value))
+            }:
+                same_as_counts[value] += 1
+        url = _normalized_url_identifier(
+            str(item_data(raw).get("url") or "")
+        )
+        if url:
+            url_counts[url] += 1
     shared_same_as = {
         value for value, count in same_as_counts.items() if count > 1
     }
+    shared_urls = {value for value, count in url_counts.items() if count > 1}
     for index, raw in enumerate(items):
         item = dict(raw)
         grouped[
-            _inventory_work_identity(item, shared_same_as=shared_same_as)
+            _inventory_work_identity(
+                item,
+                shared_same_as=shared_same_as,
+                shared_urls=shared_urls,
+            )
         ].append((index, item))
 
     pending: list[tuple[int, dict[str, Any]]] = []

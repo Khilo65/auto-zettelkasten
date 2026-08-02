@@ -1780,6 +1780,8 @@ def migrate_v016_metadata(
         }
         if relative == "auto-zettelkasten.yml":
             updated["prompt_version"] = "11"
+        elif relative == "11_state/workspace_manifest.yml":
+            updated["workspace"] = str(root)
         cleaned = yaml.safe_dump(
             updated, sort_keys=False, allow_unicode=True, width=10_000
         )

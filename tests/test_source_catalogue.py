@@ -97,9 +97,9 @@ def test_build_source_catalogue_projects_profiles_into_collection_shards(tmp_pat
     assert result["source_count"] == 2
     assert result["literature_count"] == 2
     assert result["shard_count"] == 2
-    assert SOURCE_CATALOGUE_SCHEMA_VERSION == "6"
-    assert catalogue["schema_version"] == "6"
-    assert cluster_catalogue["schema_version"] == "6"
+    assert SOURCE_CATALOGUE_SCHEMA_VERSION == "7"
+    assert catalogue["schema_version"] == "7"
+    assert cluster_catalogue["schema_version"] == "7"
     assert catalogue["revision_hash"] == result["revision_hash"]
     assert {row["title"] for row in catalogue["literatures"]} == {"Mediation", "Conflict relapse"}
     assert all(len(row["facets"]) <= 3 for row in catalogue["sources"])
@@ -139,7 +139,7 @@ def test_build_source_catalogue_upgrades_schema_two_locally_and_replays_stably(
     upgraded_bytes = catalogue_path.read_bytes()
     replay = build_source_catalogue(tmp_path, [profile], [note])
 
-    assert yaml.safe_load(upgraded_bytes)["schema_version"] == "6"
+    assert yaml.safe_load(upgraded_bytes)["schema_version"] == "7"
     assert str(catalogue_path) in upgraded["changed_paths"]
     assert replay["changed_paths"] == []
     assert catalogue_path.read_bytes() == upgraded_bytes

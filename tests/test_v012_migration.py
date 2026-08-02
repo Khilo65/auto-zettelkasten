@@ -156,7 +156,7 @@ def test_workspace_migration_includes_v012_without_relationship_registry(
     assert result["provider_calls"] == 0
     assert (
         read_yaml(tmp_path / "auto-zettelkasten.yml")["artifact_schema_version"]
-        == "1.17"
+        == "1.18"
     )
 
 

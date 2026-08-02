@@ -12,7 +12,7 @@ import unicodedata
 from .files import atomic_write_text, now_iso, read_yaml, sha256_text, slugify, write_yaml
 from .notes import read_note
 
-SOURCE_CATALOGUE_SCHEMA_VERSION = "6"
+SOURCE_CATALOGUE_SCHEMA_VERSION = "7"
 SOURCE_CATALOGUE_SHARD_MAX_CHARS = 36_000
 SOURCE_CATALOGUE_ROUTING_CARD_MAX_CHARS = 1_500
 
@@ -397,6 +397,7 @@ def build_source_catalogue(
     note_rows: Sequence[Mapping[str, Any]],
     clusters: Sequence[Mapping[str, Any]] = (),
     collection_snapshot: Mapping[str, Any] | None = None,
+    identity_projection: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Project compact, stable source and literature indexes without provider work."""
 
@@ -443,7 +444,35 @@ def build_source_catalogue(
         seen.add(identity)
         entries.append(_catalogue_entry({}, _catalogue_note_summary(workspace, note)))
 
-    literatures = _catalogue_literatures(workspace, entries)
+    canonical_by_source = dict(
+        (identity_projection or {}).get("canonical_by_source", {}) or {}
+    )
+    aliases_by_canonical = dict(
+        (identity_projection or {}).get("aliases_by_canonical", {}) or {}
+    )
+    identity_rule_by_source = dict(
+        (identity_projection or {}).get("identity_rule_by_source", {}) or {}
+    )
+    for entry in entries:
+        source_id = str(entry.get("source_id") or "")
+        canonical_source_id = str(canonical_by_source.get(source_id) or source_id)
+        entry["canonical_source_id"] = canonical_source_id
+        entry["alias_source_ids"] = sorted(
+            str(value)
+            for value in aliases_by_canonical.get(source_id, []) or []
+            if str(value)
+        )
+        entry["identity_rule"] = str(
+            identity_rule_by_source.get(source_id) or "zotero_key"
+        )
+
+    semantic_entries = [
+        entry
+        for entry in entries
+        if str(entry.get("canonical_source_id") or entry.get("source_id") or "")
+        == str(entry.get("source_id") or "")
+    ]
+    literatures = _catalogue_literatures(workspace, semantic_entries)
     relationship_rows = _catalogue_relationship_rows(workspace)
     relationship_ids_by_source = _catalogue_relationship_ids(relationship_rows)
     cluster_ids_by_source: dict[str, set[str]] = defaultdict(set)
@@ -496,13 +525,32 @@ def build_source_catalogue(
         available_zotero_keys = set(snapshot_memberships)
         for entry in entries:
             zotero_key = str(entry.get("zotero_key") or "").upper()
-            collection_keys = snapshot_memberships.get(
+            entry_identity = (
+                entry.get("identity")
+                if isinstance(entry.get("identity"), Mapping)
+                else {}
+            )
+            identity_values = entry_identity.get("zotero_item_keys", []) or []
+            if isinstance(identity_values, (str, bytes)):
+                identity_values = [identity_values]
+            identity_keys = {
                 zotero_key,
-                [],
+                *(
+                    str(value).upper()
+                    for value in identity_values
+                    if str(value)
+                ),
+            } - {""}
+            collection_keys = sorted(
+                {
+                    key
+                    for identity_key in identity_keys
+                    for key in snapshot_memberships.get(identity_key, [])
+                }
             )
             entry["zotero_availability"] = (
                 "available"
-                if not zotero_key or zotero_key in available_zotero_keys
+                if not identity_keys or identity_keys & available_zotero_keys
                 else "unavailable"
             )
             entry["collection_keys"] = collection_keys
@@ -517,10 +565,10 @@ def build_source_catalogue(
             snapshot_items.get(str(entry.get("zotero_key") or "").upper(), {}),
         )
 
-    virtual_projection = _virtual_catalogue_projection(entries)
+    virtual_projection = _virtual_catalogue_projection(semantic_entries)
 
     entry_by_identity = {
-        (entry["source_id"], entry["note_id"]): entry for entry in entries
+        (entry["source_id"], entry["note_id"]): entry for entry in semantic_entries
     }
     shard_specs: list[dict[str, Any]] = []
     for literature in literatures:
@@ -593,7 +641,7 @@ def build_source_catalogue(
 
     compact_clusters = _compact_cluster_catalogue(clusters)
     collection_projection = _collection_catalogue_projection(
-        entries,
+        semantic_entries,
         collection_snapshot,
         relationship_rows,
     )
@@ -604,7 +652,7 @@ def build_source_catalogue(
             "scope": row["scope"],
             "source_count": sum(
                 1
-                for entry in entries
+                for entry in semantic_entries
                 if row["literature_id"] in entry["literature_ids"]
             ),
         }
@@ -612,6 +660,14 @@ def build_source_catalogue(
     ]
     semantic_payload = {
         "schema_version": SOURCE_CATALOGUE_SCHEMA_VERSION,
+        "stored_source_record_count": len(entries),
+        "canonical_work_count": int(
+            (identity_projection or {}).get("canonical_work_count", len(entries))
+            or 0
+        ),
+        "duplicate_alias_count": int(
+            (identity_projection or {}).get("duplicate_alias_count", 0) or 0
+        ),
         "literatures": compact_literatures,
         "shards": [
             {
@@ -941,11 +997,23 @@ def _collection_catalogue_projection(
         values.sort(key=lambda key: (str(collections[key].get("name") or "").casefold(), key))
     roots.sort(key=lambda key: (str(collections[key].get("name") or "").casefold(), key))
 
-    entries_by_zotero_key = {
-        str(entry.get("zotero_key") or "").upper(): dict(entry)
-        for entry in entries
-        if entry.get("zotero_key")
-    }
+    entries_by_zotero_key: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        identity = (
+            entry.get("identity")
+            if isinstance(entry.get("identity"), Mapping)
+            else {}
+        )
+        keys = {
+            str(entry.get("zotero_key") or "").upper(),
+            *(
+                str(value).upper()
+                for value in identity.get("zotero_item_keys", []) or []
+                if str(value)
+            ),
+        } - {""}
+        for item_key in keys:
+            entries_by_zotero_key[item_key] = dict(entry)
     direct_item_keys: dict[str, set[str]] = defaultdict(set)
     for item in snapshot.get("items", []) or []:
         if not isinstance(item, Mapping) or not item.get("key"):
@@ -973,11 +1041,12 @@ def _collection_catalogue_projection(
         name = str(row.get("name") or key)
         direct_keys = sorted(direct_item_keys.get(key, set()))
         direct_entries = sorted(
-            (
+            {
+                str(entries_by_zotero_key[item_key].get("source_id") or item_key):
                 entries_by_zotero_key[item_key]
                 for item_key in direct_keys
                 if item_key in entries_by_zotero_key
-            ),
+            }.values(),
             key=lambda entry: (
                 str(entry.get("author") or "").casefold(),
                 str(entry.get("year") or ""),
@@ -988,11 +1057,12 @@ def _collection_catalogue_projection(
         descendant_keys = nested_item_keys(key)
         routing_keys = set(direct_keys) | descendant_keys
         routing_entries = sorted(
-            (
+            {
+                str(entries_by_zotero_key[item_key].get("source_id") or item_key):
                 entries_by_zotero_key[item_key]
                 for item_key in routing_keys
                 if item_key in entries_by_zotero_key
-            ),
+            }.values(),
             key=lambda entry: str(entry.get("source_id") or ""),
         )
         direct_source_ids = [

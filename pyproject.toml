@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "auto-zettelkasten"
-version = "0.24.0"
+version = "0.25.0"
 description = "Turn a Zotero library into validated atomic notes, literature maps, and an Obsidian-ready vault."
 readme = "README.md"
 requires-python = ">=3.11"

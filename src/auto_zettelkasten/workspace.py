@@ -137,6 +137,11 @@ def initialize(workspace: Path | str, *, overwrite: bool = False) -> ArtifactMan
                 "workspace": str(root),
             },
         )
+    else:
+        manifest = read_yaml(manifest_path, {}) or {}
+        current_manifest = {**dict(manifest), "workspace": str(root)}
+        if current_manifest != manifest:
+            write_yaml(manifest_path, current_manifest)
 
     artifacts = artifact_rows(root, [config_path, manifest_path])
     return ArtifactManifest(
@@ -178,12 +183,13 @@ def assert_compatible(workspace: Path | str) -> None:
         (1, 10),
         (1, 11),
         (1, 12),
-            (1, 13),
-            (1, 14),
-            (1, 15),
-            (1, 16),
-            (1, 17),
-        }
+        (1, 13),
+        (1, 14),
+        (1, 15),
+        (1, 16),
+        (1, 17),
+        (1, 18),
+    }
     current = _parse_schema_version(CURRENT_ARTIFACT_SCHEMA_VERSION, field="current artifact schema")
     if manifest_version not in supported:
         actual = ".".join(str(value) for value in manifest_version)

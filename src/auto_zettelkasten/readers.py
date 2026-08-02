@@ -59,6 +59,21 @@ class _ProviderText(str):
         return instance
 
 
+_LITERATURE_COMPLETION: ContextVar[Mapping[str, Any]] = ContextVar(
+    "auto_zettelkasten_literature_completion", default={}
+)
+
+
+def current_literature_completion() -> dict[str, Any]:
+    """Return completion metadata for this thread's latest literature call."""
+
+    return dict(_LITERATURE_COMPLETION.get() or {})
+
+
+def reset_literature_completion() -> None:
+    _LITERATURE_COMPLETION.set({})
+
+
 SECTION_KEYS = (
     "thesis",
     "method_and_research_design",
@@ -575,7 +590,7 @@ class _CapabilityAwareReader:
             )
         except ProviderError as exc:
             exc.raw_response = raw_response
-            completion = getattr(self, "last_literature_completion", {})
+            completion = current_literature_completion()
             if completion:
                 exc.provider_completion = dict(completion)
             raise
@@ -604,7 +619,7 @@ class _CapabilityAwareReader:
             )
         except ProviderError as exc:
             exc.raw_response = raw_response
-            completion = getattr(self, "last_literature_completion", {})
+            completion = current_literature_completion()
             if completion:
                 exc.provider_completion = dict(completion)
             raise
@@ -633,7 +648,7 @@ class _CapabilityAwareReader:
             )
         except ProviderError as exc:
             exc.raw_response = raw_response
-            completion = getattr(self, "last_literature_completion", {})
+            completion = current_literature_completion()
             if completion:
                 exc.provider_completion = dict(completion)
             raise
@@ -850,7 +865,7 @@ class _CapabilityAwareReader:
             )
         except ProviderError as exc:
             exc.raw_response = raw_response
-            completion = getattr(self, "last_literature_completion", {})
+            completion = current_literature_completion()
             if completion:
                 exc.provider_completion = dict(completion)
             raise
@@ -902,6 +917,7 @@ class _CapabilityAwareReader:
     ) -> Mapping[str, Any]:
         self.last_literature_response = None
         self.last_literature_completion = {}
+        _LITERATURE_COMPLETION.set({})
         output_tokens = int(
             output_tokens
             if output_tokens is not None
@@ -943,6 +959,7 @@ class _CapabilityAwareReader:
         self.last_literature_completion = dict(
             getattr(raw, "completion", {}) or {}
         )
+        _LITERATURE_COMPLETION.set(self.last_literature_completion)
         self.last_literature_response = response
         return response
 
@@ -1781,7 +1798,7 @@ def _relationship_candidate_system_prompt() -> str:
 def _relationship_adjudication_system_prompt() -> str:
     return (
         "You adjudicate immutable relationship pair jobs for Auto-Zettelkasten "
-        "relationship prompt v13 and contract relationship-decision-v8. Read both "
+        "relationship prompt v14 and contract relationship-decision-v8. Read both "
         "complete atomic notes. Return one JSON object whose decisions object is keyed "
         "by every supplied pair_job_id, with no missing or extra keys. Each value is "
         "either {decision:no_relationship, reason, confidence} or "
@@ -1796,26 +1813,32 @@ def _relationship_adjudication_system_prompt() -> str:
         "left_source_id note, and source_b_basis always describes the supplied "
         "right_source_id note, regardless of actor/reference direction; anchor IDs are "
         "optional and must be real when used. "
-        "Use supports, undermines, qualifies, extends, complements, contrasts, "
-        "rival_explanation, boundary_contrast, methodological_fault_line, "
-        "sequential_relationship, interpretive_or_normative_disagreement, or "
-        "contextual_connection. A shared broad topic alone is no_relationship. Use "
-        "contextual_connection when joint reading is useful but construct, stage, "
-        "outcome, method, case, or scope prevents a stronger claim. "
-        "Use complements only when both works contribute to the same sufficiently "
-        "specific proposition, mechanism, or outcome; use contextual_connection when "
-        "the useful connection combines adjacent but different objects or outcomes. "
-        "Contrasts requires "
-        "incompatible claims on a comparable proposition. extends requires explicit "
-        "intellectual lineage through building on, testing, refining, applying, or generalizing. "
-        "Citation, chronology, coding or dataset reuse, and proximity alone do not "
-        "establish substantive support or extension. Prefer contextual_connection when "
-        "a stronger label depends on an inferred practical implication, different "
-        "objectives or stages, or intellectual lineage not explicit in either note. "
-        "For directional types, actor_source_id is the "
+        "Choose the primary type in this order. supports means the works address the "
+        "same sufficiently specific proposition and reach compatible conclusions. "
+        "undermines means comparable propositions receive materially incompatible "
+        "evidence or argument. qualifies means one establishes a meaningful condition, "
+        "scope boundary, or exception to the other's proposition. extends requires "
+        "explicit intellectual lineage through building on, applying, testing, refining, or "
+        "generalizing the reference work. complements means distinct contributions to "
+        "the same specific question, proposition, mechanism, or outcome. "
+        "contextual_connection means joint reading is useful but the works concern "
+        "adjacent mechanisms, outcomes, stages, cases, methods, or scopes. Use "
+        "no_relationship when overlap is only a broad topic, broad subject, or generic outcome. "
+        "Use contrasts only for comparable propositions that differ without direct "
+        "refutation; rival_explanation only for competing explanations of the same "
+        "explanandum; boundary_contrast only when the same proposition changes across "
+        "a meaningful case, population, period, or scope; methodological_fault_line "
+        "only when design or measurement materially changes the answer to the same "
+        "question; sequential_relationship only for different stages of the same "
+        "process; and interpretive_or_normative_disagreement only for explicit "
+        "interpretive or prescriptive disagreement. Shared words, citations, "
+        "chronology, dataset reuse, methods, or broad outcomes do not establish substantive support "
+        "or another direct intellectual relationship by themselves. When both endpoint bases are accurate but "
+        "do not support one direct proposition, prefer contextual_connection rather "
+        "than inventing a bridge mechanism. For directional types, actor_source_id is the "
         "work doing the intellectual action and reference_source_id is the work acted "
-        "on; never infer direction from pair order. If A cites B as evidence for A's "
-        "claim, B normally supports A. Treat limited notes only within their visible "
+        "on; never infer direction from pair order, chronology, or citation. Citation "
+        "alone remains a separate cites or cited_by edge. Treat limited notes only within their visible "
         "scope. Before returning, self-check that proposition, primary type, actor, "
         "reference, both endpoint bases, rationale, and boundary express one consistent "
         "direction. Never write display labels, Markdown, invented IDs, locators, "
@@ -2047,8 +2070,12 @@ def _cluster_synthesis_system_prompt() -> str:
         "mapped note is not independent evidence or a member. Return exactly one compact "
         "acquisition_candidate_dispositions row for every supplied "
         "important_unmapped_literature external_source_id. Use decision recommend, "
-        "relevant_secondary, or not_relevant_to_cluster; why_it_matters is required only "
-        "for recommend, and selected_attribution_ids is optional. Do not generate a second "
+        "relevant_secondary, or not_relevant_to_cluster. recommend means a priority "
+        "addition that would materially improve the cluster's central synthesis, evidence "
+        "base, debate, or boundary. relevant_secondary means genuinely useful for "
+        "understanding or expanding the cluster but not among the first works to map. "
+        "not_relevant_to_cluster remains machine-only for this cluster. why_it_matters is "
+        "required only for recommend, and selected_attribution_ids is optional. Do not generate a second "
         "independent recommendation list. Local code restores identity, citation, action "
         "status, and citing-source characterizations. "
         "Return material_exclusions only for intellectually important boundary cases; "

@@ -519,7 +519,7 @@ def test_streamlined_markdown_groups_repeated_findings_under_one_source_block() 
     assert markdown.count("#### [[A|Source A]]") == 1
     assert markdown.count("*Method: Comparative analysis.*") == 2
     assert "See the primary [[A|Source A]] discussion under **Main line**" in markdown
-    assert "## Important cited works not yet mapped" in markdown
+    assert "## Priority works to map" in markdown
     assert "## Material exclusions" in markdown
     assert "In plain English:" not in markdown
 

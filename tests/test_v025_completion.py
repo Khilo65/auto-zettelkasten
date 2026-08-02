@@ -1,0 +1,108 @@
+from __future__ import annotations
+
+from auto_zettelkasten.literature import (
+    _CheckpointedReasonerCalls,
+    _schedule_cluster_writers,
+    build_coverage_register,
+)
+from auto_zettelkasten.pipeline import (
+    _RELATIONSHIP_BATCH_MAX_JOBS,
+    _canonical_workspace_graph_inputs,
+    _pack_relationship_rows,
+)
+from auto_zettelkasten.readers import _relationship_adjudication_system_prompt
+
+
+def test_v25_relationship_prompt_and_packet_limit() -> None:
+    prompt = _relationship_adjudication_system_prompt()
+    assert "relationship prompt v14" in prompt
+    assert "same sufficiently specific proposition" in prompt
+    assert "prefer contextual_connection" in prompt
+    assert _RELATIONSHIP_BATCH_MAX_JOBS == 15
+
+    rows = list(range(31))
+    packets = _pack_relationship_rows(
+        rows,
+        pair_for=lambda value: (f"left-{value}", f"right-{value}"),
+        profile_by_source={
+            source_id: {"source_id": source_id}
+            for value in rows
+            for source_id in (f"left-{value}", f"right-{value}")
+        },
+        context_for=lambda packet: {"jobs": list(packet)},
+        max_chars=1_000_000,
+        max_rows=_RELATIONSHIP_BATCH_MAX_JOBS,
+    )
+    assert [len(packet) for packet in packets] == [15, 15, 1]
+
+
+def test_v25_cluster_scheduler_reserves_exactly_four_calls() -> None:
+    calls = object.__new__(_CheckpointedReasonerCalls)
+    calls.max_calls = 32
+    calls.cumulative_provider_calls = 10
+    runnable = [{"cluster_id": f"cluster-{index}"} for index in range(22)]
+
+    scheduled, completion_pending = _schedule_cluster_writers(calls, runnable)
+
+    assert len(scheduled) == 15
+    assert len(completion_pending) == 7
+
+
+def test_v25_duplicate_document_hash_yields_one_canonical_work(tmp_path) -> None:
+    notes = [
+        {
+            "source_id": "canonical",
+            "note_id": "note-canonical",
+            "zotero_item_key": "AAAA1111",
+            "title": "The complete report",
+            "item_type": "report",
+        },
+        {
+            "source_id": "alias",
+            "note_id": "note-alias",
+            "zotero_item_key": "BBBB2222",
+            "title": "download.pdf",
+            "item_type": "attachment",
+        },
+    ]
+    profiles = [
+        {"source_id": "canonical", "note_id": "note-canonical", "source_hash": "same"},
+        {"source_id": "alias", "note_id": "note-alias", "source_hash": "same"},
+    ]
+
+    full_notes, _, canonical_notes, _, identity, relations = (
+        _canonical_workspace_graph_inputs(tmp_path, notes, profiles, None)
+    )
+
+    assert len(full_notes) == 2
+    assert len(canonical_notes) == 1
+    assert identity["duplicate_alias_count"] == 1
+    assert len(relations) == 1
+    assert relations[0]["relation_type"] == "alias_of"
+
+
+def test_v25_coverage_prefers_profile_state_and_counts_aliases() -> None:
+    coverage = build_coverage_register(
+        [
+            {"source_id": "analytical", "note_id": "note-a", "analytical": True},
+            {"source_id": "limited", "note_id": "note-l", "analytical": False},
+            {"source_id": "alias", "note_id": "note-x", "analytical": True},
+        ],
+        source_set={
+            "rows": [
+                {"source_id": "analytical", "note_id": "note-a", "terminal_status": "limited_note"},
+                {"source_id": "limited", "note_id": "note-l", "terminal_status": "validated_note"},
+                {"source_id": "alias", "note_id": "note-x", "terminal_status": "duplicate_alias"},
+            ]
+        },
+    )
+
+    assert coverage["counts"] == {
+        "validated_note": 1,
+        "limited_note": 1,
+        "duplicate_alias": 1,
+        "parked_for_review": 0,
+        "partial": 0,
+        "pending": 0,
+    }
+    assert all(row["attempted_route"] == ["not_recorded_legacy"] for row in coverage["records"])

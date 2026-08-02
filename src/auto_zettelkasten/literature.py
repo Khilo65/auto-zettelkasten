@@ -83,7 +83,7 @@ LITERATURE_ALGORITHM_VERSION = "36"
 LITERATURE_FAMILY_PLAN_PROMPT_VERSION = "8"
 CLUSTER_PLAN_PROMPT_VERSION = "5"
 CLUSTER_PROPOSAL_PROMPT_VERSION = "17"
-CLUSTER_SYNTHESIS_PROMPT_VERSION = "32"
+CLUSTER_SYNTHESIS_PROMPT_VERSION = "33"
 GAP_REASONING_PROMPT_VERSION = "12"
 ANCHOR_ALGORITHM_VERSION = "3"
 SUPPORT_ENVELOPE_VERSION = "2"
@@ -1338,18 +1338,19 @@ def _schedule_cluster_writers(
     reasoner_call: Any,
     runnable: Sequence[Mapping[str, Any]],
 ) -> tuple[list[Mapping[str, Any]], list[Mapping[str, Any]]]:
-    """Leave a small cumulative-call reserve for provider-empty retries."""
+    """Schedule the first writer wave while reserving four empty retries."""
 
     if not isinstance(reasoner_call, _CheckpointedReasonerCalls):
         return list(runnable), []
-    reserve = (reasoner_call.max_calls + 4) // 5
+    reserve = 4
     available = max(
         0,
         reasoner_call.max_calls
         - reasoner_call.cumulative_provider_calls
         - reserve,
     )
-    return list(runnable[:available]), list(runnable[available:])
+    initial = min(15, available, len(runnable))
+    return list(runnable[:initial]), list(runnable[initial:])
 
 
 class _CheckpointedReasonerCalls:
@@ -1928,10 +1929,14 @@ class _CheckpointedReasonerCalls:
             )
         self._progress(stage, path, active=True)
         raw_response_for_failure: Any = None
+        provider_completion: Mapping[str, Any] | None = None
         try:
             empty_retry_attempted = False
             while True:
                 try:
+                    from .readers import reset_literature_completion
+
+                    reset_literature_completion()
                     response = method(
                         profiles, self.request, context=enriched_context
                     )
@@ -1994,6 +1999,9 @@ class _CheckpointedReasonerCalls:
                 response = asdict(response)
             if not isinstance(response, Mapping):
                 raise ValueError(f"{method_name} must return a mapping")
+            from .readers import current_literature_completion
+
+            provider_completion = current_literature_completion()
             raw_response_for_failure = dict(response)
             validated_response = _revalidate_raw_synthesis_response(stage, response)
             if validated_response is None:
@@ -2012,6 +2020,11 @@ class _CheckpointedReasonerCalls:
                 "dependency_context_hashes": dependency_context_hashes,
                 "dependency_context_item_hashes": dependency_context_item_hashes,
                 "response": validated_response,
+                **(
+                    {"provider_completion": provider_completion}
+                    if provider_completion
+                    else {}
+                ),
                 "updated_at": now_iso(),
             }
             write_yaml(path, payload)
@@ -2020,7 +2033,11 @@ class _CheckpointedReasonerCalls:
                 failure_path.unlink()
             if stage == "cluster_synthesis":
                 self._mark_synthesized_cluster(key)
-            self._finish_provider_attempt(attempt_id, status="completed")
+            self._finish_provider_attempt(
+                attempt_id,
+                status="completed",
+                provider_completion=provider_completion or None,
+            )
             return validated_response
         except Exception as exc:
             raw_response = (
@@ -2028,7 +2045,9 @@ class _CheckpointedReasonerCalls:
                 if raw_response_for_failure is not None
                 else getattr(exc, "raw_response", None)
             )
-            provider_completion = getattr(exc, "provider_completion", None)
+            provider_completion = (
+                getattr(exc, "provider_completion", None) or provider_completion
+            )
             recovered = (
                 _recover_candidate_prefix(raw_response, enriched_context)
                 if stage
@@ -10879,6 +10898,7 @@ def validate_streamlined_cluster_synthesis(
         if isinstance(row, Mapping) and row.get("external_source_id")
     }
     important_cited_works: list[dict[str, Any]] = []
+    secondary_cited_works: list[dict[str, Any]] = []
     acquisition_dispositions: list[dict[str, Any]] = []
     contract = str(response.get("cluster_contract") or "")
     raw_dispositions = response.get(
@@ -10987,24 +11007,26 @@ def validate_streamlined_cluster_synthesis(
                 ],
             }
         )
+        visible_row = {
+            "external_source_id": identity,
+            "cited_work": str(canonical.get("raw_citation") or ""),
+            "identifiers": dict(canonical.get("identifiers") or {}),
+            "attributions": selected_attributions,
+            "why_it_matters": why_it_matters,
+            "status": str(canonical.get("status") or ""),
+            "action": action,
+        }
         if disposition == "recommend":
-            important_cited_works.append(
-                {
-                    "external_source_id": identity,
-                    "cited_work": str(canonical.get("raw_citation") or ""),
-                    "identifiers": dict(canonical.get("identifiers") or {}),
-                    "attributions": selected_attributions,
-                    "why_it_matters": why_it_matters,
-                    "status": str(canonical.get("status") or ""),
-                    "action": action,
-                }
-            )
+            important_cited_works.append(visible_row)
+        elif disposition == "relevant_secondary":
+            secondary_cited_works.append(visible_row)
     return {
         **dict(response),
         "retained_member_ids": sorted(retained),
         "dropped_members": returned_drops,
         "material_exclusions": material_exclusions,
         "important_cited_works_not_yet_mapped": important_cited_works,
+        "additional_cited_works_worth_mapping": secondary_cited_works,
         "acquisition_candidate_dispositions": acquisition_dispositions,
         "candidate_input_receipt": (
             dict(candidate_input_receipt)
@@ -16977,7 +16999,16 @@ def build_coverage_register(
             source_id = str(item.get("source_id") or "")
             note_id = str(item.get("note_id") or "")
             profile = profile_by_source.get(source_id) or profile_by_note.get(note_id)
-            terminal_status = str(item.get("terminal_status") or "pending")
+            recorded_status = str(item.get("terminal_status") or "pending")
+            terminal_status = (
+                "duplicate_alias"
+                if recorded_status == "duplicate_alias"
+                else "validated_note"
+                if profile is not None and bool(profile.get("analytical"))
+                else "limited_note"
+                if profile is not None
+                else recorded_status
+            )
             if terminal_status == "exhausted":
                 terminal_status = "parked_for_review"
             exclusion_reason = str(
@@ -17004,7 +17035,7 @@ def build_coverage_register(
                         str(value)
                         for value in item.get("attempted_route", []) or []
                         if str(value)
-                    ],
+                    ] or ["not_recorded_legacy"],
                     "could_affect_existing_cluster": terminal_status
                     in {"limited_note", "parked_for_review"},
                 }
@@ -17023,7 +17054,7 @@ def build_coverage_register(
                     "zotero_key": str(profile.get("zotero_item_key") or ""),
                     "terminal_state": terminal_status,
                     "exclusion_reason": str(profile.get("exclusion_reason") or ""),
-                    "attempted_route": [],
+                    "attempted_route": ["not_recorded_legacy"],
                     "could_affect_existing_cluster": terminal_status == "limited_note",
                 }
             )
@@ -17033,6 +17064,7 @@ def build_coverage_register(
     counts = {
         "validated_note": status_counts.get("validated_note", 0),
         "limited_note": status_counts.get("limited_note", 0),
+        "duplicate_alias": status_counts.get("duplicate_alias", 0),
         "parked_for_review": status_counts.get("parked_for_review", 0),
         "partial": status_counts.get("partial", 0),
         "pending": status_counts.get("pending", 0),
@@ -17822,6 +17854,22 @@ def _shared_family_cluster_plan(
             if isinstance(supplied_roles, Mapping)
             else {}
         )
+        unknown_source_ids = sorted(
+            {
+                str(value)
+                for value in raw_family.get("source_ids", []) or []
+                if str(value) and str(value) not in profile_by_source
+            }
+        )
+        if unknown_source_ids:
+            parked.append(
+                {
+                    "cluster_id": family_id,
+                    "reason": "unknown_family_plan_source_ids_omitted",
+                    "source_ids": unknown_source_ids,
+                    "advisory": True,
+                }
+            )
         source_ids = sorted(
             {
                 str(value)
@@ -20295,14 +20343,8 @@ def build_literature_report(
 
     concurrent_results: dict[str, Mapping[str, Any] | BaseException] = {}
     if uses_global_cluster_plan and runnable:
-        scheduled, deferred = _schedule_cluster_writers(reasoner_call, runnable)
-        concurrent_results.update(
-            {
-                str(cluster.get("cluster_id") or ""): LiteratureSynthesisPartialError(
-                    "cluster_synthesis_deferred_budget"
-                )
-                for cluster in deferred
-            }
+        scheduled, completion_pending = _schedule_cluster_writers(
+            reasoner_call, runnable
         )
         active_jobs = 0
         peak_jobs = 0
@@ -20350,6 +20392,30 @@ def build_literature_report(
                     concurrent_results[cluster_id] = future.result()
                 except BaseException as exc:
                     concurrent_results[cluster_id] = exc
+        for cluster in completion_pending:
+            cluster_id = str(cluster.get("cluster_id") or "")
+            if (
+                isinstance(reasoner_call, _CheckpointedReasonerCalls)
+                and reasoner_call.cumulative_provider_calls
+                >= reasoner_call.max_calls
+            ):
+                concurrent_results[cluster_id] = LiteratureSynthesisPartialError(
+                    "cluster_synthesis_deferred_budget"
+                )
+                continue
+            if (
+                isinstance(reasoner_call, _CheckpointedReasonerCalls)
+                and time.monotonic() - reasoner_call.started
+                >= reasoner_call.deadline_seconds
+            ):
+                concurrent_results[cluster_id] = LiteratureSynthesisPartialError(
+                    "cluster_synthesis_deferred_deadline"
+                )
+                continue
+            try:
+                concurrent_results[cluster_id] = run_cluster_job(cluster)
+            except BaseException as exc:
+                concurrent_results[cluster_id] = exc
         _notify_stage(
             stage_callback,
             "cluster_synthesis",
@@ -20527,6 +20593,15 @@ def build_literature_report(
                         "cluster_synthesis_deferred_budget",
                     }
                 )
+            elif "deferred_deadline" in str(exc).casefold():
+                acquisition_default_dispositions[cluster_id] = "deferred_deadline"
+                validated_synthesis["deferred_reason"] = "deferred_deadline"
+                validated_synthesis["quality_errors"] = sorted(
+                    {
+                        *validated_synthesis.get("quality_errors", []),
+                        "cluster_synthesis_deferred_deadline",
+                    }
+                )
         if (
             not uses_global_cluster_plan
             and validated_synthesis.get("status") == "partial"
@@ -20648,7 +20723,11 @@ def build_literature_report(
         acquisition_ledger_path,
         [
             _cluster_acquisition_revision(
-                cluster_input_clusters[cluster_id],
+                next(
+                    cluster
+                    for cluster in synthesis_order
+                    if str(cluster.get("cluster_id") or "") == cluster_id
+                ),
                 cluster_inputs_by_id[cluster_id][1].get(
                     "important_unmapped_literature", []
                 ),
@@ -21106,6 +21185,18 @@ def build_literature_report(
         "coverage_inventory_count": int(
             coverage_register.get("inventory_count", 0) or 0
         ),
+        "stored_source_record_count": int(
+            (source_set or {}).get("stored_source_record_count", 0)
+            or coverage_register.get("inventory_count", 0)
+            or 0
+        ),
+        "canonical_work_count": int(
+            (source_set or {}).get("canonical_work_count", len(normalized))
+            or 0
+        ),
+        "duplicate_alias_count": int(
+            (source_set or {}).get("duplicate_alias_count", 0) or 0
+        ),
         "coverage_parked_for_review_count": int(
             _as_mapping(coverage_register.get("counts")).get(
                 "parked_for_review", 0
@@ -21117,6 +21208,7 @@ def build_literature_report(
             for key in (
                 "validated_note",
                 "limited_note",
+                "duplicate_alias",
                 "parked_for_review",
                 "partial",
                 "pending",
@@ -22406,58 +22498,77 @@ def _streamlined_cluster_markdown(
             differences.append(f"- {text}")
     if differences:
         sections.append("## How the findings relate\n\n" + "\n".join(differences))
-    cited_works = []
-    for row in synthesis.get(
-        "important_cited_works_not_yet_mapped", []
-    ) or []:
-        if not isinstance(row, Mapping):
-            continue
-        cited_work = _human_projection_text(
-            row.get("cited_work") or row.get("raw_citation") or ""
-        )
-        why_it_matters = _human_projection_text(
-            row.get("why_it_matters") or ""
-        )
-        status = str(row.get("status") or "")
-        attributions = [
-            dict(value)
-            for value in row.get("attributions", []) or []
-            if isinstance(value, Mapping)
-            and str(value.get("current_source_id") or "")
-        ]
-        if not cited_work or not attributions:
-            continue
-        detail = [f"### {cited_work}"]
-        for attribution in attributions:
-            source_id = str(attribution.get("current_source_id") or "")
-            source_link = _obsidian_note_link(
-                profile_by_source.get(source_id, {"source_id": source_id})
+    def cited_work_sections(field: str, *, secondary: bool = False) -> list[str]:
+        rendered = []
+        for row in synthesis.get(field, []) or []:
+            if not isinstance(row, Mapping):
+                continue
+            cited_work = _human_projection_text(
+                row.get("cited_work") or row.get("raw_citation") or ""
             )
-            characterization = _human_projection_text(
-                attribution.get("characterization") or ""
+            attributions = [
+                dict(value)
+                for value in row.get("attributions", []) or []
+                if isinstance(value, Mapping)
+                and str(value.get("current_source_id") or "")
+            ]
+            if not cited_work or not attributions:
+                continue
+            detail = [f"### {cited_work}"]
+            if row.get("why_it_matters"):
+                detail.append(
+                    "- Why it matters: "
+                    + _human_projection_text(row.get("why_it_matters") or "")
+                )
+            elif secondary:
+                characterizations = [
+                    _human_projection_text(value.get("characterization") or "")
+                    for value in attributions
+                    if _human_projection_text(value.get("characterization") or "")
+                ]
+                if characterizations:
+                    detail.append("- Relevant because: " + characterizations[0])
+            for attribution in attributions:
+                source_id = str(attribution.get("current_source_id") or "")
+                source_link = _obsidian_note_link(
+                    profile_by_source.get(source_id, {"source_id": source_id})
+                )
+                characterization = _human_projection_text(
+                    attribution.get("characterization") or ""
+                )
+                locator = _human_locator_text(attribution.get("locator") or "")
+                line = f"- Cited by {source_link}"
+                if characterization and not secondary:
+                    line += f": {characterization}"
+                if locator:
+                    line += f" ({locator})"
+                detail.append(line)
+            detail.append(
+                "- Action: "
+                + (
+                    "Already in Zotero—map an atomic note."
+                    if str(row.get("action") or "") == "map_existing"
+                    or str(row.get("status") or "") == "known_zotero_unmapped"
+                    else "Acquire or add."
+                )
             )
-            locator = _human_locator_text(attribution.get("locator") or "")
-            line = f"- Cited by {source_link}"
-            if characterization:
-                line += f": {characterization}"
-            if locator:
-                line += f" ({locator})"
-            detail.append(line)
-        if why_it_matters:
-            detail.append(f"- Relevance: {why_it_matters}")
-        detail.append(
-            "- Library status: "
-            + (
-                "in Zotero; atomic note not yet mapped."
-                if status == "known_zotero_unmapped"
-                else "not in the current Zotero snapshot."
-            )
-        )
-        cited_works.append("\n".join(detail))
-    if cited_works:
+            rendered.append("\n".join(detail))
+        return rendered
+
+    priority_works = cited_work_sections(
+        "important_cited_works_not_yet_mapped"
+    )
+    if priority_works:
         sections.append(
-            "## Important cited works not yet mapped\n\n"
-            + "\n\n".join(cited_works)
+            "## Priority works to map\n\n" + "\n\n".join(priority_works)
+        )
+    secondary_works = cited_work_sections(
+        "additional_cited_works_worth_mapping", secondary=True
+    )
+    if secondary_works:
+        sections.append(
+            "## Additional cited works worth mapping\n\n"
+            + "\n\n".join(secondary_works)
         )
     material_exclusions = []
     for row in synthesis.get("material_exclusions", []) or []:
@@ -24214,11 +24325,13 @@ def _literature_map_markdown_v09(
     parked_count = int(coverage_counts.get("parked_for_review", 0) or 0)
     partial_count = int(coverage_counts.get("partial", 0) or 0)
     pending_count = int(coverage_counts.get("pending", 0) or 0)
+    duplicate_alias_count = int(coverage_counts.get("duplicate_alias", 0) or 0)
     cluster_count = len(clusters)
     clustered_count = len(clustered_analytical_source_ids)
     collection_verdict = (
         f"The frozen collection contains {inventory_count} inventoried items: {analytical_count} analytical profiles, "
-        f"{limited_count} limited profiles, and {parked_count} sources parked for review. "
+        f"{limited_count} limited profiles, {duplicate_alias_count} duplicate Zotero aliases, "
+        f"and {parked_count} sources parked for review. "
         f"The mapper admitted {cluster_count} analytical cluster{'s' if cluster_count != 1 else ''}; "
         f"{clustered_count} analytical source{'s' if clustered_count != 1 else ''} contribute to at least one admitted cluster. "
     )
@@ -24379,12 +24492,13 @@ def _literature_map_markdown_v09(
         f"- Frozen inventory: {inventory_count}",
         f"- Analytical profiles: {analytical_count}",
         f"- Limited profiles: {limited_count}",
+        f"- Duplicate Zotero aliases: {duplicate_alias_count}",
         f"- Parked for review: {parked_count}",
         f"- Partial sources: {partial_count}",
         f"- Pending sources: {pending_count}",
         f"- Analytical sources represented in admitted clusters: {clustered_count}",
         f"- Unclustered sources: {len(unclustered)}",
-        f"- Accounting valid: {'yes' if sum(int(coverage_counts.get(key, 0) or 0) for key in ('validated_note', 'limited_note', 'parked_for_review', 'partial', 'pending')) == inventory_count else 'no'}",
+        f"- Accounting valid: {'yes' if sum(int(coverage_counts.get(key, 0) or 0) for key in ('validated_note', 'limited_note', 'duplicate_alias', 'parked_for_review', 'partial', 'pending')) == inventory_count else 'no'}",
     ]
     parked_rows = [
         row
@@ -25994,6 +26108,31 @@ def build_literature_map(
     )
     map_id = stable_literature_map_id(source_set, effective_question)
     previous_registry = _load_map_cluster_registry(workspace, map_id)
+    canonical_source_ids = {
+        str(key): str(value)
+        for key, value in _as_mapping(
+            source_set.get("canonical_source_ids")
+        ).items()
+        if str(key) and str(value)
+    }
+    if canonical_source_ids:
+        def canonicalize(value: Any) -> Any:
+            if isinstance(value, Mapping):
+                return {
+                    canonical_source_ids.get(str(key), str(key)): canonicalize(item)
+                    for key, item in value.items()
+                }
+            if isinstance(value, list):
+                rows = [canonicalize(item) for item in value]
+                deduped: dict[str, Any] = {}
+                for item in rows:
+                    deduped.setdefault(_stable_hash(item), item)
+                return list(deduped.values())
+            if isinstance(value, str):
+                return canonical_source_ids.get(value, value)
+            return value
+
+        previous_registry = canonicalize(previous_registry)
     reasoner_calls = reasoner_calls or (
         _CheckpointedReasonerCalls(
             workspace,
@@ -26019,6 +26158,22 @@ def build_literature_map(
         literature_positions = [
             dict(row)
             for row in position_payload.get("positions", []) or []
+            if isinstance(row, Mapping)
+        ]
+    if canonical_source_ids:
+        literature_positions = [
+            {
+                **dict(row),
+                "current_source_id": canonical_source_ids.get(
+                    str(row.get("current_source_id") or ""),
+                    str(row.get("current_source_id") or ""),
+                ),
+                "matched_source_id": canonical_source_ids.get(
+                    str(row.get("matched_source_id") or ""),
+                    str(row.get("matched_source_id") or ""),
+                ),
+            }
+            for row in literature_positions
             if isinstance(row, Mapping)
         ]
     if missing_sources is None:

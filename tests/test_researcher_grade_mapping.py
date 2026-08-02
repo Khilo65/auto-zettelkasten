@@ -2333,6 +2333,7 @@ def test_coverage_register_accounts_for_all_75_frozen_items() -> None:
     assert register["counts"] == {
         "validated_note": 65,
         "limited_note": 8,
+        "duplicate_alias": 0,
         "parked_for_review": 2,
         "partial": 0,
         "pending": 0,

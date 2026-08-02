@@ -28,6 +28,7 @@ SUBJECT_FACETS = (
 )
 
 TYPED_SOURCE_RELATIONS = {
+    "alias_of",
     "cites",
     "cited_by",
     "zotero_related",
@@ -155,6 +156,7 @@ _RECONCILIATION_FRAME_STOPWORDS = {
 }
 
 _RELATION_PRIORITY = {
+    "alias_of": 120,
     "cites": 100,
     "cited_by": 100,
     "zotero_related": 95,
@@ -1310,6 +1312,8 @@ def _relation_reason(relation_type: str, evidence: Sequence[Mapping[str, Any]]) 
         return "Citation: this source cites the related source."
     if relation_type == "cited_by":
         return "Citation: this source is cited by the related source."
+    if relation_type in {"alias_of", "has_alias"}:
+        return "These Zotero records resolve to the same canonical work."
     if relation_type == "zotero_related":
         return "Explicitly related in Zotero."
     if relation_type == "same_proposition":
@@ -1379,6 +1383,14 @@ def rank_human_related_links(
         rows = sorted(grouped[target], key=lambda row: (-int(row.get("strength") or 0), row["relation_id"]))
         primary = rows[0]
         profile = by_source[target]
+        primary_type = str(primary.get("relation_type") or "")
+        if primary_type == "alias_of":
+            primary_type = str(
+                primary.get("forward_label")
+                if source_id == str(primary.get("source_id") or "")
+                else primary.get("inverse_label")
+                or "alias_of"
+            ).replace(" ", "_")
         rendered.append(
             {
                 "relation_id": str(primary.get("relation_id") or ""),
@@ -1386,8 +1398,9 @@ def rank_human_related_links(
                 "target_note_id": str(profile.get("note_id") or ""),
                 "target_title": str(profile.get("title") or target),
                 "relation_types": sorted({str(row.get("relation_type") or "") for row in rows}),
-                "primary_relation_type": str(primary.get("relation_type") or ""),
-                "reason": _relation_reason(str(primary.get("relation_type") or ""), primary.get("evidence", []) or []),
+                "primary_relation_type": primary_type,
+                "reason": str(primary.get("reason") or "")
+                or _relation_reason(primary_type, primary.get("evidence", []) or []),
                 "explicit": any(not bool(row.get("inferred")) for row in rows),
                 "strength": int(primary.get("strength") or 0),
             }
