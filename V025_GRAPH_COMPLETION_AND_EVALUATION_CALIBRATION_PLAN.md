@@ -1,6 +1,6 @@
 # Auto-Zettelkasten v0.25 Graph Completion and Evaluation Calibration Plan
 
-**Status:** Proposed
+**Status:** Implemented and evaluated; material relationship semantic gates failed
 
 **Date:** 2026-08-02
 

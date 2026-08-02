@@ -164,6 +164,69 @@ def test_v2_acquisition_dispositions_derive_visible_recommendations() -> None:
     }
 
 
+def test_visible_acquisition_rows_group_same_zotero_work() -> None:
+    profiles = [_profile("A"), _profile("B")]
+    cluster = {"cluster_id": "cluster-one", "source_ids": ["A", "B"]}
+    response = _cluster_response(cluster, profiles)
+    response["acquisition_candidate_dispositions"] = [
+        {
+            "external_source_id": "citation-one",
+            "decision": "recommend",
+            "why_it_matters": "It supplies the foundational mechanism.",
+        },
+        {
+            "external_source_id": "citation-two",
+            "decision": "relevant_secondary",
+        },
+    ]
+    candidates = [
+        {
+            "external_source_id": "citation-one",
+            "raw_citation": "Posen 1993, Security Dilemma",
+            "normalized_citation": {"title": "Security Dilemma", "year": "1993"},
+            "status": "known_zotero_unmapped",
+            "attributions": [
+                {
+                    "literature_position_id": "position-A",
+                    "current_source_id": "A",
+                }
+            ],
+        },
+        {
+            "external_source_id": "citation-two",
+            "raw_citation": "Barry Posen, The Security Dilemma (1993)",
+            "normalized_citation": {"title": "The Security Dilemma", "year": "1993"},
+            "status": "known_zotero_unmapped",
+            "attributions": [
+                {
+                    "literature_position_id": "position-B",
+                    "current_source_id": "B",
+                }
+            ],
+        },
+    ]
+
+    validated = validate_streamlined_cluster_synthesis(
+        response,
+        cluster,
+        profiles,
+        important_unmapped_literature=candidates,
+        acquisition_identity_by_id={
+            "citation-one": {"zotero_key": "4FSRNE58"},
+            "citation-two": {"zotero_key": "4FSRNE58"},
+        },
+    )
+
+    assert len(validated["important_cited_works_not_yet_mapped"]) == 1
+    assert validated["additional_cited_works_worth_mapping"] == []
+    assert {
+        row["current_source_id"]
+        for row in validated["important_cited_works_not_yet_mapped"][0][
+            "attributions"
+        ]
+    } == {"A", "B"}
+
+
 def test_acquisition_contract_defects_do_not_park_good_cluster() -> None:
     profiles = [_profile("A"), _profile("B")]
     cluster = {"cluster_id": "cluster-one", "source_ids": ["A", "B"]}

@@ -5,10 +5,14 @@ from auto_zettelkasten.literature import (
     _schedule_cluster_writers,
     build_coverage_register,
 )
+from auto_zettelkasten.files import read_yaml, write_yaml
+from auto_zettelkasten.models import EvidenceProfile, MapRequest
 from auto_zettelkasten.pipeline import (
     _RELATIONSHIP_BATCH_MAX_JOBS,
+    _RunProgress,
     _canonical_workspace_graph_inputs,
     _pack_relationship_rows,
+    _write_profile_packets,
 )
 from auto_zettelkasten.readers import _relationship_adjudication_system_prompt
 
@@ -106,3 +110,46 @@ def test_v25_coverage_prefers_profile_state_and_counts_aliases() -> None:
         "pending": 0,
     }
     assert all(row["attempted_route"] == ["not_recorded_legacy"] for row in coverage["records"])
+
+
+def test_v25_progress_reconciles_canonical_terminal_statuses(tmp_path) -> None:
+    progress = _RunProgress(
+        tmp_path / "progress.yml",
+        "run",
+        [
+            {"key": "AAAA1111", "terminal_status": "validated_note"},
+            {"key": "BBBB2222", "terminal_status": "validated_note"},
+        ],
+        resume=False,
+    )
+
+    progress.reconcile_terminal_statuses(
+        [
+            {"zotero_key": "AAAA1111", "terminal_state": "validated_note"},
+            {"zotero_key": "BBBB2222", "terminal_state": "duplicate_alias"},
+        ]
+    )
+
+    payload = read_yaml(tmp_path / "progress.yml")
+    assert payload["validated_note_count"] == 1
+    assert payload["duplicate_alias_count"] == 1
+    assert payload["terminal_count"] == 2
+
+
+def test_v25_canonical_profile_packets_remove_stale_tail(tmp_path) -> None:
+    packet_root = tmp_path / "literature" / "packets"
+    packet_root.mkdir(parents=True)
+    write_yaml(packet_root / "packet-0002.yml", {"profiles": [{"source_id": "alias"}]})
+
+    result = _write_profile_packets(
+        tmp_path / "literature",
+        [EvidenceProfile(source_id="canonical", note_id="note-canonical")],
+        source_set={"source_set_id": "canonical", "dependency_hash": "hash"},
+        request=MapRequest(workspace=tmp_path),
+        reasoner=None,
+        progress=None,
+    )
+
+    assert result["packet_count"] == 1
+    assert (packet_root / "packet-0001.yml").is_file()
+    assert not (packet_root / "packet-0002.yml").exists()

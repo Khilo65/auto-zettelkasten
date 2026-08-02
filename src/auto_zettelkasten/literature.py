@@ -10595,6 +10595,7 @@ def validate_streamlined_cluster_synthesis(
     *,
     candidate_input_receipt: Mapping[str, Any] | None = None,
     important_unmapped_literature: Sequence[Mapping[str, Any]] = (),
+    acquisition_identity_by_id: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Mechanically validate full-note synthesis without re-judging its prose."""
 
@@ -11010,6 +11011,9 @@ def validate_streamlined_cluster_synthesis(
         visible_row = {
             "external_source_id": identity,
             "cited_work": str(canonical.get("raw_citation") or ""),
+            "normalized_citation": dict(
+                _as_mapping(canonical.get("normalized_citation"))
+            ),
             "identifiers": dict(canonical.get("identifiers") or {}),
             "attributions": selected_attributions,
             "why_it_matters": why_it_matters,
@@ -11020,6 +11024,75 @@ def validate_streamlined_cluster_synthesis(
             important_cited_works.append(visible_row)
         elif disposition == "relevant_secondary":
             secondary_cited_works.append(visible_row)
+
+    # Group aliases only in the human-facing projection. Candidate-level ledger
+    # accounting remains intact for traceability.
+    grouped: dict[tuple[str, ...], dict[str, Any]] = {}
+    priority_keys: set[tuple[str, ...]] = set()
+    for priority, row in [
+        *((True, value) for value in important_cited_works),
+        *((False, value) for value in secondary_cited_works),
+    ]:
+        external_id = str(row.get("external_source_id") or "")
+        identity_row = dict((acquisition_identity_by_id or {}).get(external_id, {}))
+        zotero_key = str(identity_row.get("zotero_key") or "").strip().casefold()
+        identifiers = {
+            str(key).casefold(): str(value).strip().casefold()
+            for key, value in _as_mapping(row.get("identifiers")).items()
+            if str(value).strip()
+        }
+        normalized = _as_mapping(row.get("normalized_citation"))
+        title = re.sub(
+            r"[^a-z0-9]+",
+            " ",
+            str(normalized.get("title") or "").casefold(),
+        ).strip()
+        author = re.sub(
+            r"[^a-z0-9]+",
+            " ",
+            str(normalized.get("author") or "").casefold(),
+        ).strip()
+        year = str(normalized.get("year") or "").strip().casefold()
+        if zotero_key:
+            key = ("zotero", zotero_key)
+        elif identifiers.get("doi"):
+            key = ("doi", identifiers["doi"])
+        elif identifiers.get("isbn"):
+            key = ("isbn", identifiers["isbn"])
+        elif title and author and year:
+            key = ("title_author_year", title, author, year)
+        else:
+            key = ("external", external_id)
+        if priority:
+            priority_keys.add(key)
+        existing = grouped.get(key)
+        if existing is None:
+            grouped[key] = dict(row)
+            continue
+        existing["action"] = (
+            "map_existing"
+            if "map_existing" in {existing.get("action"), row.get("action")}
+            else "acquire"
+        )
+        if not existing.get("why_it_matters") and row.get("why_it_matters"):
+            existing["why_it_matters"] = row["why_it_matters"]
+        attribution_rows = [
+            *list(existing.get("attributions", []) or []),
+            *list(row.get("attributions", []) or []),
+        ]
+        existing["attributions"] = list(
+            {
+                _stable_hash(value): dict(value)
+                for value in attribution_rows
+                if isinstance(value, Mapping)
+            }.values()
+        )
+    important_cited_works = [
+        row for key, row in grouped.items() if key in priority_keys
+    ]
+    secondary_cited_works = [
+        row for key, row in grouped.items() if key not in priority_keys
+    ]
     return {
         **dict(response),
         "retained_member_ids": sorted(retained),
@@ -20479,6 +20552,12 @@ def build_literature_report(
                     important_unmapped_literature=synthesis_context.get(
                         "important_unmapped_literature", []
                     ),
+                    acquisition_identity_by_id={
+                        str(row.get("external_source_id") or ""): row
+                        for row in canonical_missing_sources
+                        if isinstance(row, Mapping)
+                        and row.get("external_source_id")
+                    },
                 )
                 if synthesis_response.get("cluster_contract")
                 in {"streamlined-full-note-v1", "streamlined-full-note-v2"}

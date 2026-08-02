@@ -661,6 +661,25 @@ class _RunProgress:
             self.literature.update(values)
             self._write()
 
+    def reconcile_terminal_statuses(
+        self, records: Sequence[Mapping[str, Any]]
+    ) -> None:
+        by_key = {
+            str(row.get("zotero_key") or "").upper(): str(
+                row.get("terminal_state") or ""
+            )
+            for row in records
+            if row.get("zotero_key") and row.get("terminal_state")
+        }
+        with self._lock:
+            for row in self.items.values():
+                status = by_key.get(
+                    str(row.get("zotero_item_key") or "").upper()
+                )
+                if status:
+                    row["status"] = status
+            self._write()
+
     def record_source_provider_call(self, count: int = 1) -> None:
         if count < 0:
             raise ValueError("provider call count cannot be negative")
@@ -8652,6 +8671,22 @@ def rebuild_map(
             for row in full_workspace_note_rows
         ],
     }
+    canonical_packet_result = _write_profile_packets(
+        run_directory(workspace, run_id) / "literature",
+        workspace_profiles,
+        source_set=global_source_set,
+        request=effective_request,
+        reasoner=reasoner,
+        progress=progress,
+    )
+    profile_result["paths"] = [
+        path
+        for path in profile_result["paths"]
+        if not (path.parent.name == "packets" and path.name.startswith("packet-"))
+    ] + list(canonical_packet_result["paths"])
+    profile_result["profile_packet_count"] = int(
+        canonical_packet_result["packet_count"]
+    )
     global_map_id = stable_literature_map_id(global_source_set)
     base_literature_request = LiteratureMapRequest(
         workspace=workspace,
@@ -9144,6 +9179,10 @@ def rebuild_map(
         )
         synthesis_failures = int(packet.get("synthesis_failure_count", 0) or 0)
         analytical_source_ids = _analytical_profile_source_ids(profiles)
+        coverage_register = dict(cluster_map.get("coverage_register", {}) or {})
+        progress.reconcile_terminal_statuses(
+            list(coverage_register.get("records", []) or [])
+        )
         progress.update_literature(
             unclustered_count=sum(
                 1
@@ -9270,8 +9309,52 @@ def rebuild_map(
         cluster_scope_note_ids=current_note_ids,
     )
     source_index = Path(catalogue["master_index_path"])
+    coverage_counts = dict(
+        cluster_map.get("coverage_register", {}).get("counts", {}) or {}
+    )
+    terminal_count = sum(
+        int(coverage_counts.get(key, 0) or 0)
+        for key in (
+            "validated_note",
+            "limited_note",
+            "duplicate_alias",
+            "parked_for_review",
+        )
+    )
     source_set = update_source_set_map(
-        workspace, source_set, cluster_map["clusters"], gap_map["gap_candidates"]
+        workspace,
+        {
+            **dict(source_set),
+            "inventory_count": int(
+                cluster_map.get("coverage_inventory_count", 0) or 0
+            ),
+            "terminal_count": terminal_count,
+            "validated_note_count": int(
+                coverage_counts.get("validated_note", 0) or 0
+            ),
+            "limited_note_count": int(
+                coverage_counts.get("limited_note", 0) or 0
+            ),
+            "duplicate_alias_count": int(
+                coverage_counts.get("duplicate_alias", 0) or 0
+            ),
+            "parked_for_review_count": int(
+                coverage_counts.get("parked_for_review", 0) or 0
+            ),
+            "partial_count": int(coverage_counts.get("partial", 0) or 0),
+            "pending_count": int(coverage_counts.get("pending", 0) or 0),
+            "stored_source_record_count": int(
+                identity_projection.get("stored_source_record_count", 0) or 0
+            ),
+            "canonical_work_count": int(
+                identity_projection.get("canonical_work_count", 0) or 0
+            ),
+            "canonical_source_ids": dict(
+                identity_projection.get("canonical_by_source", {}) or {}
+            ),
+        },
+        cluster_map["clusters"],
+        gap_map["gap_candidates"],
     )
     projection_hashes = {
         str(row["note_id"]): sha256_file(workspace / str(row["note_path"]))
@@ -10035,16 +10118,6 @@ def _build_profiles_for_map(
                     literature_failure_count=failures,
                 )
     profiles = [profiles_by_index[index] for index in sorted(profiles_by_index)]
-    packet_result = _write_profile_packets(
-        literature_state,
-        profiles,
-        source_set=source_set,
-        request=request,
-        reasoner=reasoner,
-        progress=progress,
-    )
-    paths.extend(packet_result["paths"])
-    checkpoint_hits += int(packet_result["checkpoint_hits"])
     return {
         "profiles": profiles,
         "paths": sorted(set(paths)),
@@ -10056,7 +10129,7 @@ def _build_profiles_for_map(
         "provider_call_limit": profile_budget.max_calls,
         "failure_count": failures,
         "failures": failure_records,
-        "profile_packet_count": int(packet_result["packet_count"]),
+        "profile_packet_count": 0,
     }
 
 
@@ -10167,6 +10240,10 @@ def _write_profile_packets(
                 progress.update_literature(active_synthesis_packet=str(path))
             write_yaml(path, payload)
         paths.append(path)
+    current_paths = set(paths)
+    for stale_path in packet_root.glob("packet-*.yml"):
+        if stale_path not in current_paths:
+            stale_path.unlink()
     if progress is not None:
         progress.update_literature(
             active_synthesis_packet="",
