@@ -452,7 +452,7 @@ def test_unchanged_source_contract_failure_is_not_retried(tmp_path) -> None:
 
     assert first.parked_for_review_count == resumed.parked_for_review_count == 1
     assert reader.calls == 1
-    assert resumed.items[0]["reason"] == "terminal_source_contract_failure"
+    assert resumed.items[0]["reason"] == "reader_failed:ProviderError"
 
 
 @pytest.mark.parametrize(
@@ -1052,6 +1052,7 @@ def test_source_calls_share_the_cumulative_profile_budget_and_replay_is_free(
     assert reader.calls == 1
     assert resumed.max_calls == 1
     assert resumed.cumulative_calls == 1
+    resumed.flush()
     assert read_yaml(budget_path)["attempts"][0]["status"] == "completed"
 
 

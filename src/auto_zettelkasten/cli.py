@@ -64,11 +64,16 @@ def build_parser() -> argparse.ArgumentParser:
     map_parser.add_argument("--provider", choices=("deepseek", "openrouter", "gemini", "ollama"), default=None)
     map_parser.add_argument("--model", default=None)
     map_parser.add_argument("--allow-cloud", action="store_true", default=None)
-    map_parser.add_argument("--parallel", type=int, default=None)
+    map_parser.add_argument(
+        "--parallel",
+        type=int,
+        default=None,
+        help="Maximum concurrent local Zotero, extraction, and OCR operations.",
+    )
     map_parser.add_argument(
         "--provider-concurrency",
         default=None,
-        help="Maximum concurrent provider jobs, or 'auto' for all ready jobs.",
+        help="Maximum concurrent provider jobs, or 'auto' for the provider-specific cap.",
     )
     map_parser.add_argument("--limit", type=int, default=None)
     map_parser.add_argument("--run-id", default="")
@@ -108,11 +113,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sync_parser.add_argument("--model", default=None)
     sync_parser.add_argument("--allow-cloud", action="store_true", default=None)
-    sync_parser.add_argument("--parallel", type=int, default=None)
+    sync_parser.add_argument(
+        "--parallel",
+        type=int,
+        default=None,
+        help="Maximum concurrent local Zotero, extraction, and OCR operations.",
+    )
     sync_parser.add_argument(
         "--provider-concurrency",
         default=None,
-        help="Maximum concurrent provider jobs, or 'auto' for all ready jobs.",
+        help="Maximum concurrent provider jobs, or 'auto' for the provider-specific cap.",
     )
     sync_parser.add_argument("--run-id", default="")
     _add_literature_policy_arguments(sync_parser)
@@ -146,7 +156,7 @@ def build_parser() -> argparse.ArgumentParser:
     build_parser_command.add_argument(
         "--provider-concurrency",
         default=None,
-        help="Maximum concurrent provider jobs, or 'auto' for all ready jobs.",
+        help="Maximum concurrent provider jobs, or 'auto' for the provider-specific cap.",
     )
     build_parser_command.add_argument("--resume", action="store_true")
     build_parser_command.add_argument("--retry-terminal-literature", action="store_true")

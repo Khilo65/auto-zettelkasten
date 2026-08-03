@@ -212,7 +212,7 @@ def test_fingerprint_rerun_and_same_run_resume_skip_reader(
         tmp_path, "first", client=FakeZotero(sample_items), reader=resume_reader
     )
     assert resumed.validated_note_count == 2
-    assert resumed.reused_count == 2
+    assert resumed.reused_count == 0
     assert resume_reader.calls == 0
 
 
@@ -294,7 +294,7 @@ def test_resume_revalidates_item_identity_and_content_fingerprint(
         reader=reader,
     )
     assert reader.calls == 0
-    assert resumed.reused_count == 2
+    assert resumed.reused_count == 0
     assert [row["zotero_item_key"] for row in resumed.items] == ["ITEMA", "ITEMB"]
     assert resumed.source_set["zotero_item_keys"] == ["ITEMA", "ITEMB"]
     assert resumed.source_set["refresh_requires_new_run"] is True

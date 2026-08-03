@@ -70,7 +70,17 @@ def current_literature_completion() -> dict[str, Any]:
     return dict(_LITERATURE_COMPLETION.get() or {})
 
 
+def current_provider_completion() -> dict[str, Any]:
+    """Return completion metadata for this thread's latest provider call."""
+
+    return current_literature_completion()
+
+
 def reset_literature_completion() -> None:
+    _LITERATURE_COMPLETION.set({})
+
+
+def reset_provider_completion() -> None:
     _LITERATURE_COMPLETION.set({})
 
 
@@ -198,11 +208,6 @@ class _CapabilityAwareReader:
     timeout: float
     request_deadline: float | None
     relationship_decision_contract = "relationship-decision-v8"
-
-    def _record_transport_attempt(self) -> None:
-        self.transport_attempt_count = (
-            int(getattr(self, "transport_attempt_count", 0) or 0) + 1
-        )
 
     def _configure_capabilities(self) -> None:
         context_window, source = _resolve_context_window(
@@ -1235,6 +1240,7 @@ class _OpenAICompatibleReader(_CapabilityAwareReader):
             body["reasoning_effort"] = _REASONING_EFFORT.get() or "high"
         else:
             body["temperature"] = 0
+        _LITERATURE_COMPLETION.set({})
         try:
             payload = _post_json(
                 self.endpoint,
@@ -1242,7 +1248,6 @@ class _OpenAICompatibleReader(_CapabilityAwareReader):
                 headers={"Authorization": f"Bearer {os.environ[self.api_key_env]}"},
                 timeout=deadline_seconds,
                 response_byte_limit=_stream_response_byte_limit(output_tokens),
-                on_attempt=self._record_transport_attempt,
                 response_reader=_read_openai_stream_response,
             )
         except ProviderError as exc:
@@ -1269,6 +1274,7 @@ class _OpenAICompatibleReader(_CapabilityAwareReader):
                 "usage": dict(payload.get("usage") or {}),
             }
             completion.update(dict(payload.get("_stream_diagnostics") or {}))
+            _LITERATURE_COMPLETION.set(completion)
             if not content.strip():
                 exc = ProviderEmptyResponse(
                     f"{self.name} returned an empty response"
@@ -1430,7 +1436,6 @@ class GeminiReader(_CapabilityAwareReader):
             },
             timeout=deadline_seconds or self._request_deadline_seconds(),
             response_byte_limit=_response_byte_limit(output_tokens),
-            on_attempt=self._record_transport_attempt,
         )
         try:
             return payload["candidates"][0]["content"]["parts"][0]["text"]
@@ -1484,7 +1489,6 @@ class OllamaReader(_CapabilityAwareReader):
             },
             timeout=deadline_seconds,
             response_byte_limit=_response_byte_limit(output_tokens),
-            on_attempt=self._record_transport_attempt,
         )
         try:
             return payload["message"]["content"]

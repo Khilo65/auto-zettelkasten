@@ -10,7 +10,7 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from . import ARTIFACT_SCHEMA_VERSION, ENGINE_VERSION
 from .controller import LocalController
@@ -141,7 +141,9 @@ from .readers import (
     _normalize_source_bundle_payload,
     _normalize_provider_evidence_anchor,
     _parse_source_bundle_response,
+    current_provider_completion,
     provider_from_name,
+    reset_provider_completion,
 )
 from .workspace import (
     artifact_rows,
@@ -168,7 +170,28 @@ _RELATIONSHIP_SELECTION_STATE_SCHEMA_VERSION = "4"
 _RELATIONSHIP_DISCOVERY_POLICY_VERSION = "family-coverage-v24"
 _RELATIONSHIP_SEMANTIC_POLICY_VERSION = "source-owned-bases-v26"
 _LITERATURE_MEMORY_LOCK = threading.Lock()
-_AUTO_SOURCE_WORKER_LIMIT = 32
+_AUTO_CLOUD_SOURCE_WORKER_LIMIT = 32
+_AUTO_DEEPSEEK_SOURCE_WORKER_LIMIT = 256
+_PROGRESS_WRITE_INTERVAL_SECONDS = 1.0
+
+
+def _source_worker_count(
+    reader: ReaderProvider,
+    request: MapRequest,
+    pending_count: int,
+) -> int:
+    if not bool(getattr(reader, "is_cloud", False)):
+        configured = request.parallel
+    elif request.provider_concurrency != "auto":
+        configured = int(request.provider_concurrency or request.parallel)
+    elif (
+        str(getattr(reader, "name", "")).casefold() == "deepseek"
+        and str(getattr(reader, "model", "")).casefold() == "deepseek-v4-flash"
+    ):
+        configured = _AUTO_DEEPSEEK_SOURCE_WORKER_LIMIT
+    else:
+        configured = _AUTO_CLOUD_SOURCE_WORKER_LIMIT
+    return max(1, min(pending_count or 1, configured))
 
 
 def _allocate_complementary_candidate_quotas(
@@ -335,35 +358,84 @@ class AtomicFidelityError(RuntimeError):
     pass
 
 
+class _LocalAcquisitionGate:
+    """Bound local Zotero/extraction work independently from provider calls."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = max(1, limit)
+        self._semaphore = threading.BoundedSemaphore(self.limit)
+        self._lock = threading.Lock()
+        self._active = 0
+        self.peak = 0
+
+    def __enter__(self) -> _LocalAcquisitionGate:
+        self._semaphore.acquire()
+        with self._lock:
+            self._active += 1
+            self.peak = max(self.peak, self._active)
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        with self._lock:
+            self._active -= 1
+        self._semaphore.release()
+
+
 class _ProfileProviderBudget:
-    """Persist the cumulative source and profile provider-call ceiling."""
+    """Persist the cumulative source/profile ceiling through append-only events."""
 
     def __init__(self, path: Path, max_calls: int) -> None:
         self.path = path
+        self.events_path = path.with_name("provider_events.jsonl")
         self._lock = threading.Lock()
         usage = read_yaml(path, {}) or {}
         persisted_max = int(usage.get("max_calls", 0) or 0)
-        self.max_calls = min(max_calls, persisted_max) if persisted_max else max_calls
-        self.attempts = [
+        legacy_attempts = [
             dict(row)
             for row in usage.get("attempts", []) or []
             if isinstance(row, Mapping)
         ]
+        events = self._read_events()
+        event_maxima = [
+            int(row.get("max_calls", 0) or 0)
+            for row in events
+            if int(row.get("max_calls", 0) or 0) > 0
+        ]
+        ceilings = [max_calls, *event_maxima]
+        if persisted_max:
+            ceilings.append(persisted_max)
+        self.max_calls = min(ceilings)
+        events = self._migrate_legacy_attempts(events, legacy_attempts)
+        self.attempts = self._attempts_from_events(events)
+        self._attempt_by_id = {
+            str(row["attempt_id"]): row
+            for row in self.attempts
+            if row.get("attempt_id")
+        }
+        self._attempt_counts = Counter(
+            (
+                str(row.get("stage") or ""),
+                str(row.get("key") or ""),
+                str(row.get("fingerprint") or ""),
+            )
+            for row in self.attempts
+        )
         self.cumulative_calls = len(self.attempts)
         self.new_calls = 0
-        self._write()
+        self._active_attempts: dict[str, float] = {}
+        self.peak_concurrency = 0
+        self._latencies: list[float] = [
+            float(row.get("elapsed_seconds", 0.0) or 0.0)
+            for row in self.attempts
+            if float(row.get("elapsed_seconds", 0.0) or 0.0) > 0
+        ]
 
     def reserve(self, stage: str, key: str, fingerprint: str) -> str:
         with self._lock:
             if self.cumulative_calls >= self.max_calls:
                 raise RuntimeError("source_profile_call_budget_reached")
-            attempt_number = 1 + sum(
-                1
-                for row in self.attempts
-                if row.get("stage") == stage
-                and row.get("key") == key
-                and row.get("fingerprint") == fingerprint
-            )
+            identity = (stage, key, fingerprint)
+            attempt_number = self._attempt_counts[identity] + 1
             attempt_id = stable_hash(
                 {
                     "stage": stage,
@@ -372,41 +444,295 @@ class _ProfileProviderBudget:
                     "attempt": attempt_number,
                 }
             )
-            self.attempts.append(
+            row = {
+                "attempt_id": attempt_id,
+                "stage": stage,
+                "key": key,
+                "fingerprint": fingerprint,
+                "attempt": attempt_number,
+                "status": "started",
+                "started_at": now_iso(),
+            }
+            self._append_event(
                 {
-                    "attempt_id": attempt_id,
-                    "stage": stage,
-                    "key": key,
-                    "fingerprint": fingerprint,
-                    "attempt": attempt_number,
-                    "status": "started",
-                    "started_at": now_iso(),
+                    "event_id": stable_hash(
+                        {"attempt_id": attempt_id, "event_type": "reserved"}
+                    ),
+                    "event_type": "reserved",
+                    "max_calls": self.max_calls,
+                    **row,
                 }
             )
+            self.attempts.append(row)
+            self._attempt_by_id[attempt_id] = row
+            self._attempt_counts[identity] = attempt_number
             self.cumulative_calls += 1
             self.new_calls += 1
-            self._write()
+            self._active_attempts[attempt_id] = time.monotonic()
+            self.peak_concurrency = max(
+                self.peak_concurrency, len(self._active_attempts)
+            )
             return attempt_id
 
-    def finish(self, attempt_id: str, *, status: str) -> None:
+    def finish(
+        self,
+        attempt_id: str,
+        *,
+        status: str,
+        provider_completion: Mapping[str, Any] | None = None,
+    ) -> None:
         with self._lock:
-            for row in self.attempts:
-                if row.get("attempt_id") == attempt_id:
-                    row["status"] = status
-                    row["finished_at"] = now_iso()
-                    break
+            row = self._attempt_by_id.get(attempt_id)
+            if row is None or row.get("status") != "started":
+                return
+            finished_at = now_iso()
+            started = self._active_attempts.pop(attempt_id, None)
+            elapsed = round(time.monotonic() - started, 6) if started else 0.0
+            completion = dict(provider_completion or {})
+            event = {
+                "event_id": stable_hash(
+                    {"attempt_id": attempt_id, "event_type": "finished"}
+                ),
+                "event_type": "finished",
+                "attempt_id": attempt_id,
+                "status": status,
+                "finished_at": finished_at,
+                "elapsed_seconds": elapsed,
+                "provider_completion": completion,
+            }
+            self._append_event(event)
+            row.update(
+                status=status,
+                finished_at=finished_at,
+                elapsed_seconds=elapsed,
+                provider_completion=completion,
+            )
+            if elapsed > 0:
+                self._latencies.append(elapsed)
+
+    def flush(self) -> None:
+        """Materialize the compatibility YAML at explicit barriers only."""
+
+        with self._lock:
             self._write()
+
+    def metrics(self) -> dict[str, Any]:
+        with self._lock:
+            latencies = sorted(self._latencies)
+
+            def percentile(fraction: float) -> float:
+                if not latencies:
+                    return 0.0
+                return latencies[round((len(latencies) - 1) * fraction)]
+
+            return {
+                "provider_peak_concurrency": self.peak_concurrency,
+                "provider_latency_p50_seconds": percentile(0.5),
+                "provider_latency_p95_seconds": percentile(0.95),
+                "provider_failure_count": sum(
+                    row.get("status") == "failed" for row in self.attempts
+                ),
+            }
+
+    def _read_events(self) -> list[dict[str, Any]]:
+        if not self.events_path.exists():
+            return []
+        events: list[dict[str, Any]] = []
+        for line_number, line in enumerate(
+            self.events_path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"provider event ledger line {line_number} is invalid"
+                ) from exc
+            if not isinstance(row, Mapping) or not row.get("event_id"):
+                raise ValueError(
+                    f"provider event ledger line {line_number} is invalid"
+                )
+            events.append(dict(row))
+        return events
+
+    def _migrate_legacy_attempts(
+        self,
+        events: list[dict[str, Any]],
+        legacy_attempts: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        event_ids = {str(row.get("event_id") or "") for row in events}
+        for legacy in legacy_attempts:
+            attempt_id = str(legacy.get("attempt_id") or "")
+            if not attempt_id:
+                continue
+            reserved = {
+                "event_id": stable_hash(
+                    {"attempt_id": attempt_id, "event_type": "reserved"}
+                ),
+                "event_type": "reserved",
+                "max_calls": self.max_calls,
+                **dict(legacy),
+                "status": "started",
+            }
+            if reserved["event_id"] not in event_ids:
+                self._append_event(reserved)
+                events.append(reserved)
+                event_ids.add(str(reserved["event_id"]))
+            legacy_status = str(legacy.get("status") or "started")
+            if legacy_status == "started":
+                continue
+            finished = {
+                "event_id": stable_hash(
+                    {"attempt_id": attempt_id, "event_type": "finished"}
+                ),
+                "event_type": "finished",
+                "attempt_id": attempt_id,
+                "status": legacy_status,
+                "finished_at": str(legacy.get("finished_at") or ""),
+                "elapsed_seconds": float(
+                    legacy.get("elapsed_seconds", 0.0) or 0.0
+                ),
+                "provider_completion": dict(
+                    legacy.get("provider_completion", {}) or {}
+                ),
+            }
+            if finished["event_id"] not in event_ids:
+                self._append_event(finished)
+                events.append(finished)
+                event_ids.add(str(finished["event_id"]))
+        return events
+
+    @staticmethod
+    def _attempts_from_events(
+        events: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        attempts: dict[str, dict[str, Any]] = {}
+        order: list[str] = []
+        seen_events: set[str] = set()
+        for event in events:
+            event_id = str(event.get("event_id") or "")
+            if event_id in seen_events:
+                continue
+            seen_events.add(event_id)
+            attempt_id = str(event.get("attempt_id") or "")
+            if str(event.get("event_type") or "") == "reserved":
+                if attempt_id not in attempts:
+                    attempts[attempt_id] = {
+                        key: event.get(key)
+                        for key in (
+                            "attempt_id",
+                            "stage",
+                            "key",
+                            "fingerprint",
+                            "attempt",
+                            "status",
+                            "started_at",
+                        )
+                    }
+                    attempts[attempt_id]["status"] = "started"
+                    order.append(attempt_id)
+            elif attempt_id in attempts:
+                attempts[attempt_id].update(
+                    {
+                        key: event.get(key)
+                        for key in (
+                            "status",
+                            "finished_at",
+                            "elapsed_seconds",
+                            "provider_completion",
+                        )
+                    }
+                )
+        return [attempts[attempt_id] for attempt_id in order]
+
+    def _append_event(self, event: Mapping[str, Any]) -> None:
+        self.events_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = (
+            json.dumps(event, sort_keys=True, ensure_ascii=False) + "\n"
+        ).encode("utf-8")
+        descriptor = os.open(
+            self.events_path,
+            os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+            0o600,
+        )
+        try:
+            remaining = memoryview(payload)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise OSError("provider event ledger write failed")
+                remaining = remaining[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     def _write(self) -> None:
         write_yaml(
             self.path,
             {
-                "usage_schema_version": "2",
+                "usage_schema_version": "3",
                 "max_calls": self.max_calls,
                 "provider_call_count": self.cumulative_calls,
+                "provider_event_ledger": self.events_path.name,
                 "attempts": self.attempts,
             },
         )
+
+
+def _transport_retryable(exc: BaseException) -> bool:
+    if not isinstance(exc, ProviderError):
+        return False
+    message = str(exc).casefold()
+    status = re.search(r"provider http (\d{3})", message)
+    if status and (int(status.group(1)) == 429 or 500 <= int(status.group(1)) <= 599):
+        return True
+    return any(
+        marker in message
+        for marker in (
+            "provider unavailable",
+            "provider request timed out",
+            "provider connection interrupted",
+        )
+    )
+
+
+def _provider_call_with_transport_retry(
+    budget: _ProfileProviderBudget,
+    stage: str,
+    key: str,
+    fingerprint: str,
+    operation: Callable[[], Any],
+    *,
+    before_attempt: Callable[[], None] | None = None,
+    on_attempt: Callable[[], None] | None = None,
+) -> Any:
+    """Run one provider operation with at most one counted transport retry."""
+
+    for attempt_number in range(2):
+        if before_attempt is not None:
+            before_attempt()
+        attempt_id = budget.reserve(stage, key, fingerprint)
+        if on_attempt is not None:
+            on_attempt()
+        try:
+            result = operation()
+        except Exception as exc:
+            budget.finish(
+                attempt_id,
+                status="failed",
+                provider_completion=getattr(exc, "provider_completion", {}),
+            )
+            if attempt_number == 0 and _transport_retryable(exc):
+                continue
+            raise
+        budget.finish(
+            attempt_id,
+            status="completed",
+            provider_completion=current_provider_completion(),
+        )
+        return result
+    raise AssertionError("provider retry loop exhausted unexpectedly")
 
 
 class DocumentCoverageLimitError(RuntimeError):
@@ -432,6 +758,9 @@ class _RunProgress:
         self.path = path
         self.run_id = run_id
         self._lock = threading.Lock()
+        self._write_timer: threading.Timer | None = None
+        self._last_write_monotonic = 0.0
+        self._dirty = False
         previous = read_yaml(path, {}) or {} if resume else {}
         previous_items = (
             previous.get("items", {})
@@ -590,7 +919,8 @@ class _RunProgress:
             }
         self._status = "running"
         self.stage_timestamps.setdefault(self.stage, {"started_at": now_iso()})
-        self._write()
+        self._dirty = True
+        self._flush_locked()
 
     def update(self, index: int, **values: Any) -> None:
         with self._lock:
@@ -598,7 +928,7 @@ class _RunProgress:
                 str(index), {"inventory_index": index, "status": "pending"}
             )
             row.update(values)
-            self._write()
+            self._request_write_locked()
 
     def finish(self, status: str) -> None:
         with self._lock:
@@ -606,7 +936,8 @@ class _RunProgress:
             self.stage_timestamps.setdefault(self.stage, {}).setdefault(
                 "completed_at", now_iso()
             )
-            self._write()
+            self._dirty = True
+            self._flush_locked()
 
     def set_stage(self, stage: str, **literature_values: Any) -> None:
         with self._lock:
@@ -657,12 +988,13 @@ class _RunProgress:
                     literature_values.get("synthesis_failure_count", 0) or 0
                 )
             self.literature.update(literature_values)
-            self._write()
+            self._dirty = True
+            self._flush_locked()
 
     def update_literature(self, **values: Any) -> None:
         with self._lock:
             self.literature.update(values)
-            self._write()
+            self._request_write_locked()
 
     def reconcile_terminal_statuses(
         self, records: Sequence[Mapping[str, Any]]
@@ -681,7 +1013,8 @@ class _RunProgress:
                 )
                 if status:
                     row["status"] = status
-            self._write()
+            self._dirty = True
+            self._flush_locked()
 
     def record_source_provider_call(self, count: int = 1) -> None:
         if count < 0:
@@ -689,7 +1022,40 @@ class _RunProgress:
         with self._lock:
             current = int(self.literature.get("source_provider_call_count", 0) or 0)
             self.literature["source_provider_call_count"] = current + count
-            self._write()
+            self._request_write_locked()
+
+    def flush(self) -> None:
+        with self._lock:
+            self._flush_locked()
+
+    def _request_write_locked(self) -> None:
+        self._dirty = True
+        elapsed = time.monotonic() - self._last_write_monotonic
+        if elapsed >= _PROGRESS_WRITE_INTERVAL_SECONDS:
+            self._flush_locked()
+            return
+        if self._write_timer is None:
+            self._write_timer = threading.Timer(
+                _PROGRESS_WRITE_INTERVAL_SECONDS - elapsed,
+                self._timer_flush,
+            )
+            self._write_timer.daemon = True
+            self._write_timer.start()
+
+    def _timer_flush(self) -> None:
+        with self._lock:
+            self._write_timer = None
+            self._flush_locked()
+
+    def _flush_locked(self) -> None:
+        if self._write_timer is not None:
+            self._write_timer.cancel()
+            self._write_timer = None
+        if not self._dirty:
+            return
+        self._write()
+        self._dirty = False
+        self._last_write_monotonic = time.monotonic()
 
     def _write(self) -> None:
         source_calls = int(self.literature.get("source_provider_call_count", 0) or 0)
@@ -1024,22 +1390,8 @@ def run_pipeline(
         )
 
     requested_concurrency = request.provider_concurrency
-    automatic_workers = (
-        min(len(pending) or 1, _AUTO_SOURCE_WORKER_LIMIT)
-        if bool(getattr(reader, "is_cloud", False))
-        else request.parallel
-    )
-    workers = max(
-        1,
-        min(
-            len(pending) or 1,
-            (
-                automatic_workers
-                if requested_concurrency == "auto"
-                else int(requested_concurrency or request.parallel)
-            ),
-        ),
-    )
+    workers = _source_worker_count(reader, request, len(pending))
+    acquisition_gate = _LocalAcquisitionGate(request.parallel)
     source_stage_started = time.monotonic()
     concurrency_lock = threading.Lock()
     active_source_jobs = 0
@@ -1065,6 +1417,7 @@ def run_pipeline(
                 progress,
                 profile_budget,
                 source_match_index,
+                acquisition_gate,
             )
         finally:
             with concurrency_lock:
@@ -1073,34 +1426,42 @@ def run_pipeline(
     progress.set_stage(
         "source_processing",
         source_worker_count=workers,
+        local_worker_limit=request.parallel,
+        provider_worker_limit=workers,
         provider_concurrency_mode=str(requested_concurrency or request.parallel),
+        source_queue_depth=max(0, len(pending) - workers),
     )
-    with ThreadPoolExecutor(
-        max_workers=workers, thread_name_prefix="auto-zettelkasten"
-    ) as executor:
-        future_map = {
-            executor.submit(
-                prepare_one,
-                index,
-                item,
-            ): index
-            for index, item in pending
-        }
-        for future in as_completed(future_map):
-            try:
-                commit_result(future.result())
-            except (
-                Exception
-            ) as exc:  # defensive terminal accounting at the worker boundary
-                index = future_map[future]
-                commit_result(
-                    _exhausted_result(
-                        index,
-                        items[index],
-                        "pipeline_worker",
-                        f"unhandled_worker_error:{type(exc).__name__}:{exc}",
+    try:
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="auto-zettelkasten"
+        ) as executor:
+            future_map = {
+                executor.submit(
+                    prepare_one,
+                    index,
+                    item,
+                ): index
+                for index, item in pending
+            }
+            for future in as_completed(future_map):
+                try:
+                    commit_result(future.result())
+                except (
+                    Exception
+                ) as exc:  # defensive terminal accounting at the worker boundary
+                    index = future_map[future]
+                    commit_result(
+                        _exhausted_result(
+                            index,
+                            items[index],
+                            "pipeline_worker",
+                            f"unhandled_worker_error:{type(exc).__name__}:{exc}",
+                        )
                     )
-                )
+    except BaseException:
+        progress.flush()
+        profile_budget.flush()
+        raise
     canonical_results = {
         int(row.get("inventory_index", -1)): row for row in prepared
     }
@@ -1170,12 +1531,35 @@ def run_pipeline(
             phase="finished",
             reason=str(public_alias["reason"]),
         )
+    source_stage_wall_seconds = time.monotonic() - source_stage_started
+    profile_budget.flush()
+    provider_metrics = profile_budget.metrics()
     progress.set_stage(
         "source_terminal_barrier",
-        source_peak_concurrency=peak_source_concurrency,
-        source_stage_wall_seconds=round(
-            time.monotonic() - source_stage_started, 3
+        source_peak_concurrency=int(
+            provider_metrics.get("provider_peak_concurrency", 0) or 0
         ),
+        source_worker_peak_concurrency=peak_source_concurrency,
+        local_peak_concurrency=acquisition_gate.peak,
+        provider_peak_concurrency=int(
+            provider_metrics.get("provider_peak_concurrency", 0) or 0
+        ),
+        provider_latency_p50_seconds=float(
+            provider_metrics.get("provider_latency_p50_seconds", 0.0) or 0.0
+        ),
+        provider_latency_p95_seconds=float(
+            provider_metrics.get("provider_latency_p95_seconds", 0.0) or 0.0
+        ),
+        provider_failure_count=int(
+            provider_metrics.get("provider_failure_count", 0) or 0
+        ),
+        source_queue_depth=max(0, len(pending) - workers),
+        source_completions_per_minute=round(
+            len(pending) * 60 / source_stage_wall_seconds, 3
+        )
+        if source_stage_wall_seconds
+        else 0.0,
+        source_stage_wall_seconds=round(source_stage_wall_seconds, 3),
     )
     prepared.sort(key=lambda row: int(row.get("inventory_index", 0)))
     tag_report = commit_tag_reviews(workspace, proposals, decisions)
@@ -1211,22 +1595,28 @@ def run_pipeline(
         )
     map_source_set = run_source_set
     progress.set_stage("profiling")
-    map_result = rebuild_map(
-        workspace,
-        source_set=map_source_set,
-        note_rows=note_rows,
-        terminal_rows=terminal_rows,
-        items=items,
-        run_id=run_id,
-        question=request.question,
-        request=request,
-        reasoner=literature_reasoner,
-        external_discovery=external_discovery,
-        progress=progress,
-        resume=resume,
-        profile_budget=profile_budget,
-        collection_snapshot=collection_snapshot,
-    )
+    try:
+        map_result = rebuild_map(
+            workspace,
+            source_set=map_source_set,
+            note_rows=note_rows,
+            terminal_rows=terminal_rows,
+            items=items,
+            run_id=run_id,
+            question=request.question,
+            request=request,
+            reasoner=literature_reasoner,
+            external_discovery=external_discovery,
+            progress=progress,
+            resume=resume,
+            profile_budget=profile_budget,
+            collection_snapshot=collection_snapshot,
+        )
+    except BaseException:
+        progress.flush()
+        profile_budget.flush()
+        raise
+    profile_budget.flush()
     # The v0.4 map is already scoped to this run's frozen source set, so every
     # generated cluster and gap belongs to the run without a second heuristic filter.
     relevant_clusters = list(map_result["cluster_map"]["clusters"])
@@ -1363,6 +1753,33 @@ def run_pipeline(
         "partial_reason": literature_partial_reason,
         "source_peak_concurrency": int(
             progress.literature.get("source_peak_concurrency", 0) or 0
+        ),
+        "source_worker_peak_concurrency": int(
+            progress.literature.get("source_worker_peak_concurrency", 0) or 0
+        ),
+        "local_peak_concurrency": int(
+            progress.literature.get("local_peak_concurrency", 0) or 0
+        ),
+        "provider_peak_concurrency": int(
+            progress.literature.get("provider_peak_concurrency", 0) or 0
+        ),
+        "source_queue_depth": int(
+            progress.literature.get("source_queue_depth", 0) or 0
+        ),
+        "source_completions_per_minute": float(
+            progress.literature.get("source_completions_per_minute", 0.0)
+            or 0.0
+        ),
+        "provider_latency_p50_seconds": float(
+            progress.literature.get("provider_latency_p50_seconds", 0.0)
+            or 0.0
+        ),
+        "provider_latency_p95_seconds": float(
+            progress.literature.get("provider_latency_p95_seconds", 0.0)
+            or 0.0
+        ),
+        "provider_failure_count": int(
+            progress.literature.get("provider_failure_count", 0) or 0
         ),
         "source_stage_wall_seconds": float(
             progress.literature.get("source_stage_wall_seconds", 0.0) or 0.0
@@ -1548,6 +1965,33 @@ def run_pipeline(
         source_peak_concurrency=int(
             progress.literature.get("source_peak_concurrency", 0) or 0
         ),
+        source_worker_peak_concurrency=int(
+            progress.literature.get("source_worker_peak_concurrency", 0) or 0
+        ),
+        local_peak_concurrency=int(
+            progress.literature.get("local_peak_concurrency", 0) or 0
+        ),
+        provider_peak_concurrency=int(
+            progress.literature.get("provider_peak_concurrency", 0) or 0
+        ),
+        source_queue_depth=int(
+            progress.literature.get("source_queue_depth", 0) or 0
+        ),
+        source_completions_per_minute=float(
+            progress.literature.get("source_completions_per_minute", 0.0)
+            or 0.0
+        ),
+        provider_latency_p50_seconds=float(
+            progress.literature.get("provider_latency_p50_seconds", 0.0)
+            or 0.0
+        ),
+        provider_latency_p95_seconds=float(
+            progress.literature.get("provider_latency_p95_seconds", 0.0)
+            or 0.0
+        ),
+        provider_failure_count=int(
+            progress.literature.get("provider_failure_count", 0) or 0
+        ),
         source_stage_wall_seconds=float(
             progress.literature.get("source_stage_wall_seconds", 0.0) or 0.0
         ),
@@ -1564,6 +2008,7 @@ def run_pipeline(
         artifact_manifest=manifest,
     )
     _write_run_report(run_dir, report)
+    _write_source_replay_receipt(workspace, run_dir, request, report)
     if status.startswith("completed"):
         scoped_item_keys = [
             str(row.get("key") or "")
@@ -9810,14 +10255,13 @@ def _build_profiles_for_map(
     valid_count = 0
     excluded_count = 0
     started = time.monotonic()
-    def reserve_provider_call(key: str, fingerprint: str) -> str:
+
+    def record_provider_call() -> None:
         nonlocal provider_calls
-        attempt_id = profile_budget.reserve("profile_source", key, fingerprint)
         provider_calls += 1
         current = provider_calls
         if progress is not None:
             progress.update_literature(literature_provider_call_count=current)
-        return attempt_id
 
     def build_one(index: int, row: Mapping[str, Any]) -> dict[str, Any]:
         if (
@@ -10169,15 +10613,12 @@ def _build_profiles_for_map(
                     and reasoner is not None
                     and analytical
                 ):
-                    profile_attempt_id = reserve_provider_call(
-                        note_id, reasoner_attempt_fingerprint
-                    )
-
                     def reasoner_method(
                         prompt: str, *, _row: Mapping[str, Any] = row, _text: str = text
                     ) -> Any:
-                        try:
-                            response = reasoner.profile_source(
+                        def operation() -> Any:
+                            reset_provider_completion()
+                            return reasoner.profile_source(
                                 {
                                     **dict(_row),
                                     "committed_note": _text,
@@ -10193,15 +10634,15 @@ def _build_profiles_for_map(
                                     "reasoner_identity": reasoner_identity,
                                 },
                             )
-                        except Exception:
-                            profile_budget.finish(
-                                profile_attempt_id, status="failed"
-                            )
-                            raise
-                        profile_budget.finish(
-                            profile_attempt_id, status="completed"
+
+                        return _provider_call_with_transport_retry(
+                            profile_budget,
+                            "profile_source",
+                            note_id,
+                            reasoner_attempt_fingerprint,
+                            operation,
+                            on_attempt=record_provider_call,
                         )
-                        return response
                 else:
                     reasoner_method = None
                 try:
@@ -10836,6 +11277,7 @@ def _prepare_item(
     progress: _RunProgress | None = None,
     profile_budget: _ProfileProviderBudget | None = None,
     source_match_index: Mapping[str, Any] | None = None,
+    acquisition_gate: _LocalAcquisitionGate | None = None,
 ) -> dict[str, Any]:
     key = item_key(item)
     base = {
@@ -10868,9 +11310,17 @@ def _prepare_item(
             _attempt(base, "frozen_content", "succeeded", "run_snapshot_reused")
         )
     else:
-        content = _acquire_content(workspace, item, client, base, request, vision)
-        if content:
-            _write_frozen_content(checkpoint_root, content)
+        if acquisition_gate is None:
+            content = _acquire_content(workspace, item, client, base, request, vision)
+            if content:
+                _write_frozen_content(checkpoint_root, content)
+        else:
+            with acquisition_gate:
+                content = _acquire_content(
+                    workspace, item, client, base, request, vision
+                )
+                if content:
+                    _write_frozen_content(checkpoint_root, content)
     if not content:
         base["reason"] = "all_allowed_extraction_routes_exhausted"
         base["attempts"].append(
@@ -13060,6 +13510,109 @@ def _write_run_report(run_dir: Path, report: RunReport) -> None:
     write_yaml(run_dir / "run_report.yml", payload)
 
 
+def _source_replay_request_hash(request: MapRequest) -> str:
+    payload = request.to_dict()
+    payload.pop("workspace", None)
+    payload.pop("parallel", None)
+    payload.pop("provider_concurrency", None)
+    return stable_hash(payload)
+
+
+def _source_replay_dependency_paths(
+    workspace: Path,
+    run_dir: Path,
+    report: Mapping[str, Any],
+) -> list[Path]:
+    paths: set[Path] = set()
+    for root in (run_dir / "items", run_dir / "literature" / "profile_calls"):
+        if root.is_dir():
+            paths.update(path for path in root.rglob("*") if path.is_file())
+    for path in (
+        run_dir / "inventory.json",
+        run_dir / "frozen_inventory.yml",
+        run_dir / "collection_snapshot.yml",
+        run_dir / "literature" / "profiles" / "provider_usage.yml",
+        run_dir / "literature" / "profiles" / "provider_events.jsonl",
+    ):
+        if path.is_file():
+            paths.add(path)
+    for row in report.get("items", []) or []:
+        if not isinstance(row, Mapping):
+            continue
+        note_path = workspace / str(row.get("note_path") or "")
+        if note_path.is_file():
+            paths.add(note_path)
+        note_id = str(row.get("note_id") or "")
+        if note_id:
+            profile_path = profile_sidecar_path(
+                workspace / "02_source_memory" / "profiles", note_id
+            )
+            if profile_path.is_file():
+                paths.add(profile_path)
+    return sorted(paths)
+
+
+def _write_source_replay_receipt(
+    workspace: Path,
+    run_dir: Path,
+    request: MapRequest,
+    report: RunReport,
+) -> None:
+    payload = report.to_dict()
+    write_yaml(
+        run_dir / "source_replay_receipt.yml",
+        {
+            "receipt_schema_version": "1",
+            "engine_version": ENGINE_VERSION,
+            "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+            "request_hash": _source_replay_request_hash(request),
+            "dependencies": [
+                {
+                    "path": str(path.relative_to(workspace)),
+                    "sha256": sha256_file(path),
+                }
+                for path in _source_replay_dependency_paths(
+                    workspace, run_dir, payload
+                )
+            ],
+        },
+    )
+
+
+def source_replay_receipt_matches(
+    workspace: Path,
+    run_id: str,
+    request: MapRequest,
+    report: Mapping[str, Any],
+) -> bool:
+    run_dir = run_directory(workspace, run_id)
+    receipt = read_yaml(run_dir / "source_replay_receipt.yml", {}) or {}
+    if (
+        not isinstance(receipt, Mapping)
+        or str(receipt.get("receipt_schema_version") or "") != "1"
+        or str(receipt.get("engine_version") or "") != ENGINE_VERSION
+        or str(receipt.get("artifact_schema_version") or "")
+        != ARTIFACT_SCHEMA_VERSION
+        or str(receipt.get("request_hash") or "")
+        != _source_replay_request_hash(request)
+    ):
+        return False
+    expected = {
+        str(row.get("path") or ""): str(row.get("sha256") or "")
+        for row in receipt.get("dependencies", []) or []
+        if isinstance(row, Mapping) and row.get("path") and row.get("sha256")
+    }
+    current_paths = _source_replay_dependency_paths(workspace, run_dir, report)
+    if set(expected) != {
+        str(path.relative_to(workspace)) for path in current_paths
+    }:
+        return False
+    return all(
+        sha256_file(workspace / relative_path) == digest
+        for relative_path, digest in expected.items()
+    )
+
+
 def _fulltext_value(value: Mapping[str, Any] | None) -> str:
     if not value:
         return ""
@@ -13336,6 +13889,29 @@ def _read_document(
         "chunk_output_tokens": source_chunk_output_tokens,
         "synthesis_output_tokens": policy.synthesis_output_tokens,
     }
+    provider_key = str(
+        (
+            metadata.get("_source_context", {})
+            if isinstance(metadata.get("_source_context"), Mapping)
+            else {}
+        ).get("zotero_key")
+        or document_hash
+    )
+    started = time.monotonic()
+    calls = 0
+
+    def record_source_attempt() -> None:
+        nonlocal calls
+        calls += 1
+        if progress is not None:
+            progress.record_source_provider_call()
+
+    def before_direct_attempt() -> None:
+        if calls >= policy.max_calls_per_document_run:
+            raise DocumentPartialError("document_call_budget_reached", 0, 0)
+        if time.monotonic() - started >= policy.document_deadline_seconds:
+            raise DocumentPartialError("document_deadline_reached", 0, 0)
+
     bundle_reader = getattr(reader, "read_source_bundle", None)
     bundle_fit = getattr(reader, "should_read_source_bundle_directly", None)
     direct_admitted = len(text) <= direct_limit and (
@@ -13361,34 +13937,31 @@ def _read_document(
                 f"{reader.name}_text",
                 "reused_direct_source_checkpoint",
             )
-        attempt_id = (
-            provider_budget.reserve(
-                "source_bundle_direct",
-                str(
-                    (
-                        metadata.get("_source_context", {})
-                        if isinstance(metadata.get("_source_context"), Mapping)
-                        else {}
-                    ).get("zotero_key")
-                    or document_hash
-                ),
-                stable_hash(direct_identity),
-            )
-            if provider_budget is not None
-            else ""
-        )
-        try:
-            if progress is not None:
-                progress.record_source_provider_call()
+        def direct_operation() -> Mapping[str, Any]:
+            reset_provider_completion()
             if callable(bundle_reader):
-                analysis = dict(bundle_reader(text, metadata, question))
-                SourceAnalysisBundle.from_dict(analysis)
-            else:
-                analysis = _ensure_analysis_contract(
-                    dict(reader.read_source(text, metadata, question))
-                )
+                result = dict(bundle_reader(text, metadata, question))
+                SourceAnalysisBundle.from_dict(result)
+                return result
+            return _ensure_analysis_contract(
+                dict(reader.read_source(text, metadata, question))
+            )
+
+        try:
             if provider_budget is not None:
-                provider_budget.finish(attempt_id, status="completed")
+                analysis = _provider_call_with_transport_retry(
+                    provider_budget,
+                    "source_bundle_direct",
+                    provider_key,
+                    stable_hash(direct_identity),
+                    direct_operation,
+                    before_attempt=before_direct_attempt,
+                    on_attempt=record_source_attempt,
+                )
+            else:
+                before_direct_attempt()
+                record_source_attempt()
+                analysis = direct_operation()
             if checkpoint_enabled:
                 write_yaml(
                     direct_path,
@@ -13404,8 +13977,6 @@ def _read_document(
                 "full_document_source_read",
             )
         except Exception as exc:
-            if provider_budget is not None:
-                provider_budget.finish(attempt_id, status="failed")
             message = str(exc).casefold()
             if not any(
                 token in message
@@ -13430,8 +14001,6 @@ def _read_document(
         "chunk_char_limit": chunk_limit,
         "total_chunks": len(chunks),
     }
-    started = time.monotonic()
-    calls = 0
     analyses: list[Mapping[str, Any]] = []
     for index, chunk in enumerate(chunks):
         checkpoint_path = (
@@ -13454,33 +14023,38 @@ def _read_document(
                     "document_deadline_reached", len(analyses), len(chunks)
                 )
             locator = _chunk_locator(chunk, index, len(chunks))
-            attempt_id = (
-                provider_budget.reserve(
-                    "source_chunk",
-                    str(
-                        (
-                            metadata.get("_source_context", {})
-                            if isinstance(metadata.get("_source_context"), Mapping)
-                            else {}
-                        ).get("zotero_key")
-                        or document_hash
-                    ),
-                    stable_hash(
-                        {
-                            **checkpoint_identity,
-                            "chunk_index": index,
-                            "chunk_hash": sha256_text(chunk),
-                        }
-                    ),
-                )
-                if provider_budget is not None
-                else ""
+            chunk_identity = stable_hash(
+                {
+                    **checkpoint_identity,
+                    "chunk_index": index,
+                    "chunk_hash": sha256_text(chunk),
+                }
             )
-            try:
+
+            def before_chunk_attempt() -> None:
+                if calls >= policy.max_calls_per_document_run:
+                    raise DocumentPartialError(
+                        "document_call_budget_reached",
+                        len(analyses),
+                        len(chunks),
+                    )
+                if time.monotonic() - started >= policy.document_deadline_seconds:
+                    raise DocumentPartialError(
+                        "document_deadline_reached",
+                        len(analyses),
+                        len(chunks),
+                    )
+
+            def record_chunk_attempt() -> None:
+                nonlocal calls
+                calls += 1
                 if progress is not None:
                     progress.record_source_provider_call()
+
+            def chunk_operation() -> Mapping[str, Any]:
+                reset_provider_completion()
                 if hasattr(reader, "summarize_chunk"):
-                    analysis = reader.summarize_chunk(  # type: ignore[attr-defined]
+                    return reader.summarize_chunk(  # type: ignore[attr-defined]
                         chunk,
                         metadata,
                         question,
@@ -13489,18 +14063,22 @@ def _read_document(
                         max_output_tokens=source_chunk_output_tokens,
                         deadline_seconds=policy.request_deadline_seconds,
                     )
-                else:
-                    analysis = reader.read_source(chunk, metadata, question)
-            except Exception:
-                if provider_budget is not None:
-                    provider_budget.finish(attempt_id, status="failed")
-                raise
+                return reader.read_source(chunk, metadata, question)
+
             if provider_budget is not None:
-                provider_budget.finish(attempt_id, status="completed")
-            # One chunk call is one document-budget unit. A reader-wide
-            # transport counter races when independent documents are read in
-            # parallel and can incorrectly charge one document for another.
-            calls += 1
+                analysis = _provider_call_with_transport_retry(
+                    provider_budget,
+                    "source_chunk",
+                    provider_key,
+                    chunk_identity,
+                    chunk_operation,
+                    before_attempt=before_chunk_attempt,
+                    on_attempt=record_chunk_attempt,
+                )
+            else:
+                before_chunk_attempt()
+                record_chunk_attempt()
+                analysis = chunk_operation()
             if checkpoint_enabled:
                 write_yaml(
                     checkpoint_path,
@@ -13541,28 +14119,31 @@ def _read_document(
             raise DocumentPartialError(
                 "document_deadline_reached_before_synthesis", len(analyses), len(chunks)
             )
-        attempt_id = (
-            provider_budget.reserve(
-                "source_bundle_synthesis",
-                str(
-                    (
-                        metadata.get("_source_context", {})
-                        if isinstance(metadata.get("_source_context"), Mapping)
-                        else {}
-                    ).get("zotero_key")
-                    or document_hash
-                ),
-                stable_hash(checkpoint_identity),
-            )
-            if provider_budget is not None
-            else ""
-        )
-        try:
+        def before_synthesis_attempt() -> None:
+            if calls >= policy.max_calls_per_document_run:
+                raise DocumentPartialError(
+                    "document_call_budget_reached_before_synthesis",
+                    len(analyses),
+                    len(chunks),
+                )
+            if time.monotonic() - started >= policy.document_deadline_seconds:
+                raise DocumentPartialError(
+                    "document_deadline_reached_before_synthesis",
+                    len(analyses),
+                    len(chunks),
+                )
+
+        def record_synthesis_attempt() -> None:
+            nonlocal calls
+            calls += 1
             if progress is not None:
                 progress.record_source_provider_call()
+
+        def synthesis_operation() -> Mapping[str, Any]:
+            reset_provider_completion()
             bundle_synthesizer = getattr(reader, "synthesize_document_bundle", None)
             if callable(bundle_synthesizer):
-                merged = _ensure_source_result_contract(
+                return _ensure_source_result_contract(
                     dict(
                         bundle_synthesizer(
                             analyses,
@@ -13573,24 +14154,32 @@ def _read_document(
                         )
                     )
                 )
-            else:
-                merged = _ensure_analysis_contract(
-                    dict(
-                        reader.synthesize_document(  # type: ignore[attr-defined]
-                            analyses,
-                            metadata,
-                            question,
-                            max_output_tokens=policy.synthesis_output_tokens,
-                            deadline_seconds=policy.request_deadline_seconds,
-                        )
+            return _ensure_analysis_contract(
+                dict(
+                    reader.synthesize_document(  # type: ignore[attr-defined]
+                        analyses,
+                        metadata,
+                        question,
+                        max_output_tokens=policy.synthesis_output_tokens,
+                        deadline_seconds=policy.request_deadline_seconds,
                     )
                 )
-        except Exception:
-            if provider_budget is not None:
-                provider_budget.finish(attempt_id, status="failed")
-            raise
+            )
+
         if provider_budget is not None:
-            provider_budget.finish(attempt_id, status="completed")
+            merged = _provider_call_with_transport_retry(
+                provider_budget,
+                "source_bundle_synthesis",
+                provider_key,
+                stable_hash(checkpoint_identity),
+                synthesis_operation,
+                before_attempt=before_synthesis_attempt,
+                on_attempt=record_synthesis_attempt,
+            )
+        else:
+            before_synthesis_attempt()
+            record_synthesis_attempt()
+            merged = synthesis_operation()
         if checkpoint_enabled:
             write_yaml(
                 synthesis_path,

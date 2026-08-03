@@ -6,7 +6,7 @@ import importlib.util
 import json
 import os
 import shutil
-from dataclasses import replace
+from dataclasses import fields, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -44,6 +44,7 @@ from .pipeline import (
     all_workspace_note_rows,
     rebuild_map,
     run_pipeline,
+    source_replay_receipt_matches,
     workspace_source_set,
 )
 from .ports import (
@@ -748,6 +749,40 @@ def resume_map(
             run_id=run_id,
             errors=[{"reason": "run_request_not_found"}],
         )
+    prior_report = read_yaml(
+        run_directory(root, run_id) / "run_report.yml", {}
+    ) or {}
+    replay_request = MapRequest.from_dict(
+        {**payload, "workspace": str(root), "retry_terminal_failures": False}
+    )
+    if (
+        not retry_terminal_failures
+        and isinstance(prior_report, Mapping)
+        and str(prior_report.get("status") or "").startswith("completed")
+        and str(prior_report.get("engine_version") or "") == ENGINE_VERSION
+        and str(prior_report.get("artifact_schema_version") or "")
+        == ARTIFACT_SCHEMA_VERSION
+        and source_replay_receipt_matches(
+            root, run_id, replay_request, prior_report
+        )
+    ):
+        allowed = {field.name for field in fields(RunReport)}
+        values = {
+            key: value
+            for key, value in prior_report.items()
+            if key in allowed and key != "terminal_count"
+        }
+        manifest = values.get("artifact_manifest")
+        if isinstance(manifest, Mapping):
+            manifest_fields = {field.name for field in fields(ArtifactManifest)}
+            values["artifact_manifest"] = ArtifactManifest(
+                **{
+                    key: value
+                    for key, value in manifest.items()
+                    if key in manifest_fields
+                }
+            )
+        return RunReport(**values)
     payload["workspace"] = str(root)
     payload["retry_terminal_failures"] = retry_terminal_failures
     return run_map(

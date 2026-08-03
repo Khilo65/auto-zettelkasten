@@ -127,7 +127,7 @@ def test_resume_uses_frozen_inventory_and_source_representations(tmp_path: Path,
     assert changed_client.fulltext_calls == 0
     assert reader.calls == 0
     assert resumed.source_set["zotero_item_keys"] == ["ITEMA", "ITEMB"]
-    assert len(list((tmp_path / "11_state" / "runs" / "frozen-resume" / "reports").glob("run-report-*.yml"))) == 2
+    assert len(list((tmp_path / "11_state" / "runs" / "frozen-resume" / "reports").glob("run-report-*.yml"))) == 1
 
 
 def test_corrupt_profile_checkpoint_returns_resumable_partial(tmp_path: Path, sample_items) -> None:

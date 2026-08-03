@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
-CURRENT_ENGINE_VERSION = "0.26.0"
+CURRENT_ENGINE_VERSION = "0.27.0"
 CURRENT_ARTIFACT_SCHEMA_VERSION = "1.18"
 CURRENT_PROFILE_SCHEMA_VERSION = "1.3"
 
@@ -5587,6 +5587,14 @@ class RunReport:
     literature_failure_count: int = 0
     internal_falsification_count: int = 0
     source_peak_concurrency: int = 0
+    source_worker_peak_concurrency: int = 0
+    local_peak_concurrency: int = 0
+    provider_peak_concurrency: int = 0
+    source_queue_depth: int = 0
+    source_completions_per_minute: float = 0.0
+    provider_latency_p50_seconds: float = 0.0
+    provider_latency_p95_seconds: float = 0.0
+    provider_failure_count: int = 0
     source_stage_wall_seconds: float = 0.0
     relationship_stage_wall_seconds: float = 0.0
     cluster_peak_concurrency: int = 0
