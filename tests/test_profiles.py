@@ -911,6 +911,22 @@ def test_profile_hard_limits_anchors_to_24() -> None:
         EvidenceProfile(source_id="source-1", evidence_anchors=[anchor] * 25)
 
 
+def test_deterministic_profile_bounds_generated_anchors_to_contract() -> None:
+    note = _analytical_note().replace(
+        "- Among urban participants, participation increased trust by 12% compared with non-participants "
+        "(p < 0.05); see Table 2.",
+        "\n".join(
+            f"- Finding {index} reports an observed association; see p. {index}."
+            for index in range(1, 31)
+        ),
+    )
+
+    profile = deterministic_profile(note)
+
+    assert len(profile.findings) == 24
+    assert len(profile.evidence_anchors) == 24
+
+
 def test_v1_profile_mapping_sidecar_and_checkpoint_upgrade_mechanically(
     tmp_path: Path,
 ) -> None:

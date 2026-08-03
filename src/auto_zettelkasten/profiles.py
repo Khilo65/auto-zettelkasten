@@ -944,7 +944,7 @@ def deterministic_profile(
                 outcomes=outcomes,
             )
         )
-    findings = [_construct_finding(payload) for payload in finding_payloads]
+    findings = [_construct_finding(payload) for payload in finding_payloads[:24]]
     support_boundaries = _support_boundaries(sections, exclusion_reason)
     semantic_hash = semantic_note_hash(note_text)
     dependency_hash = profile_dependency_fingerprint(
