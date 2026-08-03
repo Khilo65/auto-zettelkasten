@@ -21,6 +21,7 @@ from auto_zettelkasten.pipeline import (
     _recover_finalized_prepared_result,
     _source_worker_count,
 )
+from auto_zettelkasten.profiles import ProfileContractError
 from auto_zettelkasten.readers import ProviderTransportError
 
 from conftest import FakeZotero
@@ -407,3 +408,65 @@ def test_frozen_sources_fill_provider_pool_while_local_workers_are_blocked(
     assert provider_started_while_local_blocked >= 32
     assert provider_peak > 4
     assert first_commit_provider_completed > 1
+
+
+def test_one_profile_commit_failure_does_not_cancel_siblings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import auto_zettelkasten.pipeline as pipeline
+
+    run_id = "isolated-commit-failure"
+    items = _items(3)
+    run_root = tmp_path / "11_state" / "runs" / run_id
+    for item in items:
+        key = str(item["key"])
+        root = run_root / "items" / key
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "source.txt").write_text("frozen text", encoding="utf-8")
+        write_yaml(root / "frozen_content.yml", {"content_hash": key})
+
+    def prepare(_workspace, _run_dir, index, item, *_args, **_kwargs):
+        key = str(item["key"])
+        return {
+            "inventory_index": index,
+            "item": dict(item),
+            "zotero_item_key": key,
+            "source_id": f"source-{key}",
+            "note_id": "",
+            "note_path": "",
+            "terminal_status": "limited_note",
+            "note_status": "metadata_only_source_note",
+            "reason": "test",
+            "attempts": [],
+        }
+
+    failed = False
+
+    def finalize(_workspace, _request, _controller, row, *_args, **_kwargs):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise ProfileContractError("bad profile")
+        return pipeline._public_terminal_row(row), None, [], []
+
+    monkeypatch.setattr(pipeline, "_prepare_item", prepare)
+    monkeypatch.setattr(pipeline, "_finalize_prepared_row", finalize)
+
+    report = run_map(
+        MapRequest(
+            tmp_path,
+            provider="deepseek",
+            model="deepseek-v4-flash",
+            allow_cloud=True,
+            provider_concurrency=3,
+            literature_policy=LiteratureMappingPolicy(synthesis_enabled=False),
+        ),
+        client=FakeZotero(items),
+        reader=_DeepSeekStub(),
+        run_id=run_id,
+    )
+
+    assert report.pending_count == 0
+    assert report.parked_for_review_count == 1
+    assert report.limited_note_count == 2

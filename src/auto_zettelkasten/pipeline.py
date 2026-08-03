@@ -1676,7 +1676,7 @@ def run_pipeline(
     source_match_index = _source_match_index(workspace)
     prepared_request_hash = _source_replay_request_hash(request)
 
-    def commit_result(row: dict[str, Any]) -> None:
+    def commit_result(row: dict[str, Any]) -> bool:
         if row.pop("_prepared_status", "") == "committed":
             row["reused"] = True
             prepared.append(row)
@@ -1690,16 +1690,40 @@ def run_pipeline(
                 phase="committed" if public_row.get("note_path") else "finished",
                 reason=str(public_row.get("reason", "")),
             )
-            return
+            return True
+        try:
+            public_row, note_row, row_proposals, row_decisions = _finalize_prepared_row(
+                workspace,
+                request,
+                controller,
+                row,
+                attempt_path,
+                source_match_index=source_match_index,
+            )
+        except Exception as exc:
+            partial_note_path = str(row.get("note_path") or "")
+            row.update(
+                terminal_status="parked_for_review",
+                reason=f"source_commit_failed:{type(exc).__name__}:{exc}",
+                note_path="",
+            )
+            if partial_note_path:
+                row["failed_artifact_path"] = partial_note_path
+            append_jsonl(
+                attempt_path,
+                _attempt(row, "source_commit", "failed", row["reason"]),
+            )
+            prepared.append(row)
+            public_row = _public_terminal_row(row)
+            terminal_rows.append(public_row)
+            progress.update(
+                int(public_row["inventory_index"]),
+                status="parked_for_review",
+                phase="finished",
+                reason=str(public_row.get("reason", "")),
+            )
+            return False
         prepared.append(row)
-        public_row, note_row, row_proposals, row_decisions = _finalize_prepared_row(
-            workspace,
-            request,
-            controller,
-            row,
-            attempt_path,
-            source_match_index=source_match_index,
-        )
         terminal_rows.append(public_row)
         if note_row:
             note_rows.append(note_row)
@@ -1713,6 +1737,7 @@ def run_pipeline(
             completed_chunks=int(row.get("completed_chunks", 0) or 0),
             total_chunks=int(row.get("total_chunks", 0) or 0),
         )
+        return True
 
     requested_concurrency = request.provider_concurrency
     workers = _source_worker_count(reader, request, len(pending))
@@ -1948,8 +1973,8 @@ def run_pipeline(
                 raise RuntimeError(
                     f"prepared_source_result_invalid:{prepared_path}"
                 )
-            commit_result(row)
-            _mark_prepared_source_result_committed(prepared_path, row)
+            if commit_result(row):
+                _mark_prepared_source_result_committed(prepared_path, row)
             committed += 1
         for future in (*local_futures, *provider_futures):
             future.result()
