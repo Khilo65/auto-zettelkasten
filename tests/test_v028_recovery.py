@@ -18,8 +18,10 @@ from auto_zettelkasten.pipeline import (
     ProviderSpendLimitReached,
     _ProfileProviderBudget,
     _RunProgress,
+    _prepared_source_result_can_queue,
     _recover_finalized_prepared_result,
     _source_worker_count,
+    _write_prepared_source_result,
 )
 from auto_zettelkasten.profiles import ProfileContractError
 from auto_zettelkasten.readers import ProviderTransportError
@@ -67,6 +69,37 @@ def test_v028_defaults_remove_total_work_ceilings(tmp_path: Path) -> None:
     assert request.literature_policy.max_synthesis_calls == 0
     assert request.literature_policy.max_memberships == 0
     assert request.literature_policy.literature_deadline_seconds == 0
+
+
+def test_prepared_result_routing_reads_valid_header_without_full_decode(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    path = _write_prepared_source_result(
+        run_root,
+        {
+            "zotero_item_key": "ITEM1",
+            "terminal_status": "validated_note",
+            "fingerprint": "fingerprint-1",
+            "item": {"key": "ITEM1"},
+        },
+        request_hash="request-1",
+    )
+
+    assert _prepared_source_result_can_queue(
+        path,
+        request_hash="request-1",
+        expected_key="ITEM1",
+        retry_terminal_failures=False,
+        workspace=tmp_path,
+    )
+    assert not _prepared_source_result_can_queue(
+        path,
+        request_hash="wrong-request",
+        expected_key="ITEM1",
+        retry_terminal_failures=False,
+        workspace=tmp_path,
+    )
 
 
 def test_explicit_provider_concurrency_is_not_clamped_to_auto_default(

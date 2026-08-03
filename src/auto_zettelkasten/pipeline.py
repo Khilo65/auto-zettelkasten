@@ -177,7 +177,7 @@ _RELATIONSHIP_SEMANTIC_POLICY_VERSION = "source-owned-bases-v26"
 _LITERATURE_MEMORY_LOCK = threading.Lock()
 _AUTO_CLOUD_SOURCE_WORKER_LIMIT = 32
 _AUTO_DEEPSEEK_SOURCE_WORKER_LIMIT = 256
-_PROGRESS_WRITE_INTERVAL_SECONDS = 1.0
+_PROGRESS_WRITE_INTERVAL_SECONDS = 10.0
 
 
 def _source_worker_count(
@@ -270,6 +270,52 @@ def _load_prepared_source_result(
         return None
     row["_prepared_status"] = str(value.get("status") or "")
     return row
+
+
+def _prepared_source_result_can_queue(
+    path: Path,
+    *,
+    request_hash: str,
+    expected_key: str,
+    retry_terminal_failures: bool,
+    workspace: Path,
+) -> bool:
+    """Route a checkpoint without decoding its large YAML body twice."""
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+    def scalar(name: str, *, indent: int = 0) -> str:
+        match = re.search(
+            rf"^{' ' * indent}{re.escape(name)}:\s*([^\n]+)$",
+            text,
+            flags=re.MULTILINE,
+        )
+        return str(match.group(1) if match else "").strip().strip("'\"")
+
+    status = scalar("status")
+    terminal_status = scalar("terminal_status", indent=2)
+    fingerprint = scalar("fingerprint")
+    if (
+        scalar("prepared_result_version") != _PREPARED_SOURCE_RESULT_VERSION
+        or scalar("engine_version") != ENGINE_VERSION
+        or scalar("request_hash") != request_hash
+        or scalar("zotero_item_key") != expected_key
+        or status not in {"ready", "committed"}
+        or terminal_status in {"paused_transport", "partial"}
+        or (retry_terminal_failures and terminal_status == "parked_for_review")
+    ):
+        return False
+    if status != "committed" or not fingerprint:
+        return True
+    receipt = read_yaml(
+        workspace / "11_state" / "fingerprints" / f"{fingerprint}.yml",
+        {},
+    ) or {}
+    note_path = str(receipt.get("note_path") or "")
+    return not note_path or (workspace / note_path).is_file()
 
 
 def _mark_prepared_source_result_committed(
@@ -1908,35 +1954,12 @@ def run_pipeline(
         for index, item in pending:
             key = item_key(item)
             prepared_path = _prepared_source_result_path(run_dir, key)
-            saved_prepared = (
-                _load_prepared_source_result(
-                    prepared_path, request_hash=prepared_request_hash
-                )
-                if prepared_path.exists()
-                else None
-            )
-            if saved_prepared is not None:
-                saved_prepared = _recover_finalized_prepared_result(
-                    workspace, prepared_path, saved_prepared
-                )
-            saved_status = str(
-                (saved_prepared or {}).get("terminal_status") or ""
-            )
-            saved_note_path = workspace / str(
-                (saved_prepared or {}).get("note_path") or ""
-            )
-            if (
-                saved_prepared
-                and saved_status not in {"paused_transport", "partial"}
-                and not (
-                    request.retry_terminal_failures
-                    and saved_status == "parked_for_review"
-                )
-                and not (
-                    saved_prepared.get("_prepared_status") == "committed"
-                    and saved_prepared.get("note_path")
-                    and not saved_note_path.is_file()
-                )
+            if prepared_path.exists() and _prepared_source_result_can_queue(
+                prepared_path,
+                request_hash=prepared_request_hash,
+                expected_key=key,
+                retry_terminal_failures=request.retry_terminal_failures,
+                workspace=workspace,
             ):
                 completion_queue.put(prepared_path)
                 record_queue("completion", completion_queue)
@@ -1979,6 +2002,9 @@ def run_pipeline(
                 raise RuntimeError(
                     f"prepared_source_result_invalid:{prepared_path}"
                 )
+            row = _recover_finalized_prepared_result(
+                workspace, prepared_path, row
+            )
             if commit_result(row):
                 _mark_prepared_source_result_committed(prepared_path, row)
             committed += 1
