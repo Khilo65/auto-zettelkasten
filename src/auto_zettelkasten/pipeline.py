@@ -177,7 +177,7 @@ _RELATIONSHIP_SEMANTIC_POLICY_VERSION = "source-owned-bases-v26"
 _LITERATURE_MEMORY_LOCK = threading.Lock()
 _AUTO_CLOUD_SOURCE_WORKER_LIMIT = 32
 _AUTO_DEEPSEEK_SOURCE_WORKER_LIMIT = 256
-_PROGRESS_WRITE_INTERVAL_SECONDS = 10.0
+_PROGRESS_WRITE_INTERVAL_SECONDS = 1.0
 
 
 def _source_worker_count(
@@ -315,6 +315,8 @@ def _prepared_source_result_can_queue(
         {},
     ) or {}
     note_path = str(receipt.get("note_path") or "")
+    if terminal_status in {"validated_note", "limited_note"}:
+        return bool(note_path) and (workspace / note_path).is_file()
     return not note_path or (workspace / note_path).is_file()
 
 
@@ -1110,6 +1112,10 @@ class _RunProgress:
         self._write_timer: threading.Timer | None = None
         self._last_write_monotonic = 0.0
         self._dirty = False
+        self._write_interval_seconds = max(
+            _PROGRESS_WRITE_INTERVAL_SECONDS,
+            10.0 if len(items) > 1_000 else 0.0,
+        )
         previous = read_yaml(path, {}) or {} if resume else {}
         previous_items = (
             previous.get("items", {})
@@ -1380,12 +1386,12 @@ class _RunProgress:
     def _request_write_locked(self) -> None:
         self._dirty = True
         elapsed = time.monotonic() - self._last_write_monotonic
-        if elapsed >= _PROGRESS_WRITE_INTERVAL_SECONDS:
+        if elapsed >= self._write_interval_seconds:
             self._flush_locked()
             return
         if self._write_timer is None:
             self._write_timer = threading.Timer(
-                _PROGRESS_WRITE_INTERVAL_SECONDS - elapsed,
+                self._write_interval_seconds - elapsed,
                 self._timer_flush,
             )
             self._write_timer.daemon = True
@@ -1809,6 +1815,7 @@ def run_pipeline(
     provider_queue: queue.Queue[Any] = queue.Queue(maxsize=max(1, len(pending)))
     completion_queue: queue.Queue[Path] = queue.Queue(maxsize=max(1, len(pending)))
     worker_errors: queue.Queue[BaseException] = queue.Queue()
+    saved_prepared_paths: set[Path] = set()
     local_stop = object()
     local_exit_lock = threading.Lock()
     local_exits = 0
@@ -1961,6 +1968,7 @@ def run_pipeline(
                 retry_terminal_failures=request.retry_terminal_failures,
                 workspace=workspace,
             ):
+                saved_prepared_paths.add(prepared_path)
                 completion_queue.put(prepared_path)
                 record_queue("completion", completion_queue)
                 continue
@@ -2002,9 +2010,10 @@ def run_pipeline(
                 raise RuntimeError(
                     f"prepared_source_result_invalid:{prepared_path}"
                 )
-            row = _recover_finalized_prepared_result(
-                workspace, prepared_path, row
-            )
+            if prepared_path in saved_prepared_paths:
+                row = _recover_finalized_prepared_result(
+                    workspace, prepared_path, row
+                )
             if commit_result(row):
                 _mark_prepared_source_result_committed(prepared_path, row)
             committed += 1
@@ -2132,6 +2141,7 @@ def run_pipeline(
     )
     prepared.sort(key=lambda row: int(row.get("inventory_index", 0)))
     tag_report = commit_tag_reviews(workspace, proposals, decisions)
+    _rebuild_remediation_ledgers(workspace, prepared)
     _rebuild_literature_memory_from_bundles(
         workspace,
         source_ids={
@@ -2765,6 +2775,7 @@ def _finalize_prepared_row(
             request,
             source_match_index=source_match_index,
             defer_literature_memory=True,
+            defer_remediation_ledgers=True,
         )
     if row.get("quality_diagnostics"):
         write_yaml(
@@ -2804,6 +2815,7 @@ def _commit_source_bundle(
     *,
     source_match_index: Mapping[str, Any] | None = None,
     defer_literature_memory: bool = False,
+    defer_remediation_ledgers: bool = False,
 ) -> None:
     bundle = SourceAnalysisBundle.from_dict(
         dict(row["source_analysis_bundle"])
@@ -2930,7 +2942,8 @@ def _commit_source_bundle(
                 note_path,
                 source_index=source_match_index,
             )
-        _commit_remediation_ledgers(workspace, row, bundle)
+        if not defer_remediation_ledgers:
+            _commit_remediation_ledgers(workspace, row, bundle)
 
 
 def _source_bundle_dependency_fingerprint(
@@ -4023,6 +4036,10 @@ def _commit_remediation_ledgers(
     workspace: Path,
     row: Mapping[str, Any],
     bundle: SourceAnalysisBundle,
+    *,
+    metadata_rows: dict[str, dict[str, Any]] | None = None,
+    classification_rows: dict[str, dict[str, Any]] | None = None,
+    write: bool = True,
 ) -> None:
     canonical = item_data(row.get("item", {}))
     observed = dict(bundle.observed_bibliographic_identity)
@@ -4058,16 +4075,18 @@ def _commit_remediation_ledgers(
             / "zotero"
             / "zotero_metadata_issues.yml"
         )
-        existing = read_yaml(path, {}) or {}
-        rows = {
-            str(value.get("issue_id") or ""): dict(value)
-            for value in (
-                existing.get("issues", [])
-                if isinstance(existing, Mapping)
-                else []
-            )
-            if isinstance(value, Mapping) and value.get("issue_id")
-        }
+        rows = metadata_rows
+        if rows is None:
+            existing = read_yaml(path, {}) or {}
+            rows = {
+                str(value.get("issue_id") or ""): dict(value)
+                for value in (
+                    existing.get("issues", [])
+                    if isinstance(existing, Mapping)
+                    else []
+                )
+                if isinstance(value, Mapping) and value.get("issue_id")
+            }
         issue_id = "zotero-metadata-" + stable_hash(
             [row.get("zotero_item_key", ""), differences]
         )[:16]
@@ -4094,15 +4113,16 @@ def _commit_remediation_ledgers(
                 else ""
             ),
         }
-        values = [rows[key] for key in sorted(rows)]
-        write_yaml(
-            path,
-            {
-                "zotero_metadata_issue_schema_version": "1",
-                "issues": values,
-                "revision_hash": stable_hash(values),
-            },
-        )
+        if write:
+            values = [rows[key] for key in sorted(rows)]
+            write_yaml(
+                path,
+                {
+                    "zotero_metadata_issue_schema_version": "1",
+                    "issues": values,
+                    "revision_hash": stable_hash(values),
+                },
+            )
     diagnostics = list(bundle.component_diagnostics)
     for field in ("source_scope", "evidence_eligibility", "content_kind"):
         observed_value = bundle.scope_assessment.get(field)
@@ -4124,16 +4144,18 @@ def _commit_remediation_ledgers(
             )
     if diagnostics:
         path = workspace / "11_state" / "pipeline_classification_issues.yml"
-        existing = read_yaml(path, {}) or {}
-        rows = {
-            str(value.get("issue_id") or ""): dict(value)
-            for value in (
-                existing.get("issues", [])
-                if isinstance(existing, Mapping)
-                else []
-            )
-            if isinstance(value, Mapping) and value.get("issue_id")
-        }
+        rows = classification_rows
+        if rows is None:
+            existing = read_yaml(path, {}) or {}
+            rows = {
+                str(value.get("issue_id") or ""): dict(value)
+                for value in (
+                    existing.get("issues", [])
+                    if isinstance(existing, Mapping)
+                    else []
+                )
+                if isinstance(value, Mapping) and value.get("issue_id")
+            }
         issue_id = "pipeline-classification-" + stable_hash(
             [row.get("source_id", ""), diagnostics]
         )[:16]
@@ -4145,15 +4167,94 @@ def _commit_remediation_ledgers(
             "diagnostics": diagnostics,
             "status": str(prior.get("status") or "open"),
         }
-        values = [rows[key] for key in sorted(rows)]
-        write_yaml(
-            path,
-            {
-                "pipeline_classification_issue_schema_version": "1",
-                "issues": values,
-                "revision_hash": stable_hash(values),
-            },
+        if write:
+            values = [rows[key] for key in sorted(rows)]
+            write_yaml(
+                path,
+                {
+                    "pipeline_classification_issue_schema_version": "1",
+                    "issues": values,
+                    "revision_hash": stable_hash(values),
+                },
+            )
+
+
+def _rebuild_remediation_ledgers(
+    workspace: Path, rows: Sequence[Mapping[str, Any]]
+) -> None:
+    metadata_path = (
+        workspace / "01_custody" / "zotero" / "zotero_metadata_issues.yml"
+    )
+    classification_path = (
+        workspace / "11_state" / "pipeline_classification_issues.yml"
+    )
+
+    def issue_map(path: Path) -> dict[str, dict[str, Any]]:
+        existing = read_yaml(path, {}) or {}
+        return {
+            str(value.get("issue_id") or ""): dict(value)
+            for value in (
+                existing.get("issues", [])
+                if isinstance(existing, Mapping)
+                else []
+            )
+            if isinstance(value, Mapping) and value.get("issue_id")
+        }
+
+    metadata_rows = issue_map(metadata_path)
+    classification_rows = issue_map(classification_path)
+    for row in rows:
+        if (
+            not row.get("note_path")
+            or str(row.get("terminal_status") or "")
+            not in {"validated_note", "limited_note"}
+        ):
+            continue
+        payload = row.get("source_analysis_bundle")
+        if not isinstance(payload, Mapping):
+            record = read_yaml(
+                workspace
+                / "02_source_memory"
+                / "bundles"
+                / f"{safe_filename(str(row.get('source_id') or ''))}.yml",
+                {},
+            ) or {}
+            payload = record.get("bundle") if isinstance(record, Mapping) else None
+        if not isinstance(payload, Mapping):
+            continue
+        try:
+            bundle = SourceAnalysisBundle.from_dict(payload)
+        except (TypeError, ValueError):
+            continue
+        _commit_remediation_ledgers(
+            workspace,
+            row,
+            bundle,
+            metadata_rows=metadata_rows,
+            classification_rows=classification_rows,
+            write=False,
         )
+
+    metadata_values = [metadata_rows[key] for key in sorted(metadata_rows)]
+    write_yaml(
+        metadata_path,
+        {
+            "zotero_metadata_issue_schema_version": "1",
+            "issues": metadata_values,
+            "revision_hash": stable_hash(metadata_values),
+        },
+    )
+    classification_values = [
+        classification_rows[key] for key in sorted(classification_rows)
+    ]
+    write_yaml(
+        classification_path,
+        {
+            "pipeline_classification_issue_schema_version": "1",
+            "issues": classification_values,
+            "revision_hash": stable_hash(classification_values),
+        },
+    )
 
 
 def _park_note_decisions(
