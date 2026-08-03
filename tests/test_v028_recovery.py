@@ -272,6 +272,33 @@ def test_cancelled_provider_call_does_not_start_transport_retry(
     assert budget.cumulative_calls == 1
 
 
+def test_active_response_cancellation_interrupts_socket_without_buffered_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import auto_zettelkasten.readers as readers
+
+    class FakeSocket:
+        shutdown_calls: list[int] = []
+
+        def shutdown(self, how: int) -> None:
+            self.shutdown_calls.append(how)
+
+    class FakeResponse:
+        def __init__(self) -> None:
+            self.fp = SimpleNamespace(raw=SimpleNamespace(_sock=FakeSocket()))
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    response = FakeResponse()
+    monkeypatch.setattr(readers, "_ACTIVE_RESPONSES", {1: response})
+
+    assert readers.cancel_active_provider_responses() == 1
+    assert response.fp.raw._sock.shutdown_calls
+    assert response.closed is False
+
+
 def test_frozen_sources_fill_provider_pool_while_local_workers_are_blocked(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

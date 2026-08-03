@@ -87,11 +87,20 @@ _ACTIVE_RESPONSES: dict[int, Any] = {}
 
 
 def cancel_active_provider_responses() -> int:
-    """Close active HTTP responses so controlled shutdown can unwind reads."""
+    """Interrupt active reads without contending on urllib's buffered lock."""
 
     with _ACTIVE_RESPONSE_LOCK:
         responses = list(_ACTIVE_RESPONSES.values())
     for response in responses:
+        candidate = getattr(getattr(response, "fp", None), "raw", None)
+        socket_value = getattr(candidate, "_sock", None)
+        shutdown = getattr(socket_value, "shutdown", None)
+        if callable(shutdown):
+            try:
+                shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            continue
         try:
             response.close()
         except Exception:
