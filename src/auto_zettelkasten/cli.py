@@ -294,11 +294,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.workspace,
                 args.run_id,
                 retry_terminal_failures=args.retry_terminal_literature,
-                max_provider_spend_usd=(
-                    args.max_provider_spend_usd
-                    if args.max_provider_spend_usd is not None
-                    else config.get("max_provider_spend_usd")
-                ),
+                max_provider_spend_usd=args.max_provider_spend_usd,
             ).to_dict()
         elif args.command == "status":
             report = get_status(args.workspace, args.run_id or None)
