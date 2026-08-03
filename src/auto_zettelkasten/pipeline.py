@@ -1682,6 +1682,12 @@ def run_pipeline(
             prepared.append(row)
             public_row = _public_terminal_row(row)
             terminal_rows.append(public_row)
+            reused_proposals = [
+                dict(value)
+                for value in propose_tags(row["item"], str(row["note_id"]))
+            ]
+            proposals.extend(reused_proposals)
+            decisions.extend(_review_tags(controller, reused_proposals))
             if public_row.get("note_path"):
                 note_rows.append(_note_summary_from_path(workspace, public_row))
             progress.update(
@@ -2100,6 +2106,17 @@ def run_pipeline(
     )
     prepared.sort(key=lambda row: int(row.get("inventory_index", 0)))
     tag_report = commit_tag_reviews(workspace, proposals, decisions)
+    _rebuild_literature_memory_from_bundles(
+        workspace,
+        source_ids={
+            str(row.get("source_id") or "")
+            for row in terminal_rows
+            if row.get("note_path")
+            and str(row.get("terminal_status") or "")
+            in {"validated_note", "limited_note"}
+            and row.get("source_id")
+        },
+    )
     _reconcile_literature_memory(workspace)
 
     note_rows = _deduplicate_note_rows(note_rows)
@@ -2695,7 +2712,6 @@ def _finalize_prepared_row(
         )
         append_jsonl(attempt_path, _attempt(row, route, "failed", row["reason"]))
         decisions = _park_note_decisions(decisions)
-        commit_tag_reviews(workspace, proposals, decisions)
         return _public_terminal_row(row), None, proposals, decisions
     if not validation.passed:
         row.update(
@@ -2708,7 +2724,6 @@ def _finalize_prepared_row(
             _attempt(row, route, "failed", row["reason"], output_path=str(path)),
         )
         decisions = _park_note_decisions(decisions)
-        commit_tag_reviews(workspace, proposals, decisions)
         return _public_terminal_row(row), None, proposals, decisions
 
     relative_path = str(path.relative_to(workspace))
@@ -2723,6 +2738,7 @@ def _finalize_prepared_row(
             path,
             request,
             source_match_index=source_match_index,
+            defer_literature_memory=True,
         )
     if row.get("quality_diagnostics"):
         write_yaml(
@@ -2743,9 +2759,8 @@ def _finalize_prepared_row(
         attempt_path,
         _attempt(row, route, "succeeded", "note_committed", output_path=str(path)),
     )
-    commit_tag_reviews(workspace, proposals, decisions)
-    # This receipt is last: its presence proves note, bundle, diagnostics,
-    # attempts, and tag side effects were all committed.
+    # This receipt is last for per-source semantic artifacts. Global tag and
+    # literature projections are rebuilt once at the source-stage barrier.
     _write_fingerprint(workspace, row, relative_path)
     return (
         _public_terminal_row(row),
@@ -2762,6 +2777,7 @@ def _commit_source_bundle(
     request: MapRequest,
     *,
     source_match_index: Mapping[str, Any] | None = None,
+    defer_literature_memory: bool = False,
 ) -> None:
     bundle = SourceAnalysisBundle.from_dict(
         dict(row["source_analysis_bundle"])
@@ -2881,12 +2897,13 @@ def _commit_source_bundle(
     }
     save_profile(workspace / "02_source_memory" / "profiles", profile)
     with _LITERATURE_MEMORY_LOCK:
-        _commit_literature_memory(
-            workspace,
-            bundle,
-            note_path,
-            source_index=source_match_index,
-        )
+        if not defer_literature_memory:
+            _commit_literature_memory(
+                workspace,
+                bundle,
+                note_path,
+                source_index=source_match_index,
+            )
         _commit_remediation_ledgers(workspace, row, bundle)
 
 
@@ -3082,6 +3099,220 @@ def _commit_literature_memory(
             "revision_hash": stable_hash(missing_rows),
         },
     )
+
+
+def _rebuild_literature_memory_from_bundles(
+    workspace: Path, *, source_ids: set[str]
+) -> None:
+    """Rebuild global citation memory once after source commits finish.
+
+    Per-source bundles are the crash-safe source of truth. Re-reading and
+    rewriting the growing global registries after every source is quadratic at
+    library scale, so the active source pipeline defers only this projection to
+    the terminal barrier.
+    """
+
+    bundles: dict[str, SourceAnalysisBundle] = {}
+    bundle_root = workspace / "02_source_memory" / "bundles"
+    for path in sorted(bundle_root.glob("*.yml")):
+        record = read_yaml(path, {}) or {}
+        payload = record.get("bundle") if isinstance(record, Mapping) else None
+        if not isinstance(payload, Mapping):
+            continue
+        try:
+            bundle = SourceAnalysisBundle.from_dict(payload)
+        except (TypeError, ValueError):
+            continue
+        source_id = str(bundle.source_identity.get("source_id") or "")
+        if source_id in source_ids:
+            bundles[source_id] = bundle
+    index_root = workspace / "02_source_memory" / "indexes"
+    positions_path = index_root / "literature_positions.yml"
+    existing = read_yaml(positions_path, {}) or {}
+    positions_by_id = {
+        str(row.get("literature_position_id") or ""): dict(row)
+        for row in (
+            existing.get("positions", [])
+            if isinstance(existing, Mapping)
+            else []
+        )
+        if isinstance(row, Mapping)
+        and row.get("literature_position_id")
+        and str(row.get("current_source_id") or "") not in source_ids
+    }
+    source_index = _source_match_index(workspace)
+    projected_by_source: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
+    missing_path = index_root / "missing_sources.yml"
+    missing_existing = read_yaml(missing_path, {}) or {}
+    missing_by_id = {
+        str(row.get("external_source_id") or ""): dict(row)
+        for row in (
+            missing_existing.get("sources", [])
+            if isinstance(missing_existing, Mapping)
+            else []
+        )
+        if isinstance(row, Mapping) and row.get("external_source_id")
+    }
+    for external_id, prior in list(missing_by_id.items()):
+        discussing = sorted(
+            {
+                str(value)
+                for value in prior.get("discussed_by_source_ids", []) or []
+                if str(value) and str(value) not in source_ids
+            }
+        )
+        if discussing:
+            prior["discussed_by_source_ids"] = discussing
+        else:
+            del missing_by_id[external_id]
+
+    for current_source_id, bundle in sorted(bundles.items()):
+        projected_positions: list[dict[str, Any]] = []
+        for position in bundle.literature_positions:
+            row = position.to_dict()
+            match = _match_literature_position_detail(row, source_index)
+            matched = str(match.get("source_id") or "")
+            if matched == current_source_id:
+                matched = ""
+                match = {
+                    **match,
+                    "status": "not_in_snapshot",
+                    "basis": "self_citation_ignored",
+                    "source_id": "",
+                    "candidates": [],
+                }
+            row.update(
+                matched_source_id=matched,
+                match_status=str(match.get("status") or "not_in_snapshot"),
+                match_basis=str(match.get("basis") or ""),
+                match_confidence=str(match.get("confidence") or ""),
+                matched_zotero_key=str(match.get("zotero_key") or ""),
+                match_candidates=list(match.get("candidates") or []),
+            )
+            positions_by_id[position.literature_position_id] = row
+            projected_positions.append(row)
+        projected_by_source[current_source_id] = projected_positions
+
+        recommendations = [
+            recommendation.to_dict()
+            for recommendation in bundle.missing_source_recommendations
+        ]
+        recommendations.extend(
+            {
+                "external_source_id": "external-source-"
+                + stable_hash(
+                    {
+                        "citation": row.get("raw_citation", ""),
+                        "identifiers": row.get("identifiers", {}),
+                    }
+                )[:16],
+                "raw_citation": row.get("raw_citation", ""),
+                "normalized_citation": {
+                    key: str(row.get(key) or "")
+                    for key in ("author", "year", "title")
+                },
+                "identifiers": dict(row.get("identifiers") or {}),
+                "discussed_by_source_ids": [current_source_id],
+                "importance": str(row.get("engagement") or ""),
+                "relevant_collections": [],
+                "relevant_topics": [],
+                "relevant_clusters": [],
+                "acquisition_priority": "normal",
+                "match_status": "unresolved",
+                "retrieval_status": "not_requested",
+                "ambiguity_notes": "",
+                "zotero_key": "",
+                "source_id": "",
+                "note_id": "",
+            }
+            for row in projected_positions
+            if not row.get("matched_source_id")
+        )
+        for row in recommendations:
+            external_id = str(row.get("external_source_id") or "")
+            if not external_id:
+                continue
+            prior = missing_by_id.get(external_id, {})
+            missing_by_id[external_id] = {
+                **dict(row),
+                "discussed_by_source_ids": sorted(
+                    {
+                        str(value)
+                        for value in (
+                            list(prior.get("discussed_by_source_ids", []) or [])
+                            + list(row.get("discussed_by_source_ids", []) or [])
+                        )
+                        if str(value)
+                    }
+                ),
+                **{
+                    field: sorted(
+                        {
+                            str(value)
+                            for value in (
+                                list(prior.get(field, []) or [])
+                                + list(row.get(field, []) or [])
+                            )
+                            if str(value)
+                        }
+                    )
+                    for field in (
+                        "relevant_collections",
+                        "relevant_topics",
+                        "relevant_clusters",
+                    )
+                },
+                "acquisition_priority": str(
+                    prior.get("acquisition_priority")
+                    or row.get("acquisition_priority")
+                    or "normal"
+                ),
+                "retrieval_status": str(
+                    prior.get("retrieval_status")
+                    or row.get("retrieval_status")
+                    or "not_requested"
+                ),
+            }
+
+    positions = [positions_by_id[key] for key in sorted(positions_by_id)]
+    write_yaml(
+        positions_path,
+        {
+            "literature_position_registry_schema_version": "2",
+            "positions": positions,
+            "revision_hash": stable_hash(positions),
+        },
+    )
+    missing_rows = [missing_by_id[key] for key in sorted(missing_by_id)]
+    write_yaml(
+        missing_path,
+        {
+            "missing_source_registry_schema_version": "1",
+            "sources": missing_rows,
+            "revision_hash": stable_hash(missing_rows),
+        },
+    )
+
+    for source_id, rows in sorted(projected_by_source.items()):
+        source = source_index["by_source_id"].get(source_id)
+        if not source:
+            continue
+        wikilinks = {
+            str(row.get("literature_position_id") or ""): str(
+                source_index["by_source_id"][str(row["matched_source_id"])][
+                    "stem"
+                ]
+            )
+            for row in rows
+            if row.get("matched_source_id")
+            and str(row["matched_source_id"]) in source_index["by_source_id"]
+        }
+        update_note_literature(
+            workspace / "02_source_memory" / "notes" / f"{source['stem']}.md",
+            rows,
+            wikilinks,
+        )
 
 
 def _reconcile_literature_memory(workspace: Path) -> None:

@@ -407,6 +407,40 @@ def test_committed_note_projects_clean_frontmatter_and_keeps_machine_sidecar(
     assert (tmp_path / "11_state" / "note_metadata" / "note-clean.yml").is_file()
 
 
+def test_current_workspace_does_not_scan_all_notes_for_a_new_note(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "11_state" / "note_metadata").mkdir(parents=True)
+    notes_dir = tmp_path / "02_source_memory" / "notes"
+    notes_dir.mkdir(parents=True)
+    original_glob = Path.glob
+
+    def reject_note_scan(path: Path, pattern: str):
+        if path == notes_dir and pattern == "*.md":
+            raise AssertionError("new-note lookup scanned the whole note library")
+        return original_glob(path, pattern)
+
+    monkeypatch.setattr(Path, "glob", reject_note_scan)
+    frontmatter = _note_frontmatter(
+        status="analytical_atomic_note",
+        source_scope="full_document",
+        coverage_gate="passed",
+    )
+    frontmatter.update(
+        note_id="note-new",
+        source_id="source-new",
+        title="New Note",
+        reader_provider="deepseek",
+        reader_model="deepseek-v4-flash",
+    )
+    analysis = {key: f"Grounded {key}; see page 1." for key in SECTION_KEYS}
+
+    path, validation = write_atomic_note(tmp_path, frontmatter, analysis)
+
+    assert validation.passed
+    assert path.is_file()
+
+
 def _note_frontmatter(*, status: str, source_scope: str, coverage_gate: str) -> dict[str, object]:
     return {
         "note_id": "limited-n1",

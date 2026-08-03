@@ -1091,6 +1091,31 @@ def _public_note_text(text: str, frontmatter: Mapping[str, Any]) -> str:
 
 
 def _existing_note_for_id(notes_dir: Path, note_id: str) -> Path | None:
+    workspace = notes_dir.parent.parent
+    metadata_root = workspace / "11_state" / "note_metadata"
+    metadata_path = _note_metadata_path(workspace, note_id)
+    metadata_exists = metadata_path.is_file()
+    metadata = read_yaml(metadata_path, {}) or {}
+    stored_path = str(metadata.get("note_path") or "")
+    stored_frontmatter = metadata.get("frontmatter")
+    if (
+        stored_path
+        and isinstance(stored_frontmatter, Mapping)
+        and str(stored_frontmatter.get("note_id") or "") == note_id
+    ):
+        candidate = workspace / stored_path
+        if candidate.is_file():
+            try:
+                projected, _ = parse_atomic_note(candidate.read_text(encoding="utf-8"))
+            except (OSError, yaml.YAMLError):
+                projected = {}
+            if str(projected.get("note_id") or "") == note_id:
+                return candidate
+    # Current workspaces maintain a direct note-id index. A missing entry means
+    # this is a new note; scanning every existing note here is quadratic.
+    if metadata_root.is_dir() and not metadata_exists:
+        return None
+    # Legacy workspaces without note metadata retain the old compatibility scan.
     for path in notes_dir.glob("*.md"):
         try:
             frontmatter, _ = parse_atomic_note(path.read_text(encoding="utf-8"))
