@@ -1080,9 +1080,10 @@ def test_profile_call_budget_caps_source_generation_without_profile_calls(
         run_id="profile-budget",
     )
 
-    assert report.status == "completed_with_parked_items"
+    assert report.status == "partial"
     assert report.validated_note_count == 1
-    assert report.parked_for_review_count == 1
+    assert report.parked_for_review_count == 0
+    assert report.pending_count == 1
     assert report.source_provider_call_count == 1
     assert reasoner.profile_calls == 0
 

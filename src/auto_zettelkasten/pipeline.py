@@ -501,6 +501,10 @@ class ProviderSpendLimitReached(RuntimeError):
     pass
 
 
+class ProviderCallLimitReached(RuntimeError):
+    pass
+
+
 class _LocalAcquisitionGate:
     """Bound local Zotero/extraction work independently from provider calls."""
 
@@ -601,7 +605,9 @@ class _ProfileProviderBudget:
     def reserve(self, stage: str, key: str, fingerprint: str) -> str:
         with self._lock:
             if self.max_calls is not None and self.cumulative_calls >= self.max_calls:
-                raise RuntimeError("source_profile_call_budget_reached")
+                raise ProviderCallLimitReached(
+                    "source_profile_call_budget_reached"
+                )
             if (
                 self.max_spend_usd is not None
                 and (
@@ -1829,7 +1835,7 @@ def run_pipeline(
                         require_frozen_content=True,
                         cancel_event=cancel_event,
                     )
-                except ProviderSpendLimitReached:
+                except (ProviderCallLimitReached, ProviderSpendLimitReached):
                     budget_pause_event.set()
                     return
                 except Exception as exc:
@@ -12329,7 +12335,7 @@ def _prepare_item(
             _attempt(base, "hierarchical_reader", "limited", base["reason"])
         )
         return base
-    except ProviderSpendLimitReached:
+    except (ProviderCallLimitReached, ProviderSpendLimitReached):
         raise
     except Exception as exc:
         raw_response = str(getattr(exc, "raw_response", "") or "")

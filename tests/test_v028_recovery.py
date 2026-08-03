@@ -14,6 +14,7 @@ from auto_zettelkasten.extraction import ExtractionCancelled, _run_cancellable
 from auto_zettelkasten.files import read_yaml, write_yaml
 from auto_zettelkasten.models import LiteratureMappingPolicy, MapRequest, ProcessingPolicy
 from auto_zettelkasten.pipeline import (
+    ProviderCallLimitReached,
     ProviderSpendLimitReached,
     _ProfileProviderBudget,
     _RunProgress,
@@ -109,6 +110,14 @@ def test_dollar_budget_uses_provider_usage_and_drains_before_next_attempt(
 
     assert budget.cumulative_spend_usd == Decimal("0.0000028")
     with pytest.raises(ProviderSpendLimitReached):
+        budget.reserve("source", "B", "fingerprint")
+
+
+def test_explicit_call_limit_uses_controlled_pause_exception(tmp_path: Path) -> None:
+    budget = _ProfileProviderBudget(tmp_path / "provider_usage.yml", 1)
+    budget.reserve("source", "A", "fingerprint")
+
+    with pytest.raises(ProviderCallLimitReached):
         budget.reserve("source", "B", "fingerprint")
 
 
