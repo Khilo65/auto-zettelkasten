@@ -439,7 +439,7 @@ def test_oversized_cluster_synthesis_is_rejected_before_provider_call(
     assert replay.cumulative_provider_calls == 0
 
 
-def test_interrupted_attempt_becomes_terminal_without_automatic_retry(
+def test_interrupted_attempt_is_retryable_on_resume(
     tmp_path: Path,
 ) -> None:
     reasoner = _CallReasoner(failure=KeyboardInterrupt())
@@ -449,19 +449,19 @@ def test_interrupted_attempt_becomes_terminal_without_automatic_retry(
         _CheckpointedReasonerCalls(
             tmp_path, "run", reasoner, request
         )("cluster_proposal", "one", "propose_clusters", [], {})
-    terminal = _CheckpointedReasonerCalls(
-        tmp_path, "run", reasoner, request
+    recovering = _CallReasoner()
+    resumed = _CheckpointedReasonerCalls(
+        tmp_path, "run", recovering, request
     )
-    with pytest.raises(
-        LiteratureSynthesisPartialError,
-        match="literature_synthesis_terminal_failure:cluster_proposal:one",
-    ):
-        terminal("cluster_proposal", "one", "propose_clusters", [], {})
+    assert resumed(
+        "cluster_proposal", "one", "propose_clusters", [], {}
+    ) == {"clusters": []}
 
-    usage = read_yaml(terminal.usage_path, {})
+    usage = read_yaml(resumed.usage_path, {})
     assert reasoner.calls == 1
-    assert usage["provider_call_count"] == 1
-    assert [row["attempt"] for row in usage["attempts"]] == [1]
+    assert recovering.calls == 1
+    assert usage["provider_call_count"] == 2
+    assert sorted(row["attempt"] for row in usage["attempts"]) == [1, 2]
 
 
 def test_transport_failure_gets_one_checkpointed_resume_retry(
@@ -491,11 +491,11 @@ def test_transport_failure_gets_one_checkpointed_resume_retry(
     reasoner.failure = None
     resumed = _CheckpointedReasonerCalls(tmp_path, "run", reasoner, request)
     resumed("cluster_proposal", "one", "propose_clusters", [], {})
-    assert reasoner.calls == 2
-    assert resumed.cumulative_provider_calls == 2
+    assert reasoner.calls == 3
+    assert resumed.cumulative_provider_calls == 3
 
 
-def test_second_transport_failure_becomes_immediately_terminal(
+def test_repeated_transport_failure_remains_retryable(
     tmp_path: Path,
 ) -> None:
     reasoner = _CallReasoner(failure=TimeoutError("provider request timed out"))
@@ -506,10 +506,7 @@ def test_second_transport_failure_becomes_immediately_terminal(
             tmp_path, "run", reasoner, request
         )("cluster_proposal", "one", "propose_clusters", [], {})
     resumed = _CheckpointedReasonerCalls(tmp_path, "run", reasoner, request)
-    with pytest.raises(
-        LiteratureSynthesisPartialError,
-        match="literature_synthesis_terminal_failure:cluster_proposal:one",
-    ):
+    with pytest.raises(TimeoutError, match="provider request timed out"):
         resumed("cluster_proposal", "one", "propose_clusters", [], {})
     checkpoint = read_yaml(
         tmp_path
@@ -522,16 +519,16 @@ def test_second_transport_failure_becomes_immediately_terminal(
         / "one.yml",
         {},
     )
-    assert checkpoint["terminal"] is True
-    assert checkpoint["retry_on_resume"] is False
+    assert checkpoint["terminal"] is False
+    assert checkpoint["retry_on_resume"] is True
 
     final = _CheckpointedReasonerCalls(tmp_path, "run", reasoner, request)
     with pytest.raises(
         LiteratureSynthesisPartialError,
-        match="literature_synthesis_terminal_failure:cluster_proposal:one",
+        match="literature_synthesis_call_budget_reached",
     ):
         final("cluster_proposal", "one", "propose_clusters", [], {})
-    assert reasoner.calls == 2
+    assert reasoner.calls == 3
 
 
 def test_contract_failure_is_terminal_without_paid_resume_retry(
@@ -571,7 +568,7 @@ def test_contract_failure_is_terminal_without_paid_resume_retry(
     assert resumed.cumulative_provider_calls == 1
 
 
-def test_profile_and_fidelity_share_one_frozen_resume_ceiling(
+def test_profile_and_fidelity_honor_the_current_explicit_ceiling(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "provider_usage.yml"
@@ -582,13 +579,12 @@ def test_profile_and_fidelity_share_one_frozen_resume_ceiling(
     first.finish(profile, status="completed")
 
     resumed = _ProfileProviderBudget(path, 10)
-    assert resumed.max_calls == 2
+    assert resumed.max_calls == 10
     assert resumed.cumulative_calls == 2
-    with pytest.raises(RuntimeError, match="profile_call_budget_reached"):
-        resumed.reserve("profile_source", "note-b", "hash-c")
+    resumed.reserve("profile_source", "note-b", "hash-c")
 
 
-def test_existing_run_ceiling_cannot_be_raised_on_resume(tmp_path: Path) -> None:
+def test_existing_run_ceiling_can_be_changed_on_resume(tmp_path: Path) -> None:
     reasoner = _CallReasoner()
     first = _CheckpointedReasonerCalls(
         tmp_path,
@@ -605,13 +601,11 @@ def test_existing_run_ceiling_cannot_be_raised_on_resume(tmp_path: Path) -> None
         _request(tmp_path, max_calls=3),
     )
 
-    with pytest.raises(
-        LiteratureSynthesisPartialError,
-        match="literature_synthesis_call_budget_reached",
-    ):
-        resumed("cluster_proposal", "two", "propose_clusters", [], {})
-    assert resumed.max_calls == 1
-    assert reasoner.calls == 1
+    assert resumed(
+        "cluster_proposal", "two", "propose_clusters", [], {}
+    ) == {"clusters": []}
+    assert resumed.max_calls == 3
+    assert reasoner.calls == 2
 
 
 def test_stage_allocations_do_not_override_the_single_hard_ceiling(

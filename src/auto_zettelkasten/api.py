@@ -733,6 +733,7 @@ def resume_map(
     run_id: str,
     *,
     retry_terminal_failures: bool = False,
+    max_provider_spend_usd: Any = None,
     client: ZoteroClient | None = None,
     reader: ReaderProvider | None = None,
     vision: VisionProvider | None = None,
@@ -785,6 +786,8 @@ def resume_map(
         return RunReport(**values)
     payload["workspace"] = str(root)
     payload["retry_terminal_failures"] = retry_terminal_failures
+    if max_provider_spend_usd is not None:
+        payload["max_provider_spend_usd"] = max_provider_spend_usd
     return run_map(
         MapRequest.from_dict(payload),
         client=client,
@@ -1356,6 +1359,7 @@ def build_map(
     model: str | None = None,
     allow_cloud: bool = False,
     provider_concurrency: int | str | None = None,
+    max_provider_spend_usd: Any = None,
     comparison_collection_keys: Sequence[str] = (),
     literature_policy: LiteratureMappingPolicy | Mapping[str, Any] | None = None,
     navigation_policy: NavigationPolicy | Mapping[str, Any] | None = None,
@@ -1448,6 +1452,7 @@ def build_map(
             if provider_concurrency is not None
             else config.get("provider_concurrency", "auto")
         ),
+        max_provider_spend_usd=max_provider_spend_usd,
         question=question,
         extraction_version=str(extraction_config.get("version") or "2"),
         prompt_version=str(config.get("prompt_version") or "11"),
@@ -1462,17 +1467,13 @@ def build_map(
     if reasoner is not None:
         literature_request_deadline = max(
             map_request.processing.request_deadline_seconds,
-            min(600.0, policy.literature_deadline_seconds),
+            600.0,
         )
         _apply_reader_policy(  # type: ignore[arg-type]
             reasoner,
             replace(
                 map_request.processing,
                 request_deadline_seconds=literature_request_deadline,
-                document_deadline_seconds=max(
-                    map_request.processing.document_deadline_seconds,
-                    literature_request_deadline,
-                ),
             ),
         )
     receipt_source_set = dict(selected_source_set)
@@ -1691,6 +1692,7 @@ def run_literature_map(
         model=request.model,
         allow_cloud=request.allow_cloud,
         provider_concurrency=request.provider_concurrency,
+        max_provider_spend_usd=request.max_provider_spend_usd,
         literature_policy=request.literature_policy,
         reasoner=reasoner,
         external_discovery=external_discovery,

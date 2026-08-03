@@ -40,7 +40,7 @@ def test_v26_relationship_prompt_and_packet_limit() -> None:
     assert [len(packet) for packet in packets] == [15, 15, 1]
 
 
-def test_v25_cluster_scheduler_reserves_exactly_four_calls() -> None:
+def test_cluster_scheduler_uses_all_explicitly_available_calls() -> None:
     calls = object.__new__(_CheckpointedReasonerCalls)
     calls.max_calls = 32
     calls.cumulative_provider_calls = 10
@@ -48,8 +48,8 @@ def test_v25_cluster_scheduler_reserves_exactly_four_calls() -> None:
 
     scheduled, completion_pending = _schedule_cluster_writers(calls, runnable)
 
-    assert len(scheduled) == 15
-    assert len(completion_pending) == 7
+    assert len(scheduled) == 22
+    assert completion_pending == []
 
 
 def test_v25_duplicate_document_hash_yields_one_canonical_work(tmp_path) -> None:

@@ -4,8 +4,6 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-import pytest
-
 from auto_zettelkasten.files import read_yaml, write_yaml
 from auto_zettelkasten.api import resume_map
 from auto_zettelkasten.models import (
@@ -104,12 +102,12 @@ def test_provider_event_reservation_counts_after_interruption(tmp_path) -> None:
 
     resumed = _ProfileProviderBudget(path, 10)
 
-    assert resumed.max_calls == 1
+    assert resumed.max_calls == 10
     assert resumed.cumulative_calls == 1
     assert resumed.attempts[0]["attempt_id"] == attempt_id
-    assert resumed.attempts[0]["status"] == "started"
-    with pytest.raises(RuntimeError, match="source_profile_call_budget_reached"):
-        resumed.reserve("source_bundle_direct", "B", "hash-b")
+    assert resumed.attempts[0]["status"] == "interrupted"
+    assert resumed.attempts[0]["retry_on_resume"] is True
+    resumed.reserve("source_bundle_direct", "B", "hash-b")
 
 
 def test_transport_failure_retries_once_and_counts_both_attempts(tmp_path) -> None:
@@ -267,7 +265,7 @@ def test_legacy_provider_usage_migration_is_idempotent(tmp_path) -> None:
     event_text = first.events_path.read_text(encoding="utf-8")
     second = _ProfileProviderBudget(path, 10)
 
-    assert first.max_calls == second.max_calls == 2
+    assert first.max_calls == second.max_calls == 10
     assert second.cumulative_calls == 1
     assert second.events_path.read_text(encoding="utf-8") == event_text
 

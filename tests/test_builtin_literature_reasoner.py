@@ -1426,9 +1426,10 @@ def test_builtin_route_reuses_current_deterministic_profile_then_replay_is_zero_
         _only_profile(tmp_path).context["profile_generation_route"] == "deterministic"
     )
     reused_progress = _progress(tmp_path, "route-invalidation")
-    assert reused_progress["source_provider_call_count"] == 0
+    assert reused_progress["source_provider_call_count"] == 1
+    assert reused_progress["source_provider_new_call_count"] == 0
     assert reused_progress["literature_provider_call_count"] == 0
-    assert reused_progress["provider_call_count"] == 0
+    assert reused_progress["provider_call_count"] == 1
     assert reused_progress["checkpoint_hit_count"] >= 1
 
     # Simulate a v1.2 checkpoint that was excluded by the older
@@ -1457,9 +1458,10 @@ def test_builtin_route_reuses_current_deterministic_profile_then_replay_is_zero_
     assert calls == []
     assert _only_profile(tmp_path).excluded_from_synthesis is False
     replay_progress = _progress(tmp_path, "route-invalidation")
-    assert replay_progress["source_provider_call_count"] == 0
+    assert replay_progress["source_provider_call_count"] == 1
+    assert replay_progress["source_provider_new_call_count"] == 0
     assert replay_progress["literature_provider_call_count"] == 0
-    assert replay_progress["provider_call_count"] == 0
+    assert replay_progress["provider_call_count"] == 1
     assert replay_progress["checkpoint_hit_count"] >= 1
 
 

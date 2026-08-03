@@ -10,6 +10,7 @@ import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, is_dataclass
+from decimal import Decimal
 from itertools import combinations
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -1338,19 +1339,17 @@ def _schedule_cluster_writers(
     reasoner_call: Any,
     runnable: Sequence[Mapping[str, Any]],
 ) -> tuple[list[Mapping[str, Any]], list[Mapping[str, Any]]]:
-    """Schedule the first writer wave while reserving four empty retries."""
+    """Schedule every runnable cluster unless an explicit call limit forbids it."""
 
     if not isinstance(reasoner_call, _CheckpointedReasonerCalls):
         return list(runnable), []
-    reserve = 4
+    if reasoner_call.max_calls is None:
+        return list(runnable), []
     available = max(
         0,
-        reasoner_call.max_calls
-        - reasoner_call.cumulative_provider_calls
-        - reserve,
+        reasoner_call.max_calls - reasoner_call.cumulative_provider_calls,
     )
-    initial = min(15, available, len(runnable))
-    return list(runnable[:initial]), list(runnable[initial:])
+    return list(runnable[:available]), list(runnable[available:])
 
 
 class _CheckpointedReasonerCalls:
@@ -1372,12 +1371,15 @@ class _CheckpointedReasonerCalls:
         self.request = request
         request_values = _as_mapping(request) if request is not None else {}
         policy = request_values.get("literature_policy")
-        requested_max_calls = int(
-            _policy_value(policy, "max_synthesis_calls", 24)
+        requested_max_calls = int(_policy_value(policy, "max_synthesis_calls", 0))
+        self.max_calls: int | None = (
+            requested_max_calls if requested_max_calls > 0 else None
         )
-        self.max_calls = requested_max_calls
-        self.deadline_seconds = float(
-            _policy_value(policy, "literature_deadline_seconds", 1_800.0)
+        requested_deadline = float(
+            _policy_value(policy, "literature_deadline_seconds", 0.0)
+        )
+        self.deadline_seconds: float | None = (
+            requested_deadline if requested_deadline > 0 else None
         )
         self.root = (
             workspace / "11_state" / "runs" / run_id / "literature" / "synthesis"
@@ -1396,9 +1398,6 @@ class _CheckpointedReasonerCalls:
             self.cumulative_provider_calls = int(
                 usage.get("provider_call_count", 0) or 0
             )
-            persisted_max_calls = int(usage.get("max_calls", 0) or 0)
-            if persisted_max_calls:
-                self.max_calls = min(requested_max_calls, persisted_max_calls)
         else:
             usage = {}
             self.cumulative_provider_calls = 0
@@ -1408,6 +1407,20 @@ class _CheckpointedReasonerCalls:
                 usage.get("provider_call_count", 0) or 0
             )
         self._usage = dict(usage)
+        raw_spend_limit = request_values.get("max_provider_spend_usd")
+        self.max_spend_usd = (
+            Decimal(str(raw_spend_limit))
+            if raw_spend_limit not in (None, "")
+            else None
+        )
+        self.cumulative_spend_usd = sum(
+            (
+                Decimal(str(row.get("cost_usd", 0) or 0))
+                for row in self._usage.get("attempts", []) or []
+                if isinstance(row, Mapping)
+            ),
+            Decimal("0"),
+        )
         self.checkpoint_hits = 0
         self.failures = 0
         self.synthesized_clusters = 0
@@ -1425,7 +1438,10 @@ class _CheckpointedReasonerCalls:
         method = getattr(self.reasoner, method_name, None)
         if not callable(method):
             return {}
-        if time.monotonic() - self.started >= self.deadline_seconds:
+        if (
+            self.deadline_seconds is not None
+            and time.monotonic() - self.started >= self.deadline_seconds
+        ):
             raise LiteratureSynthesisPartialError("literature_stage_deadline_reached")
 
         enriched_context = dict(context)
@@ -1842,51 +1858,20 @@ class _CheckpointedReasonerCalls:
             raise LiteratureSynthesisPartialError(
                 f"literature_provider_context_budget_exceeded:{stage}:{key}"
             )
-        if (
-            durable_attempt_count >= 1
-            and not self.retry_terminal_failures
-            and durable_attempt_count > int(
-            prior_failure.get("attempt_count", 0)
-            if isinstance(prior_failure, Mapping)
-            else 0
-            )
-        ):
-            write_yaml(
-                failure_path
-                if isinstance(existing.get("response"), Mapping)
-                else path,
-                {
-                    "checkpoint_schema_version": "1",
-                    "fingerprint": fingerprint,
-                    "stage": stage,
-                    "key": key,
-                    "status": "failed",
-                    "provider": str(getattr(self.reasoner, "name", "")),
-                    "model": str(getattr(self.reasoner, "model", "")),
-                    "dependency_component_hashes": dependency_component_hashes,
-                    "dependency_context_hashes": dependency_context_hashes,
-                    "dependency_context_item_hashes": (
-                        dependency_context_item_hashes
-                    ),
-                    "error": {
-                        "type": "InterruptedProviderAttempts",
-                        "message": (
-                            "a paid attempt ended before a reusable "
-                            "checkpoint was written"
-                        ),
-                    },
-                    "failure_class": "transport",
-                    "attempt_count": durable_attempt_count,
-                    "terminal": True,
-                    "retry_on_resume": False,
-                    "updated_at": now_iso(),
-                },
-            )
-            raise LiteratureSynthesisPartialError(
-                f"literature_synthesis_terminal_failure:{stage}:{key}"
-            )
+        # A reservation without a completion event means the prior process was
+        # interrupted. It remains charged, but is retryable on resume.
         with self._state_lock:
-            if self.cumulative_provider_calls >= self.max_calls:
+            if (
+                self.max_spend_usd is not None
+                and self.cumulative_spend_usd >= self.max_spend_usd
+            ):
+                raise LiteratureSynthesisPartialError(
+                    "provider_spend_budget_reached"
+                )
+            if (
+                self.max_calls is not None
+                and self.cumulative_provider_calls >= self.max_calls
+            ):
                 raise LiteratureSynthesisPartialError(
                     "literature_synthesis_call_budget_reached"
                 )
@@ -1931,7 +1916,7 @@ class _CheckpointedReasonerCalls:
         raw_response_for_failure: Any = None
         provider_completion: Mapping[str, Any] | None = None
         try:
-            empty_retry_attempted = False
+            transport_retry_attempted = False
             while True:
                 try:
                     from .readers import reset_literature_completion
@@ -1942,23 +1927,30 @@ class _CheckpointedReasonerCalls:
                     )
                     break
                 except Exception as call_exc:
+                    failure_class = _synthesis_failure_class(call_exc)
                     if (
-                        not _is_provider_empty_response(call_exc)
-                        or empty_retry_attempted
+                        failure_class not in {"transport", "provider_empty_response"}
+                        or transport_retry_attempted
                     ):
                         raise
                     completion = getattr(call_exc, "provider_completion", None)
-                    if time.monotonic() - self.started >= self.deadline_seconds:
+                    if (
+                        self.deadline_seconds is not None
+                        and time.monotonic() - self.started >= self.deadline_seconds
+                    ):
                         setattr(call_exc, "empty_retry_deferred", "deadline")
                         raise
                     with self._state_lock:
-                        if self.cumulative_provider_calls >= self.max_calls:
+                        if (
+                            self.max_calls is not None
+                            and self.cumulative_provider_calls >= self.max_calls
+                        ):
                             setattr(call_exc, "empty_retry_deferred", "budget")
                             raise
                         self._finish_provider_attempt(
                             attempt_id,
                             status="failed",
-                            failure_class="provider_empty_response",
+                            failure_class=failure_class,
                             terminal=False,
                             provider_completion=(
                                 completion
@@ -1990,10 +1982,10 @@ class _CheckpointedReasonerCalls:
                                 "attempt": attempt_number,
                                 "status": "started",
                                 "started_at": now_iso(),
-                                "retry_reason": "provider_empty_response",
+                                "retry_reason": failure_class,
                             },
                         )
-                    empty_retry_attempted = True
+                    transport_retry_attempted = True
                     self._progress(stage, path, active=True)
             if is_dataclass(response):
                 response = asdict(response)
@@ -2090,11 +2082,10 @@ class _CheckpointedReasonerCalls:
             deferred_empty_retry = str(
                 getattr(exc, "empty_retry_deferred", "") or ""
             )
-            terminal = (
-                failure_class not in {"transport", "provider_empty_response"}
-                or attempt_number >= 2
-                or bool(deferred_empty_retry)
-            )
+            terminal = failure_class not in {
+                "transport",
+                "provider_empty_response",
+            }
             failure_payload = {
                 "checkpoint_schema_version": "1",
                 "fingerprint": fingerprint,
@@ -2267,6 +2258,12 @@ class _CheckpointedReasonerCalls:
                 "usage_schema_version": "2",
                 "max_calls": self.max_calls,
                 "provider_call_count": self.cumulative_provider_calls,
+                "max_provider_spend_usd": (
+                    str(self.max_spend_usd)
+                    if self.max_spend_usd is not None
+                    else ""
+                ),
+                "provider_spend_usd": str(self.cumulative_spend_usd),
                 "stage_call_counts": dict(sorted(stage_call_counts.items())),
                 "attempts": [attempts[key] for key in sorted(attempts)],
             }
@@ -2300,6 +2297,17 @@ class _CheckpointedReasonerCalls:
                 row.update(failure_class=failure_class, terminal=terminal)
             if provider_completion is not None:
                 row["provider_completion"] = dict(provider_completion)
+                from .readers import provider_attempt_cost_usd
+
+                priced = provider_attempt_cost_usd(
+                    str(getattr(self.reasoner, "name", "")),
+                    str(getattr(self.reasoner, "model", "")),
+                    provider_completion,
+                )
+                if priced is not None:
+                    row["cost_usd"] = str(priced[0])
+                    row["cost_status"] = priced[1]
+                    self.cumulative_spend_usd += priced[0]
             if isinstance(raw_response, Mapping):
                 row["raw_response"] = dict(raw_response)
             elif isinstance(raw_response, str):
@@ -2308,6 +2316,9 @@ class _CheckpointedReasonerCalls:
             self._usage["attempts"] = [
                 attempts[key] for key in sorted(attempts)
             ]
+            self._usage["provider_spend_usd"] = str(
+                self.cumulative_spend_usd
+            )
             write_yaml(self.usage_path, self._usage)
 
     def _progress(self, stage: str, path: Path, *, active: bool) -> None:
@@ -2398,7 +2409,9 @@ def _is_provider_empty_response(exc: BaseException) -> bool:
     )
 
 
-def _legacy_synthesis_usage(root: Path, *, max_calls: int) -> dict[str, Any]:
+def _legacy_synthesis_usage(
+    root: Path, *, max_calls: int | None
+) -> dict[str, Any]:
     """Conservatively account for paid v0.11 checkpoints without replay calls."""
 
     attempts: dict[str, dict[str, Any]] = {}
@@ -5217,22 +5230,16 @@ def _map_topic_clusters_legacy(
     """Build deterministic semantic clusters with at most three memberships per source."""
     rows = _ensure_profiles(profiles)
     analytical = [row for row in rows if row["analytical"]]
-    max_memberships = max(
-        1,
-        min(
-            3,
-            int(
-                _policy_value(
-                    policy,
-                    (
-                        "max_memberships",
-                        "max_cluster_memberships",
-                        "max_overlapping_clusters",
-                    ),
-                    3,
-                )
+    max_memberships = int(
+        _policy_value(
+            policy,
+            (
+                "max_memberships",
+                "max_cluster_memberships",
+                "max_overlapping_clusters",
             ),
-        ),
+            0,
+        )
     )
     min_emerging = max(
         2,
@@ -5452,7 +5459,10 @@ def _map_topic_clusters_legacy(
             key=lambda row: (-row["family_count"], -row["mean_score"], row["identity"])
         )
         selected_by_source[profile["source_id"]].update(
-            row["identity"] for row in available[:max_memberships]
+            row["identity"]
+            for row in (
+                available if max_memberships == 0 else available[:max_memberships]
+            )
         )
 
     relation_ids_by_source: dict[str, list[str]] = defaultdict(list)
@@ -7500,7 +7510,7 @@ def map_overlapping_clusters(
     ]
     min_backed = max(3, int(_policy_value(policy, "source_backed_threshold", 3)))
     min_emerging = 2
-    max_memberships = max(1, min(3, int(_policy_value(policy, "max_memberships", 3))))
+    max_memberships = int(_policy_value(policy, "max_memberships", 0))
     auto_promote = bool(_policy_value(policy, "auto_promote_clusters", True))
     rejected: list[dict[str, Any]] = []
     candidates: list[dict[str, Any]] = []
@@ -8343,7 +8353,10 @@ def map_overlapping_clusters(
             )
         )
         selected_by_source[source_id] = {
-            row["semantic_identity"] for row in available[:max_memberships]
+            row["semantic_identity"]
+            for row in (
+                available if max_memberships == 0 else available[:max_memberships]
+            )
         }
 
     relation_ids_by_source: dict[str, list[str]] = defaultdict(list)
@@ -17609,6 +17622,7 @@ def _cluster_plan_call_settings(
     *,
     card_count: int,
 ) -> dict[str, Any]:
+    del card_count
     capabilities = _as_mapping(getattr(reasoner, "capabilities", {}))
     supported_output = int(
         capabilities.get("supported_output_tokens")
@@ -17616,10 +17630,6 @@ def _cluster_plan_call_settings(
         or 16_000
     )
     desired_output = 64_000 if supported_output >= 64_000 else 16_000
-    if card_count > 60 and supported_output < 64_000:
-        raise LiteratureSynthesisPartialError(
-            "cluster_plan_output_capability_insufficient"
-        )
     configured_deadline = float(
         capabilities.get("request_deadline_seconds")
         or getattr(reasoner, "request_deadline", 0)
@@ -19413,49 +19423,169 @@ def build_literature_report(
                     > 1
                 ]
                 bridge_settings = _cluster_plan_call_settings(
-                    reasoner,
-                    request,
-                    card_count=len(family_cards),
+                    reasoner, request, card_count=len(family_cards)
                 )
-                bridge_context = {
-                    "accepted_relationships": bridge_relations,
-                    "literature_positions": resolved_literature_positions,
-                    "collection_identity": collection_identity,
-                    "rejected_pair_memory": list(
-                        (source_set or {}).get("rejected_pair_memory", []) or []
-                    ),
-                    "cluster_plan_mode": "bridge",
-                    "existing_family_ids": [
-                        str(card.get("family_id") or "")
-                        for card in family_cards
-                    ],
-                    "cluster_plan_settings": bridge_settings,
-                }
-                bridge_context["cluster_plan_settings"] = {
-                    **bridge_settings,
-                    "serialized_input_chars": _reasoner_packet_chars(
-                        family_cards, bridge_context
-                    ),
-                }
-                if (
-                    _reasoner_packet_chars(family_cards, bridge_context)
-                    > bridge_settings["input_char_budget"]
-                ):
-                    raise LiteratureSynthesisPartialError(
-                        "cluster_plan_bridge_context_capability_insufficient"
+                group_budget = max(
+                    1, int(bridge_settings["input_char_budget"] * 0.4)
+                )
+                family_groups: list[list[dict[str, Any]]] = []
+                current_group: list[dict[str, Any]] = []
+                for card in family_cards:
+                    candidate_group = [*current_group, dict(card)]
+                    if current_group and _reasoner_packet_chars(
+                        candidate_group, {}
+                    ) > group_budget:
+                        family_groups.append(current_group)
+                        current_group = [dict(card)]
+                    else:
+                        current_group = candidate_group
+                if current_group:
+                    family_groups.append(current_group)
+
+                bridge_packets: list[
+                    tuple[str, list[dict[str, Any]], dict[str, Any]]
+                ] = []
+                for left_index, left_group in enumerate(family_groups):
+                    for right_index in range(left_index, len(family_groups)):
+                        packet_cards = [
+                            *left_group,
+                            *(
+                                family_groups[right_index]
+                                if right_index != left_index
+                                else []
+                            ),
+                        ]
+                        if len(packet_cards) < 2:
+                            continue
+                        packet_source_ids = {
+                            str(source_id)
+                            for card in packet_cards
+                            for source_id in card.get("source_ids", []) or []
+                            if str(source_id)
+                        }
+                        packet_settings = _cluster_plan_call_settings(
+                            reasoner, request, card_count=len(packet_cards)
+                        )
+                        packet_context = {
+                            "accepted_relationships": [
+                                row
+                                for row in bridge_relations
+                                if set(
+                                    str(value)
+                                    for value in row.get("source_ids", []) or []
+                                )
+                                <= packet_source_ids
+                            ],
+                            "literature_positions": [
+                                row
+                                for row in resolved_literature_positions
+                                if str(row.get("current_source_id") or "")
+                                in packet_source_ids
+                                and str(row.get("matched_source_id") or "")
+                                in packet_source_ids
+                            ],
+                            "collection_identity": collection_identity,
+                            "rejected_pair_memory": list(
+                                (source_set or {}).get(
+                                    "rejected_pair_memory", []
+                                )
+                                or []
+                            ),
+                            "cluster_plan_mode": "bridge",
+                            "existing_family_ids": [
+                                str(card.get("family_id") or "")
+                                for card in packet_cards
+                            ],
+                            "cluster_plan_settings": packet_settings,
+                        }
+                        packet_context["cluster_plan_settings"] = {
+                            **packet_settings,
+                            "serialized_input_chars": _reasoner_packet_chars(
+                                packet_cards, packet_context
+                            ),
+                        }
+                        packet_id = f"bridge-{left_index + 1}-{right_index + 1}"
+                        if (
+                            _reasoner_packet_chars(packet_cards, packet_context)
+                            > packet_settings["input_char_budget"]
+                        ):
+                            plan_responses.append(
+                                {
+                                    "clusters": [],
+                                    "neighbor_relationships": [],
+                                    "unclustered_sources": [],
+                                    "parked_clusters": [
+                                        {
+                                            "cluster_id": packet_id,
+                                            "reason": "cluster_plan_bridge_packet_context_capability_insufficient",
+                                            "retry_on_resume": False,
+                                        }
+                                    ],
+                                }
+                            )
+                            continue
+                        bridge_packets.append(
+                            (packet_id, packet_cards, packet_context)
+                        )
+
+                def run_bridge_packet(
+                    packet_id: str,
+                    packet_cards: Sequence[Mapping[str, Any]],
+                    packet_context: Mapping[str, Any],
+                ) -> dict[str, Any]:
+                    response = _reasoner_stage(
+                        reasoner,
+                        reasoner_call,
+                        stage="cluster_plan",
+                        key=packet_id,
+                        method_name="plan_clusters",
+                        profiles=packet_cards,
+                        request=request,
+                        context=packet_context,
                     )
-                bridge_response = _reasoner_stage(
-                    reasoner,
-                    reasoner_call,
-                    stage="cluster_plan",
-                    key="bridge",
-                    method_name="plan_clusters",
-                    profiles=family_cards,
-                    request=request,
-                    context=bridge_context,
-                )
-                plan_responses.append(
-                    _namespace_cluster_plan(bridge_response, "bridge")
+                    return _namespace_cluster_plan(response, packet_id)
+
+                bridge_by_index: dict[int, dict[str, Any]] = {}
+                with ThreadPoolExecutor(
+                    max_workers=_provider_worker_count(
+                        request, len(bridge_packets)
+                    ),
+                    thread_name_prefix="auto-zettelkasten-cluster-bridge",
+                ) as executor:
+                    futures = {
+                        executor.submit(
+                            run_bridge_packet, packet_id, cards, context
+                        ): (index, packet_id)
+                        for index, (packet_id, cards, context) in enumerate(
+                            bridge_packets
+                        )
+                    }
+                    for future in as_completed(futures):
+                        index, packet_id = futures[future]
+                        try:
+                            bridge_by_index[index] = future.result()
+                        except Exception as exc:
+                            bridge_by_index[index] = {
+                                "clusters": [],
+                                "neighbor_relationships": [],
+                                "unclustered_sources": [],
+                                "parked_clusters": [
+                                    {
+                                        "cluster_id": packet_id,
+                                        "reason": (
+                                            "cluster_plan_bridge_packet_failed:"
+                                            f"{type(exc).__name__}"
+                                        ),
+                                        "retry_on_resume": (
+                                            _synthesis_failure_class(exc)
+                                            == "transport"
+                                        ),
+                                    }
+                                ],
+                            }
+                plan_responses.extend(
+                    bridge_by_index[index]
+                    for index in range(len(bridge_packets))
                 )
             plan_response = _merge_cluster_plan_responses(plan_responses)
         (
@@ -20469,6 +20599,7 @@ def build_literature_report(
             cluster_id = str(cluster.get("cluster_id") or "")
             if (
                 isinstance(reasoner_call, _CheckpointedReasonerCalls)
+                and reasoner_call.max_calls is not None
                 and reasoner_call.cumulative_provider_calls
                 >= reasoner_call.max_calls
             ):
@@ -20478,6 +20609,7 @@ def build_literature_report(
                 continue
             if (
                 isinstance(reasoner_call, _CheckpointedReasonerCalls)
+                and reasoner_call.deadline_seconds is not None
                 and time.monotonic() - reasoner_call.started
                 >= reasoner_call.deadline_seconds
             ):

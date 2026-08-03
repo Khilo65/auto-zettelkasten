@@ -4,11 +4,12 @@ import hashlib
 import json
 import re
 from dataclasses import asdict, dataclass, field, is_dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
-CURRENT_ENGINE_VERSION = "0.27.0"
-CURRENT_ARTIFACT_SCHEMA_VERSION = "1.18"
+CURRENT_ENGINE_VERSION = "0.28.0"
+CURRENT_ARTIFACT_SCHEMA_VERSION = "1.19"
 CURRENT_PROFILE_SCHEMA_VERSION = "1.3"
 
 
@@ -30,6 +31,8 @@ def _jsonable(value: Any) -> Any:
     if is_dataclass(value):
         return {key: _jsonable(item) for key, item in asdict(value).items()}
     if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Decimal):
         return str(value)
     if isinstance(value, Mapping):
         return {str(key): _jsonable(item) for key, item in value.items()}
@@ -72,6 +75,20 @@ def _require_string(value: Any, *, field: str) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{field} must be a string")
     return value
+
+
+def _optional_positive_decimal(value: Any, *, field: str) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a positive decimal amount")
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"{field} must be a positive decimal amount") from exc
+    if not result.is_finite() or result <= 0:
+        raise ValueError(f"{field} must be a positive decimal amount")
+    return result
 
 
 def _readable_bundle_text(value: Any) -> str:
@@ -294,12 +311,12 @@ class LiteratureMappingPolicy:
     auto_promote_debates: bool = True
     auto_promote_gaps: bool = True
     source_backed_threshold: int = 3
-    max_memberships: int = 3
+    max_memberships: int = 0
     external_discovery: Literal["disabled", "per_run", "always"] = "disabled"
-    max_profile_calls: int = 100
-    max_synthesis_calls: int = 24
+    max_profile_calls: int = 0
+    max_synthesis_calls: int = 0
     profile_workers: int = 4
-    literature_deadline_seconds: float = 1_800.0
+    literature_deadline_seconds: float = 0.0
     deepseek_packet_context_fraction: float = 0.8
     weak_gap_handling: Literal["audit_only"] = "audit_only"
     cluster_gap_projection: Literal["inline"] = "inline"
@@ -317,14 +334,12 @@ class LiteratureMappingPolicy:
             _require_bool(
                 getattr(self, field_name), field=f"literature_mapping.{field_name}"
             )
-        for field_name in (
-            "source_backed_threshold",
-            "max_memberships",
-            "max_profile_calls",
-            "max_synthesis_calls",
-            "profile_workers",
-        ):
+        for field_name in ("source_backed_threshold", "profile_workers"):
             _require_positive_int(
+                getattr(self, field_name), field=f"literature_mapping.{field_name}"
+            )
+        for field_name in ("max_memberships", "max_profile_calls", "max_synthesis_calls"):
+            _nonnegative_int(
                 getattr(self, field_name), field=f"literature_mapping.{field_name}"
             )
         if self.external_discovery not in {"disabled", "per_run", "always"}:
@@ -338,10 +353,10 @@ class LiteratureMappingPolicy:
         if (
             isinstance(self.literature_deadline_seconds, bool)
             or not isinstance(self.literature_deadline_seconds, (int, float))
-            or self.literature_deadline_seconds <= 0
+            or self.literature_deadline_seconds < 0
         ):
             raise ValueError(
-                "literature_mapping.literature_deadline_seconds must be a positive number"
+                "literature_mapping.literature_deadline_seconds cannot be negative"
             )
         if (
             isinstance(self.deepseek_packet_context_fraction, bool)
@@ -383,13 +398,13 @@ class LiteratureMappingPolicy:
             auto_promote_debates=values.get("auto_promote_debates", True),
             auto_promote_gaps=values.get("auto_promote_gaps", True),
             source_backed_threshold=values.get("source_backed_threshold", 3),
-            max_memberships=values.get("max_memberships", 3),
+            max_memberships=values.get("max_memberships", 0),
             external_discovery=values.get("external_discovery", "disabled"),
-            max_profile_calls=values.get("max_profile_calls", 100),
-            max_synthesis_calls=values.get("max_synthesis_calls", 24),
+            max_profile_calls=values.get("max_profile_calls", 0),
+            max_synthesis_calls=values.get("max_synthesis_calls", 0),
             profile_workers=values.get("profile_workers", 4),
             literature_deadline_seconds=values.get(
-                "literature_deadline_seconds", 1_800.0
+                "literature_deadline_seconds", 0.0
             ),
             deepseek_packet_context_fraction=values.get(
                 "deepseek_packet_context_fraction", 0.8
@@ -526,33 +541,35 @@ class ProcessingPolicy:
 
     direct_read_char_limit: int = 120_000
     chunk_char_limit: int = 60_000
-    max_total_chunks: int = 64
-    max_calls_per_document_run: int = 24
-    request_deadline_seconds: float = 120.0
-    document_deadline_seconds: float = 900.0
+    max_total_chunks: int = 0
+    max_calls_per_document_run: int = 0
+    connect_timeout_seconds: float = 60.0
+    request_deadline_seconds: float = 600.0
+    document_deadline_seconds: float = 0.0
     chunk_output_tokens: int = 900
     synthesis_output_tokens: int = 3_000
     context_window_fraction: float = 0.5
     estimated_chars_per_token: float = 3.5
 
     def __post_init__(self) -> None:
-        integer_fields = (
+        positive_integer_fields = (
             "direct_read_char_limit",
             "chunk_char_limit",
-            "max_total_chunks",
-            "max_calls_per_document_run",
             "chunk_output_tokens",
             "synthesis_output_tokens",
         )
-        for field_name in integer_fields:
+        for field_name in positive_integer_fields:
             if int(getattr(self, field_name)) < 1:
                 raise ValueError(f"processing.{field_name} must be at least 1")
-        if self.request_deadline_seconds <= 0 or self.document_deadline_seconds <= 0:
-            raise ValueError("processing deadlines must be positive")
-        if self.document_deadline_seconds < self.request_deadline_seconds:
-            raise ValueError(
-                "processing.document_deadline_seconds cannot be shorter than request_deadline_seconds"
-            )
+        for field_name in ("max_total_chunks", "max_calls_per_document_run"):
+            if int(getattr(self, field_name)) < 0:
+                raise ValueError(f"processing.{field_name} cannot be negative")
+        if self.connect_timeout_seconds <= 0:
+            raise ValueError("processing.connect_timeout_seconds must be positive")
+        if self.request_deadline_seconds <= 0:
+            raise ValueError("processing.request_deadline_seconds must be positive")
+        if self.document_deadline_seconds < 0:
+            raise ValueError("processing.document_deadline_seconds cannot be negative")
         if not 0 < self.context_window_fraction < 1:
             raise ValueError(
                 "processing.context_window_fraction must be between 0 and 1"
@@ -569,15 +586,16 @@ class ProcessingPolicy:
         return cls(
             direct_read_char_limit=int(values.get("direct_read_char_limit", 120_000)),
             chunk_char_limit=int(values.get("chunk_char_limit", 60_000)),
-            max_total_chunks=int(values.get("max_total_chunks", 64)),
+            max_total_chunks=int(values.get("max_total_chunks", 0)),
             max_calls_per_document_run=int(
-                values.get("max_calls_per_document_run", 24)
+                values.get("max_calls_per_document_run", 0)
             ),
+            connect_timeout_seconds=float(values.get("connect_timeout_seconds", 60.0)),
             request_deadline_seconds=float(
-                values.get("request_deadline_seconds", 120.0)
+                values.get("request_deadline_seconds", 600.0)
             ),
             document_deadline_seconds=float(
-                values.get("document_deadline_seconds", 900.0)
+                values.get("document_deadline_seconds", 0.0)
             ),
             chunk_output_tokens=int(values.get("chunk_output_tokens", 900)),
             synthesis_output_tokens=int(values.get("synthesis_output_tokens", 3_000)),
@@ -601,6 +619,7 @@ class MapRequest:
     allow_cloud: bool = False
     parallel: int = 4
     provider_concurrency: int | Literal["auto"] | None = None
+    max_provider_spend_usd: Decimal | None = None
     limit: int = 0
     extraction_version: str = "2"
     prompt_version: str = "11"
@@ -641,6 +660,23 @@ class MapRequest:
                 raise ValueError(
                     "provider_concurrency must be auto or a positive integer"
                 )
+            if (
+                isinstance(self.provider_concurrency, int)
+                and self.provider == "deepseek"
+                and self.model == "deepseek-v4-flash"
+                and self.provider_concurrency > 2_500
+            ):
+                raise ValueError(
+                    "provider_concurrency exceeds DeepSeek V4 Flash account limit 2500"
+                )
+        object.__setattr__(
+            self,
+            "max_provider_spend_usd",
+            _optional_positive_decimal(
+                self.max_provider_spend_usd,
+                field="max_provider_spend_usd",
+            ),
+        )
         if self.limit < 0:
             raise ValueError("limit cannot be negative")
         if not self.provider.strip():
@@ -713,6 +749,7 @@ class MapRequest:
                 if payload.get("provider_concurrency") is not None
                 else None
             ),
+            max_provider_spend_usd=payload.get("max_provider_spend_usd"),
             limit=int(payload.get("limit", 0)),
             extraction_version=str(payload.get("extraction_version", "2")),
             prompt_version=str(payload.get("prompt_version", "11")),
@@ -5362,6 +5399,7 @@ class LiteratureMapRequest:
     model: str = "deepseek-v4-flash"
     allow_cloud: bool = False
     provider_concurrency: int | Literal["auto"] = "auto"
+    max_provider_spend_usd: Decimal | None = None
     comparison_collection_keys: list[str] = field(default_factory=list)
     literature_policy: LiteratureMappingPolicy = field(
         default_factory=LiteratureMappingPolicy
@@ -5382,6 +5420,23 @@ class LiteratureMapRequest:
             raise ValueError(
                 "provider_concurrency must be auto or a positive integer"
             )
+        if (
+            isinstance(self.provider_concurrency, int)
+            and self.provider == "deepseek"
+            and self.model == "deepseek-v4-flash"
+            and self.provider_concurrency > 2_500
+        ):
+            raise ValueError(
+                "provider_concurrency exceeds DeepSeek V4 Flash account limit 2500"
+            )
+        object.__setattr__(
+            self,
+            "max_provider_spend_usd",
+            _optional_positive_decimal(
+                self.max_provider_spend_usd,
+                field="max_provider_spend_usd",
+            ),
+        )
         object.__setattr__(
             self,
             "comparison_collection_keys",
@@ -5429,6 +5484,7 @@ class LiteratureMapRequest:
                 if payload.get("provider_concurrency", "auto") == "auto"
                 else int(payload["provider_concurrency"])
             ),
+            max_provider_spend_usd=payload.get("max_provider_spend_usd"),
             comparison_collection_keys=_string_list(
                 payload.get("comparison_collection_keys"),
                 field="literature map request.comparison_collection_keys",

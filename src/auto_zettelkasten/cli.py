@@ -75,6 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Maximum concurrent provider jobs, or 'auto' for the provider-specific cap.",
     )
+    map_parser.add_argument("--max-provider-spend-usd", default=None)
     map_parser.add_argument("--limit", type=int, default=None)
     map_parser.add_argument("--run-id", default="")
     map_parser.add_argument("--ocr", choices=("auto", "off", "required"), default=None)
@@ -88,7 +89,18 @@ def build_parser() -> argparse.ArgumentParser:
     map_parser.add_argument("--chunk-char-limit", type=int, default=None)
     map_parser.add_argument("--max-total-chunks", type=int, default=None)
     map_parser.add_argument("--max-document-calls", type=int, default=None)
-    map_parser.add_argument("--request-deadline-seconds", type=float, default=None)
+    map_parser.add_argument("--connect-timeout-seconds", type=float, default=None)
+    map_parser.add_argument(
+        "--request-idle-timeout-seconds",
+        "--request-deadline-seconds",
+        dest="request_deadline_seconds",
+        type=float,
+        default=None,
+        help=(
+            "Maximum seconds without a meaningful provider stream event; "
+            "--request-deadline-seconds is a deprecated alias."
+        ),
+    )
     map_parser.add_argument("--document-deadline-seconds", type=float, default=None)
     map_parser.add_argument("--chunk-output-tokens", type=int, default=None)
     map_parser.add_argument("--synthesis-output-tokens", type=int, default=None)
@@ -124,6 +136,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Maximum concurrent provider jobs, or 'auto' for the provider-specific cap.",
     )
+    sync_parser.add_argument("--max-provider-spend-usd", default=None)
     sync_parser.add_argument("--run-id", default="")
     _add_literature_policy_arguments(sync_parser)
     _add_navigation_policy_arguments(sync_parser)
@@ -132,6 +145,7 @@ def build_parser() -> argparse.ArgumentParser:
     resume_parser.add_argument("--workspace", type=Path, required=True)
     resume_parser.add_argument("--run-id", required=True)
     resume_parser.add_argument("--retry-terminal-literature", action="store_true")
+    resume_parser.add_argument("--max-provider-spend-usd", default=None)
 
     status_parser = commands.add_parser("status", help="Show workspace or run status.")
     status_parser.add_argument("--workspace", type=Path, required=True)
@@ -158,6 +172,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Maximum concurrent provider jobs, or 'auto' for the provider-specific cap.",
     )
+    build_parser_command.add_argument("--max-provider-spend-usd", default=None)
     build_parser_command.add_argument("--resume", action="store_true")
     build_parser_command.add_argument("--retry-terminal-literature", action="store_true")
     _add_literature_policy_arguments(build_parser_command)
@@ -218,6 +233,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.provider_concurrency,
                     config.get("provider_concurrency"),
                 ),
+                max_provider_spend_usd=(
+                    args.max_provider_spend_usd
+                    if args.max_provider_spend_usd is not None
+                    else config.get("max_provider_spend_usd")
+                ),
                 limit=args.limit if args.limit is not None else 0,
                 extraction_version=str(extraction_config.get("version") or "2"),
                 prompt_version=str(config.get("prompt_version") or "11"),
@@ -257,6 +277,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.provider_concurrency,
                     config.get("provider_concurrency"),
                 ),
+                max_provider_spend_usd=(
+                    args.max_provider_spend_usd
+                    if args.max_provider_spend_usd is not None
+                    else config.get("max_provider_spend_usd")
+                ),
                 literature_policy=_literature_policy(args, config),
                 navigation_policy=_navigation_policy(args, config),
             )
@@ -269,6 +294,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.workspace,
                 args.run_id,
                 retry_terminal_failures=args.retry_terminal_literature,
+                max_provider_spend_usd=(
+                    args.max_provider_spend_usd
+                    if args.max_provider_spend_usd is not None
+                    else config.get("max_provider_spend_usd")
+                ),
             ).to_dict()
         elif args.command == "status":
             report = get_status(args.workspace, args.run_id or None)
@@ -294,6 +324,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.provider_concurrency,
                     config.get("provider_concurrency"),
                 ),
+                max_provider_spend_usd=args.max_provider_spend_usd,
                 comparison_collection_keys=args.comparison_collection_keys,
                 literature_policy=_literature_policy(args, config),
                 navigation_policy=_navigation_policy(args, config),
@@ -374,6 +405,7 @@ def _processing_policy(args: argparse.Namespace, config: dict[str, Any]) -> Proc
         "chunk_char_limit": args.chunk_char_limit,
         "max_total_chunks": args.max_total_chunks,
         "max_calls_per_document_run": args.max_document_calls,
+        "connect_timeout_seconds": args.connect_timeout_seconds,
         "request_deadline_seconds": args.request_deadline_seconds,
         "document_deadline_seconds": args.document_deadline_seconds,
         "chunk_output_tokens": args.chunk_output_tokens,

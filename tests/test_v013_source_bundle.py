@@ -1033,25 +1033,24 @@ def test_source_calls_share_the_cumulative_profile_budget_and_replay_is_free(
     )
 
     resumed = _ProfileProviderBudget(budget_path, 10)
-    with pytest.raises(RuntimeError, match="source_profile_call_budget_reached"):
-        _read_document(
-            reader,
-            "Second source.",
-            {
-                "_source_context": {
-                    "source_id": "source-zotero-B2",
-                    "zotero_key": "B2",
-                }
-            },
-            None,
-            request=request,
-            checkpoint_root=tmp_path / "second-checkpoint",
-            provider_budget=resumed,
-        )
+    _read_document(
+        reader,
+        "Second source.",
+        {
+            "_source_context": {
+                "source_id": "source-zotero-B2",
+                "zotero_key": "B2",
+            }
+        },
+        None,
+        request=request,
+        checkpoint_root=tmp_path / "second-checkpoint",
+        provider_budget=resumed,
+    )
 
-    assert reader.calls == 1
-    assert resumed.max_calls == 1
-    assert resumed.cumulative_calls == 1
+    assert reader.calls == 2
+    assert resumed.max_calls == 10
+    assert resumed.cumulative_calls == 2
     resumed.flush()
     assert read_yaml(budget_path)["attempts"][0]["status"] == "completed"
 

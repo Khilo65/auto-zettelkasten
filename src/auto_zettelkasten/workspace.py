@@ -26,6 +26,7 @@ CONFIG_FIELDS = {
     "prompt_version",
     "parallel",
     "provider_concurrency",
+    "max_provider_spend_usd",
     "processing",
     "literature_mapping",
     "navigation",
@@ -112,10 +113,11 @@ def initialize(workspace: Path | str, *, overwrite: bool = False) -> ArtifactMan
                 "processing": {
                     "direct_read_char_limit": 120000,
                     "chunk_char_limit": 60000,
-                    "max_total_chunks": 64,
-                    "max_calls_per_document_run": 24,
-                    "request_deadline_seconds": 120,
-                    "document_deadline_seconds": 900,
+                    "max_total_chunks": 0,
+                    "max_calls_per_document_run": 0,
+                    "connect_timeout_seconds": 60,
+                    "request_deadline_seconds": 600,
+                    "document_deadline_seconds": 0,
                     "chunk_output_tokens": 900,
                     "synthesis_output_tokens": 3000,
                     "context_window_fraction": 0.5,
@@ -188,7 +190,8 @@ def assert_compatible(workspace: Path | str) -> None:
         (1, 15),
         (1, 16),
         (1, 17),
-        (1, 18),
+            (1, 18),
+            (1, 19),
     }
     current = _parse_schema_version(CURRENT_ARTIFACT_SCHEMA_VERSION, field="current artifact schema")
     if manifest_version not in supported:

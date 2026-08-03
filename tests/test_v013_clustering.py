@@ -7,7 +7,6 @@ import pytest
 from auto_zettelkasten import literature
 from auto_zettelkasten.literature import (
     _CheckpointedReasonerCalls,
-    LiteratureSynthesisPartialError,
     _cluster_plan_call_settings,
     _cluster_planning_card,
     _cluster_projection_is_publishable,
@@ -328,7 +327,7 @@ def test_cluster_plan_checkpoint_ignores_machine_projection_feedback(
     assert replay.checkpoint_hits == 1
 
 
-def test_global_plan_refuses_to_assume_an_unsupported_output_limit() -> None:
+def test_global_plan_uses_the_provider_output_limit_before_packetization() -> None:
     class _LimitedPlanReasoner(_PlanReasoner):
         @property
         def capabilities(self) -> dict:
@@ -338,11 +337,12 @@ def test_global_plan_refuses_to_assume_an_unsupported_output_limit() -> None:
                 "request_deadline_seconds": 600,
             }
 
-    with pytest.raises(
-        LiteratureSynthesisPartialError,
-        match="cluster_plan_output_capability_insufficient",
-    ):
-        _cluster_plan_call_settings(_LimitedPlanReasoner(), {}, card_count=122)
+    settings = _cluster_plan_call_settings(
+        _LimitedPlanReasoner(), {}, card_count=122
+    )
+
+    assert settings["output_tokens"] == 16_000
+    assert settings["input_char_budget"] > 0
 
 
 def test_legacy_review_pending_relationships_do_not_enter_cluster_context() -> None:

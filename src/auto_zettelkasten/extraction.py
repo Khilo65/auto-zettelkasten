@@ -7,17 +7,22 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from enum import Enum
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Literal, Mapping
+from typing import Any, Callable, Literal, Mapping
 
 
 SourceScope = Literal[
     "full_document", "partial_document", "abstract_only", "metadata_only"
 ]
 CoverageGate = Literal["passed", "limited", "failed"]
+
+
+class ExtractionCancelled(RuntimeError):
+    pass
 
 
 class ContentAdequacyClass(str, Enum):
@@ -577,6 +582,7 @@ def extract_path(
     *,
     ocr_mode: Literal["auto", "off", "required"] = "auto",
     ocr_languages: tuple[str, ...] = ("eng",),
+    cancelled: Callable[[], bool] | None = None,
 ) -> ExtractionResult:
     if not path.exists() or not path.is_file():
         return ExtractionResult(status="failed", route="local_file", reason="file_not_found")
@@ -591,6 +597,7 @@ def extract_path(
         filename=path.name,
         ocr_mode=ocr_mode,
         ocr_languages=ocr_languages,
+        cancelled=cancelled,
     )
 
 
@@ -601,12 +608,18 @@ def extract_bytes(
     filename: str = "",
     ocr_mode: Literal["auto", "off", "required"] = "auto",
     ocr_languages: tuple[str, ...] = ("eng",),
+    cancelled: Callable[[], bool] | None = None,
 ) -> ExtractionResult:
     if ocr_mode not in {"auto", "off", "required"}:
         raise ValueError("ocr_mode must be one of: auto, off, required")
     suffix = Path(filename).suffix.lower()
     if media_type == "application/pdf" or suffix == ".pdf":
-        return _extract_pdf(data, ocr_mode=ocr_mode, ocr_languages=ocr_languages)
+        return _extract_pdf(
+            data,
+            ocr_mode=ocr_mode,
+            ocr_languages=ocr_languages,
+            cancelled=cancelled,
+        )
     if media_type in {"text/html", "application/xhtml+xml"} or suffix in {".html", ".htm"}:
         decoded = _decode_text(data)
         parser = _parse_html(decoded)
@@ -650,6 +663,7 @@ def _extract_pdf(
     *,
     ocr_mode: Literal["auto", "off", "required"] = "auto",
     ocr_languages: tuple[str, ...] = ("eng",),
+    cancelled: Callable[[], bool] | None = None,
 ) -> ExtractionResult:
     try:
         from pypdf import PdfReader
@@ -665,7 +679,10 @@ def _extract_pdf(
                 reason="pdf_page_count_unavailable",
                 media_type="application/pdf",
             )
-        embedded_pages = [_clean_text(page.extract_text() or "") for page in reader.pages]
+        embedded_pages = []
+        for page in reader.pages:
+            _raise_if_cancelled(cancelled)
+            embedded_pages.append(_clean_text(page.extract_text() or ""))
         try:
             page_labels = tuple(str(value) for value in reader.page_labels)
         except (AttributeError, TypeError, ValueError):
@@ -697,7 +714,14 @@ def _extract_pdf(
     orientation_retries: list[int] = []
     if suspicious_pages and ocr_mode != "off":
         for index in sorted(suspicious_pages):
-            recovered = _ocr_pdf_page(data, index, ocr_languages)
+            _raise_if_cancelled(cancelled)
+            recovered = (
+                _ocr_pdf_page(data, index, ocr_languages)
+                if cancelled is None
+                else _ocr_pdf_page(
+                    data, index, ocr_languages, cancelled=cancelled
+                )
+            )
             if not recovered.available:
                 ocr_unavailable = True
                 unresolved_pages.append(index + 1)
@@ -798,11 +822,24 @@ def ocr_pdf_bytes(data: bytes) -> ExtractionResult:
     return result
 
 
-def _ocr_pdf_page(data: bytes, page_index: int, languages: tuple[str, ...]) -> _OCRPageResult:
+def _ocr_pdf_page(
+    data: bytes,
+    page_index: int,
+    languages: tuple[str, ...],
+    *,
+    cancelled: Callable[[], bool] | None = None,
+) -> _OCRPageResult:
     try:
+        _raise_if_cancelled(cancelled)
         with tempfile.TemporaryDirectory(prefix="auto-zettelkasten-ocr-") as temporary:
             temporary_root = Path(temporary)
-            rendered = _render_pdf_page(data, page_index, temporary_root)
+            rendered = (
+                _render_pdf_page(data, page_index, temporary_root)
+                if cancelled is None
+                else _render_pdf_page(
+                    data, page_index, temporary_root, cancelled=cancelled
+                )
+            )
             if rendered is None:
                 return _OCRPageResult()
             image_path, renderer = rendered
@@ -810,7 +847,19 @@ def _ocr_pdf_page(data: bytes, page_index: int, languages: tuple[str, ...]) -> _
             if not tesseract:
                 return _OCRPageResult()
             language = "+".join(language.strip() for language in languages if language.strip()) or "eng"
-            first = _run_tesseract(tesseract, image_path, language=language, psm=3)
+            first = (
+                _run_tesseract(
+                    tesseract, image_path, language=language, psm=3
+                )
+                if cancelled is None
+                else _run_tesseract(
+                    tesseract,
+                    image_path,
+                    language=language,
+                    psm=3,
+                    cancelled=cancelled,
+                )
+            )
             orientation_retry = _rendered_page_is_landscape(image_path)
             if not _page_text_is_suspicious(first) and not orientation_retry:
                 return _OCRPageResult(
@@ -820,7 +869,19 @@ def _ocr_pdf_page(data: bytes, page_index: int, languages: tuple[str, ...]) -> _
                 )
             # PSM 1 is the single orientation-aware retry for a failed or
             # implausible first pass.
-            second = _run_tesseract(tesseract, image_path, language=language, psm=1)
+            second = (
+                _run_tesseract(
+                    tesseract, image_path, language=language, psm=1
+                )
+                if cancelled is None
+                else _run_tesseract(
+                    tesseract,
+                    image_path,
+                    language=language,
+                    psm=1,
+                    cancelled=cancelled,
+                )
+            )
             chosen = second if not _page_text_is_suspicious(second) else first
             return _OCRPageResult(
                 text=chosen,
@@ -834,11 +895,20 @@ def _ocr_pdf_page(data: bytes, page_index: int, languages: tuple[str, ...]) -> _
                     )
                 ),
             )
+    except ExtractionCancelled:
+        raise
     except (OSError, subprocess.SubprocessError, RuntimeError):
         return _OCRPageResult()
 
 
-def _render_pdf_page(data: bytes, page_index: int, temporary_root: Path) -> tuple[Path, str] | None:
+def _render_pdf_page(
+    data: bytes,
+    page_index: int,
+    temporary_root: Path,
+    *,
+    cancelled: Callable[[], bool] | None = None,
+) -> tuple[Path, str] | None:
+    _raise_if_cancelled(cancelled)
     try:
         import pypdfium2 as pdfium
 
@@ -866,7 +936,7 @@ def _render_pdf_page(data: bytes, page_index: int, temporary_root: Path) -> tupl
     source_path = temporary_root / "source.pdf"
     source_path.write_bytes(data)
     output_root = temporary_root / f"page-{page_index + 1}"
-    completed = subprocess.run(
+    completed = _run_cancellable(
         [
             pdftoppm,
             "-f",
@@ -880,23 +950,71 @@ def _render_pdf_page(data: bytes, page_index: int, temporary_root: Path) -> tupl
             str(source_path),
             str(output_root),
         ],
-        check=False,
-        capture_output=True,
+        text=False,
         timeout=120,
+        cancelled=cancelled,
     )
     image_path = output_root.with_suffix(".png")
     return (image_path, "poppler") if completed.returncode == 0 and image_path.exists() else None
 
 
-def _run_tesseract(tesseract: str, image_path: Path, *, language: str, psm: int) -> str:
-    completed = subprocess.run(
+def _run_tesseract(
+    tesseract: str,
+    image_path: Path,
+    *,
+    language: str,
+    psm: int,
+    cancelled: Callable[[], bool] | None = None,
+) -> str:
+    completed = _run_cancellable(
         [tesseract, str(image_path), "stdout", "-l", language, "--psm", str(psm)],
-        check=False,
-        capture_output=True,
         text=True,
         timeout=120,
+        cancelled=cancelled,
     )
     return _clean_text(completed.stdout) if completed.returncode == 0 else ""
+
+
+def _raise_if_cancelled(cancelled: Callable[[], bool] | None) -> None:
+    if cancelled is not None and cancelled():
+        raise ExtractionCancelled("extraction_cancelled")
+
+
+def _run_cancellable(
+    command: list[str],
+    *,
+    text: bool,
+    timeout: float,
+    cancelled: Callable[[], bool] | None,
+) -> subprocess.CompletedProcess[Any]:
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=text,
+    )
+    started = time.monotonic()
+    try:
+        while True:
+            _raise_if_cancelled(cancelled)
+            remaining = timeout - (time.monotonic() - started)
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout)
+            try:
+                stdout, stderr = process.communicate(timeout=min(0.2, remaining))
+                return subprocess.CompletedProcess(
+                    command, process.returncode, stdout, stderr
+                )
+            except subprocess.TimeoutExpired:
+                continue
+    except BaseException:
+        process.terminate()
+        try:
+            process.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+        raise
 
 
 def _rendered_page_is_landscape(image_path: Path) -> bool:

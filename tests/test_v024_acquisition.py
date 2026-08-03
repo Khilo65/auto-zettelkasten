@@ -538,7 +538,7 @@ def test_two_empty_literature_responses_are_terminal_after_two_attempts(
         reasoner,
         LiteratureMapRequest(tmp_path),
     )
-    with pytest.raises(Exception, match="terminal_failure"):
+    with pytest.raises(ProviderEmptyResponse):
         calls("cluster_proposal", "all", "propose_clusters", [], {})
 
     failure = read_yaml(calls.root / "cluster_proposal/all.yml")
@@ -546,6 +546,8 @@ def test_two_empty_literature_responses_are_terminal_after_two_attempts(
     assert failure["attempt_count"] == 2
     assert failure["failure_class"] == "provider_empty_response"
     assert failure["raw_response"] == ""
+    assert failure["terminal"] is False
+    assert failure["retry_on_resume"] is True
 
 
 def test_cluster_scheduler_reserves_retry_capacity_and_accounts_deferrals(
@@ -580,8 +582,8 @@ def test_cluster_scheduler_reserves_retry_capacity_and_accounts_deferrals(
 
     scheduled, completion_pending = _schedule_cluster_writers(calls, runnable)
 
-    assert len(scheduled) == 15
-    assert len(completion_pending) == 7
+    assert len(scheduled) == 22
+    assert completion_pending == []
     assert all(
         _cluster_acquisition_revision(
             cluster,
@@ -628,9 +630,10 @@ def test_empty_retry_defers_when_call_ceiling_is_exhausted(tmp_path: Path) -> No
             literature_policy=LiteratureMappingPolicy(max_synthesis_calls=1),
         ),
     )
-    with pytest.raises(Exception, match="terminal_failure"):
+    with pytest.raises(ProviderEmptyResponse):
         calls("cluster_proposal", "all", "propose_clusters", [], {})
 
     failure = read_yaml(calls.root / "cluster_proposal/all.yml")
     assert failure["empty_retry_status"] == "empty_retry_deferred_budget"
+    assert failure["terminal"] is False
     assert calls.cumulative_provider_calls == 1

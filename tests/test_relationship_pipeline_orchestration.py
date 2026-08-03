@@ -340,7 +340,7 @@ def test_global_discovery_creates_immutable_pair_job(
             assert context["discovery_mode"] == "global"
             assert {profile.source_id for profile in provider_profiles} == {"A", "B"}
             assert all(not profile.evidence_anchors for profile in provider_profiles)
-            assert context["max_inferred_pairs"] == 48
+            assert context["max_inferred_pairs"] == 1
             assert context["reserved_bridge_fraction"] == 0.4
             assert "literature_positions" in context
             assert "existing_graph_neighbors" not in context
@@ -403,6 +403,68 @@ def test_global_discovery_creates_immutable_pair_job(
     assert job_path.read_bytes() == before
 
 
+def test_builtin_global_discovery_continues_until_a_page_has_no_new_pairs(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile(source_id) for source_id in "ABC"]
+    candidate_pages = iter(
+        (
+            {"candidates": [_candidate("A", "B")]},
+            {"candidates": [_candidate("B", "C")]},
+            {"candidates": []},
+        )
+    )
+
+    def handler(stage, _profiles, context):
+        if stage == "relationship_candidate_selection":
+            assert context["max_inferred_pairs"] == 3
+            return next(candidate_pages)
+        return {"decisions": [_decision(job) for job in context["pair_jobs"]]}
+
+    calls = _Calls(handler)
+    result = _run(
+        tmp_path,
+        profiles,
+        calls,
+        reasoner=_BuiltInDeepSeekReasoner(),
+    )
+
+    assert result["pair_job_count"] == 2
+    assert result["relationship_stage_complete"] is True
+    assert sum(
+        stage == "relationship_candidate_selection"
+        for stage, _key, _context in calls.seen
+    ) == 3
+
+
+def test_completed_discovery_page_survives_a_retryable_continuation_failure(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile(source_id) for source_id in "ABC"]
+    candidate_calls = 0
+
+    def handler(stage, _profiles, context):
+        nonlocal candidate_calls
+        if stage == "relationship_candidate_selection":
+            candidate_calls += 1
+            if candidate_calls == 1:
+                return {"candidates": [_candidate("A", "B")]}
+            raise TimeoutError("provider request timed out")
+        return {"decisions": [_decision(job) for job in context["pair_jobs"]]}
+
+    result = _run(
+        tmp_path,
+        profiles,
+        _Calls(handler),
+        reasoner=_BuiltInDeepSeekReasoner(),
+    )
+
+    assert len(result["accepted"]) == 1
+    assert result["pair_job_count"] == 1
+    assert result["relationship_stage_complete"] is False
+    assert result["relationship_retry_on_resume"] is True
+
+
 def test_shared_plan_keeps_family_discovery_in_separate_packets(
     tmp_path: Path,
 ) -> None:
@@ -455,11 +517,10 @@ def test_shared_plan_keeps_family_discovery_in_separate_packets(
     discovery_calls = [
         row for row in calls.seen if row[0].endswith("candidate_selection")
     ]
-    assert len(discovery_calls) == 3
+    assert len(discovery_calls) == 2
     assert [row[2]["discovery_pass"] for row in discovery_calls] == [
         "broad",
         "complement",
-        "coverage_followup",
     ]
     assert discovery_calls[1][2]["prior_candidate_pairs"] == []
 
@@ -716,7 +777,7 @@ def test_shared_plan_runs_broad_before_complement_and_passes_prior_pairs(
         context["discovery_pass"]
         for stage, _key, context in calls.seen
         if stage.endswith("candidate_selection")
-    ] == ["broad", "complement"]
+    ] == ["broad", "broad", "complement", "complement"]
 
 
 def test_undercovered_families_share_one_followup_and_are_accounted(
@@ -754,7 +815,16 @@ def test_undercovered_families_share_one_followup_and_are_accounted(
             }
         if stage == "relationship_candidate_selection":
             if context["discovery_pass"] == "complement":
-                return {"candidates": []}
+                return {
+                    "candidates": [],
+                    "job_outcomes": [
+                        {
+                            "bridge_job_id": job["bridge_job_id"],
+                            "status": "completed",
+                        }
+                        for job in context["bridge_jobs"]
+                    ],
+                }
             assert {row["bridge_job_id"] for row in context["bridge_jobs"]} == {
                 "family-cd",
                 "family-ef",
@@ -791,7 +861,12 @@ def test_undercovered_families_share_one_followup_and_are_accounted(
         context["discovery_pass"]
         for stage, _key, context in calls.seen
         if stage.endswith("candidate_selection")
-    ] == ["broad", "complement", "coverage_followup"]
+    ] == [
+        "broad",
+        "complement",
+        "coverage_followup",
+        "coverage_followup",
+    ]
     accounting = {
         row["bridge_job_id"]: row
         for row in result["relationship_discovery_jobs"]
@@ -964,7 +1039,7 @@ def test_duplicate_broad_and_family_candidate_preserves_both_provenances(
     assert accounting["family-ab"]["dispositions"]["selected_for_adjudication"]
 
 
-def test_shared_packet_overflow_drops_shared_accounting(
+def test_shared_packet_overflow_preserves_other_family_accounting(
     tmp_path: Path, monkeypatch
 ) -> None:
     profiles = [_profile(source_id) for source_id in "ABCD"]
@@ -1006,8 +1081,13 @@ def test_shared_packet_overflow_drops_shared_accounting(
         },
     )
 
-    assert result["relationship_discovery_jobs"] == []
-    assert "family-cd" not in result["relationship_discovery_incomplete_jobs"]
+    accounting = {
+        row["bridge_job_id"]: row
+        for row in result["relationship_discovery_jobs"]
+    }
+    assert accounting["requested"]["status"] == "completed"
+    assert accounting["family-cd"]["status"] == "under_covered"
+    assert "family-cd" in result["relationship_discovery_incomplete_jobs"]
     assert all(
         context.get("discovery_pass") != "coverage_followup"
         for _stage, _key, context in calls.seen
@@ -1348,7 +1428,7 @@ def test_multi_packet_discovery_reserves_actual_call_count(
         context["max_inferred_pairs"] <= 96
         for context in candidate_contexts[1:]
     )
-    assert calls.cumulative_provider_calls == 4
+    assert calls.cumulative_provider_calls == 5
     assert not any(
         row.get("reason") == "relationship_discovery_budget_conflict"
         for row in result["parked"]
@@ -2384,7 +2464,6 @@ def test_changed_literature_position_reopens_pair_without_reusing_decision(
     second = _run(tmp_path, profiles, second_calls)
 
     assert [stage for stage, _key, _context in second_calls.seen] == [
-        "relationship_candidate_selection",
         "relationship_adjudication",
     ]
     assert len(job_ids) == 2

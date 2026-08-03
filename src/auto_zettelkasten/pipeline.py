@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import queue
 import re
 import threading
 import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -16,6 +18,7 @@ from . import ARTIFACT_SCHEMA_VERSION, ENGINE_VERSION
 from .controller import LocalController
 from .extraction import (
     ContentAdequacy,
+    ExtractionCancelled,
     classify_content_adequacy,
     classify_metadata_only,
     extract_bytes,
@@ -132,7 +135,9 @@ from .relationships import (
     validate_relationship_decision_rows,
 )
 from .readers import (
+    ProviderEmptyResponse,
     ProviderError,
+    ProviderTransportError,
     SECTION_KEYS,
     SOURCE_BUNDLE_ENVELOPE_CONTRACT,
     SOURCE_BUNDLE_MAX_OUTPUT_TOKENS,
@@ -141,8 +146,10 @@ from .readers import (
     _normalize_source_bundle_payload,
     _normalize_provider_evidence_anchor,
     _parse_source_bundle_response,
+    cancel_active_provider_responses,
     current_provider_completion,
     provider_from_name,
+    provider_attempt_cost_usd,
     reset_provider_completion,
 )
 from .workspace import (
@@ -163,9 +170,7 @@ CHUNKING_VERSION = "2"
 CONTENT_CLASSIFIER_VERSION = "4"
 _RELATIONSHIP_BATCH_MAX_JOBS = 15
 _LEGACY_RELATIONSHIP_BATCH_MAX_JOBS = 8
-_RELATIONSHIP_GENERAL_CANDIDATE_MAX = 70
-_RELATIONSHIP_BRIDGE_CANDIDATE_MAX = 50
-_RELATIONSHIP_CANDIDATE_MAX = 120
+_RELATIONSHIP_DISCOVERY_PAGE_SIZE = 64
 _RELATIONSHIP_SELECTION_STATE_SCHEMA_VERSION = "4"
 _RELATIONSHIP_DISCOVERY_POLICY_VERSION = "family-coverage-v24"
 _RELATIONSHIP_SEMANTIC_POLICY_VERSION = "source-owned-bases-v26"
@@ -192,6 +197,140 @@ def _source_worker_count(
     else:
         configured = _AUTO_CLOUD_SOURCE_WORKER_LIMIT
     return max(1, min(pending_count or 1, configured))
+
+
+_PREPARED_SOURCE_RESULT_VERSION = "1"
+
+
+def _source_base_row(
+    index: int,
+    item: Mapping[str, Any],
+    request: MapRequest,
+    reader: ReaderProvider,
+) -> dict[str, Any]:
+    return {
+        "inventory_index": index,
+        "item": dict(item),
+        "zotero_item_key": item_key(item),
+        "source_id": source_id_for_item(item),
+        "note_id": note_id_for_item(item),
+        "attempts": [],
+        "terminal_status": "parked_for_review",
+        "reason": "",
+        "reader_provider": str(getattr(reader, "name", request.provider)),
+        "reader_model": str(getattr(reader, "model", request.model)),
+    }
+
+
+def _prepared_source_result_path(run_dir: Path, key: str) -> Path:
+    return run_dir / "items" / safe_filename(key) / "prepared_result.yml"
+
+
+def _write_prepared_source_result(
+    run_dir: Path, row: Mapping[str, Any], *, request_hash: str
+) -> Path:
+    compact = dict(row)
+    compact.pop("text", None)
+    path = _prepared_source_result_path(
+        run_dir, str(compact.get("zotero_item_key") or "missing")
+    )
+    write_yaml(
+        path,
+        {
+            "prepared_result_version": _PREPARED_SOURCE_RESULT_VERSION,
+            "engine_version": ENGINE_VERSION,
+            "zotero_item_key": str(compact.get("zotero_item_key") or ""),
+            "request_hash": request_hash,
+            "fingerprint": str(compact.get("fingerprint") or ""),
+            "status": "ready",
+            "row": compact,
+        },
+    )
+    return path
+
+
+def _load_prepared_source_result(
+    path: Path, *, request_hash: str
+) -> dict[str, Any] | None:
+    value = read_yaml(path, {}) or {}
+    if (
+        not isinstance(value, Mapping)
+        or str(value.get("prepared_result_version") or "")
+        != _PREPARED_SOURCE_RESULT_VERSION
+        or str(value.get("engine_version") or "") != ENGINE_VERSION
+        or str(value.get("request_hash") or "") != request_hash
+        or str(value.get("status") or "") not in {"ready", "committed"}
+        or not isinstance(value.get("row"), Mapping)
+    ):
+        return None
+    row = dict(value["row"])
+    if str(row.get("zotero_item_key") or "") != str(
+        value.get("zotero_item_key") or ""
+    ):
+        return None
+    row["_prepared_status"] = str(value.get("status") or "")
+    return row
+
+
+def _mark_prepared_source_result_committed(
+    path: Path, row: Mapping[str, Any]
+) -> None:
+    value = read_yaml(path, {}) or {}
+    if not isinstance(value, Mapping) or str(value.get("status") or "") != "ready":
+        return
+    updated = dict(value)
+    updated["status"] = "committed"
+    compact = dict(row)
+    compact.pop("text", None)
+    compact.pop("_prepared_status", None)
+    updated["row"] = compact
+    write_yaml(path, updated)
+
+
+def _recover_finalized_prepared_result(
+    workspace: Path, path: Path, row: dict[str, Any]
+) -> dict[str, Any]:
+    """Use the fingerprint written after all source side effects as the receipt."""
+
+    if row.get("_prepared_status") != "ready" or not row.get("fingerprint"):
+        return row
+    receipt = read_yaml(
+        workspace
+        / "11_state"
+        / "fingerprints"
+        / f"{row['fingerprint']}.yml",
+        {},
+    ) or {}
+    note_path = workspace / str(receipt.get("note_path") or "")
+    if (
+        not isinstance(receipt, Mapping)
+        or str(receipt.get("source_id") or "") != str(row.get("source_id") or "")
+        or not note_path.is_file()
+    ):
+        return row
+    note = read_note(note_path)
+    if not validate_note(internal_note_text(note_path)).passed:
+        return row
+    note_status = str(note["frontmatter"].get("note_status") or "")
+    recovered = {
+        **row,
+        "note_path": str(note_path.relative_to(workspace)),
+        "note_status": note_status,
+        "terminal_status": (
+            "validated_note"
+            if note_status
+            in {
+                "analytical_atomic_note",
+                "verified_atomic_note",
+                "partial_document_atomic_note",
+            }
+            else "limited_note"
+        ),
+        "reused": True,
+    }
+    _mark_prepared_source_result_committed(path, recovered)
+    recovered["_prepared_status"] = "committed"
+    return recovered
 
 
 def _allocate_complementary_candidate_quotas(
@@ -358,6 +497,10 @@ class AtomicFidelityError(RuntimeError):
     pass
 
 
+class ProviderSpendLimitReached(RuntimeError):
+    pass
+
+
 class _LocalAcquisitionGate:
     """Bound local Zotero/extraction work independently from provider calls."""
 
@@ -384,7 +527,15 @@ class _LocalAcquisitionGate:
 class _ProfileProviderBudget:
     """Persist the cumulative source/profile ceiling through append-only events."""
 
-    def __init__(self, path: Path, max_calls: int) -> None:
+    def __init__(
+        self,
+        path: Path,
+        max_calls: int | None,
+        *,
+        provider: str = "deepseek",
+        model: str = "deepseek-v4-flash",
+        max_spend_usd: Decimal | None = None,
+    ) -> None:
         self.path = path
         self.events_path = path.with_name("provider_events.jsonl")
         self._lock = threading.Lock()
@@ -396,16 +547,20 @@ class _ProfileProviderBudget:
             if isinstance(row, Mapping)
         ]
         events = self._read_events()
-        event_maxima = [
-            int(row.get("max_calls", 0) or 0)
-            for row in events
-            if int(row.get("max_calls", 0) or 0) > 0
-        ]
-        ceilings = [max_calls, *event_maxima]
-        if persisted_max:
-            ceilings.append(persisted_max)
-        self.max_calls = min(ceilings)
+        requested_max = int(max_calls or 0)
+        self.max_calls: int | None = requested_max if requested_max > 0 else None
+        self.legacy_max_calls = persisted_max
+        self.provider = provider
+        self.model = model
+        self.max_spend_usd = max_spend_usd
+        if max_spend_usd is not None and provider_attempt_cost_usd(
+            provider, model, {}
+        ) is None:
+            raise ValueError(
+                f"provider pricing is not registered for {provider}/{model}"
+            )
         events = self._migrate_legacy_attempts(events, legacy_attempts)
+        events = self._reconcile_interrupted_attempts(events)
         self.attempts = self._attempts_from_events(events)
         self._attempt_by_id = {
             str(row["attempt_id"]): row
@@ -421,6 +576,19 @@ class _ProfileProviderBudget:
             for row in self.attempts
         )
         self.cumulative_calls = len(self.attempts)
+        self.cumulative_spend_usd = sum(
+            (
+                Decimal(str(row.get("cost_usd", 0) or 0))
+                for row in self.attempts
+            ),
+            Decimal("0"),
+        )
+        self.spend_unknown = any(
+            str(row.get("status") or "") != "started"
+            and str(row.get("cost_status") or "")
+            != "provider_reported_usage"
+            for row in self.attempts
+        )
         self.new_calls = 0
         self._active_attempts: dict[str, float] = {}
         self.peak_concurrency = 0
@@ -432,8 +600,20 @@ class _ProfileProviderBudget:
 
     def reserve(self, stage: str, key: str, fingerprint: str) -> str:
         with self._lock:
-            if self.cumulative_calls >= self.max_calls:
+            if self.max_calls is not None and self.cumulative_calls >= self.max_calls:
                 raise RuntimeError("source_profile_call_budget_reached")
+            if (
+                self.max_spend_usd is not None
+                and (
+                    self.spend_unknown
+                    or self.cumulative_spend_usd >= self.max_spend_usd
+                )
+            ):
+                raise ProviderSpendLimitReached(
+                    "provider_spend_unknown"
+                    if self.spend_unknown
+                    else "provider_spend_budget_reached"
+                )
             identity = (stage, key, fingerprint)
             attempt_number = self._attempt_counts[identity] + 1
             attempt_id = stable_hash(
@@ -459,7 +639,7 @@ class _ProfileProviderBudget:
                         {"attempt_id": attempt_id, "event_type": "reserved"}
                     ),
                     "event_type": "reserved",
-                    "max_calls": self.max_calls,
+                    "max_calls": self.max_calls or 0,
                     **row,
                 }
             )
@@ -480,6 +660,7 @@ class _ProfileProviderBudget:
         *,
         status: str,
         provider_completion: Mapping[str, Any] | None = None,
+        failure: BaseException | None = None,
     ) -> None:
         with self._lock:
             row = self._attempt_by_id.get(attempt_id)
@@ -489,6 +670,10 @@ class _ProfileProviderBudget:
             started = self._active_attempts.pop(attempt_id, None)
             elapsed = round(time.monotonic() - started, 6) if started else 0.0
             completion = dict(provider_completion or {})
+            priced = provider_attempt_cost_usd(
+                self.provider, self.model, completion
+            )
+            cost = priced[0] if priced is not None else Decimal("0")
             event = {
                 "event_id": stable_hash(
                     {"attempt_id": attempt_id, "event_type": "finished"}
@@ -499,14 +684,48 @@ class _ProfileProviderBudget:
                 "finished_at": finished_at,
                 "elapsed_seconds": elapsed,
                 "provider_completion": completion,
+                "cost_usd": str(cost),
+                "cost_status": priced[1] if priced is not None else "unavailable",
             }
+            if failure is not None:
+                event.update(
+                    failure_class=(
+                        "transport"
+                        if isinstance(failure, ProviderTransportError)
+                        else "provider_empty"
+                        if isinstance(failure, ProviderEmptyResponse)
+                        else "semantic_contract"
+                    ),
+                    error_type=type(failure).__name__,
+                    error=str(failure),
+                    transport_kind=str(
+                        getattr(failure, "transport_kind", "") or ""
+                    ),
+                    retry_on_resume=bool(
+                        getattr(failure, "retry_on_resume", False)
+                    ),
+                )
             self._append_event(event)
             row.update(
                 status=status,
                 finished_at=finished_at,
                 elapsed_seconds=elapsed,
                 provider_completion=completion,
+                cost_usd=str(cost),
+                cost_status=event["cost_status"],
             )
+            self.cumulative_spend_usd += cost
+            self.spend_unknown |= (
+                event["cost_status"] != "provider_reported_usage"
+            )
+            if failure is not None:
+                row.update(
+                    failure_class=event["failure_class"],
+                    error_type=event["error_type"],
+                    error=event["error"],
+                    transport_kind=event["transport_kind"],
+                    retry_on_resume=event["retry_on_resume"],
+                )
             if elapsed > 0:
                 self._latencies.append(elapsed)
 
@@ -514,6 +733,7 @@ class _ProfileProviderBudget:
         """Materialize the compatibility YAML at explicit barriers only."""
 
         with self._lock:
+            self._sync_events()
             self._write()
 
     def metrics(self) -> dict[str, Any]:
@@ -531,6 +751,13 @@ class _ProfileProviderBudget:
                 "provider_latency_p95_seconds": percentile(0.95),
                 "provider_failure_count": sum(
                     row.get("status") == "failed" for row in self.attempts
+                ),
+                "provider_spend_usd": str(self.cumulative_spend_usd),
+                "provider_spend_unknown": self.spend_unknown,
+                "provider_spend_limit_usd": (
+                    str(self.max_spend_usd)
+                    if self.max_spend_usd is not None
+                    else ""
                 ),
             }
 
@@ -571,7 +798,7 @@ class _ProfileProviderBudget:
                     {"attempt_id": attempt_id, "event_type": "reserved"}
                 ),
                 "event_type": "reserved",
-                "max_calls": self.max_calls,
+                "max_calls": self.max_calls or 0,
                 **dict(legacy),
                 "status": "started",
             }
@@ -601,6 +828,40 @@ class _ProfileProviderBudget:
                 self._append_event(finished)
                 events.append(finished)
                 event_ids.add(str(finished["event_id"]))
+        return events
+
+    def _reconcile_interrupted_attempts(
+        self, events: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        attempts = self._attempts_from_events(events)
+        event_ids = {str(row.get("event_id") or "") for row in events}
+        for attempt in attempts:
+            if str(attempt.get("status") or "") != "started":
+                continue
+            attempt_id = str(attempt.get("attempt_id") or "")
+            event = {
+                "event_id": stable_hash(
+                    {"attempt_id": attempt_id, "event_type": "finished"}
+                ),
+                "event_type": "finished",
+                "attempt_id": attempt_id,
+                "status": "interrupted",
+                "finished_at": now_iso(),
+                "elapsed_seconds": 0.0,
+                "provider_completion": {},
+                "failure_class": "transport",
+                "error_type": "InterruptedProviderAttempt",
+                "error": "provider attempt was reserved but did not finish",
+                "transport_kind": "interrupted_process",
+                "retry_on_resume": True,
+                "cost_usd": "0",
+                "cost_status": "unknown_interrupted_attempt",
+            }
+            if event["event_id"] in event_ids:
+                continue
+            self._append_event(event)
+            events.append(event)
+            event_ids.add(str(event["event_id"]))
         return events
 
     @staticmethod
@@ -641,6 +902,13 @@ class _ProfileProviderBudget:
                             "finished_at",
                             "elapsed_seconds",
                             "provider_completion",
+                            "failure_class",
+                            "error_type",
+                            "error",
+                            "transport_kind",
+                            "retry_on_resume",
+                            "cost_usd",
+                            "cost_status",
                         )
                     }
                 )
@@ -663,6 +931,14 @@ class _ProfileProviderBudget:
                 if written <= 0:
                     raise OSError("provider event ledger write failed")
                 remaining = remaining[written:]
+        finally:
+            os.close(descriptor)
+
+    def _sync_events(self) -> None:
+        if not self.events_path.exists():
+            return
+        descriptor = os.open(self.events_path, os.O_RDONLY)
+        try:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
@@ -671,8 +947,15 @@ class _ProfileProviderBudget:
         write_yaml(
             self.path,
             {
-                "usage_schema_version": "3",
-                "max_calls": self.max_calls,
+                "usage_schema_version": "4",
+                "max_calls": self.max_calls or 0,
+                "legacy_max_calls": self.legacy_max_calls,
+                "max_provider_spend_usd": (
+                    str(self.max_spend_usd)
+                    if self.max_spend_usd is not None
+                    else ""
+                ),
+                "provider_spend_usd": str(self.cumulative_spend_usd),
                 "provider_call_count": self.cumulative_calls,
                 "provider_event_ledger": self.events_path.name,
                 "attempts": self.attempts,
@@ -681,6 +964,8 @@ class _ProfileProviderBudget:
 
 
 def _transport_retryable(exc: BaseException) -> bool:
+    if isinstance(exc, (ProviderTransportError, ProviderEmptyResponse)):
+        return True
     if not isinstance(exc, ProviderError):
         return False
     message = str(exc).casefold()
@@ -693,6 +978,7 @@ def _transport_retryable(exc: BaseException) -> bool:
             "provider unavailable",
             "provider request timed out",
             "provider connection interrupted",
+            "provider stream read failed",
         )
     )
 
@@ -706,10 +992,16 @@ def _provider_call_with_transport_retry(
     *,
     before_attempt: Callable[[], None] | None = None,
     on_attempt: Callable[[], None] | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> Any:
     """Run one provider operation with at most one counted transport retry."""
 
     for attempt_number in range(2):
+        if cancelled is not None and cancelled():
+            raise ProviderTransportError(
+                "provider call cancelled",
+                transport_kind="cancelled",
+            )
         if before_attempt is not None:
             before_attempt()
         attempt_id = budget.reserve(stage, key, fingerprint)
@@ -722,8 +1014,13 @@ def _provider_call_with_transport_retry(
                 attempt_id,
                 status="failed",
                 provider_completion=getattr(exc, "provider_completion", {}),
+                failure=exc,
             )
-            if attempt_number == 0 and _transport_retryable(exc):
+            if (
+                attempt_number == 0
+                and _transport_retryable(exc)
+                and not (cancelled is not None and cancelled())
+            ):
                 continue
             raise
         budget.finish(
@@ -905,7 +1202,7 @@ class _RunProgress:
                 else "finished"
                 if terminal_status in {"exhausted", "parked_for_review"}
                 else "paused"
-                if terminal_status == "partial"
+                if terminal_status in {"partial", "paused_transport"}
                 else "queued"
             )
             self.items[str(index)] = {
@@ -1072,6 +1369,7 @@ class _RunProgress:
                 "duplicate_alias",
                 "parked_for_review",
                 "partial",
+                "paused_transport",
                 "pending",
                 "active",
             )
@@ -1093,8 +1391,11 @@ class _RunProgress:
             "limited_note_count": counts["limited_note"],
             "duplicate_alias_count": counts["duplicate_alias"],
             "parked_for_review_count": counts["parked_for_review"],
-            "partial_count": counts["partial"],
-            "pending_count": counts["pending"] + counts["active"],
+            "partial_count": counts["partial"] + counts["paused_transport"],
+            "paused_transport_count": counts["paused_transport"],
+            "pending_count": (
+                counts["pending"] + counts["active"] + counts["paused_transport"]
+            ),
             "active_count": counts["active"],
             "terminal_count": terminal_count,
             "active_item_keys": [
@@ -1351,6 +1652,9 @@ def run_pipeline(
     profile_budget = _ProfileProviderBudget(
         run_dir / "literature" / "profiles" / "provider_usage.yml",
         request.literature_policy.max_profile_calls,
+        provider=request.provider,
+        model=request.model,
+        max_spend_usd=request.max_provider_spend_usd,
     )
     progress.set_stage("frozen_inventory")
     progress.set_stage("source_processing")
@@ -1364,8 +1668,23 @@ def run_pipeline(
     )
     pending, duplicate_aliases = _canonical_inventory_plan(workspace, items)
     source_match_index = _source_match_index(workspace)
+    prepared_request_hash = _source_replay_request_hash(request)
 
     def commit_result(row: dict[str, Any]) -> None:
+        if row.pop("_prepared_status", "") == "committed":
+            row["reused"] = True
+            prepared.append(row)
+            public_row = _public_terminal_row(row)
+            terminal_rows.append(public_row)
+            if public_row.get("note_path"):
+                note_rows.append(_note_summary_from_path(workspace, public_row))
+            progress.update(
+                int(public_row["inventory_index"]),
+                status=str(public_row["terminal_status"]),
+                phase="committed" if public_row.get("note_path") else "finished",
+                reason=str(public_row.get("reason", "")),
+            )
+            return
         prepared.append(row)
         public_row, note_row, row_proposals, row_decisions = _finalize_prepared_row(
             workspace,
@@ -1391,77 +1710,258 @@ def run_pipeline(
 
     requested_concurrency = request.provider_concurrency
     workers = _source_worker_count(reader, request, len(pending))
-    acquisition_gate = _LocalAcquisitionGate(request.parallel)
+    local_workers = min(max(1, request.parallel), max(1, len(pending)))
     source_stage_started = time.monotonic()
     concurrency_lock = threading.Lock()
     active_source_jobs = 0
     peak_source_concurrency = 0
+    active_local_jobs = 0
+    peak_local_concurrency = 0
+    queue_peaks = {"local": 0, "provider_ready": 0, "completion": 0}
+    queue_lock = threading.Lock()
+    cancel_event = threading.Event()
+    budget_pause_event = threading.Event()
+    provider_input_closed = threading.Event()
+    local_queue: queue.Queue[Any] = queue.Queue(maxsize=max(1, len(pending)))
+    provider_queue: queue.Queue[Any] = queue.Queue(maxsize=max(1, len(pending)))
+    completion_queue: queue.Queue[Path] = queue.Queue(maxsize=max(1, len(pending)))
+    worker_errors: queue.Queue[BaseException] = queue.Queue()
+    local_stop = object()
+    local_exit_lock = threading.Lock()
+    local_exits = 0
 
-    def prepare_one(index: int, item: Mapping[str, Any]) -> dict[str, Any]:
-        nonlocal active_source_jobs, peak_source_concurrency
-        with concurrency_lock:
-            active_source_jobs += 1
-            peak_source_concurrency = max(
-                peak_source_concurrency, active_source_jobs
-            )
+    def record_queue(name: str, value: queue.Queue[Any]) -> None:
+        with queue_lock:
+            queue_peaks[name] = max(queue_peaks[name], value.qsize())
+
+    def local_loop() -> None:
+        nonlocal active_local_jobs, peak_local_concurrency, local_exits
         try:
-            return _prepare_item(
-                workspace,
-                run_dir,
-                index,
-                item,
-                request,
-                client,
-                reader,
-                vision,
-                progress,
-                profile_budget,
-                source_match_index,
-                acquisition_gate,
-            )
+            while not cancel_event.is_set() and not budget_pause_event.is_set():
+                try:
+                    descriptor = local_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if descriptor is local_stop:
+                    return
+                index, item = descriptor
+                with concurrency_lock:
+                    active_local_jobs += 1
+                    peak_local_concurrency = max(
+                        peak_local_concurrency, active_local_jobs
+                    )
+                try:
+                    row = _acquire_and_freeze_item(
+                        workspace,
+                        run_dir,
+                        index,
+                        dict(item),
+                        request,
+                        client,
+                        reader,
+                        vision,
+                        cancel_event=cancel_event,
+                    )
+                except ExtractionCancelled:
+                    return
+                except Exception as exc:
+                    row = _exhausted_result(
+                        index,
+                        dict(item),
+                        "local_preparation_worker",
+                        f"unhandled_worker_error:{type(exc).__name__}:{exc}",
+                    )
+                finally:
+                    with concurrency_lock:
+                        active_local_jobs -= 1
+                if row is None:
+                    if not budget_pause_event.is_set():
+                        provider_queue.put((index, dict(item)))
+                        record_queue("provider_ready", provider_queue)
+                else:
+                    path = _write_prepared_source_result(
+                        run_dir, row, request_hash=prepared_request_hash
+                    )
+                    completion_queue.put(path)
+                    record_queue("completion", completion_queue)
+        except BaseException as exc:
+            worker_errors.put(exc)
+            cancel_event.set()
         finally:
-            with concurrency_lock:
-                active_source_jobs -= 1
+            with local_exit_lock:
+                local_exits += 1
+                if local_exits == local_workers:
+                    provider_input_closed.set()
+
+    def provider_loop() -> None:
+        nonlocal active_source_jobs, peak_source_concurrency
+        try:
+            while True:
+                if budget_pause_event.is_set():
+                    return
+                if cancel_event.is_set():
+                    return
+                try:
+                    index, item = provider_queue.get(timeout=0.1)
+                except queue.Empty:
+                    if provider_input_closed.is_set():
+                        return
+                    continue
+                with concurrency_lock:
+                    active_source_jobs += 1
+                    peak_source_concurrency = max(
+                        peak_source_concurrency, active_source_jobs
+                    )
+                try:
+                    row = _prepare_item(
+                        workspace,
+                        run_dir,
+                        index,
+                        dict(item),
+                        request,
+                        client,
+                        reader,
+                        vision,
+                        None,
+                        profile_budget,
+                        source_match_index,
+                        None,
+                        require_frozen_content=True,
+                        cancel_event=cancel_event,
+                    )
+                except ProviderSpendLimitReached:
+                    budget_pause_event.set()
+                    return
+                except Exception as exc:
+                    row = _exhausted_result(
+                        index,
+                        dict(item),
+                        "provider_preparation_worker",
+                        f"unhandled_worker_error:{type(exc).__name__}:{exc}",
+                    )
+                finally:
+                    with concurrency_lock:
+                        active_source_jobs -= 1
+                path = _write_prepared_source_result(
+                    run_dir, row, request_hash=prepared_request_hash
+                )
+                completion_queue.put(path)
+                record_queue("completion", completion_queue)
+        except BaseException as exc:
+            worker_errors.put(exc)
+            cancel_event.set()
 
     progress.set_stage(
         "source_processing",
         source_worker_count=workers,
-        local_worker_limit=request.parallel,
+        local_worker_limit=local_workers,
         provider_worker_limit=workers,
         provider_concurrency_mode=str(requested_concurrency or request.parallel),
-        source_queue_depth=max(0, len(pending) - workers),
+        source_queue_depth=len(pending),
     )
+    local_executor = ThreadPoolExecutor(
+        max_workers=local_workers, thread_name_prefix="auto-zettelkasten-local"
+    )
+    provider_executor = ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="auto-zettelkasten-provider"
+    )
+    local_futures = [local_executor.submit(local_loop) for _ in range(local_workers)]
+    provider_futures = [provider_executor.submit(provider_loop) for _ in range(workers)]
     try:
-        with ThreadPoolExecutor(
-            max_workers=workers, thread_name_prefix="auto-zettelkasten"
-        ) as executor:
-            future_map = {
-                executor.submit(
-                    prepare_one,
-                    index,
-                    item,
-                ): index
-                for index, item in pending
-            }
-            for future in as_completed(future_map):
-                try:
-                    commit_result(future.result())
-                except (
-                    Exception
-                ) as exc:  # defensive terminal accounting at the worker boundary
-                    index = future_map[future]
-                    commit_result(
-                        _exhausted_result(
-                            index,
-                            items[index],
-                            "pipeline_worker",
-                            f"unhandled_worker_error:{type(exc).__name__}:{exc}",
-                        )
+        for index, item in pending:
+            key = item_key(item)
+            prepared_path = _prepared_source_result_path(run_dir, key)
+            saved_prepared = (
+                _load_prepared_source_result(
+                    prepared_path, request_hash=prepared_request_hash
+                )
+                if prepared_path.exists()
+                else None
+            )
+            if saved_prepared is not None:
+                saved_prepared = _recover_finalized_prepared_result(
+                    workspace, prepared_path, saved_prepared
+                )
+            saved_status = str(
+                (saved_prepared or {}).get("terminal_status") or ""
+            )
+            saved_note_path = workspace / str(
+                (saved_prepared or {}).get("note_path") or ""
+            )
+            if (
+                saved_prepared
+                and saved_status not in {"paused_transport", "partial"}
+                and not (
+                    request.retry_terminal_failures
+                    and saved_status == "parked_for_review"
+                )
+                and not (
+                    saved_prepared.get("_prepared_status") == "committed"
+                    and saved_prepared.get("note_path")
+                    and not saved_note_path.is_file()
+                )
+            ):
+                completion_queue.put(prepared_path)
+                record_queue("completion", completion_queue)
+                continue
+            checkpoint_root = run_dir / "items" / safe_filename(key)
+            if (
+                (checkpoint_root / "frozen_content.yml").is_file()
+                and (checkpoint_root / "source.txt").is_file()
+            ):
+                provider_queue.put((index, dict(item)))
+                record_queue("provider_ready", provider_queue)
+            else:
+                local_queue.put((index, dict(item)))
+                record_queue("local", local_queue)
+        for _ in range(local_workers):
+            local_queue.put(local_stop)
+
+        committed = 0
+        while committed < len(pending):
+            if not worker_errors.empty():
+                raise worker_errors.get()
+            try:
+                prepared_path = completion_queue.get(timeout=0.1)
+            except queue.Empty:
+                if (
+                    budget_pause_event.is_set()
+                    and all(future.done() for future in provider_futures)
+                    and all(future.done() for future in local_futures)
+                ):
+                    break
+                if all(future.done() for future in provider_futures):
+                    raise RuntimeError(
+                        f"source_pipeline_incomplete:{committed}/{len(pending)}"
                     )
+                continue
+            row = _load_prepared_source_result(
+                prepared_path, request_hash=prepared_request_hash
+            )
+            if row is None:
+                raise RuntimeError(
+                    f"prepared_source_result_invalid:{prepared_path}"
+                )
+            commit_result(row)
+            _mark_prepared_source_result_committed(prepared_path, row)
+            committed += 1
+        for future in (*local_futures, *provider_futures):
+            future.result()
+        if budget_pause_event.is_set():
+            progress.set_stage("paused_budget")
     except BaseException:
+        cancel_event.set()
+        provider_input_closed.set()
+        cancel_active_provider_responses()
         progress.flush()
         profile_budget.flush()
         raise
+    finally:
+        cancel_event.set()
+        provider_input_closed.set()
+        local_executor.shutdown(wait=True, cancel_futures=True)
+        provider_executor.shutdown(wait=True, cancel_futures=True)
+    source_budget_paused = budget_pause_event.is_set()
     canonical_results = {
         int(row.get("inventory_index", -1)): row for row in prepared
     }
@@ -1536,11 +2036,14 @@ def run_pipeline(
     provider_metrics = profile_budget.metrics()
     progress.set_stage(
         "source_terminal_barrier",
+        source_provider_call_count=profile_budget.cumulative_calls,
+        source_provider_new_call_count=profile_budget.new_calls,
+        provider_call_count=profile_budget.cumulative_calls,
         source_peak_concurrency=int(
             provider_metrics.get("provider_peak_concurrency", 0) or 0
         ),
         source_worker_peak_concurrency=peak_source_concurrency,
-        local_peak_concurrency=acquisition_gate.peak,
+        local_peak_concurrency=peak_local_concurrency,
         provider_peak_concurrency=int(
             provider_metrics.get("provider_peak_concurrency", 0) or 0
         ),
@@ -1553,9 +2056,12 @@ def run_pipeline(
         provider_failure_count=int(
             provider_metrics.get("provider_failure_count", 0) or 0
         ),
-        source_queue_depth=max(0, len(pending) - workers),
+        source_queue_depth=0,
+        local_queue_peak=queue_peaks["local"],
+        provider_ready_queue_peak=queue_peaks["provider_ready"],
+        completion_queue_peak=queue_peaks["completion"],
         source_completions_per_minute=round(
-            len(pending) * 60 / source_stage_wall_seconds, 3
+            committed * 60 / source_stage_wall_seconds, 3
         )
         if source_stage_wall_seconds
         else 0.0,
@@ -1605,8 +2111,8 @@ def run_pipeline(
             run_id=run_id,
             question=request.question,
             request=request,
-            reasoner=literature_reasoner,
-            external_discovery=external_discovery,
+            reasoner=None if source_budget_paused else literature_reasoner,
+            external_discovery=None if source_budget_paused else external_discovery,
             progress=progress,
             resume=resume,
             profile_budget=profile_budget,
@@ -1716,7 +2222,11 @@ def run_pipeline(
     synthesis_failure_count = int(
         map_result["literature_packet"].get("synthesis_failure_count", 0) or 0
     )
-    literature_partial_reason = str(map_result.get("partial_reason") or "")
+    literature_partial_reason = (
+        "provider_spend_budget_reached"
+        if source_budget_paused
+        else str(map_result.get("partial_reason") or "")
+    )
     literature_summary = {
         "status": "partial" if literature_partial_reason else "completed",
         "stage": "reporting",
@@ -1836,9 +2346,13 @@ def run_pipeline(
         if row.get("terminal_status") in {"parked_for_review", "exhausted"}
     )
     partial_count = sum(
-        1 for row in terminal_rows if row.get("terminal_status") == "partial"
+        1
+        for row in terminal_rows
+        if row.get("terminal_status") in {"partial", "paused_transport"}
     )
-    pending_count = max(0, len(items) - len(terminal_rows))
+    pending_count = max(0, len(items) - len(terminal_rows)) + sum(
+        1 for row in terminal_rows if row.get("terminal_status") == "paused_transport"
+    )
     reused_count = sum(
         1
         for row in prepared
@@ -1862,7 +2376,7 @@ def run_pipeline(
         }
         for row in terminal_rows
         if row.get("terminal_status")
-        in {"parked_for_review", "exhausted", "partial"}
+        in {"parked_for_review", "exhausted", "partial", "paused_transport"}
     ]
     if literature_partial_reason:
         errors.append(
@@ -2054,6 +2568,7 @@ def run_pipeline(
 
 def _apply_reader_policy(reader: ReaderProvider, policy: ProcessingPolicy) -> None:
     for attribute, value in (
+        ("connect_timeout", policy.connect_timeout_seconds),
         ("request_deadline", policy.request_deadline_seconds),
         ("chunk_output_tokens", policy.chunk_output_tokens),
         ("direct_read_fraction", policy.context_window_fraction),
@@ -2193,12 +2708,14 @@ def _finalize_prepared_row(
                 "updated_at": now_iso(),
             },
         )
-    _write_fingerprint(workspace, row, relative_path)
     append_jsonl(
         attempt_path,
         _attempt(row, route, "succeeded", "note_committed", output_path=str(path)),
     )
     commit_tag_reviews(workspace, proposals, decisions)
+    # This receipt is last: its presence proves note, bundle, diagnostics,
+    # attempts, and tag side effects were all committed.
+    _write_fingerprint(workspace, row, relative_path)
     return (
         _public_terminal_row(row),
         _note_summary_from_path(workspace, row),
@@ -4574,7 +5091,7 @@ def _validate_literature_family_plan(
         ):
             requested_pair = ()
         try:
-            quota = max(1, min(120, int(raw.get("candidate_quota", 24) or 24)))
+            quota = max(1, int(raw.get("candidate_quota", 24) or 24))
         except (TypeError, ValueError):
             quota = 24
         jobs.append(
@@ -4681,11 +5198,7 @@ def _relationship_discovery_identity(provider: str, model: str) -> str:
             "model": model,
             "discovery_prompt_version": RELATIONSHIP_DISCOVERY_PROMPT_VERSION,
             "discovery_policy": _RELATIONSHIP_DISCOVERY_POLICY_VERSION,
-            "candidate_limits": {
-                "total": _RELATIONSHIP_CANDIDATE_MAX,
-                "general": _RELATIONSHIP_GENERAL_CANDIDATE_MAX,
-                "bridge": _RELATIONSHIP_BRIDGE_CANDIDATE_MAX,
-            },
+            "completion_policy": "useful_exhaustion-v28",
         }
     )
 
@@ -5391,7 +5904,7 @@ def _run_relationship_reasoning(
 
     configured_max_calls = getattr(reasoner_calls, "max_calls", None)
     remaining_calls = (
-        22
+        None
         if configured_max_calls is None
         else max(
             0,
@@ -5404,7 +5917,7 @@ def _run_relationship_reasoning(
     mandatory_call_count = (
         len(mandatory_basis) + batch_max_jobs - 1
     ) // batch_max_jobs
-    if mandatory_call_count > min(20, remaining_calls):
+    if remaining_calls is not None and mandatory_call_count > remaining_calls:
         return {
             "accepted": [],
             "no_relationship": [],
@@ -5589,39 +6102,25 @@ def _run_relationship_reasoning(
         )
         > catalogue_char_budget
     )
-    routing_call_count = (
-        (2 if collection_cards else 1) if requires_routing else 0
+    can_discover = not reuse_selected_pool and (
+        remaining_calls is None or remaining_calls > 0
     )
-    bridge_routing_call_count = int(bool(collection_cards or virtual_cards))
-    discovery_call_count = 2 + routing_call_count + bridge_routing_call_count
-    can_discover = (
-        not reuse_selected_pool
-        and remaining_calls >= mandatory_call_count + discovery_call_count + 1
+    possible_pair_count = max(
+        0,
+        len(profile_by_source) * (len(profile_by_source) - 1) // 2
+        - len(mandatory_basis),
     )
-    adjudication_call_capacity = min(
-        20,
-        max(
-            mandatory_call_count,
-            remaining_calls - (discovery_call_count if can_discover else 0),
-        ),
-    )
+    adjudication_call_capacity = (
+        possible_pair_count + batch_max_jobs - 1
+    ) // batch_max_jobs
     pair_capacity = adjudication_call_capacity * batch_max_jobs
     inferred_capacity = (
-        min(
-            max(0, _RELATIONSHIP_CANDIDATE_MAX - len(mandatory_basis)),
-            max(0, pair_capacity - len(mandatory_basis)),
-        )
+        min(possible_pair_count, max(0, pair_capacity - len(mandatory_basis)))
         if can_discover
         else 0
     )
-    general_capacity = min(
-        _RELATIONSHIP_GENERAL_CANDIDATE_MAX,
-        (inferred_capacity * 2 + 4) // 5,
-    )
-    bridge_capacity = min(
-        _RELATIONSHIP_BRIDGE_CANDIDATE_MAX,
-        max(0, inferred_capacity - general_capacity),
-    )
+    general_capacity = inferred_capacity
+    bridge_capacity = inferred_capacity
     discovery_completed = False
     discovery_terminal = False
     if shared_plan_active and not requires_routing:
@@ -5850,19 +6349,76 @@ def _run_relationship_reasoning(
     if can_discover and bridge_capacity:
         if callable(bridge_selector) and bridge_cards:
             try:
-                routed = reasoner_calls(
-                    "relationship_bridge_shard_selection",
-                    f"bridge-{catalogue_revision[:16]}",
-                    "select_relationship_bridge_shards",
-                    [],
-                    {
-                        "catalogue_revision": catalogue_revision,
-                        "routing_cards": bridge_cards,
-                        "collection_index_cards": collection_index_cards,
-                        "navigation_cards": virtual_cards,
-                        "discovery_mode": "bridge_shard_routing",
-                    },
+                routed_rows: list[dict[str, Any]] = []
+                seen_routed_pairs: set[tuple[str, str]] = set()
+                routing_page = 1
+                possible_routed_pairs = (
+                    len(offered_bridge_ids) * (len(offered_bridge_ids) - 1) // 2
                 )
+                while True:
+                    try:
+                        routed = reasoner_calls(
+                            "relationship_bridge_shard_selection",
+                            (
+                                f"bridge-{catalogue_revision[:16]}"
+                                if routing_page == 1
+                                else (
+                                    f"bridge-{catalogue_revision[:16]}"
+                                    f"--continuation-{routing_page}"
+                                )
+                            ),
+                            "select_relationship_bridge_shards",
+                            [],
+                            {
+                                "catalogue_revision": catalogue_revision,
+                                "routing_cards": bridge_cards,
+                                "collection_index_cards": collection_index_cards,
+                                "navigation_cards": virtual_cards,
+                                "discovery_mode": "bridge_shard_routing",
+                                "routing_page": routing_page,
+                                "excluded_shard_pairs": [
+                                    list(pair)
+                                    for pair in sorted(seen_routed_pairs)
+                                ],
+                            },
+                        )
+                    except Exception as exc:
+                        if not routed_rows:
+                            raise
+                        failure_class = _synthesis_failure_class(exc)
+                        discovery_parked.append(
+                            {
+                                "reason": "relationship_bridge_routing_continuation_failed",
+                                "error_type": type(exc).__name__,
+                                "error": str(exc),
+                                "retry_on_resume": failure_class == "transport",
+                            }
+                        )
+                        break
+                    new_rows = []
+                    for raw_row in routed.get("shard_pairs", []) or []:
+                        if not isinstance(raw_row, Mapping):
+                            continue
+                        pair = tuple(
+                            sorted(
+                                (
+                                    str(raw_row.get("left_shard_id") or ""),
+                                    str(raw_row.get("right_shard_id") or ""),
+                                )
+                            )
+                        )
+                        if not all(pair) or pair in seen_routed_pairs:
+                            continue
+                        seen_routed_pairs.add(pair)
+                        new_rows.append(dict(raw_row))
+                    routed_rows.extend(new_rows)
+                    if (
+                        not new_rows
+                        or len(seen_routed_pairs) >= possible_routed_pairs
+                    ):
+                        break
+                    routing_page += 1
+                routed = {"shard_pairs": routed_rows}
                 bridge_side_sources = {
                     **collection_side_sources,
                     **{
@@ -5904,10 +6460,7 @@ def _run_relationship_reasoning(
                         "why_examine": str(
                             row.get("why_examine") or row.get("reason") or ""
                         ),
-                        "target_candidate_count": max(
-                            1,
-                            min(32, target_count),
-                        ),
+                        "target_candidate_count": max(1, target_count),
                         "left_source_ids": sorted(left_sources),
                         "right_source_ids": sorted(right_sources),
                     }
@@ -6035,7 +6588,9 @@ def _run_relationship_reasoning(
                 if str(card.get("literature_id") or "")
                 in packet_literature_ids
             ],
-            "max_inferred_pairs": min(32, bridge_capacity),
+            "max_inferred_pairs": min(
+                _RELATIONSHIP_DISCOVERY_PAGE_SIZE, bridge_capacity
+            ),
             "reserved_bridge_fraction": 1.0,
             "literature_positions": [
                 row
@@ -6102,8 +6657,6 @@ def _run_relationship_reasoning(
 
     if shared_plan_active and not reuse_selected_pool:
         shared_discovery_active = True
-        routed_fallback_tasks = list(candidate_tasks)
-        shared_packet_overflow = False
         lean_by_source = {
             str(row.get("source_id") or ""): row
             for row in lean_discovery_projection(
@@ -6234,7 +6787,7 @@ def _run_relationship_reasoning(
                     50
                     if pass_name == "broad"
                     else min(
-                        _RELATIONSHIP_GENERAL_CANDIDATE_MAX,
+                        _RELATIONSHIP_DISCOVERY_PAGE_SIZE,
                         sum(
                             int(row.get("target_candidate_count", 24) or 24)
                             for row in packet_jobs
@@ -6253,6 +6806,49 @@ def _run_relationship_reasoning(
                 pool,
             )
 
+        context_budget = _relationship_context_char_budget(reasoner, request)
+
+        def split_shared_job(
+            pass_name: str,
+            pool: str,
+            job: Mapping[str, Any],
+        ) -> list[tuple[str, str, Sequence[Any], dict[str, Any], str]]:
+            """Partition one cross-product without dropping any possible pair."""
+
+            pending_jobs = [dict(job)]
+            fitted: list[
+                tuple[str, str, Sequence[Any], dict[str, Any], str]
+            ] = []
+            while pending_jobs:
+                candidate = pending_jobs.pop(0)
+                task = shared_plan_task(
+                    pass_name, pool, [candidate], len(fitted) + 1
+                )
+                if _reasoner_packet_chars(task[2], task[3]) <= context_budget:
+                    fitted.append(task)
+                    continue
+                left = list(candidate.get("left_source_ids", []) or [])
+                right = list(candidate.get("right_source_ids", []) or [])
+                side = "left_source_ids" if len(left) >= len(right) else "right_source_ids"
+                values = left if side == "left_source_ids" else right
+                if len(values) < 2:
+                    discovery_parked.append(
+                        {
+                            "reason": "relationship_family_job_context_capability_insufficient",
+                            "affected_job_ids": [
+                                str(candidate.get("bridge_job_id") or "")
+                            ],
+                            "retry_on_resume": False,
+                        }
+                    )
+                    break
+                midpoint = len(values) // 2
+                pending_jobs[0:0] = [
+                    {**candidate, side: values[:midpoint]},
+                    {**candidate, side: values[midpoint:]},
+                ]
+            return fitted
+
         if broad_jobs:
             for job in broad_jobs:
                 job_id = str(job["bridge_job_id"])
@@ -6266,13 +6862,21 @@ def _run_relationship_reasoning(
                     "explicit_no_more_candidates": False,
                     "packet_status": "scheduled",
                 }
-            candidate_tasks.append(
-                shared_plan_task("broad", "bridge", broad_jobs, 1)
-            )
+            broad_task = shared_plan_task("broad", "bridge", broad_jobs, 1)
+            if _reasoner_packet_chars(broad_task[2], broad_task[3]) <= context_budget:
+                candidate_tasks.append(broad_task)
+            else:
+                for job in broad_jobs:
+                    candidate_tasks.extend(
+                        split_shared_job("broad", "bridge", job)
+                    )
 
         complementary_allocations = _allocate_complementary_candidate_quotas(
             complement_jobs,
-            capacity=_RELATIONSHIP_GENERAL_CANDIDATE_MAX,
+            capacity=max(
+                _RELATIONSHIP_DISCOVERY_PAGE_SIZE,
+                3 * len(complement_jobs),
+            ),
         )
         allocated_complement_jobs = [
             {
@@ -6299,39 +6903,28 @@ def _run_relationship_reasoning(
                 "packet_status": "scheduled",
             }
         measured_job_sizes: dict[str, int] = {}
+        oversized_complement_tasks = []
+        packable_complement_jobs = []
         for job in allocated_complement_jobs:
             measurement_task = shared_plan_task(
                 "complement", "general", [job], 0
             )
-            measured_job_sizes[str(job.get("bridge_job_id") or "")] = (
-                _reasoner_packet_chars(
-                    measurement_task[2], measurement_task[3]
-                )
+            measured_size = _reasoner_packet_chars(
+                measurement_task[2], measurement_task[3]
             )
+            measured_job_sizes[str(job.get("bridge_job_id") or "")] = measured_size
+            if measured_size > context_budget:
+                oversized_complement_tasks.extend(
+                    split_shared_job("complement", "general", job)
+                )
+            else:
+                packable_complement_jobs.append(job)
         complement_packets = _balance_complementary_jobs(
-            allocated_complement_jobs,
+            packable_complement_jobs,
             measured_sizes=measured_job_sizes,
         )
-        context_budget = _relationship_context_char_budget(reasoner, request)
-        complement_tasks = [
-            shared_plan_task(
-                "complement", "general", packet_jobs, packet_index
-            )
-            for packet_index, packet_jobs in enumerate(
-                complement_packets, start=1
-            )
-        ]
-        oversized = [
-            index
-            for index, task in enumerate(complement_tasks)
-            if _reasoner_packet_chars(task[2], task[3]) > context_budget
-        ]
-        if oversized and len(complement_packets) == 2:
-            complement_packets = _balance_complementary_jobs(
-                allocated_complement_jobs,
-                measured_sizes=measured_job_sizes,
-                packet_count=3,
-            )
+        complement_tasks = []
+        while complement_packets:
             complement_tasks = [
                 shared_plan_task(
                     "complement", "general", packet_jobs, packet_index
@@ -6340,194 +6933,236 @@ def _run_relationship_reasoning(
                     complement_packets, start=1
                 )
             ]
+            if not any(
+                _reasoner_packet_chars(task[2], task[3]) > context_budget
+                for task in complement_tasks
+            ):
+                break
+            if len(complement_packets) >= len(packable_complement_jobs):
+                break
+            complement_packets = _balance_complementary_jobs(
+                packable_complement_jobs,
+                measured_sizes=measured_job_sizes,
+                packet_count=len(complement_packets) + 1,
+            )
+        complement_tasks.extend(oversized_complement_tasks)
         shared_packet_overflow = any(
             _reasoner_packet_chars(task[2], task[3]) > context_budget
             for task in [*candidate_tasks, *complement_tasks]
-        ) or len(complement_tasks) > 3
+        )
         candidate_tasks.extend(complement_tasks)
         if shared_packet_overflow:
-            candidate_tasks = routed_fallback_tasks
-            discovery_job_accounting = {}
-            shared_discovery_active = False
+            discovery_terminal = True
+            discovery_parked.append(
+                {
+                    "reason": "relationship_family_packet_context_capability_insufficient",
+                    "retry_on_resume": False,
+                }
+            )
+            candidate_tasks = [
+                task
+                for task in candidate_tasks
+                if _reasoner_packet_chars(task[2], task[3]) <= context_budget
+            ]
     else:
         shared_discovery_active = False
 
-    current_remaining_calls = (
-        remaining_calls
-        if configured_max_calls is None
-        else max(
-            0,
-            int(configured_max_calls or 0)
-            - int(
-                getattr(reasoner_calls, "cumulative_provider_calls", 0) or 0
-            ),
-        )
-    )
-    available_discovery_calls = max(
-        0, current_remaining_calls - mandatory_call_count - 2
-    )
-    if len(candidate_tasks) > available_discovery_calls:
-        discovery_terminal = True
-        discovery_parked.append(
+    inferred_capacity = possible_pair_count
+    general_capacity = inferred_capacity
+    bridge_capacity = inferred_capacity
+    candidate_tasks = [
+        (
+            stage,
+            key,
+            task_profiles,
             {
-                "reason": "relationship_discovery_budget_conflict",
-                "required_calls": len(candidate_tasks),
-                "available_calls": available_discovery_calls,
-                "retry_on_resume": False,
-            }
-        )
-        candidate_tasks = []
-    else:
-        adjudication_call_capacity = min(
-            20,
-            max(
-                mandatory_call_count,
-                current_remaining_calls - len(candidate_tasks) - 1,
-            ),
-        )
-        pair_capacity = adjudication_call_capacity * batch_max_jobs
-        inferred_capacity = min(
-            max(0, _RELATIONSHIP_CANDIDATE_MAX - len(mandatory_basis)),
-            max(0, pair_capacity - len(mandatory_basis)),
-        )
-        if shared_discovery_active:
-            bridge_capacity = min(
-                _RELATIONSHIP_BRIDGE_CANDIDATE_MAX, inferred_capacity
-            )
-            general_capacity = min(
-                _RELATIONSHIP_GENERAL_CANDIDATE_MAX,
-                max(0, inferred_capacity - bridge_capacity),
-            )
-        else:
-            general_capacity = min(
-                _RELATIONSHIP_GENERAL_CANDIDATE_MAX,
-                (inferred_capacity * 2 + 4) // 5,
-            )
-            bridge_capacity = min(
-                _RELATIONSHIP_BRIDGE_CANDIDATE_MAX,
-                max(0, inferred_capacity - general_capacity),
-            )
-        candidate_tasks = [
-            (
-                stage,
-                key,
-                task_profiles,
-                {
-                    **task_context,
-                    "max_inferred_pairs": min(
-                        int(task_context.get("max_inferred_pairs", 0) or 0),
-                        bridge_capacity if pool == "bridge" else general_capacity,
+                **task_context,
+                "max_inferred_pairs": min(
+                    _RELATIONSHIP_DISCOVERY_PAGE_SIZE,
+                    max(
+                        1,
+                        int(
+                            task_context.get("max_inferred_pairs", 0)
+                            or _RELATIONSHIP_DISCOVERY_PAGE_SIZE
+                        ),
                     ),
-                },
-                pool,
-            )
-            for stage, key, task_profiles, task_context, pool in candidate_tasks
-        ]
+                ),
+            },
+            pool,
+        )
+        for stage, key, task_profiles, task_context, pool in candidate_tasks
+    ]
 
     candidate_results: dict[
         str, list[tuple[str, Mapping[str, Any]]]
     ] = defaultdict(list)
+    settled_candidate_tasks: set[tuple[str, str, str]] = set()
 
     def run_candidate_task(
         task: tuple[str, str, Sequence[Any], dict[str, Any], str]
-    ) -> tuple[str, Mapping[str, Any]]:
+    ) -> tuple[
+        str,
+        list[tuple[str, Mapping[str, Any]]],
+        BaseException | None,
+    ]:
         stage, key, task_profiles, task_context, pool = task
-        response = reasoner_calls(
-            stage,
-            key,
-            "select_relationship_candidates",
-            task_profiles,
-            task_context,
-        )
-        if (
-            str(getattr(reasoner, "profile_generation_route", ""))
-            == "built_in_reader"
-            and str(getattr(reasoner, "name", "")) == "deepseek"
-            and task_context.get("discovery_pass")
-            in {"complement", "coverage_followup"}
-        ):
-            expected_job_ids = {
-                str(row.get("bridge_job_id") or "")
-                for row in task_context.get("bridge_jobs", []) or []
+        page_context = dict(task_context)
+        page_key = key
+        page = 1
+        seen_pairs: set[tuple[str, str]] = set()
+        results: list[tuple[str, Mapping[str, Any]]] = []
+        while True:
+            try:
+                response = reasoner_calls(
+                    stage,
+                    page_key,
+                    "select_relationship_candidates",
+                    task_profiles,
+                    page_context,
+                )
+            except Exception as exc:
+                if results:
+                    return pool, results, exc
+                raise
+            jobs = {
+                str(row.get("bridge_job_id") or ""): row
+                for row in page_context.get("bridge_jobs", []) or []
                 if isinstance(row, Mapping) and row.get("bridge_job_id")
             }
+            expected_job_ids = set(jobs)
             raw_outcomes = response.get("job_outcomes", []) or []
-            outcome_ids = [
-                str(row.get("bridge_job_id") or row.get("job_id") or "")
+            outcomes = {
+                str(row.get("bridge_job_id") or row.get("job_id") or ""): str(
+                    row.get("status") or ""
+                )
                 for row in raw_outcomes
                 if isinstance(row, Mapping)
                 and str(row.get("status") or "")
                 in {"completed", "no_more_candidates"}
-            ]
-            if set(outcome_ids) != expected_job_ids or len(outcome_ids) != len(
-                expected_job_ids
+            }
+            built_in_deepseek = (
+                str(getattr(reasoner, "profile_generation_route", ""))
+                == "built_in_reader"
+                and str(getattr(reasoner, "name", "")) == "deepseek"
+            )
+            if (
+                built_in_deepseek
+                and jobs
+                and set(outcomes) != expected_job_ids
             ):
                 raise ValueError(
-                    "built-in complementary discovery must account for every job"
+                    "built-in discovery must account for every supplied job"
                 )
-        if task_context.get("bridge_jobs"):
-            jobs = {
-                str(row.get("bridge_job_id") or ""): row
-                for row in task_context.get("bridge_jobs", []) or []
-                if isinstance(row, Mapping) and row.get("bridge_job_id")
-            }
-            candidates: list[dict[str, Any]] = []
-            for raw in response.get("candidates", []) or []:
-                if not isinstance(raw, Mapping):
-                    continue
-                row = dict(raw)
-                job = jobs.get(str(row.get("bridge_job_id") or ""))
-                if not job:
-                    row["_candidate_disposition"] = "parked_contract_failure"
-                    candidates.append(row)
-                    continue
-                left_source_id = str(
-                    row.get("left_source_id") or row.get("source_id") or ""
+            if jobs and not outcomes and not built_in_deepseek:
+                inferred_status = (
+                    "completed"
+                    if response.get("candidates")
+                    else "no_more_candidates"
                 )
-                right_source_id = str(
-                    row.get("right_source_id")
-                    or row.get("target_source_id")
-                    or row.get("target_id")
-                    or ""
-                )
-                left_side = {
-                    str(value) for value in job.get("left_source_ids", []) or []
+                outcomes = {
+                    job_id: inferred_status for job_id in expected_job_ids
                 }
-                right_side = {
-                    str(value) for value in job.get("right_source_ids", []) or []
+                response = {
+                    **dict(response),
+                    "job_outcomes": [
+                        {"bridge_job_id": job_id, "status": status}
+                        for job_id, status in sorted(outcomes.items())
+                    ],
                 }
-                if not (
-                    (left_source_id in left_side and right_source_id in right_side)
-                    or (
-                        left_source_id in right_side
-                        and right_source_id in left_side
+            if jobs:
+                candidates: list[dict[str, Any]] = []
+                for raw in response.get("candidates", []) or []:
+                    if not isinstance(raw, Mapping):
+                        continue
+                    row = dict(raw)
+                    if not row.get("bridge_job_id") and len(jobs) == 1:
+                        row["bridge_job_id"] = next(iter(jobs))
+                    job = jobs.get(str(row.get("bridge_job_id") or ""))
+                    if not job:
+                        row["_candidate_disposition"] = "parked_contract_failure"
+                        candidates.append(row)
+                        continue
+                    left_source_id = str(
+                        row.get("left_source_id") or row.get("source_id") or ""
                     )
-                ):
-                    row["_candidate_disposition"] = "wrong_scope"
+                    right_source_id = str(
+                        row.get("right_source_id")
+                        or row.get("target_source_id")
+                        or row.get("target_id")
+                        or ""
+                    )
+                    left_side = {
+                        str(value) for value in job.get("left_source_ids", []) or []
+                    }
+                    right_side = {
+                        str(value) for value in job.get("right_source_ids", []) or []
+                    }
+                    if not (
+                        (left_source_id in left_side and right_source_id in right_side)
+                        or (
+                            left_source_id in right_side
+                            and right_source_id in left_side
+                        )
+                    ):
+                        row["_candidate_disposition"] = "wrong_scope"
+                        candidates.append(row)
+                        continue
+                    row["discovery_route"] = "routed_cross_collection_bridge"
+                    row["discovery_job_id"] = str(job.get("bridge_job_id") or "")
+                    row["discovery_family"] = str(job.get("bridge_family") or "")
+                    row["discovery_job_quota"] = int(
+                        job.get("target_candidate_count", 24) or 24
+                    )
+                    row["requested_collection_pair"] = list(
+                        job.get("requested_collection_pair", []) or []
+                    )
+                    row["discovery_pass"] = str(
+                        page_context.get("discovery_pass") or ""
+                    )
                     candidates.append(row)
-                    continue
-                row["discovery_route"] = "routed_cross_collection_bridge"
-                row["discovery_job_id"] = str(
-                    job.get("bridge_job_id") or ""
+                response = {**dict(response), "candidates": candidates}
+            results.append((page_key, response))
+            page_pairs = {
+                canonical_pair(
+                    str(row.get("left_source_id") or row.get("source_id") or ""),
+                    str(
+                        row.get("right_source_id")
+                        or row.get("target_source_id")
+                        or row.get("target_id")
+                        or ""
+                    ),
                 )
-                row["discovery_family"] = str(
-                    job.get("bridge_family") or ""
-                )
-                row["discovery_job_quota"] = int(
-                    job.get("target_candidate_count", 24) or 24
-                )
-                row["requested_collection_pair"] = list(
-                    job.get("requested_collection_pair", []) or []
-                )
-                row["discovery_pass"] = str(
-                    task_context.get("discovery_pass") or ""
-                )
-                candidates.append(row)
-            response = {**dict(response), "candidates": candidates}
-        return (
-            pool,
-            response,
-        )
+                for row in response.get("candidates", []) or []
+                if isinstance(row, Mapping)
+                and not row.get("_candidate_disposition")
+            }
+            new_pairs = page_pairs - seen_pairs
+            seen_pairs.update(page_pairs)
+            active_job_ids = {
+                job_id for job_id, status in outcomes.items() if status == "completed"
+            }
+            continue_jobless = bool(
+                not jobs and built_in_deepseek and new_pairs
+            )
+            if not new_pairs or (not active_job_ids and not continue_jobless):
+                break
+            page += 1
+            page_key = f"{key}--continuation-{page}"
+            page_context = {
+                **page_context,
+                "bridge_jobs": [
+                    row
+                    for row in page_context.get("bridge_jobs", []) or []
+                    if isinstance(row, Mapping)
+                    and str(row.get("bridge_job_id") or "") in active_job_ids
+                ],
+                "prior_candidate_pairs": [list(pair) for pair in sorted(seen_pairs)],
+                "excluded_candidate_pairs": [
+                    list(pair) for pair in sorted(seen_pairs)
+                ],
+                "discovery_page": page,
+            }
+        return pool, results, None
 
     def execute_candidate_tasks(
         tasks: Sequence[
@@ -6548,29 +7183,37 @@ def _run_relationship_reasoning(
             for future in as_completed(futures):
                 task = futures[future]
                 try:
-                    pool, response = future.result()
-                    candidate_results[pool].append((task[1], response))
+                    pool, responses, continuation_error = future.result()
+                    candidate_results[pool].extend(responses)
+                    if continuation_error is None:
+                        settled_candidate_tasks.add((task[0], task[1], task[4]))
                     outcome_by_job: dict[str, str] = {}
-                    raw_outcomes = response.get("job_outcomes", []) or []
-                    if isinstance(raw_outcomes, Mapping):
-                        raw_outcomes = [
-                            {
-                                "bridge_job_id": str(job_id),
-                                "status": status,
-                            }
-                            for job_id, status in raw_outcomes.items()
-                        ]
-                    for raw_outcome in raw_outcomes:
-                        if not isinstance(raw_outcome, Mapping):
-                            continue
-                        job_id = str(
-                            raw_outcome.get("bridge_job_id")
-                            or raw_outcome.get("job_id")
-                            or ""
-                        )
-                        status = str(raw_outcome.get("status") or "")
-                        if status in {"completed", "no_more_candidates"}:
-                            outcome_by_job[job_id] = status
+                    for _page_key, response in responses:
+                        raw_outcomes = response.get("job_outcomes", []) or []
+                        if isinstance(raw_outcomes, Mapping):
+                            raw_outcomes = [
+                                {
+                                    "bridge_job_id": str(job_id),
+                                    "status": status,
+                                }
+                                for job_id, status in raw_outcomes.items()
+                            ]
+                        for raw_outcome in raw_outcomes:
+                            if not isinstance(raw_outcome, Mapping):
+                                continue
+                            job_id = str(
+                                raw_outcome.get("bridge_job_id")
+                                or raw_outcome.get("job_id")
+                                or ""
+                            )
+                            status = str(raw_outcome.get("status") or "")
+                            if status not in {"completed", "no_more_candidates"}:
+                                continue
+                            if (
+                                outcome_by_job.get(job_id)
+                                != "no_more_candidates"
+                            ):
+                                outcome_by_job[job_id] = status
                     for raw_job in task[3].get("bridge_jobs", []) or []:
                         if not isinstance(raw_job, Mapping):
                             continue
@@ -6592,6 +7235,7 @@ def _run_relationship_reasoning(
                                     or ""
                                 ),
                             )
+                            for _page_key, response in responses
                             for row in response.get("candidates", []) or []
                             if isinstance(row, Mapping)
                             and str(row.get("discovery_job_id") or "") == job_id
@@ -6619,7 +7263,36 @@ def _run_relationship_reasoning(
                         accounting["explicit_no_more_candidates"] = (
                             outcome_by_job.get(job_id) == "no_more_candidates"
                         )
-                        accounting["packet_status"] = "completed"
+                        accounting["packet_status"] = (
+                            "failed" if continuation_error else "completed"
+                        )
+                        if continuation_error is not None:
+                            accounting["packet_failure_class"] = (
+                                _synthesis_failure_class(continuation_error)
+                            )
+                    if continuation_error is not None:
+                        failure_class = _synthesis_failure_class(
+                            continuation_error
+                        )
+                        discovery_terminal |= failure_class != "transport"
+                        discovery_parked.append(
+                            {
+                                "reason": "relationship_discovery_continuation_failed",
+                                "error_type": type(continuation_error).__name__,
+                                "error": str(continuation_error),
+                                "discovery_pass": str(
+                                    task[3].get("discovery_pass") or ""
+                                ),
+                                "discovery_task_key": task[1],
+                                "affected_job_ids": sorted(
+                                    str(row.get("bridge_job_id") or "")
+                                    for row in task[3].get("bridge_jobs", []) or []
+                                    if isinstance(row, Mapping)
+                                    and row.get("bridge_job_id")
+                                ),
+                                "retry_on_resume": failure_class == "transport",
+                            }
+                        )
                 except Exception as exc:
                     failure_class = _synthesis_failure_class(exc)
                     discovery_terminal |= failure_class != "transport"
@@ -6734,7 +7407,7 @@ def _run_relationship_reasoning(
             }
         )
         remaining_candidate_capacity = max(
-            0, _RELATIONSHIP_CANDIDATE_MAX - len(prior_candidate_pairs)
+            0, possible_pair_count - len(prior_candidate_pairs)
         )
         followup_jobs = [
             {
@@ -6757,78 +7430,72 @@ def _run_relationship_reasoning(
             if str(job.get("bridge_job_id") or "") in undercovered_ids
         ]
         if followup_jobs and remaining_candidate_capacity:
-            requested_keys = list(
-                shared_family_plan.get("requested_collection_keys", []) or []
-            )
-            max_followup_packets = 1 if len(requested_keys) <= 2 else 2
             followup_packets = [followup_jobs]
-            followup_task = shared_plan_task(
-                "coverage_followup", "general", followup_jobs, 1
-            )
-            if (
-                _reasoner_packet_chars(followup_task[2], followup_task[3])
-                > context_budget
-                and max_followup_packets == 2
-            ):
+            while True:
+                measured_followups = [
+                    shared_plan_task(
+                        "coverage_followup", "general", packet_jobs, index
+                    )
+                    for index, packet_jobs in enumerate(
+                        followup_packets, start=1
+                    )
+                ]
+                if not any(
+                    _reasoner_packet_chars(task[2], task[3]) > context_budget
+                    for task in measured_followups
+                ) or len(followup_packets) >= len(followup_jobs):
+                    break
                 followup_packets = _balance_complementary_jobs(
                     followup_jobs,
                     measured_sizes=measured_job_sizes,
-                    packet_count=2,
+                    packet_count=len(followup_packets) + 1,
                 )
             followup_tasks = []
             for packet_index, packet_jobs in enumerate(
                 followup_packets, start=1
             ):
-                task = shared_plan_task(
-                    "coverage_followup", "general", packet_jobs, packet_index
-                )
-                task = (
-                    task[0],
-                    task[1],
-                    task[2],
-                    {
+                base_tasks = [
+                    shared_plan_task(
+                        "coverage_followup", "general", packet_jobs, packet_index
+                    )
+                ]
+                if _reasoner_packet_chars(
+                    base_tasks[0][2], base_tasks[0][3]
+                ) > context_budget:
+                    base_tasks = [
+                        child
+                        for job in packet_jobs
+                        for child in split_shared_job(
+                            "coverage_followup", "general", job
+                        )
+                    ]
+                for task in base_tasks:
+                    task_source_ids = {
+                        str(row.get("source_id") or "")
+                        for row in task[2]
+                        if isinstance(row, Mapping)
+                    }
+                    relevant_prior_pairs = [
+                        pair
+                        for pair in prior_candidate_pairs
+                        if pair[0] in task_source_ids and pair[1] in task_source_ids
+                    ]
+                    enriched_context = {
                         **task[3],
-                        "prior_candidate_pairs": prior_candidate_pairs,
-                        "excluded_candidate_pairs": prior_candidate_pairs,
+                        "prior_candidate_pairs": relevant_prior_pairs,
+                        "excluded_candidate_pairs": relevant_prior_pairs,
                         "remaining_global_capacity": remaining_candidate_capacity,
-                        "max_inferred_pairs": min(
-                            remaining_candidate_capacity,
-                            sum(
-                                int(job["target_candidate_count"])
-                                for job in packet_jobs
-                            ),
-                        ),
-                    },
-                    task[4],
-                )
-                if _reasoner_packet_chars(task[2], task[3]) <= context_budget:
-                    followup_tasks.append(task)
-                else:
-                    for job in packet_jobs:
-                        discovery_job_accounting[str(job["bridge_job_id"])][
-                            "status"
-                        ] = "deferred_context"
-            followup_calls_available = (
-                configured_max_calls is None
-                or int(
-                    getattr(reasoner_calls, "cumulative_provider_calls", 0)
-                    or 0
-                )
-                + len(followup_tasks)
-                <= int(configured_max_calls or 0)
-            )
-            if followup_tasks and followup_calls_available:
-                execute_candidate_tasks(followup_tasks[:max_followup_packets])
-            elif followup_tasks:
-                for job in followup_jobs:
-                    discovery_job_accounting[str(job["bridge_job_id"])][
-                        "status"
-                    ] = "deferred_budget"
-        elif followup_jobs:
-            for job in followup_jobs:
-                discovery_job_accounting[str(job["bridge_job_id"])][
-                    "status"
-                ] = "deferred_budget"
+                    }
+                    if (
+                        _reasoner_packet_chars(task[2], enriched_context)
+                        > context_budget
+                    ):
+                        enriched_context.pop("prior_candidate_pairs", None)
+                        enriched_context.pop("excluded_candidate_pairs", None)
+                    followup_tasks.append(
+                        (task[0], task[1], task[2], enriched_context, task[4])
+                    )
+            execute_candidate_tasks(followup_tasks)
 
         # Recompute exact per-job coverage across initial and follow-up calls.
         for job in [*broad_jobs, *allocated_complement_jobs]:
@@ -6894,14 +7561,13 @@ def _run_relationship_reasoning(
         ]
         if not discovery_parked:
             discovery_terminal = False
-    successful_discovery_tasks = sum(
-        len(rows) for rows in candidate_results.values()
-    )
+    successful_discovery_tasks = len(settled_candidate_tasks)
     discovery_retryable = any(
         bool(row.get("retry_on_resume")) for row in discovery_parked
     )
     discovery_completed = bool(
         reuse_selected_pool
+        or (not candidate_tasks and not discovery_parked)
         or (
             candidate_tasks
             and (
@@ -7021,39 +7687,6 @@ def _run_relationship_reasoning(
             ],
         ]
     }
-    if configured_max_calls is not None:
-        post_discovery_remaining = max(
-            0,
-            int(configured_max_calls or 0)
-            - int(
-                getattr(reasoner_calls, "cumulative_provider_calls", 0) or 0
-            ),
-        )
-        adjudication_call_capacity = min(
-            20, max(0, post_discovery_remaining - 1)
-        )
-        pair_capacity = adjudication_call_capacity * batch_max_jobs
-        inferred_capacity = min(
-            max(0, _RELATIONSHIP_CANDIDATE_MAX - len(mandatory_basis)),
-            max(0, pair_capacity - len(mandatory_basis)),
-        )
-        if shared_discovery_active:
-            bridge_capacity = min(
-                _RELATIONSHIP_BRIDGE_CANDIDATE_MAX, inferred_capacity
-            )
-            general_capacity = min(
-                _RELATIONSHIP_GENERAL_CANDIDATE_MAX,
-                max(0, inferred_capacity - bridge_capacity),
-            )
-        else:
-            general_capacity = min(
-                _RELATIONSHIP_GENERAL_CANDIDATE_MAX,
-                (inferred_capacity * 2 + 4) // 5,
-            )
-            bridge_capacity = min(
-                _RELATIONSHIP_BRIDGE_CANDIDATE_MAX,
-                max(0, inferred_capacity - general_capacity),
-            )
     excluded_pairs = set(mandatory_basis) | negative_pairs | visible_pairs
     excluded_pair_reasons = {
         **{pair: "current_no_relationship" for pair in negative_pairs},
@@ -8295,6 +8928,8 @@ def _ranked_relationship_candidates(
         selected.extend(leftovers[: max(0, count - len(selected))])
         return selected
 
+    if maximum <= 0:
+        maximum = len(seen)
     bridge_slots = min(len(bridges), int(maximum * bridge_fraction + 0.999))
     within_slots = min(len(within), maximum - bridge_slots)
     selected = floor_then_rank(bridges, bridge_slots) + floor_then_rank(
@@ -9342,6 +9977,9 @@ def rebuild_map(
             / "profiles"
             / "provider_usage.yml",
             effective_request.literature_policy.max_profile_calls,
+            provider=effective_request.provider,
+            model=effective_request.model,
+            max_spend_usd=effective_request.max_provider_spend_usd,
         )
     try:
         profile_result = _build_profiles_for_map(
@@ -9506,6 +10144,7 @@ def rebuild_map(
         provider_concurrency=(
             effective_request.provider_concurrency or effective_request.parallel
         ),
+        max_provider_spend_usd=effective_request.max_provider_spend_usd,
         comparison_collection_keys=list(
             source_set.get("comparison_collection_keys", []) or []
         ),
@@ -10265,7 +10904,8 @@ def _build_profiles_for_map(
 
     def build_one(index: int, row: Mapping[str, Any]) -> dict[str, Any]:
         if (
-            time.monotonic() - started
+            request.literature_policy.literature_deadline_seconds > 0
+            and time.monotonic() - started
             >= request.literature_policy.literature_deadline_seconds
         ):
             raise RuntimeError("literature_stage_deadline_reached")
@@ -11265,6 +11905,93 @@ def _recover_saved_source_bundle(
     return recovered
 
 
+def _saved_source_failure_class(value: Mapping[str, Any]) -> str:
+    explicit = str(value.get("failure_class") or "")
+    if explicit:
+        return explicit
+    error_type = str(value.get("error_type") or "")
+    message = f"{value.get('error', '')} {value.get('reason', '')}".casefold()
+    if error_type == "ProviderEmptyResponse" or "without response content" in message:
+        return "provider_empty_legacy"
+    if error_type == "ProviderTransportError" or any(
+        marker in message
+        for marker in (
+            "stream read failed",
+            "timed out",
+            "timeout",
+            "provider unavailable",
+            "network unreachable",
+            "connection interrupted",
+            "premature eof",
+            "before a terminal event",
+            "provider http 429",
+            "provider http 5",
+        )
+    ):
+        return "transport"
+    if "content filter" in message or "content_filter" in message:
+        return "provider_policy"
+    if value.get("raw_response") not in (None, "", {}, []):
+        return "semantic_contract"
+    return ""
+
+
+def _acquire_and_freeze_item(
+    workspace: Path,
+    run_dir: Path,
+    index: int,
+    item: dict[str, Any],
+    request: MapRequest,
+    client: ZoteroClient,
+    reader: ReaderProvider,
+    vision: VisionProvider | None,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, Any] | None:
+    """Perform only local preparation and return a terminal row on failure."""
+
+    base = _source_base_row(index, item, request, reader)
+    key = str(base.get("zotero_item_key") or "")
+    if not key:
+        return _exhausted_result(index, item, "identity", "missing_zotero_item_key")
+    checkpoint_root = run_dir / "items" / safe_filename(key)
+    try:
+        content = _load_frozen_content(checkpoint_root)
+    except Exception as exc:
+        base["reason"] = f"frozen_content_invalid:{type(exc).__name__}:{exc}"
+        base["attempts"].append(
+            _attempt(base, "frozen_content", "failed", base["reason"])
+        )
+        return base
+    if content is None:
+        content = _acquire_content(
+            workspace,
+            item,
+            client,
+            base,
+            request,
+            vision,
+            cancel_event=cancel_event,
+        )
+        if content:
+            _write_frozen_content(
+                checkpoint_root,
+                {**content, "acquisition_attempts": list(base["attempts"])},
+            )
+    if content:
+        return None
+    base["reason"] = "all_allowed_extraction_routes_exhausted"
+    base["attempts"].append(
+        _attempt(
+            base,
+            "extraction_router",
+            "failed",
+            "all_allowed_extraction_routes_exhausted",
+        )
+    )
+    return base
+
+
 def _prepare_item(
     workspace: Path,
     run_dir: Path,
@@ -11278,20 +12005,11 @@ def _prepare_item(
     profile_budget: _ProfileProviderBudget | None = None,
     source_match_index: Mapping[str, Any] | None = None,
     acquisition_gate: _LocalAcquisitionGate | None = None,
+    require_frozen_content: bool = False,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     key = item_key(item)
-    base = {
-        "inventory_index": index,
-        "item": item,
-        "zotero_item_key": key,
-        "source_id": source_id_for_item(item),
-        "note_id": note_id_for_item(item),
-        "attempts": [],
-        "terminal_status": "parked_for_review",
-        "reason": "",
-        "reader_provider": str(getattr(reader, "name", request.provider)),
-        "reader_model": str(getattr(reader, "model", request.model)),
-    }
+    base = _source_base_row(index, item, request, reader)
     if progress is not None:
         progress.update(index, status="active", phase="acquiring_content", reason="")
     if not key:
@@ -11306,21 +12024,48 @@ def _prepare_item(
         )
         return base
     if content is not None:
+        base["attempts"].extend(content.get("acquisition_attempts", []) or [])
         base["attempts"].append(
             _attempt(base, "frozen_content", "succeeded", "run_snapshot_reused")
         )
     else:
+        if require_frozen_content:
+            base["reason"] = "provider_ready_frozen_content_missing"
+            base["attempts"].append(
+                _attempt(base, "frozen_content", "failed", base["reason"])
+            )
+            return base
         if acquisition_gate is None:
-            content = _acquire_content(workspace, item, client, base, request, vision)
+            content = _acquire_content(
+                workspace,
+                item,
+                client,
+                base,
+                request,
+                vision,
+                cancel_event=cancel_event,
+            )
             if content:
-                _write_frozen_content(checkpoint_root, content)
+                _write_frozen_content(
+                    checkpoint_root,
+                    {**content, "acquisition_attempts": list(base["attempts"])},
+                )
         else:
             with acquisition_gate:
                 content = _acquire_content(
-                    workspace, item, client, base, request, vision
+                    workspace,
+                    item,
+                    client,
+                    base,
+                    request,
+                    vision,
+                    cancel_event=cancel_event,
                 )
                 if content:
-                    _write_frozen_content(checkpoint_root, content)
+                    _write_frozen_content(
+                        checkpoint_root,
+                        {**content, "acquisition_attempts": list(base["attempts"])},
+                    )
     if not content:
         base["reason"] = "all_allowed_extraction_routes_exhausted"
         base["attempts"].append(
@@ -11415,7 +12160,6 @@ def _prepare_item(
             reused=True,
             reason="compatible_committed_note",
         )
-        _write_fingerprint(workspace, base, relative_path)
         base["attempts"].append(
             _attempt(
                 base,
@@ -11452,6 +12196,11 @@ def _prepare_item(
     saved_source_failure = read_yaml(
         checkpoint_root / "source_failure.yml", {}
     ) or {}
+    saved_failure_class = (
+        _saved_source_failure_class(saved_source_failure)
+        if isinstance(saved_source_failure, Mapping)
+        else ""
+    )
     unchanged_contract_failure = (
         recovered_source_result is None
         and isinstance(saved_source_failure, Mapping)
@@ -11460,9 +12209,9 @@ def _prepare_item(
             saved_source_failure.get("source_bundle_envelope_contract") or ""
         )
         == SOURCE_BUNDLE_ENVELOPE_CONTRACT
-        and str(saved_source_failure.get("error_type") or "")
-        in {"ProviderError", "ValueError"}
-        and saved_source_failure.get("raw_response") not in (None, "", {}, [])
+        and saved_failure_class
+        in {"semantic_contract", "provider_policy", "provider_empty"}
+        and not request.retry_terminal_failures
     )
     if unchanged_contract_failure:
         base["reason"] = "terminal_source_contract_failure"
@@ -11549,6 +12298,7 @@ def _prepare_item(
                 progress=progress,
                 inventory_index=index,
                 provider_budget=profile_budget,
+                cancel_event=cancel_event,
             )
     except DocumentPartialError as exc:
         base.update(
@@ -11579,18 +12329,34 @@ def _prepare_item(
             _attempt(base, "hierarchical_reader", "limited", base["reason"])
         )
         return base
+    except ProviderSpendLimitReached:
+        raise
     except Exception as exc:
         raw_response = str(getattr(exc, "raw_response", "") or "")
+        failure_class = (
+            "transport"
+            if isinstance(exc, ProviderTransportError)
+            else "provider_empty"
+            if isinstance(exc, ProviderEmptyResponse)
+            else "semantic_contract"
+        )
+        retry_on_resume = failure_class == "transport"
+        failure_status = "paused_transport" if retry_on_resume else "parked_for_review"
         write_yaml(
             checkpoint_root / "source_failure.yml",
             {
                 "source_id": str(base.get("source_id") or ""),
                 "zotero_item_key": key,
                 "fingerprint": fingerprint,
-                "status": "parked_for_review",
+                "status": failure_status,
                 "source_bundle_envelope_contract": SOURCE_BUNDLE_ENVELOPE_CONTRACT,
                 "error_type": type(exc).__name__,
                 "error": str(exc),
+                "failure_class": failure_class,
+                "transport_kind": str(
+                    getattr(exc, "transport_kind", "") or ""
+                ),
+                "retry_on_resume": retry_on_resume,
                 "raw_response": raw_response,
                 "raw_response_hash": (
                     sha256_text(raw_response) if raw_response else ""
@@ -11606,6 +12372,7 @@ def _prepare_item(
                 base, f"{reader.name}_text", "failed", f"{type(exc).__name__}:{exc}"
             )
         )
+        base["terminal_status"] = failure_status
         base["reason"] = f"reader_failed:{type(exc).__name__}"
         return base
     try:
@@ -12046,6 +12813,7 @@ def _write_frozen_content(checkpoint_root: Path, content: Mapping[str, Any]) -> 
         "reader_provider",
         "reader_model",
         "analysis",
+        "acquisition_attempts",
     }
     payload = {key: content[key] for key in allowed if key in content}
     payload.update(
@@ -12157,6 +12925,8 @@ def _acquire_content(
     base: dict[str, Any],
     request: MapRequest,
     vision: VisionProvider | None,
+    *,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any] | None:
     key = item_key(item)
     parent_data = item_data(item)
@@ -12164,6 +12934,9 @@ def _acquire_content(
     candidates: list[dict[str, Any]] = []
     primary_pdf_attempted = False
     failed_primary_pdf: dict[str, Any] | None = None
+    cancelled = cancel_event.is_set if cancel_event is not None else None
+    if cancelled is not None and cancelled():
+        raise ExtractionCancelled("extraction_cancelled")
     try:
         children = client.children(key)
         targets.extend(children)
@@ -12176,6 +12949,8 @@ def _acquire_content(
             _attempt(base, "zotero_children", "failed", f"{type(exc).__name__}:{exc}")
         )
     for target in targets:
+        if cancelled is not None and cancelled():
+            raise ExtractionCancelled("extraction_cancelled")
         target_key = item_key(target)
         if not target_key:
             continue
@@ -12295,6 +13070,7 @@ def _acquire_content(
                 extraction_path,
                 ocr_mode=request.extraction_policy.ocr,
                 ocr_languages=request.extraction_policy.languages,
+                cancelled=cancelled,
             )
             base["attempts"].append(
                 _attempt(
@@ -12386,6 +13162,7 @@ def _acquire_content(
             filename=custody_path.name,
             ocr_mode=request.extraction_policy.ocr,
             ocr_languages=request.extraction_policy.languages,
+            cancelled=cancelled,
         )
         document_hash = sha256_bytes(document)
         base["attempts"].append(
@@ -13515,6 +14292,26 @@ def _source_replay_request_hash(request: MapRequest) -> str:
     payload.pop("workspace", None)
     payload.pop("parallel", None)
     payload.pop("provider_concurrency", None)
+    payload.pop("max_provider_spend_usd", None)
+    processing = dict(payload.get("processing", {}) or {})
+    for key in (
+        "connect_timeout_seconds",
+        "request_deadline_seconds",
+        "document_deadline_seconds",
+        "max_calls_per_document_run",
+        "max_total_chunks",
+    ):
+        processing.pop(key, None)
+    payload["processing"] = processing
+    literature_policy = dict(payload.get("literature_policy", {}) or {})
+    for key in (
+        "literature_deadline_seconds",
+        "max_profile_calls",
+        "max_synthesis_calls",
+        "profile_workers",
+    ):
+        literature_policy.pop(key, None)
+    payload["literature_policy"] = literature_policy
     return stable_hash(payload)
 
 
@@ -13857,6 +14654,7 @@ def _read_document(
     progress: _RunProgress | None = None,
     inventory_index: int = 0,
     provider_budget: _ProfileProviderBudget | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[Mapping[str, Any], str, str]:
     policy = request.processing if request is not None else ProcessingPolicy()
     context_tokens = int(getattr(reader, "context_window_tokens", 0) or 0)
@@ -13907,9 +14705,15 @@ def _read_document(
             progress.record_source_provider_call()
 
     def before_direct_attempt() -> None:
-        if calls >= policy.max_calls_per_document_run:
+        if (
+            policy.max_calls_per_document_run > 0
+            and calls >= policy.max_calls_per_document_run
+        ):
             raise DocumentPartialError("document_call_budget_reached", 0, 0)
-        if time.monotonic() - started >= policy.document_deadline_seconds:
+        if (
+            policy.document_deadline_seconds > 0
+            and time.monotonic() - started >= policy.document_deadline_seconds
+        ):
             raise DocumentPartialError("document_deadline_reached", 0, 0)
 
     bundle_reader = getattr(reader, "read_source_bundle", None)
@@ -13957,6 +14761,7 @@ def _read_document(
                     direct_operation,
                     before_attempt=before_direct_attempt,
                     on_attempt=record_source_attempt,
+                    cancelled=cancel_event.is_set if cancel_event is not None else None,
                 )
             else:
                 before_direct_attempt()
@@ -14014,11 +14819,17 @@ def _read_document(
         ):
             analysis = dict(checkpoint["analysis"])
         else:
-            if calls >= policy.max_calls_per_document_run:
+            if (
+                policy.max_calls_per_document_run > 0
+                and calls >= policy.max_calls_per_document_run
+            ):
                 raise DocumentPartialError(
                     "document_call_budget_reached", len(analyses), len(chunks)
                 )
-            if time.monotonic() - started >= policy.document_deadline_seconds:
+            if (
+                policy.document_deadline_seconds > 0
+                and time.monotonic() - started >= policy.document_deadline_seconds
+            ):
                 raise DocumentPartialError(
                     "document_deadline_reached", len(analyses), len(chunks)
                 )
@@ -14032,13 +14843,20 @@ def _read_document(
             )
 
             def before_chunk_attempt() -> None:
-                if calls >= policy.max_calls_per_document_run:
+                if (
+                    policy.max_calls_per_document_run > 0
+                    and calls >= policy.max_calls_per_document_run
+                ):
                     raise DocumentPartialError(
                         "document_call_budget_reached",
                         len(analyses),
                         len(chunks),
                     )
-                if time.monotonic() - started >= policy.document_deadline_seconds:
+                if (
+                    policy.document_deadline_seconds > 0
+                    and time.monotonic() - started
+                    >= policy.document_deadline_seconds
+                ):
                     raise DocumentPartialError(
                         "document_deadline_reached",
                         len(analyses),
@@ -14074,6 +14892,7 @@ def _read_document(
                     chunk_operation,
                     before_attempt=before_chunk_attempt,
                     on_attempt=record_chunk_attempt,
+                    cancelled=cancel_event.is_set if cancel_event is not None else None,
                 )
             else:
                 before_chunk_attempt()
@@ -14109,24 +14928,37 @@ def _read_document(
     elif hasattr(reader, "synthesize_document_bundle") or hasattr(
         reader, "synthesize_document"
     ):
-        if calls >= policy.max_calls_per_document_run:
+        if (
+            policy.max_calls_per_document_run > 0
+            and calls >= policy.max_calls_per_document_run
+        ):
             raise DocumentPartialError(
                 "document_call_budget_reached_before_synthesis",
                 len(analyses),
                 len(chunks),
             )
-        if time.monotonic() - started >= policy.document_deadline_seconds:
+        if (
+            policy.document_deadline_seconds > 0
+            and time.monotonic() - started >= policy.document_deadline_seconds
+        ):
             raise DocumentPartialError(
                 "document_deadline_reached_before_synthesis", len(analyses), len(chunks)
             )
         def before_synthesis_attempt() -> None:
-            if calls >= policy.max_calls_per_document_run:
+            if (
+                policy.max_calls_per_document_run > 0
+                and calls >= policy.max_calls_per_document_run
+            ):
                 raise DocumentPartialError(
                     "document_call_budget_reached_before_synthesis",
                     len(analyses),
                     len(chunks),
                 )
-            if time.monotonic() - started >= policy.document_deadline_seconds:
+            if (
+                policy.document_deadline_seconds > 0
+                and time.monotonic() - started
+                >= policy.document_deadline_seconds
+            ):
                 raise DocumentPartialError(
                     "document_deadline_reached_before_synthesis",
                     len(analyses),
@@ -14175,6 +15007,7 @@ def _read_document(
                 synthesis_operation,
                 before_attempt=before_synthesis_attempt,
                 on_attempt=record_synthesis_attempt,
+                cancelled=cancel_event.is_set if cancel_event is not None else None,
             )
         else:
             before_synthesis_attempt()
@@ -14270,7 +15103,8 @@ def _split_document(
     text: str, *, chunk_char_limit: int | None = None, max_chunks: int | None = None
 ) -> list[str]:
     chunk_char_limit = chunk_char_limit or ProcessingPolicy().chunk_char_limit
-    max_chunks = max_chunks or ProcessingPolicy().max_total_chunks
+    if max_chunks is None:
+        max_chunks = ProcessingPolicy().max_total_chunks
     paragraphs = text.split("\n\n")
     chunks: list[str] = []
     current: list[str] = []
@@ -14290,7 +15124,7 @@ def _split_document(
             current_size += len(piece) + (2 if len(current) > 1 else 0)
     if current:
         chunks.append("\n\n".join(current))
-    if len(chunks) > max_chunks:
+    if max_chunks > 0 and len(chunks) > max_chunks:
         raise DocumentCoverageLimitError(len(chunks), max_chunks)
     return [
         f"--- Document Chunk {index + 1}/{len(chunks)} ---\n{chunk}"

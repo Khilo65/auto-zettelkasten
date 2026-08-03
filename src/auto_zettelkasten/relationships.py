@@ -11,7 +11,7 @@ from .navigation import TYPED_SOURCE_RELATIONS, rank_human_related_links
 
 
 RELATIONSHIP_PROMPT_VERSION = "15"
-RELATIONSHIP_DISCOVERY_PROMPT_VERSION = "15"
+RELATIONSHIP_DISCOVERY_PROMPT_VERSION = "16"
 RELATIONSHIP_REGISTRY_SCHEMA_VERSION = "7"
 RELATIONSHIP_DECISION_SCHEMA_VERSION = "8"
 RELATIONSHIP_DECISION_CONTRACT = "relationship-decision-v8"
@@ -152,7 +152,7 @@ def candidate_rows(
     focus_source_ids: Sequence[str],
     available_source_ids: Sequence[str],
     available_cluster_ids: Sequence[str] = (),
-    max_per_source: int = 12,
+    max_per_source: int = 0,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     focus = set(focus_source_ids)
     available_sources = set(available_source_ids)
@@ -204,7 +204,7 @@ def candidate_rows(
                 }
             )
             continue
-        if counts.get(source_id, 0) >= max_per_source:
+        if max_per_source > 0 and counts.get(source_id, 0) >= max_per_source:
             parked.append(
                 {
                     "row_index": index,

@@ -40,12 +40,12 @@ def test_literature_mapping_policy_defaults_and_validation() -> None:
         "auto_promote_debates": True,
         "auto_promote_gaps": True,
         "source_backed_threshold": 3,
-        "max_memberships": 3,
+        "max_memberships": 0,
         "external_discovery": "disabled",
-        "max_profile_calls": 100,
-        "max_synthesis_calls": 24,
+        "max_profile_calls": 0,
+        "max_synthesis_calls": 0,
         "profile_workers": 4,
-        "literature_deadline_seconds": 1800.0,
+        "literature_deadline_seconds": 0.0,
         "deepseek_packet_context_fraction": 0.8,
         "weak_gap_handling": "audit_only",
         "cluster_gap_projection": "inline",
@@ -673,7 +673,7 @@ def test_all_report_models_default_to_current_versions(tmp_path: Path) -> None:
         LiteratureMapReport(status="ok"),
     )
     assert {(report.engine_version, report.artifact_schema_version) for report in reports} == {
-        ("0.27.0", "1.18")
+        ("0.28.0", "1.19")
     }
     assert run_report.literature_map == {}
     assert run_report.literature_report == {}

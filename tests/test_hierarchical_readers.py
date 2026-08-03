@@ -381,7 +381,7 @@ def test_retry_after_cannot_exceed_absolute_deadline(monkeypatch: pytest.MonkeyP
     assert attempts[0] == 1
 
 
-def test_streamed_response_read_obeys_absolute_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_active_json_response_may_exceed_idle_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     clock = [0.0]
     monkeypatch.setattr("auto_zettelkasten.readers.time.monotonic", lambda: clock[0])
 
@@ -392,8 +392,7 @@ def test_streamed_response_read_obeys_absolute_deadline(monkeypatch: pytest.Monk
         "auto_zettelkasten.readers.urllib.request.urlopen",
         lambda request, timeout: _Response({"ok": True}, on_read=advance_clock),
     )
-    with pytest.raises(ProviderError, match="deadline exceeded"):
-        _post_json("https://provider.invalid", {}, timeout=3)
+    assert _post_json("https://provider.invalid", {}, timeout=3) == {"ok": True}
 
 
 def test_chunked_provider_frames_use_single_read_boundaries(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -597,7 +596,7 @@ def test_interrupted_stream_preserves_accumulated_safe_diagnostics() -> None:
     assert completion["content_fragment_count"] == 1
 
 
-def test_deepseek_stream_trickle_cannot_bypass_absolute_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_deepseek_active_stream_may_exceed_total_wall_time(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     clock = [0.0]
     monkeypatch.setattr("auto_zettelkasten.readers.time.monotonic", lambda: clock[0])
@@ -605,17 +604,35 @@ def test_deepseek_stream_trickle_cannot_bypass_absolute_deadline(monkeypatch: py
     def advance_clock() -> None:
         clock[0] += 2.0
 
+    serialized = json.dumps(_analysis())
+    midpoint = len(serialized) // 2
     monkeypatch.setattr(
         "auto_zettelkasten.readers.urllib.request.urlopen",
         lambda request, timeout: _SseResponse(
             [
-                {"choices": [{"delta": {"content": "{"}, "finish_reason": None}]},
-                {"choices": [{"delta": {"content": "}"}, "finish_reason": "stop"}]},
+                {
+                    "choices": [
+                        {
+                            "delta": {"content": serialized[:midpoint]},
+                            "finish_reason": None,
+                        }
+                    ]
+                },
+                {
+                    "choices": [
+                        {
+                            "delta": {"content": serialized[midpoint:]},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                },
                 "[DONE]",
             ],
             on_read=advance_clock,
         ),
     )
 
-    with pytest.raises(ProviderError, match="deadline exceeded"):
-        DeepSeekReader(allow_cloud=True, request_deadline=3).read_source("source text", {"title": "Study"})
+    result = DeepSeekReader(allow_cloud=True, request_deadline=3).read_source(
+        "source text", {"title": "Study"}
+    )
+    assert result["thesis"]

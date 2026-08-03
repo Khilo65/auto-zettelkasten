@@ -8,6 +8,7 @@ import json
 import os
 import re
 import socket
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -15,6 +16,7 @@ import urllib.request
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any, Callable, Mapping, Sequence
 
 import yaml
@@ -36,6 +38,24 @@ from .models import (
 
 class ProviderError(RuntimeError):
     pass
+
+
+class ProviderTransportError(ProviderError):
+    """Retryable provider transport failure with stable diagnostics."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        transport_kind: str,
+        cause: BaseException | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.transport_kind = transport_kind
+        self.retryable = True
+        self.retry_on_resume = True
+        self.cause_type = type(cause).__name__ if cause is not None else ""
+        self.errno = getattr(cause, "errno", None)
 
 
 class ProviderEmptyResponse(ProviderError):
@@ -62,6 +82,21 @@ class _ProviderText(str):
 _LITERATURE_COMPLETION: ContextVar[Mapping[str, Any]] = ContextVar(
     "auto_zettelkasten_literature_completion", default={}
 )
+_ACTIVE_RESPONSE_LOCK = threading.Lock()
+_ACTIVE_RESPONSES: dict[int, Any] = {}
+
+
+def cancel_active_provider_responses() -> int:
+    """Close active HTTP responses so controlled shutdown can unwind reads."""
+
+    with _ACTIVE_RESPONSE_LOCK:
+        responses = list(_ACTIVE_RESPONSES.values())
+    for response in responses:
+        try:
+            response.close()
+        except Exception:
+            pass
+    return len(responses)
 
 
 def current_literature_completion() -> dict[str, Any]:
@@ -175,6 +210,52 @@ _SALIENCE_LABELS = {
     "minor": 1,
 }
 
+DEEPSEEK_V4_FLASH_PRICING = {
+    "cache_hit_input_per_million": Decimal("0.0028"),
+    "cache_miss_input_per_million": Decimal("0.14"),
+    "output_per_million": Decimal("0.28"),
+    "source": "https://api-docs.deepseek.com/quick_start/pricing",
+    "effective_date": "2026-08-03",
+}
+
+
+def provider_attempt_cost_usd(
+    provider: str,
+    model: str,
+    completion: Mapping[str, Any] | None,
+) -> tuple[Decimal, str] | None:
+    """Return DeepSeek cost from provider usage, or None for unknown pricing."""
+
+    if provider.casefold() != "deepseek" or model != "deepseek-v4-flash":
+        return None
+    usage = dict((completion or {}).get("usage", {}) or {})
+    if not usage:
+        return Decimal("0"), "usage_unavailable"
+    hit = Decimal(str(usage.get("prompt_cache_hit_tokens", 0) or 0))
+    miss_value = usage.get("prompt_cache_miss_tokens")
+    if miss_value is None:
+        miss_value = max(
+            0,
+            int(usage.get("prompt_tokens", 0) or 0) - int(hit),
+        )
+    miss = Decimal(str(miss_value or 0))
+    output = Decimal(
+        str(
+            usage.get("completion_tokens", usage.get("output_tokens", 0))
+            or 0
+        )
+    )
+    million = Decimal("1000000")
+    return (
+        (
+            hit * DEEPSEEK_V4_FLASH_PRICING["cache_hit_input_per_million"]
+            + miss * DEEPSEEK_V4_FLASH_PRICING["cache_miss_input_per_million"]
+            + output * DEEPSEEK_V4_FLASH_PRICING["output_per_million"]
+        )
+        / million,
+        "provider_reported_usage",
+    )
+
 
 def provider_from_name(name: str, model: str, *, allow_cloud: bool):
     normalized = name.strip().lower()
@@ -206,6 +287,7 @@ class _CapabilityAwareReader:
     max_output_tokens: int
     chunk_output_tokens: int
     timeout: float
+    connect_timeout: float
     request_deadline: float | None
     relationship_decision_contract = "relationship-decision-v8"
 
@@ -246,6 +328,7 @@ class _CapabilityAwareReader:
             "supported_output_tokens": supported_output_tokens,
             "chunk_output_tokens": self._chunk_token_cap,
             "request_deadline_seconds": self._request_deadline_seconds(),
+            "connect_timeout_seconds": float(getattr(self, "connect_timeout", 60.0)),
             "supports_hierarchical_reading": True,
         }
         return {
@@ -255,7 +338,15 @@ class _CapabilityAwareReader:
                     {
                         "provider": self.name,
                         "model": self.model,
-                        **capability,
+                        **{
+                            key: value
+                            for key, value in capability.items()
+                            if key
+                            not in {
+                                "request_deadline_seconds",
+                                "connect_timeout_seconds",
+                            }
+                        },
                     },
                     sort_keys=True,
                 ).encode("utf-8")
@@ -1194,6 +1285,7 @@ class _OpenAICompatibleReader(_CapabilityAwareReader):
     allow_cloud: bool
     is_cloud: bool = True
     timeout: float = 180.0
+    connect_timeout: float = 60.0
     request_deadline: float | None = None
     max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS
     chunk_output_tokens: int = DEFAULT_CHUNK_OUTPUT_TOKENS
@@ -1247,6 +1339,7 @@ class _OpenAICompatibleReader(_CapabilityAwareReader):
                 body,
                 headers={"Authorization": f"Bearer {os.environ[self.api_key_env]}"},
                 timeout=deadline_seconds,
+                connect_timeout=self.connect_timeout,
                 response_byte_limit=_stream_response_byte_limit(output_tokens),
                 response_reader=_read_openai_stream_response,
             )
@@ -1301,6 +1394,7 @@ class DeepSeekReader(_OpenAICompatibleReader):
         *,
         allow_cloud: bool = False,
         timeout: float = 180.0,
+        connect_timeout: float = 60.0,
         request_deadline: float | None = None,
         max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
         chunk_output_tokens: int = DEFAULT_CHUNK_OUTPUT_TOKENS,
@@ -1315,6 +1409,7 @@ class DeepSeekReader(_OpenAICompatibleReader):
             api_key_env="DEEPSEEK_API_KEY",
             allow_cloud=allow_cloud,
             timeout=timeout,
+            connect_timeout=connect_timeout,
             request_deadline=request_deadline,
             max_output_tokens=max_output_tokens,
             chunk_output_tokens=chunk_output_tokens,
@@ -1331,6 +1426,7 @@ class OpenRouterReader(_OpenAICompatibleReader):
         *,
         allow_cloud: bool = False,
         timeout: float = 180.0,
+        connect_timeout: float = 60.0,
         request_deadline: float | None = None,
         max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
         chunk_output_tokens: int = DEFAULT_CHUNK_OUTPUT_TOKENS,
@@ -1345,6 +1441,7 @@ class OpenRouterReader(_OpenAICompatibleReader):
             api_key_env="OPENROUTER_API_KEY",
             allow_cloud=allow_cloud,
             timeout=timeout,
+            connect_timeout=connect_timeout,
             request_deadline=request_deadline,
             max_output_tokens=max_output_tokens,
             chunk_output_tokens=chunk_output_tokens,
@@ -1761,7 +1858,7 @@ def _relationship_bridge_shard_system_prompt() -> str:
         "Return exactly one JSON object with a shard_pairs array of objects. Each object must contain "
         "left_shard_id, right_shard_id, bridge_family, why_examine, "
         "target_candidate_count, and confidence. Use only IDs from the supplied "
-        "routing cards, put different IDs in each pair, and select no more than twelve diverse pairs. Route "
+        "routing cards and put different IDs in each pair. Return every worthwhile shard pair that fits, using continuation when needed. Route "
         "plausible shared propositions, mechanisms, outcomes, sequences, debates, applications, and boundaries; "
         "this is recall-oriented navigation, not relationship publication. Do not classify source relationships "
         "or manufacture source pairs. Return an empty array only when no cross-literature comparison is worthwhile."
@@ -1770,28 +1867,29 @@ def _relationship_bridge_shard_system_prompt() -> str:
 
 def _relationship_candidate_system_prompt() -> str:
     return (
-        "You retrieve comparisons for Auto-Zettelkasten relationship discovery prompt v15. "
-        "Return exactly one JSON object with candidates and optional job_outcomes arrays. Each candidate "
+        "You retrieve comparisons for Auto-Zettelkasten relationship discovery prompt v16. "
+        "Return exactly one JSON object with candidates and job_outcomes arrays. Each candidate "
         "contains only left_source_id, right_source_id, comparison_proposition, "
         "bridge_job_id, and rank. Use only supplied IDs, put the "
         "canonical lexicographically earlier ID on the left, and never repeat a "
         "pair. A candidate is a request for later full-note comparison, not a "
         "published relationship, so optimize recall, coverage, diversity, and "
         "useful navigation. Require a concrete shared proposition, mechanism, "
+        "Respect max_inferred_pairs as the per-response page size, not as a total discovery cap. "
         "outcome, debate, sequence, implementation problem, or boundary; shared "
-        "vocabulary alone is insufficient. Use max_inferred_pairs as a hard "
-        "ceiling. When discovery_mode is bridge_only, return only pairs whose "
+        "vocabulary alone is insufficient. Return as many useful pairs as fit "
+        "comfortably in this response. When discovery_mode is bridge_only, return only pairs whose "
         "supplied collection memberships are disjoint. For bridge_only packets, "
         "each candidate must name a supplied bridge_job_id and place one endpoint "
         "on each of that job's source sides. Meet each job's target_candidate_count "
         "when useful. A source may appear in several genuinely useful comparisons. "
         "When discovery_mode is complementary_family_discovery, do not repeat "
         "prior_candidate_pairs and fulfill each supplied family job independently. "
-        "For built-in complementary-family packets, return exactly one job_outcomes "
+        "For every supplied discovery job, return exactly one job_outcomes "
         "row for every supplied bridge_job_id, using status completed when more useful "
-        "comparisons may exist or no_more_candidates only after exhausting that job's "
+        "comparisons remain for a continuation or no_more_candidates only after exhausting that job's "
         "non-trivial comparisons. A candidate floor is a minimum coverage target, not "
-        "a cap; return additional useful candidates while global capacity remains. "
+        "a cap; return additional useful candidates when they are non-trivial. "
         "Cover multiple theoretical, mechanistic, empirical, "
         "institutional, implementation, outcome, sequence, and boundary families "
         "rather than stopping after citations or one theme. Full-note "
@@ -3309,6 +3407,10 @@ def _parse_source_bundle_response(
     valid: list[dict[str, Any]] = []
     seen: set[str] = set()
     for candidate in candidates:
+        if set(candidate) == {SOURCE_BUNDLE_ENVELOPE_CONTRACT} and isinstance(
+            candidate.get(SOURCE_BUNDLE_ENVELOPE_CONTRACT), Mapping
+        ):
+            candidate = candidate[SOURCE_BUNDLE_ENVELOPE_CONTRACT]
         try:
             provider_payload = _provider_source_bundle_payload(
                 candidate,
@@ -4564,16 +4666,13 @@ def _stream_response_byte_limit(output_tokens: int) -> int:
     return max(8 * 1024 * 1024, 65_536 + output_tokens * 512)
 
 
-class _RequestDeadlineExceeded(ProviderError):
-    pass
-
-
 def _post_json(
     url: str,
     body: Mapping[str, Any],
     *,
     headers: Mapping[str, str] | None = None,
     timeout: float,
+    connect_timeout: float = 60.0,
     response_byte_limit: int = 2 * 1024 * 1024,
     max_attempts: int = 1,
     on_attempt: Callable[[], None] | None = None,
@@ -4585,6 +4684,8 @@ def _post_json(
         raise ValueError("response_byte_limit must be positive")
     if max_attempts <= 0:
         raise ValueError("max_attempts must be positive")
+    if connect_timeout <= 0:
+        raise ValueError("connect_timeout must be positive")
     request_headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -4597,54 +4698,96 @@ def _post_json(
         method="POST",
         headers=request_headers,
     )
-    deadline = time.monotonic() + timeout
     for attempt in range(max_attempts):
         if on_attempt is not None:
             on_attempt()
-        remaining = _remaining_seconds(deadline)
         try:
-            with urllib.request.urlopen(request, timeout=remaining) as response:
+            response = urllib.request.urlopen(
+                request, timeout=min(timeout, connect_timeout)
+            )
+            _set_response_read_timeout(response, timeout)
+            with _ACTIVE_RESPONSE_LOCK:
+                _ACTIVE_RESPONSES[id(response)] = response
+            try:
                 reader = response_reader or _read_json_response
-                return reader(response, deadline, response_byte_limit)
+                return reader(response, timeout, response_byte_limit)
+            finally:
+                with _ACTIVE_RESPONSE_LOCK:
+                    _ACTIVE_RESPONSES.pop(id(response), None)
+                close = getattr(response, "close", None)
+                if callable(close):
+                    close()
         except urllib.error.HTTPError as exc:
             retry_after = _retry_after_seconds(exc.headers)
             try:
                 detail = exc.read(512).decode("utf-8", errors="replace")
             finally:
                 exc.close()
-            _remaining_seconds(deadline)
             if attempt + 1 < max_attempts and (
                 exc.code == 429 or 500 <= exc.code <= 599
             ):
-                _wait_for_retry(retry_after, deadline, cause=exc)
+                if retry_after > 0:
+                    time.sleep(retry_after)
                 continue
+            if exc.code == 429 or 500 <= exc.code <= 599:
+                raise ProviderTransportError(
+                    f"provider HTTP {exc.code}: {detail}",
+                    transport_kind="http_retryable",
+                    cause=exc,
+                ) from exc
             raise ProviderError(f"provider HTTP {exc.code}: {detail}") from exc
         except urllib.error.URLError as exc:
             if attempt + 1 < max_attempts:
                 continue
             if _is_network_timeout(exc.reason):
-                raise ProviderError("provider request timed out") from exc
-            raise ProviderError(f"provider unavailable: {exc.reason}") from exc
+                raise ProviderTransportError(
+                    "provider connection timed out",
+                    transport_kind="connection_timeout",
+                    cause=exc,
+                ) from exc
+            raise ProviderTransportError(
+                f"provider unavailable: {exc.reason}",
+                transport_kind="network_unavailable",
+                cause=exc,
+            ) from exc
         except http.client.HTTPException as exc:
             if attempt + 1 < max_attempts:
                 continue
-            raise ProviderError("provider connection interrupted") from exc
+            raise ProviderTransportError(
+                "provider connection interrupted",
+                transport_kind="connection_interrupted",
+                cause=exc,
+            ) from exc
         except (TimeoutError, socket.timeout) as exc:
             if attempt + 1 < max_attempts:
                 continue
-            raise ProviderError("provider request timed out") from exc
+            raise ProviderTransportError(
+                "provider connection timed out",
+                transport_kind="connection_timeout",
+                cause=exc,
+            ) from exc
     raise AssertionError("provider attempt loop exhausted unexpectedly")
 
 
+def _set_response_read_timeout(response: Any, timeout: float) -> None:
+    """Switch urllib's connection timeout to the stream inactivity timeout."""
+
+    candidate = getattr(getattr(response, "fp", None), "raw", None)
+    socket_value = getattr(candidate, "_sock", None)
+    setter = getattr(socket_value, "settimeout", None)
+    if callable(setter):
+        setter(timeout)
+
+
 def _read_openai_stream_response(
-    response: Any, deadline: float, byte_limit: int
+    response: Any, idle_timeout: float, byte_limit: int
 ) -> dict[str, Any]:
-    """Read OpenAI-compatible SSE output while enforcing one absolute deadline."""
+    """Read OpenAI-compatible SSE output with a progress-based idle timeout."""
 
     if not callable(getattr(response, "readline", None)):
         # Test doubles and a few compatible gateways may still return one JSON
         # object even when stream=true. Preserve that compatible fallback.
-        return _read_json_response(response, deadline, byte_limit)
+        return _read_json_response(response, idle_timeout, byte_limit)
 
     content: list[str] = []
     finish_reason = ""
@@ -4656,12 +4799,14 @@ def _read_openai_stream_response(
     model = ""
     usage: dict[str, Any] = {}
     stream_hash = hashlib.sha256()
+    last_activity = time.monotonic()
+    saw_terminal = False
 
     def diagnostics(visible_content: str) -> dict[str, Any]:
         return {
             "response_id": response_id,
             "usage": usage,
-            "finish_reason": finish_reason or "stop",
+            "finish_reason": finish_reason,
             "model": model,
             "event_count": event_count,
             "response_bytes": total,
@@ -4683,16 +4828,37 @@ def _read_openai_stream_response(
 
     while True:
         try:
-            remaining = _remaining_seconds(deadline)
+            remaining = idle_timeout - (time.monotonic() - last_activity)
+            if remaining <= 0:
+                raise ProviderTransportError(
+                    "provider stream idle timeout exceeded",
+                    transport_kind="idle_timeout",
+                )
             _set_stream_timeout(response, remaining)
             line = response.readline()
-            _remaining_seconds(deadline)
-        except ProviderError as exc:
+            if time.monotonic() - last_activity >= idle_timeout:
+                raise ProviderTransportError(
+                    "provider stream idle timeout exceeded",
+                    transport_kind="idle_timeout",
+                )
+        except ProviderTransportError as exc:
             preserve_stream_failure(exc)
             raise
+        except (TimeoutError, socket.timeout) as exc:
+            raise preserve_stream_failure(
+                ProviderTransportError(
+                    "provider stream idle timeout exceeded",
+                    transport_kind="idle_timeout",
+                    cause=exc,
+                )
+            ) from exc
         except (OSError, http.client.HTTPException) as exc:
             raise preserve_stream_failure(
-                ProviderError("provider stream read failed")
+                ProviderTransportError(
+                    "provider stream read failed",
+                    transport_kind="interrupted_stream",
+                    cause=exc,
+                )
             ) from exc
         if not line:
             break
@@ -4718,6 +4884,8 @@ def _read_openai_stream_response(
             continue
         data = decoded[5:].strip()
         if data == "[DONE]":
+            saw_terminal = True
+            last_activity = time.monotonic()
             break
         event_count += 1
         try:
@@ -4731,6 +4899,7 @@ def _read_openai_stream_response(
                 if event.get("model"):
                     model = str(event["model"])
                 usage = dict(event["usage"])
+                last_activity = time.monotonic()
                 continue
             choice = choices[0]
         except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
@@ -4757,15 +4926,28 @@ def _read_openai_stream_response(
         if isinstance(piece, str) and piece:
             content.append(piece)
             content_fragment_count += 1
+            last_activity = time.monotonic()
         reasoning_piece = (
             delta.get("reasoning_content") if isinstance(delta, Mapping) else None
         )
         if isinstance(reasoning_piece, str) and reasoning_piece:
             reasoning_fragment_count += 1
+            last_activity = time.monotonic()
         if choice.get("finish_reason"):
             finish_reason = str(choice["finish_reason"])
+            saw_terminal = True
+            last_activity = time.monotonic()
     visible_content = "".join(content)
     stream_diagnostics = diagnostics(visible_content)
+    if not saw_terminal:
+        error = ProviderTransportError(
+            "provider stream ended before a terminal event",
+            transport_kind="premature_eof",
+        )
+        _preserve_provider_failure(
+            error, _ProviderText(visible_content, stream_diagnostics)
+        )
+        raise error
     if not visible_content.strip():
         error = ProviderEmptyResponse("provider stream ended without response content")
         _preserve_provider_failure(
@@ -4787,22 +4969,46 @@ def _read_openai_stream_response(
 
 
 def _read_json_response(
-    response: Any, deadline: float, byte_limit: int
+    response: Any, idle_timeout: float, byte_limit: int
 ) -> dict[str, Any]:
     chunks: list[bytes] = []
     total = 0
     read = getattr(response, "read1", response.read)
+    last_activity = time.monotonic()
     while True:
-        remaining = _remaining_seconds(deadline)
+        remaining = idle_timeout - (time.monotonic() - last_activity)
+        if remaining <= 0:
+            raise ProviderTransportError(
+                "provider response idle timeout exceeded",
+                transport_kind="idle_timeout",
+            )
         _set_stream_timeout(response, remaining)
         # HTTPResponse.read(size) may internally wait for `size` bytes while a
         # chunked provider trickles smaller frames, effectively renewing the
         # socket timeout inside one Python call. read1 returns after one
         # underlying read so the monotonic deadline is checked between frames.
-        chunk = read(min(65_536, byte_limit + 1 - total))
-        _remaining_seconds(deadline)
+        try:
+            chunk = read(min(65_536, byte_limit + 1 - total))
+        except (TimeoutError, socket.timeout) as exc:
+            raise ProviderTransportError(
+                "provider response idle timeout exceeded",
+                transport_kind="idle_timeout",
+                cause=exc,
+            ) from exc
+        except (OSError, http.client.HTTPException) as exc:
+            raise ProviderTransportError(
+                "provider response read failed",
+                transport_kind="interrupted_stream",
+                cause=exc,
+            ) from exc
+        if time.monotonic() - last_activity >= idle_timeout:
+            raise ProviderTransportError(
+                "provider response idle timeout exceeded",
+                transport_kind="idle_timeout",
+            )
         if not chunk:
             break
+        last_activity = time.monotonic()
         total += len(chunk)
         if total > byte_limit:
             raise ProviderError(
@@ -4825,13 +5031,6 @@ def _set_stream_timeout(response: Any, remaining: float) -> None:
         # urllib does not expose the socket uniformly across Python versions or
         # mocked transports. The open timeout and monotonic checks still apply.
         return
-
-
-def _remaining_seconds(deadline: float) -> float:
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise _RequestDeadlineExceeded("provider request deadline exceeded")
-    return remaining
 
 
 def _is_network_timeout(reason: Any) -> bool:
@@ -4857,14 +5056,3 @@ def _retry_after_seconds(headers: Any) -> float:
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=UTC)
         return max(0.0, (parsed - datetime.now(UTC)).total_seconds())
-
-
-def _wait_for_retry(delay: float, deadline: float, *, cause: BaseException) -> None:
-    if delay <= 0:
-        return
-    remaining = _remaining_seconds(deadline)
-    if delay >= remaining:
-        raise _RequestDeadlineExceeded(
-            "provider request deadline exceeded while waiting to retry"
-        ) from cause
-    time.sleep(delay)
