@@ -8457,7 +8457,10 @@ def _run_relationship_reasoning(
         validation = validate_relationship_decision_rows(
             {"decisions": [dict(payload)]},
             jobs=[job],
-            profiles=list(profile_by_source.values()),
+            profiles=[
+                profile_by_source[job.left_source_id],
+                profile_by_source[job.right_source_id],
+            ],
             provider=provider_name,
             model=model_name,
             reasoner_backend=reasoner_backend,
