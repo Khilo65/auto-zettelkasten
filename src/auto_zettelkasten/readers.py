@@ -4580,6 +4580,16 @@ def _validate_relationship_response(
     values = payload.get(key)
     if values is None and kind == "relationship_adjudication":
         values = payload.get("relationships")
+        if (
+            values is None
+            and payload
+            and all(
+                str(job_id).startswith("relationship-job-")
+                and isinstance(value, Mapping)
+                for job_id, value in payload.items()
+            )
+        ):
+            values = payload
     if values is None and kind == "relationship_verification":
         values = payload.get("decisions")
     if kind == "relationship_adjudication" and isinstance(values, Mapping):

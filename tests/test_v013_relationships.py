@@ -259,6 +259,28 @@ def test_v6_keyed_provider_envelope_normalizes_to_rows() -> None:
     }
 
 
+def test_top_level_keyed_provider_envelope_normalizes_to_rows() -> None:
+    normalized = _validate_relationship_response(
+        {
+            "relationship-job-a-b": {
+                "decision": "no_relationship",
+                "reason": "The apparent overlap is only topical.",
+                "confidence": 0.8,
+            }
+        },
+        kind="relationship_adjudication",
+    )
+
+    assert normalized["decisions"] == [
+        {
+            "pair_job_id": "relationship-job-a-b",
+            "decision": "no_relationship",
+            "reason": "The apparent overlap is only topical.",
+            "confidence": 0.8,
+        }
+    ]
+
+
 def test_v6_keyed_provider_envelope_uses_the_mapping_key_as_job_id() -> None:
     normalized = _validate_relationship_response(
         {
