@@ -1021,6 +1021,22 @@ class SourceLocator:
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> SourceLocator:
         values = _model_payload(cls, payload, label="source locator")
+        page_start = values.get("page_start")
+        page_end = values.get("page_end")
+        if (
+            isinstance(page_start, bool)
+            or not isinstance(page_start, int)
+            or page_start < 1
+        ):
+            page_start = None
+        if (
+            isinstance(page_end, bool)
+            or not isinstance(page_end, int)
+            or page_end < 1
+        ):
+            page_end = None
+        if page_start is not None and page_end is not None and page_end < page_start:
+            page_start = page_end = None
         return cls(
             locator_id=_require_string(
                 values.get("locator_id", ""), field="source locator.locator_id"
@@ -1039,8 +1055,8 @@ class SourceLocator:
             value=_require_string(
                 values.get("value", ""), field="source locator.value"
             ),
-            page_start=values.get("page_start"),
-            page_end=values.get("page_end"),
+            page_start=page_start,
+            page_end=page_end,
             source_native=values.get("source_native", False),
             supports_strong_assertion=values.get("supports_strong_assertion", False),
         )

@@ -105,6 +105,23 @@ def test_profile_1_3_round_trips_typed_locator_quantitative_result_and_lineage()
     assert StudyLineage.from_dict(lineage.to_dict()) == lineage
 
 
+def test_invalid_optional_page_coordinates_do_not_discard_source_locator() -> None:
+    locator = SourceLocator.from_dict(
+        {
+            "locator_type": "page_range",
+            "value": "pp. 19-18",
+            "page_start": 19,
+            "page_end": 18,
+            "source_native": True,
+            "supports_strong_assertion": True,
+        }
+    )
+
+    assert locator.value == "pp. 19-18"
+    assert locator.page_start is None
+    assert locator.page_end is None
+
+
 def test_generated_headings_cannot_masquerade_as_strong_source_locators() -> None:
     try:
         SourceLocator(
