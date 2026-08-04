@@ -2576,6 +2576,11 @@ def _validate_literature_family_plan_response(
         job_id = str(row.get("job_id") or "").strip()
         if not job_id:
             raise ValueError("literature family discovery job requires job_id")
+        requested_pair = row.get("requested_collection_pair", [])
+        if not isinstance(requested_pair, Sequence) or isinstance(
+            requested_pair, (str, bytes, bytearray)
+        ):
+            requested_pair = []
         jobs.append(
             {
                 "job_id": job_id,
@@ -2596,7 +2601,7 @@ def _validate_literature_family_plan_response(
                 ),
                 "requested_collection_pair": [
                     str(value).strip()
-                    for value in row.get("requested_collection_pair", []) or []
+                    for value in requested_pair
                     if str(value).strip()
                 ],
                 "discovery_goal": str(

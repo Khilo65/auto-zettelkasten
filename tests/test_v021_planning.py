@@ -5,6 +5,7 @@ from pathlib import Path
 from auto_zettelkasten.cli import build_parser
 from auto_zettelkasten.files import write_yaml
 from auto_zettelkasten.indexes import lean_discovery_projection
+from auto_zettelkasten.literature import _validate_literature_family_plan_response
 from auto_zettelkasten.models import LiteratureMapRequest
 from auto_zettelkasten.pipeline import (
     _plan_literature_families,
@@ -84,6 +85,33 @@ def test_shared_plan_adds_missing_explicit_collection_comparison() -> None:
     assert len(requested) == 1
     assert requested[0]["left_source_ids"] == ["A"]
     assert requested[0]["right_source_ids"] == ["B"]
+
+
+def test_family_plan_normalizes_boolean_requested_pair_without_retry() -> None:
+    result = _validate_literature_family_plan_response(
+        {
+            "literature_families": [
+                {
+                    "family_id": "family",
+                    "label": "Family",
+                    "organizing_problem": "A bounded problem",
+                    "source_ids": ["A", "A", "B"],
+                }
+            ],
+            "discovery_jobs": [
+                {
+                    "job_id": "job",
+                    "left_source_ids": ["A"],
+                    "right_source_ids": ["B"],
+                    "requested_collection_pair": True,
+                }
+            ],
+            "neighboring_families": [],
+        }
+    )
+
+    assert result["literature_families"][0]["source_ids"] == ["A", "B"]
+    assert result["discovery_jobs"][0]["requested_collection_pair"] == []
 
 
 def test_build_map_cli_accepts_repeatable_collection_comparisons() -> None:
