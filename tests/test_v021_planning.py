@@ -273,6 +273,107 @@ def test_incremental_family_plan_preserves_unaffected_families(
     } == {"family-ab": "AB revised", "family-cd": "CD"}
 
 
+def test_identical_initial_family_plan_keeps_the_same_job_key(
+    tmp_path: Path,
+) -> None:
+    class Reasoner:
+        name = "local"
+        model = "test"
+
+        def literature_family_plan_fits(self, profiles, request, *, context=None):
+            return True
+
+        def plan_literature_families(self, profiles, request, *, context=None):
+            raise AssertionError("checkpoint wrapper supplies the response")
+
+    response = {
+        "literature_families": [
+            {
+                "family_id": "family-ab",
+                "label": "AB",
+                "organizing_problem": "Problem AB",
+                "source_ids": ["A", "B"],
+                "proposed_roles": {"A": "core", "B": "supporting"},
+            }
+        ],
+        "discovery_jobs": [
+            {
+                "job_id": "discover-ab",
+                "family": "family-ab",
+                "left_source_ids": ["A"],
+                "right_source_ids": ["B"],
+            }
+        ],
+        "neighboring_families": [],
+    }
+
+    class Calls:
+        def __init__(self) -> None:
+            self.keys: list[str] = []
+
+        def __call__(self, _stage, key, _method, _profiles, _context):
+            self.keys.append(key)
+            return response
+
+    catalogue_path = tmp_path / "02_source_memory" / "indexes" / "catalogue.yml"
+    write_yaml(
+        catalogue_path,
+        {
+            "sources": [
+                {
+                    "source_id": source_id,
+                    "zotero_key": source_id,
+                    "title": f"Source {source_id}",
+                    "author": "Author",
+                    "year": "2020",
+                    "collection_keys": ["C1"],
+                }
+                for source_id in ("A", "B")
+            ],
+            "collections": [
+                {
+                    "key": "C1",
+                    "name": "Collection",
+                    "direct_source_ids": ["A", "B"],
+                }
+            ],
+        },
+    )
+    profiles = [
+        {
+            "source_id": source_id,
+            "context": {
+                "thesis": f"Thesis {source_id}",
+                "method_or_knowledge_basis": "Comparative analysis",
+            },
+        }
+        for source_id in ("A", "B")
+    ]
+    calls = Calls()
+    request = LiteratureMapRequest(tmp_path)
+
+    first = _plan_literature_families(
+        tmp_path,
+        profiles=profiles,
+        catalogue={"catalogue_path": str(catalogue_path)},
+        reasoner=Reasoner(),
+        reasoner_calls=calls,
+        request=request,
+    )
+    second = _plan_literature_families(
+        tmp_path,
+        profiles=profiles,
+        catalogue={"catalogue_path": str(catalogue_path)},
+        reasoner=Reasoner(),
+        reasoner_calls=calls,
+        request=request,
+    )
+
+    assert first["incremental_source_ids"] == []
+    assert second["incremental_source_ids"] == []
+    assert calls.keys[0] == calls.keys[1]
+
+
 def test_initial_family_plan_adds_coverage_completion_family(
     tmp_path: Path,
 ) -> None:

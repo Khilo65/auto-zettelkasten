@@ -13,6 +13,7 @@ from auto_zettelkasten.literature import (
 from auto_zettelkasten.models import RelationshipPairJob
 from auto_zettelkasten.readers import (
     RELATIONSHIP_MAX_OUTPUT_TOKENS,
+    ProviderError,
     _relationship_adjudication_system_prompt,
     _relationship_candidate_system_prompt,
     _validate_relationship_response,
@@ -279,6 +280,38 @@ def test_top_level_keyed_provider_envelope_normalizes_to_rows() -> None:
             "confidence": 0.8,
         }
     ]
+
+
+def test_top_level_bare_hex_job_suffixes_normalize_to_full_job_ids() -> None:
+    suffix = "a6a74627d57ffabf1cae"
+
+    normalized = _validate_relationship_response(
+        {
+            suffix: {
+                "decision": "no_relationship",
+                "reason": "The apparent overlap is only topical.",
+                "confidence": 0.8,
+            }
+        },
+        kind="relationship_adjudication",
+    )
+
+    assert normalized["decisions"] == [
+        {
+            "pair_job_id": f"relationship-job-{suffix}",
+            "decision": "no_relationship",
+            "reason": "The apparent overlap is only topical.",
+            "confidence": 0.8,
+        }
+    ]
+
+
+def test_top_level_mixed_or_non_hex_job_suffixes_remain_invalid() -> None:
+    with pytest.raises(ProviderError, match="must contain a decisions list"):
+        _validate_relationship_response(
+            {"a6a74627d57ffabf1cae": {}, "not-a-job": {}},
+            kind="relationship_adjudication",
+        )
 
 
 def test_v6_keyed_provider_envelope_uses_the_mapping_key_as_job_id() -> None:

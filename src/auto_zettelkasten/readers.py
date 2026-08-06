@@ -4616,6 +4616,19 @@ def _validate_relationship_response(
             )
         ):
             values = payload
+        elif (
+            values is None
+            and payload
+            and all(
+                re.fullmatch(r"[0-9a-fA-F]{20}", str(job_id))
+                and isinstance(value, Mapping)
+                for job_id, value in payload.items()
+            )
+        ):
+            values = {
+                f"relationship-job-{job_id}": value
+                for job_id, value in payload.items()
+            }
     if values is None and kind == "relationship_verification":
         values = payload.get("decisions")
     if kind == "relationship_adjudication" and isinstance(values, Mapping):

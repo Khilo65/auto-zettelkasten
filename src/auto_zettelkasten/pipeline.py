@@ -5119,6 +5119,8 @@ def _plan_literature_families(
         == planning_identity
         and incremental_source_ids
     )
+    if not incremental_mode:
+        incremental_source_ids = []
     primary_routes, planning_jobs, secondary_routes = _family_route_inventory(
         lean_rows,
         catalogue_payload,
