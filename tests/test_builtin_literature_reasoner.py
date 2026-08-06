@@ -1273,6 +1273,8 @@ def test_current_mechanical_profile_reuses_unchanged_inspected_source_content(
         }
     )
     save_profile(tmp_path / "02_source_memory" / "profiles", profile)
+    profile_path = next((tmp_path / "02_source_memory" / "profiles").glob("*.yml"))
+    frozen_profile = profile_path.read_bytes()
     replay_reasoner = _RecoveringReasoner({"ITEMA"})
 
     manifest = build_map(
@@ -1286,10 +1288,7 @@ def test_current_mechanical_profile_reuses_unchanged_inspected_source_content(
 
     assert manifest.status == "built"
     assert replay_reasoner.profile_calls == 0
-    reused = _only_profile(tmp_path)
-    assert reused.context["profile_reuse_basis"] == (
-        "unchanged_inspected_source_content"
-    )
+    assert profile_path.read_bytes() == frozen_profile
 
 
 def test_explicit_reasoner_takes_precedence_over_builtin_reader(

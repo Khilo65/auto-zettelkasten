@@ -12517,17 +12517,12 @@ def _build_profiles_for_map(
                             model=request.model,
                             policy=stored_policy,
                         )
-                        existing.note_hash = current_note_hash
                         existing_context["source_set_id"] = str(
                             source_set.get("source_set_id") or ""
                         )
                         existing_context["profile_generation_route"] = stored_route
                         existing_context["reasoner_identity"] = stored_identity
-                        existing_context["profile_reuse_basis"] = (
-                            "unchanged_inspected_source_content"
-                        )
                         existing.context = existing_context
-                        existing.dependency_hash = fingerprint
                         profile = existing
                         checkpoint_hit = 1
                     if (
