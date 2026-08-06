@@ -323,22 +323,34 @@ def estimate_cost(
     collection_key: str = "",
     provider: str = "deepseek",
     model: str = "deepseek-v4-flash",
+    graph_only: bool = False,
     zotero_client: ZoteroClient | None = None,
 ) -> dict[str, Any]:
     """Estimate paid work from a read-only inventory and existing checkpoints."""
 
     if scope not in {"library", "collection", "selected"}:
         raise ValueError("scope must be library, collection, or selected")
-    client = zotero_client or ZoteroLocalClient()
-    items = [dict(row) for row in client.inventory(scope, collection_key or None)]
-    note_rows = all_workspace_note_rows(resolve_workspace(workspace))
+    root = resolve_workspace(workspace)
+    profile_paths = list((root / "02_source_memory" / "profiles").glob("*.yml"))
+    note_rows = [] if graph_only else all_workspace_note_rows(root)
     existing_keys = {
         str(row.get("zotero_item_key") or "").casefold()
         for row in note_rows
         if row.get("zotero_item_key")
     }
-    new_items = [row for row in items if item_key(row).casefold() not in existing_keys]
-    aliases_or_reusable = len(items) - len(new_items)
+    if graph_only:
+        items: list[dict[str, Any]] = []
+        new_items: list[dict[str, Any]] = []
+        aliases_or_reusable = len(profile_paths)
+    else:
+        client = zotero_client or ZoteroLocalClient()
+        items = [
+            dict(row) for row in client.inventory(scope, collection_key or None)
+        ]
+        new_items = [
+            row for row in items if item_key(row).casefold() not in existing_keys
+        ]
+        aliases_or_reusable = len(items) - len(new_items)
     if provider != "deepseek" or model != "deepseek-v4-flash":
         pricing = {"status": "unknown", "reason": "provider_model_pricing_not_built_in"}
         source_costs = {"low_usd": None, "expected_usd": None, "high_usd": None}
@@ -375,23 +387,50 @@ def estimate_cost(
                 DEEPSEEK_V4_FLASH_PRICING["effective_date"]
             ),
         }
-    root = resolve_workspace(workspace)
-    profile_paths = list((root / "02_source_memory" / "profiles").glob("*.yml"))
     analytical_profile_count = len(_analytical_profile_source_ids(note_rows))
     profile_count = analytical_profile_count or len(profile_paths)
+    if graph_only:
+        source_set_counts: dict[str, int] = {}
+        source_set_path = (
+            root
+            / "02_source_memory"
+            / "indexes"
+            / "source_sets"
+            / "source-set-auto-zettelkasten-workspace.yml"
+        )
+        if source_set_path.is_file():
+            with source_set_path.open(encoding="utf-8") as handle:
+                for _ in range(64):
+                    line = handle.readline()
+                    if not line:
+                        break
+                    key, separator, value = line.partition(":")
+                    if separator and key in {
+                        "inventory_count",
+                        "validated_note_count",
+                    }:
+                        try:
+                            source_set_counts[key] = int(value.strip())
+                        except ValueError:
+                            pass
+        profile_count = source_set_counts.get("validated_note_count", profile_count)
+        aliases_or_reusable = source_set_counts.get(
+            "inventory_count", aliases_or_reusable
+        )
     projected_profiles = profile_count + len(new_items)
+    profile_bytes = sum(
+        path.stat().st_size for path in profile_paths if path.is_file()
+    )
     compact_input_tokens = max(
         1,
-        sum(path.stat().st_size for path in profile_paths if path.is_file()) // 4,
+        int(profile_bytes * min(1.0, profile_count / max(1, len(profile_paths))))
+        // 4,
     )
+    note_paths = list((root / "02_source_memory" / "notes").glob("*.md"))
+    note_bytes = sum(path.stat().st_size for path in note_paths if path.is_file())
     note_input_tokens = max(
         1,
-        sum(
-            path.stat().st_size
-            for path in (root / "02_source_memory" / "notes").glob("*.md")
-            if path.is_file()
-        )
-        // 4,
+        int(note_bytes * min(1.0, profile_count / max(1, len(note_paths)))) // 4,
     )
 
     def stage_calls(divisors: tuple[int, int, int]) -> dict[str, int]:
@@ -487,7 +526,7 @@ def estimate_cost(
         "status": "estimated",
         "mode": (
             "graph_only"
-            if projected_profiles and not new_items
+            if graph_only or projected_profiles and not new_items
             else "incremental"
             if existing_keys
             else "bootstrap"
@@ -496,7 +535,7 @@ def estimate_cost(
         "collection_key": collection_key,
         "provider": provider,
         "model": model,
-        "inventory_count": len(items),
+        "inventory_count": aliases_or_reusable if graph_only else len(items),
         "new_source_jobs": len(new_items),
         "reusable_or_existing_records": aliases_or_reusable,
         "source_calls": {

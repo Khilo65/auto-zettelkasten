@@ -81,6 +81,36 @@ def test_standalone_literature_map_forwards_provider_concurrency(
     assert captured["provider_concurrency"] == 17
 
 
+def test_build_map_cli_prints_compact_receipt(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    initialize_workspace(tmp_path)
+
+    class Manifest:
+        def to_dict(self):
+            return {
+                "status": "built",
+                "workspace": str(tmp_path),
+                "run_id": "compact",
+                "artifacts": [{"path": "a"}, {"path": "b"}],
+                "metadata": {
+                    "literature_map": {
+                        "cluster_count": 2,
+                        "large_payload": {"rows": list(range(100))},
+                    }
+                },
+            }
+
+    monkeypatch.setattr("auto_zettelkasten.cli.build_map", lambda *_a, **_k: Manifest())
+
+    assert main(["build-map", "--workspace", str(tmp_path), "--no-synthesis"]) == 0
+    result = json.loads(capsys.readouterr().out)
+
+    assert "artifacts" not in result
+    assert result["artifact_count"] == 2
+    assert result["metadata"] == {"literature_map": {"cluster_count": 2}}
+
+
 def test_run_ids_cannot_escape_workspace_state(tmp_path: Path, sample_items) -> None:
     workspace = tmp_path / "workspace"
     with pytest.raises(ValueError, match="opaque"):

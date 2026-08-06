@@ -162,6 +162,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     estimate_parser.add_argument("--collection", default="")
     estimate_parser.add_argument(
+        "--graph-only",
+        action="store_true",
+        help="Estimate graph work from committed notes without inventorying live Zotero.",
+    )
+    estimate_parser.add_argument(
         "--provider", choices=("deepseek", "openrouter", "gemini", "ollama"), default=None
     )
     estimate_parser.add_argument("--model", default=None)
@@ -326,6 +331,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 collection_key=args.collection,
                 provider=provider,
                 model=model,
+                graph_only=args.graph_only,
             )
         elif args.command == "build-map":
             config = load_config(args.workspace)
@@ -353,6 +359,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 retry_terminal_failures=args.retry_terminal_literature,
             )
             result = manifest.to_dict()
+            result["artifact_count"] = len(result.pop("artifacts", []) or [])
             metadata = result.get("metadata", {})
             literature = (
                 metadata.get("literature_map", {})

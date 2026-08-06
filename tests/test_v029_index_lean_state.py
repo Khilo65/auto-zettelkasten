@@ -203,15 +203,30 @@ def test_cost_estimate_is_local_and_records_pricing_provenance(tmp_path: Path) -
 def test_cost_estimate_prices_graph_when_every_source_is_reusable(tmp_path: Path) -> None:
     class Zotero:
         def inventory(self, scope: str, collection_key: str | None):
-            return []
+            raise AssertionError("graph-only estimate must not inventory live Zotero")
 
     profile_dir = tmp_path / "02_source_memory" / "profiles"
-    for index in range(25):
+    for index in range(250):
         write_yaml(profile_dir / f"source-{index}.yml", {"source_id": f"source-{index}"})
+    write_yaml(
+        tmp_path
+        / "02_source_memory"
+        / "indexes"
+        / "source_sets"
+        / "source-set-auto-zettelkasten-workspace.yml",
+        {"inventory_count": 300, "validated_note_count": 10},
+    )
 
-    result = estimate_cost(tmp_path, zotero_client=Zotero())  # type: ignore[arg-type]
+    result = estimate_cost(
+        tmp_path,
+        graph_only=True,
+        zotero_client=Zotero(),  # type: ignore[arg-type]
+    )
 
     assert result["new_source_jobs"] == 0
+    assert result["mode"] == "graph_only"
+    assert result["inventory_count"] == 300
+    assert result["graph_calls"]["expected"] == 6
     assert result["source_cost_usd"]["expected_usd"] == 0
     assert result["graph_calls"]["expected"] > 0
     assert result["graph_cost_usd"]["expected_usd"] > 0
