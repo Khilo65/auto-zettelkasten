@@ -4871,6 +4871,11 @@ def _cluster_membership_relations(
     relations = []
     for cluster in clusters:
         cluster_id = str(cluster.get("cluster_id") or "")
+        roles = {
+            str(row.get("source_id") or ""): str(row.get("role") or "context")
+            for row in cluster.get("source_roles", []) or []
+            if isinstance(row, Mapping) and row.get("source_id")
+        }
         source_ids = (
             cluster.get("source_ids")
             or cluster.get("core_source_ids")
@@ -4891,6 +4896,7 @@ def _cluster_membership_relations(
                         "target_kind": "cluster",
                         "target_cluster_id": cluster_id,
                         "relation_type": "cluster_member",
+                        "cluster_role": roles.get(source_id, "context"),
                         "provenance": "admitted_cluster_registry",
                         "active": True,
                     },
@@ -4905,6 +4911,7 @@ def _cluster_membership_relations(
                         "target_source_id": source_id,
                         "target_note_id": note_id,
                         "relation_type": "has_member",
+                        "cluster_role": roles.get(source_id, "context"),
                         "provenance": "admitted_cluster_registry",
                         "active": True,
                     },
@@ -6827,6 +6834,28 @@ def _run_relationship_reasoning(
         prior_stage_complete = bool(
             prior_state.get("relationship_stage_complete", True)
         )
+        prior_discovery_jobs = list(
+            prior_state.get("relationship_discovery_jobs", []) or []
+        )
+        prior_incomplete_jobs = list(
+            prior_state.get("relationship_discovery_incomplete_jobs", []) or []
+        )
+        prior_discovery_status = str(
+            prior_state.get("relationship_discovery_status") or "complete"
+        )
+        if (
+            shared_plan_active
+            and prior_stage_complete
+            and not prior_incomplete_jobs
+            and prior_discovery_jobs
+            and all(
+                isinstance(row, Mapping)
+                and row.get("status")
+                in {"completed", "insufficient_analytical_endpoints"}
+                for row in prior_discovery_jobs
+            )
+        ):
+            prior_discovery_status = "complete"
         return {
             "semantic_noop": True,
             "accepted": [],
@@ -6846,12 +6875,9 @@ def _run_relationship_reasoning(
                 prior_state.get("relationship_retry_on_resume", False)
             ),
             "relationship_discovery_status": str(
-                prior_state.get("relationship_discovery_status") or "complete"
+                prior_discovery_status
             ),
-            "relationship_discovery_incomplete_jobs": list(
-                prior_state.get("relationship_discovery_incomplete_jobs", [])
-                or []
-            ),
+            "relationship_discovery_incomplete_jobs": prior_incomplete_jobs,
             "provider_batch_count": 0,
         }
     mandatory_basis: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
@@ -7445,7 +7471,7 @@ def _run_relationship_reasoning(
     offered_bridge_ids = {
         str(card.get("shard_id") or "") for card in bridge_cards
     }
-    if can_discover and bridge_capacity:
+    if can_discover and bridge_capacity and not shared_plan_active:
         if callable(bridge_selector) and bridge_cards:
             try:
                 routed_rows: list[dict[str, Any]] = []
@@ -9766,8 +9792,16 @@ def _run_relationship_reasoning(
             for row in discovery_parked
         )
     )
+    unaccounted_pair_job_ids = sorted(
+        job.pair_job_id for job in jobs if job.pair_job_id not in accounted_job_ids
+    )
+    durable_pair_accounting = not unaccounted_pair_job_ids
+    if shared_plan_active and discovery_completed and not durable_pair_accounting:
+        discovery_completed = False
+        discovery_status = "partial" if discovery_usable else "failed"
     selection_settled = bool(
         not relationship_retry_on_resume
+        and durable_pair_accounting
         and (
             discovery_completed
             or discovery_terminal
@@ -9776,7 +9810,7 @@ def _run_relationship_reasoning(
     )
     relationship_stage_complete = bool(
         discovery_usable
-        and len(accounted_job_ids) == len(jobs)
+        and durable_pair_accounting
         and not relationship_retry_on_resume
     )
     disposition_priority = {
@@ -9885,6 +9919,7 @@ def _run_relationship_reasoning(
                 if row.get("status")
                 not in {"completed", "insufficient_analytical_endpoints"}
             }
+            | set(unaccounted_pair_job_ids)
         ),
         "provider_batch_count": provider_batch_count,
         "candidate_dispositions": [
@@ -10903,24 +10938,33 @@ def _project_atomic_graph(
         tag = str(assignment.get("canonical_tag") or "")
         if note_id and tag and tag not in subject_tags_by_note[note_id]:
             subject_tags_by_note[note_id].append(tag)
+    note_id_by_source = {
+        str(row.get("source_id") or ""): str(row.get("note_id") or "")
+        for row in note_rows
+        if row.get("source_id") and row.get("note_id")
+    }
     cluster_by_id = {
         str(row.get("cluster_id") or ""): dict(row)
         for row in clusters
         if row.get("cluster_id")
     }
     clusters_by_note: dict[str, list[str]] = defaultdict(list)
+    cluster_roles_by_note: dict[str, dict[str, str]] = defaultdict(dict)
     for cluster_id, cluster in cluster_by_id.items():
         for note_id in cluster.get("note_ids", []) or []:
             clusters_by_note[str(note_id)].append(cluster_id)
+        for role in cluster.get("source_roles", []) or []:
+            if not isinstance(role, Mapping):
+                continue
+            note_id = note_id_by_source.get(str(role.get("source_id") or ""))
+            if note_id:
+                cluster_roles_by_note[note_id][cluster_id] = str(
+                    role.get("role") or "context"
+                )
     gap_by_id = {
         str(row.get("gap_id") or ""): dict(row)
         for row in gaps
         if row.get("gap_id")
-    }
-    note_id_by_source = {
-        str(row.get("source_id") or ""): str(row.get("note_id") or "")
-        for row in note_rows
-        if row.get("source_id") and row.get("note_id")
     }
     gaps_by_note: dict[str, list[dict[str, str]]] = defaultdict(list)
 
@@ -10990,6 +11034,12 @@ def _project_atomic_graph(
         front = current["frontmatter"]
         if note_id in explicit_scope:
             cluster_ids = sorted(clusters_by_note.get(note_id, []))
+            cluster_roles = {
+                cluster_id: cluster_roles_by_note[note_id].get(
+                    cluster_id, "context"
+                )
+                for cluster_id in cluster_ids
+            }
             cluster_wikilinks = {
                 cluster_id: (
                     f"[[{cluster_note_stem(cluster_by_id[cluster_id])}|"
@@ -11029,6 +11079,15 @@ def _project_atomic_graph(
                 )
                 for index, cluster_id in enumerate(cluster_ids)
             }
+            stored_roles = list(front.get("cluster_roles", []) or [])
+            cluster_roles = {
+                cluster_id: (
+                    str(stored_roles[index])
+                    if index < len(stored_roles)
+                    else "context"
+                )
+                for index, cluster_id in enumerate(cluster_ids)
+            }
             note_gap_links = _existing_gap_projection(
                 front, str(current.get("body") or "")
             )
@@ -11057,6 +11116,10 @@ def _project_atomic_graph(
                     for cluster_id in cluster_ids
                     if cluster_id in cluster_wikilinks
                 ],
+                "cluster_roles": [
+                    cluster_roles.get(cluster_id, "context")
+                    for cluster_id in cluster_ids
+                ],
                 "gaps": gap_ids,
                 "gap_links": [
                     gap_wikilinks[gap_id]
@@ -11072,6 +11135,7 @@ def _project_atomic_graph(
                 cluster_ids,
                 note_gap_links,
                 cluster_wikilinks,
+                cluster_roles,
             )
         except ValueError as exc:
             _park_projection_failure(

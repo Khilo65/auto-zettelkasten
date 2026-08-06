@@ -389,8 +389,9 @@ def estimate_cost(
         }
     analytical_profile_count = len(_analytical_profile_source_ids(note_rows))
     profile_count = analytical_profile_count or len(profile_paths)
+    source_set_counts: dict[str, int] = {}
+    activation: Mapping[str, Any] = {}
     if graph_only:
-        source_set_counts: dict[str, int] = {}
         source_set_path = (
             root
             / "02_source_memory"
@@ -413,77 +414,148 @@ def estimate_cost(
                             source_set_counts[key] = int(value.strip())
                         except ValueError:
                             pass
-        profile_count = source_set_counts.get("validated_note_count", profile_count)
+        validated_count = source_set_counts.get("validated_note_count", 0)
+        if validated_count > 0:
+            profile_count = validated_count
         aliases_or_reusable = source_set_counts.get(
             "inventory_count", aliases_or_reusable
         )
+        activation = read_yaml(
+            root / "evaluation" / "v029-incremental-activation.yml", {}
+        ) or {}
+        if bool(activation.get("activated")):
+            profile_count = max(profile_count, len(profile_paths))
     projected_profiles = profile_count + len(new_items)
-    profile_bytes = sum(
-        path.stat().st_size for path in profile_paths if path.is_file()
+    family_plan = read_yaml(
+        root / "02_source_memory" / "indexes" / "literature_family_plan.yml",
+        {},
+    ) or {}
+    incremental_profile_count = 0
+    activation_count = int(activation.get("source_count", 0))
+    if 0 < activation_count < projected_profiles:
+        incremental_profile_count = activation_count
+    else:
+        prior_profile_count = len(family_plan.get("lean_source_hashes", {}) or {})
+        if 0 < prior_profile_count < projected_profiles:
+            incremental_profile_count = projected_profiles - prior_profile_count
+    planning_profile_count = incremental_profile_count or projected_profiles
+    graph_profile_counts = (
+        {
+            "low": min(projected_profiles, planning_profile_count * 3),
+            "expected": min(projected_profiles, planning_profile_count * 5),
+            "high": projected_profiles,
+        }
+        if incremental_profile_count
+        else {bound: projected_profiles for bound in ("low", "expected", "high")}
     )
+    graph_profile_count = graph_profile_counts["expected"]
+    catalogue_path = (
+        root / "02_source_memory" / "indexes" / "source_catalogue.yml"
+    )
+    profile_bytes = (
+        catalogue_path.stat().st_size
+        if catalogue_path.is_file()
+        else sum(path.stat().st_size for path in profile_paths if path.is_file())
+    )
+    corpus_compact_tokens = max(1, profile_bytes // 4)
     compact_input_tokens = max(
-        1,
-        int(profile_bytes * min(1.0, profile_count / max(1, len(profile_paths))))
-        // 4,
+        planning_profile_count * 1_200,
+        int(
+            corpus_compact_tokens
+            * planning_profile_count
+            / max(1, projected_profiles)
+        ),
     )
     note_paths = list((root / "02_source_memory" / "notes").glob("*.md"))
     note_bytes = sum(path.stat().st_size for path in note_paths if path.is_file())
-    note_input_tokens = max(
-        1,
-        int(note_bytes * min(1.0, profile_count / max(1, len(note_paths)))) // 4,
-    )
+    note_input_tokens = {
+        bound: max(
+            count * 2_500,
+            int((note_bytes // 4) * count / max(1, projected_profiles)),
+        )
+        for bound, count in graph_profile_counts.items()
+    }
 
-    def stage_calls(divisors: tuple[int, int, int]) -> dict[str, int]:
+    def stage_calls(
+        count: int | Mapping[str, int], divisors: tuple[int, int, int]
+    ) -> dict[str, int]:
         return {
             bound: (
                 0
-                if projected_profiles < 2
-                else max(1, (projected_profiles + divisor - 1) // divisor)
+                if (bound_count := int(count[bound]) if isinstance(count, Mapping) else count) < 2
+                else max(1, (bound_count + divisor - 1) // divisor)
             )
             for bound, divisor in zip(
                 ("low", "expected", "high"), divisors, strict=True
             )
         }
 
-    graph_call_components = {
-        "family_planning": stage_calls((500, 250, 125)),
-        "family_reconciliation": stage_calls((4_000, 2_000, 1_000)),
-        "bridge_routing": stage_calls((2_000, 1_000, 500)),
-        "candidate_discovery": stage_calls((1_000, 500, 200)),
-        "relationship_adjudication": stage_calls((400, 200, 48)),
-        "cluster_synthesis": stage_calls((160, 80, 40)),
-    }
-    graph_calls = {
-        bound: sum(int(stage[bound]) for stage in graph_call_components.values())
+    candidate_rates = {"low": 0.8, "expected": 1.7, "high": 2.5}
+    candidate_packet_sizes = {"low": 15, "expected": 12, "high": 10}
+    relationship_calls = {
+        bound: (
+            0
+            if graph_profile_counts[bound] < 2
+            else max(
+                1,
+                (
+                    int(graph_profile_counts[bound] * candidate_rates[bound])
+                    + candidate_packet_sizes[bound]
+                    - 1
+                )
+                // candidate_packet_sizes[bound],
+            )
+        )
         for bound in ("low", "expected", "high")
     }
+    cluster_calls = {
+        bound: (
+            0
+            if graph_profile_counts[bound] < 2
+            else max(1, int(graph_profile_counts[bound] * rate + 0.999))
+        )
+        for bound, rate in {"low": 0.03, "expected": 0.05, "high": 0.07}.items()
+    }
+    graph_call_components = {
+        "family_planning": stage_calls(
+            planning_profile_count, (180, 125, 80)
+        ),
+        "direct_discovery": stage_calls(graph_profile_counts, (300, 120, 70)),
+        "complementary_discovery": stage_calls(
+            graph_profile_counts, (40, 25, 18)
+        ),
+        "relationship_adjudication": relationship_calls,
+        "cluster_synthesis": cluster_calls,
+    }
     input_multipliers = {
-        "family_planning": (1.0, 1.4, 2.0),
-        "family_reconciliation": (0.02, 0.1, 0.25),
-        "bridge_routing": (0.05, 0.2, 0.5),
-        "candidate_discovery": (0.15, 0.5, 1.0),
-        "relationship_adjudication": (0.05, 0.2, 0.75),
-        "cluster_synthesis": (0.25, 0.75, 1.5),
+        "family_planning": (0.8, 2.0, 4.0),
+        "direct_discovery": (0.25, 1.0, 2.0),
+        "complementary_discovery": (1.5, 4.0, 8.0),
+        "relationship_adjudication": (1.5, 4.0, 6.0),
+        "cluster_synthesis": (0.5, 1.5, 3.0),
     }
     output_tokens_per_call = {
-        "family_planning": (2_000, 5_000, 12_000),
-        "family_reconciliation": (2_000, 5_000, 12_000),
-        "bridge_routing": (1_000, 3_000, 8_000),
-        "candidate_discovery": (2_000, 8_000, 20_000),
-        "relationship_adjudication": (3_000, 10_000, 24_000),
-        "cluster_synthesis": (4_000, 14_000, 32_000),
+        "family_planning": (3_000, 6_000, 12_000),
+        "direct_discovery": (3_000, 8_000, 16_000),
+        "complementary_discovery": (5_000, 12_000, 24_000),
+        "relationship_adjudication": (10_000, 30_000, 40_000),
+        "cluster_synthesis": (12_000, 30_000, 50_000),
     }
     full_note_stages = {"relationship_adjudication", "cluster_synthesis"}
     bounds = ("low", "expected", "high")
     graph_stage_estimates: dict[str, dict[str, dict[str, int | float | None]]] = {}
     for stage, calls_by_bound in graph_call_components.items():
-        base_input = note_input_tokens if stage in full_note_stages else compact_input_tokens
         graph_stage_estimates[stage] = {}
         for index, bound in enumerate(bounds):
+            base_input = (
+                note_input_tokens[bound]
+                if stage in full_note_stages
+                else compact_input_tokens
+            )
             calls = calls_by_bound[bound]
             input_tokens = int(base_input * input_multipliers[stage][index]) if calls else 0
             output_tokens = calls * output_tokens_per_call[stage][index]
-            retries = 0 if bound != "high" else max(1, calls // 20) if calls else 0
+            retries = 0 if bound != "high" else max(1, calls // 15) if calls else 0
             usd = None
             if provider == "deepseek" and model == "deepseek-v4-flash":
                 usd = round(
@@ -501,6 +573,13 @@ def estimate_cost(
                 "retry_attempts": retries,
                 "usd": usd,
             }
+    graph_calls = {
+        bound: sum(
+            int(stage[bound]["calls"]) + int(stage[bound]["retry_attempts"])
+            for stage in graph_stage_estimates.values()
+        )
+        for bound in bounds
+    }
     if provider != "deepseek" or model != "deepseek-v4-flash":
         graph_costs = {"low_usd": None, "expected_usd": None, "high_usd": None}
     else:
@@ -550,8 +629,16 @@ def estimate_cost(
             "compact_profile_tokens": compact_input_tokens,
             "complete_note_tokens": note_input_tokens,
             "token_estimator": "measured_utf8_bytes_divided_by_four",
-            "call_basis": "profile_count_stage_envelopes",
-            "confidence": "low_until_first_v029_usage_reconciliation",
+            "call_basis": "packed_v029_graph_stage_envelopes",
+            "planning_profile_count": planning_profile_count,
+            "graph_neighborhood_profile_count": graph_profile_count,
+            "graph_neighborhood_profile_counts": graph_profile_counts,
+            "incremental_profile_count": incremental_profile_count,
+            "candidate_pairs": {
+                bound: int(graph_profile_counts[bound] * candidate_rates[bound])
+                for bound in bounds
+            },
+            "confidence": "bounded_from_v029_full_note_packet_usage",
             "cache_assumption": "all_input_priced_as_cache_miss",
         },
         "source_cost_usd": source_costs,

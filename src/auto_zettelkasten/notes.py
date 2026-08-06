@@ -70,6 +70,7 @@ NON_SOURCE_FRONTMATTER_FIELDS = frozenset(
     {
         "artifact_schema_version",
         "cluster_links",
+        "cluster_roles",
         "clusters",
         "created_at",
         "engine_version",
@@ -855,6 +856,7 @@ def update_note_graph(
     cluster_ids: list[str],
     gap_links: Sequence[Mapping[str, Any]] = (),
     cluster_wikilinks: Mapping[str, str] | None = None,
+    cluster_roles: Mapping[str, str] | None = None,
 ) -> bool:
     text = path.read_text(encoding="utf-8")
     note = read_note(path)
@@ -875,10 +877,12 @@ def update_note_graph(
             f"- {link['relation_type']}: [[{link['target_stem']}]]{suffix}{identity}"
         )
     cluster_wikilinks = cluster_wikilinks or {}
+    cluster_roles = cluster_roles or {}
     cluster_lines: list[str] = []
     for cluster_id in cluster_ids:
         cluster_lines.append(
-            f"- member of: {cluster_wikilinks.get(cluster_id, f'[[{cluster_id}]]')}"
+            f"- member of ({cluster_roles.get(cluster_id, 'context')}): "
+            f"{cluster_wikilinks.get(cluster_id, f'[[{cluster_id}]]')}"
         )
     gap_lines: list[str] = []
     for gap_link in gap_links:

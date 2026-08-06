@@ -233,12 +233,14 @@ def test_streamlined_cluster_rebinds_locator_only_finding_evidence() -> None:
     assert normalized["lines_of_inquiry"][0]["study_findings"][0][
         "evidence"
     ] == [{"source_id": "A", "locator": "p. 10"}]
-    assert validated["status"] == "reasoned"
-    assert validated["quality_errors"] == []
-    assert validated["quality_warnings"] == [
+    assert validated["status"] == "partial"
+    assert validated["quality_errors"] == ["cluster_requires_two_retained_members"]
+    assert validated["retained_member_ids"] == ["A"]
+    assert set(validated["quality_warnings"]) == {
+        "retained_member_without_specific_finding_removed",
         "study_finding_evidence_unresolved",
         "study_finding_requires_source_owned_evidence",
-    ]
+    }
     assert validated["source_contributions"][0]["evidence"][0][
         "evidence_anchor_id"
     ] == "anchor-A"

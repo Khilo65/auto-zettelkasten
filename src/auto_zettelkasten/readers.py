@@ -2128,12 +2128,12 @@ def _debate_system_prompt() -> str:
 def _cluster_synthesis_system_prompt() -> str:
     return (
         "You are the full-note cluster writer for Auto-Zettelkasten cluster "
-        "synthesis prompt v34 and contract streamlined-full-note-v2. Read every supplied atomic_note_markdown before "
+        "synthesis prompt v35 and contract streamlined-full-note-v2. Read every supplied atomic_note_markdown before "
         "drafting. Copy cluster_id exactly from context.cluster.cluster_id. Return "
         "exactly one JSON object with cluster_id, status, title, "
         "organizing_mode, organizing_problem, optional guiding_question, optional "
         "central_tension, bottom_line, lines_of_inquiry, differences, limits, "
-        "related_clusters, retained_member_ids, optional dropped_members, optional "
+        "related_clusters, retained_member_ids, member_roles, optional dropped_members, optional "
         "material_exclusions, acquisition_candidate_dispositions, optional "
         "split_proposals, and optional missing_member_ids. Status is accepted or "
         "rejected; it is the writer decision, not a copied planning or registry "
@@ -2146,8 +2146,10 @@ def _cluster_synthesis_system_prompt() -> str:
         "qualifies, contrasts, extends, applies, or contextualizes. Evidence uses "
         "an array of objects; every object copies source_id, evidence_anchor_id, "
         "and locator exactly from a supplied source-owned anchor. Every retained member must "
-        "have at least one specific study finding; preserve a supplied core, context, or bridge role when it remains accurate, "
-        "changing it only when the complete notes justify the correction. Drop a source rather than retain "
+        "have at least one specific study finding. member_roles must map every retained source_id to core, context, or bridge: "
+        "core directly answers the organizing problem; context supplies supporting, boundary, methodological, practitioner, "
+        "or background evidence; bridge materially connects another literature or mechanism. Preserve a supplied role when it "
+        "remains accurate, changing it only when the complete notes justify the correction. Drop a source rather than retain "
         "decorative context. Any member may contribute regardless of a prior core, "
         "context, or bridge label. A partial-document member may be retained when its "
         "recovered text supplies a specific theoretical, methodological, contextual, "
@@ -4523,6 +4525,17 @@ def _validate_streamlined_cluster_response(
         limits = []
     if not isinstance(limits, list):
         raise ProviderError("streamlined cluster response limits must be a list")
+    member_roles = payload.get("member_roles", {})
+    if isinstance(member_roles, Mapping):
+        member_roles = {
+            str(source_id).strip(): str(role).strip().casefold()
+            for source_id, role in member_roles.items()
+            if str(source_id).strip()
+        }
+    elif isinstance(member_roles, list):
+        member_roles = [
+            dict(row) for row in member_roles if isinstance(row, Mapping)
+        ]
     return {
         **result,
         "lines_of_inquiry": normalized_lines,
@@ -4536,6 +4549,7 @@ def _validate_streamlined_cluster_response(
         "retained_member_ids": [
             str(value).strip() for value in retained if str(value).strip()
         ],
+        "member_roles": member_roles,
         "dropped_members": (
             dropped_members
             if isinstance(dropped_members, list)

@@ -85,7 +85,7 @@ LITERATURE_ALGORITHM_VERSION = "37"
 LITERATURE_FAMILY_PLAN_PROMPT_VERSION = "9"
 CLUSTER_PLAN_PROMPT_VERSION = "5"
 CLUSTER_PROPOSAL_PROMPT_VERSION = "17"
-CLUSTER_SYNTHESIS_PROMPT_VERSION = "34"
+CLUSTER_SYNTHESIS_PROMPT_VERSION = "35"
 GAP_REASONING_PROMPT_VERSION = "12"
 ANCHOR_ALGORITHM_VERSION = "3"
 SUPPORT_ENVELOPE_VERSION = "2"
@@ -5703,6 +5703,63 @@ def _proposal_source_roles(proposal: Mapping[str, Any]) -> dict[str, str]:
     }
 
 
+def _normalized_cluster_member_role(value: Any) -> str:
+    role = str(value or "").strip().casefold()
+    if role == "core":
+        return "core"
+    if role == "bridge":
+        return "bridge"
+    return "context"
+
+
+def _cluster_writer_member_roles(
+    response: Mapping[str, Any],
+    cluster: Mapping[str, Any],
+    retained: set[str],
+    warnings: list[str],
+) -> dict[str, str]:
+    """Keep writer roles when valid; otherwise preserve normalized planner intent."""
+
+    canonical = _proposal_source_roles(cluster)
+    candidate = {
+        str(source_id): _normalized_cluster_member_role(role)
+        for source_id, role in _as_mapping(cluster.get("candidate_roles")).items()
+    }
+    fallback = (
+        canonical
+        if str(response.get("cluster_contract") or "").endswith("-v1")
+        else {**canonical, **candidate}
+    )
+    supplied = response.get("member_roles")
+    rows: dict[str, Any] = {}
+    if isinstance(supplied, Mapping):
+        rows = {str(source_id): role for source_id, role in supplied.items()}
+    elif isinstance(supplied, Sequence) and not isinstance(
+        supplied, (str, bytes, bytearray)
+    ):
+        rows = {
+            str(row.get("source_id") or ""): row.get("role")
+            for row in supplied
+            if isinstance(row, Mapping) and row.get("source_id")
+        }
+    elif supplied not in (None, ""):
+        warnings.append("malformed_member_roles_fallback")
+    if set(rows) - retained:
+        warnings.append("unknown_member_role_ignored")
+    result: dict[str, str] = {}
+    used_fallback = False
+    for source_id in sorted(retained):
+        role = str(rows.get(source_id) or "").strip().casefold()
+        if role in {"core", "context", "bridge"}:
+            result[source_id] = role
+        else:
+            result[source_id] = fallback.get(source_id, "context")
+            used_fallback = True
+    if used_fallback and (candidate or bool(rows)):
+        warnings.append("member_role_fallback_applied")
+    return result
+
+
 def _family_relation_semantic_assessment(
     proposal: Mapping[str, Any],
     relation_type: str,
@@ -10679,7 +10736,9 @@ def validate_streamlined_cluster_synthesis(
     claims_by_source = {
         str(profile.get("source_id") or ""): [
             dict(anchor)
-            for anchor in profile.get("claims", []) or []
+            for anchor in (
+                profile.get("claims", []) or profile.get("evidence_anchors", []) or []
+            )
             if isinstance(anchor, Mapping)
         ]
         for profile in profiles
@@ -10849,7 +10908,7 @@ def validate_streamlined_cluster_synthesis(
                 valid_evidence.append(resolved)
             if not valid_evidence:
                 warnings.append("study_finding_requires_source_owned_evidence")
-            if finding_complete:
+            if finding_complete and valid_evidence:
                 finding_source_ids.add(source_id)
             line_evidence.extend(valid_evidence)
             supporting_evidence.extend(valid_evidence)
@@ -10899,8 +10958,28 @@ def validate_streamlined_cluster_synthesis(
         retained -= missing
     if len(retained) < 2:
         errors.append("cluster_requires_two_retained_members")
+    member_roles = _cluster_writer_member_roles(
+        response, cluster, retained, warnings
+    )
     source_contributions = [
-        row for row in source_contributions if row["source_id"] in retained
+        {
+            **row,
+            "cluster_role": member_roles[row["source_id"]],
+            "contribution_kind": (
+                "bridge_evidence"
+                if member_roles[row["source_id"]] == "bridge"
+                else "conceptual_context"
+                if member_roles[row["source_id"]] == "context"
+                else "unique_cluster_relevant_finding"
+            ),
+            "comparison_status": (
+                "single_source"
+                if member_roles[row["source_id"]] == "core"
+                else "context_only"
+            ),
+        }
+        for row in source_contributions
+        if row["source_id"] in retained
     ]
     supporting_evidence = [
         row
@@ -11167,6 +11246,11 @@ def validate_streamlined_cluster_synthesis(
     return {
         **dict(response),
         "retained_member_ids": sorted(retained),
+        "member_roles": member_roles,
+        "source_roles": [
+            {"source_id": source_id, "role": member_roles[source_id]}
+            for source_id in sorted(member_roles)
+        ],
         "dropped_members": returned_drops,
         "material_exclusions": material_exclusions,
         "important_cited_works_not_yet_mapped": important_cited_works,
@@ -16335,9 +16419,11 @@ def _navigation_profile_rows(
             if value not in (None, "", [], {}):
                 row[field] = value
         if note:
-            row.setdefault("zotero_item_key", note.get("zotero_item_key", ""))
-            row.setdefault("note_path", note.get("note_path", ""))
-            row.setdefault("title", note.get("title", ""))
+            for field in ("zotero_item_key", "note_id", "note_path"):
+                if note.get(field):
+                    row[field] = note[field]
+            if not row.get("title") and note.get("title"):
+                row["title"] = note["title"]
         hydrated.append(row)
     return hydrated
 
@@ -20267,6 +20353,7 @@ def build_literature_report(
     def apply_writer_membership(
         cluster: dict[str, Any],
         retained_ids: Sequence[str],
+        member_roles: Mapping[str, Any] | None = None,
     ) -> None:
         nonlocal writer_membership_changed
         retained = {
@@ -20280,7 +20367,11 @@ def build_literature_report(
         ordered = sorted(retained)
         prior_roles = _proposal_source_roles(cluster)
         roles = {
-            source_id: prior_roles.get(source_id, "core")
+            source_id: _normalized_cluster_member_role(
+                _as_mapping(member_roles).get(
+                    source_id, prior_roles.get(source_id, "context")
+                )
+            )
             for source_id in ordered
         }
         cluster["source_ids"] = ordered
@@ -20342,11 +20433,15 @@ def build_literature_report(
             {
                 "semantic_identity": cluster.get("semantic_identity", ""),
                 "source_ids": ordered,
+                "source_roles": roles,
                 "cluster_writer_contract": "streamlined-full-note-v2",
             }
         )
         removed = sorted(prior_ids - retained)
-        if removed:
+        if removed or any(
+            prior_roles.get(source_id, "context") != roles[source_id]
+            for source_id in ordered
+        ):
             writer_membership_changed = True
 
     reverted_refresh = False
@@ -20786,7 +20881,11 @@ def build_literature_report(
                     validated_synthesis.get("retained_member_ids", []) or []
                 )
                 if retained_ids:
-                    apply_writer_membership(cluster, retained_ids)
+                    apply_writer_membership(
+                        cluster,
+                        retained_ids,
+                        _as_mapping(validated_synthesis.get("member_roles")),
+                    )
             if uses_global_cluster_plan and not synthesis_response:
                 validated_synthesis["status"] = "partial"
                 validated_synthesis["parked_for_review"] = True
@@ -21957,12 +22056,10 @@ def _mark_cluster_refresh_pending(
 
 def _obsidian_note_link(row: Mapping[str, Any]) -> str:
     note_path = str(row.get("note_path") or "")
-    target = (
-        Path(note_path).stem
-        if note_path
-        else str(row.get("note_id") or row.get("source_id") or "")
-    )
     title = str(row.get("title") or "").replace("|", "-").replace("]", "")
+    if not note_path:
+        return title or str(row.get("note_id") or row.get("source_id") or "")
+    target = Path(note_path).stem
     return f"[[{target}|{title}]]" if title and title != target else f"[[{target}]]"
 
 

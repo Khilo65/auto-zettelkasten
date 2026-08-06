@@ -56,7 +56,7 @@ def test_initialize_creates_compatible_file_first_workspace(tmp_path: Path) -> N
     workspace = tmp_path / "workspace"
     manifest = initialize(workspace)
     assert manifest.status == "initialized"
-    assert manifest.engine_version == "0.29.0"
+    assert manifest.engine_version == "0.29.1"
     assert manifest.artifact_schema_version == "1.20"
     for relative in (
         "01_custody",
@@ -70,7 +70,7 @@ def test_initialize_creates_compatible_file_first_workspace(tmp_path: Path) -> N
     config_text = (workspace / "auto-zettelkasten.yml").read_text()
     config = read_yaml(workspace / "auto-zettelkasten.yml")
     assert "API_KEY" not in config_text
-    assert config["engine_version"] == "0.29.0"
+    assert config["engine_version"] == "0.29.1"
     assert config["artifact_schema_version"] == "1.20"
     assert config["privacy"]["allow_cloud"] is False
     assert config["prompt_version"] == "11"
