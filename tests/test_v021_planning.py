@@ -8,6 +8,7 @@ from auto_zettelkasten.indexes import lean_discovery_projection
 from auto_zettelkasten.literature import _validate_literature_family_plan_response
 from auto_zettelkasten.models import LiteratureMapRequest
 from auto_zettelkasten.pipeline import (
+    _merge_literature_family_plans,
     _plan_literature_families,
     _validate_literature_family_plan,
 )
@@ -320,7 +321,13 @@ def test_initial_family_plan_adds_coverage_completion_family(
                         "organizing_problem": "How mediation operates",
                         "source_ids": ["A", "B"],
                         "proposed_roles": {"A": "core", "B": "supporting"},
-                    }
+                    },
+                    {
+                        "family_id": "singleton-c",
+                        "label": "Singleton C",
+                        "organizing_problem": "A provisional singleton",
+                        "source_ids": ["C"],
+                    },
                 ],
                 "discovery_jobs": [
                     {
@@ -331,6 +338,13 @@ def test_initial_family_plan_adds_coverage_completion_family(
                     }
                 ],
                 "neighboring_families": [],
+                "source_dispositions": [
+                    {
+                        "source_id": "C",
+                        "disposition": "assigned",
+                        "family_ids": ["singleton-c"],
+                    }
+                ],
             }
 
     catalogue_path = tmp_path / "02_source_memory" / "indexes" / "catalogue.yml"
@@ -423,6 +437,153 @@ def test_family_plan_discards_placeholder_requested_pair() -> None:
         row["requested_collection_pair"] == ["C1", "C2"]
         for row in result["discovery_jobs"]
     )
+
+
+def test_singleton_family_assignment_remains_pending_for_coverage() -> None:
+    response = {
+        "literature_families": [
+            {
+                "family_id": "singleton",
+                "label": "Singleton",
+                "source_ids": ["A"],
+            },
+            {
+                "family_id": "admitted",
+                "label": "Admitted",
+                "source_ids": ["B", "C"],
+            },
+        ],
+        "discovery_jobs": [],
+        "neighboring_families": [],
+        "source_dispositions": [
+            {
+                "source_id": "A",
+                "disposition": "assigned",
+                "family_ids": ["singleton"],
+            }
+        ],
+    }
+    result = _validate_literature_family_plan(
+        response,
+        lean_rows=[
+            {"source_id": "A", "collection_keys": []},
+            {"source_id": "B", "collection_keys": []},
+            {"source_id": "C", "collection_keys": []},
+        ],
+        requested_collection_keys=[],
+        allow_empty=True,
+    )
+
+    dispositions = {
+        row["source_id"]: row for row in result["source_dispositions"]
+    }
+    assert dispositions["A"] == {
+        "source_id": "A",
+        "disposition": "pending",
+        "family_ids": [],
+        "reason": "assigned_singleton_family_pending_completion",
+    }
+    assert result["unaccounted_source_ids"] == ["A"]
+
+    incremental = _validate_literature_family_plan(
+        response,
+        lean_rows=[
+            {"source_id": "A", "collection_keys": []},
+            {"source_id": "B", "collection_keys": []},
+            {"source_id": "C", "collection_keys": []},
+        ],
+        requested_collection_keys=[],
+        allow_empty=True,
+        settle_singletons=True,
+    )
+    incremental_dispositions = {
+        row["source_id"]: row for row in incremental["source_dispositions"]
+    }
+    assert incremental_dispositions["A"]["disposition"] == "currently_unclustered"
+    assert incremental["unaccounted_source_ids"] == []
+
+
+def test_unknown_family_assignment_remains_unaccounted() -> None:
+    result = _validate_literature_family_plan(
+        {
+            "literature_families": [
+                {"family_id": "admitted", "source_ids": ["B", "C"]}
+            ],
+            "discovery_jobs": [],
+            "neighboring_families": [],
+            "source_dispositions": [
+                {
+                    "source_id": "A",
+                    "disposition": "assigned",
+                    "family_ids": ["hallucinated-family"],
+                }
+            ],
+        },
+        lean_rows=[
+            {"source_id": "A", "collection_keys": []},
+            {"source_id": "B", "collection_keys": []},
+            {"source_id": "C", "collection_keys": []},
+        ],
+        requested_collection_keys=[],
+        allow_empty=True,
+    )
+
+    dispositions = {
+        row["source_id"]: row for row in result["source_dispositions"]
+    }
+    assert dispositions["A"]["disposition"] == "pending"
+    assert dispositions["A"]["reason"] == "planning_packet_did_not_account_for_source"
+
+
+def test_invalid_coverage_does_not_settle_initial_singleton() -> None:
+    rows = [
+        {"source_id": "A", "collection_keys": []},
+        {"source_id": "B", "collection_keys": []},
+        {"source_id": "C", "collection_keys": []},
+    ]
+    initial = _validate_literature_family_plan(
+        {
+            "literature_families": [
+                {"family_id": "singleton", "source_ids": ["A"]},
+                {"family_id": "admitted", "source_ids": ["B", "C"]},
+            ],
+            "discovery_jobs": [],
+            "source_dispositions": [
+                {
+                    "source_id": "A",
+                    "disposition": "assigned",
+                    "family_ids": ["singleton"],
+                }
+            ],
+        },
+        lean_rows=rows,
+        requested_collection_keys=[],
+        allow_empty=True,
+    )
+    invalid_completion = _validate_literature_family_plan(
+        {
+            "literature_families": [],
+            "discovery_jobs": [],
+            "source_dispositions": [
+                {
+                    "source_id": "A",
+                    "disposition": "assigned",
+                    "family_ids": ["hallucinated-family"],
+                }
+            ],
+        },
+        lean_rows=rows,
+        requested_collection_keys=[],
+        allow_empty=True,
+        settle_singletons=True,
+    )
+
+    merged = _merge_literature_family_plans(initial, invalid_completion)
+    dispositions = {
+        row["source_id"]: row for row in merged["source_dispositions"]
+    }
+    assert dispositions["A"]["disposition"] == "pending"
+    assert dispositions["A"]["reason"] == "planning_packet_did_not_account_for_source"
 
 
 def test_narrow_family_job_does_not_replace_full_requested_comparison() -> None:

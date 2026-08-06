@@ -5380,6 +5380,7 @@ def _plan_literature_families(
         plan,
         lean_rows=lean_rows,
         requested_collection_keys=requested_keys,
+        settle_singletons=incremental_mode,
     )
     completion_status = "not_needed_incremental" if incremental_mode else "completed"
     if not incremental_mode:
@@ -5481,6 +5482,7 @@ def _plan_literature_families(
                         requested_collection_keys=requested_keys,
                         allow_empty=True,
                         add_requested_jobs=False,
+                        settle_singletons=True,
                     )
                     validated = _merge_literature_family_plans(
                         validated, additions
@@ -5903,8 +5905,18 @@ def _merge_literature_family_plans(
         source_id = str(row["source_id"])
         current = dispositions.get(source_id)
         rank = {"pending": 0, "overlap": 1, "currently_unclustered": 2, "assigned": 3}
-        if current is None or rank.get(str(row.get("disposition") or ""), 0) > rank.get(
-            str(current.get("disposition") or ""), 0
+        current_rank = rank.get(str((current or {}).get("disposition") or ""), 0)
+        row_rank = rank.get(str(row.get("disposition") or ""), 0)
+        if (
+            current is None
+            or row_rank > current_rank
+            or (
+                row_rank == current_rank == 0
+                and str(current.get("reason") or "")
+                == "assigned_singleton_family_pending_completion"
+                and str(row.get("reason") or "")
+                != "assigned_singleton_family_pending_completion"
+            )
         ):
             dispositions[source_id] = row
     return {
@@ -6017,6 +6029,7 @@ def _validate_literature_family_plan(
     requested_collection_keys: Sequence[str],
     allow_empty: bool = False,
     add_requested_jobs: bool = True,
+    settle_singletons: bool = False,
 ) -> dict[str, Any]:
     available = {str(row.get("source_id") or "") for row in lean_rows}
     memberships = {
@@ -6035,6 +6048,7 @@ def _validate_literature_family_plan(
         raise ValueError("literature family plan neighboring_families must be a list")
     families = []
     family_ids: set[str] = set()
+    singleton_family_ids: set[str] = set()
     for raw in raw_families:
         if not isinstance(raw, Mapping):
             continue
@@ -6046,6 +6060,8 @@ def _validate_literature_family_plan(
                 if str(value) in available
             }
         )
+        if family_id and len(source_ids) == 1:
+            singleton_family_ids.add(family_id)
         if not family_id or family_id in family_ids or len(source_ids) < 2:
             continue
         family_ids.add(family_id)
@@ -6189,6 +6205,7 @@ def _validate_literature_family_plan(
         for source_id in family.get("source_ids", []) or []:
             assigned_by_source[str(source_id)].append(str(family["family_id"]))
     declared: dict[str, dict[str, Any]] = {}
+    assigned_only_to_singleton_family: set[str] = set()
     if isinstance(raw_dispositions, list):
         for raw in raw_dispositions:
             if not isinstance(raw, Mapping):
@@ -6201,16 +6218,21 @@ def _validate_literature_family_plan(
                 "overlap",
             }:
                 continue
+            raw_family_ids = {
+                str(value) for value in raw.get("family_ids", []) or [] if str(value)
+            }
+            admitted_family_ids = sorted(raw_family_ids & family_ids)
+            if (
+                disposition in {"assigned", "overlap"}
+                and raw_family_ids
+                and raw_family_ids <= singleton_family_ids
+                and not admitted_family_ids
+            ):
+                assigned_only_to_singleton_family.add(source_id)
             declared[source_id] = {
                 "source_id": source_id,
                 "disposition": disposition,
-                "family_ids": sorted(
-                    {
-                        str(value)
-                        for value in raw.get("family_ids", []) or []
-                        if str(value) in family_ids
-                    }
-                ),
+                "family_ids": admitted_family_ids,
                 "reason": str(raw.get("reason") or "").strip(),
             }
     source_dispositions: list[dict[str, Any]] = []
@@ -6226,6 +6248,21 @@ def _validate_literature_family_plan(
             )
         elif declared.get(source_id, {}).get("disposition") == "currently_unclustered":
             source_dispositions.append(declared[source_id])
+        elif source_id in assigned_only_to_singleton_family:
+            source_dispositions.append(
+                {
+                    "source_id": source_id,
+                    "disposition": (
+                        "currently_unclustered" if settle_singletons else "pending"
+                    ),
+                    "family_ids": [],
+                    "reason": (
+                        "assigned_family_not_admitted"
+                        if settle_singletons
+                        else "assigned_singleton_family_pending_completion"
+                    ),
+                }
+            )
         else:
             source_dispositions.append(
                 {
@@ -8237,6 +8274,22 @@ def _run_relationship_reasoning(
         nonlocal discovery_terminal
         if not tasks:
             return
+        wave_task_counts = Counter(
+            str(row.get("bridge_job_id") or "")
+            for task in tasks
+            for row in task[3].get("bridge_jobs", []) or []
+            if isinstance(row, Mapping) and row.get("bridge_job_id")
+        )
+        wave_successes: Counter[str] = Counter()
+        wave_no_more: Counter[str] = Counter()
+        wave_failures: dict[str, list[str]] = defaultdict(list)
+        wave_pairs: dict[str, set[tuple[str, str]]] = defaultdict(set)
+        wave_left_endpoints: dict[str, set[str]] = defaultdict(set)
+        wave_right_endpoints: dict[str, set[str]] = defaultdict(set)
+        is_coverage_followup = all(
+            task[3].get("discovery_pass") == "coverage_followup"
+            for task in tasks
+        )
         with ThreadPoolExecutor(
             max_workers=_provider_worker_count(request, len(tasks)),
             thread_name_prefix="auto-zettelkasten-discovery",
@@ -8308,56 +8361,63 @@ def _run_relationship_reasoning(
                         }
                         left_side = set(raw_job.get("left_source_ids", []) or [])
                         right_side = set(raw_job.get("right_source_ids", []) or [])
-                        accounting["valid_unique_candidates"] = len(pairs)
-                        accounting["distinct_left_endpoints"] = len(
-                            {
-                                endpoint
-                                for pair in pairs
-                                for endpoint in pair
-                                if endpoint in left_side
-                            }
+                        wave_pairs[job_id].update(pairs)
+                        wave_left_endpoints[job_id].update(
+                            endpoint
+                            for pair in pairs
+                            for endpoint in pair
+                            if endpoint in left_side
                         )
-                        accounting["distinct_right_endpoints"] = len(
-                            {
-                                endpoint
-                                for pair in pairs
-                                for endpoint in pair
-                                if endpoint in right_side
-                            }
+                        wave_right_endpoints[job_id].update(
+                            endpoint
+                            for pair in pairs
+                            for endpoint in pair
+                            if endpoint in right_side
                         )
-                        accounting["explicit_no_more_candidates"] = (
+                        task_no_more = (
                             outcome_by_job.get(job_id) == "no_more_candidates"
                         )
-                        accounting["packet_status"] = (
-                            "failed" if continuation_error else "completed"
-                        )
-                        if continuation_error is not None:
-                            accounting["packet_failure_class"] = (
+                        if continuation_error and not task_no_more:
+                            wave_failures[job_id].append(
                                 _synthesis_failure_class(continuation_error)
                             )
+                        else:
+                            wave_successes[job_id] += 1
+                            wave_no_more[job_id] += int(task_no_more)
                     if continuation_error is not None:
                         failure_class = _synthesis_failure_class(
                             continuation_error
                         )
-                        discovery_terminal |= failure_class != "transport"
-                        discovery_parked.append(
-                            {
-                                "reason": "relationship_discovery_continuation_failed",
-                                "error_type": type(continuation_error).__name__,
-                                "error": str(continuation_error),
-                                "discovery_pass": str(
-                                    task[3].get("discovery_pass") or ""
-                                ),
-                                "discovery_task_key": task[1],
-                                "affected_job_ids": sorted(
-                                    str(row.get("bridge_job_id") or "")
-                                    for row in task[3].get("bridge_jobs", []) or []
-                                    if isinstance(row, Mapping)
-                                    and row.get("bridge_job_id")
-                                ),
-                                "retry_on_resume": failure_class == "transport",
-                            }
+                        affected_job_ids = sorted(
+                            str(row.get("bridge_job_id") or "")
+                            for row in task[3].get("bridge_jobs", []) or []
+                            if isinstance(row, Mapping)
+                            and row.get("bridge_job_id")
+                            and outcome_by_job.get(
+                                str(row.get("bridge_job_id") or "")
+                            )
+                            != "no_more_candidates"
                         )
+                        has_routed_jobs = any(
+                            isinstance(row, Mapping)
+                            and row.get("bridge_job_id")
+                            for row in task[3].get("bridge_jobs", []) or []
+                        )
+                        if affected_job_ids or not has_routed_jobs:
+                            discovery_terminal |= failure_class != "transport"
+                            discovery_parked.append(
+                                {
+                                    "reason": "relationship_discovery_continuation_failed",
+                                    "error_type": type(continuation_error).__name__,
+                                    "error": str(continuation_error),
+                                    "discovery_pass": str(
+                                        task[3].get("discovery_pass") or ""
+                                    ),
+                                    "discovery_task_key": task[1],
+                                    "affected_job_ids": affected_job_ids,
+                                    "retry_on_resume": failure_class == "transport",
+                                }
+                            )
                 except Exception as exc:
                     failure_class = _synthesis_failure_class(exc)
                     discovery_terminal |= failure_class != "transport"
@@ -8386,12 +8446,36 @@ def _run_relationship_reasoning(
                     for raw_job in task[3].get("bridge_jobs", []) or []:
                         if not isinstance(raw_job, Mapping):
                             continue
-                        accounting = discovery_job_accounting.get(
-                            str(raw_job.get("bridge_job_id") or "")
-                        )
-                        if accounting is not None:
-                            accounting["packet_status"] = "failed"
-                            accounting["packet_failure_class"] = failure_class
+                        job_id = str(raw_job.get("bridge_job_id") or "")
+                        if job_id in discovery_job_accounting:
+                            wave_failures[job_id].append(failure_class)
+        for job_id, task_count in wave_task_counts.items():
+            accounting = discovery_job_accounting.get(job_id)
+            if accounting is None:
+                continue
+            all_succeeded = wave_successes[job_id] == task_count
+            prior_failed = accounting.get("packet_status") == "failed"
+            remains_failed = bool(wave_failures[job_id]) or (
+                prior_failed and not (is_coverage_followup and all_succeeded)
+            )
+            accounting["packet_status"] = (
+                "failed" if remains_failed else "completed"
+            )
+            accounting["explicit_no_more_candidates"] = bool(
+                all_succeeded and wave_no_more[job_id] == task_count
+            )
+            if wave_failures[job_id]:
+                accounting["packet_failure_class"] = wave_failures[job_id][0]
+            elif not remains_failed:
+                accounting.pop("packet_failure_class", None)
+            if not is_coverage_followup:
+                accounting["valid_unique_candidates"] = len(wave_pairs[job_id])
+                accounting["distinct_left_endpoints"] = len(
+                    wave_left_endpoints[job_id]
+                )
+                accounting["distinct_right_endpoints"] = len(
+                    wave_right_endpoints[job_id]
+                )
     broad_tasks = [
         task
         for task in candidate_tasks

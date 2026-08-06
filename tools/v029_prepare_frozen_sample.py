@@ -431,6 +431,11 @@ def prepare(origin: Path, target: Path) -> None:
     for key in ("processing", "literature_mapping", "navigation"):
         if isinstance(original_config.get(key), Mapping):
             config[key] = dict(original_config[key])
+    config["literature_mapping"].update(
+        max_profile_calls=0,
+        max_synthesis_calls=0,
+        literature_deadline_seconds=7200.0,
+    )
     config.update(provider="deepseek", model="deepseek-v4-flash", scope="library")
     config["privacy"] = {"allow_cloud": False}
     write_yaml(target / "auto-zettelkasten.yml", config)

@@ -969,6 +969,247 @@ def test_builtin_complement_requires_complete_job_outcomes(tmp_path: Path) -> No
     )
 
 
+def test_failed_continuation_does_not_reopen_completed_sibling_job(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile(source_id) for source_id in "ABCDEF"]
+    jobs = [
+        {
+            "job_id": "requested",
+            "family": "explicit_requested_collection_comparison",
+            "left_source_ids": ["A"],
+            "right_source_ids": ["B"],
+            "requested_collection_pair": ["C1", "C2"],
+            "candidate_quota": 40,
+        },
+        {
+            "job_id": "family-cd",
+            "family": "family-cd",
+            "left_source_ids": ["C"],
+            "right_source_ids": ["D"],
+            "candidate_quota": 12,
+        },
+        {
+            "job_id": "family-ef",
+            "family": "family-ef",
+            "left_source_ids": ["E"],
+            "right_source_ids": ["F"],
+            "candidate_quota": 12,
+        },
+    ]
+
+    def handler(stage, _profiles, context):
+        if stage == "relationship_bridge_candidate_selection":
+            return {
+                "candidates": [],
+                "job_outcomes": [
+                    {"bridge_job_id": "requested", "status": "no_more_candidates"}
+                ],
+            }
+        if stage == "relationship_candidate_selection":
+            if int(context.get("discovery_page", 0) or 0) == 1:
+                assert [
+                    row["bridge_job_id"] for row in context["bridge_jobs"]
+                ] == ["family-ef"]
+                raise ValueError("malformed continuation")
+            return {
+                "candidates": [
+                    {**_candidate("C", "D"), "bridge_job_id": "family-cd"},
+                ],
+                "job_outcomes": [
+                    {"bridge_job_id": "family-cd", "status": "no_more_candidates"},
+                    {"bridge_job_id": "family-ef", "status": "completed"},
+                ],
+            }
+        return {"decisions": [_decision(job) for job in context["pair_jobs"]]}
+
+    result = _run(
+        tmp_path,
+        profiles,
+        _Calls(handler),
+        reasoner=_BuiltInDeepSeekReasoner(),
+        shared_family_plan={
+            "lean_index_hash": "lean",
+            "requested_collection_keys": ["C1", "C2"],
+            "literature_families": [
+                {"family_id": "family-cd", "source_ids": ["C", "D"]},
+                {"family_id": "family-ef", "source_ids": ["E", "F"]},
+            ],
+            "discovery_jobs": jobs,
+        },
+    )
+
+    accounting = {
+        row["bridge_job_id"]: row
+        for row in result["relationship_discovery_jobs"]
+    }
+    assert accounting["family-cd"]["status"] == "completed"
+    assert accounting["family-cd"]["packet_status"] == "completed"
+    assert result["relationship_discovery_incomplete_jobs"] == ["family-ef"]
+
+
+def test_split_discovery_job_keeps_failed_shard_incomplete(
+    tmp_path: Path, monkeypatch
+) -> None:
+    profiles = [_profile(source_id) for source_id in "ABCDEF"]
+    original = pipeline_module._reasoner_packet_chars
+
+    def measured(profiles, context):
+        if (
+            context.get("discovery_pass") == "complement"
+            and len(context.get("catalogue", []) or []) > 2
+        ):
+            return 10**9
+        return original(profiles, context)
+
+    monkeypatch.setattr(pipeline_module, "_reasoner_packet_chars", measured)
+
+    def handler(stage, _profiles, context):
+        if stage == "relationship_bridge_candidate_selection":
+            return {
+                "candidates": [],
+                "job_outcomes": [
+                    {"bridge_job_id": "requested", "status": "no_more_candidates"}
+                ],
+            }
+        if stage == "relationship_candidate_selection":
+            source_ids = {
+                row["source_id"] for row in context.get("catalogue", []) or []
+            }
+            if "D" in source_ids:
+                raise ValueError("one split shard failed")
+            return {
+                "candidates": [],
+                "job_outcomes": [
+                    {"bridge_job_id": "split-family", "status": "no_more_candidates"}
+                ],
+            }
+        return {"decisions": []}
+
+    result = _run(
+        tmp_path,
+        profiles,
+        _Calls(handler),
+        reasoner=_BuiltInDeepSeekReasoner(),
+        shared_family_plan={
+            "lean_index_hash": "lean",
+            "requested_collection_keys": ["C1", "C2"],
+            "literature_families": [
+                {"family_id": "split-family", "source_ids": ["C", "D", "E", "F"]}
+            ],
+            "discovery_jobs": [
+                {
+                    "job_id": "requested",
+                    "family": "explicit_requested_collection_comparison",
+                    "left_source_ids": ["A"],
+                    "right_source_ids": ["B"],
+                    "requested_collection_pair": ["C1", "C2"],
+                    "candidate_quota": 40,
+                },
+                {
+                    "job_id": "split-family",
+                    "family": "split-family",
+                    "left_source_ids": ["C", "D"],
+                    "right_source_ids": ["E", "F"],
+                    "candidate_quota": 12,
+                },
+            ],
+        },
+    )
+
+    accounting = {
+        row["bridge_job_id"]: row
+        for row in result["relationship_discovery_jobs"]
+    }
+    assert accounting["split-family"]["packet_status"] == "failed"
+    assert accounting["split-family"]["explicit_no_more_candidates"] is False
+    assert result["relationship_discovery_incomplete_jobs"] == ["split-family"]
+
+
+def test_split_coverage_followup_cannot_hide_failed_shard(
+    tmp_path: Path, monkeypatch
+) -> None:
+    profiles = [_profile(source_id) for source_id in "ABCDEF"]
+    original = pipeline_module._reasoner_packet_chars
+
+    def measured(profiles, context):
+        if (
+            context.get("discovery_pass") == "coverage_followup"
+            and len(context.get("catalogue", []) or []) > 2
+        ):
+            return 10**9
+        return original(profiles, context)
+
+    monkeypatch.setattr(pipeline_module, "_reasoner_packet_chars", measured)
+
+    def handler(stage, _profiles, context):
+        if stage == "relationship_bridge_candidate_selection":
+            return {
+                "candidates": [],
+                "job_outcomes": [
+                    {"bridge_job_id": "requested", "status": "no_more_candidates"}
+                ],
+            }
+        if stage == "relationship_candidate_selection":
+            if context.get("discovery_pass") == "complement":
+                return {
+                    "candidates": [],
+                    "job_outcomes": [
+                        {"bridge_job_id": "split-family", "status": "completed"}
+                    ],
+                }
+            source_ids = {
+                row["source_id"] for row in context.get("catalogue", []) or []
+            }
+            if "D" in source_ids:
+                raise ValueError("one followup shard failed")
+            return {
+                "candidates": [],
+                "job_outcomes": [
+                    {"bridge_job_id": "split-family", "status": "no_more_candidates"}
+                ],
+            }
+        return {"decisions": []}
+
+    result = _run(
+        tmp_path,
+        profiles,
+        _Calls(handler),
+        reasoner=_BuiltInDeepSeekReasoner(),
+        shared_family_plan={
+            "lean_index_hash": "lean",
+            "requested_collection_keys": ["C1", "C2"],
+            "literature_families": [
+                {"family_id": "split-family", "source_ids": ["C", "D", "E", "F"]}
+            ],
+            "discovery_jobs": [
+                {
+                    "job_id": "requested",
+                    "family": "explicit_requested_collection_comparison",
+                    "left_source_ids": ["A"],
+                    "right_source_ids": ["B"],
+                    "requested_collection_pair": ["C1", "C2"],
+                    "candidate_quota": 40,
+                },
+                {
+                    "job_id": "split-family",
+                    "family": "split-family",
+                    "left_source_ids": ["C", "D"],
+                    "right_source_ids": ["E", "F"],
+                    "candidate_quota": 12,
+                },
+            ],
+        },
+    )
+
+    accounting = {
+        row["bridge_job_id"]: row
+        for row in result["relationship_discovery_jobs"]
+    }
+    assert accounting["split-family"]["packet_status"] == "failed"
+    assert result["relationship_discovery_incomplete_jobs"] == ["split-family"]
+
+
 def test_duplicate_broad_and_family_candidate_preserves_both_provenances(
     tmp_path: Path,
 ) -> None:
