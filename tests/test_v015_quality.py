@@ -48,7 +48,7 @@ def _profile(source_id: str) -> dict[str, object]:
 def test_source_bundle_prompt_uses_one_shot_statistical_interpretation() -> None:
     prompt = _source_bundle_system_prompt()
 
-    assert "source bundle prompt v5" in prompt
+    assert "source bundle prompt v6" in prompt
     assert "9 percentage points lower" in prompt
     assert "22.5% lower relative" in prompt
     assert "odds, hazards, risks, and probabilities distinct" in prompt

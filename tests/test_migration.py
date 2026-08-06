@@ -373,7 +373,7 @@ Automated structure checks passed. No substantive human verification was perform
     assert "human_review" not in cleaned
     assert "Automated Validation" not in cleaned
     assert "The substantive analysis remains unchanged." in cleaned
-    assert read_yaml(tmp_path / "auto-zettelkasten.yml")["artifact_schema_version"] == "1.19"
+    assert read_yaml(tmp_path / "auto-zettelkasten.yml")["artifact_schema_version"] == "1.20"
     aliases = review_hash_aliases(tmp_path)
     assert aliases["note-legacy"]["legacy_semantic_hash"]
     assert aliases["note-legacy"]["semantic_hash"]
@@ -422,8 +422,8 @@ Keep these bytes exactly.
 
     assert result["provider_calls"] == 0
     assert note_path.read_bytes() == before
-    assert read_yaml(tmp_path / "auto-zettelkasten.yml")["artifact_schema_version"] == "1.19"
-    assert read_yaml(tmp_path / "11_state" / "workspace_manifest.yml")["artifact_schema_version"] == "1.19"
+    assert read_yaml(tmp_path / "auto-zettelkasten.yml")["artifact_schema_version"] == "1.20"
+    assert read_yaml(tmp_path / "11_state" / "workspace_manifest.yml")["artifact_schema_version"] == "1.20"
 
 
 def test_schema_1_4_to_1_5_dry_run_is_fully_non_mutating(tmp_path: Path, monkeypatch) -> None:
@@ -523,11 +523,11 @@ def test_schema_1_4_to_1_5_apply_is_local_byte_preserving_and_idempotent(
     assert first["proposition_anchors"]["profile_upgrade"] == "lazy_on_read"
     assert first["proposition_anchors"]["archived_files"] == []
     assert marker.is_file()
-    assert read_yaml(tmp_path / "auto-zettelkasten.yml")["engine_version"] == "0.28.0"
+    assert read_yaml(tmp_path / "auto-zettelkasten.yml")["engine_version"] == "0.29.0"
     assert read_yaml(tmp_path / "auto-zettelkasten.yml")["prompt_version"] == "11"
-    assert read_yaml(tmp_path / "auto-zettelkasten.yml")["artifact_schema_version"] == "1.19"
-    assert read_yaml(tmp_path / "11_state" / "workspace_manifest.yml")["engine_version"] == "0.28.0"
-    assert read_yaml(tmp_path / "11_state" / "workspace_manifest.yml")["artifact_schema_version"] == "1.19"
+    assert read_yaml(tmp_path / "auto-zettelkasten.yml")["artifact_schema_version"] == "1.20"
+    assert read_yaml(tmp_path / "11_state" / "workspace_manifest.yml")["engine_version"] == "0.29.0"
+    assert read_yaml(tmp_path / "11_state" / "workspace_manifest.yml")["artifact_schema_version"] == "1.20"
     assert all(path.read_bytes() == content for path, content in preserved.items())
     assert second["proposition_anchors"]["status"] == "already_migrated"
     assert second["navigation"]["status"] == "already_migrated"

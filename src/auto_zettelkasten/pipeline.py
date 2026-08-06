@@ -44,6 +44,7 @@ from .indexes import (
     build_source_catalogue,
     commit_tag_reviews,
     lean_discovery_projection,
+    update_catalogue_clusters,
     update_source_set_map,
     write_source_set,
 )
@@ -1108,6 +1109,8 @@ class _RunProgress:
     ) -> None:
         self.path = path
         self.run_id = run_id
+        self.invocation_id = f"{run_id}-{time.time_ns()}"
+        self.events_path = path.with_name("stage_events.jsonl")
         self._lock = threading.Lock()
         self._write_timer: threading.Timer | None = None
         self._last_write_monotonic = 0.0
@@ -1177,9 +1180,8 @@ class _RunProgress:
                 else {}
             ),
         }
-        # Literature counters describe the current invocation. A resume starts
-        # from its frozen items/checkpoints but must not display stale counts
-        # from the prior invocation while work is still in flight.
+        # Semantic inventory metrics refresh per invocation; paid-attempt,
+        # checkpoint, and failure counters remain cumulative across resumes.
         self.literature.update(
             profile_count=0,
             profile_valid_count=0,
@@ -1203,9 +1205,6 @@ class _RunProgress:
             rejected_underspecified_gap_count=0,
             rejected_gap_quality_count=0,
             merged_gap_count=0,
-            synthesis_call_count=0,
-            synthesis_checkpoint_hit_count=0,
-            synthesis_failure_count=0,
             quantitative_comparison_count=0,
             rejected_quantitative_comparison_count=0,
             rejected_generated_locator_count=0,
@@ -1215,11 +1214,6 @@ class _RunProgress:
             active_cluster="",
             active_gap_packet="",
             active_synthesis_packet="",
-            checkpoint_hit_count=0,
-            source_provider_call_count=0,
-            literature_provider_call_count=0,
-            provider_call_count=0,
-            literature_failure_count=0,
             internal_falsification_count=0,
         )
         # Source-item accounting is derived from ``self.items``. Older progress
@@ -1276,6 +1270,16 @@ class _RunProgress:
         self.stage_timestamps.setdefault(self.stage, {"started_at": now_iso()})
         self._dirty = True
         self._flush_locked()
+        append_jsonl(
+            self.events_path,
+            {
+                "event": "resume" if resume else "start",
+                "run_id": run_id,
+                "invocation_id": self.invocation_id,
+                "stage": self.stage,
+                "at": now_iso(),
+            },
+        )
 
     def update(self, index: int, **values: Any) -> None:
         with self._lock:
@@ -1293,17 +1297,40 @@ class _RunProgress:
             )
             self._dirty = True
             self._flush_locked()
+            append_jsonl(
+                self.events_path,
+                {
+                    "event": "finish",
+                    "run_id": self.run_id,
+                    "invocation_id": self.invocation_id,
+                    "stage": self.stage,
+                    "status": status,
+                    "at": now_iso(),
+                },
+            )
 
     def set_stage(self, stage: str, **literature_values: Any) -> None:
         with self._lock:
             timestamp = now_iso()
             if stage != self.stage:
+                prior_stage = self.stage
                 self.stage_timestamps.setdefault(self.stage, {}).setdefault(
                     "completed_at", timestamp
                 )
                 self.stage = stage
                 self.stage_timestamps.setdefault(stage, {}).setdefault(
                     "started_at", timestamp
+                )
+                append_jsonl(
+                    self.events_path,
+                    {
+                        "event": "stage_transition",
+                        "run_id": self.run_id,
+                        "invocation_id": self.invocation_id,
+                        "from_stage": prior_stage,
+                        "stage": stage,
+                        "at": timestamp,
+                    },
                 )
             if "synthesis_call_count" in literature_values:
                 prior_synthesis = int(
@@ -1441,6 +1468,7 @@ class _RunProgress:
         payload = {
             "status": self._status,
             "run_id": self.run_id,
+            "invocation_id": self.invocation_id,
             "stage": self.stage,
             "stage_timestamps": self.stage_timestamps,
             **self.literature,
@@ -2184,28 +2212,64 @@ def run_pipeline(
             },
         )
     map_source_set = run_source_set
-    progress.set_stage("profiling")
-    try:
-        map_result = rebuild_map(
-            workspace,
-            source_set=map_source_set,
-            note_rows=note_rows,
-            terminal_rows=terminal_rows,
-            items=items,
-            run_id=run_id,
-            question=request.question,
-            request=request,
-            reasoner=None if source_budget_paused else literature_reasoner,
-            external_discovery=None if source_budget_paused else external_discovery,
-            progress=progress,
-            resume=resume,
-            profile_budget=profile_budget,
-            collection_snapshot=collection_snapshot,
-        )
-    except BaseException:
-        progress.flush()
-        profile_budget.flush()
-        raise
+    source_work_pending = len(terminal_rows) < len(items) or any(
+        str(row.get("terminal_status") or "") in {
+            "partial",
+            "pending",
+            "paused_transport",
+        }
+        for row in terminal_rows
+    )
+    if source_work_pending:
+        progress.set_stage("source_barrier_pending")
+        map_result = {
+            "source_set": map_source_set,
+            "cluster_map": {
+                "status": "pending_source_barrier",
+                "clusters": [],
+                "unclustered_sources": [],
+            },
+            "gap_map": {
+                "status": "pending_source_barrier",
+                "gap_candidates": [],
+            },
+            "literature_packet": {
+                "status": "pending",
+                "reason": "source_accounting_barrier_incomplete",
+                "synthesis_call_count": 0,
+                "synthesis_checkpoint_hit_count": 0,
+                "synthesis_failure_count": 0,
+            },
+            "profile_result": {},
+            "profiles": [],
+            "paths": [],
+            "partial_reason": "source_accounting_barrier_incomplete",
+        }
+    else:
+        progress.set_stage("profiling")
+        try:
+            map_result = rebuild_map(
+                workspace,
+                source_set=map_source_set,
+                note_rows=note_rows,
+                terminal_rows=terminal_rows,
+                items=items,
+                run_id=run_id,
+                question=request.question,
+                request=request,
+                reasoner=None if source_budget_paused else literature_reasoner,
+                external_discovery=(
+                    None if source_budget_paused else external_discovery
+                ),
+                progress=progress,
+                resume=resume,
+                profile_budget=profile_budget,
+                collection_snapshot=collection_snapshot,
+            )
+        except BaseException:
+            progress.flush()
+            profile_budget.flush()
+            raise
     profile_budget.flush()
     # The v0.4 map is already scoped to this run's frozen source set, so every
     # generated cluster and gap belongs to the run without a second heuristic filter.
@@ -4849,6 +4913,148 @@ def _cluster_membership_relations(
     return relations
 
 
+def _family_route_inventory(
+    lean_rows: Sequence[Mapping[str, Any]],
+    catalogue: Mapping[str, Any],
+    *,
+    prior_routes: Mapping[str, Any],
+    prior_hashes: Mapping[str, Any],
+    current_hashes: Mapping[str, str],
+) -> tuple[dict[str, str], list[dict[str, Any]], dict[str, list[str]]]:
+    """Assign one stable primary planning route while retaining secondary indexes."""
+
+    available = {str(row.get("source_id") or "") for row in lean_rows}
+    route_rows: dict[str, dict[str, Any]] = {}
+    source_routes: dict[str, list[str]] = defaultdict(list)
+
+    def add_route(
+        route_id: str,
+        route_type: str,
+        title: str,
+        source_ids: Sequence[Any],
+        revision_hash: str = "",
+    ) -> None:
+        members = sorted({str(value) for value in source_ids if str(value) in available})
+        if not members:
+            return
+        route_rows[route_id] = {
+            "route_id": route_id,
+            "route_type": route_type,
+            "title": title or route_id,
+            "revision_hash": revision_hash or stable_hash(members),
+            "source_ids": members,
+        }
+        for source_id in members:
+            source_routes[source_id].append(route_id)
+
+    for raw in catalogue.get("virtual_shards", []) or []:
+        if not isinstance(raw, Mapping):
+            continue
+        shard_id = str(raw.get("shard_id") or "")
+        topic_id = str(raw.get("topic_id") or "")
+        if not shard_id or topic_id == "topic-catch-all":
+            continue
+        add_route(
+            f"virtual:{shard_id}",
+            "virtual_topic",
+            str(raw.get("title") or topic_id),
+            raw.get("source_ids", []) or [],
+            str(raw.get("revision_hash") or ""),
+        )
+
+    collections = {
+        str(row.get("key") or ""): row
+        for row in catalogue.get("collections", []) or []
+        if isinstance(row, Mapping) and row.get("key")
+    }
+
+    def collection_depth(key: str) -> int:
+        depth = 0
+        seen: set[str] = set()
+        while key in collections and key not in seen:
+            seen.add(key)
+            parent = str(collections[key].get("parent_key") or "")
+            if not parent:
+                break
+            depth += 1
+            key = parent
+        return depth
+
+    for key, raw in sorted(
+        collections.items(), key=lambda item: (-collection_depth(item[0]), item[0])
+    ):
+        add_route(
+            f"collection:{key}",
+            "zotero_collection",
+            str(raw.get("name") or key),
+            raw.get("direct_source_ids", []) or [],
+            str((raw.get("routing_card") or {}).get("revision_hash") or ""),
+        )
+
+    for raw in catalogue.get("shards", []) or []:
+        if not isinstance(raw, Mapping):
+            continue
+        shard_id = str(raw.get("shard_id") or "")
+        if shard_id:
+            add_route(
+                f"literature:{shard_id}",
+                "literature_shard",
+                str(raw.get("title") or shard_id),
+                raw.get("source_ids", []) or [],
+                str(raw.get("revision_hash") or ""),
+            )
+
+    primary: dict[str, str] = {}
+    secondary: dict[str, list[str]] = {}
+    for source_id in sorted(available):
+        eligible = source_routes.get(source_id, [])
+        prior = str(prior_routes.get(source_id) or "")
+        if (
+            prior in eligible
+            and str(prior_hashes.get(source_id) or "") == current_hashes[source_id]
+        ):
+            selected = prior
+        else:
+            selected = next(
+                (value for value in eligible if value.startswith("virtual:")),
+                next(
+                    (value for value in eligible if value.startswith("collection:")),
+                    next(
+                        (value for value in eligible if value.startswith("literature:")),
+                        "catch_all:analytical",
+                    ),
+                ),
+            )
+        primary[source_id] = selected
+        secondary[source_id] = [value for value in eligible if value != selected]
+    catch_all = [source_id for source_id, route_id in primary.items() if route_id.startswith("catch_all:")]
+    if catch_all:
+        add_route(
+            "catch_all:analytical",
+            "analytical_catch_all",
+            "Analytical catch-all",
+            catch_all,
+        )
+    jobs: list[dict[str, Any]] = []
+    for route_id in sorted(set(primary.values())):
+        route = dict(route_rows.get(route_id) or {})
+        members = sorted(
+            source_id for source_id, selected in primary.items() if selected == route_id
+        )
+        if not members:
+            continue
+        jobs.append(
+            {
+                **route,
+                "route_id": route_id,
+                "source_ids": members,
+                "required_source_ids": members,
+                "revision_hash": str(route.get("revision_hash") or stable_hash(members)),
+            }
+        )
+    return primary, jobs, secondary
+
+
 def _plan_literature_families(
     workspace: Path,
     *,
@@ -4863,7 +5069,13 @@ def _plan_literature_families(
         return None
     catalogue_path = Path(str(catalogue.get("catalogue_path") or ""))
     catalogue_payload = read_yaml(catalogue_path, {}) or {}
-    lean_rows = lean_discovery_projection(profiles, catalogue_payload)
+    all_lean_rows = lean_discovery_projection(profiles, catalogue_payload)
+    lean_rows = [
+        row
+        for row in all_lean_rows
+        if str(row.get("evidence_eligibility") or "substantive_bounded")
+        == "substantive_bounded"
+    ]
     if len(lean_rows) < 2:
         return None
     plan_path = (
@@ -4882,9 +5094,6 @@ def _plan_literature_families(
             "model": str(getattr(reasoner, "model", "")),
             "prompt_version": LITERATURE_FAMILY_PLAN_PROMPT_VERSION,
             "policy": request.literature_policy.to_dict(),
-            "requested_collection_keys": list(
-                request.comparison_collection_keys
-            ),
         }
     )
     prior_source_hashes = dict(prior_plan.get("lean_source_hashes", {}) or {})
@@ -4902,6 +5111,13 @@ def _plan_literature_families(
         and str(prior_plan.get("planning_identity") or "")
         == planning_identity
         and incremental_source_ids
+    )
+    primary_routes, planning_jobs, secondary_routes = _family_route_inventory(
+        lean_rows,
+        catalogue_payload,
+        prior_routes=dict(prior_plan.get("primary_routes", {}) or {}),
+        prior_hashes=prior_source_hashes,
+        current_hashes=lean_source_hashes,
     )
     source_ids = {str(row["source_id"]) for row in lean_rows}
     collections = [
@@ -4932,7 +5148,8 @@ def _plan_literature_families(
             "incremental_patch" if incremental_mode else "initial_global"
         ),
         "collections": collections,
-        "requested_collection_keys": requested_keys,
+        "planning_jobs": planning_jobs,
+        "required_source_ids": sorted(source_ids),
     }
     planner_rows = lean_rows
     if incremental_mode:
@@ -4940,45 +5157,7 @@ def _plan_literature_families(
         changed_rows = [
             row for row in lean_rows if str(row["source_id"]) in changed
         ]
-        changed_collections = {
-            str(value)
-            for row in changed_rows
-            for value in row.get("collection_keys", []) or []
-        }
-        changed_facets = {
-            str(value).casefold()
-            for row in changed_rows
-            for values in (row.get("facets", {}) or {}).values()
-            for value in values
-        }
-        neighboring_rows = [
-            row
-            for row in lean_rows
-            if str(row["source_id"]) not in changed
-            and (
-                bool(
-                    changed_collections
-                    & {
-                        str(value)
-                        for value in row.get("collection_keys", []) or []
-                    }
-                )
-                or bool(
-                    changed_facets
-                    & {
-                        str(value).casefold()
-                        for values in (row.get("facets", {}) or {}).values()
-                        for value in values
-                    }
-                )
-            )
-        ]
-        # ponytail: bounded deterministic retrieval; switch to indexed search
-        # only if incremental packets become a measured bottleneck.
-        planner_rows = sorted(
-            [*changed_rows, *neighboring_rows[:300]],
-            key=lambda row: str(row["source_id"]),
-        )
+        planner_rows = sorted(changed_rows, key=lambda row: str(row["source_id"]))
         context.update(
             {
                 "changed_source_ids": incremental_source_ids,
@@ -5002,6 +5181,31 @@ def _plan_literature_families(
                 ],
             }
         )
+    planner_rows = sorted(
+        planner_rows,
+        key=lambda row: (
+            primary_routes.get(str(row.get("source_id") or ""), ""),
+            str(row.get("source_id") or ""),
+        ),
+    )
+    active_planner_ids = {str(row.get("source_id") or "") for row in planner_rows}
+    context["planning_jobs"] = [
+        {
+            **job,
+            "source_ids": [
+                source_id
+                for source_id in job.get("source_ids", []) or []
+                if source_id in active_planner_ids
+            ],
+            "required_source_ids": [
+                source_id
+                for source_id in job.get("required_source_ids", []) or []
+                if source_id in active_planner_ids
+            ],
+        }
+        for job in planning_jobs
+        if active_planner_ids.intersection(job.get("source_ids", []) or [])
+    ]
     fits = getattr(reasoner, "literature_family_plan_fits", None)
     flat_path = (
         bool(fits(planner_rows, request, context=context))
@@ -5009,6 +5213,7 @@ def _plan_literature_families(
         else _reasoner_packet_chars(planner_rows, context)
         <= _relationship_context_char_budget(reasoner, request)
     )
+    failed_packet_ids: list[str] = []
     if flat_path:
         plan = reasoner_calls(
             "literature_family_plan",
@@ -5028,72 +5233,76 @@ def _plan_literature_families(
         planning_path = (
             "incremental_patch"
             if incremental_mode
-            else "flat_complete_index"
+            else "single_shard_packet"
         )
         packet_source_ids = [
             sorted(str(row["source_id"]) for row in planner_rows)
         ]
     else:
-        global_spine = [
-            {
-                key: row[key]
-                for key in ("source_id", "title", "author", "year")
-            }
-            for row in planner_rows
-        ]
-        chunk_context = {
-            **context,
-            "planning_mode": "chunk",
-            "global_spine": global_spine,
-        }
+        chunk_context = {**context, "planning_mode": "shard_packet"}
         chunks = _lean_family_plan_chunks(
             planner_rows,
             request=request,
             context=chunk_context,
             fits=fits,
         )
-        local_plans = []
-        for index, chunk in enumerate(chunks, start=1):
+        def plan_packet(index: int, chunk: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
+            chunk_ids = {str(row.get("source_id") or "") for row in chunk}
+            packet_id = "planning-packet-" + stable_hash(sorted(chunk_ids))[:16]
             local_context = {
-                **chunk_context,
-                "chunk_id": f"chunk-{index}",
+                **_family_packet_context(chunk_context, chunk_ids),
+                "packet_id": packet_id,
             }
-            local_plans.append(
+            return _namespace_literature_family_plan(
                 reasoner_calls(
                     "literature_family_plan",
-                    f"chunk-{index}-" + stable_hash(chunk)[:16],
+                    packet_id + "-" + stable_hash(local_context)[:16],
                     "plan_literature_families",
                     chunk,
                     local_context,
-                )
+                ),
+                packet_id,
             )
-        compact_local_plans = [
-            {
-                "literature_families": list(
-                    value.get("literature_families", []) or []
-                ),
-                "neighboring_families": list(
-                    value.get("neighboring_families", []) or []
-                ),
+
+        indexed_plans: dict[int, Mapping[str, Any]] = {}
+        packet_errors: list[BaseException] = []
+        with ThreadPoolExecutor(
+            max_workers=_provider_worker_count(request, len(chunks)),
+            thread_name_prefix="auto-zettelkasten-family-plan",
+        ) as executor:
+            futures = {
+                executor.submit(plan_packet, index, chunk): (index, chunk)
+                for index, chunk in enumerate(chunks, start=1)
             }
-            for value in local_plans
-        ]
-        plan = reasoner_calls(
-            "literature_family_plan",
-            "reconcile-" + stable_hash(compact_local_plans)[:16],
-            "plan_literature_families",
-            [],
-            {
-                **context,
-                "planning_mode": "chunk_reconciliation",
-                "global_spine": global_spine,
-                "local_family_plans": compact_local_plans,
-            },
-        )
+            for future in as_completed(futures):
+                index, chunk = futures[future]
+                try:
+                    indexed_plans[index] = future.result()
+                except Exception as exc:
+                    failed_packet_ids.append(
+                        "planning-packet-"
+                        + stable_hash(
+                            sorted(
+                                str(row.get("source_id") or "") for row in chunk
+                            )
+                        )[:16]
+                    )
+                    packet_errors.append(exc)
+        if not indexed_plans and packet_errors:
+            raise packet_errors[0]
+        local_plans = [indexed_plans[index] for index in sorted(indexed_plans)]
+        plan: dict[str, Any] = {
+            "literature_families": [],
+            "discovery_jobs": [],
+            "neighboring_families": [],
+            "source_dispositions": [],
+        }
+        for local_plan in local_plans:
+            plan = _merge_literature_family_plans(plan, local_plan)
         planning_path = (
-            "incremental_chunked_reconciliation"
+            "incremental_shard_packets"
             if incremental_mode
-            else "chunked_index_reconciliation"
+            else "shard_led_packets"
         )
         packet_source_ids = [
             [str(row["source_id"]) for row in chunk] for chunk in chunks
@@ -5162,6 +5371,10 @@ def _plan_literature_families(
             "literature_families": merged_families,
             "discovery_jobs": [*retained_jobs, *patch_jobs],
             "neighboring_families": list(merged_neighbors.values()),
+            "source_dispositions": [
+                *(prior_plan.get("source_dispositions", []) or []),
+                *(plan.get("source_dispositions", []) or []),
+            ],
         }
     validated = _validate_literature_family_plan(
         plan,
@@ -5182,50 +5395,119 @@ def _plan_literature_families(
             "covered_source_ids": sorted(represented),
             "unassigned_source_ids": sorted(source_ids - represented),
         }
-        completion_rows = (
-            planner_rows
-            if flat_path
-            else [
-                row
-                for row in planner_rows
-                if str(row["source_id"]) not in represented
-            ]
-        )
+        pending_source_ids = {
+            str(row.get("source_id") or "")
+            for row in validated.get("source_dispositions", []) or []
+            if isinstance(row, Mapping)
+            and str(row.get("disposition") or "") == "pending"
+        }
+        completion_rows = [
+            row
+            for row in planner_rows
+            if str(row["source_id"]) in pending_source_ids
+        ]
         if not flat_path:
-            completion_context["global_spine"] = [
-                {
-                    key: row[key]
-                    for key in ("source_id", "title", "author", "year")
-                }
-                for row in lean_rows
-            ]
             completion_context["local_family_cards"] = validated[
                 "literature_families"
             ]
-        try:
-            completion = reasoner_calls(
-                "literature_family_plan",
-                "coverage-"
-                + stable_hash(
-                    {
-                        "index": lean_source_hashes,
-                        "primary": validated,
-                    }
-                )[:16],
-                "plan_literature_families",
+        if completion_rows:
+            completion_chunks = _lean_family_plan_chunks(
                 completion_rows,
-                completion_context,
+                request=request,
+                context=completion_context,
+                fits=fits,
             )
-            additions = _validate_literature_family_plan(
-                completion,
-                lean_rows=lean_rows,
-                requested_collection_keys=requested_keys,
-                allow_empty=True,
-                add_requested_jobs=False,
-            )
-            validated = _merge_literature_family_plans(validated, additions)
-        except Exception as exc:
-            completion_status = f"advisory_failure:{type(exc).__name__}"
+
+            def complete_packet(
+                index: int, chunk: Sequence[Mapping[str, Any]]
+            ) -> Mapping[str, Any]:
+                chunk_ids = {str(row.get("source_id") or "") for row in chunk}
+                packet_id = "coverage-packet-" + stable_hash(
+                    sorted(chunk_ids)
+                )[:16]
+                local_context = {
+                    **_family_packet_context(completion_context, chunk_ids),
+                    "packet_id": packet_id,
+                }
+                return _namespace_literature_family_plan(
+                    reasoner_calls(
+                        "literature_family_plan",
+                        packet_id + "-" + stable_hash(local_context)[:16],
+                        "plan_literature_families",
+                        chunk,
+                        local_context,
+                    ),
+                    packet_id,
+                )
+
+            completion_failures: list[str] = []
+            try:
+                indexed_completions: dict[int, Mapping[str, Any]] = {}
+                with ThreadPoolExecutor(
+                    max_workers=_provider_worker_count(
+                        request, len(completion_chunks)
+                    ),
+                    thread_name_prefix="auto-zettelkasten-family-coverage",
+                ) as executor:
+                    futures = {
+                        executor.submit(complete_packet, index, chunk): (
+                            index,
+                            chunk,
+                        )
+                        for index, chunk in enumerate(completion_chunks, start=1)
+                    }
+                    for future in as_completed(futures):
+                        index, chunk = futures[future]
+                        try:
+                            indexed_completions[index] = future.result()
+                        except Exception:
+                            completion_failures.append(
+                                "coverage-packet-"
+                                + stable_hash(
+                                    sorted(
+                                        str(row.get("source_id") or "")
+                                        for row in chunk
+                                    )
+                                )[:16]
+                            )
+                completion_plans = [
+                    indexed_completions[index]
+                    for index in sorted(indexed_completions)
+                ]
+                for completion in completion_plans:
+                    additions = _validate_literature_family_plan(
+                        completion,
+                        lean_rows=lean_rows,
+                        requested_collection_keys=requested_keys,
+                        allow_empty=True,
+                        add_requested_jobs=False,
+                    )
+                    validated = _merge_literature_family_plans(
+                        validated, additions
+                    )
+                if completion_failures:
+                    completion_status = "partial_failure:packet_failure"
+                    failed_packet_ids.extend(completion_failures)
+            except Exception as exc:
+                completion_status = f"partial_failure:{type(exc).__name__}"
+    unaccounted_source_ids = sorted(
+        str(row.get("source_id") or "")
+        for row in validated.get("source_dispositions", []) or []
+        if isinstance(row, Mapping)
+        and str(row.get("disposition") or "") == "pending"
+    )
+    validated, reconciliation_warnings = _reconcile_overlapping_family_cards(
+        validated,
+        request=request,
+        reasoner=reasoner,
+        reasoner_calls=reasoner_calls,
+    )
+    plan_is_partial = bool(
+        unaccounted_source_ids
+        or failed_packet_ids
+        or completion_status.startswith("partial_failure")
+        or reconciliation_warnings
+    )
     lean_serialized = json.dumps(
         lean_rows,
         ensure_ascii=False,
@@ -5246,7 +5528,29 @@ def _plan_literature_families(
         "packet_source_ids": packet_source_ids,
         "requested_collection_keys": requested_keys,
         "coverage_completion_status": completion_status,
+        "plan_status": "partial" if plan_is_partial else "complete",
+        "unaccounted_source_ids": unaccounted_source_ids,
+        "primary_routes": primary_routes,
+        "secondary_routes": secondary_routes,
+        "planning_jobs": planning_jobs,
+        "failed_packet_ids": sorted(set(failed_packet_ids)),
+        "reconciliation_warnings": reconciliation_warnings,
     }
+    result["source_dispositions"] = [
+        *validated.get("source_dispositions", []),
+        *[
+            {
+                "source_id": str(row.get("source_id") or ""),
+                "disposition": "ineligible",
+                "family_ids": [],
+                "reason": str(
+                    row.get("evidence_eligibility") or "non_substantive_scope"
+                ),
+            }
+            for row in all_lean_rows
+            if str(row.get("source_id") or "") not in source_ids
+        ],
+    ]
     receipt_path = (
         workspace
         / "02_source_memory"
@@ -5266,6 +5570,10 @@ def _plan_literature_families(
             "packet_source_ids",
             "requested_collection_keys",
             "coverage_completion_status",
+            "plan_status",
+            "unaccounted_source_ids",
+            "failed_packet_ids",
+            "reconciliation_warnings",
         )
     }
     if (read_yaml(receipt_path, {}) or {}) != receipt:
@@ -5283,6 +5591,14 @@ def _plan_literature_families(
             "lean_index_hash",
             "requested_collection_keys",
             "coverage_completion_status",
+            "plan_status",
+            "unaccounted_source_ids",
+            "failed_packet_ids",
+            "reconciliation_warnings",
+            "source_dispositions",
+            "primary_routes",
+            "secondary_routes",
+            "planning_jobs",
         )
     }
     if (read_yaml(plan_path, {}) or {}) != persisted_plan:
@@ -5290,6 +5606,239 @@ def _plan_literature_families(
     result["receipt_path"] = str(receipt_path)
     result["plan_path"] = str(plan_path)
     return result
+
+
+def _namespace_literature_family_plan(
+    response: Mapping[str, Any], packet_id: str
+) -> dict[str, Any]:
+    """Prevent unrelated provider-local IDs from colliding across packets."""
+
+    family_ids = {
+        str(row.get("family_id") or ""): f"{packet_id}:{row.get('family_id')}"
+        for row in response.get("literature_families", []) or []
+        if isinstance(row, Mapping) and row.get("family_id")
+    }
+    return {
+        **dict(response),
+        "literature_families": [
+            {
+                **dict(row),
+                "family_id": family_ids.get(
+                    str(row.get("family_id") or ""),
+                    str(row.get("family_id") or ""),
+                ),
+            }
+            for row in response.get("literature_families", []) or []
+            if isinstance(row, Mapping)
+        ],
+        "discovery_jobs": [
+            {
+                **dict(row),
+                "job_id": f"{packet_id}:{row.get('job_id')}",
+                "family": family_ids.get(
+                    str(row.get("family") or ""),
+                    str(row.get("family") or ""),
+                ),
+            }
+            for row in response.get("discovery_jobs", []) or []
+            if isinstance(row, Mapping) and row.get("job_id")
+        ],
+        "neighboring_families": [
+            {
+                **dict(row),
+                "left_family_id": family_ids.get(
+                    str(row.get("left_family_id") or ""),
+                    str(row.get("left_family_id") or ""),
+                ),
+                "right_family_id": family_ids.get(
+                    str(row.get("right_family_id") or ""),
+                    str(row.get("right_family_id") or ""),
+                ),
+            }
+            for row in response.get("neighboring_families", []) or []
+            if isinstance(row, Mapping)
+        ],
+        "source_dispositions": [
+            {
+                **dict(row),
+                "family_ids": [
+                    family_ids.get(str(value), str(value))
+                    for value in row.get("family_ids", []) or []
+                ],
+            }
+            for row in response.get("source_dispositions", []) or []
+            if isinstance(row, Mapping)
+        ],
+    }
+
+
+def _reconcile_overlapping_family_cards(
+    plan: Mapping[str, Any],
+    *,
+    request: LiteratureMapRequest,
+    reasoner: LiteratureReasoner,
+    reasoner_calls: _CheckpointedReasonerCalls,
+) -> tuple[dict[str, Any], list[str]]:
+    """Probabilistically merge only bounded families sharing source members."""
+
+    capabilities = dict(getattr(reasoner, "capabilities", {}) or {})
+    if not capabilities.get("supports_family_card_reconciliation"):
+        return dict(plan), []
+
+    families = {
+        str(row.get("family_id") or ""): dict(row)
+        for row in plan.get("literature_families", []) or []
+        if isinstance(row, Mapping) and row.get("family_id")
+    }
+    by_source: dict[str, set[str]] = defaultdict(set)
+    for family_id, row in families.items():
+        for source_id in row.get("source_ids", []) or []:
+            by_source[str(source_id)].add(family_id)
+    neighbors = {
+        family_id: set() for family_id in families
+    }
+    for family_ids in by_source.values():
+        for family_id in family_ids:
+            neighbors[family_id].update(family_ids - {family_id})
+    components: list[list[str]] = []
+    unseen = set(families)
+    while unseen:
+        root = min(unseen)
+        pending = [root]
+        component: set[str] = set()
+        while pending:
+            family_id = pending.pop()
+            if family_id in component:
+                continue
+            component.add(family_id)
+            pending.extend(neighbors.get(family_id, set()) - component)
+        unseen -= component
+        if len(component) > 1:
+            components.append(sorted(component))
+    warnings: list[str] = []
+    replacements: dict[str, dict[str, Any]] = {}
+    superseded: set[str] = set()
+    for component in components:
+        cards = [
+            {
+                "source_id": family_id,
+                "title": str(families[family_id].get("label") or family_id),
+                "thesis": str(
+                    families[family_id].get("organizing_problem") or ""
+                ),
+                "method": "compact literature-family card",
+                "scope": "family_card",
+                "facets": {},
+            }
+            for family_id in component
+        ]
+        context = {
+            "planning_mode": "family_card_reconciliation",
+            "required_source_ids": component,
+            "existing_family_cards": [families[value] for value in component],
+            "collections": [],
+            "planning_jobs": [],
+        }
+        fits = getattr(reasoner, "literature_family_plan_fits", None)
+        if callable(fits) and not fits(cards, request, context=context):
+            warnings.append("context:" + stable_hash(component)[:16])
+            continue
+        try:
+            response = reasoner_calls(
+                "literature_family_plan",
+                "family-reconciliation-" + stable_hash(component)[:16],
+                "plan_literature_families",
+                cards,
+                context,
+            )
+        except Exception as exc:
+            warnings.append(type(exc).__name__ + ":" + stable_hash(component)[:16])
+            continue
+        for raw in response.get("literature_families", []) or []:
+            if not isinstance(raw, Mapping):
+                continue
+            merged_ids = sorted(
+                {
+                    str(value)
+                    for value in raw.get("source_ids", []) or []
+                    if str(value) in component
+                }
+            )
+            if len(merged_ids) < 2:
+                continue
+            merged_sources = sorted(
+                {
+                    str(source_id)
+                    for family_id in merged_ids
+                    for source_id in families[family_id].get("source_ids", []) or []
+                }
+            )
+            merged_id = "family-reconciled-" + stable_hash(merged_ids)[:16]
+            replacements[merged_id] = {
+                "family_id": merged_id,
+                "label": str(raw.get("label") or merged_id),
+                "organizing_problem": str(
+                    raw.get("organizing_problem") or ""
+                ),
+                "source_ids": merged_sources,
+                "proposed_roles": {
+                    source_id: next(
+                        (
+                            str(
+                                families[family_id]
+                                .get("proposed_roles", {})
+                                .get(source_id)
+                                or ""
+                            )
+                            for family_id in merged_ids
+                            if source_id
+                            in (families[family_id].get("proposed_roles", {}) or {})
+                        ),
+                        "supporting",
+                    )
+                    for source_id in merged_sources
+                },
+                "candidate_cluster": any(
+                    bool(families[family_id].get("candidate_cluster", True))
+                    for family_id in merged_ids
+                ),
+                "supersedes_family_ids": merged_ids,
+            }
+            superseded.update(merged_ids)
+    final_families = {
+        family_id: row
+        for family_id, row in families.items()
+        if family_id not in superseded
+    }
+    final_families.update(replacements)
+    family_replacements = {
+        old_id: new_id
+        for new_id, row in replacements.items()
+        for old_id in row.get("supersedes_family_ids", []) or []
+    }
+    dispositions = []
+    for raw in plan.get("source_dispositions", []) or []:
+        if not isinstance(raw, Mapping):
+            continue
+        row = dict(raw)
+        row["family_ids"] = sorted(
+            {
+                family_replacements.get(str(value), str(value))
+                for value in row.get("family_ids", []) or []
+                if family_replacements.get(str(value), str(value)) in final_families
+            }
+        )
+        dispositions.append(row)
+    return (
+        {
+            **dict(plan),
+            "literature_families": [
+                final_families[key] for key in sorted(final_families)
+            ],
+            "source_dispositions": dispositions,
+        },
+        warnings,
+    )
 
 
 def _merge_literature_family_plans(
@@ -5343,10 +5892,28 @@ def _merge_literature_family_plans(
         )
         if pair[0] in families and pair[1] in families and pair[0] != pair[1]:
             neighbors.setdefault(pair, dict(row))
+    dispositions: dict[str, dict[str, Any]] = {}
+    for raw in [
+        *(primary.get("source_dispositions", []) or []),
+        *(additions.get("source_dispositions", []) or []),
+    ]:
+        if not isinstance(raw, Mapping) or not raw.get("source_id"):
+            continue
+        row = dict(raw)
+        source_id = str(row["source_id"])
+        current = dispositions.get(source_id)
+        rank = {"pending": 0, "overlap": 1, "currently_unclustered": 2, "assigned": 3}
+        if current is None or rank.get(str(row.get("disposition") or ""), 0) > rank.get(
+            str(current.get("disposition") or ""), 0
+        ):
+            dispositions[source_id] = row
     return {
         "literature_families": [families[key] for key in sorted(families)],
         "discovery_jobs": [jobs[key] for key in sorted(jobs)],
         "neighboring_families": [neighbors[key] for key in sorted(neighbors)],
+        "source_dispositions": [
+            dispositions[key] for key in sorted(dispositions)
+        ],
     }
 
 
@@ -5362,10 +5929,14 @@ def _lean_family_plan_chunks(
     for raw in rows:
         row = dict(raw)
         candidate = [*current, row]
+        candidate_ids = {
+            str(value.get("source_id") or "") for value in candidate
+        }
+        candidate_context = _family_packet_context(context, candidate_ids)
         candidate_fits = (
-            bool(fits(candidate, request, context=context))
+            bool(fits(candidate, request, context=candidate_context))
             if callable(fits)
-            else _reasoner_packet_chars(candidate, context)
+            else _reasoner_packet_chars(candidate, candidate_context)
             <= 1_200_000
         )
         if current and not candidate_fits:
@@ -5376,11 +5947,67 @@ def _lean_family_plan_chunks(
     if current:
         chunks.append(current)
     if any(
-        callable(fits) and not fits(chunk, request, context=context)
+        callable(fits)
+        and not fits(
+            chunk,
+            request,
+            context=_family_packet_context(
+                context,
+                {str(row.get("source_id") or "") for row in chunk},
+            ),
+        )
         for chunk in chunks
     ):
         raise ValueError("one complete lean index record exceeds the planning context")
     return chunks
+
+
+def _family_packet_context(
+    context: Mapping[str, Any], source_ids: set[str]
+) -> dict[str, Any]:
+    """Return only routing context owned by one bounded planning packet."""
+
+    packet = {
+        key: value
+        for key, value in context.items()
+        if key
+        not in {
+            "collections",
+            "planning_jobs",
+            "required_source_ids",
+            "existing_family_cards",
+        }
+    }
+    packet["required_source_ids"] = sorted(source_ids)
+    packet["collections"] = [
+        dict(row)
+        for row in context.get("collections", []) or []
+        if isinstance(row, Mapping)
+        and source_ids.intersection(row.get("source_ids", []) or [])
+    ]
+    packet["planning_jobs"] = [
+        {
+            **dict(row),
+            "source_ids": sorted(
+                source_ids.intersection(row.get("source_ids", []) or [])
+            ),
+            "required_source_ids": sorted(
+                source_ids.intersection(
+                    row.get("required_source_ids", []) or []
+                )
+            ),
+        }
+        for row in context.get("planning_jobs", []) or []
+        if isinstance(row, Mapping)
+        and source_ids.intersection(row.get("source_ids", []) or [])
+    ]
+    packet["existing_family_cards"] = [
+        dict(row)
+        for row in context.get("existing_family_cards", []) or []
+        if isinstance(row, Mapping)
+        and source_ids.intersection(row.get("source_ids", []) or [])
+    ]
+    return packet
 
 
 def _validate_literature_family_plan(
@@ -5401,6 +6028,7 @@ def _validate_literature_family_plan(
     raw_families = response.get("literature_families")
     raw_jobs = response.get("discovery_jobs")
     raw_neighbors = response.get("neighboring_families", [])
+    raw_dispositions = response.get("source_dispositions", [])
     if not isinstance(raw_families, list) or not isinstance(raw_jobs, list):
         raise ValueError("literature family plan requires family and discovery lists")
     if not isinstance(raw_neighbors, list):
@@ -5556,10 +6184,69 @@ def _validate_literature_family_plan(
         and str(row.get("left_family_id") or "")
         != str(row.get("right_family_id") or "")
     ]
+    assigned_by_source: dict[str, list[str]] = defaultdict(list)
+    for family in families:
+        for source_id in family.get("source_ids", []) or []:
+            assigned_by_source[str(source_id)].append(str(family["family_id"]))
+    declared: dict[str, dict[str, Any]] = {}
+    if isinstance(raw_dispositions, list):
+        for raw in raw_dispositions:
+            if not isinstance(raw, Mapping):
+                continue
+            source_id = str(raw.get("source_id") or "")
+            disposition = str(raw.get("disposition") or "")
+            if source_id not in available or disposition not in {
+                "assigned",
+                "currently_unclustered",
+                "overlap",
+            }:
+                continue
+            declared[source_id] = {
+                "source_id": source_id,
+                "disposition": disposition,
+                "family_ids": sorted(
+                    {
+                        str(value)
+                        for value in raw.get("family_ids", []) or []
+                        if str(value) in family_ids
+                    }
+                ),
+                "reason": str(raw.get("reason") or "").strip(),
+            }
+    source_dispositions: list[dict[str, Any]] = []
+    for source_id in sorted(available):
+        if assigned_by_source.get(source_id):
+            source_dispositions.append(
+                {
+                    "source_id": source_id,
+                    "disposition": "assigned",
+                    "family_ids": sorted(set(assigned_by_source[source_id])),
+                    "reason": str(declared.get(source_id, {}).get("reason") or ""),
+                }
+            )
+        elif declared.get(source_id, {}).get("disposition") == "currently_unclustered":
+            source_dispositions.append(declared[source_id])
+        else:
+            source_dispositions.append(
+                {
+                    "source_id": source_id,
+                    "disposition": "pending",
+                    "family_ids": [],
+                    "reason": "planning_packet_did_not_account_for_source",
+                }
+            )
+    unaccounted = [
+        row["source_id"]
+        for row in source_dispositions
+        if row["disposition"] == "pending"
+    ]
     return {
         "literature_families": families,
         "discovery_jobs": jobs,
         "neighboring_families": neighbors,
+        "source_dispositions": source_dispositions,
+        "plan_status": "partial" if unaccounted else "complete",
+        "unaccounted_source_ids": unaccounted,
     }
 
 
@@ -5596,7 +6283,6 @@ def _relationship_adjudication_identity(
     provider: str,
     model: str,
     decision_contract: str,
-    atomic_note_hashes: Mapping[str, str],
 ) -> tuple[str, str]:
     policy_identity = stable_hash(
         {"relationship_semantic_policy": _RELATIONSHIP_SEMANTIC_POLICY_VERSION}
@@ -5612,7 +6298,6 @@ def _relationship_adjudication_identity(
                     RELATIONSHIP_DECISION_NORMALIZATION_VERSION
                 ),
                 "semantic_policy_identity": policy_identity,
-                "atomic_note_hashes": dict(sorted(atomic_note_hashes.items())),
             }
         ),
         policy_identity,
@@ -5736,6 +6421,7 @@ def _run_relationship_reasoning(
     reasoner_calls: _CheckpointedReasonerCalls | None,
     request: LiteratureMapRequest,
     shared_family_plan: Mapping[str, Any] | None = None,
+    note_rows: Sequence[Mapping[str, Any]] | None = None,
     frozen_pair_jobs: Sequence[RelationshipPairJob] | None = None,
     require_reused_discovery: bool = False,
     verify_reuse_only: bool = False,
@@ -5785,34 +6471,12 @@ def _run_relationship_reasoning(
         }
     note_row_by_source = {
         str(row.get("source_id") or ""): row
-        for row in all_workspace_note_rows(workspace)
+        for row in (
+            note_rows if note_rows is not None else all_workspace_note_rows(workspace)
+        )
         if row.get("source_id") and row.get("note_path")
     }
     atomic_note_by_source: dict[str, dict[str, str]] = {}
-    for source_id, profile in profile_by_source.items():
-        profile_row = profile_to_dict(profile)
-        context = (
-            profile_row.get("context")
-            if isinstance(profile_row.get("context"), Mapping)
-            else {}
-        )
-        raw_path = str(
-            note_row_by_source.get(source_id, {}).get("note_path")
-            or context.get("note_path")
-            or ""
-        )
-        note_path = Path(raw_path)
-        if raw_path and not note_path.is_absolute():
-            note_path = workspace / note_path
-        if not raw_path or not note_path.is_file():
-            continue
-        internal_text = internal_note_text(note_path)
-        _frontmatter, semantic_body = source_note_semantic_components(internal_text)
-        atomic_note_by_source[source_id] = {
-            "source_id": source_id,
-            "semantic_hash": semantic_note_hash(internal_text),
-            "markdown": semantic_body.strip(),
-        }
     catalogue_payload = read_yaml(Path(str(catalogue["catalogue_path"])), {}) or {}
     available_catalogue_ids = {
         str(row.get("source_id") or "")
@@ -6008,16 +6672,11 @@ def _run_relationship_reasoning(
     discovery_identity = _relationship_discovery_identity(
         relationship_provider, relationship_model
     )
-    current_atomic_hashes = {
-        source_id: str(row.get("semantic_hash") or "")
-        for source_id, row in sorted(atomic_note_by_source.items())
-    }
     adjudication_identity, relationship_policy_identity = (
         _relationship_adjudication_identity(
             relationship_provider,
             relationship_model,
             decision_contract,
-            current_atomic_hashes,
         )
     )
     selection_identity = discovery_identity
@@ -6212,6 +6871,7 @@ def _run_relationship_reasoning(
     }
     visible_pairs: set[tuple[str, str]] = set()
     inactive_accepted_pairs: set[tuple[str, str]] = set()
+    stale_accepted_pairs: set[tuple[str, str]] = set()
     for row in registry.get("current_pair_decisions", []) or []:
         if not isinstance(row, Mapping) or str(row.get("status") or "") not in {
             "accepted",
@@ -6222,12 +6882,32 @@ def _run_relationship_reasoning(
         if len(pair_values) != 2:
             continue
         pair = canonical_pair(str(pair_values[0]), str(pair_values[1]))
-        if active_relation_ids & {
+        input_hashes = dict(row.get("input_profile_hashes", {}) or {})
+        fresh = all(
+            str(input_hashes.get(source_id) or "")
+            == str(current_hashes.get(source_id) or "")
+            for source_id in pair
+        ) and str(row.get("provider") or "") == relationship_provider and str(
+            row.get("model") or ""
+        ) == relationship_model
+        current_relation_ids = {
             str(value) for value in row.get("relation_ids", []) or []
-        }:
+        }
+        if fresh and active_relation_ids & current_relation_ids:
             visible_pairs.add(pair)
-        else:
+        elif fresh:
             inactive_accepted_pairs.add(pair)
+        elif active_relation_ids & current_relation_ids:
+            stale_accepted_pairs.add(pair)
+    for pair in sorted(stale_accepted_pairs):
+        mandatory_basis[pair].append(
+            {
+                "discovery_route": "changed_endpoint_relationship_refresh",
+                "reason": "An active relationship endpoint profile changed.",
+                "mandatory": True,
+                "refresh_pending": True,
+            }
+        )
     negative_pairs: set[tuple[str, str]] = set()
     for row in prior_decisions:
         if (
@@ -6286,11 +6966,6 @@ def _run_relationship_reasoning(
             negative_pairs.add(pair)
     for pair in negative_pairs:
         mandatory_basis.pop(pair, None)
-    if shared_plan_active:
-        # Structural citations remain visible without consuming full-note
-        # adjudication capacity. The shared plan chooses which pairs merit it.
-        mandatory_basis.clear()
-
     configured_max_calls = getattr(reasoner_calls, "max_calls", None)
     remaining_calls = (
         None
@@ -6512,8 +7187,6 @@ def _run_relationship_reasoning(
     bridge_capacity = inferred_capacity
     discovery_completed = False
     discovery_terminal = False
-    if shared_plan_active and not requires_routing:
-        can_discover = False
     if can_discover and requires_routing:
         selected_collection_source_ids = set(profile_by_source)
         if collection_cards:
@@ -6670,7 +7343,7 @@ def _run_relationship_reasoning(
     candidate_tasks: list[
         tuple[str, str, Sequence[Any], dict[str, Any], str]
     ] = []
-    if can_discover and general_capacity:
+    if can_discover and general_capacity and not shared_plan_active:
         discovery_source_ids = {
             str(row.get("source_id") or "")
             for row in discovery_entries
@@ -7115,7 +7788,6 @@ def _run_relationship_reasoning(
                 if job["requested_collection_pair"]
                 else complement_jobs
             ).append(job)
-        candidate_tasks = []
         family_rows = {
             str(row.get("family_id") or ""): dict(row)
             for row in shared_family_plan.get("literature_families", []) or []
@@ -7439,9 +8111,13 @@ def _run_relationship_reasoning(
                 and jobs
                 and set(outcomes) != expected_job_ids
             ):
-                raise ValueError(
-                    "built-in discovery must account for every supplied job"
-                )
+                # Candidate rows are independently useful and must survive a
+                # malformed optional packet-accounting envelope.  Keep the job
+                # partial so resume can complete its accounting.
+                response = {
+                    **dict(response),
+                    "accounting_warning": "missing_or_invalid_job_outcomes",
+                }
             if jobs and not outcomes and not built_in_deepseek:
                 inferred_status = (
                     "completed"
@@ -8209,6 +8885,36 @@ def _run_relationship_reasoning(
 
     selected_candidates = _selected_candidate_rows(candidate_by_pair)
     selected_candidate_pool_hash = stable_hash(selected_candidates)
+    if frozen_pair_jobs is None:
+        selected_source_ids = {
+            source_id for pair in candidate_by_pair for source_id in pair
+        }
+        for source_id in sorted(selected_source_ids):
+            profile_row = profile_to_dict(profile_by_source[source_id])
+            context = (
+                profile_row.get("context")
+                if isinstance(profile_row.get("context"), Mapping)
+                else {}
+            )
+            raw_path = str(
+                note_row_by_source.get(source_id, {}).get("note_path")
+                or context.get("note_path")
+                or ""
+            )
+            note_path = Path(raw_path)
+            if raw_path and not note_path.is_absolute():
+                note_path = workspace / note_path
+            if not raw_path or not note_path.is_file():
+                continue
+            internal_text = internal_note_text(note_path)
+            _frontmatter, semantic_body = source_note_semantic_components(
+                internal_text
+            )
+            atomic_note_by_source[source_id] = {
+                "source_id": source_id,
+                "semantic_hash": semantic_note_hash(internal_text),
+                "markdown": semantic_body.strip(),
+            }
 
     run_id = str(getattr(reasoner_calls, "run_id", "") or "")
     job_root = (
@@ -9913,6 +10619,88 @@ def _write_relationship_run_ledger(
     return path
 
 
+def _write_cross_boundary_ledger(
+    workspace: Path,
+    *,
+    family_plan: Mapping[str, Any] | None,
+    relationship_result: Mapping[str, Any],
+) -> Path:
+    """Persist compact routing/accounting references without graph payloads."""
+
+    family_plan = family_plan or {}
+    plan_path = str(family_plan.get("plan_path") or "")
+    payload = {
+        "ledger_schema_version": "1",
+        "family_plan_path": plan_path,
+        "family_plan_hash": stable_hash(
+            {
+                "planning_identity": family_plan.get("planning_identity", ""),
+                "lean_index_hash": family_plan.get("lean_index_hash", ""),
+                "plan_status": family_plan.get("plan_status", ""),
+            }
+        ),
+        "planning_routes": [
+            {
+                "route_id": str(row.get("route_id") or ""),
+                "route_type": str(row.get("route_type") or ""),
+                "source_count": len(row.get("source_ids", []) or []),
+                "source_list_hash": stable_hash(
+                    sorted(str(value) for value in row.get("source_ids", []) or [])
+                ),
+                "source_list_path": plan_path,
+            }
+            for row in family_plan.get("planning_jobs", []) or []
+            if isinstance(row, Mapping)
+        ],
+        "discovery_jobs": [
+            {
+                key: row.get(key)
+                for key in (
+                    "bridge_job_id",
+                    "status",
+                    "packet_status",
+                    "valid_unique_candidates",
+                    "distinct_left_endpoints",
+                    "distinct_right_endpoints",
+                    "explicit_no_more_candidates",
+                    "accounting_warning",
+                )
+                if row.get(key) not in (None, "")
+            }
+            for row in relationship_result.get(
+                "relationship_discovery_jobs", []
+            )
+            or []
+            if isinstance(row, Mapping)
+        ],
+        "accepted_relationship_ids": sorted(
+            {
+                str(row.get("relation_id") or row.get("connection_id") or "")
+                for row in relationship_result.get("accepted", []) or []
+                if isinstance(row, Mapping)
+                and (row.get("relation_id") or row.get("connection_id"))
+            }
+        ),
+        "no_relationship_job_ids": sorted(
+            {
+                str(row.get("pair_job_id") or "")
+                for row in relationship_result.get("no_relationship", []) or []
+                if isinstance(row, Mapping) and row.get("pair_job_id")
+            }
+        ),
+        "pending_job_ids": list(
+            relationship_result.get(
+                "relationship_discovery_incomplete_jobs", []
+            )
+            or []
+        ),
+    }
+    path = workspace / "02_source_memory" / "indexes" / "cross_boundary_ledger.yml"
+    if (read_yaml(path, {}) or {}) != payload:
+        write_yaml(path, payload)
+    return path
+
+
 
 
 def _relationship_event_id(event_type: str, row: Mapping[str, Any]) -> str:
@@ -10003,6 +10791,22 @@ def _project_atomic_graph(
         dict(profile) if isinstance(profile, Mapping) else profile_to_dict(profile)
         for profile in profiles
     ]
+    profile_by_source = {
+        str(row.get("source_id") or ""): row
+        for row in profile_rows
+        if row.get("source_id")
+    }
+    relations_by_source: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for relation in relations:
+        if not isinstance(relation, Mapping) or not bool(
+            relation.get("active", True)
+        ):
+            continue
+        for source_id in {
+            str(relation.get("source_id") or ""),
+            str(relation.get("target_source_id") or ""),
+        } - {""}:
+            relations_by_source[source_id].append(relation)
     note_stem_by_id = {
         str(row.get("note_id") or ""): Path(str(row.get("note_path") or "")).stem
         for row in note_rows
@@ -10058,6 +10862,15 @@ def _project_atomic_graph(
             continue
         note_id = str(row.get("note_id") or "")
         source_id = str(row.get("source_id") or "")
+        incident_relations = relations_by_source.get(source_id, [])
+        incident_source_ids = {
+            source_id,
+            *(
+                str(relation.get(field) or "")
+                for relation in incident_relations
+                for field in ("source_id", "target_source_id")
+            ),
+        } - {""}
         related_links = [
             {
                 "relation_id": str(link.get("relation_id") or ""),
@@ -10073,8 +10886,12 @@ def _project_atomic_graph(
             }
             for link in projected_related_links(
                 source_id,
-                profile_rows,
-                relations,
+                [
+                    profile_by_source[value]
+                    for value in sorted(incident_source_ids)
+                    if value in profile_by_source
+                ],
+                incident_relations,
                 max_inferred_links=int(
                     getattr(
                         navigation_policy,
@@ -10638,6 +11455,18 @@ def rebuild_map(
             reasoner_calls=reasoner_calls,
             request=base_literature_request,
         )
+        family_plan_partial_reason = (
+            "literature_family_plan_partial:"
+            + ",".join(
+                str(value)
+                for value in shared_family_plan.get(
+                    "unaccounted_source_ids", []
+                )[:20]
+            )
+            if shared_family_plan
+            and str(shared_family_plan.get("plan_status") or "") == "partial"
+            else ""
+        )
         relationship_result = _run_relationship_reasoning(
             workspace,
             profiles=workspace_profiles,
@@ -10647,6 +11476,7 @@ def rebuild_map(
             reasoner_calls=reasoner_calls,
             request=base_literature_request,
             shared_family_plan=shared_family_plan,
+            note_rows=full_workspace_note_rows,
         )
     except Exception as exc:
         failure_reason = (
@@ -10678,6 +11508,13 @@ def rebuild_map(
     relationship_ledger_path = _write_relationship_run_ledger(
         workspace, run_id, relationship_result
     )
+    cross_boundary_ledger_path = _write_cross_boundary_ledger(
+        workspace,
+        family_plan=(
+            shared_family_plan if "shared_family_plan" in locals() else None
+        ),
+        relationship_result=relationship_result,
+    )
     if progress is not None:
         progress.update_literature(
             relationship_stage_wall_seconds=float(
@@ -10700,11 +11537,9 @@ def rebuild_map(
         parked_rows=relationship_result.get("parked", []) or [],
         preserve_unmentioned_structural=False,
         orphaned_source_ids=orphaned_source_ids,
-        reconcile_machine_prompt_version=(
-            None
-            if relationship_result.get("planning_failed")
-            else RELATIONSHIP_PROMPT_VERSION
-        ),
+        # Prompt identity is provenance for new or refreshed pair decisions,
+        # not a global retirement trigger for still-valid earlier decisions.
+        reconcile_machine_prompt_version=None,
     )
     global_source_set["rejected_pair_memory"] = [
         {
@@ -10723,14 +11558,6 @@ def rebuild_map(
         )
         == "no_relationship"
     ]
-    graph_note_paths = _project_atomic_graph(
-        workspace,
-        note_rows=full_workspace_note_rows,
-        profiles=full_workspace_profiles,
-        relations=typed.get("links", []) or [],
-        navigation=navigation,
-        navigation_policy=effective_request.navigation_policy,
-    )
     selection_state_path = _commit_relationship_selection_state(
         workspace,
         relationship_result,
@@ -10748,7 +11575,7 @@ def rebuild_map(
         Path(catalogue["cluster_index_path"]),
         *(Path(path) for path in catalogue.get("shard_paths", []) or []),
         relationship_ledger_path,
-        *graph_note_paths,
+        cross_boundary_ledger_path,
         *([duplicate_issue_path] if duplicate_issue_path is not None else []),
         *([selection_state_path] if selection_state_path is not None else []),
     ]
@@ -10771,6 +11598,15 @@ def rebuild_map(
                 global_map_id,
                 reason,
             )
+        )
+        partial_note_paths = _project_atomic_graph(
+            workspace,
+            note_rows=full_workspace_note_rows,
+            profiles=full_workspace_profiles,
+            relations=typed.get("links", []) or [],
+            navigation=navigation,
+            navigation_policy=effective_request.navigation_policy,
+            clusters=preserved_clusters,
         )
         return {
             "source_set": dict(source_set),
@@ -10822,6 +11658,7 @@ def rebuild_map(
                 *profile_result["paths"],
                 *_existing_source_set_paths(workspace, source_set),
                 *refresh_paths,
+                *partial_note_paths,
             ],
         }
     literature_note_rows = list(workspace_note_rows)
@@ -10867,6 +11704,7 @@ def rebuild_map(
                 *list(catalogue_payload.get("shards", []) or []),
                 *list(catalogue_payload.get("virtual_shards", []) or []),
             ],
+            prebuilt_navigation=navigation,
         )
         acquisition_ledger_path = _reconcile_cluster_acquisition_recommendations(
             workspace,
@@ -10885,6 +11723,15 @@ def rebuild_map(
                 global_map_id,
                 reason,
             )
+        )
+        partial_note_paths = _project_atomic_graph(
+            workspace,
+            note_rows=full_workspace_note_rows,
+            profiles=full_workspace_profiles,
+            relations=typed.get("links", []) or [],
+            navigation=navigation,
+            navigation_policy=effective_request.navigation_policy,
+            clusters=preserved_clusters,
         )
         synthesis_calls = int(
             getattr(reasoner_calls, "cumulative_provider_calls", 0) or 0
@@ -10953,6 +11800,7 @@ def rebuild_map(
                 *profile_result["paths"],
                 *_existing_source_set_paths(workspace, source_set),
                 *refresh_paths,
+                *partial_note_paths,
             ],
         }
     navigation = (
@@ -10975,15 +11823,6 @@ def rebuild_map(
             *(navigation.get("typed_relations", []) or []),
             *citation_relations,
             *alias_relations,
-            *(
-                build_navigation_projection(
-                    workspace,
-                    workspace_profiles,
-                    workspace_note_rows,
-                    navigation_policy=effective_request.navigation_policy,
-                ).get("typed_relations", [])
-                or []
-            ),
             *_cluster_membership_relations(
                 cluster_map.get("clusters", []) or [],
                 workspace_profiles,
@@ -11126,13 +11965,9 @@ def rebuild_map(
         for cluster in cluster_map.get("clusters", []) or []
         if isinstance(cluster, Mapping) and cluster.get("cluster_id")
     }
-    catalogue = build_source_catalogue(
+    catalogue = update_catalogue_clusters(
         workspace,
-        full_workspace_profiles,
-        full_workspace_note_rows,
         catalogue_clusters.values(),
-        collection_snapshot=collection_snapshot,
-        identity_projection=identity_projection,
     )
     note_paths = _project_atomic_graph(
         workspace,
@@ -11249,7 +12084,11 @@ def rebuild_map(
     }
     partial_reasons = [
         reason
-        for reason in (profile_partial_reason, synthesis_partial_reason)
+        for reason in (
+            profile_partial_reason,
+            family_plan_partial_reason,
+            synthesis_partial_reason,
+        )
         if reason
     ]
     if partial_reasons:
@@ -11348,6 +12187,40 @@ def _build_profiles_for_map(
         mechanically_upgraded = False
         if profile is not None:
             checkpoint_hit = 1
+            cached_context = dict(getattr(profile, "context", {}) or {})
+            cached_validation = validate_profile(
+                profile,
+                require_substantive=analytical,
+            )
+            if (
+                cached_validation.passed
+                and bool(row.get("validation_passed", True))
+                and not str(getattr(profile, "exclusion_reason", "") or "").startswith(
+                    "profile_or_note_validation_failed:"
+                )
+                and not cached_context.get("lazy_reprofile_required")
+                and not cached_context.get("profile_retry_terminal")
+            ):
+                profile_path = profile_sidecar_path(profiles_dir, note_id)
+                checkpoint_path = (
+                    literature_state
+                    / "profile_calls"
+                    / f"{slugify(note_id, fallback='profile')}.yml"
+                )
+                return {
+                    "index": index,
+                    "profile": profile,
+                    "paths": [
+                        candidate
+                        for candidate in (profile_path, checkpoint_path)
+                        if candidate.exists()
+                    ],
+                    "checkpoint_hit": 1,
+                    "failure": 0,
+                    "excluded": bool(
+                        getattr(profile, "excluded_from_synthesis", False)
+                    ),
+                }
         else:
             sidecar = profile_sidecar_path(profiles_dir, note_id)
             if sidecar.exists():
@@ -12001,6 +12874,21 @@ def _write_profile_packets(
     progress: _RunProgress | None,
 ) -> dict[str, Any]:
     profile_payloads = [profile_to_dict(profile) for profile in profiles]
+    profile_references = {
+        str(row.get("note_id") or ""): {
+            "source_id": str(row.get("source_id") or ""),
+            "note_id": str(row.get("note_id") or ""),
+            "profile_hash": str(row.get("dependency_hash") or ""),
+            "path": str(
+                profile_sidecar_path(
+                    literature_state.parents[3] / "02_source_memory" / "profiles",
+                    str(row.get("note_id") or ""),
+                ).relative_to(literature_state.parents[3])
+            ),
+        }
+        for row in profile_payloads
+        if row.get("note_id")
+    }
     configured_context = int(getattr(reasoner, "context_window_tokens", 0) or 0)
     if configured_context <= 0:
         configured_context = (
@@ -12063,7 +12951,11 @@ def _write_profile_packets(
             "context_fraction": request.literature_policy.deepseek_packet_context_fraction,
             "max_packet_characters": max_chars,
             "profile_count": len(packet_profiles),
-            "profiles": packet_profiles,
+            "profile_references": [
+                profile_references[str(row.get("note_id") or "")]
+                for row in packet_profiles
+                if str(row.get("note_id") or "") in profile_references
+            ],
             "merge_required": len(packets) > 1,
         }
         existing = read_yaml(path, {}) or {}
@@ -13406,7 +14298,7 @@ def _acquire_content(
                 candidate = _content_candidate(
                     adequacy,
                     text=text,
-                    content_hash=sha256_text(text),
+                    content_hash=_normalized_text_hash(text),
                     source_file=f"zotero://select/library/items/{target_key}",
                     content_route="zotero_fulltext",
                     media_type=effective_media_type,
@@ -14287,6 +15179,12 @@ def _fingerprint(
     return sha256_text(json.dumps(payload, sort_keys=True))
 
 
+def _normalized_text_hash(text: str) -> str:
+    """Hash semantic text independently of platform newline representation."""
+
+    return sha256_text(text.replace("\r\n", "\n").replace("\r", "\n"))
+
+
 def _prompt_metadata(item: Mapping[str, Any]) -> dict[str, Any]:
     metadata = item_data(item)
     return {
@@ -14414,13 +15312,24 @@ def _inventory_work_identity(
     )
     title = _normalized_match_text(str(data.get("title") or ""))
     item_type = str(data.get("itemType") or "").casefold()
-    if doi and title:
-        return ("doi", doi, title, item_type)
+    role = _work_identity_role(item_type)
+    if doi:
+        if role == "chapter":
+            surnames = tuple(_creator_surnames(list(data.get("creators", []) or [])))
+            year_match = re.search(r"(?:19|20)\d{2}", str(data.get("date") or ""))
+            return (
+                "doi_chapter",
+                doi,
+                title,
+                *surnames,
+                year_match.group(0) if year_match else "",
+            )
+        return ("doi", doi, role)
     isbn = _normalized_strong_identifier(
         str(data.get("ISBN") or data.get("isbn") or "")
     )
-    if isbn and title:
-        return ("isbn", isbn, title, item_type)
+    if isbn and title and role == "container":
+        return ("isbn", isbn, role)
     surnames = tuple(_creator_surnames(list(data.get("creators", []) or [])))
     year_match = re.search(r"(?:19|20)\d{2}", str(data.get("date") or ""))
     if title and surnames and year_match and item_type:
@@ -14434,6 +15343,15 @@ def _inventory_work_identity(
     return ("zotero_key", item_key(item).upper())
 
 
+def _work_identity_role(item_type: str) -> str:
+    value = str(item_type or "").casefold()
+    if value in {"booksection", "encyclopediaarticle", "dictionaryentry"}:
+        return "chapter"
+    if value in {"book", "editedbook", "conferenceproceedings"}:
+        return "container"
+    return "document"
+
+
 def _compatible_work_identity(
     item: Mapping[str, Any],
     candidate: Mapping[str, Any],
@@ -14441,11 +15359,15 @@ def _compatible_work_identity(
     data = item_data(item)
     item_title = _normalized_match_text(str(data.get("title") or ""))
     candidate_title = _normalized_match_text(str(candidate.get("title") or ""))
-    if not item_title or not candidate_title or item_title != candidate_title:
-        return False
     item_type = str(data.get("itemType") or "").casefold()
     candidate_type = str(candidate.get("item_type") or "").casefold()
-    return not item_type or not candidate_type or item_type == candidate_type
+    if _work_identity_role(item_type) != _work_identity_role(candidate_type):
+        return False
+    item_doi = _normalized_doi_identifier(str(data.get("DOI") or data.get("doi") or ""))
+    candidate_doi = _normalized_doi_identifier(str(candidate.get("doi") or ""))
+    if item_doi and candidate_doi and item_doi == candidate_doi:
+        return _work_identity_role(item_type) != "chapter" or item_title == candidate_title
+    return bool(item_title and candidate_title and item_title == candidate_title)
 
 
 def _existing_canonical_for_item(
@@ -14847,7 +15769,7 @@ def _reusable_note(
             == request.extraction_version,
             str(frontmatter.get("prompt_version", "")) == request.prompt_version,
             str(frontmatter.get("source_bundle_prompt_version", ""))
-            == SOURCE_BUNDLE_PROMPT_VERSION,
+            in {"5", SOURCE_BUNDLE_PROMPT_VERSION},
         )
     )
     if not reusable:
@@ -15060,7 +15982,7 @@ def _read_document(
     else:
         direct_limit = policy.direct_read_char_limit
         chunk_limit = policy.chunk_char_limit
-    document_hash = sha256_text(text)
+    document_hash = _normalized_text_hash(text)
     checkpoint_enabled = checkpoint_root is not None
     checkpoint_root = checkpoint_root or Path()
     source_chunk_output_tokens = max(

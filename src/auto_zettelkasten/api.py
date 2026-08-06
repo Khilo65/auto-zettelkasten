@@ -21,8 +21,13 @@ from .files import (
     write_yaml,
 )
 from .indexes import write_source_set
-from .literature import run_literature_map as run_profile_literature_map
-from .migration import migrate_workspace
+from .literature import (
+    CLUSTER_SYNTHESIS_PROMPT_VERSION,
+    LITERATURE_ALGORITHM_VERSION,
+    LITERATURE_FAMILY_PLAN_PROMPT_VERSION,
+    run_literature_map as run_profile_literature_map,
+)
+from .migration import finalize_v029_lean_state, migrate_workspace
 from .models import (
     ArtifactManifest,
     ExtractionPolicy,
@@ -37,6 +42,7 @@ from .models import (
 )
 from .obsidian import export_obsidian
 from .notes import source_id_for_item
+from .notes import item_key
 from .pipeline import (
     _RunProgress,
     _analytical_profile_source_ids,
@@ -55,7 +61,7 @@ from .ports import (
     VisionProvider,
     ZoteroClient,
 )
-from .readers import provider_from_name
+from .readers import DEEPSEEK_V4_FLASH_PRICING, provider_from_name
 from .relationships import (
     RELATIONSHIP_DISCOVERY_PROMPT_VERSION,
     RELATIONSHIP_PROMPT_VERSION,
@@ -93,6 +99,7 @@ __all__ = [
     "StatusReport",
     "build_map",
     "doctor",
+    "estimate_cost",
     "export_to_obsidian",
     "get_status",
     "initialize_workspace",
@@ -307,6 +314,219 @@ def inventory(
         "collection_snapshot": collection_snapshot,
         "artifact_manifest": manifest.to_dict(),
     }
+
+
+def estimate_cost(
+    workspace: Path | str,
+    *,
+    scope: str = "library",
+    collection_key: str = "",
+    provider: str = "deepseek",
+    model: str = "deepseek-v4-flash",
+    zotero_client: ZoteroClient | None = None,
+) -> dict[str, Any]:
+    """Estimate paid work from a read-only inventory and existing checkpoints."""
+
+    if scope not in {"library", "collection", "selected"}:
+        raise ValueError("scope must be library, collection, or selected")
+    client = zotero_client or ZoteroLocalClient()
+    items = [dict(row) for row in client.inventory(scope, collection_key or None)]
+    note_rows = all_workspace_note_rows(resolve_workspace(workspace))
+    existing_keys = {
+        str(row.get("zotero_item_key") or "").casefold()
+        for row in note_rows
+        if row.get("zotero_item_key")
+    }
+    new_items = [row for row in items if item_key(row).casefold() not in existing_keys]
+    aliases_or_reusable = len(items) - len(new_items)
+    if provider != "deepseek" or model != "deepseek-v4-flash":
+        pricing = {"status": "unknown", "reason": "provider_model_pricing_not_built_in"}
+        source_costs = {"low_usd": None, "expected_usd": None, "high_usd": None}
+    else:
+        # Conservative document-level envelope. Historical usage replaces this
+        # assumption in the persisted actual-cost reconciliation after a run.
+        rates = {
+            "input": float(
+                DEEPSEEK_V4_FLASH_PRICING["cache_miss_input_per_million"]
+            ),
+            "output": float(DEEPSEEK_V4_FLASH_PRICING["output_per_million"]),
+        }
+
+        def source_cost(input_tokens: int, output_tokens: int) -> float:
+            return round(
+                len(new_items)
+                * (input_tokens * rates["input"] + output_tokens * rates["output"])
+                / 1_000_000,
+                2,
+            )
+
+        source_costs = {
+            "low_usd": source_cost(8_000, 2_000),
+            "expected_usd": source_cost(35_000, 6_000),
+            "high_usd": source_cost(150_000, 16_000),
+        }
+        pricing = {
+            "status": "known",
+            "basis": "deepseek_v4_flash_cache_miss_rates",
+            "input_per_million": rates["input"],
+            "output_per_million": rates["output"],
+            "source": str(DEEPSEEK_V4_FLASH_PRICING["source"]),
+            "effective_date": str(
+                DEEPSEEK_V4_FLASH_PRICING["effective_date"]
+            ),
+        }
+    root = resolve_workspace(workspace)
+    profile_paths = list((root / "02_source_memory" / "profiles").glob("*.yml"))
+    analytical_profile_count = len(_analytical_profile_source_ids(note_rows))
+    profile_count = analytical_profile_count or len(profile_paths)
+    projected_profiles = profile_count + len(new_items)
+    compact_input_tokens = max(
+        1,
+        sum(path.stat().st_size for path in profile_paths if path.is_file()) // 4,
+    )
+    note_input_tokens = max(
+        1,
+        sum(
+            path.stat().st_size
+            for path in (root / "02_source_memory" / "notes").glob("*.md")
+            if path.is_file()
+        )
+        // 4,
+    )
+
+    def stage_calls(divisors: tuple[int, int, int]) -> dict[str, int]:
+        return {
+            bound: (
+                0
+                if projected_profiles < 2
+                else max(1, (projected_profiles + divisor - 1) // divisor)
+            )
+            for bound, divisor in zip(
+                ("low", "expected", "high"), divisors, strict=True
+            )
+        }
+
+    graph_call_components = {
+        "family_planning": stage_calls((500, 250, 125)),
+        "family_reconciliation": stage_calls((4_000, 2_000, 1_000)),
+        "bridge_routing": stage_calls((2_000, 1_000, 500)),
+        "candidate_discovery": stage_calls((1_000, 500, 200)),
+        "relationship_adjudication": stage_calls((400, 200, 48)),
+        "cluster_synthesis": stage_calls((160, 80, 40)),
+    }
+    graph_calls = {
+        bound: sum(int(stage[bound]) for stage in graph_call_components.values())
+        for bound in ("low", "expected", "high")
+    }
+    input_multipliers = {
+        "family_planning": (1.0, 1.4, 2.0),
+        "family_reconciliation": (0.02, 0.1, 0.25),
+        "bridge_routing": (0.05, 0.2, 0.5),
+        "candidate_discovery": (0.15, 0.5, 1.0),
+        "relationship_adjudication": (0.05, 0.2, 0.75),
+        "cluster_synthesis": (0.25, 0.75, 1.5),
+    }
+    output_tokens_per_call = {
+        "family_planning": (2_000, 5_000, 12_000),
+        "family_reconciliation": (2_000, 5_000, 12_000),
+        "bridge_routing": (1_000, 3_000, 8_000),
+        "candidate_discovery": (2_000, 8_000, 20_000),
+        "relationship_adjudication": (3_000, 10_000, 24_000),
+        "cluster_synthesis": (4_000, 14_000, 32_000),
+    }
+    full_note_stages = {"relationship_adjudication", "cluster_synthesis"}
+    bounds = ("low", "expected", "high")
+    graph_stage_estimates: dict[str, dict[str, dict[str, int | float | None]]] = {}
+    for stage, calls_by_bound in graph_call_components.items():
+        base_input = note_input_tokens if stage in full_note_stages else compact_input_tokens
+        graph_stage_estimates[stage] = {}
+        for index, bound in enumerate(bounds):
+            calls = calls_by_bound[bound]
+            input_tokens = int(base_input * input_multipliers[stage][index]) if calls else 0
+            output_tokens = calls * output_tokens_per_call[stage][index]
+            retries = 0 if bound != "high" else max(1, calls // 20) if calls else 0
+            usd = None
+            if provider == "deepseek" and model == "deepseek-v4-flash":
+                usd = round(
+                    (
+                        input_tokens * rates["input"]
+                        + output_tokens * rates["output"]
+                    )
+                    / 1_000_000,
+                    4,
+                )
+            graph_stage_estimates[stage][bound] = {
+                "calls": calls,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "retry_attempts": retries,
+                "usd": usd,
+            }
+    if provider != "deepseek" or model != "deepseek-v4-flash":
+        graph_costs = {"low_usd": None, "expected_usd": None, "high_usd": None}
+    else:
+        graph_costs = {
+            f"{bound}_usd": round(
+                sum(
+                    float(stage[bound]["usd"] or 0)
+                    for stage in graph_stage_estimates.values()
+                ),
+                2,
+            )
+            for bound in bounds
+        }
+    total_costs = {
+        key: (
+            None
+            if source_costs[key] is None or graph_costs[key] is None
+            else round(float(source_costs[key]) + float(graph_costs[key]), 2)
+        )
+        for key in ("low_usd", "expected_usd", "high_usd")
+    }
+    result = {
+        "status": "estimated",
+        "mode": (
+            "graph_only"
+            if projected_profiles and not new_items
+            else "incremental"
+            if existing_keys
+            else "bootstrap"
+        ),
+        "scope": scope,
+        "collection_key": collection_key,
+        "provider": provider,
+        "model": model,
+        "inventory_count": len(items),
+        "new_source_jobs": len(new_items),
+        "reusable_or_existing_records": aliases_or_reusable,
+        "source_calls": {
+            "low": len(new_items),
+            "expected": len(new_items),
+            "high": len(new_items) * 3,
+        },
+        "graph_calls": graph_calls,
+        "graph_call_components": graph_call_components,
+        "graph_stage_estimates": graph_stage_estimates,
+        "graph_estimate_provenance": {
+            "compact_profile_tokens": compact_input_tokens,
+            "complete_note_tokens": note_input_tokens,
+            "token_estimator": "measured_utf8_bytes_divided_by_four",
+            "call_basis": "profile_count_stage_envelopes",
+            "confidence": "low_until_first_v029_usage_reconciliation",
+            "cache_assumption": "all_input_priced_as_cache_miss",
+        },
+        "source_cost_usd": source_costs,
+        "graph_cost_usd": graph_costs,
+        "total_cost_usd": total_costs,
+        "cost": total_costs,
+        "pricing": pricing,
+        "uncertainty": "Document length, OCR, hierarchical reading, cache hits, relationships, and cluster count change actual cost.",
+        "provider_calls": 0,
+    }
+    estimate_path = resolve_workspace(workspace) / "11_state" / "cost_estimate.yml"
+    write_yaml(estimate_path, result)
+    result["path"] = str(estimate_path)
+    return result
 
 
 def run_map(
@@ -1348,6 +1568,112 @@ def _reusable_build_map_manifest(
     )
 
 
+def _build_map_receipt_identity(
+    *,
+    provider: str,
+    model: str,
+    question: str | None,
+    policy: LiteratureMappingPolicy,
+    navigation: NavigationPolicy,
+    comparison_collection_keys: Sequence[str],
+    source_set: Mapping[str, Any] | Path | str | None,
+) -> str:
+    if isinstance(source_set, Mapping):
+        source_set_identity: Any = dict(source_set)
+    else:
+        source_set_identity = str(source_set or "")
+    return sha256_text(
+        json.dumps(
+            {
+                "engine_version": ENGINE_VERSION,
+                "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+                "relationship_discovery_prompt_version": RELATIONSHIP_DISCOVERY_PROMPT_VERSION,
+                "relationship_prompt_version": RELATIONSHIP_PROMPT_VERSION,
+                "literature_algorithm_version": LITERATURE_ALGORITHM_VERSION,
+                "literature_family_plan_prompt_version": LITERATURE_FAMILY_PLAN_PROMPT_VERSION,
+                "cluster_synthesis_prompt_version": CLUSTER_SYNTHESIS_PROMPT_VERSION,
+                "provider": provider,
+                "model": model,
+                "question": question or "",
+                "literature_policy": policy.to_dict(),
+                "navigation_policy": navigation.to_dict(),
+                "comparison_collection_keys": sorted(comparison_collection_keys),
+                "source_set": source_set_identity,
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+            default=str,
+        )
+    )
+
+
+def _stat_inventory(root: Path, paths: Sequence[Path]) -> list[dict[str, Any]]:
+    rows = []
+    for path in sorted({path for path in paths if path.is_file()}):
+        stat = path.stat()
+        rows.append(
+            {
+                "path": str(path.relative_to(root)),
+                "bytes": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+            }
+        )
+    return rows
+
+
+def _build_map_input_inventory(root: Path, run_id: str) -> list[dict[str, Any]]:
+    paths = [
+        *(root / "02_source_memory" / "notes").glob("*.md"),
+        *(root / "02_source_memory" / "profiles").glob("*.yml"),
+        *(root / "02_source_memory" / "indexes" / "source_sets").glob("*.yml"),
+    ]
+    paths.extend(
+        path
+        for path in (
+            root / "02_source_memory" / "indexes" / "literature_positions.yml",
+            root / "02_source_memory" / "indexes" / "missing_sources.yml",
+            root / "02_source_memory" / "indexes" / "typed_links.yml",
+            root / "01_custody" / "zotero" / "collection_snapshot.yml",
+            run_directory(root, run_id) / "collection_snapshot.yml",
+        )
+        if path.is_file()
+    )
+    return _stat_inventory(root, paths)
+
+
+def _reusable_build_map_receipt(
+    root: Path,
+    run_id: str,
+    identity: str,
+) -> ArtifactManifest | None:
+    path = run_directory(root, run_id) / "semantic_build_receipt.yml"
+    payload = read_yaml(path, {}) or {}
+    if (
+        not isinstance(payload, Mapping)
+        or str(payload.get("identity") or "") != identity
+        or not bool(payload.get("semantic_replayable", False))
+        or payload.get("inputs") != _build_map_input_inventory(root, run_id)
+    ):
+        return None
+    artifacts = [
+        dict(row)
+        for row in payload.get("artifacts", []) or []
+        if isinstance(row, Mapping) and row.get("path")
+    ]
+    if artifacts != _stat_inventory(
+        root, [root / str(row["path"]) for row in artifacts]
+    ):
+        return None
+    return ArtifactManifest(
+        status=str(payload.get("status") or "partial"),
+        workspace=root,
+        artifacts=artifacts,
+        run_id=run_id,
+        created_at=str(payload.get("created_at") or ""),
+        metadata=dict(payload.get("summary", {}) or {}),
+    )
+
+
 def build_map(
     workspace: Path | str,
     *,
@@ -1405,6 +1731,25 @@ def build_map(
         )
     if external_discovery is not None:
         raise ValueError("standalone Auto-Zettelkasten does not accept an external discovery provider")
+    run_id = run_id or _latest_run_id(root) or f"build-{now_iso().replace(':', '').replace('+00:00', 'Z')}"
+    validate_opaque_id(run_id, field="run_id")
+    receipt_identity = _build_map_receipt_identity(
+        provider=provider,
+        model=model,
+        question=question,
+        policy=policy,
+        navigation=navigation,
+        comparison_collection_keys=comparison_collection_keys,
+        source_set=source_set,
+    )
+    if not retry_terminal_failures:
+        reusable_receipt = _reusable_build_map_receipt(
+            root,
+            run_id,
+            receipt_identity,
+        )
+        if reusable_receipt is not None:
+            return reusable_receipt
     if reasoner is None and policy.synthesis_enabled and allow_cloud:
         built_in_reasoner = provider_from_name(provider, model, allow_cloud=allow_cloud)
         if not isinstance(built_in_reasoner, LiteratureReasoner):
@@ -1414,8 +1759,6 @@ def build_map(
         raise ValueError("cloud literature reasoner requires allow_cloud=True")
     if external_discovery is not None and bool(getattr(external_discovery, "is_cloud", True)) and not allow_cloud:
         raise ValueError("cloud external discovery provider requires allow_cloud=True")
-    run_id = run_id or _latest_run_id(root) or f"build-{now_iso().replace(':', '').replace('+00:00', 'Z')}"
-    validate_opaque_id(run_id, field="run_id")
     note_rows = all_workspace_note_rows(root)
     selected_source_set = _resolve_source_set(root, source_set)
     explicit_source_set = bool(selected_source_set)
@@ -1480,23 +1823,15 @@ def build_map(
     receipt_source_set["comparison_collection_keys"] = list(
         comparison_collection_keys
     )
-    semantic_fingerprint = _build_map_semantic_fingerprint(
-        root,
-        note_rows=note_rows,
-        source_set=receipt_source_set,
-        provider=provider,
-        model=model,
-        question=question,
-        policy=policy,
-        navigation=navigation,
-        comparison_collection_keys=comparison_collection_keys,
-    )
-    if not retry_terminal_failures:
-        reusable_manifest = _reusable_build_map_manifest(
-            root, run_id, semantic_fingerprint
+    semantic_fingerprint = sha256_text(
+        json.dumps(
+            {
+                "identity": receipt_identity,
+                "inputs": _build_map_input_inventory(root, run_id),
+            },
+            sort_keys=True,
         )
-        if reusable_manifest is not None:
-            return reusable_manifest
+    )
     if not explicit_source_set:
         selected_source_set = workspace_source_set(
             root, note_rows, run_id=run_id
@@ -1595,28 +1930,27 @@ def build_map(
     if bool(result["literature_packet"].get("retry_on_resume")):
         semantic_replayable = False
     partial_text = str(result.get("partial_reason") or "").casefold()
+    if "literature_family_plan_partial" in partial_text:
+        semantic_replayable = False
     if "retry_on_resume" not in result["literature_packet"] and any(
         token in partial_text
         for token in ("timeout", "timed out", "connection", "transport")
     ):
         semantic_replayable = False
-    semantic_fingerprint = _build_map_semantic_fingerprint(
-        root,
-        note_rows=all_workspace_note_rows(root),
-        source_set=receipt_source_set,
-        provider=provider,
-        model=model,
-        question=question,
-        policy=policy,
-        navigation=navigation,
-        comparison_collection_keys=comparison_collection_keys,
+    input_inventory = _build_map_input_inventory(root, run_id)
+    semantic_fingerprint = sha256_text(
+        json.dumps(
+            {"identity": receipt_identity, "inputs": input_inventory},
+            sort_keys=True,
+        )
     )
+    compact_artifacts = _stat_inventory(root, list(result["paths"]))
     manifest = ArtifactManifest(
         status="partial" if result.get("partial_reason") else "built",
         workspace=root,
         run_id=run_id,
         created_at=now_iso(),
-        artifacts=artifact_rows(root, result["paths"]),
+        artifacts=compact_artifacts,
         metadata={
             "source_set": result["source_set"],
             "cluster_map": result["cluster_map"],
@@ -1629,7 +1963,48 @@ def build_map(
     )
     run_dir = run_directory(root, run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
-    write_yaml(run_dir / "build_map_manifest.yml", manifest.to_dict())
+    compact_literature_summary = {
+        key: value
+        for key, value in literature_summary.items()
+        if isinstance(value, (str, int, float, bool)) or value is None
+    }
+    summary = {
+        "literature_map": compact_literature_summary,
+        "semantic_build_fingerprint": semantic_fingerprint,
+        "semantic_replayable": semantic_replayable,
+        "source_count": len(result["source_set"].get("source_ids", []) or []),
+        "relationship_count": len((result.get("typed_links", {}) or {}).get("links", []) or []),
+        "cluster_count": len(result["cluster_map"].get("clusters", []) or []),
+        "gap_count": len(result["gap_map"].get("gap_candidates", []) or []),
+    }
+    compact_manifest = {
+        "status": manifest.status,
+        "workspace": str(root),
+        "run_id": run_id,
+        "created_at": manifest.created_at,
+        "engine_version": ENGINE_VERSION,
+        "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+        "artifacts": compact_artifacts,
+        "metadata": summary,
+    }
+    write_yaml(run_dir / "build_map_manifest.yml", compact_manifest)
+    semantic_receipt_path = run_dir / "semantic_build_receipt.yml"
+    write_yaml(
+        semantic_receipt_path,
+        {
+            "receipt_schema_version": "1",
+            "engine_version": ENGINE_VERSION,
+            "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+            "identity": receipt_identity,
+            "status": manifest.status,
+            "created_at": manifest.created_at,
+            "semantic_replayable": semantic_replayable,
+            "inputs": input_inventory,
+            "artifacts": compact_artifacts,
+            "summary": summary,
+        },
+    )
+    finalize_v029_lean_state(root, replacement_receipt=semantic_receipt_path)
     progress.set_stage("reporting")
     source_work_remains = any(
         str(row.get("terminal_status") or "") in {"partial", "pending"}

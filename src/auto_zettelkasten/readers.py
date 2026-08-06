@@ -158,7 +158,7 @@ DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
-SOURCE_BUNDLE_PROMPT_VERSION = "5"
+SOURCE_BUNDLE_PROMPT_VERSION = "6"
 SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v2"
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
@@ -339,6 +339,7 @@ class _CapabilityAwareReader:
             "request_deadline_seconds": self._request_deadline_seconds(),
             "connect_timeout_seconds": float(getattr(self, "connect_timeout", 60.0)),
             "supports_hierarchical_reading": True,
+            "supports_family_card_reconciliation": True,
         }
         return {
             **capability,
@@ -1661,7 +1662,7 @@ def _system_prompt() -> str:
 def _source_bundle_system_prompt() -> str:
     keys = ", ".join(SECTION_KEYS)
     return (
-        "You are the source-reading reasoner for Auto-Zettelkasten source bundle prompt v5. "
+        "You are the source-reading reasoner for Auto-Zettelkasten source bundle prompt v6. "
         "Capture the thesis, knowledge basis, important evidence, detailed findings, limitations, literature position, "
         "and distinct contribution. Include the consequential data, examples, historical analogies, mechanisms, nulls, "
         "counterexamples, and qualifications needed to evaluate the argument. Distinguish reported observations, modeled "
@@ -1673,6 +1674,11 @@ def _source_bundle_system_prompt() -> str:
         "retains assumptions, logical sequence, propositions, rivals, examples, and scope; institutional or practitioner work "
         "separates evidence and consultations from recommendations and implementation constraints; reviews retain the "
         "organizing debate, important cited positions, evidence bases, unresolved questions, and the author's contribution. "
+        "For a book-like source, identify whether it is an authored monograph, edited volume, collected work, chapter or "
+        "contribution, partial excerpt, or composition-uncertain. An authored monograph needs book-level analysis and a bounded "
+        "chapter breakdown when headings are recoverable. An edited or collected volume needs the editors' framing plus chapter "
+        "title, chapter author, thesis, evidence or method, and contribution for consequential recoverable chapters. Keep "
+        "book-level and chapter-level claims distinct and never attribute a contributor's claim to an editor or the whole volume. "
         "Use associational wording for observational evidence unless the design and source justify causality. Attribute "
         "qualitative explanatory claims to the author. Never turn a recommendation into a demonstrated result. Preserve every "
         "important source-reported number on its original scale with its estimand, comparison, reference group, denominator, "
@@ -1909,7 +1915,7 @@ def _relationship_candidate_system_prompt() -> str:
 def _relationship_adjudication_system_prompt() -> str:
     return (
         "You adjudicate immutable relationship pair jobs for Auto-Zettelkasten "
-        "relationship prompt v15 and contract relationship-decision-v8. Read both "
+        "relationship prompt v16 and contract relationship-decision-v8. Read both "
         "complete atomic notes. Return one JSON object whose decisions object is keyed "
         "by every supplied pair_job_id, with no missing or extra keys. Each value is "
         "either {decision:no_relationship, reason, confidence} or "
@@ -1946,7 +1952,9 @@ def _relationship_adjudication_system_prompt() -> str:
         "reference; symmetric types may return them as null because local code stores "
         "the canonical pair. Do not infer intellectual direction or support from pair "
         "order, chronology, citation, shared data, method, vocabulary, or broad outcome. "
-        "Treat limited notes only within visible scope. Finally, self-review once: the "
+        "A direct relationship requires a sufficiently specific shared proposition. When the works instead illuminate adjacent "
+        "units, populations, settings, stages, mechanisms, outcomes, or evidentiary questions, prefer a contextual relationship "
+        "and state the boundary precisely. Treat limited notes only within visible scope. Finally, self-review once: the "
         "proposition, type, actor, reference, endpoint bases, rationale, and boundary "
         "must preserve meaning, roles, scope, outcome, causal and evidentiary strength, "
         "source ownership, and any applicable direction. Never write display labels, "
@@ -2036,14 +2044,16 @@ def _cluster_proposal_system_prompt() -> str:
 def _literature_family_plan_system_prompt() -> str:
     return (
         "You are the shared literature-family planner for Auto-Zettelkasten "
-        "cluster plan prompt v8. Read the complete lean source index. Return one "
-        "JSON object with literature_families, discovery_jobs, and "
-        "neighboring_families arrays. A family has family_id, label, "
+        "cluster plan prompt v9. Read the supplied labeled source-index shard jobs. Return one "
+        "JSON object with literature_families, discovery_jobs, neighboring_families, and "
+        "source_dispositions arrays. A family has family_id, label, "
         "organizing_problem, source_ids, proposed_roles, and candidate_cluster. "
         "Roles are core, supporting, mechanism, boundary, practitioner, or partial. "
         "A discovery job has job_id, family, left_source_ids, right_source_ids, "
         "requested_collection_pair, discovery_goal, and candidate_quota. A "
-        "neighbor row has left_family_id, right_family_id, and reason. Use only "
+        "neighbor row has left_family_id, right_family_id, and reason. Each source disposition has source_id, disposition "
+        "(assigned, currently_unclustered, or overlap), family_ids, and a concise reason. Account for every source required "
+        "by the supplied planning jobs. Use only "
         "supplied source and collection IDs. Families and memberships may overlap. "
         "Inspect the whole inventory and identify specific research problems, "
         "debates, mechanisms, outcomes, sequences, methods, cases, and practice "
@@ -2060,7 +2070,8 @@ def _literature_family_plan_system_prompt() -> str:
         "planning_mode is incremental_patch, return only affected "
         "or replacement families and discovery jobs, retain existing family IDs "
         "when their organizing problem still applies, and do not reshuffle "
-        "unaffected families. Do not adjudicate relationships, summarize findings, write "
+        "unaffected families. Consider coherent within-collection, mixed-collection, bridge, and neighboring-but-distinct "
+        "families; collection membership is routing provenance, not an intellectual boundary. Do not adjudicate relationships, summarize findings, write "
         "clusters, invent IDs, or force every source into a family."
     )
 
@@ -2117,7 +2128,7 @@ def _debate_system_prompt() -> str:
 def _cluster_synthesis_system_prompt() -> str:
     return (
         "You are the full-note cluster writer for Auto-Zettelkasten cluster "
-        "synthesis prompt v32 and contract streamlined-full-note-v2. Read every supplied atomic_note_markdown before "
+        "synthesis prompt v34 and contract streamlined-full-note-v2. Read every supplied atomic_note_markdown before "
         "drafting. Copy cluster_id exactly from context.cluster.cluster_id. Return "
         "exactly one JSON object with cluster_id, status, title, "
         "organizing_mode, organizing_problem, optional guiding_question, optional "
@@ -2135,7 +2146,8 @@ def _cluster_synthesis_system_prompt() -> str:
         "qualifies, contrasts, extends, applies, or contextualizes. Evidence uses "
         "an array of objects; every object copies source_id, evidence_anchor_id, "
         "and locator exactly from a supplied source-owned anchor. Every retained member must "
-        "have at least one specific study finding; drop a source rather than retain "
+        "have at least one specific study finding; preserve a supplied core, context, or bridge role when it remains accurate, "
+        "changing it only when the complete notes justify the correction. Drop a source rather than retain "
         "decorative context. Any member may contribute regardless of a prior core, "
         "context, or bridge label. A partial-document member may be retained when its "
         "recovered text supplies a specific theoretical, methodological, contextual, "
@@ -4608,14 +4620,14 @@ def _validate_relationship_response(
     }
     if kind == "candidate_selection" and "job_outcomes" in payload:
         outcomes = payload["job_outcomes"]
-        if not isinstance(outcomes, list):
-            raise ProviderError(
-                "relationship candidate response job_outcomes must be a list"
-            )
-        result["job_outcomes"] = [
-            dict(value) if isinstance(value, Mapping) else value
-            for value in outcomes
-        ]
+        if isinstance(outcomes, list):
+            result["job_outcomes"] = [
+                dict(value) if isinstance(value, Mapping) else value
+                for value in outcomes
+            ]
+        else:
+            result["job_outcomes"] = []
+            result["accounting_warning"] = "invalid_job_outcomes_shape"
     return result
 
 

@@ -375,7 +375,7 @@ def test_initial_family_plan_adds_coverage_completion_family(
     )
 
     assert [row["family_id"] for row in result["literature_families"]] == [
-        "ceasefire-peacekeeping",
+        "coverage-packet-d686b243a7679f1e:ceasefire-peacekeeping",
         "mediation",
     ]
     assert [context["planning_mode"] for context in calls.contexts] == [

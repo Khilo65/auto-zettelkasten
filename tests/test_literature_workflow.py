@@ -66,7 +66,7 @@ def test_canonical_map_replay_is_idempotent_and_uses_profile_sidecars(
     tracked_paths = (
         tmp_path / "03_literature_synthesis" / "manifest.yml",
         first_maps[0],
-        first_maps[0].parent / "packet.yml",
+        Path(manifest["artifacts"]["packet"]),
     )
     tracked_bytes = {path: path.read_bytes() for path in tracked_paths}
     monkeypatch.setattr("auto_zettelkasten.literature.now_iso", lambda: "2099-01-01T00:00:00+00:00")
@@ -256,4 +256,4 @@ def test_source_set_alias_keeps_one_map_and_ledger_across_dependency_revisions(t
         source_set=other_source_set,
     )
     assert other.map_id != first.map_id
-    assert other.artifact_paths["cluster_ledger"] != first.artifact_paths["cluster_ledger"]
+    assert other.artifact_paths["cluster_ledger"] == first.artifact_paths["cluster_ledger"]

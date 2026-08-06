@@ -9,6 +9,7 @@ from typing import Any, Sequence
 from .api import (
     build_map,
     doctor,
+    estimate_cost,
     export_to_obsidian,
     get_status,
     initialize_workspace,
@@ -151,6 +152,19 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser.add_argument("--workspace", type=Path, required=True)
     status_parser.add_argument("--run-id", default="")
     status_parser.add_argument("--json", action="store_true", dest="as_json")
+
+    estimate_parser = commands.add_parser(
+        "estimate", help="Estimate source and graph cost without provider calls."
+    )
+    estimate_parser.add_argument("--workspace", type=Path, required=True)
+    estimate_parser.add_argument(
+        "--scope", choices=("library", "collection", "selected"), default="library"
+    )
+    estimate_parser.add_argument("--collection", default="")
+    estimate_parser.add_argument(
+        "--provider", choices=("deepseek", "openrouter", "gemini", "ollama"), default=None
+    )
+    estimate_parser.add_argument("--model", default=None)
 
     build_parser_command = commands.add_parser("build-map", help="Rebuild typed links, clusters, gaps, and indexes from validated notes.")
     build_parser_command.add_argument("--workspace", type=Path, required=True)
@@ -302,13 +316,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not args.as_json:
                 print(_status_text(result))
                 return _exit_code(result)
+        elif args.command == "estimate":
+            config = load_config(args.workspace)
+            provider = args.provider or str(config.get("provider") or "deepseek")
+            model = args.model or str(config.get("model") or DEFAULT_MODELS.get(provider, ""))
+            result = estimate_cost(
+                args.workspace,
+                scope=args.scope,
+                collection_key=args.collection,
+                provider=provider,
+                model=model,
+            )
         elif args.command == "build-map":
             config = load_config(args.workspace)
             configured_provider = str(config.get("provider") or "deepseek")
             provider = args.provider or configured_provider
             configured_model = str(config.get("model") or "") if provider == configured_provider else ""
             model = args.model or configured_model or DEFAULT_MODELS.get(provider, "")
-            result = build_map(
+            manifest = build_map(
                 args.workspace,
                 run_id=args.run_id or None,
                 source_set=args.source_set or None,
@@ -326,7 +351,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 navigation_policy=_navigation_policy(args, config),
                 resume=args.resume,
                 retry_terminal_failures=args.retry_terminal_literature,
-            ).to_dict()
+            )
+            result = manifest.to_dict()
+            metadata = result.get("metadata", {})
+            literature = (
+                metadata.get("literature_map", {})
+                if isinstance(metadata, dict)
+                else {}
+            )
+            result["metadata"] = {
+                "literature_map": {
+                    key: value
+                    for key, value in literature.items()
+                    if isinstance(value, (str, int, float, bool))
+                    or value is None
+                }
+            }
         elif args.command == "migrate":
             result = migrate_workspace(args.workspace, dry_run=args.dry_run)
         elif args.command == "export" and args.export_command == "obsidian":

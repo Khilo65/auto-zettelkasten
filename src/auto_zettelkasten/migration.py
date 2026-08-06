@@ -104,6 +104,7 @@ V015_MIGRATION_ID = "auto-zettelkasten-0.15-statistical-explanation-metadata"
 V015_TARGET_ENGINE_VERSION = "0.15.0"
 V015_TARGET_ARTIFACT_SCHEMA_VERSION = "1.13"
 V016_MIGRATION_ID = "auto-zettelkasten-0.16-scalable-discovery-replay"
+V029_MIGRATION_ID = "auto-zettelkasten-0.29-lean-index-state"
 
 _MARKER_FIELDS = {
     "migration_id",
@@ -405,6 +406,7 @@ def migrate_workspace(workspace: Path | str, *, dry_run: bool = False) -> dict[s
     v014 = migrate_v014_schema(workspace, dry_run=dry_run)
     v015 = migrate_v015_metadata(workspace, dry_run=dry_run)
     v016 = migrate_v016_metadata(workspace, dry_run=dry_run)
+    v029 = migrate_v029_lean_state(workspace, dry_run=dry_run)
     return {
         "status": "dry_run" if dry_run else "completed",
         "dry_run": dry_run,
@@ -424,6 +426,7 @@ def migrate_workspace(workspace: Path | str, *, dry_run: bool = False) -> dict[s
             v014,
             v015,
             v016,
+            v029,
         ],
         "literature_map": legacy,
         "review_status": review,
@@ -438,7 +441,128 @@ def migrate_workspace(workspace: Path | str, *, dry_run: bool = False) -> dict[s
         "v013": v013,
         "v014": v014,
         "v015": v015,
+        "v029": v029,
     }
+
+
+def migrate_v029_lean_state(
+    workspace: Path | str,
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Retire only recognized, reproducible v0.28 state explosions."""
+
+    root = resolve_workspace(workspace)
+    marker = root / "11_state" / "migrations" / f"{V029_MIGRATION_ID}.yml"
+    if marker.is_file():
+        return {**dict(read_yaml(marker, {}) or {}), "status": "already_migrated", "dry_run": dry_run}
+    candidates = [
+        root / "03_literature_synthesis" / "tag_concept_registry.yml",
+        *sorted(
+            (root / "03_literature_synthesis" / "maps").glob(
+                "*/tag_concept_registry.yml"
+            )
+        ),
+        *sorted((root / "11_state" / "runs").glob("*/build_map_manifest.yml")),
+    ]
+    recognized = []
+    for path in candidates:
+        if not path.is_file():
+            continue
+        if path.name == "build_map_manifest.yml" and (
+            path.parent / "semantic_build_receipt.yml"
+        ).is_file():
+            continue
+        if path.name == "build_map_manifest.yml":
+            with path.open("rb") as handle:
+                header = handle.read(65_536).decode("utf-8", errors="replace")
+            if not re.search(
+                r"artifact_schema_version:\s*['\"]?1\.19(?:['\"]|\s|$)",
+                header,
+            ):
+                continue
+        stat = path.stat()
+        recognized.append(
+            {
+                "path": str(path.relative_to(root)),
+                "bytes": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+            }
+        )
+    payload = {
+        "migration_id": V029_MIGRATION_ID,
+        "target_engine_version": CURRENT_ENGINE_VERSION,
+        "target_artifact_schema_version": CURRENT_ARTIFACT_SCHEMA_VERSION,
+        "retired_generated_files": recognized,
+        "provider_calls": 0,
+        "source_notes_rewritten": 0,
+        "cleanup_pending": bool(recognized),
+    }
+    if dry_run:
+        return {"status": "dry_run", "dry_run": True, **payload}
+    write_yaml(
+        marker,
+        {**payload, "status": "completed", "completed_at": now_iso()},
+    )
+    return {"status": "migrated", "dry_run": False, **payload}
+
+
+def finalize_v029_lean_state(
+    workspace: Path | str, *, replacement_receipt: Path
+) -> list[str]:
+    """Remove only unchanged legacy files after a compact receipt is durable."""
+
+    root = resolve_workspace(workspace)
+    marker = root / "11_state" / "migrations" / f"{V029_MIGRATION_ID}.yml"
+    if not marker.is_file() or not replacement_receipt.is_file():
+        return []
+    receipt = read_yaml(replacement_receipt, {}) or {}
+    if (
+        not isinstance(receipt, Mapping)
+        or str(receipt.get("receipt_schema_version") or "") != "1"
+        or str(receipt.get("engine_version") or "") != CURRENT_ENGINE_VERSION
+        or str(receipt.get("artifact_schema_version") or "")
+        != CURRENT_ARTIFACT_SCHEMA_VERSION
+        or str(receipt.get("status") or "") != "built"
+        or not bool(receipt.get("semantic_replayable"))
+        or not str(receipt.get("identity") or "")
+    ):
+        return []
+    payload = read_yaml(marker, {}) or {}
+    removed: list[str] = []
+    for row in payload.get("retired_generated_files", []) or []:
+        if not isinstance(row, Mapping) or not row.get("path"):
+            continue
+        path = root / str(row["path"])
+        if not path.is_file():
+            continue
+        stat = path.stat()
+        if stat.st_size != int(row.get("bytes", -1)) or stat.st_mtime_ns != int(
+            row.get("mtime_ns", -1)
+        ):
+            continue
+        path.unlink()
+        removed.append(str(row["path"]))
+    remaining = [
+        str(row.get("path") or "")
+        for row in payload.get("retired_generated_files", []) or []
+        if isinstance(row, Mapping)
+        and row.get("path")
+        and (root / str(row["path"])).is_file()
+    ]
+    updated = {
+        **dict(payload),
+        "cleanup_pending": bool(remaining),
+        "remaining_generated_files": remaining,
+        "removed_generated_files": sorted(
+            set(payload.get("removed_generated_files", []) or []) | set(removed)
+        ),
+    }
+    if not remaining:
+        updated["cleanup_completed_at"] = now_iso()
+    if updated != payload:
+        write_yaml(marker, updated)
+    return removed
 
 
 def migrate_gap_quality_schema(workspace: Path | str, *, dry_run: bool = False) -> dict[str, Any]:

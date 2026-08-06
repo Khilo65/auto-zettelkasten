@@ -19,7 +19,7 @@ from auto_zettelkasten.readers import _relationship_adjudication_system_prompt
 
 def test_v26_relationship_prompt_and_packet_limit() -> None:
     prompt = _relationship_adjudication_system_prompt()
-    assert "relationship prompt v15" in prompt
+    assert "relationship prompt v16" in prompt
     assert "one sufficiently specific proposition" in prompt
     assert "Use contextual_connection" in prompt
     assert _RELATIONSHIP_BATCH_MAX_JOBS == 15

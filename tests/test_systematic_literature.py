@@ -1655,7 +1655,6 @@ def test_compatibility_entry_accepts_current_rows_writes_all_outputs_and_has_no_
         "quantitative_comparisons",
         "locator_audit",
         "coverage_register",
-        "tag_concept_registry",
         "evidence_matrices",
         "navigation_facets",
         "topic_neighborhoods",
@@ -1716,18 +1715,6 @@ def test_compatibility_entry_accepts_current_rows_writes_all_outputs_and_has_no_
     assert map_root.name == stable_literature_map_id(source_set, "What changes trust?")
     for relative in (
         "manifest.yml",
-        "cluster_registry.yml",
-        "cluster_ledger.yml",
-        "cluster_syntheses.yml",
-        "evidence_matrices.yml",
-        "topic_neighborhoods.yml",
-        "propositions.yml",
-        "debate_registry.yml",
-        "gap_registry.yml",
-        "gap_memory.yml",
-        "gap_merge_ledger.yml",
-        "internal_search_log.yml",
-        "packet.yml",
         "INDEX.md",
         "clusters/INDEX.md",
         "gaps/INDEX.md",
@@ -4157,7 +4144,7 @@ def test_public_run_entry_returns_report_and_map_id_ignores_run_timestamp(
     assert changed == first.map_id
 
 
-def test_cluster_lifecycle_history_is_isolated_per_canonical_map(
+def test_cluster_lifecycle_history_uses_one_canonical_global_registry(
     tmp_path: Path,
 ) -> None:
     request_a = LiteratureMapRequest(
@@ -4190,8 +4177,10 @@ def test_cluster_lifecycle_history_is_isolated_per_canonical_map(
     registry_b = yaml.safe_load(
         (tmp_path / mapped_b.artifact_paths["cluster_registry"]).read_text()
     )
-    b_ids = {row["cluster_id"] for row in registry_b["clusters"]}
-    assert not any(cluster_id in repr(registry_a["ledger"]) for cluster_id in b_ids)
+    assert replay_a.artifact_paths["cluster_registry"] == mapped_b.artifact_paths[
+        "cluster_registry"
+    ]
+    assert registry_a == registry_b
 
 
 def test_stage_callback_fires_before_each_v06_systematic_stage() -> None:

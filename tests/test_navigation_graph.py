@@ -14,7 +14,7 @@ from auto_zettelkasten.navigation import (
     rank_human_related_links,
     rank_topic_neighborhoods,
 )
-from auto_zettelkasten.models import NeighborhoodSummary, TagConcept
+from auto_zettelkasten.models import NeighborhoodSummary
 
 
 def _profile(source_id: str, **values: object) -> dict[str, object]:
@@ -388,7 +388,8 @@ def test_active_vocabulary_merges_safe_spelling_variants() -> None:
     assert concepts[0]["graph_active"] is True
     assert concepts[0]["eligible_study_family_count"] == 2
     assert result["navigation_metrics"]["safe_alias_count"] >= 1
-    assert all(TagConcept.from_dict(row) for row in result["tag_concept_registry"])
+    assert result["tag_concept_registry"] == []
+    assert result["tag_reconciliation_proposals"] == []
 
 
 def test_singleton_facets_remain_in_audit_but_not_native_tags() -> None:
@@ -403,7 +404,7 @@ def test_singleton_facets_remain_in_audit_but_not_native_tags() -> None:
     assert result["navigation_metrics"]["source_local_singleton_tag_count"] == 1
 
 
-def test_semantic_synonyms_are_unresolved_proposals_not_automatic_merges() -> None:
+def test_semantic_synonyms_remain_separate_without_speculative_proposals() -> None:
     result = derive_subject_tags(
         [
             _profile("A", concepts=["Mediator impartiality"]),
@@ -415,10 +416,8 @@ def test_semantic_synonyms_are_unresolved_proposals_not_automatic_merges() -> No
     assert concepts["concept/mediator-impartiality"]["subject_tag_id"] != concepts[
         "concept/mediator-neutrality"
     ]["subject_tag_id"]
-    proposal = result["tag_reconciliation_proposals"][0]
-    assert proposal["status"] == "semantic_review_required"
-    assert proposal["automatic_merge"] is False
-    assert result["navigation_metrics"]["unresolved_reconciliation_count"] == 1
+    assert result["tag_reconciliation_proposals"] == []
+    assert result["navigation_metrics"]["unresolved_reconciliation_count"] == 0
 
 
 def test_incidental_same_case_alone_creates_neighborhood_not_direct_link() -> None:

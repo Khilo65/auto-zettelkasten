@@ -358,7 +358,7 @@ def test_frozen_sources_fill_provider_pool_while_local_workers_are_blocked(
     provider_peak = 0
     provider_started_while_local_blocked = 0
     provider_completed = 0
-    first_commit_provider_completed = 0
+    first_commit_provider_active = -1
 
     def acquire(
         _workspace, _run_dir, _index, item, *_args, **_kwargs
@@ -410,10 +410,10 @@ def test_frozen_sources_fill_provider_pool_while_local_workers_are_blocked(
         }
 
     def finalize(_workspace, _request, _controller, row, *_args, **_kwargs):
-        nonlocal first_commit_provider_completed
+        nonlocal first_commit_provider_active
         with lock:
-            if first_commit_provider_completed == 0:
-                first_commit_provider_completed = provider_completed
+            if first_commit_provider_active < 0:
+                first_commit_provider_active = provider_active
         time.sleep(0.01)
         return pipeline._public_terminal_row(row), None, [], []
 
@@ -440,7 +440,7 @@ def test_frozen_sources_fill_provider_pool_while_local_workers_are_blocked(
     assert local_peak == 4
     assert provider_started_while_local_blocked >= 32
     assert provider_peak > 4
-    assert first_commit_provider_completed > 1
+    assert first_commit_provider_active > 0
 
 
 def test_one_profile_commit_failure_does_not_cancel_siblings(

@@ -40,6 +40,7 @@ from .relationships import (
 
 from .navigation import (
     build_navigation_graph,
+    build_proposition_source_relations,
     build_typed_source_relations,
     rank_topic_neighborhoods,
 )
@@ -80,11 +81,11 @@ GAP_RULES = (
     "cross_cluster_integration",
     "author_stated_gap",
 )
-LITERATURE_ALGORITHM_VERSION = "36"
-LITERATURE_FAMILY_PLAN_PROMPT_VERSION = "8"
+LITERATURE_ALGORITHM_VERSION = "37"
+LITERATURE_FAMILY_PLAN_PROMPT_VERSION = "9"
 CLUSTER_PLAN_PROMPT_VERSION = "5"
 CLUSTER_PROPOSAL_PROMPT_VERSION = "17"
-CLUSTER_SYNTHESIS_PROMPT_VERSION = "33"
+CLUSTER_SYNTHESIS_PROMPT_VERSION = "34"
 GAP_REASONING_PROMPT_VERSION = "12"
 ANCHOR_ALGORITHM_VERSION = "3"
 SUPPORT_ENVELOPE_VERSION = "2"
@@ -2627,10 +2628,35 @@ def _validate_literature_family_plan_response(
                 "reason": reason,
             }
         )
+    dispositions: list[dict[str, Any]] = []
+    for row in mapping_rows("source_dispositions"):
+        source_id = str(row.get("source_id") or "").strip()
+        disposition = str(row.get("disposition") or "").strip().casefold()
+        if not source_id or disposition not in {
+            "assigned",
+            "currently_unclustered",
+            "overlap",
+        }:
+            raise ValueError("literature family source disposition is invalid")
+        dispositions.append(
+            {
+                "source_id": source_id,
+                "disposition": disposition,
+                "family_ids": sorted(
+                    {
+                        str(value).strip()
+                        for value in row.get("family_ids", []) or []
+                        if str(value).strip()
+                    }
+                ),
+                "reason": str(row.get("reason") or "").strip(),
+            }
+        )
     return {
         "literature_families": families,
         "discovery_jobs": jobs,
         "neighboring_families": neighbors,
+        "source_dispositions": dispositions,
     }
 
 
@@ -4383,81 +4409,61 @@ def _reconcile_evidence_base_groups(rows: list[dict[str, Any]]) -> None:
         "secondary data",
         "survey",
     }
-    for left_index, right_index in combinations(range(len(rows)), 2):
-        left, right = rows[left_index], rows[right_index]
-        left_lineage = _as_mapping(left.get("study_lineage"))
-        right_lineage = _as_mapping(right.get("study_lineage"))
-        reasons: list[str] = []
-        left_family = str(left.get("study_family_id") or "")
-        right_family = str(right.get("study_family_id") or "")
-        family_is_substantive = (
-            left_family
-            and not left_family.casefold().startswith(("doi:", "title:"))
-            and left_family
-            not in {
-                str(left.get("source_id") or ""),
-                str(right.get("source_id") or ""),
-            }
-        )
-        if family_is_substantive and left_family == right_family:
-            reasons.append(f"study_family:{left_family}")
+    source_ids = {str(row.get("source_id") or "") for row in rows}
+    overlap_index: dict[tuple[str, str], set[int]] = defaultdict(set)
+    for index, row in enumerate(rows):
+        lineage = _as_mapping(row.get("study_lineage"))
+        family = str(row.get("study_family_id") or "")
+        if (
+            family
+            and family not in source_ids
+            and not family.casefold().startswith(("doi:", "title:"))
+        ):
+            overlap_index[("study_family", family)].add(index)
         for key, label in (
             ("sample_ids", "shared_sample"),
             ("dataset_ids", "shared_dataset"),
             ("program_ids", "shared_program"),
         ):
-            shared = values(left_lineage, key) & values(right_lineage, key)
-            shared -= generic_lineage_values
-            if key == "dataset_ids":
-                shared = {
-                    value
-                    for value in shared
-                    if not re.search(
-                        r"\b(?:interviews?|fieldwork|document analysis|secondary data)\b",
-                        value,
-                        flags=re.I,
-                    )
-                }
-            reasons.extend(f"{label}:{value}" for value in sorted(shared))
-        shared_fieldwork = {
+            for value in values(lineage, key) - generic_lineage_values:
+                if key == "dataset_ids" and re.search(
+                    r"\b(?:interviews?|fieldwork|document analysis|secondary data)\b",
+                    value,
+                    flags=re.I,
+                ):
+                    continue
+                overlap_index[(label, value)].add(index)
+        authors = values(lineage, "authors")
+        fieldwork = {
             str(value).casefold().strip()
-            for value in left_lineage.get("fieldwork_signals", []) or []
-            if str(value).strip()
-        } & {
-            str(value).casefold().strip()
-            for value in right_lineage.get("fieldwork_signals", []) or []
+            for value in lineage.get("fieldwork_signals", []) or []
             if str(value).strip()
         }
-        left_authors = values(left_lineage, "authors")
-        right_authors = values(right_lineage, "authors")
-        if shared_fieldwork and left_authors & right_authors:
-            reasons.extend(
-                f"shared_fieldwork:{value}" for value in sorted(shared_fieldwork)
-            )
-        left_group = str(left_lineage.get("evidence_base_group_id") or "")
-        right_group = str(right_lineage.get("evidence_base_group_id") or "")
-        if (
-            left_group
-            and left_group == right_group
-            and bool(left_lineage.get("counted_as_independent"))
-            and bool(right_lineage.get("counted_as_independent"))
-        ):
-            reasons.append(f"declared_group:{left_group}")
-        left_role = str(left.get("source_role") or "").casefold()
-        right_role = str(right.get("source_role") or "").casefold()
+        for fieldwork_value in fieldwork:
+            for author in authors:
+                overlap_index[
+                    ("shared_fieldwork", f"{fieldwork_value}\0{author}")
+                ].add(index)
+        group = str(lineage.get("evidence_base_group_id") or "")
+        if group and bool(lineage.get("counted_as_independent")):
+            overlap_index[("declared_group", group)].add(index)
+        role = str(row.get("source_role") or "").casefold()
         if any(
-            marker in left_role
-            for marker in ("practitioner", "guidance", "institutional")
-        ) and any(
-            marker in right_role
+            marker in role
             for marker in ("practitioner", "guidance", "institutional")
         ):
-            left_institution = _canonical_phrase(left_lineage.get("institution"))
-            right_institution = _canonical_phrase(right_lineage.get("institution"))
-            if left_institution and left_institution == right_institution:
-                reasons.append(f"institutional_guidance:{left_institution}")
-        if reasons:
-            union(left_index, right_index, reasons)
+            institution = _canonical_phrase(lineage.get("institution"))
+            if institution:
+                overlap_index[("institutional_guidance", institution)].add(index)
+
+    for (label, value), member_indexes in sorted(overlap_index.items()):
+        members = sorted(member_indexes)
+        if len(members) < 2:
+            continue
+        reason_value = value.split("\0", 1)[0]
+        reason = f"{label}:{reason_value}"
+        for member_index in members[1:]:
+            union(members[0], member_index, [reason])
 
     members_by_root: dict[int, list[int]] = defaultdict(list)
     for index in range(len(rows)):
@@ -4830,21 +4836,68 @@ def _has_explicit_relation(
 def map_profile_relations(profiles: Sequence[Any]) -> list[dict[str, Any]]:
     """Map evidence relations; tag overlap is recorded only after a substantive relation exists."""
     rows = [row for row in _ensure_profiles(profiles) if row["analytical"]]
+    by_source = {str(row["source_id"]): row for row in rows}
+    finding_tokens = {
+        source_id: (
+            set().union(
+                *(_tokens(claim.get("text", "")) for claim in row["claims"])
+            )
+            if row["claims"]
+            else set()
+        )
+        for source_id, row in by_source.items()
+    }
+    candidate_pairs: set[tuple[str, str]] = set()
+    topic_sources: dict[str, set[str]] = defaultdict(set)
+    token_sources: dict[str, set[str]] = defaultdict(set)
+    aliases: dict[str, str] = {}
+    for source_id, row in by_source.items():
+        for topic in row["semantic_topic_scores"]:
+            topic_sources[str(topic)].add(source_id)
+        for token in finding_tokens[source_id]:
+            token_sources[token].add(source_id)
+        for alias in (
+            source_id,
+            str(row.get("note_id") or ""),
+            str(row.get("zotero_item_key") or ""),
+        ):
+            if alias:
+                aliases[alias.casefold()] = source_id
+    for members in topic_sources.values():
+        candidate_pairs.update(combinations(sorted(members), 2))
+
+    # Very common words are retrieval noise. A genuine structured-finding
+    # match still needs two sufficiently discriminating shared tokens.
+    maximum_token_frequency = max(50, len(rows) // 5)
+    for source_id in sorted(by_source):
+        shared_counts: Counter[str] = Counter()
+        for token in finding_tokens[source_id]:
+            members = token_sources[token]
+            if len(members) > maximum_token_frequency:
+                continue
+            shared_counts.update(
+                member for member in members if member > source_id
+            )
+        candidate_pairs.update(
+            (source_id, target_id)
+            for target_id, count in shared_counts.items()
+            if count >= 2
+        )
+    for source_id, row in by_source.items():
+        for value in _relation_strings(row.get("relations")):
+            normalized = str(value).strip().casefold()
+            target_id = aliases.get(normalized)
+            if target_id and target_id != source_id:
+                candidate_pairs.add(tuple(sorted((source_id, target_id))))
+
     relations: list[dict[str, Any]] = []
-    for left, right in combinations(rows, 2):
+    for left_id, right_id in sorted(candidate_pairs):
+        left, right = by_source[left_id], by_source[right_id]
         shared_topics = sorted(
             set(left["semantic_topic_scores"]) & set(right["semantic_topic_scores"])
         )
-        left_findings = (
-            set().union(*(_tokens(claim.get("text", "")) for claim in left["claims"]))
-            if left["claims"]
-            else set()
-        )
-        right_findings = (
-            set().union(*(_tokens(claim.get("text", "")) for claim in right["claims"]))
-            if right["claims"]
-            else set()
-        )
+        left_findings = finding_tokens[left_id]
+        right_findings = finding_tokens[right_id]
         shared_findings = sorted(left_findings & right_findings)
         finding_overlap = len(shared_findings) / max(
             1, min(len(left_findings), len(right_findings))
@@ -18967,6 +19020,7 @@ def build_literature_report(
     literature_positions: Sequence[Mapping[str, Any]] = (),
     missing_sources: Sequence[Mapping[str, Any]] = (),
     acquisition_ledger_path: Path | None = None,
+    prebuilt_navigation: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Pure end-to-end mapper over already-built evidence profiles."""
     normalized = normalize_evidence_profiles(profiles)
@@ -20224,12 +20278,23 @@ def build_literature_report(
             return
         prior_ids = set(cluster.get("source_ids", []) or [])
         ordered = sorted(retained)
+        prior_roles = _proposal_source_roles(cluster)
+        roles = {
+            source_id: prior_roles.get(source_id, "core")
+            for source_id in ordered
+        }
         cluster["source_ids"] = ordered
-        cluster["core_source_ids"] = ordered
-        cluster["context_source_ids"] = []
-        cluster["bridge_source_ids"] = []
+        cluster["core_source_ids"] = [
+            source_id for source_id in ordered if roles[source_id] == "core"
+        ]
+        cluster["context_source_ids"] = [
+            source_id for source_id in ordered if roles[source_id] == "context"
+        ]
+        cluster["bridge_source_ids"] = [
+            source_id for source_id in ordered if roles[source_id] == "bridge"
+        ]
         cluster["source_roles"] = [
-            {"source_id": source_id, "role": "core"}
+            {"source_id": source_id, "role": roles[source_id]}
             for source_id in ordered
         ]
         cluster["note_ids"] = sorted(
@@ -20247,13 +20312,21 @@ def build_literature_report(
             }
         )
         cluster["study_family_ids"] = families
-        cluster["core_study_family_ids"] = families
-        cluster["independent_study_family_count"] = len(families)
+        cluster["core_study_family_ids"] = sorted(
+            {
+                str(normalized_by_source[source_id].get("study_family_id") or source_id)
+                for source_id in ordered
+                if roles[source_id] == "core"
+            }
+        )
+        cluster["independent_study_family_count"] = len(
+            cluster["core_study_family_ids"]
+        )
         cluster["source_count"] = len(ordered)
         cluster["representative_sources"] = [
             {
                 **dict(row),
-                "cluster_role": "core",
+                "cluster_role": roles.get(str(row.get("source_id") or ""), "core"),
             }
             for row in cluster.get("representative_sources", []) or []
             if isinstance(row, Mapping)
@@ -21218,13 +21291,49 @@ def build_literature_report(
     navigation_profiles = _navigation_profile_rows(
         [_as_mapping(profile) for profile in profiles], source_notes
     )
-    navigation = build_navigation_projection(
-        None,
-        profiles,
-        source_notes,
-        navigation_policy=navigation_policy,
-        propositions=mapped_propositions,
-    )
+    if isinstance(prebuilt_navigation, Mapping):
+        navigation = dict(prebuilt_navigation)
+        relation_by_id = {
+            str(row.get("relation_id") or row.get("link_id") or _stable_hash(row)): dict(row)
+            for row in navigation.get("typed_relations", []) or []
+            if isinstance(row, Mapping)
+        }
+        for row in build_proposition_source_relations(
+            navigation_profiles,
+            mapped_propositions,
+        ):
+            relation_by_id[str(row["relation_id"])] = row
+        navigation["typed_relations"] = [
+            relation_by_id[key] for key in sorted(relation_by_id)
+        ]
+        navigation["typed_relation_counts"] = {
+            relation_type: sum(
+                str(row.get("relation_type") or "") == relation_type
+                for row in navigation["typed_relations"]
+            )
+            for relation_type in sorted(
+                {str(row.get("relation_type") or "") for row in navigation["typed_relations"]}
+            )
+            if relation_type
+        }
+        navigation["graph_projection_hash"] = _stable_hash(
+            {
+                "base": str(prebuilt_navigation.get("graph_projection_hash") or ""),
+                "proposition_relations": [
+                    row
+                    for row in navigation["typed_relations"]
+                    if str(row.get("relation_type") or "") == "same_proposition"
+                ],
+            }
+        )
+    else:
+        navigation = build_navigation_projection(
+            None,
+            profiles,
+            source_notes,
+            navigation_policy=navigation_policy,
+            propositions=mapped_propositions,
+        )
     _project_navigation_onto_map(
         navigation,
         navigation_profiles,
@@ -24798,13 +24907,28 @@ def literature_map_note_stem(source_set: Mapping[str, Any], map_id: str) -> str:
 
 
 def _load_map_cluster_registry(workspace: Path, map_id: str) -> Mapping[str, Any]:
-    canonical = (
-        workspace / "03_literature_synthesis" / "maps" / map_id / "cluster_registry.yml"
+    map_root = workspace / "03_literature_synthesis" / "maps" / map_id
+    canonical = map_root / "cluster_registry.yml"
+    manifest = read_yaml(map_root / "manifest.yml", {}) or {}
+    artifacts = (
+        manifest.get("artifacts", {}) if isinstance(manifest, Mapping) else {}
     )
+    declared_registry = str(artifacts.get("cluster_registry") or "")
+    if declared_registry:
+        candidate = Path(declared_registry)
+        canonical = candidate if candidate.is_absolute() else workspace / candidate
     payload = read_yaml(canonical, None)
     if isinstance(payload, Mapping):
         result = dict(payload)
-        syntheses = read_yaml(canonical.parent / "cluster_syntheses.yml", {}) or {}
+        declared_syntheses = str(artifacts.get("cluster_syntheses") or "")
+        synthesis_path = (
+            Path(declared_syntheses)
+            if Path(declared_syntheses).is_absolute()
+            else workspace / declared_syntheses
+            if declared_syntheses
+            else canonical.parent / "cluster_syntheses.yml"
+        )
+        syntheses = read_yaml(synthesis_path, {}) or {}
         result["cluster_syntheses"] = dict(
             syntheses.get("syntheses", {}) or {}
         )
@@ -24933,20 +25057,6 @@ def _preserve_last_valid_clusters_on_refresh_failure(
             _mark_cluster_refresh_pending(path, cluster)
             paths.append(path)
     return clusters, paths
-
-
-def _projection_without_volatile_timestamps(value: Any) -> Any:
-    """Return projection content without recursively generated timestamps."""
-
-    if isinstance(value, Mapping):
-        return {
-            str(key): _projection_without_volatile_timestamps(child)
-            for key, child in value.items()
-            if str(key) not in {"created_at", "updated_at"}
-        }
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return [_projection_without_volatile_timestamps(child) for child in value]
-    return value
 
 
 def _literature_map_markdown(
@@ -25263,31 +25373,15 @@ def _literature_map_markdown(
 def _write_projection_yaml(path: Path, value: Any) -> None:
     """Avoid rewriting a generated projection when only timestamps changed."""
 
-    existing = read_yaml(path, None)
-    if existing is not None:
-        existing_projection = yaml.safe_dump(
-            _projection_without_volatile_timestamps(existing),
-            sort_keys=False,
-            allow_unicode=True,
-        )
-        requested_projection = yaml.safe_dump(
-            _projection_without_volatile_timestamps(value),
-            sort_keys=False,
-            allow_unicode=True,
-        )
-        if existing_projection == requested_projection:
-            return
-        # Some live payloads contain string-like model values that compare
-        # differently in memory but serialize to the same YAML scalar. Compare
-        # the exact emitted form as a final guard for top-level run timestamps.
+    requested_text = yaml.safe_dump(value, sort_keys=False, allow_unicode=True)
+    if path.is_file():
         existing_text = path.read_text(encoding="utf-8")
-        requested_text = yaml.safe_dump(value, sort_keys=False, allow_unicode=True)
         timestamp_line = re.compile(
-            r"^(created_at|updated_at):[^\n]*(?:\n|$)", re.MULTILINE
+            r"^(\s*)(created_at|updated_at):[^\n]*(?:\n|$)", re.MULTILINE
         )
         if timestamp_line.sub(
-            r"\1: <volatile-timestamp>\n", existing_text
-        ) == timestamp_line.sub(r"\1: <volatile-timestamp>\n", requested_text):
+            r"\1\2: <volatile-timestamp>\n", existing_text
+        ) == timestamp_line.sub(r"\1\2: <volatile-timestamp>\n", requested_text):
             return
     write_yaml(path, value)
 
@@ -25469,7 +25563,6 @@ def persist_literature_report(
     quantitative_path = root / "quantitative_comparisons.yml"
     locator_audit_path = root / "locator_audit.yml"
     coverage_register_path = root / "coverage_register.yml"
-    tag_concept_registry_path = root / "tag_concept_registry.yml"
     write_yaml(
         matrix_path,
         {"updated_at": generated_at, "matrices": report["evidence_matrices"]},
@@ -25484,9 +25577,9 @@ def persist_literature_report(
     write_yaml(
         neighborhood_path,
         {
-            "updated_at": generated_at,
             "purpose": "deprecated_compatibility_alias",
-            "topic_neighborhoods": report.get("topic_neighborhoods", []),
+            "canonical_path": str(navigation_facets_path.relative_to(workspace)),
+            "count": len(report.get("topic_neighborhoods", [])),
         },
     )
     navigation = _as_mapping(report.get("navigation"))
@@ -25526,13 +25619,34 @@ def persist_literature_report(
     }
     for path, payload in (
         (subject_tag_registry_path, tag_registry_payload),
-        (compatibility_subject_tag_registry_path, tag_registry_payload),
         (subject_tag_assignments_path, tag_assignments_payload),
-        (compatibility_subject_tag_assignments_path, tag_assignments_payload),
         (typed_relations_path, typed_relations_payload),
         (navigation_audit_path, navigation_audit_payload),
     ):
         write_yaml(path, payload)
+    for path, canonical, count in (
+        (
+            compatibility_subject_tag_registry_path,
+            subject_tag_registry_path,
+            len(tag_registry_payload["subject_tags"]),
+        ),
+        (
+            compatibility_subject_tag_assignments_path,
+            subject_tag_assignments_path,
+            len(tag_assignments_payload["assignments"]),
+        ),
+    ):
+        write_yaml(
+            path,
+            {
+                "artifact_schema_version": CURRENT_ARTIFACT_SCHEMA_VERSION,
+                "canonical_path": str(canonical.relative_to(workspace)),
+                "graph_projection_hash": navigation.get(
+                    "graph_projection_hash", ""
+                ),
+                "count": count,
+            },
+        )
     from .relationships import persist_relationship_registry
 
     persist_relationship_registry(
@@ -25593,17 +25707,6 @@ def persist_literature_report(
         coverage_register_path,
         dict(report.get("coverage_register", {})),
     )
-    write_yaml(
-        tag_concept_registry_path,
-        {
-            "updated_at": generated_at,
-            "version": navigation.get("tag_reconciliation_version", "2"),
-            "concepts": navigation.get("tag_concept_registry", []),
-            "reconciliation_proposals": navigation.get(
-                "tag_reconciliation_proposals", []
-            ),
-        },
-    )
     paths.extend(
         (
             matrix_path,
@@ -25627,7 +25730,6 @@ def persist_literature_report(
             quantitative_path,
             locator_audit_path,
             coverage_register_path,
-            tag_concept_registry_path,
         )
     )
 
@@ -25872,167 +25974,29 @@ def persist_literature_report(
     )
     paths.extend((literature_map_path, index_path))
 
-    canonical_registry_path = map_root / "cluster_registry.yml"
-    canonical_ledger_path = map_root / "cluster_ledger.yml"
-    canonical_matrix_path = map_root / "evidence_matrices.yml"
-    canonical_navigation_facets_path = map_root / "navigation_facets.yml"
-    canonical_neighborhood_path = map_root / "topic_neighborhoods.yml"
-    canonical_subject_tag_registry_path = map_root / "subject_tag_registry.yml"
-    canonical_subject_tag_assignments_path = map_root / "subject_tag_assignments.yml"
-    canonical_typed_relations_path = map_root / "typed_source_relations.yml"
-    canonical_navigation_audit_path = map_root / "navigation_audit.yml"
-    canonical_proposition_path = map_root / "propositions.yml"
-    canonical_debate_path = map_root / "debate_registry.yml"
-    canonical_synthesis_path = map_root / "cluster_syntheses.yml"
-    canonical_study_lineage_path = map_root / "study_lineage_registry.yml"
-    canonical_independence_path = map_root / "independence_assessments.yml"
-    canonical_source_contributions_path = map_root / "cluster_source_contributions.yml"
-    canonical_quantitative_path = map_root / "quantitative_comparisons.yml"
-    canonical_locator_audit_path = map_root / "locator_audit.yml"
-    canonical_coverage_register_path = map_root / "coverage_register.yml"
-    canonical_tag_concept_registry_path = map_root / "tag_concept_registry.yml"
-    canonical_gap_registry_path = map_root / "gap_registry.yml"
-    canonical_gap_memory_path = map_root / "gap_memory.yml"
-    canonical_gap_merge_ledger_path = map_root / "gap_merge_ledger.yml"
-    canonical_search_path = map_root / "internal_search_log.yml"
-    canonical_packet_path = map_root / "packet.yml"
-    write_yaml(
-        canonical_registry_path,
-        {"updated_at": generated_at, **dict(report["cluster_registry"])},
-    )
-    write_yaml(
-        canonical_ledger_path,
-        {"updated_at": generated_at, "events": report["cluster_registry"]["ledger"]},
-    )
-    write_yaml(
-        canonical_matrix_path,
-        {"updated_at": generated_at, "matrices": report["evidence_matrices"]},
-    )
-    write_yaml(canonical_navigation_facets_path, navigation_facets_payload)
-    write_yaml(
-        canonical_neighborhood_path,
-        {
-            "updated_at": generated_at,
-            "purpose": "deprecated_compatibility_alias",
-            "topic_neighborhoods": report.get("topic_neighborhoods", []),
-        },
-    )
-    write_yaml(canonical_subject_tag_registry_path, tag_registry_payload)
-    write_yaml(canonical_subject_tag_assignments_path, tag_assignments_payload)
-    write_yaml(canonical_typed_relations_path, typed_relations_payload)
-    write_yaml(canonical_navigation_audit_path, navigation_audit_payload)
-    write_yaml(
-        canonical_proposition_path,
-        {"updated_at": generated_at, "propositions": report.get("propositions", [])},
-    )
-    write_yaml(
-        canonical_debate_path,
-        {"updated_at": generated_at, **dict(report["debate_registry"])},
-    )
-    write_yaml(
-        canonical_synthesis_path,
-        {"updated_at": generated_at, "syntheses": synthesis_by_cluster},
-    )
-    write_yaml(
-        canonical_study_lineage_path,
-        {
-            "updated_at": generated_at,
-            "version": STUDY_LINEAGE_VERSION,
-            "study_lineages": report.get("study_lineages", []),
-            "evidence_base_groups": report.get("evidence_base_groups", []),
-        },
-    )
-    write_yaml(
-        canonical_independence_path,
-        {
-            "updated_at": generated_at,
-            "version": INDEPENDENCE_ALGORITHM_VERSION,
-            "assessments": report.get("independence_assessments", []),
-        },
-    )
-    write_yaml(
-        canonical_source_contributions_path,
-        {
-            "updated_at": generated_at,
-            "clusters": report.get("cluster_source_contributions", {}),
-        },
-    )
-    write_yaml(
-        canonical_quantitative_path,
-        {
-            "updated_at": generated_at,
-            "comparisons": report.get("quantitative_comparisons", []),
-        },
-    )
-    write_yaml(
-        canonical_locator_audit_path,
-        {"updated_at": generated_at, **dict(report.get("locator_audit", {}))},
-    )
-    write_yaml(
-        canonical_coverage_register_path,
-        dict(report.get("coverage_register", {})),
-    )
-    write_yaml(
-        canonical_tag_concept_registry_path,
-        {
-            "updated_at": generated_at,
-            "version": navigation.get("tag_reconciliation_version", "2"),
-            "concepts": navigation.get("tag_concept_registry", []),
-            "reconciliation_proposals": navigation.get(
-                "tag_reconciliation_proposals", []
-            ),
-        },
-    )
-    write_yaml(
-        canonical_gap_registry_path,
-        {"updated_at": generated_at, **dict(report["gap_registry"])},
-    )
-    write_yaml(
-        canonical_gap_memory_path,
-        {"updated_at": generated_at, "entries": report["gap_memory"]},
-    )
-    write_yaml(
-        canonical_gap_merge_ledger_path,
-        {"updated_at": generated_at, "events": merge_events},
-    )
-    write_yaml(
-        canonical_search_path,
-        {"updated_at": generated_at, "searches": report["internal_search_log"]},
-    )
-    packet = _preserve_existing_projection_fields(
-        canonical_packet_path,
-        packet,
-        ("profile_packet_count", "profile_packet_paths"),
-    )
-    write_yaml(canonical_packet_path, packet)
-    paths.extend(
-        (
-            canonical_registry_path,
-            canonical_ledger_path,
-            canonical_matrix_path,
-            canonical_navigation_facets_path,
-            canonical_neighborhood_path,
-            canonical_subject_tag_registry_path,
-            canonical_subject_tag_assignments_path,
-            canonical_typed_relations_path,
-            canonical_navigation_audit_path,
-            canonical_proposition_path,
-            canonical_debate_path,
-            canonical_synthesis_path,
-            canonical_study_lineage_path,
-            canonical_independence_path,
-            canonical_source_contributions_path,
-            canonical_quantitative_path,
-            canonical_locator_audit_path,
-            canonical_coverage_register_path,
-            canonical_tag_concept_registry_path,
-            canonical_gap_registry_path,
-            canonical_gap_memory_path,
-            canonical_gap_merge_ledger_path,
-            canonical_search_path,
-            canonical_packet_path,
-        )
-    )
+    canonical_registry_path = registry_path
+    canonical_ledger_path = ledger_path
+    canonical_matrix_path = matrix_path
+    canonical_navigation_facets_path = navigation_facets_path
+    canonical_neighborhood_path = neighborhood_path
+    canonical_subject_tag_registry_path = subject_tag_registry_path
+    canonical_subject_tag_assignments_path = subject_tag_assignments_path
+    canonical_typed_relations_path = typed_relations_path
+    canonical_navigation_audit_path = navigation_audit_path
+    canonical_proposition_path = proposition_path
+    canonical_debate_path = debate_path
+    canonical_synthesis_path = synthesis_path
+    canonical_study_lineage_path = study_lineage_path
+    canonical_independence_path = independence_path
+    canonical_source_contributions_path = source_contributions_path
+    canonical_quantitative_path = quantitative_path
+    canonical_locator_audit_path = locator_audit_path
+    canonical_coverage_register_path = coverage_register_path
+    canonical_gap_registry_path = gap_registry_path
+    canonical_gap_memory_path = gap_memory_path
+    canonical_gap_merge_ledger_path = gap_merge_ledger_path
+    canonical_search_path = search_path
+    canonical_packet_path = packet_path
 
     canonical_gap_index = [
         "# Gap Index",
@@ -26194,7 +26158,6 @@ def persist_literature_report(
         "quantitative_comparisons": str(canonical_quantitative_path),
         "locator_audit": str(canonical_locator_audit_path),
         "coverage_register": str(canonical_coverage_register_path),
-        "tag_concept_registry": str(canonical_tag_concept_registry_path),
         "gap_registry": str(canonical_gap_registry_path),
         "gap_memory": str(canonical_gap_memory_path),
         "gap_merge_ledger": str(canonical_gap_merge_ledger_path),
@@ -26257,7 +26220,6 @@ def persist_literature_report(
         "quantitative_comparisons": str(quantitative_path),
         "locator_audit": str(locator_audit_path),
         "coverage_register": str(coverage_register_path),
-        "tag_concept_registry": str(tag_concept_registry_path),
         "gap_registry": str(gap_registry_path),
         "gap_memory": str(gap_memory_path),
         "gap_merge_ledger": str(gap_merge_ledger_path),
@@ -26312,6 +26274,7 @@ def build_literature_map(
     shared_literature_plan: Mapping[str, Any] | None = None,
     literature_positions: Sequence[Mapping[str, Any]] | None = None,
     missing_sources: Sequence[Mapping[str, Any]] | None = None,
+    prebuilt_navigation: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], list[Path]]:
     """Compatibility entry point for current pipeline callers."""
     request_values = _as_mapping(request) if request is not None else {}
@@ -26428,6 +26391,7 @@ def build_literature_map(
             / "03_literature_synthesis"
             / "cluster_acquisition_ledger.yml"
         ),
+        prebuilt_navigation=prebuilt_navigation,
     )
     if reasoner_calls is not None:
         report["manifest"].update(

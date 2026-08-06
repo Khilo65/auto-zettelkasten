@@ -1562,6 +1562,12 @@ def lean_discovery_projection(
             "collection_keys": sorted(
                 {str(value) for value in entry.get("collection_keys", []) or [] if str(value)}
             ),
+            "virtual_topic_ids": sorted(
+                {str(value) for value in entry.get("virtual_topic_ids", []) or [] if str(value)}
+            ),
+            "literature_ids": sorted(
+                {str(value) for value in entry.get("literature_ids", []) or [] if str(value)}
+            ),
             "facets": {
                 key: values for key, values in facets.items() if values
             },
@@ -1699,6 +1705,85 @@ def _compact_cluster_catalogue(
             }
         )
     return sorted(rows, key=lambda row: row["cluster_id"])
+
+
+def update_catalogue_clusters(
+    workspace: Path,
+    clusters: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Attach final cluster references without rebuilding source navigation."""
+
+    catalogue_path = workspace / "02_source_memory" / "indexes" / "source_catalogue.yml"
+    payload = read_yaml(catalogue_path, {}) or {}
+    compact_clusters = _compact_cluster_catalogue(clusters)
+    cluster_ids_by_source: dict[str, list[str]] = defaultdict(list)
+    for cluster in clusters:
+        cluster_id = str(cluster.get("cluster_id") or "")
+        for source_id in cluster.get("source_ids", []) or []:
+            if cluster_id and source_id:
+                cluster_ids_by_source[str(source_id)].append(cluster_id)
+    for source in payload.get("sources", []) or []:
+        if isinstance(source, dict):
+            source["cluster_ids"] = sorted(
+                set(cluster_ids_by_source.get(str(source.get("source_id") or ""), []))
+            )
+    payload["clusters"] = compact_clusters
+    semantic = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"revision_hash", "routing_revision_hash"}
+    }
+    payload["revision_hash"] = sha256_text(
+        json.dumps(semantic, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    )
+    atomic_write_text(
+        catalogue_path,
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+    )
+
+    cluster_semantic = {
+        "schema_version": SOURCE_CATALOGUE_SCHEMA_VERSION,
+        "clusters": compact_clusters,
+    }
+    cluster_revision = sha256_text(
+        json.dumps(cluster_semantic, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    )
+    cluster_catalogue_path = workspace / "02_source_memory" / "indexes" / "cluster_catalogue.yml"
+    atomic_write_text(
+        cluster_catalogue_path,
+        json.dumps(
+            {**cluster_semantic, "revision_hash": cluster_revision},
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+    )
+    cluster_lines = ["# Cluster Catalogue", "", f"Catalogue revision: `{cluster_revision}`", ""]
+    for cluster in compact_clusters:
+        cluster_lines.extend(
+            [
+                f"## {cluster['title'] or cluster['cluster_id']}",
+                "",
+                str(cluster["shared_question"] or cluster["bounded_scope"] or "Scope not specified."),
+                "",
+                f"- Cluster ID: `{cluster['cluster_id']}`",
+                f"- Core sources: {', '.join(f'`{value}`' for value in cluster['core_source_ids']) or 'none'}",
+                f"- Neighbors: {', '.join(f'`{value}`' for value in cluster['neighboring_cluster_ids']) or 'none'}",
+                f"- Refresh pending: {'yes' if cluster['refresh_pending'] else 'no'}",
+                "",
+            ]
+        )
+    cluster_index_path = workspace / "02_source_memory" / "indexes" / "CLUSTERS.md"
+    atomic_write_text(cluster_index_path, "\n".join(cluster_lines).rstrip() + "\n")
+    return {
+        "catalogue_path": str(catalogue_path),
+        "master_index_path": str(workspace / "02_source_memory" / "indexes" / "INDEX.md"),
+        "cluster_catalogue_path": str(cluster_catalogue_path),
+        "cluster_index_path": str(cluster_index_path),
+        "shard_paths": [],
+        "revision_hash": str(payload["revision_hash"]),
+        "routing_revision_hash": str(payload.get("routing_revision_hash") or ""),
+    }
 
 
 def _meaningful_catalogue_chunks(

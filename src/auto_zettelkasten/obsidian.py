@@ -78,11 +78,22 @@ def export_obsidian(
         else root / "03_literature_synthesis" / "clusters"
     )
     current_cluster_names: set[str] | None = None
-    cluster_registry_path = (
-        latest_map / "cluster_registry.yml"
-        if latest_map is not None
-        else root / "03_literature_synthesis" / "cluster_registry.yml"
-    )
+    cluster_registry_path = root / "03_literature_synthesis" / "cluster_registry.yml"
+    if latest_map is not None:
+        map_manifest = read_yaml(latest_map / "manifest.yml", {}) or {}
+        artifacts = (
+            map_manifest.get("artifacts", {})
+            if isinstance(map_manifest, dict)
+            else {}
+        )
+        declared = str(artifacts.get("cluster_registry") or "")
+        if declared:
+            candidate = Path(declared)
+            cluster_registry_path = (
+                candidate if candidate.is_absolute() else root / candidate
+            )
+        elif (latest_map / "cluster_registry.yml").is_file():
+            cluster_registry_path = latest_map / "cluster_registry.yml"
     if cluster_registry_path.is_file():
         from .literature import cluster_note_stem
 

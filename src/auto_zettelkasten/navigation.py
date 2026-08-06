@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from itertools import combinations
 import hashlib
+from itertools import combinations
 import json
 import re
 import unicodedata
@@ -351,71 +351,6 @@ def _is_salient_tag(row: Mapping[str, Any], identifiers: set[str]) -> bool:
     )
 
 
-def _semantic_reconciliation_proposals(
-    registries: Sequence[Mapping[str, Any]],
-) -> list[dict[str, Any]]:
-    """Surface plausible semantic reconciliation without silently merging it.
-
-    The rule is deliberately narrow: two multi-token labels in the same facet
-    must share an informative lexical frame and differ in at least one token.
-    This catches review-worthy pairs such as ``mediator impartiality`` and
-    ``mediator neutrality`` while keeping their graph identities separate.
-    """
-
-    by_facet: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
-    for row in registries:
-        by_facet[str(row.get("facet_type") or "")].append(row)
-    proposals: list[dict[str, Any]] = []
-    for facet, rows in sorted(by_facet.items()):
-        token_index: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
-        tokens_by_id: dict[str, set[str]] = {}
-        for row in rows:
-            tag_id = str(row.get("subject_tag_id") or "")
-            tokens = {
-                token
-                for token in str(row.get("slug") or "").split("-")
-                if token and token not in _RECONCILIATION_FRAME_STOPWORDS
-            }
-            tokens_by_id[tag_id] = tokens
-            if len(tokens) < 2:
-                continue
-            for token in tokens:
-                token_index[token].append(row)
-        candidate_pairs: set[tuple[str, str]] = set()
-        for indexed_rows in token_index.values():
-            ids = sorted({str(row.get("subject_tag_id") or "") for row in indexed_rows})
-            candidate_pairs.update(combinations(ids, 2))
-        rows_by_id = {str(row.get("subject_tag_id") or ""): row for row in rows}
-        for left_id, right_id in sorted(candidate_pairs):
-            left_tokens = tokens_by_id[left_id]
-            right_tokens = tokens_by_id[right_id]
-            shared = sorted(left_tokens & right_tokens)
-            if not shared:
-                continue
-            overlap = len(shared) / max(1, min(len(left_tokens), len(right_tokens)))
-            if overlap < 0.5 or left_tokens == right_tokens:
-                continue
-            left = rows_by_id[left_id]
-            right = rows_by_id[right_id]
-            proposal = {
-                "proposal_id": f"tag-reconciliation-proposal-{_stable_hash([left_id, right_id])[:16]}",
-                "facet_type": facet,
-                "left_subject_tag_id": left_id,
-                "right_subject_tag_id": right_id,
-                "left_canonical_tag": str(left.get("canonical_tag") or ""),
-                "right_canonical_tag": str(right.get("canonical_tag") or ""),
-                "shared_lexical_frame": shared,
-                "overlap_coefficient": round(overlap, 3),
-                "proposed_relation": "related_to",
-                "status": "semantic_review_required",
-                "automatic_merge": False,
-                "reason": "Shared lexical framing is not proof of conceptual equivalence.",
-            }
-            proposal["revision_hash"] = _stable_hash(proposal)
-            proposals.append(proposal)
-    return sorted(proposals, key=lambda row: row["proposal_id"])
-
-
 def derive_subject_tags(
     profiles: Sequence[Mapping[str, Any]],
     *,
@@ -713,55 +648,6 @@ def derive_subject_tags(
             }
             relation["revision_hash"] = _stable_hash(relation)
             alias_relations.append(relation)
-    reconciliation_proposals = _semantic_reconciliation_proposals(registries)
-    concept_id_by_subject_tag = {
-        str(row["subject_tag_id"]): str(row["tag_concept_id"]) for row in registries
-    }
-    semantic_relations_by_concept: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for proposal in reconciliation_proposals:
-        left_concept = concept_id_by_subject_tag[str(proposal["left_subject_tag_id"])]
-        right_concept = concept_id_by_subject_tag[str(proposal["right_subject_tag_id"])]
-        semantic_relations_by_concept[left_concept].append(
-            {
-                "relation_type": "related_to",
-                "target_tag_concept_id": right_concept,
-                "status": "semantic_review_required",
-                "automatic_merge": False,
-                "proposal_id": proposal["proposal_id"],
-            }
-        )
-        semantic_relations_by_concept[right_concept].append(
-            {
-                "relation_type": "related_to",
-                "target_tag_concept_id": left_concept,
-                "status": "semantic_review_required",
-                "automatic_merge": False,
-                "proposal_id": proposal["proposal_id"],
-            }
-        )
-    tag_concepts: list[dict[str, Any]] = []
-    for registry in registries:
-        concept_id = str(registry["tag_concept_id"])
-        concept = {
-            "tag_concept_id": concept_id,
-            "label": str(registry["label"]),
-            "slug": str(registry["slug"]),
-            "original_variants": list(registry["original_variants"]),
-            "source_ids": list(registry["source_ids"]),
-            "relations": sorted(
-                semantic_relations_by_concept.get(concept_id, []),
-                key=lambda row: (str(row["target_tag_concept_id"]), str(row["proposal_id"])),
-            ),
-            "graph_active": bool(registry["graph_active"]),
-            "activation_reason": str(registry["activation_reason"]),
-        }
-        concept["revision_hash"] = _stable_hash(concept)
-        tag_concepts.append(concept)
-    fragmented_ids = {
-        str(row[field])
-        for row in reconciliation_proposals
-        for field in ("left_subject_tag_id", "right_subject_tag_id")
-    }
     active_count = sum(bool(row["graph_active"]) for row in registries)
     inactive_count = len(registries) - active_count
     navigation_metrics = {
@@ -772,8 +658,8 @@ def derive_subject_tags(
         "source_local_singleton_tag_count": sum(
             row["activation_reason"] == "source_local_singleton" for row in registries
         ),
-        "fragmented_tag_concept_count": len(fragmented_ids),
-        "unresolved_reconciliation_count": len(reconciliation_proposals),
+        "fragmented_tag_concept_count": 0,
+        "unresolved_reconciliation_count": 0,
         "safe_alias_count": len(alias_relations),
         "active_vocabulary_ratio": round(active_count / max(1, len(registries)), 4),
     }
@@ -785,9 +671,9 @@ def derive_subject_tags(
             (row for row in registries if row["graph_active"]),
             key=lambda row: row["subject_tag_id"],
         ),
-        "tag_concept_registry": sorted(tag_concepts, key=lambda row: row["tag_concept_id"]),
+        "tag_concept_registry": [],
         "tag_concept_relations": sorted(alias_relations, key=lambda row: row["tag_relation_id"]),
-        "tag_reconciliation_proposals": reconciliation_proposals,
+        "tag_reconciliation_proposals": [],
         "assignments": sorted(assignment_rows, key=lambda row: row["assignment_id"]),
         "candidates": sorted(candidate_rows, key=lambda row: (row["source_id"], _candidate_rank(row))),
         "rejected_candidates": sorted(
@@ -978,6 +864,8 @@ def build_typed_source_relations(
             )
 
     assignments_by_source: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+    sources_by_tag: dict[str, set[str]] = defaultdict(set)
+    facet_by_tag: dict[str, str] = {}
     labels_by_tag: dict[str, str] = {}
     for assignment in tag_assignments:
         if assignment.get("promotion_status", "promoted") != "promoted":
@@ -992,17 +880,24 @@ def build_typed_source_relations(
         if slug in _GENERIC_SLUGS:
             continue
         assignments_by_source[source_id][facet].add(tag_id)
+        sources_by_tag[tag_id].add(source_id)
+        facet_by_tag[tag_id] = facet
         labels_by_tag[tag_id] = canonical_tag
 
-    source_ids = sorted(by_source)
-    for left, right in combinations(source_ids, 2):
+    shared_by_pair: dict[
+        tuple[str, str], dict[str, set[str]]
+    ] = defaultdict(lambda: defaultdict(set))
+    for tag_id, members in sources_by_tag.items():
+        facet = facet_by_tag[tag_id]
+        for pair in combinations(sorted(members), 2):
+            shared_by_pair[pair][facet].add(tag_id)
+
+    for (left, right), raw_shared in sorted(shared_by_pair.items()):
         left_facets = assignments_by_source[left]
         right_facets = assignments_by_source[right]
         shared = {
-            facet: sorted(left_facets.get(facet, set()) & right_facets.get(facet, set()))
-            for facet in SUBJECT_FACETS
+            facet: sorted(tag_ids) for facet, tag_ids in raw_shared.items()
         }
-        shared = {facet: tag_ids for facet, tag_ids in shared.items() if tag_ids}
         shared_all = sorted({tag_id for tag_ids in shared.values() for tag_id in tag_ids})
         # A lone shared case, method, outcome, or concept is a useful
         # neighborhood path, not enough evidence for a direct source-to-source
@@ -1095,6 +990,42 @@ def build_typed_source_relations(
     for row in result:
         row["revision_hash"] = _stable_hash(row)
     return sorted(result, key=lambda row: row["relation_id"])
+
+
+def build_proposition_source_relations(
+    profiles: Sequence[Mapping[str, Any]],
+    propositions: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Project admitted proposition links without rebuilding navigation."""
+
+    by_source, _aliases = _profile_index(profiles)
+    relations: dict[str, dict[str, Any]] = {}
+    for proposition in propositions:
+        source_ids = sorted(
+            {
+                str(source_id)
+                for source_id in proposition.get("source_ids", []) or []
+                if str(source_id) in by_source
+            }
+        )
+        for left, right in combinations(source_ids, 2):
+            row = _relation_record(
+                left,
+                right,
+                "same_proposition",
+                by_source,
+                evidence=[
+                    {
+                        "proposition_id": str(proposition.get("proposition_id") or ""),
+                        "statement": str(proposition.get("statement") or ""),
+                    }
+                ],
+                provenance="admitted_literature_proposition",
+                inferred=True,
+            )
+            row["revision_hash"] = _stable_hash(row)
+            relations[row["relation_id"]] = row
+    return [relations[key] for key in sorted(relations)]
 
 
 def _profile_is_analytical(profile: Mapping[str, Any]) -> bool:

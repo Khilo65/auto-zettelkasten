@@ -963,8 +963,8 @@ def test_builtin_complement_requires_complete_job_outcomes(tmp_path: Path) -> No
     )
 
     assert "family-cd" in result["relationship_discovery_incomplete_jobs"]
-    assert all(
-        context.get("discovery_pass") != "coverage_followup"
+    assert any(
+        context.get("discovery_pass") == "coverage_followup"
         for _stage, _key, context in calls.seen
     )
 
@@ -2022,7 +2022,7 @@ def test_committed_selection_state_makes_unchanged_replay_call_free(
     assert replay["provider_batch_count"] == 0
 
 
-def test_adjudication_prompt_change_reuses_selected_pool_without_discovery(
+def test_adjudication_prompt_change_reuses_current_decision_without_calls(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
@@ -2059,13 +2059,8 @@ def test_adjudication_prompt_change_reuses_selected_pool_without_discovery(
     )
     second = _run(tmp_path, profiles, calls)
 
-    assert [stage for stage, _key, _context in calls.seen] == [
-        "relationship_adjudication"
-    ]
-    assert second["pair_job_count"] == 1
-    assert second["selected_candidate_pool_hash"] == state[
-        "selected_candidate_pool_hash"
-    ]
+    assert calls.seen == []
+    assert second["pair_job_count"] == 0
     _commit_relationship_selection_state(
         tmp_path,
         second,
@@ -2163,7 +2158,7 @@ def test_schema3_selected_dispositions_migrate_without_discovery(
     ] == "legacy_selected_disposition"
 
 
-def test_prompt_change_readjudicates_frozen_negative_pair_without_discovery(
+def test_prompt_change_keeps_frozen_negative_pair_without_calls(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
@@ -2224,11 +2219,8 @@ def test_prompt_change_readjudicates_frozen_negative_pair_without_discovery(
         frozen_pair_jobs=[frozen_job],
     )
 
-    assert [stage for stage, _key, _context in calls.seen] == [
-        "relationship_adjudication"
-    ]
-    assert second["pair_job_count"] == 1
-    assert second["no_relationship"][0]["pair_job_id"] == frozen_job.pair_job_id
+    assert calls.seen == []
+    assert second["pair_job_count"] == 0
 
 
 def test_operational_policy_changes_do_not_invalidate_relationship_state(
@@ -2711,6 +2703,14 @@ def test_only_active_current_relationship_satisfies_a_discovered_pair(
                         "source_ids": ["A", "B"],
                         "status": "accepted",
                         "relation_ids": ["current-relation"],
+                        "provider": "test-provider",
+                        "model": "test-model",
+                        "input_profile_hashes": {
+                            profile.source_id: stable_hash(
+                                profile_to_dict(profile)
+                            )
+                            for profile in profiles
+                        },
                     }
                 ],
             },
@@ -2730,6 +2730,66 @@ def test_only_active_current_relationship_satisfies_a_discovered_pair(
                 for row in result["candidate_dispositions"]
             )
             assert len(result["accepted"]) == 1
+
+
+def test_changed_endpoint_refreshes_only_its_active_relationship(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile("A"), _profile("B"), _profile("C")]
+    old_hashes = {
+        profile.source_id: stable_hash(profile_to_dict(profile))
+        for profile in profiles
+    }
+    profiles[0].context["thesis"] = "A materially changed thesis"
+    write_yaml(
+        tmp_path / "02_source_memory" / "indexes" / "typed_links.yml",
+        {
+            "relations": [
+                {
+                    "relation_id": "relation-ab",
+                    "source_id": "A",
+                    "target_source_id": "B",
+                    "relation_type": "supports",
+                    "active": True,
+                },
+                {
+                    "relation_id": "relation-bc",
+                    "source_id": "B",
+                    "target_source_id": "C",
+                    "relation_type": "supports",
+                    "active": True,
+                },
+            ],
+            "current_pair_decisions": [
+                {
+                    "source_ids": list(pair),
+                    "status": "accepted",
+                    "relation_ids": [relation_id],
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "input_profile_hashes": {
+                        source_id: old_hashes[source_id] for source_id in pair
+                    },
+                }
+                for pair, relation_id in (
+                    (("A", "B"), "relation-ab"),
+                    (("B", "C"), "relation-bc"),
+                )
+            ],
+        },
+    )
+
+    def handler(stage, _profiles, context):
+        if stage == "relationship_candidate_selection":
+            return {"candidates": []}
+        assert [job["source_ids"] for job in context["pair_jobs"]] == [
+            ["A", "B"]
+        ]
+        return {"decisions": [_decision(job) for job in context["pair_jobs"]]}
+
+    result = _run(tmp_path, profiles, _Calls(handler))
+
+    assert result["pair_job_count"] == 1
 
 
 def test_cluster_membership_relations_are_reciprocal() -> None:
