@@ -24,7 +24,7 @@ from auto_zettelkasten.pipeline import (
 def _valid_receipt() -> dict[str, object]:
     return {
         "receipt_schema_version": "1",
-        "engine_version": "0.29.1",
+        "engine_version": "0.29.2",
         "artifact_schema_version": "1.20",
         "identity": "semantic-build",
         "status": "built",
@@ -143,6 +143,18 @@ def test_v029_cleanup_waits_for_durable_replacement_receipt(tmp_path: Path) -> N
         "03_literature_synthesis/tag_concept_registry.yml"
     ]
     assert not legacy.exists()
+
+
+def test_v029_cleanup_accepts_schema_two_replacement_receipt(tmp_path: Path) -> None:
+    legacy = tmp_path / "03_literature_synthesis" / "tag_concept_registry.yml"
+    write_yaml(legacy, {"concepts": ["legacy"]})
+    migrate_v029_lean_state(tmp_path)
+    receipt = tmp_path / "11_state" / "semantic_build_receipt.yml"
+    write_yaml(receipt, {**_valid_receipt(), "receipt_schema_version": "2"})
+
+    assert finalize_v029_lean_state(
+        tmp_path, replacement_receipt=receipt
+    ) == ["03_literature_synthesis/tag_concept_registry.yml"]
 
 
 def test_v029_cleanup_preserves_a_changed_legacy_candidate(tmp_path: Path) -> None:

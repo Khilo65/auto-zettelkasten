@@ -519,7 +519,7 @@ def finalize_v029_lean_state(
     receipt = read_yaml(replacement_receipt, {}) or {}
     if (
         not isinstance(receipt, Mapping)
-        or str(receipt.get("receipt_schema_version") or "") != "1"
+        or str(receipt.get("receipt_schema_version") or "") not in {"1", "2"}
         or str(receipt.get("engine_version") or "") != CURRENT_ENGINE_VERSION
         or str(receipt.get("artifact_schema_version") or "")
         != CURRENT_ARTIFACT_SCHEMA_VERSION

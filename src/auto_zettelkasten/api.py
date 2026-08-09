@@ -41,8 +41,7 @@ from .models import (
     StatusReport,
 )
 from .obsidian import export_obsidian
-from .notes import source_id_for_item
-from .notes import item_key
+from .notes import item_key, semantic_note_hash, source_id_for_item
 from .pipeline import (
     _RunProgress,
     _analytical_profile_source_ids,
@@ -1525,36 +1524,6 @@ def _build_map_semantic_fingerprint(
                 "sha256": sha256_file(path) if path.is_file() else "",
             }
         )
-    source_sets = []
-    for path in sorted(
-        (root / "02_source_memory" / "indexes" / "source_sets").glob("*.yml")
-    ):
-        payload = read_yaml(path, {}) or {}
-        if not isinstance(payload, Mapping):
-            continue
-        source_sets.append(
-            {
-                "source_set_alias": str(
-                    payload.get("source_set_alias")
-                    or payload.get("source_set_id")
-                    or path.stem
-                ),
-                "collection_key": str(
-                    payload.get("zotero_collection_key") or ""
-                ),
-                "collection_name": str(payload.get("collection_name") or ""),
-                "source_ids": sorted(
-                    str(value)
-                    for value in payload.get("source_ids", []) or []
-                    if str(value)
-                ),
-                "note_ids": sorted(
-                    str(value)
-                    for value in payload.get("note_ids", []) or []
-                    if str(value)
-                ),
-            }
-        )
     positions_payload = read_yaml(
         root / "02_source_memory" / "indexes" / "literature_positions.yml",
         {},
@@ -1628,7 +1597,16 @@ def _build_map_semantic_fingerprint(
         "profiles": sorted(
             profiles, key=lambda row: (row["source_id"], row["note_id"])
         ),
-        "collection_source_sets": source_sets,
+        "collection_snapshots": [
+            {
+                "path": str(path.relative_to(root)),
+                "sha256": sha256_file(path),
+            }
+            for path in (
+                root / "01_custody" / "zotero" / "collection_snapshot.yml",
+            )
+            if path.is_file()
+        ],
         "literature_positions": sorted(
             positions,
             key=lambda row: json.dumps(
@@ -1733,62 +1711,329 @@ def _build_map_receipt_identity(
     )
 
 
-def _stat_inventory(root: Path, paths: Sequence[Path]) -> list[dict[str, Any]]:
+def _stat_inventory(
+    root: Path,
+    paths: Sequence[Path],
+    *,
+    include_hash: bool = False,
+) -> list[dict[str, Any]]:
     rows = []
     for path in sorted({path for path in paths if path.is_file()}):
         stat = path.stat()
-        rows.append(
-            {
-                "path": str(path.relative_to(root)),
-                "bytes": stat.st_size,
-                "mtime_ns": stat.st_mtime_ns,
-            }
-        )
+        row = {
+            "path": str(path.relative_to(root)),
+            "bytes": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        }
+        if include_hash:
+            row["sha256"] = sha256_file(path)
+        rows.append(row)
     return rows
 
 
-def _build_map_input_inventory(root: Path, run_id: str) -> list[dict[str, Any]]:
-    paths = [
-        *(root / "02_source_memory" / "notes").glob("*.md"),
-        *(root / "02_source_memory" / "profiles").glob("*.yml"),
-        *(root / "02_source_memory" / "indexes" / "source_sets").glob("*.yml"),
-    ]
-    paths.extend(
-        path
-        for path in (
-            root / "02_source_memory" / "indexes" / "literature_positions.yml",
-            root / "02_source_memory" / "indexes" / "missing_sources.yml",
-            root / "02_source_memory" / "indexes" / "typed_links.yml",
-            root / "01_custody" / "zotero" / "collection_snapshot.yml",
-            run_directory(root, run_id) / "collection_snapshot.yml",
+def _source_set_path(
+    root: Path, value: Mapping[str, Any] | Path | str | None
+) -> Path | None:
+    if value is None or isinstance(value, Mapping):
+        return None
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        workspace_candidate = root / candidate
+        identifier_candidate = (
+            root
+            / "02_source_memory"
+            / "indexes"
+            / "source_sets"
+            / f"{candidate}.yml"
         )
-        if path.is_file()
+        candidate = (
+            workspace_candidate
+            if workspace_candidate.is_file()
+            else identifier_candidate
+        )
+    return candidate if candidate.is_file() else None
+
+
+def _upstream_input_row(
+    root: Path,
+    path: Path,
+    *,
+    kind: str,
+    semantic_sha256: str | None = None,
+) -> dict[str, Any]:
+    stat = path.stat()
+    try:
+        stored_path = str(path.relative_to(root))
+    except ValueError:
+        stored_path = str(path)
+    return {
+        "path": stored_path,
+        "kind": kind,
+        "present": True,
+        "bytes": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "semantic_sha256": semantic_sha256 or sha256_file(path),
+    }
+
+
+def _absent_upstream_input_row(
+    root: Path, path: Path, *, kind: str
+) -> dict[str, Any]:
+    try:
+        stored_path = str(path.relative_to(root))
+    except ValueError:
+        stored_path = str(path)
+    return {
+        "path": stored_path,
+        "kind": kind,
+        "present": False,
+        "bytes": 0,
+        "mtime_ns": 0,
+        "semantic_sha256": (
+            sha256_text("[]")
+            if kind in {"literature_positions", "human_relations"}
+            else ""
+        ),
+    }
+
+
+def _semantic_index_hash(path: Path, kind: str) -> str:
+    """Hash only the upstream semantic rows in a mixed machine index."""
+
+    payload = read_yaml(path, {}) or {}
+    if not isinstance(payload, Mapping):
+        return sha256_text("[]")
+    if kind == "literature_positions":
+        rows = [
+            {
+                key: value
+                for key, value in row.items()
+                if key not in {"created_at", "updated_at"}
+            }
+            for row in payload.get("positions", []) or []
+            if isinstance(row, Mapping)
+        ]
+    elif kind == "human_relations":
+        rows = [
+            {
+                key: row.get(key)
+                for key in (
+                    "source_id",
+                    "target_source_id",
+                    "relation_type",
+                    "reason",
+                    "active",
+                    "provenance",
+                )
+            }
+            for row in payload.get("relations", []) or payload.get("links", []) or []
+            if isinstance(row, Mapping)
+            and str(row.get("provenance") or "").casefold().startswith("human")
+        ]
+    else:
+        return sha256_file(path)
+    return sha256_text(
+        json.dumps(
+            sorted(
+                rows,
+                key=lambda row: json.dumps(
+                    row, sort_keys=True, ensure_ascii=False, default=str
+                ),
+            ),
+            sort_keys=True,
+            ensure_ascii=False,
+            default=str,
+        )
     )
-    return _stat_inventory(root, paths)
+
+
+def _build_map_upstream_inventory(
+    root: Path,
+    *,
+    note_rows: Sequence[Mapping[str, Any]],
+    source_set_argument: Mapping[str, Any] | Path | str | None,
+    run_id: str,
+) -> list[dict[str, Any]]:
+    """Record selected immutable inputs, never generated graph state."""
+
+    rows: list[dict[str, Any]] = []
+    for note in note_rows:
+        relative = str(note.get("note_path") or "")
+        path = root / relative
+        if not relative or not path.is_file():
+            continue
+        # Read the final projected file and strip owned graph sections. Cached
+        # note-row hashes can predate projection and must not seed a receipt.
+        semantic_hash = semantic_note_hash(path.read_text(encoding="utf-8"))
+        rows.append(
+            _upstream_input_row(
+                root,
+                path,
+                kind="semantic_note",
+                semantic_sha256=semantic_hash,
+            )
+        )
+        profile = profile_sidecar_path(
+            root / "02_source_memory" / "profiles",
+            str(note.get("note_id") or ""),
+        )
+        rows.append(
+            _upstream_input_row(root, profile, kind="profile")
+            if profile.is_file()
+            else _absent_upstream_input_row(root, profile, kind="profile")
+        )
+
+    positions_path = (
+        root / "02_source_memory" / "indexes" / "literature_positions.yml"
+    )
+    rows.append(
+        (
+            _upstream_input_row(
+                root,
+                positions_path,
+                kind="literature_positions",
+                semantic_sha256=_semantic_index_hash(
+                    positions_path, "literature_positions"
+                ),
+            )
+            if positions_path.is_file()
+            else _absent_upstream_input_row(
+                root, positions_path, kind="literature_positions"
+            )
+        )
+    )
+    typed_links_path = root / "02_source_memory" / "indexes" / "typed_links.yml"
+    rows.append(
+        (
+            _upstream_input_row(
+                root,
+                typed_links_path,
+                kind="human_relations",
+                semantic_sha256=_semantic_index_hash(
+                    typed_links_path, "human_relations"
+                ),
+            )
+            if typed_links_path.is_file()
+            else _absent_upstream_input_row(
+                root, typed_links_path, kind="human_relations"
+            )
+        )
+    )
+    for snapshot in (
+        root / "01_custody" / "zotero" / "collection_snapshot.yml",
+        run_directory(root, run_id) / "collection_snapshot.yml",
+    ):
+        rows.append(
+            _upstream_input_row(root, snapshot, kind="collection_snapshot")
+            if snapshot.is_file()
+            else _absent_upstream_input_row(
+                root, snapshot, kind="collection_snapshot"
+            )
+        )
+    selected_path = _source_set_path(root, source_set_argument)
+    if selected_path is not None:
+        rows.append(_upstream_input_row(root, selected_path, kind="explicit_source_set"))
+
+    return sorted(rows, key=lambda row: (str(row["path"]), str(row["kind"])))
+
+
+def _current_upstream_hash(path: Path, kind: str) -> str:
+    if kind == "semantic_note":
+        return semantic_note_hash(path.read_text(encoding="utf-8"))
+    if kind in {"literature_positions", "human_relations"}:
+        return _semantic_index_hash(path, kind)
+    return sha256_file(path)
+
+
+def _upstream_inputs_match(root: Path, rows: Sequence[Mapping[str, Any]]) -> bool:
+    for row in rows:
+        relative = str(row.get("path") or "")
+        kind = str(row.get("kind") or "")
+        path = root / relative
+        if not relative or not kind:
+            return False
+        expected_present = bool(row.get("present", True))
+        if not path.is_file():
+            if expected_present:
+                return False
+            continue
+        if _current_upstream_hash(path, kind) != str(
+            row.get("semantic_sha256") or ""
+        ):
+            return False
+    return True
+
+
+def _artifact_inventory(root: Path, paths: Sequence[Path]) -> list[dict[str, Any]]:
+    graph_paths = []
+    profile_root = root / "02_source_memory" / "profiles"
+    for path in paths:
+        try:
+            path.relative_to(profile_root)
+        except ValueError:
+            relative_parts = path.relative_to(root).parts
+            if not any(
+                part in {"profile_calls", "profile_failures"}
+                for part in relative_parts
+            ):
+                graph_paths.append(path)
+    return _stat_inventory(root, graph_paths, include_hash=True)
+
+
+def _artifacts_match(root: Path, rows: Sequence[Mapping[str, Any]]) -> bool:
+    for row in rows:
+        relative = str(row.get("path") or "")
+        path = root / relative
+        if not relative or not path.is_file():
+            return False
+        if sha256_file(path) != str(row.get("sha256") or ""):
+            return False
+    return True
 
 
 def _reusable_build_map_receipt(
     root: Path,
     run_id: str,
     identity: str,
+    *,
+    workspace_wide_selection: bool,
 ) -> ArtifactManifest | None:
     path = run_directory(root, run_id) / "semantic_build_receipt.yml"
     payload = read_yaml(path, {}) or {}
     if (
         not isinstance(payload, Mapping)
+        or str(payload.get("receipt_schema_version") or "") != "2"
         or str(payload.get("identity") or "") != identity
+        or not str(payload.get("upstream_fingerprint") or "")
         or not bool(payload.get("semantic_replayable", False))
-        or payload.get("inputs") != _build_map_input_inventory(root, run_id)
     ):
         return None
+    inputs = [
+        dict(row)
+        for row in payload.get("upstream_inputs", []) or []
+        if isinstance(row, Mapping)
+    ]
+    if not inputs or not _upstream_inputs_match(root, inputs):
+        return None
+    if workspace_wide_selection:
+        expected_notes = sorted(
+            str(value)
+            for value in payload.get("workspace_note_paths", []) or []
+            if str(value)
+        )
+        current_notes = sorted(
+            str(path.relative_to(root))
+            for path in (root / "02_source_memory" / "notes").glob("*.md")
+            if path.is_file()
+        )
+        if current_notes != expected_notes:
+            return None
     artifacts = [
         dict(row)
         for row in payload.get("artifacts", []) or []
         if isinstance(row, Mapping) and row.get("path")
     ]
-    if artifacts != _stat_inventory(
-        root, [root / str(row["path"]) for row in artifacts]
-    ):
+    if not artifacts or not _artifacts_match(root, artifacts):
         return None
     return ArtifactManifest(
         status=str(payload.get("status") or "partial"),
@@ -1873,18 +2118,10 @@ def build_map(
             root,
             run_id,
             receipt_identity,
+            workspace_wide_selection=not bool(source_set),
         )
         if reusable_receipt is not None:
             return reusable_receipt
-    if reasoner is None and policy.synthesis_enabled and allow_cloud:
-        built_in_reasoner = provider_from_name(provider, model, allow_cloud=allow_cloud)
-        if not isinstance(built_in_reasoner, LiteratureReasoner):
-            raise ValueError(f"provider {provider} does not implement literature reasoning")
-        reasoner = built_in_reasoner
-    if reasoner is not None and bool(getattr(reasoner, "is_cloud", True)) and not allow_cloud:
-        raise ValueError("cloud literature reasoner requires allow_cloud=True")
-    if external_discovery is not None and bool(getattr(external_discovery, "is_cloud", True)) and not allow_cloud:
-        raise ValueError("cloud external discovery provider requires allow_cloud=True")
     note_rows = all_workspace_note_rows(root)
     selected_source_set = _resolve_source_set(root, source_set)
     explicit_source_set = bool(selected_source_set)
@@ -1906,6 +2143,26 @@ def build_map(
                 if row.get("note_id")
             ),
         }
+    semantic_fingerprint = _build_map_semantic_fingerprint(
+        root,
+        note_rows=note_rows,
+        source_set=selected_source_set,
+        provider=provider,
+        model=model,
+        question=question,
+        policy=policy,
+        navigation=navigation,
+        comparison_collection_keys=comparison_collection_keys,
+    )
+    if reasoner is None and policy.synthesis_enabled and allow_cloud:
+        built_in_reasoner = provider_from_name(provider, model, allow_cloud=allow_cloud)
+        if not isinstance(built_in_reasoner, LiteratureReasoner):
+            raise ValueError(f"provider {provider} does not implement literature reasoning")
+        reasoner = built_in_reasoner
+    if reasoner is not None and bool(getattr(reasoner, "is_cloud", True)) and not allow_cloud:
+        raise ValueError("cloud literature reasoner requires allow_cloud=True")
+    if external_discovery is not None and bool(getattr(external_discovery, "is_cloud", True)) and not allow_cloud:
+        raise ValueError("cloud external discovery provider requires allow_cloud=True")
     extraction_config = (
         config.get("extraction", {})
         if isinstance(config.get("extraction", {}), Mapping)
@@ -1945,19 +2202,6 @@ def build_map(
                 request_deadline_seconds=literature_request_deadline,
             ),
         )
-    receipt_source_set = dict(selected_source_set)
-    receipt_source_set["comparison_collection_keys"] = list(
-        comparison_collection_keys
-    )
-    semantic_fingerprint = sha256_text(
-        json.dumps(
-            {
-                "identity": receipt_identity,
-                "inputs": _build_map_input_inventory(root, run_id),
-            },
-            sort_keys=True,
-        )
-    )
     if not explicit_source_set:
         selected_source_set = workspace_source_set(
             root, note_rows, run_id=run_id
@@ -2063,14 +2307,13 @@ def build_map(
         for token in ("timeout", "timed out", "connection", "transport")
     ):
         semantic_replayable = False
-    input_inventory = _build_map_input_inventory(root, run_id)
-    semantic_fingerprint = sha256_text(
-        json.dumps(
-            {"identity": receipt_identity, "inputs": input_inventory},
-            sort_keys=True,
-        )
+    upstream_inputs = _build_map_upstream_inventory(
+        root,
+        note_rows=note_rows,
+        source_set_argument=source_set,
+        run_id=run_id,
     )
-    compact_artifacts = _stat_inventory(root, list(result["paths"]))
+    compact_artifacts = _artifact_inventory(root, list(result["paths"]))
     manifest = ArtifactManifest(
         status="partial" if result.get("partial_reason") else "built",
         workspace=root,
@@ -2118,14 +2361,20 @@ def build_map(
     write_yaml(
         semantic_receipt_path,
         {
-            "receipt_schema_version": "1",
+            "receipt_schema_version": "2",
             "engine_version": ENGINE_VERSION,
             "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
             "identity": receipt_identity,
+            "upstream_fingerprint": semantic_fingerprint,
             "status": manifest.status,
             "created_at": manifest.created_at,
             "semantic_replayable": semantic_replayable,
-            "inputs": input_inventory,
+            "upstream_inputs": upstream_inputs,
+            "workspace_note_paths": sorted(
+                str(path.relative_to(root))
+                for path in (root / "02_source_memory" / "notes").glob("*.md")
+                if path.is_file()
+            ),
             "artifacts": compact_artifacts,
             "summary": summary,
         },

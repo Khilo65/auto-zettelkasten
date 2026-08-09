@@ -15,14 +15,20 @@ from auto_zettelkasten.pipeline import (
     _write_profile_packets,
 )
 from auto_zettelkasten.readers import _relationship_adjudication_system_prompt
+from auto_zettelkasten.relationships import (
+    RELATIONSHIP_DISCOVERY_PROMPT_VERSION,
+    RELATIONSHIP_PROMPT_VERSION,
+)
 
 
-def test_v26_relationship_prompt_and_packet_limit() -> None:
+def test_v29_2_relationship_prompt_and_packet_limit() -> None:
     prompt = _relationship_adjudication_system_prompt()
-    assert "relationship prompt v16" in prompt
-    assert "one sufficiently specific proposition" in prompt
+    assert RELATIONSHIP_PROMPT_VERSION == "17"
+    assert RELATIONSHIP_DISCOVERY_PROMPT_VERSION == "16"
+    assert "relationship prompt v17" in prompt
+    assert "choose the tier before the subtype" in prompt
     assert "Use contextual_connection" in prompt
-    assert _RELATIONSHIP_BATCH_MAX_JOBS == 15
+    assert _RELATIONSHIP_BATCH_MAX_JOBS == 12
 
     rows = list(range(31))
     packets = _pack_relationship_rows(
@@ -37,7 +43,7 @@ def test_v26_relationship_prompt_and_packet_limit() -> None:
         max_chars=1_000_000,
         max_rows=_RELATIONSHIP_BATCH_MAX_JOBS,
     )
-    assert [len(packet) for packet in packets] == [15, 15, 1]
+    assert [len(packet) for packet in packets] == [12, 12, 7]
 
 
 def test_cluster_scheduler_uses_all_explicitly_available_calls() -> None:

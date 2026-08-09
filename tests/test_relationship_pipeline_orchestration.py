@@ -2263,7 +2263,7 @@ def test_committed_selection_state_makes_unchanged_replay_call_free(
     assert replay["provider_batch_count"] == 0
 
 
-def test_adjudication_prompt_change_reuses_current_decision_without_calls(
+def test_adjudication_prompt_change_reuses_discovery_and_readjudicates(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
@@ -2300,8 +2300,10 @@ def test_adjudication_prompt_change_reuses_current_decision_without_calls(
     )
     second = _run(tmp_path, profiles, calls)
 
-    assert calls.seen == []
-    assert second["pair_job_count"] == 0
+    assert [stage for stage, _key, _context in calls.seen] == [
+        "relationship_adjudication"
+    ]
+    assert second["pair_job_count"] == 1
     _commit_relationship_selection_state(
         tmp_path,
         second,
@@ -2399,7 +2401,7 @@ def test_schema3_selected_dispositions_migrate_without_discovery(
     ] == "legacy_selected_disposition"
 
 
-def test_prompt_change_keeps_frozen_negative_pair_without_calls(
+def test_prompt_change_reuses_frozen_negative_pair_for_readjudication(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
@@ -2460,8 +2462,10 @@ def test_prompt_change_keeps_frozen_negative_pair_without_calls(
         frozen_pair_jobs=[frozen_job],
     )
 
-    assert calls.seen == []
-    assert second["pair_job_count"] == 0
+    assert [stage for stage, _key, _context in calls.seen] == [
+        "relationship_adjudication"
+    ]
+    assert second["pair_job_count"] == 1
 
 
 def test_operational_policy_changes_do_not_invalidate_relationship_state(

@@ -83,16 +83,22 @@ def test_v8_salvages_valid_connections_and_keeps_anchors_optional() -> None:
     assert accepted["connection_id"].startswith("relationship-connection-")
 
 
-def test_v16_is_compact_domain_neutral_and_source_owned() -> None:
+def test_v17_is_compact_domain_neutral_and_source_owned() -> None:
     prompt = _relationship_adjudication_system_prompt()
 
-    assert "relationship prompt v16" in prompt
-    assert "source_a_basis must describe only the supplied left_source_id" in prompt
+    assert "relationship prompt v17" in prompt
+    assert "source_a_basis describes only the supplied left_source_id" in prompt
     assert "source_b_basis only the supplied right_source_id" in prompt
-    assert "without widening, recasting, or exchanging" in prompt
-    assert "joint-reading or system-level inference" in prompt
-    assert "supports is directional" in prompt
-    assert "complements is symmetric" in prompt
+    assert "whole work versus chapter, excerpt, or component" in prompt
+    assert "choose the tier before the subtype" in prompt
+    assert "same sufficiently specific proposition" in prompt
+    assert "explicitly establishes an intellectual bridge" in prompt
+    assert "supports means the actor supplies evidence or argument" in prompt
+    assert "undermines means the actor supplies materially incompatible" in prompt
+    assert "qualifies means the actor establishes a condition" in prompt
+    assert "sequential_relationship means the actor precedes the reference" in prompt
+    assert "contextual_connection are symmetric" in prompt
+    assert "ACTOR [relation type] REFERENCE" in prompt
     assert len(prompt) <= 3_500
     assert not any(
         name in prompt.casefold()

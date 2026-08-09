@@ -1915,7 +1915,7 @@ def _relationship_candidate_system_prompt() -> str:
 def _relationship_adjudication_system_prompt() -> str:
     return (
         "You adjudicate immutable relationship pair jobs for Auto-Zettelkasten "
-        "relationship prompt v16 and contract relationship-decision-v8. Read both "
+        "relationship prompt v17 and contract relationship-decision-v8. Read both "
         "complete atomic notes. Return one JSON object whose decisions object is keyed "
         "by every supplied pair_job_id, with no missing or extra keys. Each value is "
         "either {decision:no_relationship, reason, confidence} or "
@@ -1924,40 +1924,38 @@ def _relationship_adjudication_system_prompt() -> str:
         "propositions. Every connection contains comparison_proposition, "
         "primary_relation_type, secondary_relation_types, actor_source_id, "
         "reference_source_id, source_a_basis, source_b_basis, reason, "
-        "boundary_or_qualification, and confidence. First describe each endpoint "
-        "independently: source_a_basis must describe only the supplied left_source_id "
-        "note and source_b_basis only the supplied right_source_id note. Preserve each "
-        "source's constructs, entities and roles, level and unit of analysis, process "
-        "position, outcome, scope, method, evidentiary status, and causal strength. "
-        "Second, test whether both bases support one sufficiently specific proposition, "
-        "question, mechanism, outcome, or explicit intellectual engagement without "
-        "widening, recasting, or exchanging either source's meaning. Third, choose a "
-        "direct relationship only when that comparison succeeds. Use "
-        "contextual_connection when joint reading is useful but the connection requires "
-        "an additional interpretive step; identify it explicitly as a joint-reading or "
-        "system-level inference rather than either author's finding. Use no_relationship "
-        "when overlap is only topical, lexical, or generic. Fourth, choose the narrowest "
-        "defensible type. supports is directional: the actor supplies evidence or "
-        "argument bearing on a sufficiently specific proposition advanced by the "
-        "reference. undermines supplies materially incompatible evidence or argument; "
-        "qualifies establishes a meaningful condition, exception, or boundary; extends "
-        "requires explicit building on, applying, testing, refining, or generalizing; "
-        "rival_explanation advances a competing explanation of the same explanandum; "
-        "and sequential_relationship expresses an established intellectual or process "
-        "sequence. complements is symmetric and is appropriate for independent "
-        "compatible contributions to the same specific problem. contrasts, "
-        "boundary_contrast, methodological_fault_line, "
-        "interpretive_or_normative_disagreement, and contextual_connection are also "
-        "symmetric. Directional types require the supplied endpoint IDs as actor and "
+        "boundary_or_qualification, and confidence. Apply this ordered rubric. First, "
+        "describe each endpoint independently: source_a_basis describes only the supplied "
+        "left_source_id note and source_b_basis only the supplied right_source_id note. "
+        "Preserve visible scope (whole work versus chapter, excerpt, or component), "
+        "construct and outcome, unit and level of analysis, process stage, method, "
+        "evidentiary role and status, and causal strength. Second, choose the tier before the "
+        "subtype. Use a direct relationship only when the notes address the same "
+        "sufficiently specific proposition or one endpoint explicitly establishes an "
+        "intellectual bridge across a boundary. Use contextual_connection when joint "
+        "reading is useful but the system combines adjacent constructs, outcomes, "
+        "levels, stages, or evidence types; state that boundary and the system-level "
+        "inference. Use no_relationship for merely topical, lexical, or generic overlap. "
+        "Third, choose the narrowest defensible subtype. Citation, chronology, shared "
+        "data, motivation, method, or vocabulary alone do not establish support. "
+        "Do not infer intellectual direction or support from pair order or those signals. "
+        "supports means the actor supplies evidence or argument for the reference proposition; "
+        "undermines means the actor supplies materially incompatible evidence or argument; "
+        "qualifies means the actor establishes a condition, exception, or boundary; extends "
+        "requires explicit building on, applying, testing, refining, or generalizing the "
+        "reference; rival_explanation offers a competing answer to the same explanandum; and "
+        "sequential_relationship means the actor precedes the reference in an explicit "
+        "intellectual or process sequence. "
+        "These directional types require actor and reference. complements, contrasts, "
+        "boundary_contrast, methodological_fault_line, interpretive_or_normative_disagreement, "
+        "and contextual_connection are symmetric and may use null actor and reference. A "
+        "direct relationship may cross a boundary when a source explicitly establishes "
+        "that bridge. Directional types require the supplied endpoint IDs as actor and "
         "reference; symmetric types may return them as null because local code stores "
-        "the canonical pair. Do not infer intellectual direction or support from pair "
-        "order, chronology, citation, shared data, method, vocabulary, or broad outcome. "
-        "A direct relationship requires a sufficiently specific shared proposition. When the works instead illuminate adjacent "
-        "units, populations, settings, stages, mechanisms, outcomes, or evidentiary questions, prefer a contextual relationship "
-        "and state the boundary precisely. Treat limited notes only within visible scope. Finally, self-review once: the "
-        "proposition, type, actor, reference, endpoint bases, rationale, and boundary "
-        "must preserve meaning, roles, scope, outcome, causal and evidentiary strength, "
-        "source ownership, and any applicable direction. Never write display labels, "
+        "the canonical pair. Treat limited notes only within their visible scope. "
+        "Finally, self-review once and check the direction by reading the result as 'ACTOR [relation "
+        "type] REFERENCE', then confirm that proposition, type, endpoint bases, reason, "
+        "boundary, scope, causal strength, and source ownership all agree. Never write display labels, "
         "Markdown, invented IDs, locators, provenance, or timestamps."
     )
 
@@ -4525,6 +4523,19 @@ def _validate_streamlined_cluster_response(
         limits = []
     if not isinstance(limits, list):
         raise ProviderError("streamlined cluster response limits must be a list")
+
+    def limit_text(value: Any) -> str:
+        if isinstance(value, Mapping):
+            return next(
+                (
+                    str(value.get(field) or "").strip()
+                    for field in ("limit", "text", "boundary", "reason")
+                    if str(value.get(field) or "").strip()
+                ),
+                "",
+            )
+        return str(value).strip()
+
     member_roles = payload.get("member_roles", {})
     if isinstance(member_roles, Mapping):
         member_roles = {
@@ -4541,9 +4552,9 @@ def _validate_streamlined_cluster_response(
         "lines_of_inquiry": normalized_lines,
         "differences": narrative_rows("differences", "difference"),
         "limits": [
-            str(value).strip()
+            limit_text(value)
             for value in limits
-            if str(value).strip()
+            if limit_text(value)
         ],
         "related_clusters": mapping_rows("related_clusters"),
         "retained_member_ids": [

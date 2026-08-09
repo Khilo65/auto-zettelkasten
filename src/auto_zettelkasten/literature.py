@@ -11243,6 +11243,11 @@ def validate_streamlined_cluster_synthesis(
     secondary_cited_works = [
         row for key, row in grouped.items() if key not in priority_keys
     ]
+    normalized_limits = [
+        rendered
+        for value in response.get("limits", []) or []
+        if (rendered := _cluster_limit_text(value))
+    ]
     return {
         **dict(response),
         "retained_member_ids": sorted(retained),
@@ -11262,7 +11267,8 @@ def validate_streamlined_cluster_synthesis(
             else {}
         ),
         "scope": str(response.get("organizing_problem") or ""),
-        "boundaries": list(response.get("limits", []) or []),
+        "limits": normalized_limits,
+        "boundaries": normalized_limits,
         "coherence_rationale": str(
             response.get("organizing_problem") or ""
         ),
@@ -16428,6 +16434,23 @@ def _navigation_profile_rows(
     return hydrated
 
 
+def _report_projection_profiles(
+    report: Mapping[str, Any],
+) -> list[Mapping[str, Any]]:
+    """Return canonical-path profiles for rendering, with legacy fallback."""
+
+    projection_profiles = report.get("projection_profiles")
+    if isinstance(projection_profiles, list):
+        return [
+            row for row in projection_profiles if isinstance(row, Mapping)
+        ]
+    return [
+        row
+        for row in report.get("profiles", []) or []
+        if isinstance(row, Mapping)
+    ]
+
+
 def build_navigation_projection(
     workspace: Path | None,
     profiles: Sequence[Any],
@@ -21388,7 +21411,7 @@ def build_literature_report(
             set(gap_ids_by_cluster.get(str(cluster["cluster_id"]), []))
         )
     navigation_profiles = _navigation_profile_rows(
-        [_as_mapping(profile) for profile in profiles], source_notes
+        normalized, source_notes
     )
     if isinstance(prebuilt_navigation, Mapping):
         navigation = dict(prebuilt_navigation)
@@ -21706,6 +21729,10 @@ def build_literature_report(
     return {
         "manifest": manifest,
         "profiles": normalized,
+        # Analytical profiles remain unchanged for callers and checkpoints.
+        # Projection-only metadata is hydrated from the canonical source-note
+        # registry so generated wikilinks cannot inherit stale profile paths.
+        "projection_profiles": navigation_profiles,
         "relations": navigation["typed_relations"],
         "topic_neighborhoods": navigation["topic_neighborhoods"],
         "navigation": navigation,
@@ -22061,6 +22088,28 @@ def _obsidian_note_link(row: Mapping[str, Any]) -> str:
         return title or str(row.get("note_id") or row.get("source_id") or "")
     target = Path(note_path).stem
     return f"[[{target}|{title}]]" if title and title != target else f"[[{target}]]"
+
+
+def _cluster_limit_text(value: Any) -> str:
+    """Render one cluster limit from current or legacy provider envelopes."""
+
+    candidate = value
+    if isinstance(candidate, str):
+        stripped = candidate.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                recovered = ast.literal_eval(stripped)
+            except (SyntaxError, ValueError):
+                recovered = None
+            if isinstance(recovered, Mapping):
+                candidate = recovered
+    if isinstance(candidate, Mapping):
+        for field in ("limit", "text", "boundary", "reason"):
+            rendered = _human_projection_text(candidate.get(field) or "")
+            if rendered:
+                return rendered
+        return ""
+    return _human_projection_text(candidate)
 
 
 def _cluster_obsidian_tags(cluster: Mapping[str, Any]) -> list[str]:
@@ -23014,9 +23063,9 @@ def _streamlined_cluster_markdown(
             + "\n".join(material_exclusions)
         )
     limits = [
-        f"- {_human_projection_text(value)}"
+        f"- {rendered}"
         for value in synthesis.get("limits", []) or []
-        if _human_projection_text(value)
+        if (rendered := _cluster_limit_text(value))
     ]
     if limits:
         sections.append("## Limits and boundaries\n\n" + "\n".join(limits))
@@ -24690,7 +24739,7 @@ def _literature_map_markdown_v09(
     coverage_counts = _as_mapping(coverage_register.get("counts"))
     profile_by_source = {
         str(row.get("source_id") or ""): row
-        for row in report.get("profiles", []) or []
+        for row in _report_projection_profiles(report)
         if isinstance(row, Mapping) and row.get("source_id")
     }
     analytical_source_ids = {
@@ -25219,7 +25268,7 @@ def _literature_map_markdown(
     }
     profiles_by_source = {
         str(row.get("source_id") or ""): row
-        for row in report.get("profiles", []) or []
+        for row in _report_projection_profiles(report)
         if isinstance(row, Mapping) and row.get("source_id")
     }
     analytical_unclustered = [
@@ -25539,7 +25588,7 @@ def persist_literature_report(
     gaps = list(report["gap_registry"]["gaps"])
     profile_by_source = {
         str(row.get("source_id") or ""): row
-        for row in report.get("profiles", []) or []
+        for row in _report_projection_profiles(report)
         if row.get("source_id")
     }
     cluster_by_id = {str(row["cluster_id"]): row for row in clusters}
