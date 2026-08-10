@@ -6790,6 +6790,7 @@ def _run_relationship_reasoning(
         or focus_source_ids
         or catalogue_changed
         or prior_selected_candidates is None
+        or prior_state.get("relationship_discovery_incomplete_jobs")
     )
     if (
         require_reused_discovery

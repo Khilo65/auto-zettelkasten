@@ -713,6 +713,56 @@ def test_terminal_complement_packet_does_not_discard_successful_graph_work(
     assert result["accounted_pair_job_count"] == result["pair_job_count"]
     assert result["accepted"]
 
+    _commit_relationship_selection_state(
+        tmp_path,
+        result,
+        catalogue_revision=result["reconciled_catalogue_revision"],
+    )
+
+    def resume_handler(stage, _profiles, context):
+        if stage.endswith("candidate_selection"):
+            return {
+                "candidates": [
+                    {
+                        **_candidate(
+                            job["left_source_ids"][0],
+                            job["right_source_ids"][0],
+                        ),
+                        "bridge_job_id": job["bridge_job_id"],
+                    }
+                    for job in context["bridge_jobs"]
+                ],
+                "job_outcomes": [
+                    {
+                        "bridge_job_id": job["bridge_job_id"],
+                        "status": "completed",
+                    }
+                    for job in context["bridge_jobs"]
+                ],
+            }
+        return {"decisions": [_decision(job) for job in context["pair_jobs"]]}
+
+    resume_calls = _Calls(resume_handler)
+    resumed = _run(
+        tmp_path,
+        profiles,
+        resume_calls,
+        shared_family_plan={
+            "lean_index_hash": "lean",
+            "literature_families": [
+                {
+                    "family_id": f"family-{index:02d}",
+                    "source_ids": [source_ids[index], source_ids[index + 8]],
+                }
+                for index in range(8)
+            ],
+            "discovery_jobs": jobs,
+        },
+    )
+    assert resume_calls.seen
+    assert not resumed.get("semantic_noop", False)
+    assert resumed["relationship_discovery_status"] == "complete"
+
 
 def test_shared_plan_runs_broad_before_complement_and_passes_prior_pairs(
     tmp_path: Path,
