@@ -24,7 +24,7 @@ from auto_zettelkasten.pipeline import (
 def _valid_receipt() -> dict[str, object]:
     return {
         "receipt_schema_version": "1",
-        "engine_version": "0.29.2",
+        "engine_version": "0.29.3",
         "artifact_schema_version": "1.20",
         "identity": "semantic-build",
         "status": "built",
@@ -238,7 +238,7 @@ def test_cost_estimate_prices_graph_when_every_source_is_reusable(tmp_path: Path
     assert result["new_source_jobs"] == 0
     assert result["mode"] == "graph_only"
     assert result["inventory_count"] == 300
-    assert result["graph_calls"]["expected"] == 6
+    assert result["graph_calls"]["expected"] == 7
     assert result["source_cost_usd"]["expected_usd"] == 0
     assert result["graph_calls"]["expected"] > 0
     assert result["graph_cost_usd"]["expected_usd"] > 0

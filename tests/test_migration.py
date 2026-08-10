@@ -523,10 +523,10 @@ def test_schema_1_4_to_1_5_apply_is_local_byte_preserving_and_idempotent(
     assert first["proposition_anchors"]["profile_upgrade"] == "lazy_on_read"
     assert first["proposition_anchors"]["archived_files"] == []
     assert marker.is_file()
-    assert read_yaml(tmp_path / "auto-zettelkasten.yml")["engine_version"] == "0.29.2"
+    assert read_yaml(tmp_path / "auto-zettelkasten.yml")["engine_version"] == "0.29.3"
     assert read_yaml(tmp_path / "auto-zettelkasten.yml")["prompt_version"] == "11"
     assert read_yaml(tmp_path / "auto-zettelkasten.yml")["artifact_schema_version"] == "1.20"
-    assert read_yaml(tmp_path / "11_state" / "workspace_manifest.yml")["engine_version"] == "0.29.2"
+    assert read_yaml(tmp_path / "11_state" / "workspace_manifest.yml")["engine_version"] == "0.29.3"
     assert read_yaml(tmp_path / "11_state" / "workspace_manifest.yml")["artifact_schema_version"] == "1.20"
     assert all(path.read_bytes() == content for path, content in preserved.items())
     assert second["proposition_anchors"]["status"] == "already_migrated"

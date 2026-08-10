@@ -1915,7 +1915,7 @@ def _relationship_candidate_system_prompt() -> str:
 def _relationship_adjudication_system_prompt() -> str:
     return (
         "You adjudicate immutable relationship pair jobs for Auto-Zettelkasten "
-        "relationship prompt v17 and contract relationship-decision-v8. Read both "
+        "relationship prompt v18 and contract relationship-decision-v8. Read both "
         "complete atomic notes. Return one JSON object whose decisions object is keyed "
         "by every supplied pair_job_id, with no missing or extra keys. Each value is "
         "either {decision:no_relationship, reason, confidence} or "
@@ -1953,7 +1953,9 @@ def _relationship_adjudication_system_prompt() -> str:
         "that bridge. Directional types require the supplied endpoint IDs as actor and "
         "reference; symmetric types may return them as null because local code stores "
         "the canonical pair. Treat limited notes only within their visible scope. "
-        "Finally, self-review once and check the direction by reading the result as 'ACTOR [relation "
+        "Finally, compare the returned decision keys with the supplied pair_job_ids and do not "
+        "finish until every ID appears exactly once; use no_relationship rather than omitting a pair. "
+        "Then self-review once and check the direction by reading the result as 'ACTOR [relation "
         "type] REFERENCE', then confirm that proposition, type, endpoint bases, reason, "
         "boundary, scope, causal strength, and source ownership all agree. Never write display labels, "
         "Markdown, invented IDs, locators, provenance, or timestamps."

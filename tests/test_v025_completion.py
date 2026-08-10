@@ -23,12 +23,13 @@ from auto_zettelkasten.relationships import (
 
 def test_v29_2_relationship_prompt_and_packet_limit() -> None:
     prompt = _relationship_adjudication_system_prompt()
-    assert RELATIONSHIP_PROMPT_VERSION == "17"
+    assert RELATIONSHIP_PROMPT_VERSION == "18"
     assert RELATIONSHIP_DISCOVERY_PROMPT_VERSION == "16"
-    assert "relationship prompt v17" in prompt
+    assert "relationship prompt v18" in prompt
     assert "choose the tier before the subtype" in prompt
     assert "Use contextual_connection" in prompt
-    assert _RELATIONSHIP_BATCH_MAX_JOBS == 12
+    assert "every ID appears exactly once" in prompt
+    assert _RELATIONSHIP_BATCH_MAX_JOBS == 8
 
     rows = list(range(31))
     packets = _pack_relationship_rows(
@@ -43,7 +44,7 @@ def test_v29_2_relationship_prompt_and_packet_limit() -> None:
         max_chars=1_000_000,
         max_rows=_RELATIONSHIP_BATCH_MAX_JOBS,
     )
-    assert [len(packet) for packet in packets] == [12, 12, 7]
+    assert [len(packet) for packet in packets] == [8, 8, 8, 7]
 
 
 def test_cluster_scheduler_uses_all_explicitly_available_calls() -> None:

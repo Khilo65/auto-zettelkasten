@@ -490,7 +490,7 @@ def estimate_cost(
         }
 
     candidate_rates = {"low": 0.8, "expected": 1.7, "high": 2.5}
-    candidate_packet_sizes = {"low": 15, "expected": 12, "high": 10}
+    candidate_packet_sizes = {"low": 8, "expected": 8, "high": 8}
     relationship_calls = {
         bound: (
             0
