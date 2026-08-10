@@ -11,6 +11,7 @@ from auto_zettelkasten.literature import (
     _cluster_synthesis_profile_projection,
     _cluster_markdown,
     _prune_stale_generated_markdown,
+    _project_planned_cluster_neighbors,
     _source_notes_with_custody_relations,
     _write_markdown_with_quality_ratchet,
     build_literature_report,
@@ -244,6 +245,481 @@ def test_streamlined_cluster_rebinds_locator_only_finding_evidence() -> None:
     assert validated["source_contributions"][0]["evidence"][0][
         "evidence_anchor_id"
     ] == "anchor-A"
+
+
+def test_streamlined_cluster_ignores_only_cross_owned_evidence_rows() -> None:
+    profiles = [_profile("A"), _profile("B"), _profile("C")]
+    cluster = {"cluster_id": "cluster-one", "source_ids": ["A", "B", "C"]}
+    response = _streamlined_response(cluster, profiles)
+    findings = response["lines_of_inquiry"][0]["study_findings"]
+    findings[0]["evidence"].append(
+        {
+            "source_id": "B",
+            "evidence_anchor_id": "anchor-B",
+            "locator": "p. 10",
+        }
+    )
+    findings.append(
+        {
+            "source_id": "A",
+            "finding": "A separate valid source-owned finding.",
+            "method_scope": "Single-source analysis.",
+            "relation_to_line": "supports",
+            "evidence": [
+                {
+                    "source_id": "A",
+                    "evidence_anchor_id": "anchor-A",
+                    "locator": "p. 10",
+                }
+            ],
+        }
+    )
+    findings.append(
+        {
+            "source_id": "A",
+            "finding": "An invalid cross-source comparison.",
+            "method_scope": "Comparative analysis.",
+            "relation_to_line": "contrasts",
+            "evidence": [
+                {
+                    "source_id": "C",
+                    "evidence_anchor_id": "anchor-C",
+                    "locator": "p. 10",
+                }
+            ],
+        }
+    )
+
+    validated = validate_streamlined_cluster_synthesis(
+        response, cluster, profiles
+    )
+
+    assert validated["status"] == "reasoned"
+    assert validated["retained_member_ids"] == ["A", "B", "C"]
+    assert all(
+        len(row.get("evidence", []) or []) == 1
+        for row in validated["lines_of_inquiry"][0]["study_findings"]
+    )
+    assert len(validated["lines_of_inquiry"][0]["study_findings"]) == 3
+    assert "An invalid cross-source comparison." not in {
+        row["finding"]
+        for row in validated["lines_of_inquiry"][0]["study_findings"]
+    }
+    assert "study_finding_evidence_source_mismatch_ignored" in validated[
+        "quality_warnings"
+    ]
+
+
+def test_oversized_cluster_is_partitioned_before_writers(tmp_path: Path) -> None:
+    profiles = [_profile(source_id) for source_id in ("A", "B", "C", "D")]
+    writer_sizes: list[int] = []
+
+    class Reasoner:
+        name = "local"
+        model = "test"
+
+        def cluster_synthesis_fits(self, projected, request, *, context=None):
+            return len(projected) <= 2
+
+        def plan_clusters(self, projected, request, *, context=None):
+            assert not projected
+            assert context["cluster_plan_mode"] == "partition"
+            return {
+                "clusters": [
+                    {
+                        "cluster_id": "left",
+                        "title": "Left child",
+                        "semantic_identity": "left child",
+                        "organizing_problem": "Left problem",
+                        "members": [
+                            {"source_id": "A", "role": "core"},
+                            {"source_id": "B", "role": "core"},
+                        ],
+                    },
+                    {
+                        "cluster_id": "right",
+                        "title": "Right child",
+                        "semantic_identity": "right child",
+                        "organizing_problem": "Right problem",
+                        "members": [
+                            {"source_id": "C", "role": "core"},
+                            {"source_id": "D", "role": "core"},
+                        ],
+                    },
+                ],
+                "neighbor_relationships": [],
+                "unclustered_sources": [],
+            }
+
+        def synthesize_cluster(self, projected, request, *, context=None):
+            writer_sizes.append(len(projected))
+            return _streamlined_response(context["cluster"], projected)
+
+    report = build_literature_report(
+        profiles,
+        reasoner=Reasoner(),
+        request=LiteratureMapRequest(tmp_path),
+        source_notes=[
+            {
+                "source_id": row["source_id"],
+                "title": row["title"],
+                "source_scope": "full_document",
+                "body": f"# {row['title']}\n\nComplete note.",
+            }
+            for row in profiles
+        ],
+        shared_literature_plan={
+            "literature_families": [
+                {
+                    "family_id": "oversized",
+                    "label": "Oversized",
+                    "organizing_problem": "One broad problem",
+                    "source_ids": ["A", "B", "C", "D"],
+                    "proposed_roles": {
+                        source_id: "core" for source_id in ("A", "B", "C", "D")
+                    },
+                    "candidate_cluster": True,
+                }
+            ],
+            "discovery_jobs": [],
+            "neighboring_families": [],
+        },
+        acquisition_ledger_path=tmp_path / "cluster_acquisition_ledger.yml",
+    )
+
+    clusters = report["cluster_registry"]["clusters"]
+    assert len(clusters) == 2
+    assert all(row["formation_route"] == "partitioned_cluster_plan" for row in clusters)
+    assert writer_sizes == [2, 2]
+    assert all(row["parent_cluster_id"] for row in clusters)
+
+
+def test_nonshrinking_partition_never_reaches_cluster_writer(tmp_path: Path) -> None:
+    profiles = [_profile(source_id) for source_id in ("A", "B", "C", "D")]
+    writer_called = False
+
+    class Reasoner:
+        name = "local"
+        model = "test"
+
+        def cluster_synthesis_fits(self, projected, request, *, context=None):
+            return False
+
+        def plan_clusters(self, projected, request, *, context=None):
+            return {
+                "clusters": [
+                    {
+                        "cluster_id": "same",
+                        "members": [
+                            {"source_id": source_id, "role": "core"}
+                            for source_id in ("A", "B", "C", "D")
+                        ],
+                    }
+                ],
+                "neighbor_relationships": [],
+                "unclustered_sources": [],
+            }
+
+        def synthesize_cluster(self, projected, request, *, context=None):
+            nonlocal writer_called
+            writer_called = True
+            return {}
+
+    report = build_literature_report(
+        profiles,
+        reasoner=Reasoner(),
+        request=LiteratureMapRequest(tmp_path),
+        source_notes=[
+            {
+                "source_id": row["source_id"],
+                "title": row["title"],
+                "source_scope": "full_document",
+                "body": f"# {row['title']}\n\nComplete note.",
+            }
+            for row in profiles
+        ],
+        shared_literature_plan={
+            "literature_families": [
+                {
+                    "family_id": "oversized",
+                    "label": "Oversized",
+                    "organizing_problem": "One broad problem",
+                    "source_ids": ["A", "B", "C", "D"],
+                    "proposed_roles": {
+                        source_id: "core" for source_id in ("A", "B", "C", "D")
+                    },
+                    "candidate_cluster": True,
+                }
+            ],
+            "discovery_jobs": [],
+            "neighboring_families": [],
+        },
+    )
+
+    assert not writer_called
+    pending = report["cluster_registry"]["pending_revisions"]
+    assert len(pending) == 1
+    assert "cluster_partition_contract_invalid" in pending[0]["synthesis"][
+        "quality_errors"
+    ]
+
+
+def test_partition_replacement_waits_for_every_child_writer(tmp_path: Path) -> None:
+    profiles = [_profile(source_id) for source_id in ("A", "B", "C", "D")]
+    source_notes = [
+        {
+            "source_id": row["source_id"],
+            "title": row["title"],
+            "source_scope": "full_document",
+            "body": f"# {row['title']}\n\nComplete note.",
+        }
+        for row in profiles
+    ]
+    shared_plan = {
+        "literature_families": [
+            {
+                "family_id": "oversized",
+                "label": "Oversized",
+                "organizing_problem": "One broad problem",
+                "source_ids": ["A", "B", "C", "D"],
+                "proposed_roles": {
+                    source_id: "core" for source_id in ("A", "B", "C", "D")
+                },
+                "candidate_cluster": True,
+            }
+        ],
+        "discovery_jobs": [],
+        "neighboring_families": [],
+    }
+
+    class InitialReasoner:
+        name = "local"
+        model = "test"
+
+        def cluster_synthesis_fits(self, projected, request, *, context=None):
+            return True
+
+        def synthesize_cluster(self, projected, request, *, context=None):
+            return _streamlined_response(context["cluster"], projected)
+
+    initial = build_literature_report(
+        profiles,
+        reasoner=InitialReasoner(),
+        request=LiteratureMapRequest(tmp_path),
+        source_notes=source_notes,
+        shared_literature_plan=shared_plan,
+    )
+    prior_cluster = initial["cluster_registry"]["clusters"][0]
+
+    class PartitionReasoner:
+        name = "local"
+        model = "test"
+
+        def cluster_synthesis_fits(self, projected, request, *, context=None):
+            return len(projected) <= 2
+
+        def plan_clusters(self, projected, request, *, context=None):
+            return {
+                "clusters": [
+                    {
+                        "cluster_id": "left",
+                        "title": "Left child",
+                        "members": [
+                            {"source_id": "A", "role": "core"},
+                            {"source_id": "B", "role": "core"},
+                        ],
+                    },
+                    {
+                        "cluster_id": "right",
+                        "title": "Right child",
+                        "members": [
+                            {"source_id": "C", "role": "core"},
+                            {"source_id": "D", "role": "core"},
+                        ],
+                    },
+                ],
+                "neighbor_relationships": [],
+                "unclustered_sources": [],
+            }
+
+        def synthesize_cluster(self, projected, request, *, context=None):
+            if {row["source_id"] for row in projected} == {"C", "D"}:
+                return {}
+            return _streamlined_response(context["cluster"], projected)
+
+    repaired = build_literature_report(
+        profiles,
+        previous_registry={
+            **initial["cluster_registry"],
+            "cluster_syntheses": initial["cluster_syntheses"],
+        },
+        reasoner=PartitionReasoner(),
+        request=LiteratureMapRequest(tmp_path),
+        source_notes=source_notes,
+        shared_literature_plan=shared_plan,
+    )
+
+    assert [
+        row["cluster_id"] for row in repaired["cluster_registry"]["clusters"]
+    ] == [prior_cluster["cluster_id"]]
+    assert repaired["cluster_registry"]["clusters"][0]["refresh_pending"] is True
+    assert repaired["cluster_registry"]["pending_revisions"][0][
+        "partition_child_ids"
+    ]
+
+
+def test_book_chapters_count_as_one_canonical_work(tmp_path: Path) -> None:
+    profiles = [_profile("A"), _profile("B")]
+    for index, profile in enumerate(profiles, start=1):
+        profile["source_role"] = "Academic book chapter"
+        profile["study_family_id"] = (
+            f"doi:10.1017/cbo9780511490866.00{index}"
+        )
+
+    class Reasoner:
+        name = "local"
+        model = "test"
+
+        def cluster_synthesis_fits(self, projected, request, *, context=None):
+            return True
+
+        def synthesize_cluster(self, projected, request, *, context=None):
+            assert context["cluster"]["canonical_work_count"] == 1
+            assert context["cluster"]["synthesis_lineage"] == (
+                "single_work_multi_component"
+            )
+            return _streamlined_response(context["cluster"], projected)
+
+    report = build_literature_report(
+        profiles,
+        reasoner=Reasoner(),
+        request=LiteratureMapRequest(tmp_path),
+        source_notes=[
+            {
+                "source_id": row["source_id"],
+                "title": row["title"],
+                "source_scope": "full_document",
+                "body": f"# {row['title']}\n\nComplete note.",
+            }
+            for row in profiles
+        ],
+        shared_literature_plan={
+            "literature_families": [
+                {
+                    "family_id": "one-book",
+                    "label": "One book",
+                    "source_ids": ["A", "B"],
+                    "proposed_roles": {"A": "core", "B": "core"},
+                    "candidate_cluster": True,
+                }
+            ],
+            "discovery_jobs": [],
+            "neighboring_families": [],
+        },
+    )
+
+    cluster = report["cluster_registry"]["clusters"][0]
+    assert cluster["canonical_work_count"] == 1
+    assert cluster["independent_study_family_count"] <= 1
+
+
+def test_partition_neighbors_merge_reciprocal_source_owned_evidence() -> None:
+    clusters = [
+        {
+            "cluster_id": "left",
+            "source_ids": ["A"],
+            "planned_neighbor_relationships": [
+                {
+                    "target_cluster_id": "right",
+                    "relationship": "A bounded bridge.",
+                    "evidence": [
+                        {
+                            "source_id": "A",
+                            "evidence_anchor_id": "anchor-A",
+                            "locator": "p. 10",
+                        }
+                    ],
+                }
+            ],
+        },
+        {
+            "cluster_id": "right",
+            "source_ids": ["B"],
+            "planned_neighbor_relationships": [
+                {
+                    "target_cluster_id": "left",
+                    "relationship": "A bounded bridge.",
+                    "evidence": [
+                        {
+                            "source_id": "B",
+                            "evidence_anchor_id": "anchor-B",
+                            "locator": "p. 11",
+                        }
+                    ],
+                }
+            ],
+        },
+    ]
+    syntheses = {
+        cluster_id: {"status": "reasoned", "related_clusters": []}
+        for cluster_id in ("left", "right")
+    }
+
+    _project_planned_cluster_neighbors(clusters, syntheses)
+
+    assert syntheses["left"]["related_clusters"][0]["target_cluster_id"] == "right"
+    assert syntheses["right"]["related_clusters"][0]["target_cluster_id"] == "left"
+
+    partitioned = [
+        {
+            "cluster_id": "child",
+            "source_ids": ["A"],
+            "planned_neighbor_relationships": [
+                {
+                    "target_cluster_id": "external",
+                    "partition_parent_target_id": "parent",
+                    "relationship": "An external bridge.",
+                    "evidence": [
+                        {
+                            "source_id": "A",
+                            "evidence_anchor_id": "anchor-A",
+                            "locator": "p. 10",
+                        }
+                    ],
+                }
+            ],
+        },
+        {
+            "cluster_id": "external",
+            "source_ids": ["E"],
+            "planned_neighbor_relationships": [
+                {
+                    "target_cluster_id": "parent",
+                    "relationship": "An external bridge.",
+                    "evidence": [
+                        {
+                            "source_id": "E",
+                            "evidence_anchor_id": "anchor-E",
+                            "locator": "p. 12",
+                        }
+                    ],
+                }
+            ],
+        },
+    ]
+    partitioned_syntheses = {
+        cluster_id: {"status": "reasoned", "related_clusters": []}
+        for cluster_id in ("child", "external")
+    }
+
+    _project_planned_cluster_neighbors(partitioned, partitioned_syntheses)
+
+    assert partitioned_syntheses["child"]["related_clusters"][0][
+        "target_cluster_id"
+    ] == "external"
+    assert partitioned_syntheses["external"]["related_clusters"][0][
+        "target_cluster_id"
+    ] == "child"
 
 
 def test_cluster_catalogue_round_trip_preserves_semantic_fields(

@@ -5,8 +5,9 @@ from typing import Any, Mapping, Sequence
 
 import pytest
 
-from auto_zettelkasten.files import read_yaml
+from auto_zettelkasten.files import read_yaml, write_yaml
 from auto_zettelkasten.literature import (
+    LiteratureSynthesisPartialError,
     _CheckpointedReasonerCalls,
     _cluster_acquisition_revision,
     _persist_cluster_acquisition_revisions,
@@ -550,6 +551,204 @@ def test_two_empty_literature_responses_are_terminal_after_two_attempts(
     assert failure["retry_on_resume"] is True
 
 
+def test_cluster_empty_retry_uses_high_reasoning_and_then_replays(
+    tmp_path: Path,
+) -> None:
+    response = {
+        "cluster_contract": "streamlined-full-note-v2",
+        "cluster_id": "cluster-one",
+        "status": "accepted",
+        "title": "Cluster One",
+        "organizing_mode": "question",
+        "organizing_problem": "What do the sources establish?",
+        "bottom_line": "They establish bounded findings.",
+        "retained_member_ids": ["A", "B"],
+        "member_roles": {"A": "core", "B": "core"},
+        "dropped_members": [],
+        "lines_of_inquiry": [],
+        "differences": [],
+        "limits": [],
+        "related_clusters": [],
+        "acquisition_candidate_dispositions": [],
+    }
+
+    class Reasoner:
+        name = "local"
+        model = "test"
+
+        def __init__(self) -> None:
+            self.efforts: list[str] = []
+
+        def synthesize_cluster(self, profiles, request, *, context=None):
+            self.efforts.append(
+                str((context or {}).get("_cluster_synthesis_reasoning_effort", "max"))
+            )
+            if len(self.efforts) == 1:
+                raise ProviderEmptyResponse()
+            return response
+
+    reasoner = Reasoner()
+    calls = _CheckpointedReasonerCalls(
+        tmp_path,
+        "cluster-empty-retry",
+        reasoner,
+        LiteratureMapRequest(tmp_path),
+    )
+
+    assert calls(
+        "cluster_synthesis",
+        "cluster-one",
+        "synthesize_cluster",
+        [],
+        {"cluster": {"cluster_id": "cluster-one"}},
+    )["cluster_id"] == "cluster-one"
+    assert reasoner.efforts == ["max", "high"]
+    attempts = sorted(
+        read_yaml(calls.usage_path)["attempts"], key=lambda row: row["attempt"]
+    )
+    assert [row["reasoning_effort"] for row in attempts] == ["max", "high"]
+
+    class ReplayReasoner:
+        name = "local"
+        model = "test"
+
+        def synthesize_cluster(self, profiles, request, *, context=None):
+            raise AssertionError("successful high retry must replay")
+
+    replay = _CheckpointedReasonerCalls(
+        tmp_path,
+        "cluster-empty-retry",
+        ReplayReasoner(),
+        LiteratureMapRequest(tmp_path),
+    )
+    assert replay(
+        "cluster_synthesis",
+        "cluster-one",
+        "synthesize_cluster",
+        [],
+        {"cluster": {"cluster_id": "cluster-one"}},
+    )["cluster_id"] == "cluster-one"
+    assert replay.provider_calls == 0
+
+
+def test_two_empty_cluster_attempts_are_terminal_with_diagnostics(
+    tmp_path: Path,
+) -> None:
+    class Reasoner:
+        name = "local"
+        model = "test"
+
+        def __init__(self) -> None:
+            self.efforts: list[str] = []
+
+        def synthesize_cluster(self, profiles, request, *, context=None):
+            self.efforts.append(
+                str((context or {}).get("_cluster_synthesis_reasoning_effort", "max"))
+            )
+            raise ProviderEmptyResponse()
+
+    reasoner = Reasoner()
+    calls = _CheckpointedReasonerCalls(
+        tmp_path,
+        "cluster-empty-terminal",
+        reasoner,
+        LiteratureMapRequest(tmp_path),
+    )
+
+    with pytest.raises(LiteratureSynthesisPartialError):
+        calls(
+            "cluster_synthesis",
+            "cluster-one",
+            "synthesize_cluster",
+            [],
+            {"cluster": {"cluster_id": "cluster-one"}},
+        )
+
+    failure = read_yaml(calls.root / "cluster_synthesis/cluster-one.yml")
+    assert reasoner.efforts == ["max", "high"]
+    assert failure["terminal"] is True
+    assert failure["retry_on_resume"] is False
+    assert failure["raw_response"] == ""
+
+
+def test_legacy_max_empty_checkpoint_gets_one_high_recovery(
+    tmp_path: Path,
+) -> None:
+    class EmptyReasoner:
+        name = "local"
+        model = "test"
+
+        def synthesize_cluster(self, profiles, request, *, context=None):
+            raise ProviderEmptyResponse()
+
+    first = _CheckpointedReasonerCalls(
+        tmp_path,
+        "legacy-empty",
+        EmptyReasoner(),
+        LiteratureMapRequest(tmp_path),
+    )
+    with pytest.raises(LiteratureSynthesisPartialError):
+        first(
+            "cluster_synthesis",
+            "cluster-one",
+            "synthesize_cluster",
+            [],
+            {"cluster": {"cluster_id": "cluster-one"}},
+        )
+    checkpoint_path = first.root / "cluster_synthesis/cluster-one.yml"
+    checkpoint = read_yaml(checkpoint_path)
+    checkpoint["fingerprint"] = "legacy-empty-policy"
+    write_yaml(checkpoint_path, checkpoint)
+
+    response = {
+        "cluster_contract": "streamlined-full-note-v2",
+        "cluster_id": "cluster-one",
+        "status": "accepted",
+        "title": "Cluster One",
+        "organizing_mode": "question",
+        "organizing_problem": "What do the sources establish?",
+        "bottom_line": "They establish bounded findings.",
+        "retained_member_ids": ["A", "B"],
+        "member_roles": {"A": "core", "B": "core"},
+        "dropped_members": [],
+        "lines_of_inquiry": [],
+        "differences": [],
+        "limits": [],
+        "related_clusters": [],
+        "acquisition_candidate_dispositions": [],
+    }
+
+    class RecoveryReasoner:
+        name = "local"
+        model = "test"
+
+        def __init__(self) -> None:
+            self.efforts: list[str] = []
+
+        def synthesize_cluster(self, profiles, request, *, context=None):
+            self.efforts.append(
+                str((context or {}).get("_cluster_synthesis_reasoning_effort"))
+            )
+            return response
+
+    reasoner = RecoveryReasoner()
+    recovery = _CheckpointedReasonerCalls(
+        tmp_path,
+        "legacy-empty",
+        reasoner,
+        LiteratureMapRequest(tmp_path),
+    )
+
+    assert recovery(
+        "cluster_synthesis",
+        "cluster-one",
+        "synthesize_cluster",
+        [],
+        {"cluster": {"cluster_id": "cluster-one"}},
+    )["cluster_id"] == "cluster-one"
+    assert reasoner.efforts == ["high"]
+
+
 def test_cluster_scheduler_reserves_retry_capacity_and_accounts_deferrals(
     tmp_path: Path,
 ) -> None:
@@ -637,3 +836,69 @@ def test_empty_retry_defers_when_call_ceiling_is_exhausted(tmp_path: Path) -> No
     assert failure["empty_retry_status"] == "empty_retry_deferred_budget"
     assert failure["terminal"] is False
     assert calls.cumulative_provider_calls == 1
+
+
+def test_cluster_empty_retry_deferred_by_budget_remains_resumable(
+    tmp_path: Path,
+) -> None:
+    class Reasoner:
+        name = "local"
+        model = "test"
+
+        def synthesize_cluster(self, profiles, request, *, context=None):
+            raise ProviderEmptyResponse()
+
+    calls = _CheckpointedReasonerCalls(
+        tmp_path,
+        "cluster-empty-budget",
+        Reasoner(),
+        LiteratureMapRequest(
+            tmp_path,
+            literature_policy=LiteratureMappingPolicy(max_synthesis_calls=1),
+        ),
+    )
+
+    with pytest.raises(ProviderEmptyResponse):
+        calls(
+            "cluster_synthesis",
+            "cluster-one",
+            "synthesize_cluster",
+            [],
+            {"cluster": {"cluster_id": "cluster-one"}},
+        )
+
+    failure = read_yaml(calls.root / "cluster_synthesis/cluster-one.yml")
+    assert failure["empty_retry_status"] == "empty_retry_deferred_budget"
+    assert failure["attempt_count"] == 1
+    assert failure["terminal"] is False
+    assert failure["retry_on_resume"] is True
+
+
+def test_partition_supersedes_parent_acquisition_revision(tmp_path: Path) -> None:
+    path = tmp_path / "cluster_acquisition_ledger.yml"
+    parent = _cluster_acquisition_revision(
+        {"cluster_id": "parent", "revision_hash": "parent-r1"},
+        [],
+        state="active",
+    )
+    child = _cluster_acquisition_revision(
+        {
+            "cluster_id": "child",
+            "revision_hash": "child-r1",
+            "parent_cluster_id": "parent",
+            "partition_root_id": "parent",
+        },
+        [],
+        state="active",
+    )
+    _persist_cluster_acquisition_revisions(path, [parent])
+
+    ledger = _persist_cluster_acquisition_revisions(
+        path,
+        [child],
+        superseded_cluster_ids={"parent"},
+    )
+
+    by_id = {row["cluster_id"]: row for row in ledger["revisions"]}
+    assert by_id["parent"]["state"] == "superseded_by_partition"
+    assert by_id["child"]["parent_cluster_id"] == "parent"

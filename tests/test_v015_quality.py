@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from auto_zettelkasten.literature import (
+    CLUSTER_PLAN_PROMPT_VERSION,
     _reconcile_final_unclustered_sources,
     _streamlined_cluster_markdown,
     validate_streamlined_cluster_synthesis,
@@ -67,7 +68,10 @@ def test_cluster_plan_can_omit_unclustered_reasons() -> None:
         kind="cluster_plan",
     )
 
-    assert "cluster plan prompt v5" in prompt
+    assert f"cluster plan prompt v{CLUSTER_PLAN_PROMPT_VERSION}" in prompt
+    assert "COHERENCE RULE" in prompt
+    assert "one bounded research problem" in prompt
+    assert "practitioner guidance alone" in prompt
     assert "does not need reasons from you" in prompt
     assert parsed["unclustered_sources"] == []
 

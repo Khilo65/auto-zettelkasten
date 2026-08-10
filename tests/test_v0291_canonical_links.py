@@ -5,6 +5,7 @@ from auto_zettelkasten.literature import (
     _cluster_limit_text,
     _navigation_profile_rows,
     _obsidian_note_link,
+    _replace_source_keys_in_markdown_body,
     _report_projection_profiles,
     _streamlined_cluster_markdown,
     build_literature_map,
@@ -184,16 +185,19 @@ def test_cluster_body_uses_final_canonical_profile_links(tmp_path: Path) -> None
             "projection_profiles": [
                 {
                     "source_id": "source-zotero-9mh7lag9",
+                    "zotero_item_key": "9mh7lag9",
                     "title": "At war's end",
                     "note_path": "02_source_memory/notes/Paris (2004).md",
                 },
                 {
                     "source_id": "source-zotero-494iyya8",
+                    "zotero_item_key": "494iyya8",
                     "title": "Document Viewer",
                     "note_path": "02_source_memory/notes/Unknownn.d..md",
                 },
                 {
                     "source_id": "source-zotero-iwhwd39r",
+                    "zotero_item_key": "iwhwd39r",
                     "title": "Does Conflict Beget Conflict?",
                     "note_path": "02_source_memory/notes/Walter (2004).md",
                 },
@@ -254,6 +258,37 @@ def test_cluster_body_uses_final_canonical_profile_links(tmp_path: Path) -> None
         "[[Walter (2004)",
     ):
         assert stale_target not in markdown
+
+
+def test_prose_humanizer_never_rewrites_keyed_wikilinks() -> None:
+    profiles = [
+        {
+            "source_id": "source-zotero-9mh7lag9",
+            "zotero_item_key": "9mh7lag9",
+            "citation_key": "Paris2004",
+        },
+        {
+            "source_id": "source-zotero-9vncmnst",
+            "zotero_item_key": "9vncmnst",
+            "citation_key": "Vreeland2008",
+        },
+        {
+            "source_id": "source-zotero-494iyya8",
+            "zotero_item_key": "494iyya8",
+            "citation_key": "Unknownn.d.",
+        },
+    ]
+    links = (
+        "[[Paris2004 - At war's end [9mh7lag9]|Paris]] and "
+        "[[Vreeland2008 - Political Institutions [9vncmnst]|Vreeland]] and "
+        "[[Unknownn.d. - Document Viewer [494iyya8]|Document Viewer]]"
+    )
+    markdown = f"---\ntitle: Cluster\n---\n{links}\n9mh7lag9 9vncmnst 494iyya8"
+
+    rendered = _replace_source_keys_in_markdown_body(markdown, profiles)
+
+    assert links in rendered
+    assert rendered.endswith("Paris (2004) Vreeland (2008) Unknownn.d.")
 
 
 def test_cluster_limits_render_current_and_legacy_mapping_rows_cleanly() -> None:

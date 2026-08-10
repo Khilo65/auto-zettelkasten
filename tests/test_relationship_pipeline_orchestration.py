@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -931,18 +932,29 @@ def test_undercovered_families_share_one_followup_and_are_accounted(
         context["discovery_pass"]
         for stage, _key, context in calls.seen
         if stage.endswith("candidate_selection")
-    ] == ["broad", "complement", "coverage_followup"]
+    ] == [
+        "broad",
+        "complement",
+        "breadth_completion",
+    ]
     accounting = {
         row["bridge_job_id"]: row
         for row in result["relationship_discovery_jobs"]
     }
+    assert accounting["requested"]["planner_target_candidates"] == 1
+    assert accounting["requested"]["breadth_completion_status"] == "no_more"
     assert accounting["family-cd"]["status"] == "completed"
     assert accounting["family-ef"]["status"] == "completed"
     assert accounting["family-cd"]["coverage_warning"] == (
-        "coverage_shortfall_after_followup"
+        "coverage_shortfall_after_single_breadth_wave"
     )
     assert accounting["family-ef"]["coverage_warning"] == (
-        "coverage_shortfall_after_followup"
+        "coverage_shortfall_after_single_breadth_wave"
+    )
+    assert accounting["family-cd"]["breadth_completion_status"] == "completed"
+    assert accounting["family-ef"]["breadth_completion_status"] == "completed"
+    assert accounting["family-cd"]["breadth_warning"] == (
+        "planner_target_shortfall_after_single_breadth_wave"
     )
     assert result["relationship_discovery_status"] == "complete"
     _commit_relationship_selection_state(
@@ -963,6 +975,373 @@ def test_undercovered_families_share_one_followup_and_are_accounted(
     )
     assert replay_calls.seen == []
     assert replay["semantic_noop"] is True
+
+
+def test_breadth_completion_runs_once_for_broad_job_with_exclusions(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile(source_id) for source_id in "ABCDE"]
+    job = {
+        "job_id": "requested",
+        "family": "explicit_requested_collection_comparison",
+        "left_source_ids": ["A", "C"],
+        "right_source_ids": ["B", "D", "E"],
+        "requested_collection_pair": ["C1", "C2"],
+        "candidate_quota": 4,
+    }
+
+    def handler(stage, _profiles, context):
+        if stage == "relationship_bridge_candidate_selection":
+            assert context["discovery_mode"] == "bridge_only"
+            if context["discovery_pass"] == "broad":
+                return {
+                    "candidates": [
+                        {**_candidate("A", "B"), "bridge_job_id": "requested"}
+                    ],
+                    "job_outcomes": [
+                        {"bridge_job_id": "requested", "status": "completed"}
+                    ],
+                }
+            assert context["discovery_pass"] == "breadth_completion"
+            assert context["breadth_completion_wave"] == 1
+            assert context["excluded_candidate_pairs"] == [("A", "B")]
+            assert context["max_inferred_pairs"] <= 64
+            return {
+                "candidates": [
+                    {
+                        **_candidate(left, right, rank=rank),
+                        "bridge_job_id": "requested",
+                    }
+                    for rank, (left, right) in enumerate(
+                        (("A", "D"), ("A", "E"), ("B", "C"), ("C", "D")),
+                        start=1,
+                    )
+                ],
+                "job_outcomes": [
+                    {"bridge_job_id": "requested", "status": "completed"}
+                ],
+            }
+        return {"decisions": [_decision(row) for row in context["pair_jobs"]]}
+
+    calls = _Calls(handler)
+    result = _run(
+        tmp_path,
+        profiles,
+        calls,
+        shared_family_plan={
+            "lean_index_hash": "lean",
+            "requested_collection_keys": ["C1", "C2"],
+            "literature_families": [
+                {"family_id": "requested", "source_ids": list("ABCDE")}
+            ],
+            "discovery_jobs": [job],
+        },
+    )
+
+    discovery_passes = [
+        context["discovery_pass"]
+        for stage, _key, context in calls.seen
+        if stage.endswith("candidate_selection")
+    ]
+    assert discovery_passes == ["broad", "breadth_completion"]
+    accounting = result["relationship_discovery_jobs"][0]
+    assert accounting["coverage_floor"] == 0
+    assert accounting["planner_target_candidates"] == 4
+    assert accounting["initial_unique_candidates"] == 1
+    assert accounting["breadth_requested_count"] == 3
+    assert accounting["breadth_added_unique_candidates"] == 4
+    assert accounting["planner_target_met"] is True
+    assert accounting["breadth_completion_status"] == "completed"
+    assert "breadth_warning" not in accounting
+
+
+def test_breadth_completion_packs_output_and_runs_packets_concurrently(
+    tmp_path: Path,
+) -> None:
+    first_left = [f"A{index}" for index in range(7)]
+    first_right = [f"B{index}" for index in range(6)]
+    second_left = [f"C{index}" for index in range(7)]
+    second_right = [f"D{index}" for index in range(6)]
+    profiles = [
+        _profile(source_id)
+        for source_id in [
+            *first_left,
+            *first_right,
+            *second_left,
+            *second_right,
+        ]
+    ]
+    jobs = [
+        {
+            "job_id": job_id,
+            "family": "explicit_requested_collection_comparison",
+            "left_source_ids": left,
+            "right_source_ids": right,
+            "requested_collection_pair": ["C1", "C2"],
+            "candidate_quota": 40,
+        }
+        for job_id, left, right in (
+            ("requested-one", first_left, first_right),
+            ("requested-two", second_left, second_right),
+        )
+    ]
+    barrier = threading.Barrier(2)
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+
+    def handler(stage, _profiles, context):
+        nonlocal active, peak
+        if stage == "relationship_bridge_candidate_selection":
+            if context["discovery_pass"] == "broad":
+                return {
+                    "candidates": [],
+                    "job_outcomes": [
+                        {
+                            "bridge_job_id": job["bridge_job_id"],
+                            "status": "completed",
+                        }
+                        for job in context["bridge_jobs"]
+                    ],
+                }
+            assert context["discovery_pass"] == "breadth_completion"
+            assert sum(
+                int(job["target_candidate_count"])
+                for job in context["bridge_jobs"]
+            ) <= 64
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            barrier.wait(timeout=2)
+            with lock:
+                active -= 1
+            return {
+                "candidates": [],
+                "job_outcomes": [
+                    {
+                        "bridge_job_id": job["bridge_job_id"],
+                        "status": "completed",
+                    }
+                    for job in context["bridge_jobs"]
+                ],
+            }
+        return {"decisions": []}
+
+    calls = _Calls(handler)
+    _run(
+        tmp_path,
+        profiles,
+        calls,
+        request=LiteratureMapRequest(
+            workspace=tmp_path,
+            provider="test-provider",
+            model="test-model",
+            provider_concurrency=2,
+        ),
+        shared_family_plan={
+            "lean_index_hash": "lean",
+            "requested_collection_keys": ["C1", "C2"],
+            "literature_families": [
+                {
+                    "family_id": "requested",
+                    "source_ids": [profile.source_id for profile in profiles],
+                }
+            ],
+            "discovery_jobs": jobs,
+        },
+    )
+
+    breadth_calls = [
+        context
+        for stage, _key, context in calls.seen
+        if stage == "relationship_bridge_candidate_selection"
+        and context["discovery_pass"] == "breadth_completion"
+    ]
+    assert len(breadth_calls) == 2
+    assert peak == 2
+
+
+def test_breadth_completion_apportions_residual_across_split_shards(
+    tmp_path: Path, monkeypatch
+) -> None:
+    profiles = [_profile(source_id) for source_id in "ABCDEF"]
+    original = pipeline_module._reasoner_packet_chars
+
+    def measured(profiles, context):
+        if (
+            context.get("discovery_pass") == "breadth_completion"
+            and len(context.get("catalogue", []) or []) > 2
+        ):
+            return 10**9
+        return original(profiles, context)
+
+    monkeypatch.setattr(pipeline_module, "_reasoner_packet_chars", measured)
+    breadth_targets: list[int] = []
+
+    def handler(stage, _profiles, context):
+        if stage == "relationship_bridge_candidate_selection":
+            return {
+                "candidates": [],
+                "job_outcomes": [
+                    {"bridge_job_id": "requested", "status": "no_more_candidates"}
+                ],
+            }
+        if stage == "relationship_candidate_selection":
+            if context["discovery_pass"] == "breadth_completion":
+                breadth_targets.extend(
+                    int(job["target_candidate_count"])
+                    for job in context["bridge_jobs"]
+                )
+            return {
+                "candidates": [],
+                "job_outcomes": [
+                    {
+                        "bridge_job_id": job["bridge_job_id"],
+                        "status": "completed",
+                    }
+                    for job in context["bridge_jobs"]
+                ],
+            }
+        return {"decisions": []}
+
+    result = _run(
+        tmp_path,
+        profiles,
+        _Calls(handler),
+        shared_family_plan={
+            "lean_index_hash": "lean",
+            "requested_collection_keys": ["C1", "C2"],
+            "literature_families": [
+                {"family_id": "split-family", "source_ids": ["C", "D", "E", "F"]}
+            ],
+            "discovery_jobs": [
+                {
+                    "job_id": "requested",
+                    "family": "explicit_requested_collection_comparison",
+                    "left_source_ids": ["A"],
+                    "right_source_ids": ["B"],
+                    "requested_collection_pair": ["C1", "C2"],
+                    "candidate_quota": 1,
+                },
+                {
+                    "job_id": "split-family",
+                    "family": "split-family",
+                    "left_source_ids": ["C", "D"],
+                    "right_source_ids": ["E", "F"],
+                    "candidate_quota": 4,
+                },
+            ],
+        },
+    )
+
+    accounting = {
+        row["bridge_job_id"]: row
+        for row in result["relationship_discovery_jobs"]
+    }
+    assert len(breadth_targets) == 4
+    assert sum(breadth_targets) == 4
+    assert accounting["split-family"]["breadth_requested_count"] == 4
+
+
+def test_unschedulable_breadth_shard_survives_successful_sibling(
+    tmp_path: Path, monkeypatch
+) -> None:
+    profiles = [_profile(source_id) for source_id in "ABCDEF"]
+    original = pipeline_module._reasoner_packet_chars
+
+    def measured(profiles, context):
+        if context.get("discovery_pass") != "breadth_completion":
+            return original(profiles, context)
+        job_ids = {
+            job["bridge_job_id"] for job in context.get("bridge_jobs", []) or []
+        }
+        if "family-bad" in job_ids or len(job_ids) > 1:
+            return 10**9
+        return original(profiles, context)
+
+    monkeypatch.setattr(pipeline_module, "_reasoner_packet_chars", measured)
+
+    def handler(stage, _profiles, context):
+        if stage == "relationship_bridge_candidate_selection":
+            return {
+                "candidates": [],
+                "job_outcomes": [
+                    {"bridge_job_id": "requested", "status": "no_more_candidates"}
+                ],
+            }
+        if stage == "relationship_candidate_selection":
+            if context["discovery_pass"] == "complement":
+                return {
+                    "candidates": [],
+                    "job_outcomes": [
+                        {
+                            "bridge_job_id": job["bridge_job_id"],
+                            "status": "completed",
+                        }
+                        for job in context["bridge_jobs"]
+                    ],
+                }
+            assert {
+                job["bridge_job_id"] for job in context["bridge_jobs"]
+            } == {"family-good"}
+            return {
+                "candidates": [
+                    {**_candidate("E", "F"), "bridge_job_id": "family-good"}
+                ],
+                "job_outcomes": [
+                    {"bridge_job_id": "family-good", "status": "completed"}
+                ],
+            }
+        return {"decisions": [_decision(job) for job in context["pair_jobs"]]}
+
+    result = _run(
+        tmp_path,
+        profiles,
+        _Calls(handler),
+        shared_family_plan={
+            "lean_index_hash": "lean",
+            "requested_collection_keys": ["C1", "C2"],
+            "literature_families": [
+                {"family_id": "family-bad", "source_ids": ["C", "D"]},
+                {"family_id": "family-good", "source_ids": ["E", "F"]},
+            ],
+            "discovery_jobs": [
+                {
+                    "job_id": "requested",
+                    "family": "explicit_requested_collection_comparison",
+                    "left_source_ids": ["A"],
+                    "right_source_ids": ["B"],
+                    "requested_collection_pair": ["C1", "C2"],
+                    "candidate_quota": 1,
+                },
+                {
+                    "job_id": "family-bad",
+                    "family": "family-bad",
+                    "left_source_ids": ["C"],
+                    "right_source_ids": ["D"],
+                    "candidate_quota": 1,
+                },
+                {
+                    "job_id": "family-good",
+                    "family": "family-good",
+                    "left_source_ids": ["E"],
+                    "right_source_ids": ["F"],
+                    "candidate_quota": 1,
+                },
+            ],
+        },
+    )
+
+    accounting = {
+        row["bridge_job_id"]: row
+        for row in result["relationship_discovery_jobs"]
+    }
+    assert accounting["family-bad"]["packet_status"] == "failed"
+    assert accounting["family-bad"]["packet_failure_class"] == "context"
+    assert accounting["family-bad"]["unschedulable_completion_shards"] == 1
+    assert accounting["family-good"]["status"] == "completed"
+    assert result["relationship_discovery_incomplete_jobs"] == ["family-bad"]
+    assert result["pair_job_count"] == 1
 
 
 def test_limited_family_side_is_accounted_without_a_call(tmp_path: Path) -> None:
@@ -1084,16 +1463,16 @@ def test_builtin_missing_job_outcomes_settle_with_warning(tmp_path: Path) -> Non
     assert result["relationship_discovery_incomplete_jobs"] == []
     assert result["relationship_discovery_status"] == "complete"
     assert accounting["family-cd"]["coverage_warning"] == (
-        "coverage_shortfall_after_followup"
+        "coverage_shortfall_after_single_breadth_wave"
     )
     assert accounting["family-ef"]["coverage_warning"] == (
-        "coverage_shortfall_after_followup"
+        "coverage_shortfall_after_single_breadth_wave"
     )
     assert accounting["family-ef"]["accounting_warning"] == (
         "missing_or_invalid_job_outcomes"
     )
     assert any(
-        context.get("discovery_pass") == "coverage_followup"
+        context.get("discovery_pass") == "breadth_completion"
         for _stage, _key, context in calls.seen
     )
 
@@ -1171,7 +1550,7 @@ def test_completed_packet_does_not_start_autonomous_continuation(
     assert accounting["family-cd"]["status"] == "completed"
     assert accounting["family-cd"]["packet_status"] == "completed"
     assert accounting["family-ef"]["coverage_warning"] == (
-        "coverage_shortfall_after_followup"
+        "coverage_shortfall_after_single_breadth_wave"
     )
     assert result["relationship_discovery_incomplete_jobs"] == []
     assert all(
@@ -1259,7 +1638,7 @@ def test_split_discovery_job_keeps_failed_shard_incomplete(
     assert result["relationship_discovery_incomplete_jobs"] == ["split-family"]
 
 
-def test_split_coverage_followup_cannot_hide_failed_shard(
+def test_split_breadth_completion_cannot_hide_failed_shard(
     tmp_path: Path, monkeypatch
 ) -> None:
     profiles = [_profile(source_id) for source_id in "ABCDEF"]
@@ -1267,7 +1646,7 @@ def test_split_coverage_followup_cannot_hide_failed_shard(
 
     def measured(profiles, context):
         if (
-            context.get("discovery_pass") == "coverage_followup"
+            context.get("discovery_pass") == "breadth_completion"
             and len(context.get("catalogue", []) or []) > 2
         ):
             return 10**9
@@ -1295,7 +1674,7 @@ def test_split_coverage_followup_cannot_hide_failed_shard(
                 row["source_id"] for row in context.get("catalogue", []) or []
             }
             if "D" in source_ids:
-                raise ValueError("one followup shard failed")
+                raise ValueError("one breadth shard failed")
             return {
                 "candidates": [],
                 "job_outcomes": [
@@ -1463,7 +1842,7 @@ def test_shared_packet_overflow_preserves_other_family_accounting(
     assert accounting["family-cd"]["status"] == "eligible"
     assert "family-cd" in result["relationship_discovery_incomplete_jobs"]
     assert all(
-        context.get("discovery_pass") != "coverage_followup"
+        context.get("discovery_pass") != "breadth_completion"
         for _stage, _key, context in calls.seen
     )
 

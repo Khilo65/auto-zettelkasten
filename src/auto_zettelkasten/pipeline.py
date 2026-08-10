@@ -173,7 +173,7 @@ _RELATIONSHIP_BATCH_MAX_JOBS = 8
 _LEGACY_RELATIONSHIP_BATCH_MAX_JOBS = 8
 _RELATIONSHIP_DISCOVERY_PAGE_SIZE = 64
 _RELATIONSHIP_SELECTION_STATE_SCHEMA_VERSION = "4"
-_RELATIONSHIP_DISCOVERY_POLICY_VERSION = "family-coverage-v24"
+_RELATIONSHIP_DISCOVERY_POLICY_VERSION = "single-breadth-completion-v296"
 _RELATIONSHIP_SEMANTIC_POLICY_VERSION = "source-owned-bases-v26"
 _LITERATURE_MEMORY_LOCK = threading.Lock()
 _AUTO_CLOUD_SOURCE_WORKER_LIMIT = 32
@@ -7828,6 +7828,8 @@ def _run_relationship_reasoning(
                     "bridge_job_id": job_id,
                     "status": "insufficient_analytical_endpoints",
                     "candidate_floor": 0,
+                    "coverage_floor": 0,
+                    "planner_target_candidates": 0,
                     "valid_unique_candidates": 0,
                     "distinct_left_endpoints": 0,
                     "distinct_right_endpoints": 0,
@@ -7835,15 +7837,18 @@ def _run_relationship_reasoning(
                     "packet_status": "not_scheduled",
                 }
                 continue
+            planner_target = min(
+                int(raw_job.get("candidate_quota", 24) or 24),
+                len(left_ids) * len(right_ids),
+            )
             job = {
                 "bridge_job_id": job_id,
                 "left_source_ids": left_ids,
                 "right_source_ids": right_ids,
                 "bridge_family": str(raw_job.get("family") or ""),
                 "why_examine": str(raw_job.get("discovery_goal") or ""),
-                "target_candidate_count": int(
-                    raw_job.get("candidate_quota", 24) or 24
-                ),
+                "target_candidate_count": planner_target,
+                "planner_target_candidate_count": planner_target,
                 "requested_collection_pair": list(
                     raw_job.get("requested_collection_pair", []) or []
                 ),
@@ -7898,10 +7903,15 @@ def _run_relationship_reasoning(
                 **base_discovery_context,
                 "discovery_mode": (
                     "bridge_only"
-                    if pass_name == "broad"
+                    if pool == "bridge"
                     else "complementary_family_discovery"
                 ),
                 "discovery_pass": pass_name,
+                **(
+                    {"breadth_completion_wave": 1}
+                    if pass_name == "breadth_completion"
+                    else {}
+                ),
                 "catalogue": [
                     lean_by_source[source_id]
                     for source_id in sorted(source_ids)
@@ -7975,6 +7985,254 @@ def _run_relationship_reasoning(
                 ]
             return fitted
 
+        unschedulable_completion_job_ids: set[str] = set()
+
+        def completion_tasks(
+            pass_name: str,
+            pool: str,
+            jobs: Sequence[Mapping[str, Any]],
+            prior_pairs: Sequence[tuple[str, str]],
+        ) -> list[
+            tuple[str, str, Sequence[Any], dict[str, Any], str]
+        ]:
+            """Pack one bounded, exclusion-complete discovery wave."""
+
+            if not jobs:
+                return []
+
+            def enrich(
+                task: tuple[
+                    str,
+                    str,
+                    Sequence[Any],
+                    dict[str, Any],
+                    str,
+                ],
+            ) -> tuple[
+                str,
+                str,
+                Sequence[Any],
+                dict[str, Any],
+                str,
+            ]:
+                task_source_ids = {
+                    str(source_id)
+                    for job in task[3].get("bridge_jobs", []) or []
+                    if isinstance(job, Mapping)
+                    for side in ("left_source_ids", "right_source_ids")
+                    for source_id in job.get(side, []) or []
+                    if str(source_id)
+                }
+                relevant_pairs = [
+                    pair
+                    for pair in prior_pairs
+                    if pair[0] in task_source_ids and pair[1] in task_source_ids
+                ]
+                return (
+                    task[0],
+                    task[1],
+                    task[2],
+                    {
+                        **task[3],
+                        "prior_candidate_pairs": relevant_pairs,
+                        "excluded_candidate_pairs": relevant_pairs,
+                    },
+                    task[4],
+                )
+
+            measured_sizes = {
+                str(job.get("bridge_job_id") or ""): _reasoner_packet_chars(
+                    *shared_plan_task(pass_name, pool, [job], 0)[2:4]
+                )
+                for job in jobs
+            }
+            packets: list[list[dict[str, Any]]] = []
+            packet_targets: list[int] = []
+            for job in sorted(
+                (dict(value) for value in jobs),
+                key=lambda value: (
+                    -measured_sizes[str(value.get("bridge_job_id") or "")],
+                    str(value.get("bridge_job_id") or ""),
+                ),
+            ):
+                target = int(job.get("target_candidate_count", 0) or 0)
+                selected_index: int | None = None
+                for packet_index, packet in enumerate(packets):
+                    if packet_targets[packet_index] + target > (
+                        _RELATIONSHIP_DISCOVERY_PAGE_SIZE
+                    ):
+                        continue
+                    candidate = enrich(
+                        shared_plan_task(
+                            pass_name,
+                            pool,
+                            [*packet, job],
+                            packet_index + 1,
+                        )
+                    )
+                    if (
+                        _reasoner_packet_chars(candidate[2], candidate[3])
+                        <= context_budget
+                    ):
+                        selected_index = packet_index
+                        break
+                if selected_index is None:
+                    packets.append([job])
+                    packet_targets.append(target)
+                else:
+                    packets[selected_index].append(job)
+                    packet_targets[selected_index] += target
+
+            tasks: list[
+                tuple[str, str, Sequence[Any], dict[str, Any], str]
+            ] = []
+
+            def add_split_job(job: Mapping[str, Any]) -> None:
+                pending = [dict(job)]
+                while pending:
+                    candidate = pending.pop(0)
+                    child = enrich(
+                        shared_plan_task(
+                            pass_name,
+                            pool,
+                            [candidate],
+                            len(tasks) + 1,
+                        )
+                    )
+                    if (
+                        _reasoner_packet_chars(child[2], child[3])
+                        <= context_budget
+                    ):
+                        tasks.append(child)
+                        continue
+                    left = list(candidate.get("left_source_ids", []) or [])
+                    right = list(candidate.get("right_source_ids", []) or [])
+                    side = (
+                        "left_source_ids"
+                        if len(left) >= len(right)
+                        else "right_source_ids"
+                    )
+                    values = left if side == "left_source_ids" else right
+                    if len(values) < 2:
+                        job_id = str(job.get("bridge_job_id") or "")
+                        unschedulable_completion_job_ids.add(job_id)
+                        discovery_parked.append(
+                            {
+                                "reason": (
+                                    "relationship_family_exclusions_exceed_"
+                                    "context_budget"
+                                ),
+                                "affected_job_ids": [job_id],
+                                "retry_on_resume": False,
+                            }
+                        )
+                        if job_id in discovery_job_accounting:
+                            discovery_job_accounting[job_id][
+                                "packet_status"
+                            ] = "failed"
+                            discovery_job_accounting[job_id][
+                                "packet_failure_class"
+                            ] = "context"
+                            discovery_job_accounting[job_id][
+                                "unschedulable_completion_shards"
+                            ] = int(
+                                discovery_job_accounting[job_id].get(
+                                    "unschedulable_completion_shards", 0
+                                )
+                                or 0
+                            ) + 1
+                        continue
+                    midpoint = len(values) // 2
+                    children = [
+                        {**candidate, side: values[:midpoint]},
+                        {**candidate, side: values[midpoint:]},
+                    ]
+                    target = int(
+                        candidate.get("target_candidate_count", 0) or 0
+                    )
+                    unseen_capacities = []
+                    for child_job in children:
+                        child_left = set(
+                            child_job.get("left_source_ids", []) or []
+                        )
+                        child_right = set(
+                            child_job.get("right_source_ids", []) or []
+                        )
+                        excluded_count = sum(
+                            1
+                            for pair in prior_pairs
+                            if (
+                                pair[0] in child_left
+                                and pair[1] in child_right
+                            )
+                            or (
+                                pair[0] in child_right
+                                and pair[1] in child_left
+                            )
+                        )
+                        unseen_capacities.append(
+                            max(
+                                0,
+                                len(child_left) * len(child_right)
+                                - excluded_count,
+                            )
+                        )
+                    total_capacity = sum(unseen_capacities)
+                    allocations = [0, 0]
+                    if total_capacity:
+                        allocations = [
+                            min(
+                                capacity,
+                                target * capacity // total_capacity,
+                            )
+                            for capacity in unseen_capacities
+                        ]
+                        remaining = target - sum(allocations)
+                        for index in sorted(
+                            range(2),
+                            key=lambda value: (
+                                -(
+                                    target * unseen_capacities[value]
+                                    % total_capacity
+                                ),
+                                value,
+                            ),
+                        ):
+                            addition = min(
+                                remaining,
+                                unseen_capacities[index] - allocations[index],
+                            )
+                            allocations[index] += addition
+                            remaining -= addition
+                            if not remaining:
+                                break
+                    pending[0:0] = [
+                        {
+                            **child_job,
+                            "target_candidate_count": allocation,
+                        }
+                        for child_job, allocation in zip(
+                            children, allocations, strict=True
+                        )
+                        if allocation > 0
+                    ]
+
+            for packet_index, packet in enumerate(packets, start=1):
+                task = enrich(
+                    shared_plan_task(
+                        pass_name, pool, packet, packet_index
+                    )
+                )
+                if _reasoner_packet_chars(task[2], task[3]) <= context_budget:
+                    tasks.append(task)
+                    continue
+                # Context splitting is exceptional. Keep every relevant
+                # exclusion in the smaller task instead of silently dropping
+                # the exclusion list and rediscovering old pairs.
+                for job in packet:
+                    add_split_job(job)
+            return tasks
+
         if broad_jobs:
             for job in broad_jobs:
                 job_id = str(job["bridge_job_id"])
@@ -7982,6 +8240,10 @@ def _run_relationship_reasoning(
                     "bridge_job_id": job_id,
                     "status": "eligible",
                     "candidate_floor": 0,
+                    "coverage_floor": 0,
+                    "planner_target_candidates": int(
+                        job.get("planner_target_candidate_count", 0) or 0
+                    ),
                     "valid_unique_candidates": 0,
                     "distinct_left_endpoints": 0,
                     "distinct_right_endpoints": 0,
@@ -8022,6 +8284,10 @@ def _run_relationship_reasoning(
                 "bridge_job_id": job_id,
                 "status": "eligible",
                 "candidate_floor": int(job["target_candidate_count"]),
+                "coverage_floor": int(job["target_candidate_count"]),
+                "planner_target_candidates": int(
+                    job.get("planner_target_candidate_count", 0) or 0
+                ),
                 "valid_unique_candidates": 0,
                 "distinct_left_endpoints": 0,
                 "distinct_right_endpoints": 0,
@@ -8280,8 +8546,8 @@ def _run_relationship_reasoning(
         wave_pairs: dict[str, set[tuple[str, str]]] = defaultdict(set)
         wave_left_endpoints: dict[str, set[str]] = defaultdict(set)
         wave_right_endpoints: dict[str, set[str]] = defaultdict(set)
-        is_coverage_followup = all(
-            task[3].get("discovery_pass") == "coverage_followup"
+        additive_wave = all(
+            task[3].get("discovery_pass") == "breadth_completion"
             for task in tasks
         )
         with ThreadPoolExecutor(
@@ -8457,8 +8723,12 @@ def _run_relationship_reasoning(
                 continue
             all_succeeded = wave_successes[job_id] == task_count
             prior_failed = accounting.get("packet_status") == "failed"
-            remains_failed = bool(wave_failures[job_id]) or (
-                prior_failed and not (is_coverage_followup and all_succeeded)
+            remains_failed = (
+                job_id in unschedulable_completion_job_ids
+                or bool(wave_failures[job_id])
+                or (
+                    prior_failed and not (additive_wave and all_succeeded)
+                )
             )
             accounting["packet_status"] = (
                 "failed" if remains_failed else "completed"
@@ -8470,7 +8740,7 @@ def _run_relationship_reasoning(
                 accounting["packet_failure_class"] = wave_failures[job_id][0]
             elif not remains_failed:
                 accounting.pop("packet_failure_class", None)
-            if not is_coverage_followup:
+            if not additive_wave:
                 accounting["valid_unique_candidates"] = len(wave_pairs[job_id])
                 accounting["distinct_left_endpoints"] = len(
                     wave_left_endpoints[job_id]
@@ -8518,195 +8788,242 @@ def _run_relationship_reasoning(
     ]
     execute_candidate_tasks(complement_tasks)
     if shared_discovery_active:
-        undercovered_ids = {
-            job_id
-            for job_id, row in discovery_job_accounting.items()
-            if row.get("status") == "eligible"
-            and not row.get("explicit_no_more_candidates")
-            and (
-                (
-                    row.get("packet_status") == "failed"
-                    and row.get("packet_failure_class") == "transport"
-                )
-                or (
-                    row.get("packet_status") == "completed"
-                    and int(row.get("valid_unique_candidates", 0) or 0)
-                    < int(row.get("candidate_floor", 0) or 0)
-                )
-            )
-            and any(
-                str(job.get("bridge_job_id") or "") == job_id
-                for job in allocated_complement_jobs
-            )
-        }
-        prior_candidate_pairs = sorted(
-            {
-                canonical_pair(
-                    str(row.get("left_source_id") or row.get("source_id") or ""),
-                    str(
-                        row.get("right_source_id")
-                        or row.get("target_source_id")
-                        or row.get("target_id")
-                        or ""
-                    ),
-                )
-                for rows in candidate_results.values()
-                for _key, response in rows
-                for row in response.get("candidates", []) or []
-                if isinstance(row, Mapping)
-                and not row.get("_candidate_disposition")
-            }
-        )
-        remaining_candidate_capacity = max(
-            0, possible_pair_count - len(prior_candidate_pairs)
-        )
-        followup_jobs = [
-            {
-                **job,
-                "target_candidate_count": max(
-                    1,
-                    int(
-                        discovery_job_accounting[str(job["bridge_job_id"])][
-                            "candidate_floor"
-                        ]
-                    )
-                    - int(
-                        discovery_job_accounting[str(job["bridge_job_id"])][
-                            "valid_unique_candidates"
-                        ]
-                    ),
-                ),
-            }
-            for job in allocated_complement_jobs
-            if str(job.get("bridge_job_id") or "") in undercovered_ids
-        ]
-        if followup_jobs and remaining_candidate_capacity:
-            followup_packets = [followup_jobs]
-            while True:
-                measured_followups = [
-                    shared_plan_task(
-                        "coverage_followup", "general", packet_jobs, index
-                    )
-                    for index, packet_jobs in enumerate(
-                        followup_packets, start=1
-                    )
-                ]
-                if not any(
-                    _reasoner_packet_chars(task[2], task[3]) > context_budget
-                    for task in measured_followups
-                ) or len(followup_packets) >= len(followup_jobs):
-                    break
-                followup_packets = _balance_complementary_jobs(
-                    followup_jobs,
-                    measured_sizes=measured_job_sizes,
-                    packet_count=len(followup_packets) + 1,
-                )
-            followup_tasks = []
-            for packet_index, packet_jobs in enumerate(
-                followup_packets, start=1
-            ):
-                base_tasks = [
-                    shared_plan_task(
-                        "coverage_followup", "general", packet_jobs, packet_index
-                    )
-                ]
-                if _reasoner_packet_chars(
-                    base_tasks[0][2], base_tasks[0][3]
-                ) > context_budget:
-                    base_tasks = [
-                        child
-                        for job in packet_jobs
-                        for child in split_shared_job(
-                            "coverage_followup", "general", job
-                        )
-                    ]
-                for task in base_tasks:
-                    task_source_ids = {
-                        str(row.get("source_id") or "")
-                        for row in task[2]
-                        if isinstance(row, Mapping)
-                    }
-                    relevant_prior_pairs = [
-                        pair
-                        for pair in prior_candidate_pairs
-                        if pair[0] in task_source_ids and pair[1] in task_source_ids
-                    ]
-                    enriched_context = {
-                        **task[3],
-                        "prior_candidate_pairs": relevant_prior_pairs,
-                        "excluded_candidate_pairs": relevant_prior_pairs,
-                        "remaining_global_capacity": remaining_candidate_capacity,
-                    }
-                    if (
-                        _reasoner_packet_chars(task[2], enriched_context)
-                        > context_budget
-                    ):
-                        enriched_context.pop("prior_candidate_pairs", None)
-                        enriched_context.pop("excluded_candidate_pairs", None)
-                    followup_tasks.append(
-                        (task[0], task[1], task[2], enriched_context, task[4])
-                    )
-            execute_candidate_tasks(followup_tasks)
+        shared_jobs = [*broad_jobs, *allocated_complement_jobs]
 
-        # Recompute exact per-job coverage across initial and follow-up calls.
-        for job in [*broad_jobs, *allocated_complement_jobs]:
+        def discovered_pairs() -> list[tuple[str, str]]:
+            return sorted(
+                {
+                    canonical_pair(
+                        str(
+                            row.get("left_source_id")
+                            or row.get("source_id")
+                            or ""
+                        ),
+                        str(
+                            row.get("right_source_id")
+                            or row.get("target_source_id")
+                            or row.get("target_id")
+                            or ""
+                        ),
+                    )
+                    for rows in candidate_results.values()
+                    for _key, response in rows
+                    for row in response.get("candidates", []) or []
+                    if isinstance(row, Mapping)
+                    and not row.get("_candidate_disposition")
+                }
+            )
+
+        def recompute_discovery_accounting() -> None:
+            for job in shared_jobs:
+                job_id = str(job["bridge_job_id"])
+                accounting = discovery_job_accounting[job_id]
+                pairs = {
+                    canonical_pair(
+                        str(
+                            row.get("left_source_id")
+                            or row.get("source_id")
+                            or ""
+                        ),
+                        str(
+                            row.get("right_source_id")
+                            or row.get("target_source_id")
+                            or row.get("target_id")
+                            or ""
+                        ),
+                    )
+                    for rows in candidate_results.values()
+                    for _key, response in rows
+                    for row in response.get("candidates", []) or []
+                    if isinstance(row, Mapping)
+                    and str(row.get("discovery_job_id") or "") == job_id
+                    and not row.get("_candidate_disposition")
+                }
+                left_side = set(job.get("left_source_ids", []) or [])
+                right_side = set(job.get("right_source_ids", []) or [])
+                accounting["valid_unique_candidates"] = len(pairs)
+                accounting["distinct_left_endpoints"] = len(
+                    {
+                        endpoint
+                        for pair in pairs
+                        for endpoint in pair
+                        if endpoint in left_side
+                    }
+                )
+                accounting["distinct_right_endpoints"] = len(
+                    {
+                        endpoint
+                        for pair in pairs
+                        for endpoint in pair
+                        if endpoint in right_side
+                    }
+                )
+
+        recompute_discovery_accounting()
+        for accounting in discovery_job_accounting.values():
+            if accounting.get("status") == "eligible":
+                accounting["initial_unique_candidates"] = int(
+                    accounting.get("valid_unique_candidates", 0) or 0
+                )
+        # The minimum floor and the planner's larger breadth target share one
+        # exclusion-aware completion wave. This is the only additive discovery
+        # wave: it does not page or recursively continue itself.
+        breadth_jobs_by_pool: dict[str, list[dict[str, Any]]] = {
+            "bridge": [],
+            "general": [],
+        }
+        broad_job_ids = {
+            str(job.get("bridge_job_id") or "") for job in broad_jobs
+        }
+        for job in shared_jobs:
             job_id = str(job["bridge_job_id"])
             accounting = discovery_job_accounting[job_id]
-            pairs = {
-                canonical_pair(
-                    str(row.get("left_source_id") or row.get("source_id") or ""),
-                    str(
-                        row.get("right_source_id")
-                        or row.get("target_source_id")
-                        or row.get("target_id")
-                        or ""
-                    ),
-                )
-                for rows in candidate_results.values()
-                for _key, response in rows
-                for row in response.get("candidates", []) or []
-                if isinstance(row, Mapping)
-                and str(row.get("discovery_job_id") or "") == job_id
-                and not row.get("_candidate_disposition")
-            }
-            left_side = set(job.get("left_source_ids", []) or [])
-            right_side = set(job.get("right_source_ids", []) or [])
-            accounting["valid_unique_candidates"] = len(pairs)
-            accounting["distinct_left_endpoints"] = len(
-                {
-                    endpoint
-                    for pair in pairs
-                    for endpoint in pair
-                    if endpoint in left_side
-                }
+            current_count = int(
+                accounting.get("valid_unique_candidates", 0) or 0
             )
-            accounting["distinct_right_endpoints"] = len(
-                {
-                    endpoint
-                    for pair in pairs
-                    for endpoint in pair
-                    if endpoint in right_side
-                }
+            desired_count = max(
+                int(accounting.get("coverage_floor", 0) or 0),
+                int(accounting.get("planner_target_candidates", 0) or 0),
+            )
+            packet_status = str(accounting.get("packet_status") or "")
+            recoverable_transport_failure = bool(
+                packet_status == "failed"
+                and accounting.get("packet_failure_class") == "transport"
             )
             if (
-                accounting.get("status") == "eligible"
-                and accounting.get("packet_status") == "completed"
-            ):
-                coverage_target_met = bool(
-                    int(accounting["valid_unique_candidates"])
-                    >= int(accounting["candidate_floor"])
-                    or accounting.get("explicit_no_more_candidates")
+                (
+                    packet_status != "completed"
+                    and not recoverable_transport_failure
                 )
+                or accounting.get("explicit_no_more_candidates")
+                or current_count >= desired_count
+            ):
+                accounting["breadth_completion_status"] = (
+                    "no_more"
+                    if accounting.get("explicit_no_more_candidates")
+                    else "not_needed"
+                )
+                continue
+            requested = min(
+                _RELATIONSHIP_DISCOVERY_PAGE_SIZE,
+                desired_count - current_count,
+            )
+            accounting["breadth_completion_status"] = "scheduled"
+            accounting["breadth_requested_count"] = requested
+            breadth_jobs_by_pool[
+                "bridge" if job_id in broad_job_ids else "general"
+            ].append(
+                {
+                    **job,
+                    "target_candidate_count": requested,
+                }
+            )
+
+        prior_candidate_pairs = discovered_pairs()
+        breadth_tasks = [
+            *completion_tasks(
+                "breadth_completion",
+                "bridge",
+                breadth_jobs_by_pool["bridge"],
+                prior_candidate_pairs,
+            ),
+            *completion_tasks(
+                "breadth_completion",
+                "general",
+                breadth_jobs_by_pool["general"],
+                prior_candidate_pairs,
+            ),
+        ]
+        for task in breadth_tasks:
+            for job in task[3].get("bridge_jobs", []) or []:
+                if not isinstance(job, Mapping):
+                    continue
+                job_id = str(job.get("bridge_job_id") or "")
+                accounting = discovery_job_accounting.get(job_id)
+                if accounting is None:
+                    continue
+                packet_ids = accounting.setdefault(
+                    "breadth_completion_packet_ids", []
+                )
+                if task[1] not in packet_ids:
+                    packet_ids.append(task[1])
+        before_breadth = {
+            job_id: int(row.get("valid_unique_candidates", 0) or 0)
+            for job_id, row in discovery_job_accounting.items()
+        }
+        execute_candidate_tasks(breadth_tasks)
+        for job_id in unschedulable_completion_job_ids:
+            accounting = discovery_job_accounting.get(job_id)
+            if accounting is None:
+                continue
+            accounting["packet_status"] = "failed"
+            accounting["packet_failure_class"] = "context"
+            accounting["breadth_completion_status"] = "failed"
+        recompute_discovery_accounting()
+        for accounting in discovery_job_accounting.values():
+            if accounting.get("status") == "insufficient_analytical_endpoints":
+                continue
+            job_id = str(accounting.get("bridge_job_id") or "")
+            final_count = int(
+                accounting.get("valid_unique_candidates", 0) or 0
+            )
+            accounting["breadth_added_unique_candidates"] = max(
+                0, final_count - before_breadth.get(job_id, final_count)
+            )
+            initial_count = int(
+                accounting.get("initial_unique_candidates", 0) or 0
+            )
+            coverage_floor = int(
+                accounting.get("coverage_floor", 0) or 0
+            )
+            accounting["coverage_repair_added"] = max(
+                0,
+                min(final_count, coverage_floor)
+                - min(initial_count, coverage_floor),
+            )
+            planner_target = int(
+                accounting.get("planner_target_candidates", 0) or 0
+            )
+            accounting["planner_target_met"] = bool(
+                final_count >= planner_target
+            )
+            if accounting.get("breadth_completion_status") == "scheduled":
+                accounting["breadth_completion_status"] = (
+                    "failed"
+                    if accounting.get("packet_status") == "failed"
+                    else "no_more"
+                    if accounting.get("explicit_no_more_candidates")
+                    else "completed"
+                )
+            coverage_target_met = bool(
+                final_count >= coverage_floor
+                or accounting.get("explicit_no_more_candidates")
+            )
+            accounting["coverage_target_met"] = coverage_target_met
+            if coverage_target_met:
+                accounting.pop("coverage_warning", None)
+            else:
+                accounting["coverage_warning"] = (
+                    "coverage_shortfall_after_single_breadth_wave"
+                )
+            if (
+                accounting.get("packet_status") == "completed"
+                and accounting.get("status") == "eligible"
+            ):
                 accounting["status"] = "completed"
-                accounting["coverage_target_met"] = coverage_target_met
-                if not coverage_target_met:
-                    accounting["coverage_warning"] = (
-                        "coverage_shortfall_after_followup"
-                    )
+            if (
+                accounting.get("packet_status") == "completed"
+                and not accounting["planner_target_met"]
+                and not accounting.get("explicit_no_more_candidates")
+            ):
+                accounting["breadth_warning"] = (
+                    "planner_target_shortfall_after_single_breadth_wave"
+                )
         repaired_job_ids = {
             job_id
             for job_id, row in discovery_job_accounting.items()
             if row.get("packet_status") == "completed"
+            and job_id not in unschedulable_completion_job_ids
         }
         discovery_parked = [
             row

@@ -60,7 +60,14 @@ from .ports import (
     VisionProvider,
     ZoteroClient,
 )
-from .readers import DEEPSEEK_V4_FLASH_PRICING, provider_from_name
+from .readers import (
+    CLUSTER_SYNTHESIS_MAX_OUTPUT_TOKENS,
+    DEEPSEEK_V4_FLASH_PRICING,
+    DEFAULT_PROMPT_RESERVE_TOKENS,
+    MODEL_CONTEXT_WINDOWS,
+    PROVIDER_CONTEXT_WINDOW_DEFAULTS,
+    provider_from_name,
+)
 from .relationships import (
     RELATIONSHIP_DISCOVERY_PROMPT_VERSION,
     RELATIONSHIP_PROMPT_VERSION,
@@ -460,9 +467,7 @@ def estimate_cost(
     compact_input_tokens = max(
         planning_profile_count * 1_200,
         int(
-            corpus_compact_tokens
-            * planning_profile_count
-            / max(1, projected_profiles)
+            corpus_compact_tokens * planning_profile_count / max(1, projected_profiles)
         ),
     )
     note_paths = list((root / "02_source_memory" / "notes").glob("*.md"))
@@ -475,13 +480,163 @@ def estimate_cost(
         for bound, count in graph_profile_counts.items()
     }
 
+    cluster_checkpoints: dict[str, tuple[str, str, dict[str, Any]]] = {}
+    for path in (root / "11_state" / "runs").glob(
+        "*/literature/synthesis/cluster_synthesis/*.yml"
+    ):
+        row = read_yaml(path, {}) or {}
+        key = str(row.get("key") or path.stem)
+        updated_at = str(row.get("updated_at") or "")
+        prior = cluster_checkpoints.get(key)
+        if prior is None or (updated_at, str(path)) > prior[:2]:
+            cluster_checkpoints[key] = (updated_at, str(path), dict(row))
+
+    oversized_cluster_ids = {
+        key
+        for key, (_updated_at, _path, row) in cluster_checkpoints.items()
+        if row.get("status") == "failed"
+        and bool(row.get("deterministic_preflight"))
+        and "context_budget_exceeded:cluster_synthesis"
+        in str(
+            (row.get("error") or {}).get("message")
+            if isinstance(row.get("error"), Mapping)
+            else row.get("error") or ""
+        )
+    }
+    eligible_empty_recoveries = {
+        key: row
+        for key, (_updated_at, _path, row) in cluster_checkpoints.items()
+        if row.get("status") == "failed"
+        and str(row.get("failure_class") or "") == "provider_empty_response"
+        and int(row.get("attempt_count", 0) or 0) >= 2
+        and str(row.get("provider") or "") == provider
+        and str(row.get("model") or "") == model
+        and int(
+            ((row.get("provider_completion") or {}).get("max_output_tokens", 0))
+            if isinstance(row.get("provider_completion"), Mapping)
+            else 0
+        )
+        >= CLUSTER_SYNTHESIS_MAX_OUTPUT_TOKENS
+    }
+    cluster_registry = (
+        read_yaml(root / "03_literature_synthesis" / "cluster_registry.yml", {}) or {}
+    )
+    cluster_rows = [
+        dict(row)
+        for row in cluster_registry.get("clusters", []) or []
+        if isinstance(row, Mapping) and row.get("cluster_id")
+    ]
+    cluster_rows.extend(
+        dict(row.get("cluster") or {})
+        for row in cluster_registry.get("pending_revisions", []) or []
+        if isinstance(row, Mapping)
+        and isinstance(row.get("cluster"), Mapping)
+        and row.get("cluster", {}).get("cluster_id")
+    )
+    cluster_by_id = {str(row.get("cluster_id") or ""): row for row in cluster_rows}
+
+    def cluster_writer_input_characters(cluster_id: str) -> int:
+        cluster = cluster_by_id.get(cluster_id, {})
+        total = len(
+            json.dumps(cluster, sort_keys=True, ensure_ascii=False, default=str)
+        )
+        for note_id in {
+            str(value) for value in cluster.get("note_ids", []) or [] if str(value)
+        }:
+            path = root / "02_source_memory" / "profiles" / f"{note_id}.yml"
+            if not path.is_file():
+                continue
+            total += path.stat().st_size
+            profile = read_yaml(path, {}) or {}
+            profile_payload = profile.get("profile", profile)
+            context = (
+                profile_payload.get("context", {})
+                if isinstance(profile_payload, Mapping)
+                else {}
+            )
+            note_path = str(
+                context.get("note_path") if isinstance(context, Mapping) else ""
+            )
+            if note_path and (root / note_path).is_file():
+                total += (root / note_path).stat().st_size
+        return total
+
+    config = read_yaml(root / "auto-zettelkasten.yml", {}) or {}
+    literature_config = config.get("literature_mapping", {}) or {}
+    literature_context_fraction = float(
+        literature_config.get("deepseek_packet_context_fraction", 0.8) or 0.8
+    )
+    context_window_tokens = MODEL_CONTEXT_WINDOWS.get(
+        (provider, model), PROVIDER_CONTEXT_WINDOW_DEFAULTS.get(provider, 128_000)
+    )
+    # Match the built-in cluster writer's packet admission boundary: its exact
+    # output allowance, the reader prompt reserve, and the conservative
+    # three-characters-per-token transport estimate.
+    cluster_writer_input_budget_characters = max(
+        8_000,
+        (
+            int(context_window_tokens * literature_context_fraction)
+            - CLUSTER_SYNTHESIS_MAX_OUTPUT_TOKENS
+            - DEFAULT_PROMPT_RESERVE_TOKENS
+        )
+        * 3,
+    )
+    oversized_writer_input_characters = {
+        cluster_id: cluster_writer_input_characters(cluster_id)
+        for cluster_id in sorted(oversized_cluster_ids)
+    }
+    cluster_child_writer_counts = {
+        "low": 0,
+        "expected": 0,
+        "high": 0,
+    }
+    for cluster_id, input_characters in oversized_writer_input_characters.items():
+        cluster = cluster_by_id.get(cluster_id, {})
+        member_count = len(
+            {str(value) for value in cluster.get("source_ids", []) or [] if str(value)}
+        )
+        expected_children = max(
+            2,
+            (input_characters + cluster_writer_input_budget_characters - 1)
+            // cluster_writer_input_budget_characters,
+        )
+        high_children = min(
+            expected_children + 1,
+            max(expected_children, member_count // 2),
+        )
+        cluster_child_writer_counts["low"] += 2
+        cluster_child_writer_counts["expected"] += expected_children
+        cluster_child_writer_counts["high"] += high_children
+    eligible_empty_recovery_input_tokens = 0
+    for cluster_id, row in eligible_empty_recoveries.items():
+        completion = row.get("provider_completion") or {}
+        usage = (
+            completion.get("usage", {}) or {}
+            if isinstance(completion, Mapping)
+            else {}
+        )
+        prompt_tokens = int(
+            usage.get("prompt_tokens", 0) if isinstance(usage, Mapping) else 0
+        )
+        if prompt_tokens <= 0:
+            prompt_tokens = max(
+                2_500,
+                cluster_writer_input_characters(cluster_id) // 4,
+            )
+        eligible_empty_recovery_input_tokens += prompt_tokens
+
     def stage_calls(
         count: int | Mapping[str, int], divisors: tuple[int, int, int]
     ) -> dict[str, int]:
         return {
             bound: (
                 0
-                if (bound_count := int(count[bound]) if isinstance(count, Mapping) else count) < 2
+                if (
+                    bound_count := int(count[bound])
+                    if isinstance(count, Mapping)
+                    else count
+                )
+                < 2
                 else max(1, (bound_count + divisor - 1) // divisor)
             )
             for bound, divisor in zip(
@@ -516,34 +671,64 @@ def estimate_cost(
         for bound, rate in {"low": 0.03, "expected": 0.05, "high": 0.07}.items()
     }
     graph_call_components = {
-        "family_planning": stage_calls(
-            planning_profile_count, (180, 125, 80)
-        ),
+        "family_planning": stage_calls(planning_profile_count, (180, 125, 80)),
         "direct_discovery": {
             bound: 0 if graph_profile_counts[bound] < 2 else 1
             for bound in ("low", "expected", "high")
         },
-        "complementary_discovery": stage_calls(
-            graph_profile_counts, (300, 175, 90)
-        ),
+        "complementary_discovery": stage_calls(graph_profile_counts, (300, 175, 90)),
+        "breadth_completion": {
+            bound: 0 if graph_profile_counts[bound] < 2 else 1
+            for bound in ("low", "expected", "high")
+        },
         "relationship_adjudication": relationship_calls,
         "cluster_synthesis": cluster_calls,
+        "cluster_partition_planning": {
+            bound: len(oversized_cluster_ids) for bound in ("low", "expected", "high")
+        },
+        "cluster_child_synthesis": cluster_child_writer_counts,
+        "empty_response_recovery": {
+            bound: len(eligible_empty_recoveries)
+            for bound in ("low", "expected", "high")
+        },
     }
     input_multipliers = {
         "family_planning": (0.04, 0.08, 0.2),
         "direct_discovery": (0.03, 0.05, 0.1),
         "complementary_discovery": (0.05, 0.15, 0.4),
+        "breadth_completion": (0.05, 0.15, 0.4),
         "relationship_adjudication": (5.0, 14.0, 24.0),
         "cluster_synthesis": (1.0, 4.0, 8.0),
+        "cluster_partition_planning": (1.0, 1.0, 1.0),
+        "cluster_child_synthesis": (1.0, 1.0, 1.0),
+        "empty_response_recovery": (1.0, 1.0, 1.0),
     }
     output_tokens_per_call = {
         "family_planning": (3_000, 6_000, 12_000),
         "direct_discovery": (3_000, 8_000, 16_000),
         "complementary_discovery": (5_000, 12_000, 24_000),
+        "breadth_completion": (5_000, 12_000, 24_000),
         "relationship_adjudication": (10_000, 30_000, 40_000),
         "cluster_synthesis": (12_000, 30_000, 50_000),
+        "cluster_partition_planning": (8_000, 16_000, 32_000),
+        "cluster_child_synthesis": (12_000, 30_000, 50_000),
+        "empty_response_recovery": (12_000, 30_000, 50_000),
     }
-    full_note_stages = {"relationship_adjudication", "cluster_synthesis"}
+    full_note_stages = {
+        "relationship_adjudication",
+        "cluster_synthesis",
+        "cluster_partition_planning",
+        "cluster_child_synthesis",
+        "empty_response_recovery",
+    }
+    oversized_writer_input_tokens = max(
+        0, sum(oversized_writer_input_characters.values()) // 4
+    )
+    exact_stage_input_tokens = {
+        "cluster_partition_planning": oversized_writer_input_tokens,
+        "cluster_child_synthesis": oversized_writer_input_tokens,
+        "empty_response_recovery": eligible_empty_recovery_input_tokens,
+    }
     bounds = ("low", "expected", "high")
     graph_stage_estimates: dict[str, dict[str, dict[str, int | float | None]]] = {}
     for stage, calls_by_bound in graph_call_components.items():
@@ -555,16 +740,28 @@ def estimate_cost(
                 else compact_input_tokens
             )
             calls = calls_by_bound[bound]
-            input_tokens = int(base_input * input_multipliers[stage][index]) if calls else 0
+            input_tokens = (
+                int(
+                    exact_stage_input_tokens.get(
+                        stage,
+                        base_input * input_multipliers[stage][index],
+                    )
+                )
+                if calls
+                else 0
+            )
             output_tokens = calls * output_tokens_per_call[stage][index]
-            retries = 0 if bound != "high" else max(1, calls // 15) if calls else 0
+            retries = (
+                0
+                if stage == "empty_response_recovery" or bound != "high"
+                else max(1, calls // 15)
+                if calls
+                else 0
+            )
             usd = None
             if provider == "deepseek" and model == "deepseek-v4-flash":
                 usd = round(
-                    (
-                        input_tokens * rates["input"]
-                        + output_tokens * rates["output"]
-                    )
+                    (input_tokens * rates["input"] + output_tokens * rates["output"])
                     / 1_000_000,
                     4,
                 )
@@ -631,7 +828,7 @@ def estimate_cost(
             "compact_profile_tokens": compact_input_tokens,
             "complete_note_tokens": note_input_tokens,
             "token_estimator": "measured_utf8_bytes_divided_by_four",
-            "call_basis": "packed_v0295_single-response_discovery_envelopes",
+            "call_basis": "packed_v0296_breadth_and_cluster_completion_envelopes",
             "planning_profile_count": planning_profile_count,
             "graph_neighborhood_profile_count": graph_profile_count,
             "graph_neighborhood_profile_counts": graph_profile_counts,
@@ -640,6 +837,20 @@ def estimate_cost(
                 bound: int(graph_profile_counts[bound] * candidate_rates[bound])
                 for bound in bounds
             },
+            "breadth_completion_waves": 1 if projected_profiles >= 2 else 0,
+            "oversized_cluster_parent_count": len(oversized_cluster_ids),
+            "oversized_cluster_ids": sorted(oversized_cluster_ids),
+            "cluster_writer_input_budget_characters": (
+                cluster_writer_input_budget_characters
+            ),
+            "oversized_writer_input_characters": (oversized_writer_input_characters),
+            "cluster_child_writer_counts": cluster_child_writer_counts,
+            "eligible_empty_recovery_count": len(eligible_empty_recoveries),
+            "eligible_empty_recovery_cluster_ids": sorted(eligible_empty_recoveries),
+            "eligible_empty_recovery_input_tokens": (
+                eligible_empty_recovery_input_tokens
+            ),
+            "empty_recovery_reasoning_effort": "high",
             "confidence": "bounded_from_v029_full_note_packet_usage",
             "cache_assumption": "all_input_priced_as_cache_miss",
         },

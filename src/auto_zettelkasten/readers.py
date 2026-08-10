@@ -857,7 +857,22 @@ class _CapabilityAwareReader:
             settings.get("deadline_seconds") or self._request_deadline_seconds()
         )
         mode = str((context or {}).get("cluster_plan_mode") or "collection")
-        if mode == "bridge":
+        if mode == "partition":
+            instruction = (
+                "Partition the supplied compact parent cluster card and compact "
+                "member cards into smaller coherent child clusters. Treat the "
+                "parent card as the scope and the member cards as the complete "
+                "eligible inventory; do not import sources from elsewhere. Split "
+                "by bounded research question, debate, mechanism, outcome, stage, "
+                "or evidence boundary, never by token size alone. Every child must "
+                "be strictly smaller than the parent and contain at least two "
+                "members. Account for every parent member in one primary child or "
+                "in unclustered_sources. Repeat a member in another child only when "
+                "it is an indispensable bridge, and explain that role. Preserve "
+                "construct, outcome, population, period, and evidence-type "
+                "differences rather than forcing a broad umbrella synthesis."
+            )
+        elif mode == "bridge":
             instruction = (
                 "The supplied records are compact, evidence-referenced local "
                 "families. Identify only genuinely cross-family or "
@@ -910,6 +925,56 @@ class _CapabilityAwareReader:
             kind="cluster_plan",
         )
 
+    def _cluster_synthesis_call_inputs(
+        self,
+        profiles: Sequence[EvidenceProfile],
+        request: LiteratureMapRequest,
+        context: Mapping[str, Any] | None,
+    ) -> tuple[str, str, int, str]:
+        prompt_context = dict(context or {})
+        reasoning_effort = str(
+            prompt_context.pop("_cluster_synthesis_reasoning_effort", None)
+            or "max"
+        ).strip().casefold()
+        if reasoning_effort not in {"medium", "high", "max"}:
+            raise ValueError(
+                "_cluster_synthesis_reasoning_effort must be medium, high, or max"
+            )
+        system_prompt = _cluster_synthesis_system_prompt()
+        instruction = (
+            "Read every complete atomic note in the packet and write the most useful "
+            "source-specific synthesis of the proposed cluster. Use the depth needed "
+            "by the literature, without decorative sections or generic summaries."
+        )
+        user_prompt = _literature_prompt(
+            profiles,
+            request,
+            prompt_context,
+            instruction=instruction,
+        )
+        supported_output = int(self.capabilities["supported_output_tokens"])
+        desired_output = min(CLUSTER_SYNTHESIS_MAX_OUTPUT_TOKENS, supported_output)
+        return system_prompt, user_prompt, desired_output, reasoning_effort
+
+    def cluster_synthesis_fits(
+        self,
+        profiles: Sequence[EvidenceProfile],
+        request: LiteratureMapRequest,
+        *,
+        context: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Return whether the exact provider-visible cluster writer call fits."""
+
+        system_prompt, user_prompt, desired_output, _reasoning_effort = (
+            self._cluster_synthesis_call_inputs(profiles, request, context)
+        )
+        return self._prompt_fits(
+            system_prompt,
+            user_prompt,
+            desired_output,
+            context_fraction=0.8,
+        )
+
     def map_debates(
         self,
         profiles: Sequence[EvidenceProfile],
@@ -943,25 +1008,14 @@ class _CapabilityAwareReader:
         context: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
         self._authorize_request()
-        system_prompt = _cluster_synthesis_system_prompt()
-        instruction = (
-            "Read every complete atomic note in the packet and write the most useful "
-            "source-specific synthesis of the proposed cluster. Use the depth needed "
-            "by the literature, without decorative sections or generic summaries."
+        system_prompt, user_prompt, desired_output, reasoning_effort = (
+            self._cluster_synthesis_call_inputs(profiles, request, context)
         )
-        user_prompt = _literature_prompt(
-            profiles,
-            request,
-            context,
-            instruction=instruction,
-        )
-        supported_output = int(self.capabilities["supported_output_tokens"])
-        desired_output = min(CLUSTER_SYNTHESIS_MAX_OUTPUT_TOKENS, supported_output)
         raw_response = self._literature_json_call(
             system_prompt,
             user_prompt,
             label="cluster synthesis",
-            reasoning_effort="max",
+            reasoning_effort=reasoning_effort,
             output_tokens=desired_output,
             deadline_seconds=min(600.0, self._request_deadline_seconds()),
         )
@@ -2079,7 +2133,7 @@ def _literature_family_plan_system_prompt() -> str:
 def _cluster_plan_system_prompt() -> str:
     return (
         "You are the global collection-clustering reasoner for Auto-Zettelkasten "
-        "cluster plan prompt v5. Return exactly one JSON object containing "
+        "cluster plan prompt v6. Return exactly one JSON object containing "
         "clusters and neighbor_relationships. For backward compatibility you may "
         "also return an unclustered_sources array, but local code computes current "
         "non-membership and does not need reasons from you. Each cluster "
@@ -2098,7 +2152,16 @@ def _cluster_plan_system_prompt() -> str:
         "from shared tags, methods, geography, or vocabulary alone. Preserve "
         "differences in construct, outcome, population, period, evidence type, and "
         "causal scope. A citation or verified relationship is a routing signal, not "
-        "automatic agreement. Planning chooses membership and organization; it does "
+        "automatic agreement. COHERENCE RULE: every cluster must organize one "
+        "bounded research problem, not merely a broad topic or domain. Every member "
+        "must directly answer that problem, materially qualify it, supply a relevant "
+        "mechanism, method, boundary, or practitioner contribution, or serve as an "
+        "explicitly justified bridge. Adjacent stages, outcomes, cases, or evidence "
+        "types belong together only when organizing_problem states their substantive "
+        "relationship and coherence_rationale explains why each is necessary. Keep "
+        "neighboring but distinct problems in separate clusters, and never treat "
+        "practitioner guidance alone as evidence of empirical effectiveness. Planning "
+        "chooses membership and organization; it does "
         "not preselect the only evidence the cluster writer may read. Do not invent "
         "IDs, locators, sources, claims, debates, consensus, contradictions, or "
         "intellectual lineage. Produce a comprehensive map, not a showcase sample, "

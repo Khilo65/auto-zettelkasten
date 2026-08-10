@@ -175,6 +175,19 @@ def test_deepseek_atomic_and_cluster_calls_use_requested_thinking_effort(
         ),
         context={"cluster_id": "cluster-a"},
     )
+    reader.synthesize_cluster(
+        [],
+        LiteratureMapRequest(
+            workspace=".",
+            provider="deepseek",
+            model="deepseek-v4-flash",
+            allow_cloud=True,
+        ),
+        context={
+            "cluster_id": "cluster-a",
+            "_cluster_synthesis_reasoning_effort": "high",
+        },
+    )
 
     assert bodies[0]["thinking"] == {"type": "enabled"}
     assert bodies[0]["reasoning_effort"] == "high"
@@ -182,6 +195,147 @@ def test_deepseek_atomic_and_cluster_calls_use_requested_thinking_effort(
     assert bodies[1]["thinking"] == {"type": "enabled"}
     assert bodies[1]["reasoning_effort"] == "max"
     assert "temperature" not in bodies[1]
+    assert bodies[2]["thinking"] == {"type": "enabled"}
+    assert bodies[2]["reasoning_effort"] == "high"
+    assert "_cluster_synthesis_reasoning_effort" not in bodies[2]["messages"][1][
+        "content"
+    ]
+
+
+def test_cluster_synthesis_fit_uses_exact_call_prompt_and_output_reserve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    fit_inputs: list[tuple[str, str, int]] = []
+    bodies: list[dict[str, Any]] = []
+
+    def prompt_fits(self, system_prompt, user_prompt, output_tokens, **kwargs):
+        del self, kwargs
+        fit_inputs.append((system_prompt, user_prompt, output_tokens))
+        return True
+
+    def post_json(endpoint, body, **kwargs):
+        del endpoint, kwargs
+        bodies.append(dict(body))
+        return _completion(
+            {
+                "cluster_id": "cluster-a",
+                "status": "accepted",
+                "title": "A cluster",
+                "organizing_mode": "question",
+                "organizing_problem": "What does the literature establish?",
+                "bottom_line": "The supplied source provides one bounded finding.",
+                "lines_of_inquiry": [],
+                "differences": [],
+                "limits": [],
+                "related_clusters": [],
+                "retained_member_ids": [],
+                "dropped_members": [],
+                "missing_member_ids": [],
+            }
+        )
+
+    monkeypatch.setattr(DeepSeekReader, "_prompt_fits", prompt_fits)
+    monkeypatch.setattr("auto_zettelkasten.readers._post_json", post_json)
+    reader = DeepSeekReader(allow_cloud=True)
+    request = LiteratureMapRequest(
+        workspace=".",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        allow_cloud=True,
+    )
+    context = {"cluster": {"cluster_id": "cluster-a"}}
+
+    assert reader.cluster_synthesis_fits([], request, context=context)
+    assert bodies == []
+    reader.synthesize_cluster([], request, context=context)
+
+    system_prompt, user_prompt, output_tokens = fit_inputs[0]
+    assert bodies[0]["messages"] == [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    assert bodies[0]["max_tokens"] == output_tokens == 128_000
+
+
+def test_cluster_synthesis_fit_includes_exact_boundary() -> None:
+    reader = DeepSeekReader(
+        context_window_tokens=1_000_000,
+        direct_read_fraction=1.0,
+    )
+    request = LiteratureMapRequest(
+        workspace=".",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+    )
+    context = {"cluster": {"cluster_id": "cluster-a"}}
+    low = 1
+    high = reader.context_window_tokens
+    while low < high:
+        midpoint = (low + high) // 2
+        reader.context_window_tokens = midpoint
+        if reader.cluster_synthesis_fits([], request, context=context):
+            high = midpoint
+        else:
+            low = midpoint + 1
+
+    reader.context_window_tokens = low
+    assert reader.cluster_synthesis_fits([], request, context=context)
+    reader.context_window_tokens = low - 1
+    assert not reader.cluster_synthesis_fits([], request, context=context)
+
+
+def test_cluster_partition_mode_uses_supplied_compact_cards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    bodies: list[dict[str, Any]] = []
+
+    def post_json(endpoint, body, **kwargs):
+        del endpoint, kwargs
+        bodies.append(dict(body))
+        return _completion({"clusters": [], "neighbor_relationships": []})
+
+    monkeypatch.setattr("auto_zettelkasten.readers._post_json", post_json)
+    reader = DeepSeekReader(allow_cloud=True)
+    request = LiteratureMapRequest(
+        workspace=".",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        allow_cloud=True,
+    )
+    parent_card = {
+        "cluster_id": "cluster-parent",
+        "organizing_problem": "How do distinct conflict stages relate?",
+    }
+    member_cards = [
+        {"source_id": "source-a", "outcomes": ["onset"]},
+        {"source_id": "source-b", "outcomes": ["recurrence"]},
+    ]
+
+    assert reader.plan_clusters(
+        [],
+        request,
+        context={
+            "cluster_plan_mode": "partition",
+            "compact_parent_cluster": parent_card,
+            "compact_member_cards": member_cards,
+        },
+    ) == {
+        "clusters": [],
+        "neighbor_relationships": [],
+        "parked_clusters": [],
+        "unclustered_sources": [],
+    }
+
+    payload = json.loads(bodies[0]["messages"][1]["content"])
+    assert payload["profiles"] == []
+    assert payload["context"]["compact_parent_cluster"] == parent_card
+    assert payload["context"]["compact_member_cards"] == member_cards
+    assert "Partition the supplied compact parent cluster card" in payload[
+        "instruction"
+    ]
+    assert "never by token size alone" in payload["instruction"]
 
 
 def test_generic_openai_provider_keeps_deterministic_nonreasoning_request(
