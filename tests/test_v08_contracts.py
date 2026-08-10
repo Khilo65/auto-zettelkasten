@@ -24,7 +24,7 @@ from auto_zettelkasten.models import LiteratureMapReport, NavigationPolicy
 
 
 def test_current_versions_and_navigation_defaults() -> None:
-    assert ENGINE_VERSION == "0.29.3"
+    assert ENGINE_VERSION == "0.29.4"
     assert ARTIFACT_SCHEMA_VERSION == "1.20"
     assert NavigationPolicy().max_visible_tags_per_source == 6
     assert NavigationPolicy().max_collection_neighborhoods == 20
@@ -319,5 +319,5 @@ def test_literature_report_exposes_v08_artifact_counts() -> None:
     assert report.source_contribution_count == 4
     assert report.evidence_base_group_count == 2
     assert report.coverage_record_count == 75
-    assert report.engine_version == "0.29.3"
+    assert report.engine_version == "0.29.4"
     assert report.artifact_schema_version == "1.20"

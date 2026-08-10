@@ -14,14 +14,18 @@ from auto_zettelkasten.pipeline import (
     _pack_relationship_rows,
     _write_profile_packets,
 )
-from auto_zettelkasten.readers import _relationship_adjudication_system_prompt
+from auto_zettelkasten.literature import LITERATURE_FAMILY_PLAN_PROMPT_VERSION
+from auto_zettelkasten.readers import (
+    LITERATURE_FAMILY_PLAN_MAX_OUTPUT_TOKENS,
+    _relationship_adjudication_system_prompt,
+)
 from auto_zettelkasten.relationships import (
     RELATIONSHIP_DISCOVERY_PROMPT_VERSION,
     RELATIONSHIP_PROMPT_VERSION,
 )
 
 
-def test_v29_2_relationship_prompt_and_packet_limit() -> None:
+def test_v29_4_relationship_packet_and_family_plan_limits() -> None:
     prompt = _relationship_adjudication_system_prompt()
     assert RELATIONSHIP_PROMPT_VERSION == "18"
     assert RELATIONSHIP_DISCOVERY_PROMPT_VERSION == "16"
@@ -30,6 +34,8 @@ def test_v29_2_relationship_prompt_and_packet_limit() -> None:
     assert "Use contextual_connection" in prompt
     assert "every ID appears exactly once" in prompt
     assert _RELATIONSHIP_BATCH_MAX_JOBS == 8
+    assert LITERATURE_FAMILY_PLAN_MAX_OUTPUT_TOKENS == 128_000
+    assert LITERATURE_FAMILY_PLAN_PROMPT_VERSION == "10"
 
     rows = list(range(31))
     packets = _pack_relationship_rows(

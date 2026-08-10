@@ -164,7 +164,7 @@ LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
 GAP_ADJUDICATION_MAX_OUTPUT_TOKENS = 32_000
 RELATIONSHIP_ROUTING_MAX_OUTPUT_TOKENS = 8_000
-LITERATURE_FAMILY_PLAN_MAX_OUTPUT_TOKENS = 64_000
+LITERATURE_FAMILY_PLAN_MAX_OUTPUT_TOKENS = 128_000
 RELATIONSHIP_CANDIDATE_MAX_OUTPUT_TOKENS = 32_000
 RELATIONSHIP_MAX_OUTPUT_TOKENS = 128_000
 CLUSTER_SYNTHESIS_MAX_OUTPUT_TOKENS = 128_000
@@ -2044,7 +2044,7 @@ def _cluster_proposal_system_prompt() -> str:
 def _literature_family_plan_system_prompt() -> str:
     return (
         "You are the shared literature-family planner for Auto-Zettelkasten "
-        "cluster plan prompt v9. Read the supplied labeled source-index shard jobs. Return one "
+        "cluster plan prompt v10. Read the supplied labeled source-index shard jobs. Return one "
         "JSON object with literature_families, discovery_jobs, neighboring_families, and "
         "source_dispositions arrays. A family has family_id, label, "
         "organizing_problem, source_ids, proposed_roles, and candidate_cluster. "
