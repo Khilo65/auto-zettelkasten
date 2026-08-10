@@ -403,22 +403,15 @@ def test_global_discovery_creates_immutable_pair_job(
     assert job_path.read_bytes() == before
 
 
-def test_builtin_global_discovery_continues_until_a_page_has_no_new_pairs(
+def test_builtin_global_discovery_uses_one_complete_response(
     tmp_path: Path,
 ) -> None:
     profiles = [_profile(source_id) for source_id in "ABC"]
-    candidate_pages = iter(
-        (
-            {"candidates": [_candidate("A", "B")]},
-            {"candidates": [_candidate("B", "C")]},
-            {"candidates": []},
-        )
-    )
 
     def handler(stage, _profiles, context):
         if stage == "relationship_candidate_selection":
             assert context["max_inferred_pairs"] == 3
-            return next(candidate_pages)
+            return {"candidates": [_candidate("A", "B")]}
         return {"decisions": [_decision(job) for job in context["pair_jobs"]]}
 
     calls = _Calls(handler)
@@ -429,15 +422,15 @@ def test_builtin_global_discovery_continues_until_a_page_has_no_new_pairs(
         reasoner=_BuiltInDeepSeekReasoner(),
     )
 
-    assert result["pair_job_count"] == 2
+    assert result["pair_job_count"] == 1
     assert result["relationship_stage_complete"] is True
     assert sum(
         stage == "relationship_candidate_selection"
         for stage, _key, _context in calls.seen
-    ) == 3
+    ) == 1
 
 
-def test_completed_discovery_page_survives_a_retryable_continuation_failure(
+def test_completed_discovery_response_does_not_start_serial_continuation(
     tmp_path: Path,
 ) -> None:
     profiles = [_profile(source_id) for source_id in "ABC"]
@@ -461,8 +454,9 @@ def test_completed_discovery_page_survives_a_retryable_continuation_failure(
 
     assert len(result["accepted"]) == 1
     assert result["pair_job_count"] == 1
-    assert result["relationship_stage_complete"] is False
-    assert result["relationship_retry_on_resume"] is True
+    assert result["relationship_stage_complete"] is True
+    assert result["relationship_retry_on_resume"] is False
+    assert candidate_calls == 1
 
 
 def test_shared_plan_keeps_family_discovery_in_separate_packets(
@@ -777,13 +771,88 @@ def test_shared_plan_runs_broad_before_complement_and_passes_prior_pairs(
         context["discovery_pass"]
         for stage, _key, context in calls.seen
         if stage.endswith("candidate_selection")
-    ] == ["broad", "broad", "complement", "complement"]
+    ] == ["broad", "complement"]
+
+
+def test_missing_candidate_job_id_is_recovered_from_unique_endpoint_sides(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile(source_id) for source_id in "ABCDEF"]
+    jobs = [
+        {
+            "job_id": "requested",
+            "family": "explicit_requested_collection_comparison",
+            "left_source_ids": ["A"],
+            "right_source_ids": ["B"],
+            "requested_collection_pair": ["C1", "C2"],
+            "candidate_quota": 40,
+        },
+        {
+            "job_id": "family-cd",
+            "family": "family-cd",
+            "left_source_ids": ["C"],
+            "right_source_ids": ["D"],
+            "candidate_quota": 12,
+        },
+        {
+            "job_id": "family-ef",
+            "family": "family-ef",
+            "left_source_ids": ["E"],
+            "right_source_ids": ["F"],
+            "candidate_quota": 12,
+        },
+    ]
+
+    def handler(stage, _profiles, context):
+        if stage == "relationship_bridge_candidate_selection":
+            return {
+                "candidates": [],
+                "job_outcomes": [
+                    {"bridge_job_id": "requested", "status": "no_more_candidates"}
+                ],
+            }
+        if stage == "relationship_candidate_selection":
+            return {
+                "candidates": [_candidate("C", "D"), _candidate("E", "F")],
+                "job_outcomes": [
+                    {"bridge_job_id": "family-cd", "status": "completed"},
+                    {"bridge_job_id": "family-ef", "status": "completed"},
+                ],
+            }
+        return {"decisions": [_decision(job) for job in context["pair_jobs"]]}
+
+    result = _run(
+        tmp_path,
+        profiles,
+        _Calls(handler),
+        shared_family_plan={
+            "lean_index_hash": "lean",
+            "literature_families": [
+                {"family_id": "family-cd", "source_ids": ["C", "D"]},
+                {"family_id": "family-ef", "source_ids": ["E", "F"]},
+            ],
+            "discovery_jobs": jobs,
+        },
+    )
+
+    assert result["pair_job_count"] == 2
+    assert {
+        tuple(row["pair"])
+        for row in result["candidate_dispositions"]
+        if row["disposition"] == "selected_for_adjudication"
+    } == {("C", "D"), ("E", "F")}
+    accounting = {
+        row["bridge_job_id"]: row
+        for row in result["relationship_discovery_jobs"]
+    }
+    assert accounting["family-cd"]["valid_unique_candidates"] == 1
+    assert accounting["family-ef"]["valid_unique_candidates"] == 1
 
 
 def test_undercovered_families_share_one_followup_and_are_accounted(
     tmp_path: Path,
 ) -> None:
-    profiles = [_profile(source_id) for source_id in "ABCDEF"]
+    profiles = [_profile(source_id) for source_id in "ABCDEFGHIJ"]
     jobs = [
         {
             "job_id": "requested",
@@ -797,8 +866,8 @@ def test_undercovered_families_share_one_followup_and_are_accounted(
             {
                 "job_id": f"family-{left.lower()}{right.lower()}",
                 "family": f"family-{left.lower()}{right.lower()}",
-                "left_source_ids": [left],
-                "right_source_ids": [right],
+                "left_source_ids": [left, {"C": "G", "E": "I"}[left]],
+                "right_source_ids": [right, {"D": "H", "F": "J"}[right]],
                 "candidate_quota": 12,
             }
             for left, right in (("C", "D"), ("E", "F"))
@@ -841,38 +910,59 @@ def test_undercovered_families_share_one_followup_and_are_accounted(
             }
         return {"decisions": [_decision(job) for job in context["pair_jobs"]]}
 
+    shared_plan = {
+        "lean_index_hash": "lean",
+        "requested_collection_keys": ["C1", "C2"],
+        "literature_families": [
+            {"family_id": "family-cd", "source_ids": ["C", "D", "G", "H"]},
+            {"family_id": "family-ef", "source_ids": ["E", "F", "I", "J"]},
+        ],
+        "discovery_jobs": jobs,
+    }
     calls = _Calls(handler)
     result = _run(
         tmp_path,
         profiles,
         calls,
-        shared_family_plan={
-            "lean_index_hash": "lean",
-            "requested_collection_keys": ["C1", "C2"],
-            "literature_families": [
-                {"family_id": "family-cd", "source_ids": ["C", "D"]},
-                {"family_id": "family-ef", "source_ids": ["E", "F"]},
-            ],
-            "discovery_jobs": jobs,
-        },
+        shared_family_plan=shared_plan,
     )
 
     assert [
         context["discovery_pass"]
         for stage, _key, context in calls.seen
         if stage.endswith("candidate_selection")
-    ] == [
-        "broad",
-        "complement",
-        "coverage_followup",
-        "coverage_followup",
-    ]
+    ] == ["broad", "complement", "coverage_followup"]
     accounting = {
         row["bridge_job_id"]: row
         for row in result["relationship_discovery_jobs"]
     }
     assert accounting["family-cd"]["status"] == "completed"
     assert accounting["family-ef"]["status"] == "completed"
+    assert accounting["family-cd"]["coverage_warning"] == (
+        "coverage_shortfall_after_followup"
+    )
+    assert accounting["family-ef"]["coverage_warning"] == (
+        "coverage_shortfall_after_followup"
+    )
+    assert result["relationship_discovery_status"] == "complete"
+    _commit_relationship_selection_state(
+        tmp_path,
+        result,
+        catalogue_revision=result["reconciled_catalogue_revision"],
+    )
+    replay_calls = _Calls(
+        lambda stage, _profiles, _context: (_ for _ in ()).throw(
+            AssertionError(f"unexpected replay call: {stage}")
+        )
+    )
+    replay = _run(
+        tmp_path,
+        profiles,
+        replay_calls,
+        shared_family_plan=shared_plan,
+    )
+    assert replay_calls.seen == []
+    assert replay["semantic_noop"] is True
 
 
 def test_limited_family_side_is_accounted_without_a_call(tmp_path: Path) -> None:
@@ -928,8 +1018,8 @@ def test_limited_family_side_is_accounted_without_a_call(tmp_path: Path) -> None
     assert accounting["limited"]["status"] == "insufficient_analytical_endpoints"
 
 
-def test_builtin_complement_requires_complete_job_outcomes(tmp_path: Path) -> None:
-    profiles = [_profile(source_id) for source_id in "ABCD"]
+def test_builtin_missing_job_outcomes_settle_with_warning(tmp_path: Path) -> None:
+    profiles = [_profile(source_id) for source_id in "ABCDEF"]
     jobs = [
         {
             "job_id": "requested",
@@ -946,8 +1036,32 @@ def test_builtin_complement_requires_complete_job_outcomes(tmp_path: Path) -> No
             "right_source_ids": ["D"],
             "candidate_quota": 12,
         },
+        {
+            "job_id": "family-ef",
+            "family": "family-ef",
+            "left_source_ids": ["E"],
+            "right_source_ids": ["F"],
+            "candidate_quota": 12,
+        },
     ]
-    calls = _Calls(lambda _stage, _profiles, _context: {"candidates": []})
+
+    def handler(stage, _profiles, context):
+        if stage == "relationship_bridge_candidate_selection":
+            return {
+                "candidates": [],
+                "job_outcomes": [
+                    {"bridge_job_id": "requested", "status": "completed"}
+                ],
+            }
+        return {
+            "candidates": [],
+            # Deliberately omit family-ef from a partial built-in envelope.
+            "job_outcomes": [
+                {"bridge_job_id": "family-cd", "status": "completed"}
+            ],
+        }
+
+    calls = _Calls(handler)
     result = _run(
         tmp_path,
         profiles,
@@ -956,20 +1070,35 @@ def test_builtin_complement_requires_complete_job_outcomes(tmp_path: Path) -> No
         shared_family_plan={
             "lean_index_hash": "lean",
             "literature_families": [
-                {"family_id": "family-cd", "source_ids": ["C", "D"]}
+                {"family_id": "family-cd", "source_ids": ["C", "D"]},
+                {"family_id": "family-ef", "source_ids": ["E", "F"]},
             ],
             "discovery_jobs": jobs,
         },
     )
 
-    assert "family-cd" in result["relationship_discovery_incomplete_jobs"]
+    accounting = {
+        row["bridge_job_id"]: row
+        for row in result["relationship_discovery_jobs"]
+    }
+    assert result["relationship_discovery_incomplete_jobs"] == []
+    assert result["relationship_discovery_status"] == "complete"
+    assert accounting["family-cd"]["coverage_warning"] == (
+        "coverage_shortfall_after_followup"
+    )
+    assert accounting["family-ef"]["coverage_warning"] == (
+        "coverage_shortfall_after_followup"
+    )
+    assert accounting["family-ef"]["accounting_warning"] == (
+        "missing_or_invalid_job_outcomes"
+    )
     assert any(
         context.get("discovery_pass") == "coverage_followup"
         for _stage, _key, context in calls.seen
     )
 
 
-def test_failed_continuation_does_not_reopen_completed_sibling_job(
+def test_completed_packet_does_not_start_autonomous_continuation(
     tmp_path: Path,
 ) -> None:
     profiles = [_profile(source_id) for source_id in "ABCDEF"]
@@ -1007,11 +1136,6 @@ def test_failed_continuation_does_not_reopen_completed_sibling_job(
                 ],
             }
         if stage == "relationship_candidate_selection":
-            if int(context.get("discovery_page", 0) or 0) == 1:
-                assert [
-                    row["bridge_job_id"] for row in context["bridge_jobs"]
-                ] == ["family-ef"]
-                raise ValueError("malformed continuation")
             return {
                 "candidates": [
                     {**_candidate("C", "D"), "bridge_job_id": "family-cd"},
@@ -1023,10 +1147,11 @@ def test_failed_continuation_does_not_reopen_completed_sibling_job(
             }
         return {"decisions": [_decision(job) for job in context["pair_jobs"]]}
 
+    calls = _Calls(handler)
     result = _run(
         tmp_path,
         profiles,
-        _Calls(handler),
+        calls,
         reasoner=_BuiltInDeepSeekReasoner(),
         shared_family_plan={
             "lean_index_hash": "lean",
@@ -1045,7 +1170,15 @@ def test_failed_continuation_does_not_reopen_completed_sibling_job(
     }
     assert accounting["family-cd"]["status"] == "completed"
     assert accounting["family-cd"]["packet_status"] == "completed"
-    assert result["relationship_discovery_incomplete_jobs"] == ["family-ef"]
+    assert accounting["family-ef"]["coverage_warning"] == (
+        "coverage_shortfall_after_followup"
+    )
+    assert result["relationship_discovery_incomplete_jobs"] == []
+    assert all(
+        "discovery_page" not in context
+        for stage, _key, context in calls.seen
+        if stage.endswith("candidate_selection")
+    )
 
 
 def test_split_discovery_job_keeps_failed_shard_incomplete(
@@ -1327,7 +1460,7 @@ def test_shared_packet_overflow_preserves_other_family_accounting(
         for row in result["relationship_discovery_jobs"]
     }
     assert accounting["requested"]["status"] == "completed"
-    assert accounting["family-cd"]["status"] == "under_covered"
+    assert accounting["family-cd"]["status"] == "eligible"
     assert "family-cd" in result["relationship_discovery_incomplete_jobs"]
     assert all(
         context.get("discovery_pass") != "coverage_followup"

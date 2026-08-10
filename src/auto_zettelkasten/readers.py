@@ -165,7 +165,7 @@ CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
 GAP_ADJUDICATION_MAX_OUTPUT_TOKENS = 32_000
 RELATIONSHIP_ROUTING_MAX_OUTPUT_TOKENS = 8_000
 LITERATURE_FAMILY_PLAN_MAX_OUTPUT_TOKENS = 128_000
-RELATIONSHIP_CANDIDATE_MAX_OUTPUT_TOKENS = 32_000
+RELATIONSHIP_CANDIDATE_MAX_OUTPUT_TOKENS = 64_000
 RELATIONSHIP_MAX_OUTPUT_TOKENS = 128_000
 CLUSTER_SYNTHESIS_MAX_OUTPUT_TOKENS = 128_000
 ATOMIC_FIDELITY_MAX_OUTPUT_TOKENS = 8_000
@@ -1882,7 +1882,7 @@ def _relationship_bridge_shard_system_prompt() -> str:
 
 def _relationship_candidate_system_prompt() -> str:
     return (
-        "You retrieve comparisons for Auto-Zettelkasten relationship discovery prompt v16. "
+        "You retrieve comparisons for Auto-Zettelkasten relationship discovery prompt v17. "
         "Return exactly one JSON object with candidates and job_outcomes arrays. Each candidate "
         "contains only left_source_id, right_source_id, comparison_proposition, "
         "bridge_job_id, and rank. Use only supplied IDs, put the "
@@ -1890,9 +1890,9 @@ def _relationship_candidate_system_prompt() -> str:
         "pair. A candidate is a request for later full-note comparison, not a "
         "published relationship, so optimize recall, coverage, diversity, and "
         "useful navigation. Require a concrete shared proposition, mechanism, "
-        "Respect max_inferred_pairs as the per-response page size, not as a total discovery cap. "
         "outcome, debate, sequence, implementation problem, or boundary; shared "
-        "vocabulary alone is insufficient. Return as many useful pairs as fit "
+        "vocabulary alone is insufficient. Respect max_inferred_pairs as the maximum "
+        "number of candidates in this response. Return as many useful pairs as fit "
         "comfortably in this response. When discovery_mode is bridge_only, return only pairs whose "
         "supplied collection memberships are disjoint. For bridge_only packets, "
         "each candidate must name a supplied bridge_job_id and place one endpoint "
@@ -1901,9 +1901,9 @@ def _relationship_candidate_system_prompt() -> str:
         "When discovery_mode is complementary_family_discovery, do not repeat "
         "prior_candidate_pairs and fulfill each supplied family job independently. "
         "For every supplied discovery job, return exactly one job_outcomes "
-        "row for every supplied bridge_job_id, using status completed when more useful "
-        "comparisons remain for a continuation or no_more_candidates only after exhausting that job's "
-        "non-trivial comparisons. A candidate floor is a minimum coverage target, not "
+        "row for every supplied bridge_job_id. Use completed when the job was examined "
+        "successfully in this response, or no_more_candidates when you exhausted that job's "
+        "non-trivial comparisons. Neither status requests automatic continuation. A candidate floor is a minimum coverage target, not "
         "a cap; return additional useful candidates when they are non-trivial. "
         "Cover multiple theoretical, mechanistic, empirical, "
         "institutional, implementation, outcome, sequence, and boundary families "

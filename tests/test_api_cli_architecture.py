@@ -52,7 +52,7 @@ def test_release_metadata_matches_engine_version() -> None:
     pyproject = Path(__file__).parents[1] / "pyproject.toml"
     payload = tomllib.loads(pyproject.read_text(encoding="utf-8"))
 
-    assert payload["project"]["version"] == "0.29.4"
+    assert payload["project"]["version"] == "0.29.5"
 
 
 def test_standalone_literature_map_forwards_provider_concurrency(

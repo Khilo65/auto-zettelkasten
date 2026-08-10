@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from auto_zettelkasten.literature import (
+    _canonical_projection_profiles,
     _cluster_limit_text,
     _navigation_profile_rows,
     _obsidian_note_link,
@@ -77,6 +78,182 @@ def test_projection_profiles_preserve_public_profiles_and_drive_rendering() -> N
         "[[Canonical Source A [ABC123]|Source A]]"
     )
     assert _report_projection_profiles({"profiles": [analytical]}) == [analytical]
+
+
+def test_final_projection_resolves_stale_zotero_note_paths(tmp_path: Path) -> None:
+    notes_root = tmp_path / "02_source_memory" / "notes"
+    notes_root.mkdir(parents=True)
+    canonical_paths = {
+        "source-zotero-9mh7lag9": (
+            notes_root / "Paris2004 - At war's end [9mh7lag9].md"
+        ),
+        "source-zotero-494iyya8": (
+            notes_root / "Unknownn.d. - Document Viewer [494iyya8].md"
+        ),
+        "source-zotero-iwhwd39r": (
+            notes_root
+            / "Walter2004 - Does Conflict Beget Conflict [iwhwd39r].md"
+        ),
+    }
+    for path in canonical_paths.values():
+        path.write_text("", encoding="utf-8")
+    (notes_root / "Paris (2004).md").write_text("stale", encoding="utf-8")
+    report = {
+        "projection_profiles": [
+            {
+                "source_id": source_id,
+                "title": path.stem.split(" - ", 1)[-1].rsplit(" [", 1)[0],
+                "note_path": (
+                    "02_source_memory/notes/"
+                    + {
+                        "source-zotero-9mh7lag9": "Paris (2004).md",
+                        "source-zotero-494iyya8": "Unknownn.d..md",
+                        "source-zotero-iwhwd39r": "Walter (2004).md",
+                    }[source_id]
+                ),
+            }
+            for source_id, path in canonical_paths.items()
+        ]
+    }
+
+    profiles = _canonical_projection_profiles(tmp_path, report)
+
+    assert {
+        row["source_id"]: row["note_path"] for row in profiles
+    } == {
+        source_id: str(path.relative_to(tmp_path))
+        for source_id, path in canonical_paths.items()
+    }
+    links = {_obsidian_note_link(row) for row in profiles}
+    assert all("(2004)" not in link for link in links)
+    assert "[[Paris2004 - At war's end [9mh7lag9]|At war's end]]" in links
+
+
+def test_final_projection_omits_ambiguous_or_unknown_wikilink_targets(
+    tmp_path: Path,
+) -> None:
+    notes_root = tmp_path / "02_source_memory" / "notes"
+    notes_root.mkdir(parents=True)
+    (notes_root / "First [abcd1234].md").write_text("", encoding="utf-8")
+    (notes_root / "Second [abcd1234].md").write_text("", encoding="utf-8")
+    (notes_root / "Stale target.md").write_text("", encoding="utf-8")
+    report = {
+        "projection_profiles": [
+            {
+                "source_id": "source-zotero-abcd1234",
+                "title": "Ambiguous",
+                "note_path": "02_source_memory/notes/Stale target.md",
+            },
+            {
+                "source_id": "source-zotero-deadbeef",
+                "title": "Missing",
+                "note_path": "02_source_memory/notes/Missing target.md",
+            },
+            {
+                "source_id": "custom-source",
+                "title": "Unknown custom source",
+                "note_path": "02_source_memory/notes/Unknown custom.md",
+            },
+        ]
+    }
+
+    profiles = _canonical_projection_profiles(tmp_path, report)
+
+    assert [row["note_path"] for row in profiles] == ["", "", ""]
+    assert [_obsidian_note_link(row) for row in profiles] == [
+        "Ambiguous",
+        "Missing",
+        "Unknown custom source",
+    ]
+
+
+def test_cluster_body_uses_final_canonical_profile_links(tmp_path: Path) -> None:
+    notes_root = tmp_path / "02_source_memory" / "notes"
+    notes_root.mkdir(parents=True)
+    paris_path = notes_root / "Paris2004 - At war's end [9mh7lag9].md"
+    unknown_path = notes_root / "Unknownn.d. - Document Viewer [494iyya8].md"
+    walter_path = (
+        notes_root
+        / "Walter2004 - Does Conflict Beget Conflict [iwhwd39r].md"
+    )
+    for path in (paris_path, unknown_path, walter_path):
+        path.write_text("", encoding="utf-8")
+    profiles = _canonical_projection_profiles(
+        tmp_path,
+        {
+            "projection_profiles": [
+                {
+                    "source_id": "source-zotero-9mh7lag9",
+                    "title": "At war's end",
+                    "note_path": "02_source_memory/notes/Paris (2004).md",
+                },
+                {
+                    "source_id": "source-zotero-494iyya8",
+                    "title": "Document Viewer",
+                    "note_path": "02_source_memory/notes/Unknownn.d..md",
+                },
+                {
+                    "source_id": "source-zotero-iwhwd39r",
+                    "title": "Does Conflict Beget Conflict?",
+                    "note_path": "02_source_memory/notes/Walter (2004).md",
+                },
+            ]
+        },
+    )
+    profile_by_source = {row["source_id"]: row for row in profiles}
+    cluster = {
+        "cluster_id": "cluster-a",
+        "source_ids": list(profile_by_source),
+    }
+    synthesis = {
+        "title": "Cluster A",
+        "retained_member_ids": list(profile_by_source),
+        "lines_of_inquiry": [
+            {
+                "title": "Finding",
+                "study_findings": [
+                    {
+                        "source_id": "source-zotero-9mh7lag9",
+                        "finding": "A finding.",
+                    }
+                ],
+            }
+        ],
+        "additional_cited_works_worth_mapping": [
+            {
+                "cited_work": "External work",
+                "attributions": [
+                    {"current_source_id": "source-zotero-494iyya8"}
+                ],
+            }
+        ],
+        "material_exclusions": [
+            {
+                "source_id": "source-zotero-iwhwd39r",
+                "boundary": "Outside the boundary.",
+            }
+        ],
+    }
+
+    markdown = _streamlined_cluster_markdown(
+        cluster,
+        synthesis,
+        profile_by_source=profile_by_source,
+        cluster_by_id={"cluster-a": cluster},
+    )
+
+    for canonical_target in (
+        "Paris2004 - At war's end [9mh7lag9]",
+        "Unknownn.d. - Document Viewer [494iyya8]",
+        "Walter2004 - Does Conflict Beget Conflict [iwhwd39r]",
+    ):
+        assert f"[[{canonical_target}" in markdown
+    for stale_target in (
+        "[[Paris (2004)",
+        "[[Unknownn.d.]]",
+        "[[Walter (2004)",
+    ):
+        assert stale_target not in markdown
 
 
 def test_cluster_limits_render_current_and_legacy_mapping_rows_cleanly() -> None:

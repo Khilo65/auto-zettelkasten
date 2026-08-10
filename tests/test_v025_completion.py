@@ -28,7 +28,7 @@ from auto_zettelkasten.relationships import (
 def test_v29_4_relationship_packet_and_family_plan_limits() -> None:
     prompt = _relationship_adjudication_system_prompt()
     assert RELATIONSHIP_PROMPT_VERSION == "18"
-    assert RELATIONSHIP_DISCOVERY_PROMPT_VERSION == "16"
+    assert RELATIONSHIP_DISCOVERY_PROMPT_VERSION == "17"
     assert "relationship prompt v18" in prompt
     assert "choose the tier before the subtype" in prompt
     assert "Use contextual_connection" in prompt

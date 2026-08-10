@@ -1731,6 +1731,10 @@ def test_compatibility_entry_accepts_current_rows_writes_all_outputs_and_has_no_
 def test_gap_markdown_has_native_tags_and_reciprocal_evidence_links(
     tmp_path: Path,
 ) -> None:
+    notes_root = tmp_path / "02_source_memory" / "notes"
+    notes_root.mkdir(parents=True)
+    (notes_root / "a.md").write_text("", encoding="utf-8")
+    (notes_root / "b.md").write_text("", encoding="utf-8")
     base = [
         {
             **profile("a", tags=["shared-topic"]),

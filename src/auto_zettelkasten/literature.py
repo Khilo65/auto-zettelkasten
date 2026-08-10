@@ -16451,6 +16451,53 @@ def _report_projection_profiles(
     ]
 
 
+_CANONICAL_SOURCE_NOTE_KEY = re.compile(r"\[([A-Za-z0-9]{8})\]\.md$")
+
+
+def _canonical_projection_profiles(
+    workspace: Path,
+    report: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Resolve stale Zotero note paths against the canonical source-note files."""
+
+    profiles = [dict(row) for row in _report_projection_profiles(report)]
+    paths_by_key: dict[str, list[str]] = defaultdict(list)
+    notes_root = workspace / "02_source_memory" / "notes"
+    if notes_root.is_dir():
+        for path in notes_root.glob("*.md"):
+            match = _CANONICAL_SOURCE_NOTE_KEY.search(path.name)
+            if match:
+                paths_by_key[match.group(1).casefold()].append(
+                    str(path.relative_to(workspace))
+                )
+
+    for profile in profiles:
+        note_path = str(profile.get("note_path") or "")
+        context = _as_mapping(profile.get("context"))
+        zotero_key = str(
+            profile.get("zotero_item_key")
+            or context.get("zotero_item_key")
+            or ""
+        ).casefold()
+        if not zotero_key:
+            source_id = str(profile.get("source_id") or "")
+            prefix = "source-zotero-"
+            if source_id.casefold().startswith(prefix):
+                zotero_key = source_id[len(prefix) :].casefold()
+        if not zotero_key:
+            if not note_path or not (workspace / note_path).is_file():
+                profile["note_path"] = ""
+            continue
+        matches = paths_by_key.get(zotero_key, [])
+        if len(matches) == 1:
+            profile["note_path"] = matches[0]
+        elif len(matches) > 1:
+            profile["note_path"] = ""
+        elif not note_path or not (workspace / note_path).is_file():
+            profile["note_path"] = ""
+    return profiles
+
+
 def build_navigation_projection(
     workspace: Path | None,
     profiles: Sequence[Any],
@@ -25588,7 +25635,7 @@ def persist_literature_report(
     gaps = list(report["gap_registry"]["gaps"])
     profile_by_source = {
         str(row.get("source_id") or ""): row
-        for row in _report_projection_profiles(report)
+        for row in _canonical_projection_profiles(workspace, report)
         if row.get("source_id")
     }
     cluster_by_id = {str(row["cluster_id"]): row for row in clusters}

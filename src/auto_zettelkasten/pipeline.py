@@ -8132,167 +8132,133 @@ def _run_relationship_reasoning(
         BaseException | None,
     ]:
         stage, key, task_profiles, task_context, pool = task
-        page_context = dict(task_context)
-        page_key = key
-        page = 1
-        seen_pairs: set[tuple[str, str]] = set()
-        results: list[tuple[str, Mapping[str, Any]]] = []
-        while True:
-            try:
-                response = reasoner_calls(
-                    stage,
-                    page_key,
-                    "select_relationship_candidates",
-                    task_profiles,
-                    page_context,
-                )
-            except Exception as exc:
-                if results:
-                    return pool, results, exc
-                raise
-            jobs = {
-                str(row.get("bridge_job_id") or ""): row
-                for row in page_context.get("bridge_jobs", []) or []
-                if isinstance(row, Mapping) and row.get("bridge_job_id")
-            }
-            expected_job_ids = set(jobs)
-            raw_outcomes = response.get("job_outcomes", []) or []
-            outcomes = {
-                str(row.get("bridge_job_id") or row.get("job_id") or ""): str(
-                    row.get("status") or ""
-                )
-                for row in raw_outcomes
-                if isinstance(row, Mapping)
-                and str(row.get("status") or "")
-                in {"completed", "no_more_candidates"}
-            }
-            built_in_deepseek = (
-                str(getattr(reasoner, "profile_generation_route", ""))
-                == "built_in_reader"
-                and str(getattr(reasoner, "name", "")) == "deepseek"
+        response = reasoner_calls(
+            stage,
+            key,
+            "select_relationship_candidates",
+            task_profiles,
+            task_context,
+        )
+        jobs = {
+            str(row.get("bridge_job_id") or ""): row
+            for row in task_context.get("bridge_jobs", []) or []
+            if isinstance(row, Mapping) and row.get("bridge_job_id")
+        }
+        expected_job_ids = set(jobs)
+        raw_outcomes = response.get("job_outcomes", []) or []
+        outcomes = {
+            str(row.get("bridge_job_id") or row.get("job_id") or ""): str(
+                row.get("status") or ""
             )
-            if (
-                built_in_deepseek
-                and jobs
-                and set(outcomes) != expected_job_ids
-            ):
-                # Candidate rows are independently useful and must survive a
-                # malformed optional packet-accounting envelope.  Keep the job
-                # partial so resume can complete its accounting.
-                response = {
-                    **dict(response),
-                    "accounting_warning": "missing_or_invalid_job_outcomes",
-                }
-            if jobs and not outcomes and not built_in_deepseek:
-                inferred_status = (
-                    "completed"
-                    if response.get("candidates")
-                    else "no_more_candidates"
+            for row in raw_outcomes
+            if isinstance(row, Mapping)
+            and str(row.get("status") or "")
+            in {"completed", "no_more_candidates"}
+        }
+        built_in_deepseek = (
+            str(getattr(reasoner, "profile_generation_route", ""))
+            == "built_in_reader"
+            and str(getattr(reasoner, "name", "")) == "deepseek"
+        )
+        if built_in_deepseek and jobs and set(outcomes) != expected_job_ids:
+            # Candidate rows are independently useful and must survive a
+            # malformed optional packet-accounting envelope. Missing rows are
+            # a structural warning, not a reason to repeat paid discovery.
+            missing_job_ids = expected_job_ids - set(outcomes)
+            outcomes.update({job_id: "completed" for job_id in missing_job_ids})
+            response = {
+                **dict(response),
+                "accounting_warning": "missing_or_invalid_job_outcomes",
+                "_accounting_warning_job_ids": sorted(missing_job_ids),
+                "job_outcomes": [
+                    {"bridge_job_id": job_id, "status": status}
+                    for job_id, status in sorted(outcomes.items())
+                ],
+            }
+        if jobs and not outcomes and not built_in_deepseek:
+            inferred_status = (
+                "completed" if response.get("candidates") else "no_more_candidates"
+            )
+            outcomes = {job_id: inferred_status for job_id in expected_job_ids}
+            response = {
+                **dict(response),
+                "job_outcomes": [
+                    {"bridge_job_id": job_id, "status": status}
+                    for job_id, status in sorted(outcomes.items())
+                ],
+            }
+        if jobs:
+            candidates: list[dict[str, Any]] = []
+            for raw in response.get("candidates", []) or []:
+                if not isinstance(raw, Mapping):
+                    continue
+                row = dict(raw)
+                left_source_id = str(
+                    row.get("left_source_id") or row.get("source_id") or ""
                 )
-                outcomes = {
-                    job_id: inferred_status for job_id in expected_job_ids
-                }
-                response = {
-                    **dict(response),
-                    "job_outcomes": [
-                        {"bridge_job_id": job_id, "status": status}
-                        for job_id, status in sorted(outcomes.items())
-                    ],
-                }
-            if jobs:
-                candidates: list[dict[str, Any]] = []
-                for raw in response.get("candidates", []) or []:
-                    if not isinstance(raw, Mapping):
-                        continue
-                    row = dict(raw)
-                    if not row.get("bridge_job_id") and len(jobs) == 1:
-                        row["bridge_job_id"] = next(iter(jobs))
-                    job = jobs.get(str(row.get("bridge_job_id") or ""))
-                    if not job:
-                        row["_candidate_disposition"] = "parked_contract_failure"
-                        candidates.append(row)
-                        continue
-                    left_source_id = str(
-                        row.get("left_source_id") or row.get("source_id") or ""
-                    )
-                    right_source_id = str(
-                        row.get("right_source_id")
-                        or row.get("target_source_id")
-                        or row.get("target_id")
-                        or ""
-                    )
-                    left_side = {
-                        str(value) for value in job.get("left_source_ids", []) or []
-                    }
-                    right_side = {
-                        str(value) for value in job.get("right_source_ids", []) or []
-                    }
-                    if not (
-                        (left_source_id in left_side and right_source_id in right_side)
-                        or (
-                            left_source_id in right_side
-                            and right_source_id in left_side
-                        )
-                    ):
-                        row["_candidate_disposition"] = "wrong_scope"
-                        candidates.append(row)
-                        continue
-                    row["discovery_route"] = "routed_cross_collection_bridge"
-                    row["discovery_job_id"] = str(job.get("bridge_job_id") or "")
-                    row["discovery_family"] = str(job.get("bridge_family") or "")
-                    row["discovery_job_quota"] = int(
-                        job.get("target_candidate_count", 24) or 24
-                    )
-                    row["requested_collection_pair"] = list(
-                        job.get("requested_collection_pair", []) or []
-                    )
-                    row["discovery_pass"] = str(
-                        page_context.get("discovery_pass") or ""
-                    )
+                right_source_id = str(
+                    row.get("right_source_id")
+                    or row.get("target_source_id")
+                    or row.get("target_id")
+                    or ""
+                )
+                if not row.get("bridge_job_id"):
+                    matching_job_ids = []
+                    for candidate_job_id, candidate_job in jobs.items():
+                        candidate_left = {
+                            str(value)
+                            for value in candidate_job.get("left_source_ids", []) or []
+                        }
+                        candidate_right = {
+                            str(value)
+                            for value in candidate_job.get("right_source_ids", []) or []
+                        }
+                        if (
+                            left_source_id in candidate_left
+                            and right_source_id in candidate_right
+                        ) or (
+                            left_source_id in candidate_right
+                            and right_source_id in candidate_left
+                        ):
+                            matching_job_ids.append(candidate_job_id)
+                    if len(matching_job_ids) == 1:
+                        row["bridge_job_id"] = matching_job_ids[0]
+                job = jobs.get(str(row.get("bridge_job_id") or ""))
+                if not job:
+                    row["_candidate_disposition"] = "parked_contract_failure"
                     candidates.append(row)
-                response = {**dict(response), "candidates": candidates}
-            results.append((page_key, response))
-            page_pairs = {
-                canonical_pair(
-                    str(row.get("left_source_id") or row.get("source_id") or ""),
-                    str(
-                        row.get("right_source_id")
-                        or row.get("target_source_id")
-                        or row.get("target_id")
-                        or ""
-                    ),
+                    continue
+                left_side = {
+                    str(value) for value in job.get("left_source_ids", []) or []
+                }
+                right_side = {
+                    str(value) for value in job.get("right_source_ids", []) or []
+                }
+                if not (
+                    (left_source_id in left_side and right_source_id in right_side)
+                    or (
+                        left_source_id in right_side
+                        and right_source_id in left_side
+                    )
+                ):
+                    row["_candidate_disposition"] = "wrong_scope"
+                    candidates.append(row)
+                    continue
+                row["discovery_route"] = "routed_cross_collection_bridge"
+                row["discovery_job_id"] = str(job.get("bridge_job_id") or "")
+                row["discovery_family"] = str(job.get("bridge_family") or "")
+                row["discovery_job_quota"] = int(
+                    job.get("target_candidate_count", 24) or 24
                 )
-                for row in response.get("candidates", []) or []
-                if isinstance(row, Mapping)
-                and not row.get("_candidate_disposition")
-            }
-            new_pairs = page_pairs - seen_pairs
-            seen_pairs.update(page_pairs)
-            active_job_ids = {
-                job_id for job_id, status in outcomes.items() if status == "completed"
-            }
-            continue_jobless = bool(
-                not jobs and built_in_deepseek and new_pairs
-            )
-            if not new_pairs or (not active_job_ids and not continue_jobless):
-                break
-            page += 1
-            page_key = f"{key}--continuation-{page}"
-            page_context = {
-                **page_context,
-                "bridge_jobs": [
-                    row
-                    for row in page_context.get("bridge_jobs", []) or []
-                    if isinstance(row, Mapping)
-                    and str(row.get("bridge_job_id") or "") in active_job_ids
-                ],
-                "prior_candidate_pairs": [list(pair) for pair in sorted(seen_pairs)],
-                "excluded_candidate_pairs": [
-                    list(pair) for pair in sorted(seen_pairs)
-                ],
-                "discovery_page": page,
-            }
-        return pool, results, None
+                row["requested_collection_pair"] = list(
+                    job.get("requested_collection_pair", []) or []
+                )
+                row["discovery_pass"] = str(
+                    task_context.get("discovery_pass") or ""
+                )
+                candidates.append(row)
+            response = {**dict(response), "candidates": candidates}
+        return pool, [(key, response)], None
 
     def execute_candidate_tasks(
         tasks: Sequence[
@@ -8367,6 +8333,14 @@ def _run_relationship_reasoning(
                         accounting = discovery_job_accounting.get(job_id)
                         if accounting is None:
                             continue
+                        if any(
+                            job_id
+                            in set(response.get("_accounting_warning_job_ids", []) or [])
+                            for _page_key, response in responses
+                        ):
+                            accounting["accounting_warning"] = (
+                                "missing_or_invalid_job_outcomes"
+                            )
                         pairs = {
                             canonical_pair(
                                 str(
@@ -8714,14 +8688,21 @@ def _run_relationship_reasoning(
                     if endpoint in right_side
                 }
             )
-            if accounting.get("status") == "eligible":
-                accounting["status"] = (
-                    "completed"
-                    if int(accounting["valid_unique_candidates"])
+            if (
+                accounting.get("status") == "eligible"
+                and accounting.get("packet_status") == "completed"
+            ):
+                coverage_target_met = bool(
+                    int(accounting["valid_unique_candidates"])
                     >= int(accounting["candidate_floor"])
                     or accounting.get("explicit_no_more_candidates")
-                    else "under_covered"
                 )
+                accounting["status"] = "completed"
+                accounting["coverage_target_met"] = coverage_target_met
+                if not coverage_target_met:
+                    accounting["coverage_warning"] = (
+                        "coverage_shortfall_after_followup"
+                    )
         repaired_job_ids = {
             job_id
             for job_id, row in discovery_job_accounting.items()

@@ -12,6 +12,7 @@ from auto_zettelkasten.literature import (
 )
 from auto_zettelkasten.models import RelationshipPairJob
 from auto_zettelkasten.readers import (
+    RELATIONSHIP_CANDIDATE_MAX_OUTPUT_TOKENS,
     RELATIONSHIP_MAX_OUTPUT_TOKENS,
     ProviderError,
     _relationship_adjudication_system_prompt,
@@ -45,6 +46,8 @@ def test_relationship_discovery_uses_lean_recall_first_prompt() -> None:
     assert "evidence_anchor_ids" not in prompt
     assert "job_outcomes" in prompt
     assert "no_more_candidates" in prompt
+    assert "Neither status requests automatic continuation" in prompt
+    assert RELATIONSHIP_CANDIDATE_MAX_OUTPUT_TOKENS == 64_000
     assert RELATIONSHIP_MAX_OUTPUT_TOKENS == 128_000
 
 
