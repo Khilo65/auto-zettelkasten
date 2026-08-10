@@ -17,6 +17,7 @@ from auto_zettelkasten.literature import (
     validate_streamlined_cluster_synthesis,
 )
 from auto_zettelkasten.models import LiteratureMapRequest, LiteratureMappingPolicy
+from auto_zettelkasten.readers import ProviderTransportError
 
 
 def _profile(source_id: str) -> dict[str, Any]:
@@ -934,6 +935,12 @@ def test_stream_read_failure_is_transport() -> None:
     assert _synthesis_failure_class(RuntimeError("provider stream read failed")) == (
         "transport"
     )
+    assert _synthesis_failure_class(
+        ProviderTransportError(
+            "provider stream ended before a terminal event",
+            transport_kind="premature_stream_end",
+        )
+    ) == "transport"
 
 
 def test_empty_retry_defers_when_call_ceiling_is_exhausted(tmp_path: Path) -> None:

@@ -385,7 +385,7 @@ def test_cluster_partition_mode_uses_supplied_compact_cards(
     assert "partition the supplied compact parent cluster card" in payload[
         "instruction"
     ]
-    assert "partition policy v2" in payload["instruction"]
+    assert "partition policy v3" in payload["instruction"]
     assert "never by token size alone" in payload["instruction"]
     assert "exact member roles core, context, or bridge" in payload["instruction"]
     assert "exactly one primary child" in payload["instruction"]

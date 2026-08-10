@@ -126,6 +126,8 @@ from .profiles import (
 from .relationships import (
     canonical_pair,
     persist_relationship_registry,
+    profile_content_hash,
+    profile_hash_aliases,
     projected_related_links,
     relationship_decision_key,
     RELATIONSHIP_DECISION_CONTRACT,
@@ -6644,8 +6646,12 @@ def _run_relationship_reasoning(
         else {"entries": entries, "collection_structure": collection_structure}
     )
     current_hashes = {
-        source_id: stable_hash(profile_to_dict(profile))
+        source_id: profile_content_hash(profile)
         for source_id, profile in sorted(profile_by_source.items())
+    }
+    current_hash_aliases = {
+        source_id: set(profile_hash_aliases(profile))
+        for source_id, profile in profile_by_source.items()
     }
     registry = read_yaml(
         workspace / "02_source_memory" / "indexes" / "typed_links.yml", {}
@@ -6950,7 +6956,7 @@ def _run_relationship_reasoning(
         input_hashes = dict(row.get("input_profile_hashes", {}) or {})
         fresh = all(
             str(input_hashes.get(source_id) or "")
-            == str(current_hashes.get(source_id) or "")
+            in current_hash_aliases.get(source_id, set())
             for source_id in pair
         ) and str(row.get("provider") or "") == relationship_provider and str(
             row.get("model") or ""
@@ -7028,7 +7034,7 @@ def _run_relationship_reasoning(
             )
             if any(
                 str(current_input_hashes.get(source_id) or "")
-                != current_hashes[source_id]
+                not in current_hash_aliases[source_id]
                 for source_id in pair
             ):
                 continue
@@ -7047,31 +7053,39 @@ def _run_relationship_reasoning(
             for source_id in pair
         ):
             continue
-        expected_key = relationship_decision_key(
-            pair[0],
-            pair[1],
-            current_hashes[pair[0]],
-            current_hashes[pair[1]],
-            provider=relationship_provider,
-            model=relationship_model,
-            prompt_version=RELATIONSHIP_PROMPT_VERSION,
-            policy_identity=relationship_policy_identity,
-        )
-        matches_current = str(row.get("decision_key") or "") == expected_key
+        current_keys = {
+            relationship_decision_key(
+                pair[0],
+                pair[1],
+                source_hash,
+                target_hash,
+                provider=relationship_provider,
+                model=relationship_model,
+                prompt_version=RELATIONSHIP_PROMPT_VERSION,
+                policy_identity=relationship_policy_identity,
+            )
+            for source_hash in current_hash_aliases[pair[0]]
+            for target_hash in current_hash_aliases[pair[1]]
+        }
+        matches_current = str(row.get("decision_key") or "") in current_keys
         matches_legacy_default = bool(
             not row.get("relationship_policy_identity")
             and relationship_policy_identity
             == stable_hash(LiteratureMappingPolicy().to_dict())
             and str(row.get("decision_key") or "")
-            == relationship_decision_key(
-                pair[0],
-                pair[1],
-                current_hashes[pair[0]],
-                current_hashes[pair[1]],
-                provider=relationship_provider,
-                model=relationship_model,
-                prompt_version=RELATIONSHIP_PROMPT_VERSION,
-            )
+            in {
+                relationship_decision_key(
+                    pair[0],
+                    pair[1],
+                    source_hash,
+                    target_hash,
+                    provider=relationship_provider,
+                    model=relationship_model,
+                    prompt_version=RELATIONSHIP_PROMPT_VERSION,
+                )
+                for source_hash in current_hash_aliases[pair[0]]
+                for target_hash in current_hash_aliases[pair[1]]
+            }
         )
         if matches_current or matches_legacy_default:
             negative_pairs.add(pair)

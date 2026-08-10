@@ -859,7 +859,7 @@ class _CapabilityAwareReader:
         mode = str((context or {}).get("cluster_plan_mode") or "collection")
         if mode == "partition":
             instruction = (
-                "Under partition policy v2, partition the supplied compact parent "
+                "Under partition policy v3, partition the supplied compact parent "
                 "cluster card and compact "
                 "member cards into smaller coherent child clusters. Treat the "
                 "parent card as the scope and the member cards as the complete "
@@ -5208,7 +5208,7 @@ def _read_openai_stream_response(
     if not saw_terminal:
         error = ProviderTransportError(
             "provider stream ended before a terminal event",
-            transport_kind="premature_eof",
+            transport_kind="premature_stream_end",
         )
         _preserve_provider_failure(
             error, _ProviderText(visible_content, stream_diagnostics)

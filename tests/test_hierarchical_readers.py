@@ -20,6 +20,7 @@ from auto_zettelkasten.readers import (
     OpenRouterReader,
     ProviderEmptyResponse,
     ProviderError,
+    ProviderTransportError,
     _post_json,
     _read_openai_stream_response,
 )
@@ -502,6 +503,88 @@ def test_deepseek_empty_stream_preserves_diagnostics_without_reasoning(
     assert len(completion["stream_sha256"]) == 64
     assert len(completion["content_sha256"]) == 64
     assert "private reasoning" not in json.dumps(completion)
+
+
+def test_reasoning_only_stream_without_terminal_event_is_retryable_transport_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "auto_zettelkasten.readers.urllib.request.urlopen",
+        lambda request, timeout: _SseResponse(
+            [
+                {
+                    "id": "response-interrupted",
+                    "model": "deepseek-v4-flash",
+                    "choices": [
+                        {
+                            "delta": {
+                                "reasoning_content": "private reasoning",
+                                "content": "",
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+            ]
+        ),
+    )
+
+    with pytest.raises(ProviderTransportError) as raised:
+        DeepSeekReader(allow_cloud=True).read_source(
+            "source text", {"title": "Study"}
+        )
+
+    assert raised.value.transport_kind == "premature_stream_end"
+    assert raised.value.retryable is True
+    assert raised.value.retry_on_resume is True
+    assert raised.value.raw_response == ""
+    completion = raised.value.provider_completion
+    assert completion["response_id"] == "response-interrupted"
+    assert completion["finish_reason"] == ""
+    assert completion["event_count"] == 1
+    assert completion["content_fragment_count"] == 0
+    assert completion["content_characters"] == 0
+    assert completion["reasoning_fragment_count"] == 1
+    assert completion["response_bytes"] > 0
+    assert "private reasoning" not in json.dumps(completion)
+
+
+def test_reasoning_only_stream_with_done_envelope_is_completed_empty_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "auto_zettelkasten.readers.urllib.request.urlopen",
+        lambda request, timeout: _SseResponse(
+            [
+                {
+                    "id": "response-complete",
+                    "model": "deepseek-v4-flash",
+                    "choices": [
+                        {
+                            "delta": {"reasoning_content": "private reasoning"},
+                            "finish_reason": None,
+                        }
+                    ],
+                },
+                "[DONE]",
+            ]
+        ),
+    )
+
+    with pytest.raises(ProviderEmptyResponse) as raised:
+        DeepSeekReader(allow_cloud=True).read_source(
+            "source text", {"title": "Study"}
+        )
+
+    assert raised.value.raw_response == ""
+    completion = raised.value.provider_completion
+    assert completion["response_id"] == "response-complete"
+    assert completion["finish_reason"] == ""
+    assert completion["reasoning_fragment_count"] == 1
+    assert completion["content_characters"] == 0
+    assert "transport_kind" not in completion
 
 
 def test_deepseek_malformed_stream_event_preserves_bounded_transport_excerpt(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -3463,6 +3464,9 @@ def test_current_negative_pairs_reach_initial_shared_packets_and_replay(
         profile.source_id: stable_hash(profile_to_dict(profile))
         for profile in profiles
     }
+    legacy_profile_hashes = {
+        profile.source_id: stable_hash(asdict(profile)) for profile in profiles
+    }
     write_yaml(
         tmp_path / "02_source_memory" / "indexes" / "typed_links.yml",
         {
@@ -3471,8 +3475,8 @@ def test_current_negative_pairs_reach_initial_shared_packets_and_replay(
                     "decision_key": relationship_decision_key(
                         "A",
                         "B",
-                        profile_hashes["A"],
-                        profile_hashes["B"],
+                        legacy_profile_hashes["A"],
+                        legacy_profile_hashes["B"],
                         provider="test-provider",
                         model="test-model",
                         policy_identity=relationship_policy_identity,
@@ -3482,6 +3486,11 @@ def test_current_negative_pairs_reach_initial_shared_packets_and_replay(
                     "target_source_id": "B",
                     "status": "no_relationship",
                     "relationship_policy_identity": relationship_policy_identity,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "prompt_version": pipeline_module.RELATIONSHIP_PROMPT_VERSION,
+                    "source_profile_hash": legacy_profile_hashes["A"],
+                    "target_profile_hash": legacy_profile_hashes["B"],
                 }
             ],
             "current_pair_decisions": [
@@ -3493,8 +3502,8 @@ def test_current_negative_pairs_reach_initial_shared_packets_and_replay(
                     "provider": "test-provider",
                     "model": "test-model",
                     "input_profile_hashes": {
-                        "A": profile_hashes["A"],
-                        "B": profile_hashes["B"],
+                        "A": legacy_profile_hashes["A"],
+                        "B": legacy_profile_hashes["B"],
                     },
                     "active": True,
                 }
@@ -3610,6 +3619,9 @@ def test_current_negative_pairs_reach_initial_shared_packets_and_replay(
         if stage.endswith("candidate_selection")
     } == {"broad", "complement", "breadth_completion"}
     assert result["pair_job_count"] == 3
+    registry_bytes = (
+        tmp_path / "02_source_memory" / "indexes" / "typed_links.yml"
+    ).read_bytes()
     _commit_relationship_selection_state(
         tmp_path,
         result,
@@ -3628,6 +3640,83 @@ def test_current_negative_pairs_reach_initial_shared_packets_and_replay(
     )
     assert replay_calls.seen == []
     assert replay["semantic_noop"] is True
+    assert (
+        tmp_path / "02_source_memory" / "indexes" / "typed_links.yml"
+    ).read_bytes() == registry_bytes
+
+
+def test_changed_endpoint_does_not_reuse_legacy_negative_hashes(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile("A"), _profile("B")]
+    relationship_policy_identity = stable_hash(
+        {"relationship_semantic_policy": "source-owned-bases-v26"}
+    )
+    legacy_hashes = {
+        profile.source_id: stable_hash(asdict(profile)) for profile in profiles
+    }
+    profiles[0].context["thesis"] = "Materially changed endpoint evidence."
+    write_yaml(
+        tmp_path / "02_source_memory" / "indexes" / "typed_links.yml",
+        {
+            "pair_decisions": [
+                {
+                    "decision_key": relationship_decision_key(
+                        "A",
+                        "B",
+                        legacy_hashes["A"],
+                        legacy_hashes["B"],
+                        provider="test-provider",
+                        model="test-model",
+                        policy_identity=relationship_policy_identity,
+                    ),
+                    "pair_job_id": "negative-a-b",
+                    "source_id": "A",
+                    "target_source_id": "B",
+                    "status": "no_relationship",
+                    "relationship_policy_identity": relationship_policy_identity,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "prompt_version": pipeline_module.RELATIONSHIP_PROMPT_VERSION,
+                    "source_profile_hash": legacy_hashes["A"],
+                    "target_profile_hash": legacy_hashes["B"],
+                }
+            ],
+            "current_pair_decisions": [
+                {
+                    "source_ids": ["A", "B"],
+                    "status": "no_relationship",
+                    "pair_job_id": "negative-a-b",
+                    "prompt_version": pipeline_module.RELATIONSHIP_PROMPT_VERSION,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "input_profile_hashes": legacy_hashes,
+                    "active": True,
+                }
+            ],
+        },
+    )
+
+    def handler(
+        stage: str,
+        _profiles: Sequence[Any],
+        context: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if stage == "relationship_candidate_selection":
+            assert context["prior_negative_pairs"] == []
+            assert context["excluded_candidate_pairs"] == []
+            return {"candidates": [_candidate("A", "B")]}
+        return {"decisions": [_decision(context["pair_jobs"][0])]}
+
+    result = _run(tmp_path, profiles, _Calls(handler))
+
+    assert result["pair_job_count"] == 1
+    stored = read_yaml(
+        tmp_path / "02_source_memory" / "indexes" / "typed_links.yml", {}
+    )
+    assert stored["current_pair_decisions"][0]["input_profile_hashes"] == (
+        legacy_hashes
+    )
 
 
 def test_changed_relationship_prompt_reconsiders_current_negative(
@@ -3742,9 +3831,7 @@ def test_only_active_current_relationship_satisfies_a_discovered_pair(
                         "provider": "test-provider",
                         "model": "test-model",
                         "input_profile_hashes": {
-                            profile.source_id: stable_hash(
-                                profile_to_dict(profile)
-                            )
+                            profile.source_id: stable_hash(asdict(profile))
                             for profile in profiles
                         },
                     }

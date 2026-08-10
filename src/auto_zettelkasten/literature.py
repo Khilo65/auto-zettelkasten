@@ -86,7 +86,7 @@ LITERATURE_FAMILY_PLAN_PROMPT_VERSION = "10"
 CLUSTER_PLAN_PROMPT_VERSION = "6"
 CLUSTER_PROPOSAL_PROMPT_VERSION = "17"
 CLUSTER_SYNTHESIS_PROMPT_VERSION = "35"
-CLUSTER_PARTITION_POLICY_VERSION = "2"
+CLUSTER_PARTITION_POLICY_VERSION = "3"
 CLUSTER_VALIDATION_POLICY_VERSION = "1"
 CLUSTER_EMPTY_RETRY_POLICY_VERSION = "1"
 GAP_REASONING_PROMPT_VERSION = "12"
@@ -1653,7 +1653,9 @@ class _CheckpointedReasonerCalls:
             matching_checkpoint.get("response"), Mapping
         ):
             validated_checkpoint_response = _revalidate_raw_synthesis_response(
-                stage, matching_checkpoint["response"]
+                stage,
+                matching_checkpoint["response"],
+                context=enriched_context,
             )
             if validated_checkpoint_response is None:
                 matching_checkpoint = None
@@ -1711,7 +1713,9 @@ class _CheckpointedReasonerCalls:
             if not isinstance(prior_response, Mapping):
                 continue
             recovered_response = _revalidate_raw_synthesis_response(
-                stage, prior_response
+                stage,
+                prior_response,
+                context=enriched_context,
             )
             if recovered_response is None:
                 continue
@@ -1757,6 +1761,7 @@ class _CheckpointedReasonerCalls:
             recovered_response = _revalidate_raw_synthesis_response(
                 stage,
                 failed_checkpoint["raw_response"],
+                context=enriched_context,
             )
             recovery_metadata: Mapping[str, Any] | None = None
             completion = failed_checkpoint.get("provider_completion", {})
@@ -2095,7 +2100,11 @@ class _CheckpointedReasonerCalls:
 
             provider_completion = current_literature_completion()
             raw_response_for_failure = dict(response)
-            validated_response = _revalidate_raw_synthesis_response(stage, response)
+            validated_response = _revalidate_raw_synthesis_response(
+                stage,
+                response,
+                context=enriched_context,
+            )
             if validated_response is None:
                 raise ValueError(
                     f"{method_name} returned an invalid {stage} contract"
@@ -2467,11 +2476,13 @@ def _notify_stage(
 def _synthesis_failure_class(exc: BaseException) -> str:
     """Classify retry safety without coupling checkpoints to one provider."""
 
-    from .readers import CloudPermissionError
+    from .readers import CloudPermissionError, ProviderTransportError
 
     message = str(exc).casefold()
     if _is_provider_empty_response(exc):
         return "provider_empty_response"
+    if isinstance(exc, ProviderTransportError):
+        return "transport"
     if isinstance(exc, CloudPermissionError) or any(
         marker in message
         for marker in (
@@ -2766,6 +2777,8 @@ def _validate_literature_family_plan_response(
 def _revalidate_raw_synthesis_response(
     stage: str,
     raw_response: Any,
+    *,
+    context: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     try:
         if isinstance(raw_response, Mapping):
@@ -2813,10 +2826,23 @@ def _revalidate_raw_synthesis_response(
         return None
     # Keep provider transport independent from the collection mapper while
     # allowing a paid response to survive a local schema-adapter repair.
-    from .readers import _validate_literature_response
+    from .readers import (
+        _validate_literature_response,
+        _validate_partition_cluster_plan,
+    )
 
     try:
-        return _validate_literature_response(payload, kind=kind)
+        validated = _validate_literature_response(payload, kind=kind)
+        if (
+            stage == "cluster_plan"
+            and str(_as_mapping(context).get("cluster_plan_mode") or "")
+            == "partition"
+        ):
+            validated = _validate_partition_cluster_plan(
+                validated,
+                context=context,
+            )
+        return validated
     except (TypeError, ValueError, RuntimeError):
         return None
 
@@ -21100,6 +21126,11 @@ def build_literature_report(
             if len(work_ids) == 1 and len(member_ids) > 1
             else "multi_work"
         )
+        if cluster["synthesis_lineage"] == "single_work_multi_component":
+            cluster["qualification_status"] = "evidence_concentrated_cluster"
+            cluster["source_backed"] = False
+            if bool(cluster.get("promoted")):
+                cluster["status"] = "evidence_concentrated_cluster"
 
     def partition_child(
         parent: Mapping[str, Any], raw_child: Mapping[str, Any], child_ids: list[str]

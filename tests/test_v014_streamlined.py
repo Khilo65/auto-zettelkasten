@@ -400,6 +400,140 @@ def test_oversized_cluster_is_partitioned_before_writers(tmp_path: Path) -> None
     } == {"D"}
 
 
+def test_partition_checkpoint_revalidation_rejects_old_free_text_roles(
+    tmp_path: Path,
+) -> None:
+    valid_response = {
+        "clusters": [
+            {
+                "cluster_id": "left",
+                "title": "Left child",
+                "organizing_problem": "Left bounded problem",
+                "coherence_rationale": "A and B address the left problem.",
+                "members": [
+                    {
+                        "source_id": "A",
+                        "role": "core",
+                        "membership_reason": "Direct evidence.",
+                    },
+                    {
+                        "source_id": "B",
+                        "role": "context",
+                        "membership_reason": "Boundary evidence.",
+                    },
+                ],
+            },
+            {
+                "cluster_id": "right",
+                "title": "Right child",
+                "organizing_problem": "Right bounded problem",
+                "coherence_rationale": "C and D address the right problem.",
+                "members": [
+                    {
+                        "source_id": "C",
+                        "role": "core",
+                        "membership_reason": "Direct evidence.",
+                    },
+                    {
+                        "source_id": "D",
+                        "role": "context",
+                        "membership_reason": "Boundary evidence.",
+                    },
+                ],
+            },
+        ],
+        "neighbor_relationships": [],
+        "unclustered_sources": [],
+    }
+    old_response = {
+        **valid_response,
+        "clusters": [
+            {
+                "cluster_id": "left",
+                "title": "Left child",
+                "organizing_problem": "Left bounded problem",
+                "coherence_rationale": "A and B address the left problem.",
+                "members": [
+                    {
+                        "source_id": "A",
+                        "role": "core theoretical model",
+                        "membership_reason": "Direct evidence.",
+                    },
+                    {
+                        "source_id": "B",
+                        "role": "bridge source",
+                        "membership_reason": "Cross-child evidence.",
+                    },
+                ],
+            },
+            valid_response["clusters"][1],
+        ],
+    }
+    context = {
+        "cluster_plan_mode": "partition",
+        "compact_parent_cluster": {
+            "cluster_id": "parent",
+            "source_ids": ["A", "B", "C", "D"],
+        },
+        "compact_member_cards": [
+            {"source_id": source_id} for source_id in ("A", "B", "C", "D")
+        ],
+    }
+
+    class Reasoner:
+        name = "local"
+        model = "test"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def plan_clusters(self, profiles, request, *, context=None):
+            del profiles, request, context
+            self.calls += 1
+            return valid_response
+
+    reasoner = Reasoner()
+    request = LiteratureMapRequest(tmp_path)
+    calls = _CheckpointedReasonerCalls(tmp_path, "partition-run", reasoner, request)
+    validated_response = calls(
+        "cluster_plan", "partition-parent", "plan_clusters", [], context
+    )
+    assert [
+        member["role"]
+        for cluster in validated_response["clusters"]
+        for member in cluster["members"]
+    ] == ["core", "context", "core", "context"]
+
+    checkpoint_path = (
+        tmp_path
+        / "11_state"
+        / "runs"
+        / "partition-run"
+        / "literature"
+        / "synthesis"
+        / "cluster_plan"
+        / "partition-parent.yml"
+    )
+    checkpoint = read_yaml(checkpoint_path)
+    checkpoint["fingerprint"] = "old-partition-policy"
+    checkpoint["response"] = old_response
+    write_yaml(checkpoint_path, checkpoint)
+    for path in (tmp_path / "11_state" / "semantic_jobs").rglob("*.yml"):
+        path.unlink()
+
+    reasoner.calls = 0
+    replay = _CheckpointedReasonerCalls(
+        tmp_path, "partition-run", reasoner, request
+    )
+    assert replay(
+        "cluster_plan", "partition-parent", "plan_clusters", [], context
+    ) == validated_response
+    assert reasoner.calls == 1
+    refreshed = read_yaml(checkpoint_path)
+    assert "revalidated_from_provider_input_fingerprint" not in refreshed
+    assert refreshed["response"] == validated_response
+
+
 def test_nonshrinking_partition_never_reaches_cluster_writer(tmp_path: Path) -> None:
     profiles = [_profile(source_id) for source_id in ("A", "B", "C", "D")]
     writer_called = False
@@ -575,12 +709,19 @@ def test_partition_replacement_waits_for_every_child_writer(tmp_path: Path) -> N
 
 
 def test_book_chapters_count_as_one_canonical_work(tmp_path: Path) -> None:
-    profiles = [_profile("A"), _profile("B")]
+    profiles = [_profile("A"), _profile("B"), _profile("C")]
     for index, profile in enumerate(profiles, start=1):
         profile["source_role"] = "Academic book chapter"
         profile["study_family_id"] = (
             f"doi:10.1017/cbo9780511490866.00{index}"
         )
+        profile["evidence_base_counted"] = True
+        profile["evidence_base_group_id"] = f"chapter-{index}"
+        profile["study_lineage"] = {
+            "counted_as_independent": True,
+            "evidence_base_group_id": f"chapter-{index}",
+            "group_basis": "study_family",
+        }
 
     class Reasoner:
         name = "local"
@@ -614,8 +755,8 @@ def test_book_chapters_count_as_one_canonical_work(tmp_path: Path) -> None:
                 {
                     "family_id": "one-book",
                     "label": "One book",
-                    "source_ids": ["A", "B"],
-                    "proposed_roles": {"A": "core", "B": "core"},
+                    "source_ids": ["A", "B", "C"],
+                    "proposed_roles": {"A": "core", "B": "core", "C": "core"},
                     "candidate_cluster": True,
                 }
             ],
@@ -626,7 +767,10 @@ def test_book_chapters_count_as_one_canonical_work(tmp_path: Path) -> None:
 
     cluster = report["cluster_registry"]["clusters"][0]
     assert cluster["canonical_work_count"] == 1
-    assert cluster["independent_study_family_count"] <= 1
+    assert cluster["independent_study_family_count"] == 1
+    assert cluster["qualification_status"] == "evidence_concentrated_cluster"
+    assert cluster["status"] == "evidence_concentrated_cluster"
+    assert cluster["source_backed"] is False
 
 
 def test_partition_neighbors_merge_reciprocal_source_owned_evidence() -> None:

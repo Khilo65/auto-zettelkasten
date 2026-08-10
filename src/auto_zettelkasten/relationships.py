@@ -104,18 +104,30 @@ def stable_hash(value: Any) -> str:
 def profile_row(value: Any) -> dict[str, Any]:
     if isinstance(value, Mapping):
         return dict(value)
-    if is_dataclass(value):
-        return dict(asdict(value))
     to_dict = getattr(value, "to_dict", None)
     if callable(to_dict):
         result = to_dict()
         if isinstance(result, Mapping):
             return dict(result)
+    if is_dataclass(value):
+        return dict(asdict(value))
     raise ValueError("relationship profiles must be mappings or dataclass models")
 
 
 def profile_content_hash(value: Any) -> str:
     return stable_hash(profile_row(value))
+
+
+def profile_hash_aliases(value: Any) -> tuple[str, ...]:
+    """Return the canonical hash and any safe legacy hash for one profile."""
+
+    canonical = profile_content_hash(value)
+    aliases = [canonical]
+    if is_dataclass(value):
+        legacy = stable_hash(asdict(value))
+        if legacy != canonical:
+            aliases.append(legacy)
+    return tuple(aliases)
 
 
 def relationship_decision_key(
