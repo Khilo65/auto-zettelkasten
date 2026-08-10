@@ -35,7 +35,7 @@ def test_graph_estimate_does_not_treat_zero_validated_count_as_empty(
     result = estimate_cost(tmp_path, graph_only=True)
 
     assert result["new_source_jobs"] == 0
-    assert result["graph_calls"]["expected"] == 138
+    assert result["graph_calls"]["expected"] == 121
     assert result["graph_calls"]["high"] >= 107
     assert result["graph_cost_usd"]["high_usd"] >= 3.55
     assert result["graph_estimate_provenance"]["planning_profile_count"] == 425
@@ -69,6 +69,6 @@ def test_incremental_estimate_prices_delta_and_bounded_neighborhood(
         "expected": 125,
         "high": 450,
     }
-    assert result["graph_calls"]["expected"] == 42
+    assert result["graph_calls"]["expected"] == 37
     assert result["source_cost_usd"]["expected_usd"] == 0
     assert result["provider_calls"] == 0

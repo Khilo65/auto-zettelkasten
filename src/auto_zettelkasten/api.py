@@ -519,19 +519,22 @@ def estimate_cost(
         "family_planning": stage_calls(
             planning_profile_count, (180, 125, 80)
         ),
-        "direct_discovery": stage_calls(graph_profile_counts, (300, 120, 70)),
+        "direct_discovery": {
+            bound: 0 if graph_profile_counts[bound] < 2 else 1
+            for bound in ("low", "expected", "high")
+        },
         "complementary_discovery": stage_calls(
-            graph_profile_counts, (40, 25, 18)
+            graph_profile_counts, (300, 175, 90)
         ),
         "relationship_adjudication": relationship_calls,
         "cluster_synthesis": cluster_calls,
     }
     input_multipliers = {
-        "family_planning": (0.8, 2.0, 4.0),
-        "direct_discovery": (0.25, 1.0, 2.0),
-        "complementary_discovery": (1.5, 4.0, 8.0),
-        "relationship_adjudication": (1.5, 4.0, 6.0),
-        "cluster_synthesis": (0.5, 1.5, 3.0),
+        "family_planning": (0.04, 0.08, 0.2),
+        "direct_discovery": (0.03, 0.05, 0.1),
+        "complementary_discovery": (0.05, 0.15, 0.4),
+        "relationship_adjudication": (5.0, 14.0, 24.0),
+        "cluster_synthesis": (1.0, 4.0, 8.0),
     }
     output_tokens_per_call = {
         "family_planning": (3_000, 6_000, 12_000),
@@ -628,7 +631,7 @@ def estimate_cost(
             "compact_profile_tokens": compact_input_tokens,
             "complete_note_tokens": note_input_tokens,
             "token_estimator": "measured_utf8_bytes_divided_by_four",
-            "call_basis": "packed_v029_graph_stage_envelopes",
+            "call_basis": "packed_v0295_single-response_discovery_envelopes",
             "planning_profile_count": planning_profile_count,
             "graph_neighborhood_profile_count": graph_profile_count,
             "graph_neighborhood_profile_counts": graph_profile_counts,
