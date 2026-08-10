@@ -5,9 +5,11 @@ from typing import Any
 
 from auto_zettelkasten.files import read_yaml, write_yaml
 from auto_zettelkasten.relationships import (
+    RELATIONSHIP_DECISION_CONTRACT,
     candidate_rows,
     persist_relationship_registry,
     projected_related_links,
+    stable_hash,
     validate_decisions,
     validate_verifications,
 )
@@ -241,6 +243,130 @@ def test_registry_is_idempotent_preserves_substance_and_repairs_compatibility(
     )
     assert repaired["revision_hash"] == refreshed["revision_hash"]
     assert read_yaml(compatibility) == read_yaml(registry)
+
+
+def test_registry_normalizes_stale_historical_pair_decisions_on_replay(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile(source_id) for source_id in "ABCDEFGH"]
+    initial = _verified_relations(
+        validate_decisions(
+            {
+                "decisions": [
+                    _decision("A", "B"),
+                    _decision("C", "D"),
+                ]
+            },
+            offered_pairs=[("A", "B"), ("C", "D")],
+            profiles=profiles,
+        )["accepted"],
+        profiles,
+    )
+    initial[0]["connection_id"] = "connection-initial-a-b"
+    initial[1]["connection_id"] = "connection-initial-c-d"
+    persist_relationship_registry(
+        tmp_path,
+        structural_relations=[],
+        accepted_relations=initial,
+    )
+    replacement = _verified_relations(
+        validate_decisions(
+            {
+                "decisions": [
+                    _decision("A", "B", relation_type="qualifies")
+                ]
+            },
+            offered_pairs=[("A", "B")],
+            profiles=profiles,
+        )["accepted"],
+        profiles,
+    )[0]
+    replacement["connection_id"] = "connection-replacement-a-b"
+    retired = initial[1]
+    no_relationship = {
+        "pair_job_id": "job-c-d",
+        "source_id": "C",
+        "target_source_id": "D",
+        "source_profile_hash": retired["source_profile_hash"],
+        "target_profile_hash": retired["target_profile_hash"],
+        "verification_status": "no_relationship",
+        "provider": "test-provider",
+        "model": "test-model",
+        "prompt_version": retired["prompt_version"],
+        "output_contract": RELATIONSHIP_DECISION_CONTRACT,
+    }
+    human = {
+        "relation_id": "human-e-f",
+        "source_id": "E",
+        "target_source_id": "F",
+        "relation_type": "supports",
+        "provenance": "human_authored",
+        "active": True,
+    }
+    structural = {
+        "relation_id": "citation-g-h",
+        "source_id": "G",
+        "target_source_id": "H",
+        "relation_type": "cites",
+        "provenance": "explicit_citation",
+        "active": True,
+    }
+    reconciled = persist_relationship_registry(
+        tmp_path,
+        structural_relations=[structural],
+        accepted_relations=[replacement, human],
+        no_relationship_decisions=[no_relationship],
+    )
+    registry = Path(reconciled["path"])
+    compatibility = Path(reconciled["compatibility_path"])
+    payload = read_yaml(registry)
+    for decision in payload["pair_decisions"]:
+        decision["active"] = True
+    payload["revision_hash"] = stable_hash(
+        {
+            key: payload[key]
+            for key in (
+                "registry_schema_version",
+                "relations",
+                "links",
+                "pair_decisions",
+                "current_pair_decisions",
+                "events",
+                "parked",
+            )
+        }
+    )
+    write_yaml(registry, payload)
+    write_yaml(compatibility, payload)
+
+    normalized = persist_relationship_registry(
+        tmp_path,
+        structural_relations=[structural],
+    )
+    decisions = {
+        row.get("relation_id") or row["status"]: row
+        for row in normalized["pair_decisions"]
+    }
+    assert decisions[initial[0]["relation_id"]]["active"] is False
+    assert decisions[replacement["relation_id"]]["active"] is True
+    assert decisions[retired["relation_id"]]["active"] is False
+    assert decisions["no_relationship"]["active"] is True
+    assert normalized["current_pair_decisions"] == reconciled[
+        "current_pair_decisions"
+    ]
+    assert normalized["links"] == reconciled["links"]
+    relations = {row["relation_id"]: row for row in normalized["relations"]}
+    assert relations[replacement["relation_id"]]["active"] is True
+    assert relations["human-e-f"]["active"] is True
+    assert relations["citation-g-h"]["active"] is True
+
+    original = registry.read_bytes()
+    replay = persist_relationship_registry(
+        tmp_path,
+        structural_relations=[structural],
+    )
+    assert replay["revision_hash"] == normalized["revision_hash"]
+    assert registry.read_bytes() == original
 
 
 def test_registry_keeps_stale_machine_prompt_edges_pending_until_readjudicated(

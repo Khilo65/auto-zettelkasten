@@ -86,7 +86,7 @@ LITERATURE_FAMILY_PLAN_PROMPT_VERSION = "10"
 CLUSTER_PLAN_PROMPT_VERSION = "6"
 CLUSTER_PROPOSAL_PROMPT_VERSION = "17"
 CLUSTER_SYNTHESIS_PROMPT_VERSION = "35"
-CLUSTER_PARTITION_POLICY_VERSION = "1"
+CLUSTER_PARTITION_POLICY_VERSION = "2"
 CLUSTER_VALIDATION_POLICY_VERSION = "1"
 CLUSTER_EMPTY_RETRY_POLICY_VERSION = "1"
 GAP_REASONING_PROMPT_VERSION = "12"
@@ -11302,8 +11302,14 @@ def validate_streamlined_cluster_synthesis(
 
     # Group aliases only in the human-facing projection. Candidate-level ledger
     # accounting remains intact for traceability.
-    grouped: dict[tuple[str, ...], dict[str, Any]] = {}
-    priority_keys: set[tuple[str, ...]] = set()
+    projection_rows: list[
+        tuple[
+            bool,
+            dict[str, Any],
+            tuple[str, ...],
+            tuple[str, str, tuple[str, ...]],
+        ]
+    ] = []
     for priority, row in [
         *((True, value) for value in important_cited_works),
         *((False, value) for value in secondary_cited_works),
@@ -11317,10 +11323,16 @@ def validate_streamlined_cluster_synthesis(
             if str(value).strip()
         }
         normalized = _as_mapping(row.get("normalized_citation"))
+        raw_title = re.sub(
+            r"\(\s*as cited in (?:the )?source\s*\)",
+            " ",
+            str(normalized.get("title") or ""),
+            flags=re.I,
+        )
         title = re.sub(
             r"[^a-z0-9]+",
             " ",
-            str(normalized.get("title") or "").casefold(),
+            raw_title.casefold(),
         ).strip()
         author = re.sub(
             r"[^a-z0-9]+",
@@ -11338,30 +11350,74 @@ def validate_streamlined_cluster_synthesis(
             key = ("title_author_year", title, author, year)
         else:
             key = ("external", external_id)
+        projection_rows.append(
+            (priority, dict(row), key, (author, year, tuple(title.split())))
+        )
+
+    mapped_aliases = {
+        key: bibliography
+        for _priority, row, key, bibliography in projection_rows
+        if row.get("action") == "map_existing"
+    }
+
+    def mapped_alias_key(
+        key: tuple[str, ...],
+        bibliography: tuple[str, str, tuple[str, ...]],
+    ) -> tuple[str, ...]:
+        author, year, title_tokens = bibliography
+        if not author or not year or len(title_tokens) < 4:
+            return key
+        # Reconcile only one unambiguous bibliographic prefix with a known
+        # Zotero identity; candidate-level records remain separate below.
+        matches = set()
+        for mapped_key, (mapped_author, mapped_year, mapped_title) in (
+            mapped_aliases.items()
+        ):
+            if author != mapped_author or year != mapped_year:
+                continue
+            shorter, longer = sorted(
+                (title_tokens, mapped_title), key=lambda value: len(value)
+            )
+            if len(shorter) >= 4 and longer[: len(shorter)] == shorter:
+                matches.add(mapped_key)
+        return next(iter(matches)) if len(matches) == 1 else key
+
+    grouped: dict[tuple[str, ...], dict[str, Any]] = {}
+    priority_keys: set[tuple[str, ...]] = set()
+    for priority, row, key, bibliography in projection_rows:
+        key = mapped_alias_key(key, bibliography)
         if priority:
             priority_keys.add(key)
         existing = grouped.get(key)
         if existing is None:
             grouped[key] = dict(row)
             continue
-        existing["action"] = (
+        mapped_row = row if row.get("action") == "map_existing" else existing
+        other_row = existing if mapped_row is row else row
+        merged = dict(mapped_row)
+        merged["action"] = (
             "map_existing"
             if "map_existing" in {existing.get("action"), row.get("action")}
             else "acquire"
         )
-        if not existing.get("why_it_matters") and row.get("why_it_matters"):
-            existing["why_it_matters"] = row["why_it_matters"]
+        if not merged.get("why_it_matters") and other_row.get("why_it_matters"):
+            merged["why_it_matters"] = other_row["why_it_matters"]
+        merged["identifiers"] = {
+            **dict(_as_mapping(other_row.get("identifiers"))),
+            **dict(_as_mapping(mapped_row.get("identifiers"))),
+        }
         attribution_rows = [
             *list(existing.get("attributions", []) or []),
             *list(row.get("attributions", []) or []),
         ]
-        existing["attributions"] = list(
+        merged["attributions"] = list(
             {
                 _stable_hash(value): dict(value)
                 for value in attribution_rows
                 if isinstance(value, Mapping)
             }.values()
         )
+        grouped[key] = merged
     important_cited_works = [
         row for key, row in grouped.items() if key in priority_keys
     ]
@@ -19345,7 +19401,16 @@ def _persist_cluster_acquisition_revisions(
                 if (
                     existing_key != key
                     and existing_key[0] == key[0]
-                    and old.get("state") == "active"
+                    and (
+                        old.get("state") == "active"
+                        or (
+                            # The writer may change the cluster revision hash
+                            # after the pre-call acquisition receipt is stored.
+                            old.get("state") == "pending"
+                            and row.get("candidate_input_hash")
+                            == old.get("candidate_input_hash")
+                        )
+                    )
                 ):
                     old["state"] = "superseded"
         by_key[key] = row
@@ -22942,6 +23007,38 @@ def _write_managed_cluster_projection(
         text,
         flags=re.DOTALL,
     )
+    generated_frontmatter_end = generated.find("\n---\n", 4)
+    existing_frontmatter_end = (
+        text_without_refresh.find("\n---\n", 4)
+        if text_without_refresh.startswith("---\n")
+        else -1
+    )
+    if generated_frontmatter_end >= 0 and existing_frontmatter_end >= 0:
+        try:
+            generated_frontmatter = _as_mapping(
+                yaml.safe_load(generated[4:generated_frontmatter_end])
+            )
+            existing_frontmatter = _as_mapping(
+                yaml.safe_load(text_without_refresh[4:existing_frontmatter_end])
+            )
+        except yaml.YAMLError:
+            generated_frontmatter = {}
+            existing_frontmatter = {}
+        if generated_frontmatter:
+            merged_frontmatter = {
+                **dict(existing_frontmatter),
+                **dict(generated_frontmatter),
+            }
+            rendered_frontmatter = yaml.safe_dump(
+                merged_frontmatter,
+                sort_keys=False,
+                allow_unicode=True,
+                width=10_000,
+            ).strip()
+            text_without_refresh = (
+                f"---\n{rendered_frontmatter}\n---\n"
+                f"{text_without_refresh[existing_frontmatter_end + 5:]}"
+            )
     existing = re.search(
         rf"{re.escape(_CLUSTER_MANAGED_START)}.*?"
         rf"{re.escape(_CLUSTER_MANAGED_END)}\n?",

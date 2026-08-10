@@ -10,6 +10,7 @@ from auto_zettelkasten.readers import (
     SECTION_KEYS,
     DeepSeekReader,
     OpenRouterReader,
+    ProviderError,
     _cluster_synthesis_system_prompt,
     _gap_adjudication_system_prompt,
     _source_prompt,
@@ -294,7 +295,55 @@ def test_cluster_partition_mode_uses_supplied_compact_cards(
     def post_json(endpoint, body, **kwargs):
         del endpoint, kwargs
         bodies.append(dict(body))
-        return _completion({"clusters": [], "neighbor_relationships": []})
+        return _completion(
+            {
+                "clusters": [
+                    {
+                        "cluster_id": "child-a",
+                        "title": "First child",
+                        "organizing_problem": "First bounded problem",
+                        "coherence_rationale": "A and B answer it.",
+                        "members": [
+                            {
+                                "source_id": "source-a",
+                                "role": "core",
+                                "membership_reason": "Directly answers it.",
+                            },
+                            {
+                                "source_id": "source-b",
+                                "role": "context",
+                                "membership_reason": "Supplies its boundary.",
+                            },
+                        ],
+                    },
+                    {
+                        "cluster_id": "child-b",
+                        "title": "Second child",
+                        "organizing_problem": "Second bounded problem",
+                        "coherence_rationale": "C and D answer it.",
+                        "members": [
+                            {
+                                "source_id": "source-c",
+                                "role": "core",
+                                "membership_reason": "Directly answers it.",
+                            },
+                            {
+                                "source_id": "source-a",
+                                "role": "bridge",
+                                "membership_reason": "Connects the two problems.",
+                            },
+                        ],
+                    },
+                ],
+                "neighbor_relationships": [],
+                "unclustered_sources": [
+                    {
+                        "source_id": "source-d",
+                        "reason": "It does not fit either bounded problem.",
+                    }
+                ],
+            }
+        )
 
     monkeypatch.setattr("auto_zettelkasten.readers._post_json", post_json)
     reader = DeepSeekReader(allow_cloud=True)
@@ -311,9 +360,11 @@ def test_cluster_partition_mode_uses_supplied_compact_cards(
     member_cards = [
         {"source_id": "source-a", "outcomes": ["onset"]},
         {"source_id": "source-b", "outcomes": ["recurrence"]},
+        {"source_id": "source-c", "outcomes": ["duration"]},
+        {"source_id": "source-d", "outcomes": ["settlement"]},
     ]
 
-    assert reader.plan_clusters(
+    response = reader.plan_clusters(
         [],
         request,
         context={
@@ -321,21 +372,106 @@ def test_cluster_partition_mode_uses_supplied_compact_cards(
             "compact_parent_cluster": parent_card,
             "compact_member_cards": member_cards,
         },
-    ) == {
-        "clusters": [],
-        "neighbor_relationships": [],
-        "parked_clusters": [],
-        "unclustered_sources": [],
-    }
+    )
+    assert [row["cluster_id"] for row in response["clusters"]] == [
+        "child-a",
+        "child-b",
+    ]
 
     payload = json.loads(bodies[0]["messages"][1]["content"])
     assert payload["profiles"] == []
     assert payload["context"]["compact_parent_cluster"] == parent_card
     assert payload["context"]["compact_member_cards"] == member_cards
-    assert "Partition the supplied compact parent cluster card" in payload[
+    assert "partition the supplied compact parent cluster card" in payload[
         "instruction"
     ]
+    assert "partition policy v2" in payload["instruction"]
     assert "never by token size alone" in payload["instruction"]
+    assert "exact member roles core, context, or bridge" in payload["instruction"]
+    assert "exactly one primary child" in payload["instruction"]
+    assert "or place it in unclustered_sources" in payload["instruction"]
+    assert "additional memberships are bridge only" in payload["instruction"]
+    assert "Do not repeat source cards" in payload["instruction"]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "diagnostic"),
+    [
+        ("bridge_only", "bridge_only_source_ids=source-d"),
+        ("duplicate_primary", "duplicate_primary_source_ids=source-a"),
+        ("invalid_role", "invalid_role_memberships=source-d:supporting"),
+    ],
+)
+def test_cluster_partition_contract_reports_source_ids_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    mutate: str,
+    diagnostic: str,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    bodies: list[dict[str, Any]] = []
+    clusters = [
+        {
+            "cluster_id": "child-a",
+            "title": "First child",
+            "organizing_problem": "First bounded problem",
+            "members": [
+                {"source_id": "source-a", "role": "core"},
+                {"source_id": "source-b", "role": "context"},
+            ],
+        },
+        {
+            "cluster_id": "child-b",
+            "title": "Second child",
+            "organizing_problem": "Second bounded problem",
+            "members": [
+                {"source_id": "source-c", "role": "core"},
+                {"source_id": "source-d", "role": "context"},
+            ],
+        },
+    ]
+    if mutate == "bridge_only":
+        clusters[1]["members"][1]["role"] = "bridge"
+    elif mutate == "duplicate_primary":
+        clusters[1]["members"].append({"source_id": "source-a", "role": "context"})
+    else:
+        clusters[1]["members"][1]["role"] = "supporting"
+
+    def post_json(endpoint, body, **kwargs):
+        del endpoint, kwargs
+        bodies.append(dict(body))
+        return _completion(
+            {
+                "clusters": clusters,
+                "neighbor_relationships": [],
+                "unclustered_sources": [],
+            }
+        )
+
+    monkeypatch.setattr("auto_zettelkasten.readers._post_json", post_json)
+    reader = DeepSeekReader(allow_cloud=True)
+    request = LiteratureMapRequest(
+        workspace=".",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        allow_cloud=True,
+    )
+    context = {
+        "cluster_plan_mode": "partition",
+        "compact_parent_cluster": {
+            "cluster_id": "cluster-parent",
+            "source_ids": ["source-a", "source-b", "source-c", "source-d"],
+        },
+        "compact_member_cards": [
+            {"source_id": source_id}
+            for source_id in ("source-a", "source-b", "source-c", "source-d")
+        ],
+    }
+
+    with pytest.raises(ProviderError, match=diagnostic) as raised:
+        reader.plan_clusters([], request, context=context)
+
+    assert len(bodies) == 1
+    assert getattr(raised.value, "raw_response", {})["clusters"] == clusters
 
 
 def test_generic_openai_provider_keeps_deterministic_nonreasoning_request(

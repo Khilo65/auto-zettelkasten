@@ -1985,6 +1985,53 @@ def persist_relationship_registry(
         current["active"] = visible
         if not visible:
             current["refresh_pending"] = True
+    current_decisions_by_pair = {
+        canonical_pair(*[str(value) for value in current.get("source_ids", [])]): current
+        for current in current_pair_decisions.values()
+        if len(current.get("source_ids", []) or []) == 2
+    }
+    for decision in pair_decisions.values():
+        pair = canonical_pair(
+            str(decision.get("source_id") or ""),
+            str(decision.get("target_source_id") or ""),
+        )
+        current = current_decisions_by_pair.get(pair, {})
+        current_status = str(current.get("status") or "")
+        is_current = False
+        if bool(current.get("active", True)):
+            if current_status in {"accepted", "reconciliation_pending"}:
+                is_current = (
+                    str(decision.get("status") or "") == "accepted"
+                    and str(decision.get("relation_id") or "")
+                    in {
+                        str(value)
+                        for value in current.get("relation_ids", []) or []
+                    }
+                )
+            elif current_status == "no_relationship":
+                profile_hashes = current.get("input_profile_hashes", {}) or {}
+                is_current = (
+                    str(decision.get("status") or "") == "no_relationship"
+                    and str(decision.get("provider") or "")
+                    == str(current.get("provider") or "")
+                    and str(decision.get("model") or "")
+                    == str(current.get("model") or "")
+                    and str(decision.get("prompt_version") or "")
+                    == str(current.get("prompt_version") or "")
+                    and str(decision.get("source_profile_hash") or "")
+                    == str(
+                        profile_hashes.get(str(decision.get("source_id") or ""))
+                        or ""
+                    )
+                    and str(decision.get("target_profile_hash") or "")
+                    == str(
+                        profile_hashes.get(
+                            str(decision.get("target_source_id") or "")
+                        )
+                        or ""
+                    )
+                )
+        decision["active"] = is_current
     semantic = {
         "registry_schema_version": RELATIONSHIP_REGISTRY_SCHEMA_VERSION,
         "relations": relations,

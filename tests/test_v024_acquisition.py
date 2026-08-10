@@ -228,6 +228,86 @@ def test_visible_acquisition_rows_group_same_zotero_work() -> None:
     } == {"A", "B"}
 
 
+def test_visible_acquisition_alias_prefers_mapped_identity_and_action() -> None:
+    profiles = [_profile("A"), _profile("B")]
+    cluster = {"cluster_id": "cluster-one", "source_ids": ["A", "B"]}
+    response = _cluster_response(cluster, profiles)
+    response["acquisition_candidate_dispositions"] = [
+        {
+            "external_source_id": "short-citation",
+            "decision": "recommend",
+            "why_it_matters": "It supplies the conflict-recovery framework.",
+        },
+        {
+            "external_source_id": "mapped-citation",
+            "decision": "recommend",
+            "why_it_matters": "It supplies the conflict-recovery framework.",
+        },
+    ]
+    candidates = [
+        {
+            "external_source_id": "short-citation",
+            "raw_citation": "World Development Report 2011 (World Bank)",
+            "normalized_citation": {
+                "author": "World Bank",
+                "year": "2011",
+                "title": "World Development Report 2011 (as cited in source)",
+            },
+            "status": "not_in_snapshot",
+            "attributions": [
+                {
+                    "literature_position_id": "position-A",
+                    "current_source_id": "A",
+                }
+            ],
+        },
+        {
+            "external_source_id": "mapped-citation",
+            "raw_citation": (
+                "World Bank. 2011. World Development Report 2011: "
+                "Conflict, Security, and Development."
+            ),
+            "normalized_citation": {
+                "author": "World Bank",
+                "year": "2011",
+                "title": (
+                    "World Development Report 2011: Conflict, Security, "
+                    "and Development"
+                ),
+            },
+            "status": "known_zotero_unmapped",
+            "attributions": [
+                {
+                    "literature_position_id": "position-B",
+                    "current_source_id": "B",
+                }
+            ],
+        },
+    ]
+
+    validated = validate_streamlined_cluster_synthesis(
+        response,
+        cluster,
+        profiles,
+        important_unmapped_literature=candidates,
+        acquisition_identity_by_id={
+            "short-citation": {},
+            "mapped-citation": {"zotero_key": "DM6DWW5Y"},
+        },
+    )
+
+    visible = validated["important_cited_works_not_yet_mapped"]
+    assert len(visible) == 1
+    assert visible[0]["external_source_id"] == "mapped-citation"
+    assert visible[0]["action"] == "map_existing"
+    assert visible[0]["status"] == "known_zotero_unmapped"
+    assert {row["current_source_id"] for row in visible[0]["attributions"]} == {
+        "A",
+        "B",
+    }
+    assert len(validated["acquisition_candidate_dispositions"]) == 2
+
+
 def test_acquisition_contract_defects_do_not_park_good_cluster() -> None:
     profiles = [_profile("A"), _profile("B")]
     cluster = {"cluster_id": "cluster-one", "source_ids": ["A", "B"]}
@@ -455,6 +535,50 @@ def test_failed_refresh_keeps_active_acquisition_revision_and_records_failure(
         if row["cluster_revision_hash"] == "old"
     )
     assert old["candidates"][0]["writer_disposition"] == "retired_mapped"
+
+
+def test_active_writer_revision_supersedes_matching_pending_receipt(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "cluster_acquisition_ledger.yml"
+    candidates = [
+        {
+            "external_source_id": "missing-1",
+            "raw_citation": "Missing 2000",
+            "status": "not_in_snapshot",
+            "attributions": [],
+        }
+    ]
+    pending = _cluster_acquisition_revision(
+        {"cluster_id": "cluster-one", "revision_hash": "pre-writer"},
+        candidates,
+        state="pending",
+    )
+    active = _cluster_acquisition_revision(
+        {"cluster_id": "cluster-one", "revision_hash": "writer-final"},
+        candidates,
+        state="active",
+        dispositions=[
+            {
+                "external_source_id": "missing-1",
+                "decision": "recommend",
+                "why_it_matters": "It supplies the mechanism.",
+            }
+        ],
+    )
+
+    _persist_cluster_acquisition_revisions(path, [pending])
+    ledger = _persist_cluster_acquisition_revisions(path, [active])
+
+    by_revision = {
+        row["cluster_revision_hash"]: row["state"]
+        for row in ledger["revisions"]
+    }
+    assert by_revision == {
+        "pre-writer": "superseded",
+        "writer-final": "active",
+    }
+    assert not any(row["state"] == "pending" for row in ledger["revisions"])
 
 
 class ProviderEmptyResponse(RuntimeError):

@@ -343,12 +343,14 @@ def test_oversized_cluster_is_partitioned_before_writers(tmp_path: Path) -> None
                         "organizing_problem": "Right problem",
                         "members": [
                             {"source_id": "C", "role": "core"},
-                            {"source_id": "D", "role": "core"},
+                            {"source_id": "A", "role": "bridge"},
                         ],
                     },
                 ],
                 "neighbor_relationships": [],
-                "unclustered_sources": [],
+                "unclustered_sources": [
+                    {"source_id": "D", "reason": "Outside both bounded questions."}
+                ],
             }
 
         def synthesize_cluster(self, projected, request, *, context=None):
@@ -392,6 +394,10 @@ def test_oversized_cluster_is_partitioned_before_writers(tmp_path: Path) -> None
     assert all(row["formation_route"] == "partitioned_cluster_plan" for row in clusters)
     assert writer_sizes == [2, 2]
     assert all(row["parent_cluster_id"] for row in clusters)
+    assert {
+        row["source_id"]
+        for row in report["cluster_registry"]["unclustered_sources"]
+    } == {"D"}
 
 
 def test_nonshrinking_partition_never_reaches_cluster_writer(tmp_path: Path) -> None:

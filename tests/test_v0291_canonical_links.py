@@ -1,13 +1,17 @@
 from pathlib import Path
 
+import yaml
+
 from auto_zettelkasten.literature import (
     _canonical_projection_profiles,
     _cluster_limit_text,
+    _cluster_wikilink,
     _navigation_profile_rows,
     _obsidian_note_link,
     _replace_source_keys_in_markdown_body,
     _report_projection_profiles,
     _streamlined_cluster_markdown,
+    _write_managed_cluster_projection,
     build_literature_map,
 )
 from auto_zettelkasten.readers import _validate_streamlined_cluster_response
@@ -258,6 +262,76 @@ def test_cluster_body_uses_final_canonical_profile_links(tmp_path: Path) -> None
         "[[Walter (2004)",
     ):
         assert stale_target not in markdown
+
+
+def test_managed_cluster_refresh_replaces_stale_related_cluster_targets(
+    tmp_path: Path,
+) -> None:
+    source = {
+        "cluster_id": "cluster-source",
+        "label": "Source cluster",
+        "source_ids": [],
+    }
+    target = {
+        "cluster_id": "cluster-target-stable-id",
+        "label": "Current complete target label used by the canonical cluster note",
+    }
+    stale_link = (
+        "[[Cluster - Current complete target label… "
+        "[cluster-target-stable-id]|Cluster: Target]]"
+    )
+    path = tmp_path / "cluster.md"
+    path.write_text(
+        "---\n"
+        "type: literature_cluster\n"
+        f"related_clusters:\n- '{stale_link}'\n"
+        "user_field: keep-me\n"
+        "---\n\n"
+        "User preface.\n\n"
+        "<!-- auto-zettelkasten:cluster:start -->\n"
+        "## Related clusters\n\n"
+        f"- {stale_link}\n"
+        "<!-- auto-zettelkasten:cluster:end -->\n\n"
+        "User appendix.\n",
+        encoding="utf-8",
+    )
+    synthesis = {
+        "cluster_contract": "streamlined-full-note-v2",
+        "title": "Source cluster",
+        "related_clusters": [{"target_cluster_id": target["cluster_id"]}],
+    }
+    rendered = _streamlined_cluster_markdown(
+        source,
+        synthesis,
+        profile_by_source={},
+        cluster_by_id={source["cluster_id"]: source, target["cluster_id"]: target},
+    )
+
+    _write_managed_cluster_projection(
+        tmp_path,
+        path,
+        rendered,
+        cluster_id=source["cluster_id"],
+    )
+
+    text = path.read_text(encoding="utf-8")
+    frontmatter = yaml.safe_load(
+        text.split("\n---\n", 1)[0].removeprefix("---\n")
+    )
+    canonical_link = _cluster_wikilink(target)
+    assert frontmatter["related_clusters"] == [canonical_link]
+    assert canonical_link in text
+    assert stale_link not in text
+    assert frontmatter["user_field"] == "keep-me"
+    assert "User preface." in text
+    assert "User appendix." in text
+    assert not _write_managed_cluster_projection(
+        tmp_path,
+        path,
+        rendered,
+        cluster_id=source["cluster_id"],
+    )
+    assert path.read_text(encoding="utf-8") == text
 
 
 def test_prose_humanizer_never_rewrites_keyed_wikilinks() -> None:

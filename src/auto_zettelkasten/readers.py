@@ -859,16 +859,28 @@ class _CapabilityAwareReader:
         mode = str((context or {}).get("cluster_plan_mode") or "collection")
         if mode == "partition":
             instruction = (
-                "Partition the supplied compact parent cluster card and compact "
+                "Under partition policy v2, partition the supplied compact parent "
+                "cluster card and compact "
                 "member cards into smaller coherent child clusters. Treat the "
                 "parent card as the scope and the member cards as the complete "
                 "eligible inventory; do not import sources from elsewhere. Split "
                 "by bounded research question, debate, mechanism, outcome, stage, "
                 "or evidence boundary, never by token size alone. Every child must "
                 "be strictly smaller than the parent and contain at least two "
-                "members. Account for every parent member in one primary child or "
-                "in unclustered_sources. Repeat a member in another child only when "
-                "it is an indispensable bridge, and explain that role. Preserve "
+                "members. Use only the exact member roles core, context, or bridge. "
+                "Account for every parent source in exactly one primary child with "
+                "role core or context, or place it in unclustered_sources with a "
+                "concise reason; bridge never substitutes for primary ownership. "
+                "A clustered source may additionally appear in another child "
+                "only with the exact role bridge and a concise explanation of the "
+                "cross-child contribution. Unclustered sources must not also appear "
+                "in a child. Keep the response compact: for each child return only its "
+                "identity, bounded organizing fields, coherence rationale, and "
+                "members; for each member return only source_id, role, and a short "
+                "membership_reason. Do not repeat source cards, findings, profiles, "
+                "or atomic-note prose. Before returning, self-check that every "
+                "supplied source has exactly one primary or unclustered disposition "
+                "and that any additional memberships are bridge only. Preserve "
                 "construct, outcome, population, period, and evidence-type "
                 "differences rather than forcing a broad umbrella synthesis."
             )
@@ -913,17 +925,31 @@ class _CapabilityAwareReader:
             context,
             instruction=instruction,
         )
-        return _validate_literature_response(
-            self._literature_json_call(
-                _cluster_plan_system_prompt(),
-                user_prompt,
-                label="global cluster plan",
-                reasoning_effort="max",
-                output_tokens=output_tokens,
-                deadline_seconds=deadline_seconds,
-            ),
-            kind="cluster_plan",
+        raw_response = self._literature_json_call(
+            _cluster_plan_system_prompt(),
+            user_prompt,
+            label="global cluster plan",
+            reasoning_effort="max",
+            output_tokens=output_tokens,
+            deadline_seconds=deadline_seconds,
         )
+        try:
+            response = _validate_literature_response(
+                raw_response,
+                kind="cluster_plan",
+            )
+            if mode == "partition":
+                response = _validate_partition_cluster_plan(
+                    response,
+                    context=context,
+                )
+            return response
+        except ProviderError as exc:
+            exc.raw_response = raw_response
+            completion = current_literature_completion()
+            if completion:
+                exc.provider_completion = dict(completion)
+            raise
 
     def _cluster_synthesis_call_inputs(
         self,
@@ -4449,6 +4475,112 @@ def _validate_literature_response(
             f"invalid {kind.replace('_', ' ')} response: {exc}"
         ) from exc
     raise ProviderError(f"unsupported literature response kind: {kind}")
+
+
+def _validate_partition_cluster_plan(
+    payload: Mapping[str, Any],
+    *,
+    context: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Validate the one-primary-membership contract for a bounded partition."""
+
+    prompt_context = dict(context or {})
+    parent = prompt_context.get("compact_parent_cluster") or {}
+    member_cards = prompt_context.get("compact_member_cards") or []
+    inventory = {
+        str(value)
+        for value in (
+            parent.get("source_ids", []) if isinstance(parent, Mapping) else []
+        )
+        if str(value)
+    }
+    if not inventory and isinstance(member_cards, list):
+        inventory = {
+            str(row.get("source_id") or "")
+            for row in member_cards
+            if isinstance(row, Mapping) and str(row.get("source_id") or "")
+        }
+
+    allowed_roles = {"core", "context", "bridge"}
+    primary_children: dict[str, list[str]] = {source_id: [] for source_id in inventory}
+    bridge_children: dict[str, list[str]] = {source_id: [] for source_id in inventory}
+    invalid_roles: list[str] = []
+    unknown_source_ids: set[str] = set()
+    for cluster in payload.get("clusters", []) or []:
+        if not isinstance(cluster, Mapping):
+            continue
+        cluster_id = str(cluster.get("cluster_id") or "")
+        for member in cluster.get("members", []) or []:
+            if not isinstance(member, Mapping):
+                continue
+            source_id = str(member.get("source_id") or "")
+            role = str(member.get("role") or "").strip().casefold()
+            if source_id not in inventory:
+                if source_id:
+                    unknown_source_ids.add(source_id)
+                continue
+            if role not in allowed_roles:
+                invalid_roles.append(f"{source_id}:{role or '<missing>'}")
+            elif role == "bridge":
+                bridge_children[source_id].append(cluster_id)
+            else:
+                primary_children[source_id].append(cluster_id)
+
+    unclustered = {
+        str(row.get("source_id") or "")
+        if isinstance(row, Mapping)
+        else str(row or "")
+        for row in payload.get("unclustered_sources", []) or []
+    } - {""}
+    bridge_only = sorted(
+        source_id
+        for source_id in inventory
+        if source_id not in unclustered
+        and not primary_children[source_id]
+        and bridge_children[source_id]
+    )
+    missing_primary = sorted(
+        source_id
+        for source_id in inventory
+        if source_id not in unclustered
+        and not primary_children[source_id]
+        and not bridge_children[source_id]
+    )
+    duplicate_primary = sorted(
+        source_id
+        for source_id in inventory
+        if len(primary_children[source_id]) > 1
+    )
+    redundant_bridge = sorted(
+        source_id
+        for source_id in inventory
+        if set(primary_children[source_id]) & set(bridge_children[source_id])
+    )
+    unclustered_overlap = sorted(
+        source_id
+        for source_id in unclustered & inventory
+        if primary_children[source_id] or bridge_children[source_id]
+    )
+    unknown_unclustered = sorted(unclustered - inventory)
+    diagnostics = {
+        "bridge_only_source_ids": bridge_only,
+        "duplicate_primary_source_ids": duplicate_primary,
+        "invalid_role_memberships": sorted(invalid_roles),
+        "missing_primary_source_ids": missing_primary,
+        "redundant_bridge_source_ids": redundant_bridge,
+        "unclustered_membership_overlap": unclustered_overlap,
+        "unknown_unclustered_source_ids": unknown_unclustered,
+        "unknown_source_ids": sorted(unknown_source_ids),
+    }
+    failures = {key: value for key, value in diagnostics.items() if value}
+    if failures:
+        details = "; ".join(
+            f"{key}={','.join(values)}" for key, values in failures.items()
+        )
+        exc = ProviderError(f"invalid cluster partition response: {details}")
+        exc.partition_diagnostics = diagnostics
+        raise exc
+    return dict(payload)
 
 
 def _validate_streamlined_cluster_response(

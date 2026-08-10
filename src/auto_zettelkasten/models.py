@@ -8,7 +8,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
-CURRENT_ENGINE_VERSION = "0.29.6"
+CURRENT_ENGINE_VERSION = "0.29.7"
 CURRENT_ARTIFACT_SCHEMA_VERSION = "1.20"
 CURRENT_PROFILE_SCHEMA_VERSION = "1.3"
 

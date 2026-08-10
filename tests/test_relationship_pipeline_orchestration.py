@@ -3392,12 +3392,28 @@ def test_unchanged_negative_pair_memory_skips_readjudication(
             "pair_decisions": [
                 {
                     "decision_key": decision_key,
+                    "pair_job_id": "negative-a-b",
                     "source_id": "A",
                     "target_source_id": "B",
-                        "status": "no_relationship",
-                        "relationship_policy_identity": relationship_policy_identity,
+                    "status": "no_relationship",
+                    "relationship_policy_identity": relationship_policy_identity,
                 }
-            ]
+            ],
+            "current_pair_decisions": [
+                {
+                    "source_ids": ["A", "B"],
+                    "status": "no_relationship",
+                    "pair_job_id": "negative-a-b",
+                    "prompt_version": pipeline_module.RELATIONSHIP_PROMPT_VERSION,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "input_profile_hashes": {
+                        profile.source_id: stable_hash(profile_to_dict(profile))
+                        for profile in profiles
+                    },
+                    "active": True,
+                }
+            ],
         },
     )
     write_yaml(
@@ -3420,9 +3436,11 @@ def test_unchanged_negative_pair_memory_skips_readjudication(
     def handler(
         stage: str,
         _profiles: Sequence[Any],
-        _context: Mapping[str, Any],
+        context: Mapping[str, Any],
     ) -> Mapping[str, Any]:
         assert stage == "relationship_candidate_selection"
+        assert context["prior_negative_pairs"] == [["A", "B"]]
+        assert context["excluded_candidate_pairs"] == [("A", "B")]
         return {"candidates": [_candidate("A", "B")]}
 
     calls = _Calls(handler)
@@ -3432,6 +3450,267 @@ def test_unchanged_negative_pair_memory_skips_readjudication(
         "relationship_candidate_selection"
     ]
     assert result["pair_job_count"] == 0
+
+
+def test_current_negative_pairs_reach_initial_shared_packets_and_replay(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile(source_id) for source_id in "ABCD"]
+    relationship_policy_identity = stable_hash(
+        {"relationship_semantic_policy": "source-owned-bases-v26"}
+    )
+    profile_hashes = {
+        profile.source_id: stable_hash(profile_to_dict(profile))
+        for profile in profiles
+    }
+    write_yaml(
+        tmp_path / "02_source_memory" / "indexes" / "typed_links.yml",
+        {
+            "pair_decisions": [
+                {
+                    "decision_key": relationship_decision_key(
+                        "A",
+                        "B",
+                        profile_hashes["A"],
+                        profile_hashes["B"],
+                        provider="test-provider",
+                        model="test-model",
+                        policy_identity=relationship_policy_identity,
+                    ),
+                    "pair_job_id": "negative-a-b",
+                    "source_id": "A",
+                    "target_source_id": "B",
+                    "status": "no_relationship",
+                    "relationship_policy_identity": relationship_policy_identity,
+                }
+            ],
+            "current_pair_decisions": [
+                {
+                    "source_ids": ["A", "B"],
+                    "status": "no_relationship",
+                    "pair_job_id": "negative-a-b",
+                    "prompt_version": pipeline_module.RELATIONSHIP_PROMPT_VERSION,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "input_profile_hashes": {
+                        "A": profile_hashes["A"],
+                        "B": profile_hashes["B"],
+                    },
+                    "active": True,
+                }
+            ],
+        },
+    )
+    write_yaml(
+        tmp_path
+        / "02_source_memory"
+        / "indexes"
+        / "relationship_selection_state.yml",
+        {
+            "selection_identity": "older-discovery-prompt",
+            "profile_hashes": profile_hashes,
+            "relationship_memory_hashes": {
+                profile.source_id: stable_hash([]) for profile in profiles
+            },
+        },
+    )
+    shared_plan = {
+        "lean_index_hash": "lean",
+        "requested_collection_keys": ["C1", "C2"],
+        "literature_families": [
+            {"family_id": "requested", "source_ids": ["A", "B", "C", "D"]},
+            {"family_id": "complement", "source_ids": ["A", "B"]},
+        ],
+        "discovery_jobs": [
+            {
+                "job_id": "requested",
+                "family": "requested",
+                "left_source_ids": ["A", "C"],
+                "right_source_ids": ["B", "D"],
+                "requested_collection_pair": ["C1", "C2"],
+                "candidate_quota": 3,
+            },
+            {
+                "job_id": "complement",
+                "family": "complement",
+                "left_source_ids": ["A"],
+                "right_source_ids": ["B"],
+                "candidate_quota": 1,
+            },
+        ],
+    }
+
+    def handler(
+        stage: str,
+        _profiles: Sequence[Any],
+        context: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if stage == "relationship_adjudication":
+            return {"decisions": [_decision(row) for row in context["pair_jobs"]]}
+        assert stage in {
+            "relationship_bridge_candidate_selection",
+            "relationship_candidate_selection",
+        }
+        assert context["prior_negative_pairs"] == [["A", "B"]]
+        if context["discovery_pass"] == "breadth_completion":
+            assert context["excluded_candidate_pairs"] == [
+                ("A", "B"),
+                ("A", "D"),
+            ]
+            return {
+                "candidates": [
+                    {
+                        **_candidate("B", "C", rank=1),
+                        "bridge_job_id": "requested",
+                    },
+                    {
+                        **_candidate("C", "D", rank=2),
+                        "bridge_job_id": "requested",
+                    },
+                ],
+                "job_outcomes": [
+                    {"bridge_job_id": "requested", "status": "completed"}
+                ],
+            }
+        assert context["excluded_candidate_pairs"] == [("A", "B")]
+        if context["discovery_pass"] == "broad":
+            return {
+                "candidates": [
+                    {
+                        **_candidate("A", "D"),
+                        "bridge_job_id": "requested",
+                    }
+                ],
+                "job_outcomes": [
+                    {"bridge_job_id": "requested", "status": "completed"}
+                ],
+            }
+        return {
+            "candidates": [],
+            "job_outcomes": [
+                {
+                    "bridge_job_id": row["bridge_job_id"],
+                    "status": "no_more_candidates",
+                }
+                for row in context["bridge_jobs"]
+            ],
+        }
+
+    calls = _Calls(handler)
+    result = _run(
+        tmp_path,
+        profiles,
+        calls,
+        shared_family_plan=shared_plan,
+    )
+
+    assert {
+        context["discovery_pass"]
+        for stage, _key, context in calls.seen
+        if stage.endswith("candidate_selection")
+    } == {"broad", "complement", "breadth_completion"}
+    assert result["pair_job_count"] == 3
+    _commit_relationship_selection_state(
+        tmp_path,
+        result,
+        catalogue_revision=result["reconciled_catalogue_revision"],
+    )
+    replay_calls = _Calls(
+        lambda stage, _profiles, _context: (_ for _ in ()).throw(
+            AssertionError(f"unexpected replay call: {stage}")
+        )
+    )
+    replay = _run(
+        tmp_path,
+        profiles,
+        replay_calls,
+        shared_family_plan=shared_plan,
+    )
+    assert replay_calls.seen == []
+    assert replay["semantic_noop"] is True
+
+
+def test_changed_relationship_prompt_reconsiders_current_negative(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    profiles = [_profile("A"), _profile("B")]
+    relationship_policy_identity = stable_hash(
+        {"relationship_semantic_policy": "source-owned-bases-v26"}
+    )
+    profile_hashes = {
+        profile.source_id: stable_hash(profile_to_dict(profile))
+        for profile in profiles
+    }
+    write_yaml(
+        tmp_path / "02_source_memory" / "indexes" / "typed_links.yml",
+        {
+            "pair_decisions": [
+                {
+                    "decision_key": relationship_decision_key(
+                        "A",
+                        "B",
+                        profile_hashes["A"],
+                        profile_hashes["B"],
+                        provider="test-provider",
+                        model="test-model",
+                        policy_identity=relationship_policy_identity,
+                    ),
+                    "pair_job_id": "negative-a-b",
+                    "source_id": "A",
+                    "target_source_id": "B",
+                    "status": "no_relationship",
+                    "relationship_policy_identity": relationship_policy_identity,
+                }
+            ],
+            "current_pair_decisions": [
+                {
+                    "source_ids": ["A", "B"],
+                    "status": "no_relationship",
+                    "pair_job_id": "negative-a-b",
+                    "prompt_version": pipeline_module.RELATIONSHIP_PROMPT_VERSION,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "input_profile_hashes": profile_hashes,
+                    "active": True,
+                }
+            ],
+        },
+    )
+    write_yaml(
+        tmp_path
+        / "02_source_memory"
+        / "indexes"
+        / "relationship_selection_state.yml",
+        {
+            "selection_identity": "older-discovery-prompt",
+            "profile_hashes": profile_hashes,
+            "relationship_memory_hashes": {
+                profile.source_id: stable_hash([]) for profile in profiles
+            },
+        },
+    )
+    monkeypatch.setattr(pipeline_module, "RELATIONSHIP_PROMPT_VERSION", "changed")
+
+    def handler(
+        stage: str,
+        _profiles: Sequence[Any],
+        context: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if stage == "relationship_candidate_selection":
+            assert context["prior_negative_pairs"] == []
+            assert context["excluded_candidate_pairs"] == []
+            return {"candidates": [_candidate("A", "B")]}
+        return {"decisions": [_decision(context["pair_jobs"][0])]}
+
+    calls = _Calls(handler)
+    result = _run(tmp_path, profiles, calls)
+
+    assert [stage for stage, _key, _context in calls.seen] == [
+        "relationship_candidate_selection",
+        "relationship_adjudication",
+    ]
+    assert result["pair_job_count"] == 1
 
 
 def test_only_active_current_relationship_satisfies_a_discovered_pair(

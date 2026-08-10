@@ -173,7 +173,7 @@ _RELATIONSHIP_BATCH_MAX_JOBS = 8
 _LEGACY_RELATIONSHIP_BATCH_MAX_JOBS = 8
 _RELATIONSHIP_DISCOVERY_PAGE_SIZE = 64
 _RELATIONSHIP_SELECTION_STATE_SCHEMA_VERSION = "4"
-_RELATIONSHIP_DISCOVERY_POLICY_VERSION = "single-breadth-completion-v296"
+_RELATIONSHIP_DISCOVERY_POLICY_VERSION = "negative-aware-breadth-v297"
 _RELATIONSHIP_SEMANTIC_POLICY_VERSION = "source-owned-bases-v26"
 _LITERATURE_MEMORY_LOCK = threading.Lock()
 _AUTO_CLOUD_SOURCE_WORKER_LIMIT = 32
@@ -6974,6 +6974,22 @@ def _run_relationship_reasoning(
             }
         )
     negative_pairs: set[tuple[str, str]] = set()
+    current_pair_rows_present = "current_pair_decisions" in registry
+    current_negative_rows: dict[tuple[str, str], dict[str, Any]] = {}
+    for raw_row in registry.get("current_pair_decisions", []) or []:
+        if not isinstance(raw_row, Mapping):
+            continue
+        row = dict(raw_row)
+        source_ids = list(row.get("source_ids", []) or [])
+        if (
+            len(source_ids) != 2
+            or str(row.get("status") or "") != "no_relationship"
+            or not bool(row.get("active", True))
+        ):
+            continue
+        current_negative_rows[
+            canonical_pair(str(source_ids[0]), str(source_ids[1]))
+        ] = row
     for row in prior_decisions:
         if (
             str(
@@ -6995,6 +7011,36 @@ def _run_relationship_reasoning(
         )
         if pair[0] not in current_hashes or pair[1] not in current_hashes:
             continue
+        current_negative = current_negative_rows.get(pair)
+        if current_pair_rows_present:
+            if current_negative is None:
+                continue
+            current_job_id = str(current_negative.get("pair_job_id") or "")
+            historical_job_id = str(row.get("pair_job_id") or "")
+            if (
+                current_job_id
+                and historical_job_id
+                and current_job_id != historical_job_id
+            ):
+                continue
+            current_input_hashes = dict(
+                current_negative.get("input_profile_hashes", {}) or {}
+            )
+            if any(
+                str(current_input_hashes.get(source_id) or "")
+                != current_hashes[source_id]
+                for source_id in pair
+            ):
+                continue
+            if (
+                str(current_negative.get("provider") or "")
+                != relationship_provider
+                or str(current_negative.get("model") or "")
+                != relationship_model
+                or str(current_negative.get("prompt_version") or "")
+                != RELATIONSHIP_PROMPT_VERSION
+            ):
+                continue
         if prior_state and any(
             str(prior_memory_hashes.get(source_id) or "")
             != current_memory_hashes[source_id]
@@ -7217,6 +7263,7 @@ def _run_relationship_reasoning(
         "focus_source_ids": focus_source_ids,
         "mandatory_pairs": [list(pair) for pair in sorted(mandatory_basis)],
         "prior_negative_pairs": [list(pair) for pair in sorted(negative_pairs)],
+        "excluded_candidate_pairs": sorted(negative_pairs),
         "reserved_bridge_fraction": 0.4,
     }
     full_discovery_context = {
@@ -7876,6 +7923,11 @@ def _run_relationship_reasoning(
                 for side in ("left_source_ids", "right_source_ids")
                 for source_id in job[side]
             }
+            relevant_negative_pairs = [
+                pair
+                for pair in sorted(negative_pairs)
+                if pair[0] in source_ids and pair[1] in source_ids
+            ]
             task_profiles = [
                 _relationship_evidence_projection(
                     profile_by_source[source_id],
@@ -7901,6 +7953,10 @@ def _run_relationship_reasoning(
             )
             task_context = {
                 **base_discovery_context,
+                "prior_negative_pairs": [
+                    list(pair) for pair in relevant_negative_pairs
+                ],
+                "excluded_candidate_pairs": relevant_negative_pairs,
                 "discovery_mode": (
                     "bridge_only"
                     if pool == "bridge"
@@ -8028,6 +8084,14 @@ def _run_relationship_reasoning(
                     for pair in prior_pairs
                     if pair[0] in task_source_ids and pair[1] in task_source_ids
                 ]
+                inherited_exclusions = {
+                    canonical_pair(str(pair[0]), str(pair[1]))
+                    for pair in task[3].get("excluded_candidate_pairs", []) or []
+                    if isinstance(pair, (list, tuple)) and len(pair) == 2
+                }
+                excluded_pairs = sorted(
+                    set(relevant_pairs) | inherited_exclusions
+                )
                 return (
                     task[0],
                     task[1],
@@ -8035,7 +8099,7 @@ def _run_relationship_reasoning(
                     {
                         **task[3],
                         "prior_candidate_pairs": relevant_pairs,
-                        "excluded_candidate_pairs": relevant_pairs,
+                        "excluded_candidate_pairs": excluded_pairs,
                     },
                     task[4],
                 )
