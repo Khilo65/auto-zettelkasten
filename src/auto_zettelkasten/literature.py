@@ -348,6 +348,30 @@ _PROVIDER_INPUT_DEPENDENCY_COMPONENTS = {
 }
 
 
+def _profile_dependency_rows(profiles: Sequence[Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "source_id": str(_as_mapping(profile).get("source_id") or ""),
+            "note_hash": str(_as_mapping(profile).get("note_hash") or ""),
+            "dependency_hash": str(
+                _as_mapping(profile).get("dependency_hash") or ""
+            ),
+            "profile_schema_version": str(
+                _as_mapping(profile).get("profile_schema_version") or ""
+            ),
+            "profile_content_hash": _stable_hash(
+                _checkpoint_dependency_context(_as_mapping(profile))
+            ),
+            "anchor_revisions": sorted(
+                str(_as_mapping(anchor).get("revision_hash") or "")
+                for anchor in _as_mapping(profile).get("evidence_anchors", []) or []
+                if _as_mapping(anchor).get("revision_hash")
+            ),
+        }
+        for profile in profiles
+    ]
+
+
 def _has_unqualified_causal_language(value: Any) -> bool:
     text = re.sub(
         r"\broot causes?\b",
@@ -1441,6 +1465,12 @@ class _CheckpointedReasonerCalls:
             raise LiteratureSynthesisPartialError("literature_stage_deadline_reached")
 
         enriched_context = dict(context)
+        prior_validated_synthesis = _as_mapping(
+            enriched_context.pop("_prior_validated_synthesis", None)
+        )
+        prior_candidate_profiles = list(
+            enriched_context.pop("_prior_candidate_profiles", []) or []
+        )
         provider_profiles = [_as_mapping(profile) for profile in profiles]
         packet_chars = _reasoner_packet_chars(
             provider_profiles, enriched_context
@@ -1489,34 +1519,9 @@ class _CheckpointedReasonerCalls:
             "method": method_name,
             "provider": str(getattr(self.reasoner, "name", "")),
             "model": str(getattr(self.reasoner, "model", "")),
-            "profile_dependencies": [
-                {
-                    "source_id": str(_as_mapping(profile).get("source_id") or ""),
-                    "note_hash": str(_as_mapping(profile).get("note_hash") or ""),
-                    "dependency_hash": str(
-                        _as_mapping(profile).get("dependency_hash") or ""
-                    ),
-                    "profile_schema_version": str(
-                        _as_mapping(profile).get("profile_schema_version") or ""
-                    ),
-                    # Note and anchor hashes alone do not capture synthesis
-                    # eligibility, support-envelope downgrades, typed
-                    # quantitative records, or other profile-level repairs.
-                    # Hash the stable semantic profile projection so a repaired
-                    # profile cannot reuse a proposal produced from its older
-                    # excluded or weaker state.
-                    "profile_content_hash": _stable_hash(
-                        _checkpoint_dependency_context(_as_mapping(profile))
-                    ),
-                    "anchor_revisions": sorted(
-                        str(_as_mapping(anchor).get("revision_hash") or "")
-                        for anchor in _as_mapping(profile).get("evidence_anchors", [])
-                        or []
-                        if _as_mapping(anchor).get("revision_hash")
-                    ),
-                }
-                for profile in profiles
-            ],
+            # Profile content includes support envelopes and anchor revisions,
+            # not only note hashes.
+            "profile_dependencies": _profile_dependency_rows(profiles),
             "context": _checkpoint_dependency_context(
                 enriched_context,
                 sort_sequences=stage == "gap_adjudication",
@@ -1699,6 +1704,16 @@ class _CheckpointedReasonerCalls:
                 dependency_component_hashes,
                 stage=stage,
                 current_context_hashes=dependency_context_hashes,
+            ) and not (
+                stage == "cluster_synthesis"
+                and _same_retained_cluster_synthesis_inputs(
+                    prior,
+                    dependency_component_hashes,
+                    dependency_context_hashes,
+                    enriched_context,
+                    prior_validated_synthesis,
+                    prior_candidate_profiles,
+                )
             ):
                 continue
             prior_response = prior.get("response")
@@ -3067,6 +3082,182 @@ def _same_provider_inputs(
         str(prior_context_hashes.get(component) or "")
         == str(current_context_hashes.get(component) or "")
         for component in visible_context_components
+    )
+
+
+def _same_retained_cluster_synthesis_inputs(
+    checkpoint: Any,
+    current_component_hashes: Mapping[str, str],
+    current_context_hashes: Mapping[str, str],
+    current_context: Mapping[str, Any],
+    prior_validated: Mapping[str, Any],
+    prior_candidate_profiles: Sequence[Any],
+) -> bool:
+    """Reuse a writer that already dropped exactly the removed candidates."""
+
+    def writer_content(value: Mapping[str, Any]) -> dict[str, Any]:
+        fields = (
+            "cluster_contract",
+            "cluster_id",
+            "title",
+            "organizing_mode",
+            "organizing_problem",
+            "guiding_question",
+            "central_tension",
+            "bottom_line",
+            "differences",
+            "limits",
+            "retained_member_ids",
+            "member_roles",
+            "dropped_members",
+            "split_proposals",
+            "missing_member_ids",
+        )
+        return {
+            **{field: value.get(field) for field in fields},
+            "lines_of_inquiry": [
+                {
+                    "title": line.get("title"),
+                    "synthesis": line.get("synthesis"),
+                    "study_findings": [
+                        {
+                            field: finding.get(field)
+                            for field in (
+                                "source_id",
+                                "finding",
+                                "method_scope",
+                                "relation_to_line",
+                                "technical_result",
+                                "plain_english_meaning",
+                            )
+                        }
+                        for finding in line.get("study_findings", []) or []
+                        if isinstance(finding, Mapping)
+                    ],
+                }
+                for line in value.get("lines_of_inquiry", []) or []
+                if isinstance(line, Mapping)
+            ],
+        }
+
+    if not isinstance(checkpoint, Mapping):
+        return False
+    response = _as_mapping(checkpoint.get("response"))
+    if str(response.get("cluster_contract") or "") not in {
+        "streamlined-full-note-v1",
+        "streamlined-full-note-v2",
+    }:
+        return False
+    retained = {
+        str(value) for value in response.get("retained_member_ids", []) or []
+    }
+    dropped = {
+        str(row.get("source_id") or "")
+        for row in response.get("dropped_members", []) or []
+        if isinstance(row, Mapping) and row.get("source_id")
+    }
+    prior_receipt = _as_mapping(prior_validated.get("candidate_input_receipt"))
+    current_receipt = _as_mapping(current_context.get("candidate_input_receipt"))
+    current_cluster = _as_mapping(current_context.get("cluster"))
+    prior_cluster = _as_mapping(prior_validated.get("_prior_cluster"))
+    prior_ids = {
+        str(value) for value in prior_receipt.get("candidate_source_ids", []) or []
+    }
+    current_ids = {
+        str(value) for value in current_receipt.get("candidate_source_ids", []) or []
+    }
+    prior_dropped = {
+        str(row.get("source_id") or "")
+        for row in prior_validated.get("dropped_members", []) or []
+        if isinstance(row, Mapping) and row.get("source_id")
+    }
+    if (
+        not dropped
+        or not retained.isdisjoint(dropped)
+        or current_ids != retained
+        or prior_ids != retained | dropped
+        or prior_dropped != dropped
+        or retained
+        != {
+            str(value)
+            for value in prior_validated.get("retained_member_ids", []) or []
+        }
+        or str(current_cluster.get("cluster_id") or "")
+        != str(response.get("cluster_id") or "")
+        or writer_content(response) != writer_content(prior_validated)
+    ):
+        return False
+    prior_sources = {
+        str(row.get("source_id") or ""): dict(row)
+        for row in prior_receipt.get("sources", []) or []
+        if isinstance(row, Mapping) and row.get("source_id")
+    }
+    current_sources = {
+        str(row.get("source_id") or ""): dict(row)
+        for row in current_receipt.get("sources", []) or []
+        if isinstance(row, Mapping) and row.get("source_id")
+    }
+    if (
+        set(prior_sources) != prior_ids
+        or current_sources
+        != {source_id: prior_sources[source_id] for source_id in retained}
+    ):
+        return False
+    prior_components = _as_mapping(checkpoint.get("dependency_component_hashes"))
+    prior_context = _as_mapping(checkpoint.get("dependency_context_hashes"))
+    if (
+        str(prior_context.get("candidate_input_receipt") or "")
+        != _stable_hash(prior_receipt)
+        or str(prior_components.get("profile_dependencies") or "")
+        != _stable_hash(_profile_dependency_rows(prior_candidate_profiles))
+        or not all(
+            str(prior_components.get(component) or "")
+            == str(current_component_hashes.get(component) or "")
+            for component in _PROVIDER_INPUT_DEPENDENCY_COMPONENTS
+            - {"profile_dependencies", "context"}
+        )
+    ):
+        return False
+    prior_candidate_roles = {
+        str(source_id): str(role)
+        for source_id, role in _as_mapping(
+            prior_cluster.get("candidate_roles")
+        ).items()
+        if str(source_id) in retained
+    }
+    if any(
+        current_cluster.get(field) != prior_cluster.get(field)
+        for field in (
+            "semantic_identity",
+            "label",
+            "organizing_mode",
+            "organizing_problem",
+            "shared_question",
+            "bounded_object",
+            "guiding_question",
+            "central_tension",
+            "coherence_rationale",
+            "source_ids",
+            "proposition_ids",
+            "propositions",
+            "canonical_work_ids",
+            "canonical_work_count",
+            "effective_evidence_base_count",
+            "independent_study_family_count",
+            "independence_status",
+            "synthesis_lineage",
+        )
+    ) or _as_mapping(current_cluster.get("candidate_roles")) != prior_candidate_roles:
+        return False
+    return all(
+        str(prior_context.get(component) or "")
+        == str(current_context_hashes.get(component) or "")
+        for component in (
+            "accepted_relationships",
+            "literature_positions",
+            "important_unmapped_literature",
+            "planned_neighbor_relationships",
+        )
     )
 
 
@@ -21101,6 +21292,37 @@ def build_literature_report(
         planned_neighbors = list(
             cluster.get("planned_neighbor_relationships", []) or []
         )
+        prior_validated_synthesis = _as_mapping(
+            _as_mapping(
+                (previous_registry or {}).get("cluster_syntheses")
+            ).get(cluster_id)
+        )
+        prior_cluster = next(
+            (
+                dict(row)
+                for row in (previous_registry or {}).get("clusters", []) or []
+                if isinstance(row, Mapping)
+                and str(row.get("cluster_id") or "") == cluster_id
+            ),
+            {},
+        )
+        prior_candidate_ids = {
+            str(value)
+            for value in _as_mapping(
+                prior_validated_synthesis.get("candidate_input_receipt")
+            ).get("candidate_source_ids", [])
+            or []
+        }
+        prior_candidate_profiles = [
+            _cluster_synthesis_profile_projection(
+                row,
+                prior_cluster,
+                source_note_by_source.get(str(row.get("source_id") or "")),
+                include_legacy_claims=not uses_global_cluster_plan,
+            )
+            for row in normalized
+            if str(row.get("source_id") or "") in prior_candidate_ids
+        ]
         planned_neighbor_ids = {
             str(row.get("target_cluster_id") or "")
             for row in planned_neighbors
@@ -21167,6 +21389,12 @@ def build_literature_report(
             "synthesis_lineage": str(cluster.get("synthesis_lineage") or ""),
         }
         return synthesis_profiles, {
+            "_prior_validated_synthesis": (
+                {**dict(prior_validated_synthesis), "_prior_cluster": prior_cluster}
+                if _cluster_projection_is_publishable(prior_validated_synthesis)
+                else {}
+            ),
+            "_prior_candidate_profiles": prior_candidate_profiles,
             "cluster": cluster_card,
             "candidate_input_receipt": candidate_input_receipt,
             "accepted_relationships": _cluster_relationship_context(

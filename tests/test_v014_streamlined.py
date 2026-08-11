@@ -1365,6 +1365,176 @@ def test_cluster_writer_cache_ignores_only_projection_neighbors() -> None:
     )
 
 
+def test_cluster_writer_reuses_explicitly_dropped_candidate_subset(
+    tmp_path: Path,
+) -> None:
+    response = {
+        "cluster_contract": "streamlined-full-note-v2",
+        "cluster_id": "cluster-one",
+        "status": "accepted",
+        "title": "Cluster One",
+        "organizing_mode": "question",
+        "organizing_problem": "What do A and B establish?",
+        "guiding_question": "",
+        "central_tension": "",
+        "bottom_line": "A and B establish the bounded finding.",
+        "retained_member_ids": ["A", "B"],
+        "member_roles": {"A": "core", "B": "context"},
+        "dropped_members": [{"source_id": "C", "reason": "off question"}],
+        "material_exclusions": [],
+        "lines_of_inquiry": [],
+        "differences": [],
+        "limits": [],
+        "related_clusters": [],
+        "acquisition_candidate_dispositions": [],
+        "important_cited_works_not_yet_mapped": [],
+        "split_proposals": [],
+        "missing_member_ids": [],
+    }
+
+    class Reasoner:
+        name = "local"
+        model = "test"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def synthesize_cluster(self, profiles, request, *, context=None):
+            self.calls += 1
+            return response
+
+    def receipt(source_ids: Sequence[str]) -> dict[str, Any]:
+        return {
+            "receipt_schema_version": "1",
+            "cluster_id": "cluster-one",
+            "candidate_source_ids": list(source_ids),
+            "sources": [
+                {
+                    "source_id": source_id,
+                    "atomic_note_semantic_hash": f"note-{source_id}",
+                    "candidate_role": "supporting",
+                    "source_scope": "full_document",
+                    "complete_atomic_note_supplied": True,
+                }
+                for source_id in source_ids
+            ],
+        }
+
+    def context(source_ids: Sequence[str]) -> dict[str, Any]:
+        return {
+            "cluster": {
+                "cluster_id": "cluster-one",
+                "source_ids": list(source_ids),
+                "candidate_roles": {
+                    source_id: "supporting" for source_id in source_ids
+                },
+            },
+            "candidate_input_receipt": receipt(source_ids),
+            "accepted_relationships": [],
+            "literature_positions": [],
+            "important_unmapped_literature": [],
+            "planned_neighbor_relationships": [],
+        }
+
+    profiles = [
+        {"source_id": source_id, "note_hash": f"note-{source_id}"}
+        for source_id in ("A", "B", "C")
+    ]
+    reasoner = Reasoner()
+    first = _CheckpointedReasonerCalls(
+        tmp_path, "subset", reasoner, LiteratureMapRequest(tmp_path)
+    )
+    first(
+        "cluster_synthesis",
+        "cluster-one",
+        "synthesize_cluster",
+        profiles,
+        context(("A", "B", "C")),
+    )
+
+    current_context = context(("A", "B"))
+    current_context.update(
+        {
+            "_prior_validated_synthesis": {
+                **response,
+                "status": "reasoned",
+                "quality_status": "complete",
+                "candidate_input_receipt": receipt(("A", "B", "C")),
+                "_prior_cluster": {
+                    "source_ids": ["A", "B"],
+                    "candidate_roles": {"A": "supporting", "B": "supporting"},
+                },
+            },
+            "_prior_candidate_profiles": profiles,
+        }
+    )
+    second = _CheckpointedReasonerCalls(
+        tmp_path, "subset", reasoner, LiteratureMapRequest(tmp_path)
+    )
+    second(
+        "cluster_synthesis",
+        "cluster-one",
+        "synthesize_cluster",
+        profiles[:2],
+        current_context,
+    )
+    assert reasoner.calls == 1
+
+    changed_profiles = [{**profiles[0], "note_hash": "changed"}, profiles[1]]
+    changed_context = {
+        **current_context,
+        "_prior_candidate_profiles": [*changed_profiles, profiles[2]],
+    }
+    third = _CheckpointedReasonerCalls(
+        tmp_path, "subset", reasoner, LiteratureMapRequest(tmp_path)
+    )
+    third(
+        "cluster_synthesis",
+        "cluster-one",
+        "synthesize_cluster",
+        changed_profiles,
+        changed_context,
+    )
+    assert reasoner.calls == 2
+
+    mismatch_reasoner = Reasoner()
+    mismatch_root = tmp_path / "mismatch"
+    mismatch_first = _CheckpointedReasonerCalls(
+        mismatch_root,
+        "subset",
+        mismatch_reasoner,
+        LiteratureMapRequest(mismatch_root),
+    )
+    mismatch_first(
+        "cluster_synthesis",
+        "cluster-one",
+        "synthesize_cluster",
+        profiles,
+        context(("A", "B", "C")),
+    )
+    mismatched_context = {
+        **current_context,
+        "_prior_validated_synthesis": {
+            **current_context["_prior_validated_synthesis"],
+            "bottom_line": "Different validated writer output.",
+        },
+    }
+    mismatch_second = _CheckpointedReasonerCalls(
+        mismatch_root,
+        "subset",
+        mismatch_reasoner,
+        LiteratureMapRequest(mismatch_root),
+    )
+    mismatch_second(
+        "cluster_synthesis",
+        "cluster-one",
+        "synthesize_cluster",
+        profiles[:2],
+        mismatched_context,
+    )
+    assert mismatch_reasoner.calls == 2
+
+
 def test_independent_cluster_writers_run_concurrently_with_full_notes() -> None:
     profiles = [_profile(source_id) for source_id in ("A", "B", "C", "D")]
     notes = [
