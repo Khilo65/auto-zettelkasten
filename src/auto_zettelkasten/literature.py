@@ -20974,14 +20974,6 @@ def build_literature_report(
                 for row in cluster.get("representative_sources", []) or []
                 if isinstance(row, Mapping)
             ]
-            cluster["revision_hash"] = _stable_hash(
-                {
-                    "semantic_identity": cluster.get("semantic_identity", ""),
-                    "source_ids": source_ids,
-                    "source_roles": prior_roles,
-                    "cluster_writer_contract": "streamlined-full-note-v2",
-                }
-            )
     registry = reconcile_cluster_registry(
         [
             cluster
