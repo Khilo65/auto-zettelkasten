@@ -3905,7 +3905,7 @@ def test_only_active_current_relationship_satisfies_a_discovered_pair(
             assert len(result["accepted"]) == 1
 
 
-def test_changed_endpoint_refreshes_only_its_active_relationship(
+def test_changed_endpoint_and_refresh_pending_refresh_active_relationships(
     tmp_path: Path,
 ) -> None:
     profiles = [_profile("A"), _profile("B"), _profile("C")]
@@ -3940,6 +3940,7 @@ def test_changed_endpoint_refreshes_only_its_active_relationship(
                     "relation_ids": [relation_id],
                     "provider": "test-provider",
                     "model": "test-model",
+                    "refresh_pending": relation_id == "relation-bc",
                     "input_profile_hashes": {
                         source_id: old_hashes[source_id] for source_id in pair
                     },
@@ -3956,13 +3957,14 @@ def test_changed_endpoint_refreshes_only_its_active_relationship(
         if stage == "relationship_candidate_selection":
             return {"candidates": []}
         assert [job["source_ids"] for job in context["pair_jobs"]] == [
-            ["A", "B"]
+            ["A", "B"],
+            ["B", "C"],
         ]
         return {"decisions": [_decision(job) for job in context["pair_jobs"]]}
 
     result = _run(tmp_path, profiles, _Calls(handler))
 
-    assert result["pair_job_count"] == 1
+    assert result["pair_job_count"] == 2
 
 
 def test_cluster_membership_relations_are_reciprocal() -> None:

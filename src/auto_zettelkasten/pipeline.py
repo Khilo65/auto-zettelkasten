@@ -6975,7 +6975,7 @@ def _run_relationship_reasoning(
             continue
         pair = canonical_pair(str(pair_values[0]), str(pair_values[1]))
         input_hashes = dict(row.get("input_profile_hashes", {}) or {})
-        fresh = all(
+        fresh = not bool(row.get("refresh_pending")) and all(
             str(input_hashes.get(source_id) or "")
             in current_hash_aliases.get(source_id, set())
             for source_id in pair
