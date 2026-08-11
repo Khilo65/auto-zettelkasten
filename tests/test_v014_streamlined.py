@@ -1633,12 +1633,14 @@ def test_stable_cluster_preserves_writer_final_roles_before_retry(tmp_path: Path
         request=LiteratureMapRequest(tmp_path),
         shared_literature_plan=shared_plan,
     )
+    previous = {
+        **initial["cluster_registry"],
+        "cluster_syntheses": initial["cluster_syntheses"],
+    }
+    previous["clusters"][0]["refresh_pending"] = True
     retried = build_literature_report(
         profiles,
-        previous_registry={
-            **initial["cluster_registry"],
-            "cluster_syntheses": initial["cluster_syntheses"],
-        },
+        previous_registry=previous,
         reasoner=Reasoner(fail=True),
         request=LiteratureMapRequest(tmp_path),
         shared_literature_plan=shared_plan,
@@ -1649,6 +1651,7 @@ def test_stable_cluster_preserves_writer_final_roles_before_retry(tmp_path: Path
         {"source_id": "A", "role": "core"},
         {"source_id": "B", "role": "context"},
     ]
+    assert pending["revision_hash"] == previous["clusters"][0]["revision_hash"]
 
 
 def test_independent_cluster_writers_run_concurrently_with_full_notes() -> None:

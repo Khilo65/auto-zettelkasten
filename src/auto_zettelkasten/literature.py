@@ -20974,6 +20974,8 @@ def build_literature_report(
                 for row in cluster.get("representative_sources", []) or []
                 if isinstance(row, Mapping)
             ]
+            if prior.get("refresh_pending") and prior.get("revision_hash"):
+                cluster["revision_hash"] = str(prior["revision_hash"])
     registry = reconcile_cluster_registry(
         [
             cluster
