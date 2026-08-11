@@ -874,7 +874,7 @@ def test_terminal_complement_packet_does_not_discard_successful_graph_work(
         },
     )
 
-    assert result["relationship_stage_complete"] is True
+    assert result["relationship_stage_complete"] is False
     assert result["relationship_discovery_status"] == "partial"
     assert "family-00" in result["relationship_discovery_incomplete_jobs"]
     assert result["accounted_pair_job_count"] == result["pair_job_count"]

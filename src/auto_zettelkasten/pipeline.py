@@ -10319,7 +10319,7 @@ def _run_relationship_reasoning(
         )
     )
     relationship_stage_complete = bool(
-        discovery_usable
+        (discovery_completed if shared_plan_active else discovery_usable)
         and durable_pair_accounting
         and not relationship_retry_on_resume
     )
