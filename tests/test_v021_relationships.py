@@ -228,6 +228,21 @@ def test_registry_keeps_two_connections_under_one_effective_pair_decision(
     assert refreshed["relation_ids"] == current["relation_ids"]
     assert refreshed["refresh_pending"] is True
 
+    settled = persist_relationship_registry(
+        tmp_path,
+        structural_relations=[],
+        accepted_relations=result["accepted"],
+        parked_rows=[
+            {
+                "pair_job_id": "older-job-ab",
+                "source_id": "A",
+                "target_source_id": "B",
+                "reason": "historical_malformed_attempt",
+            }
+        ],
+    )
+    assert settled["current_pair_decisions"][0]["refresh_pending"] is False
+
 
 def test_projection_keeps_same_type_connections_with_distinct_propositions() -> None:
     profiles = [_profile("A"), _profile("B")]

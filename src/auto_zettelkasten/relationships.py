@@ -1884,11 +1884,13 @@ def persist_relationship_registry(
             "reconciliation_pending": False,
             "refresh_pending": False,
         }
+    settled_pairs = set(accepted_by_pair)
     for row in verified_no_relationship_decisions:
         pair = canonical_pair(
             str(row.get("source_id") or ""),
             str(row.get("target_source_id") or ""),
         )
+        settled_pairs.add(pair)
         pair_key = stable_hash(pair)
         prior_current = current_pair_decisions.get(pair_key, {})
         current_pair_decisions[pair_key] = {
@@ -1940,7 +1942,12 @@ def persist_relationship_registry(
             ),
         )
         pair_key = stable_hash(pair)
-        if pair[0] and pair[1] and pair_key in current_pair_decisions:
+        if (
+            pair[0]
+            and pair[1]
+            and pair_key in current_pair_decisions
+            and pair not in settled_pairs
+        ):
             current_pair_decisions[pair_key]["refresh_pending"] = True
 
     events = {
