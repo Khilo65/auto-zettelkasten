@@ -5894,6 +5894,18 @@ def _cluster_writer_member_roles(
         else:
             result[source_id] = fallback.get(source_id, "context")
             used_fallback = True
+    if cluster.get("partition_root_id"):
+        preserved_partition_class = False
+        for source_id in sorted(retained):
+            planned_role = candidate.get(source_id, canonical.get(source_id, "context"))
+            if planned_role == "bridge" and result[source_id] != "bridge":
+                result[source_id] = "bridge"
+                preserved_partition_class = True
+            elif planned_role in {"core", "context"} and result[source_id] == "bridge":
+                result[source_id] = planned_role
+                preserved_partition_class = True
+        if preserved_partition_class:
+            warnings.append("partition_member_role_class_preserved")
     if used_fallback and (candidate or bool(rows)):
         warnings.append("member_role_fallback_applied")
     return result
@@ -11336,6 +11348,19 @@ def validate_streamlined_cluster_synthesis(
             tuple[str, str, tuple[str, ...]],
         ]
     ] = []
+
+    def visible_author_key(value: Any) -> str:
+        parts = re.split(
+            r"\s*(?:;|&|\band\b|\bet al\.?)\s*",
+            str(value or ""),
+            flags=re.I,
+        )
+        first = next((part.strip() for part in parts if part.strip()), "")
+        if not first:
+            return ""
+        surname = first.split(",", 1)[0] if "," in first else first.split()[-1]
+        return re.sub(r"[^a-z0-9]+", " ", surname.casefold()).strip()
+
     for priority, row in [
         *((True, value) for value in important_cited_works),
         *((False, value) for value in secondary_cited_works),
@@ -11360,12 +11385,10 @@ def validate_streamlined_cluster_synthesis(
             " ",
             raw_title.casefold(),
         ).strip()
-        author = re.sub(
-            r"[^a-z0-9]+",
-            " ",
-            str(normalized.get("author") or "").casefold(),
-        ).strip()
-        year = str(normalized.get("year") or "").strip().casefold()
+        author = visible_author_key(normalized.get("author"))
+        raw_year = str(normalized.get("year") or "")
+        year_match = re.search(r"\b(?:1[5-9]|20)\d{2}\b", raw_year)
+        year = year_match.group(0) if year_match else raw_year.strip().casefold()
         if zotero_key:
             key = ("zotero", zotero_key)
         elif identifiers.get("doi"):
@@ -11380,38 +11403,22 @@ def validate_streamlined_cluster_synthesis(
             (priority, dict(row), key, (author, year, tuple(title.split())))
         )
 
-    mapped_aliases = {
-        key: bibliography
-        for _priority, row, key, bibliography in projection_rows
-        if row.get("action") == "map_existing"
+    mapped_keys_by_bibliography: dict[
+        tuple[str, str, tuple[str, ...]], set[tuple[str, ...]]
+    ] = defaultdict(set)
+    for _priority, row, key, bibliography in projection_rows:
+        if row.get("action") == "map_existing" and all(bibliography):
+            mapped_keys_by_bibliography[bibliography].add(key)
+    exact_mapped_aliases = {
+        bibliography: next(iter(keys))
+        for bibliography, keys in mapped_keys_by_bibliography.items()
+        if len(keys) == 1
     }
-
-    def mapped_alias_key(
-        key: tuple[str, ...],
-        bibliography: tuple[str, str, tuple[str, ...]],
-    ) -> tuple[str, ...]:
-        author, year, title_tokens = bibliography
-        if not author or not year or len(title_tokens) < 4:
-            return key
-        # Reconcile only one unambiguous bibliographic prefix with a known
-        # Zotero identity; candidate-level records remain separate below.
-        matches = set()
-        for mapped_key, (mapped_author, mapped_year, mapped_title) in (
-            mapped_aliases.items()
-        ):
-            if author != mapped_author or year != mapped_year:
-                continue
-            shorter, longer = sorted(
-                (title_tokens, mapped_title), key=lambda value: len(value)
-            )
-            if len(shorter) >= 4 and longer[: len(shorter)] == shorter:
-                matches.add(mapped_key)
-        return next(iter(matches)) if len(matches) == 1 else key
 
     grouped: dict[tuple[str, ...], dict[str, Any]] = {}
     priority_keys: set[tuple[str, ...]] = set()
     for priority, row, key, bibliography in projection_rows:
-        key = mapped_alias_key(key, bibliography)
+        key = exact_mapped_aliases.get(bibliography, key)
         if priority:
             priority_keys.add(key)
         existing = grouped.get(key)
@@ -11455,10 +11462,26 @@ def validate_streamlined_cluster_synthesis(
         for value in response.get("limits", []) or []
         if (rendered := _cluster_limit_text(value))
     ]
+    raw_missing_member_ids = {
+        str(value)
+        for value in response.get("missing_member_ids", []) or []
+        if isinstance(value, (str, int)) and str(value)
+    }
+    if raw_missing_member_ids - proposed_ids:
+        warnings.append("unknown_missing_member_ignored")
+    normalized_related_clusters = [
+        {**dict(row), "target_cluster_id": target_id, "cluster_id": target_id}
+        for row in response.get("related_clusters", []) or []
+        if isinstance(row, Mapping)
+        and (target_id := _related_cluster_target_id(row))
+    ]
     return {
         **dict(response),
         "lines_of_inquiry": validated_lines,
         "retained_member_ids": sorted(retained),
+        "missing_member_ids": sorted(
+            (raw_missing_member_ids & proposed_ids) | missing
+        ),
         "member_roles": member_roles,
         "source_roles": [
             {"source_id": source_id, "role": member_roles[source_id]}
@@ -11466,6 +11489,7 @@ def validate_streamlined_cluster_synthesis(
         ],
         "dropped_members": returned_drops,
         "material_exclusions": material_exclusions,
+        "related_clusters": normalized_related_clusters,
         "important_cited_works_not_yet_mapped": important_cited_works,
         "additional_cited_works_worth_mapping": secondary_cited_works,
         "acquisition_candidate_dispositions": acquisition_dispositions,
@@ -17016,6 +17040,15 @@ def _project_navigation_onto_map(
         )
 
 
+def _related_cluster_target_id(row: Mapping[str, Any]) -> str:
+    return str(
+        row.get("target_cluster_id")
+        or row.get("related_cluster_id")
+        or row.get("cluster_id")
+        or ""
+    )
+
+
 def _project_planned_cluster_neighbors(
     clusters: Sequence[Mapping[str, Any]],
     cluster_syntheses: Mapping[str, dict[str, Any]],
@@ -17032,7 +17065,7 @@ def _project_planned_cluster_neighbors(
         if synthesis is None:
             continue
         existing_targets = {
-            str(row.get("target_cluster_id") or "")
+            _related_cluster_target_id(row)
             for row in synthesis.get("related_clusters", []) or []
             if isinstance(row, Mapping)
         }
@@ -17114,7 +17147,7 @@ def _project_planned_cluster_neighbors(
             target_synthesis = cluster_syntheses.get(target_id)
             if target_synthesis is not None and not any(
                 isinstance(existing, Mapping)
-                and str(existing.get("target_cluster_id") or "") == cluster_id
+                and _related_cluster_target_id(existing) == cluster_id
                 for existing in target_synthesis.get("related_clusters", []) or []
             ):
                 target_synthesis.setdefault("related_clusters", []).append(
@@ -17200,12 +17233,7 @@ def _project_cross_cluster_relationships(
         for raw in list(synthesis.get("related_clusters", []) or []):
             if not isinstance(raw, Mapping):
                 continue
-            target_id = str(
-                raw.get("target_cluster_id")
-                or raw.get("related_cluster_id")
-                or raw.get("cluster_id")
-                or ""
-            )
+            target_id = _related_cluster_target_id(raw)
             if target_id not in cluster_by_id or target_id == cluster_id:
                 continue
             existing_targets[cluster_id].add(target_id)
@@ -17213,12 +17241,7 @@ def _project_cross_cluster_relationships(
             if reverse_synthesis is None:
                 continue
             reverse_targets = {
-                str(
-                    row.get("target_cluster_id")
-                    or row.get("related_cluster_id")
-                    or row.get("cluster_id")
-                    or ""
-                )
+                _related_cluster_target_id(row)
                 for row in reverse_synthesis.get("related_clusters", []) or []
                 if isinstance(row, Mapping)
             }
@@ -17491,7 +17514,7 @@ def _project_cross_cluster_relationships(
                 if isinstance(row, Mapping)
             ],
             key=lambda row: (
-                str(row.get("target_cluster_id") or ""),
+                _related_cluster_target_id(row),
                 str(row.get("relationship_id") or ""),
             ),
         )
@@ -21131,6 +21154,11 @@ def build_literature_report(
             cluster["source_backed"] = False
             if bool(cluster.get("promoted")):
                 cluster["status"] = "evidence_concentrated_cluster"
+        else:
+            cluster["source_backed"] = (
+                str(cluster.get("qualification_status") or "")
+                == "source_backed_cluster"
+            )
 
     def partition_child(
         parent: Mapping[str, Any], raw_child: Mapping[str, Any], child_ids: list[str]
@@ -21465,7 +21493,11 @@ def build_literature_report(
         root_id = str(
             cluster.get("partition_root_id") or cluster.get("cluster_id") or ""
         )
-        partition_roots.setdefault(root_id, dict(cluster))
+        root_record = partition_roots.setdefault(root_id, dict(cluster))
+        root_record["partition_unclustered_source_ids"] = sorted(
+            set(root_record.get("partition_unclustered_source_ids", []) or [])
+            | unclustered_ids
+        )
         raw_id_to_child = {
             str(raw_child.get("cluster_id") or ""): child
             for (raw_child, _child_ids), child in zip(child_rows, children)
@@ -22041,10 +22073,39 @@ def build_literature_report(
             leaf_id: dict(cluster_syntheses.get(leaf_id, {}))
             for leaf_id in leaf_ids
         }
+        root_source_ids = {
+            str(value)
+            for value in root_cluster.get("source_ids", []) or []
+            if str(value)
+        }
+        expected_partition_source_ids = root_source_ids - {
+            str(value)
+            for value in root_cluster.get(
+                "partition_unclustered_source_ids", []
+            )
+            or []
+            if str(value)
+        }
+        final_member_ids: set[str] = set()
+        final_primary_counts: Counter[str] = Counter()
+        for leaf in leaves:
+            roles = _proposal_source_roles(leaf)
+            for source_id in leaf.get("source_ids", []) or []:
+                source_id = str(source_id)
+                if not source_id:
+                    continue
+                final_member_ids.add(source_id)
+                if roles.get(source_id, "context") != "bridge":
+                    final_primary_counts[source_id] += 1
+        partition_membership_valid = (
+            final_member_ids == expected_partition_source_ids
+            and set(final_primary_counts) == expected_partition_source_ids
+            and all(count == 1 for count in final_primary_counts.values())
+        )
         if leaves and all(
             _cluster_projection_is_publishable(leaf_states[leaf_id])
             for leaf_id in leaf_ids
-        ):
+        ) and partition_membership_valid:
             registry["clusters"] = [
                 row
                 for row in registry["clusters"]
@@ -23908,7 +23969,7 @@ def _streamlined_cluster_markdown(
     for row in synthesis.get("related_clusters", []) or []:
         if not isinstance(row, Mapping):
             continue
-        target_id = str(row.get("target_cluster_id") or "")
+        target_id = _related_cluster_target_id(row)
         if target_id in cluster_by_id:
             related_links.append(_cluster_wikilink(cluster_by_id[target_id]))
     frontmatter = {
@@ -24208,12 +24269,7 @@ def _cluster_markdown(
         for relationship in synthesis.get("related_clusters", []) or []
         if isinstance(relationship, Mapping)
         and (
-            target_id := str(
-                relationship.get("target_cluster_id")
-                or relationship.get("related_cluster_id")
-                or relationship.get("cluster_id")
-                or ""
-            )
+            target_id := _related_cluster_target_id(relationship)
         )
         in cluster_by_id
     ]
@@ -24840,12 +24896,7 @@ def _cluster_markdown(
     for relationship in synthesis.get("related_clusters", []) or []:
         if not isinstance(relationship, Mapping):
             continue
-        target_id = str(
-            relationship.get("target_cluster_id")
-            or relationship.get("related_cluster_id")
-            or relationship.get("cluster_id")
-            or ""
-        )
+        target_id = _related_cluster_target_id(relationship)
         target = cluster_by_id.get(target_id)
         text = _human_projection_text(
             relationship.get("relationship")
@@ -25965,12 +26016,7 @@ def _literature_map_markdown_v09(
                 or relationship.get("text")
                 or ""
             )
-            target_id = str(
-                relationship.get("target_cluster_id")
-                or relationship.get("cluster_id")
-                or relationship.get("related_cluster_id")
-                or ""
-            )
+            target_id = _related_cluster_target_id(relationship)
             target = cluster_by_id.get(target_id)
             if text:
                 target_text = (

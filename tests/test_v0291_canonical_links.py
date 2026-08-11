@@ -298,7 +298,7 @@ def test_managed_cluster_refresh_replaces_stale_related_cluster_targets(
     synthesis = {
         "cluster_contract": "streamlined-full-note-v2",
         "title": "Source cluster",
-        "related_clusters": [{"target_cluster_id": target["cluster_id"]}],
+        "related_clusters": [{"cluster_id": target["cluster_id"]}],
     }
     rendered = _streamlined_cluster_markdown(
         source,

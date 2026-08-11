@@ -24,7 +24,7 @@ from auto_zettelkasten.pipeline import (
 def _valid_receipt() -> dict[str, object]:
     return {
         "receipt_schema_version": "1",
-        "engine_version": "0.29.8",
+        "engine_version": "0.29.9",
         "artifact_schema_version": "1.20",
         "identity": "semantic-build",
         "status": "built",

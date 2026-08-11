@@ -549,6 +549,106 @@ def test_berg_style_citations_match_compatible_first_author_surnames() -> None:
     assert walter["basis"] == hegre["basis"] == "title_year_first_author"
 
 
+@pytest.mark.parametrize("candidate_year", ["", "2001"])
+@pytest.mark.parametrize(
+    ("citation_title", "candidate_title"),
+    [
+        ("A Theory of Durable Peace Settlements", "a theory of durable peace settlements"),
+        ("Theory of Durable Peace Settlements", "a theory of durable peace settlements"),
+    ],
+)
+def test_title_literature_match_requires_confirmed_citation_year(
+    candidate_year: str,
+    citation_title: str,
+    candidate_title: str,
+) -> None:
+    match = _match_literature_position_detail(
+        {
+            "title": citation_title,
+            "author": "Scholar",
+            "year": "2002",
+        },
+        {
+            "by_source_id": {
+                "source-candidate": {
+                    "source_id": "source-candidate",
+                    "zotero_key": "CANDIDATE",
+                    "title": candidate_title,
+                    "author_surnames": ["scholar"],
+                    "year": candidate_year,
+                }
+            },
+            "by_zotero_key": {},
+            "by_doi": {},
+            "by_isbn": {},
+            "by_url": {},
+            "known_zotero_items": [],
+        },
+    )
+
+    assert match["status"] == "not_in_snapshot"
+    assert match["source_id"] == ""
+
+
+def test_title_literature_match_without_citation_year_remains_available() -> None:
+    match = _match_literature_position_detail(
+        {"title": "A Theory of Durable Peace Settlements", "author": "Scholar"},
+        {
+            "by_source_id": {
+                "source-candidate": {
+                    "source_id": "source-candidate",
+                    "zotero_key": "CANDIDATE",
+                    "title": "a theory of durable peace settlements",
+                    "author_surnames": ["scholar"],
+                    "year": "",
+                }
+            },
+            "by_zotero_key": {},
+            "by_doi": {},
+            "by_isbn": {},
+            "by_url": {},
+            "known_zotero_items": [],
+        },
+    )
+
+    assert match["source_id"] == "source-candidate"
+    assert match["basis"] == "title_year_first_author"
+
+
+@pytest.mark.parametrize("candidate_year", ["", "2001"])
+def test_known_unmapped_title_match_requires_confirmed_citation_year(
+    candidate_year: str,
+) -> None:
+    match = _match_literature_position_detail(
+        {
+            "title": "A Theory of Durable Peace Settlements",
+            "author": "Scholar",
+            "year": "2002",
+        },
+        {
+            "by_source_id": {},
+            "by_zotero_key": {},
+            "by_doi": {},
+            "by_isbn": {},
+            "by_url": {},
+            "known_zotero_items": [
+                {
+                    "zotero_key": "KNOWN",
+                    "title": "a theory of durable peace settlements",
+                    "author_surnames": ["scholar"],
+                    "year": candidate_year,
+                    "doi": "",
+                    "isbn": "",
+                    "url": "",
+                }
+            ],
+        },
+    )
+
+    assert match["status"] == "not_in_snapshot"
+    assert match["zotero_key"] == ""
+
+
 def test_literature_match_distinguishes_known_unmapped_from_absent() -> None:
     index = {
         "by_source_id": {},

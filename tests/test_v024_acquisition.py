@@ -227,9 +227,32 @@ def test_visible_acquisition_rows_group_same_zotero_work() -> None:
             "attributions"
         ]
     } == {"A", "B"}
+    exact_aliases = []
+    for row, author, year in zip(
+        candidates,
+        ("Barry R. Posen", "Posen, Barry R."),
+        ("1993", "1993 [first edition]"),
+        strict=True,
+    ):
+        exact_aliases.append(
+            {
+                **row,
+                "status": "not_in_snapshot",
+                "normalized_citation": {
+                    "title": "Security Dilemma",
+                    "author": author,
+                    "year": year,
+                },
+            }
+        )
+    exact = validate_streamlined_cluster_synthesis(
+        response, cluster, profiles, important_unmapped_literature=exact_aliases
+    )
+    assert len(exact["important_cited_works_not_yet_mapped"]) == 1
+    assert len(exact["acquisition_candidate_dispositions"]) == 2
 
 
-def test_visible_acquisition_alias_prefers_mapped_identity_and_action() -> None:
+def test_visible_exact_acquisition_alias_prefers_mapped_identity_and_action() -> None:
     profiles = [_profile("A"), _profile("B")]
     cluster = {"cluster_id": "cluster-one", "source_ids": ["A", "B"]}
     response = _cluster_response(cluster, profiles)
@@ -252,7 +275,10 @@ def test_visible_acquisition_alias_prefers_mapped_identity_and_action() -> None:
             "normalized_citation": {
                 "author": "World Bank",
                 "year": "2011",
-                "title": "World Development Report 2011 (as cited in source)",
+                "title": (
+                    "World Development Report 2011: Conflict, Security, "
+                    "and Development (as cited in source)"
+                ),
             },
             "status": "not_in_snapshot",
             "attributions": [

@@ -3811,7 +3811,7 @@ def _match_literature_position_detail(
         for source_id, row in dict(source_index.get("by_source_id", {})).items()
         if title
         and str(row.get("title") or "") == title
-        and (not year or not row.get("year") or str(row.get("year")) == year)
+        and _compatible_citation_year(year, str(row.get("year") or ""))
         and _compatible_first_author(
             first_author, list(row.get("author_surnames", []) or [])
         )
@@ -3843,7 +3843,7 @@ def _match_literature_position_detail(
             for source_id, row in dict(
                 source_index.get("by_source_id", {})
             ).items()
-            if (not year or not row.get("year") or row.get("year") == year)
+            if _compatible_citation_year(year, str(row.get("year") or ""))
             and _compatible_first_author(
                 first_author, list(row.get("author_surnames", []) or [])
             )
@@ -3985,7 +3985,9 @@ def _known_or_absent_literature_match(
             or (
                 title
                 and str(row.get("title") or "") == title
-                and (not year or not row.get("year") or row.get("year") == year)
+                and _compatible_citation_year(
+                    year, str(row.get("year") or "")
+                )
                 and _compatible_first_author(
                     first_author, list(row.get("author_surnames", []) or [])
                 )
@@ -4080,6 +4082,14 @@ def _compatible_first_author(
     if not cited_first_author or not candidate_surnames:
         return True
     return cited_first_author == _normalized_match_text(str(candidate_surnames[0]))
+
+
+def _compatible_citation_year(cited_year: str, candidate_year: str) -> bool:
+    """Fail closed when a supplied citation year cannot be confirmed."""
+
+    if not cited_year:
+        return True
+    return bool(candidate_year) and candidate_year == cited_year
 
 
 def _normalized_strong_identifier(value: str) -> str:

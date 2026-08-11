@@ -8,6 +8,7 @@ from auto_zettelkasten.files import read_yaml, write_yaml
 from auto_zettelkasten.indexes import _compact_cluster_catalogue
 from auto_zettelkasten.literature import (
     _CheckpointedReasonerCalls,
+    _cluster_writer_member_roles,
     _cluster_synthesis_profile_projection,
     _cluster_markdown,
     _prune_stale_generated_markdown,
@@ -213,6 +214,26 @@ def test_streamlined_cluster_ignores_harmless_optional_shape_drift() -> None:
     assert normalized["dropped_members"] == [{"source_id": "B"}]
 
 
+def test_streamlined_cluster_filters_nonmember_missing_ids() -> None:
+    profiles = [_profile("A"), _profile("B")]
+    cluster = {
+        "cluster_id": "cluster-one",
+        "label": "Cluster One",
+        "source_ids": ["A", "B"],
+    }
+    response = _streamlined_response(cluster, profiles)
+    response["missing_member_ids"] = ["A", "external-source-candidate"]
+    response["related_clusters"] = [{"cluster_id": "cluster-two"}]
+
+    validated = validate_streamlined_cluster_synthesis(
+        response, cluster, profiles
+    )
+
+    assert validated["missing_member_ids"] == ["A"]
+    assert validated["related_clusters"][0]["target_cluster_id"] == "cluster-two"
+    assert "unknown_missing_member_ignored" in validated["quality_warnings"]
+
+
 def test_streamlined_cluster_rebinds_locator_only_finding_evidence() -> None:
     profiles = [_profile("A"), _profile("B")]
     for profile in profiles:
@@ -355,7 +376,11 @@ def test_oversized_cluster_is_partitioned_before_writers(tmp_path: Path) -> None
 
         def synthesize_cluster(self, projected, request, *, context=None):
             writer_sizes.append(len(projected))
-            return _streamlined_response(context["cluster"], projected)
+            response = _streamlined_response(context["cluster"], projected)
+            response["member_roles"] = {
+                row["source_id"]: "core" for row in projected
+            }
+            return response
 
     report = build_literature_report(
         profiles,
@@ -394,10 +419,39 @@ def test_oversized_cluster_is_partitioned_before_writers(tmp_path: Path) -> None
     assert all(row["formation_route"] == "partitioned_cluster_plan" for row in clusters)
     assert writer_sizes == [2, 2]
     assert all(row["parent_cluster_id"] for row in clusters)
+    assert all(
+        row["source_backed"]
+        == (row["qualification_status"] == "source_backed_cluster")
+        for row in clusters
+    )
+    roles_by_cluster = {
+        row["label"]: {
+            role["source_id"]: role["role"] for role in row["source_roles"]
+        }
+        for row in clusters
+    }
+    assert roles_by_cluster["Left child"]["A"] == "core"
+    assert roles_by_cluster["Right child"]["A"] == "bridge"
     assert {
         row["source_id"]
         for row in report["cluster_registry"]["unclustered_sources"]
     } == {"D"}
+
+
+def test_partition_writer_uses_preserved_planner_role_class() -> None:
+    warnings: list[str] = []
+    roles = _cluster_writer_member_roles(
+        {"member_roles": {"A": "core"}},
+        {
+            "partition_root_id": "parent",
+            "source_roles": [{"source_id": "A", "role": "core"}],
+            "candidate_roles": {"A": "bridge"},
+        },
+        {"A"},
+        warnings,
+    )
+
+    assert roles == {"A": "bridge"}
 
 
 def test_partition_checkpoint_revalidation_rejects_old_free_text_roles(
