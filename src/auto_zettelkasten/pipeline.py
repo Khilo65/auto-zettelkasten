@@ -55,6 +55,7 @@ from .literature import (
     _preserve_last_valid_clusters_on_refresh_failure,
     _provider_worker_count,
     _reasoner_packet_chars,
+    _semantic_literature_policy,
     _synthesis_failure_class,
     build_navigation_projection,
     build_literature_map,
@@ -5112,8 +5113,15 @@ def _plan_literature_families(
             "provider": str(getattr(reasoner, "name", "")),
             "model": str(getattr(reasoner, "model", "")),
             "prompt_version": LITERATURE_FAMILY_PLAN_PROMPT_VERSION,
-            "policy": request.literature_policy.to_dict(),
+            "policy": _semantic_literature_policy(
+                request.literature_policy.to_dict()
+            ),
         }
+    )
+    planning_job_identity = str(
+        prior_plan.get("planning_job_identity")
+        or prior_plan.get("planning_identity")
+        or planning_identity
     )
     prior_source_hashes = dict(prior_plan.get("lean_source_hashes", {}) or {})
     incremental_source_ids = sorted(
@@ -5243,7 +5251,7 @@ def _plan_literature_families(
             + stable_hash(
                 {
                     "index": planner_rows,
-                    "planning_identity": planning_identity,
+                    "planning_identity": planning_job_identity,
                     "incremental_source_ids": incremental_source_ids,
                 }
             )[:16],
@@ -5542,6 +5550,7 @@ def _plan_literature_families(
         "planning_path": planning_path,
         "planning_mode": str(context["planning_mode"]),
         "planning_identity": planning_identity,
+        "planning_job_identity": planning_job_identity,
         "incremental_source_ids": incremental_source_ids,
         "lean_source_hashes": lean_source_hashes,
         "lean_index_hash": stable_hash(lean_rows),
@@ -5609,6 +5618,7 @@ def _plan_literature_families(
             "neighboring_families",
             "planning_path",
             "planning_identity",
+            "planning_job_identity",
             "incremental_source_ids",
             "lean_source_hashes",
             "lean_index_hash",

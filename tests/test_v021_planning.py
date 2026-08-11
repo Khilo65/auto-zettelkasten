@@ -3,10 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 
 from auto_zettelkasten.cli import build_parser
-from auto_zettelkasten.files import write_yaml
+from auto_zettelkasten.files import read_yaml, write_yaml
 from auto_zettelkasten.indexes import lean_discovery_projection
 from auto_zettelkasten.literature import _validate_literature_family_plan_response
-from auto_zettelkasten.models import LiteratureMapRequest
+from auto_zettelkasten.models import LiteratureMappingPolicy, LiteratureMapRequest
 from auto_zettelkasten.pipeline import (
     _merge_literature_family_plans,
     _plan_literature_families,
@@ -360,18 +360,45 @@ def test_identical_initial_family_plan_keeps_the_same_job_key(
         reasoner_calls=calls,
         request=request,
     )
+    plan_path = (
+        tmp_path / "02_source_memory" / "indexes" / "literature_family_plan.yml"
+    )
+    legacy_plan = read_yaml(plan_path, {})
+    legacy_plan["planning_identity"] = "legacy-planning-identity"
+    legacy_plan.pop("planning_job_identity", None)
+    write_yaml(plan_path, legacy_plan)
     second = _plan_literature_families(
         tmp_path,
         profiles=profiles,
         catalogue={"catalogue_path": str(catalogue_path)},
         reasoner=Reasoner(),
         reasoner_calls=calls,
-        request=request,
+        request=LiteratureMapRequest(
+            tmp_path,
+            literature_policy=LiteratureMappingPolicy(max_synthesis_calls=271),
+        ),
+    )
+    third = _plan_literature_families(
+        tmp_path,
+        profiles=profiles,
+        catalogue={"catalogue_path": str(catalogue_path)},
+        reasoner=Reasoner(),
+        reasoner_calls=calls,
+        request=LiteratureMapRequest(
+            tmp_path,
+            literature_policy=LiteratureMappingPolicy(max_synthesis_calls=271),
+        ),
     )
 
     assert first["incremental_source_ids"] == []
     assert second["incremental_source_ids"] == []
-    assert calls.keys[0] == calls.keys[1]
+    assert third["incremental_source_ids"] == []
+    assert calls.keys[1] == calls.keys[2]
+    assert second["planning_job_identity"] == "legacy-planning-identity"
+    assert third["planning_job_identity"] == "legacy-planning-identity"
+    assert read_yaml(plan_path, {})["planning_job_identity"] == (
+        "legacy-planning-identity"
+    )
 
 
 def test_initial_family_plan_adds_coverage_completion_family(
