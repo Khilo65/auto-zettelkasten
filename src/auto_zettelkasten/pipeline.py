@@ -9408,12 +9408,34 @@ def _run_relationship_reasoning(
             and row.get("disposition") == "selected_for_adjudication"
         ):
             row["reconsideration"] = "inactive_or_retired_reconsidered"
+    shared_incremental_source_ids = {
+        str(source_id)
+        for source_id in (
+            shared_family_plan.get("incremental_source_ids", [])
+            if shared_family_plan
+            else []
+        )
+        if str(source_id) in profile_by_source
+    }
     incremental_focus = (
         set(profile_focus_source_ids)
-        if shared_family_plan
-        and shared_family_plan.get("incremental_source_ids")
+        if shared_incremental_source_ids
         else set(focus_source_ids)
     )
+    if (
+        shared_incremental_source_ids
+        and not incremental_focus
+        and (
+            prior_state.get("relationship_discovery_incomplete_jobs")
+            or str(prior_state.get("relationship_discovery_status") or "")
+            in {"partial", "failed"}
+        )
+    ):
+        # A terminal-partial discovery may durably record the current profile
+        # hashes before its incomplete jobs are resumed. Retain the shared
+        # incremental affected set so that resume cannot admit unchanged
+        # old-old candidates merely because the current hash delta is empty.
+        incremental_focus = shared_incremental_source_ids
     if incremental_focus and not discovery_identity_changed and not reuse_selected_pool:
         inferred_rows = [
             row
