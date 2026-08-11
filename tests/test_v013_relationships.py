@@ -33,7 +33,7 @@ def test_relationship_discovery_uses_lean_recall_first_prompt() -> None:
     prompt = _relationship_candidate_system_prompt()
 
     assert LITERATURE_RELATIONSHIP_PROMPT_VERSION == RELATIONSHIP_PROMPT_VERSION
-    assert "optimize recall" in prompt
+    assert "Prefer fewer grounded pairs to filling a target" in prompt
     assert "not a published relationship" in prompt
     assert "navigation hypothesis that may be wrong" in prompt
     assert "each endpoint profile independently supplies" in prompt
