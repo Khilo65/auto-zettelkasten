@@ -1343,17 +1343,9 @@ def _schedule_cluster_writers(
     reasoner_call: Any,
     runnable: Sequence[Mapping[str, Any]],
 ) -> tuple[list[Mapping[str, Any]], list[Mapping[str, Any]]]:
-    """Schedule every runnable cluster unless an explicit call limit forbids it."""
+    """Let checkpoints settle before the call budget rejects true misses."""
 
-    if not isinstance(reasoner_call, _CheckpointedReasonerCalls):
-        return list(runnable), []
-    if reasoner_call.max_calls is None:
-        return list(runnable), []
-    available = max(
-        0,
-        reasoner_call.max_calls - reasoner_call.cumulative_provider_calls,
-    )
-    return list(runnable[:available]), list(runnable[available:])
+    return list(runnable), []
 
 
 class _CheckpointedReasonerCalls:
@@ -19443,7 +19435,10 @@ def _persist_cluster_acquisition_revisions(
         if not all(key):
             continue
         prior = by_key.get(key, {})
-        if row.get("state") == "pending" and prior.get("state") == "active":
+        if (
+            row.get("state") in {"pending", "failure"}
+            and prior.get("state") == "active"
+        ):
             continue
         if row.get("state") == "active":
             for existing_key, old in by_key.items():
@@ -22218,11 +22213,7 @@ def build_literature_report(
         acquisition_ledger_path,
         [
             _cluster_acquisition_revision(
-                next(
-                    cluster
-                    for cluster in synthesis_order
-                    if str(cluster.get("cluster_id") or "") == cluster_id
-                ),
+                cluster_input_clusters[cluster_id],
                 cluster_inputs_by_id[cluster_id][1].get(
                     "important_unmapped_literature", []
                 ),

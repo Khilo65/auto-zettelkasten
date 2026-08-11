@@ -564,6 +564,26 @@ def test_failed_refresh_keeps_active_acquisition_revision_and_records_failure(
     assert old["candidates"][0]["writer_disposition"] == "retired_mapped"
 
 
+def test_failed_same_revision_cannot_replace_active_acquisition_receipt(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "cluster_acquisition_ledger.yml"
+    active = {
+        "cluster_id": "cluster-one",
+        "cluster_revision_hash": "same",
+        "candidate_input_hash": "same-input",
+        "state": "active",
+        "candidates": [],
+    }
+
+    _persist_cluster_acquisition_revisions(path, [active])
+    payload = _persist_cluster_acquisition_revisions(
+        path, [{**active, "state": "failure"}]
+    )
+
+    assert payload["revisions"] == [active]
+
+
 def test_active_writer_revision_supersedes_matching_pending_receipt(
     tmp_path: Path,
 ) -> None:
@@ -950,11 +970,163 @@ def test_cluster_scheduler_reserves_retry_capacity_and_accounts_deferrals(
         for index, cluster in enumerate(completion_pending)
     )
 
+    calls.cumulative_provider_calls = calls.max_calls
+    scheduled, completion_pending = _schedule_cluster_writers(calls, runnable)
+    assert scheduled == runnable
+    assert completion_pending == []
+
     calls.cumulative_provider_calls = 25
     assert calls("cluster_proposal", "retry", "propose_clusters", [], {}) == {
         "clusters": []
     }
     assert calls.cumulative_provider_calls == 27
+
+
+def test_unchanged_plan_reuses_cluster_writers_and_localizes_relationship_change(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile(source_id) for source_id in ("A", "B", "C", "D")]
+    notes = [
+        {
+            "source_id": source_id,
+            "title": f"Source {source_id}",
+            "source_scope": "full_document",
+            "body": f"# Source {source_id}\n\nComplete note.",
+        }
+        for source_id in ("A", "B", "C", "D")
+    ]
+    shared_plan = {
+        "literature_families": [
+            {
+                "family_id": "first",
+                "label": "First problem",
+                "organizing_problem": "How do A and B address the first problem?",
+                "source_ids": ["A", "B"],
+                "proposed_roles": {"A": "core", "B": "supporting"},
+                "candidate_cluster": True,
+            },
+            {
+                "family_id": "second",
+                "label": "Second problem",
+                "organizing_problem": "How do C and D address the second problem?",
+                "source_ids": ["C", "D"],
+                "proposed_roles": {"C": "core", "D": "supporting"},
+                "candidate_cluster": True,
+            },
+        ],
+        "discovery_jobs": [],
+        "neighboring_families": [],
+    }
+    ledger_path = tmp_path / "cluster_acquisition_ledger.yml"
+
+    class Reasoner:
+        name = "local"
+        model = "test"
+
+        def __init__(self) -> None:
+            self.cluster_calls: list[str] = []
+
+        def synthesize_cluster(self, projected, request, *, context=None):
+            self.cluster_calls.append(str(context["cluster"]["cluster_id"]))
+            return _cluster_response(context["cluster"], projected)
+
+    reasoner = Reasoner()
+
+    def request(max_calls: int) -> LiteratureMapRequest:
+        return LiteratureMapRequest(
+            tmp_path,
+            literature_policy=LiteratureMappingPolicy(
+                max_synthesis_calls=max_calls
+            ),
+        )
+
+    def prior(report: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            **dict(report["cluster_registry"]),
+            "cluster_syntheses": dict(report["cluster_syntheses"]),
+        }
+
+    first_request = request(2)
+    first_calls = _CheckpointedReasonerCalls(
+        tmp_path, "localized-clusters", reasoner, first_request
+    )
+    first = build_literature_report(
+        profiles,
+        reasoner=reasoner,
+        reasoner_call=first_calls,
+        request=first_request,
+        source_notes=notes,
+        shared_literature_plan=shared_plan,
+        acquisition_ledger_path=ledger_path,
+    )
+    assert len(reasoner.cluster_calls) == 2
+    first_clusters = {
+        row["cluster_id"]: row["revision_hash"]
+        for row in first["cluster_registry"]["clusters"]
+    }
+
+    outside_relationship = {
+        "relation_id": "outside",
+        "source_id": "A",
+        "target_source_id": "C",
+        "relation_type": "supports",
+        "provenance": "human_curated",
+        "active": True,
+    }
+    replay_calls = _CheckpointedReasonerCalls(
+        tmp_path, "localized-clusters", reasoner, first_request
+    )
+    replay = build_literature_report(
+        profiles,
+        previous_registry=prior(first),
+        reasoner=reasoner,
+        reasoner_call=replay_calls,
+        request=first_request,
+        source_notes=notes,
+        shared_literature_plan=shared_plan,
+        accepted_relationships=[outside_relationship],
+        acquisition_ledger_path=ledger_path,
+    )
+    assert replay_calls.provider_calls == 0
+    assert len(reasoner.cluster_calls) == 2
+    assert {
+        row["cluster_id"]: row["revision_hash"]
+        for row in replay["cluster_registry"]["clusters"]
+    } == first_clusters
+    assert {
+        row["state"] for row in replay["cluster_acquisition_ledger"]["revisions"]
+    } == {"active"}
+
+    internal_relationship = {
+        **outside_relationship,
+        "relation_id": "inside",
+        "target_source_id": "B",
+    }
+    changed_request = request(3)
+    changed_calls = _CheckpointedReasonerCalls(
+        tmp_path, "localized-clusters", reasoner, changed_request
+    )
+    changed = build_literature_report(
+        profiles,
+        previous_registry=prior(replay),
+        reasoner=reasoner,
+        reasoner_call=changed_calls,
+        request=changed_request,
+        source_notes=notes,
+        shared_literature_plan=shared_plan,
+        accepted_relationships=[outside_relationship, internal_relationship],
+        acquisition_ledger_path=ledger_path,
+    )
+
+    assert changed_calls.provider_calls == 1
+    assert len(reasoner.cluster_calls) == 3
+    changed_cluster_id = reasoner.cluster_calls[-1]
+    changed_members = next(
+        row["source_ids"]
+        for row in changed["cluster_registry"]["clusters"]
+        if row["cluster_id"] == changed_cluster_id
+    )
+    assert changed_members == ["A", "B"]
 
 
 def test_stream_read_failure_is_transport() -> None:
