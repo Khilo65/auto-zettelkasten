@@ -38,6 +38,7 @@ def test_relationship_discovery_uses_lean_recall_first_prompt() -> None:
     assert "navigation hypothesis that may be wrong" in prompt
     assert "each endpoint profile independently supplies" in prompt
     assert "must not invent an unstated mediator" in prompt
+    assert "remove the family goal and self-check" in prompt
     assert "return no_more_candidates even below" in prompt
     assert "max_inferred_pairs" in prompt
     assert "bridge_job_id" in prompt

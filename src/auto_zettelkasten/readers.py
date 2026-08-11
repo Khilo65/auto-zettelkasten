@@ -1962,7 +1962,7 @@ def _relationship_bridge_shard_system_prompt() -> str:
 
 def _relationship_candidate_system_prompt() -> str:
     return (
-        "You retrieve comparisons for Auto-Zettelkasten relationship discovery prompt v18. "
+        "You retrieve comparisons for Auto-Zettelkasten relationship discovery prompt v19. "
         "Return exactly one JSON object with candidates and job_outcomes arrays. Each candidate "
         "contains only left_source_id, right_source_id, comparison_proposition, "
         "bridge_job_id, and rank. Use only supplied IDs, put the "
@@ -1976,8 +1976,10 @@ def _relationship_candidate_system_prompt() -> str:
         "pathway, construct or actor equivalence, outcome link, or empirical "
         "classification. A valid sequence requires one work's studied output or "
         "construct to be the other's studied input or construct; a valid theory-to-"
-        "application bridge requires the same mechanism or object. Continue to optimize recall, "
-        "coverage, diversity, and useful navigation within that grounding rule. If "
+        "application bridge requires the same mechanism or object. Before returning each pair, "
+        "remove the family goal and self-check that the two endpoint profiles alone still support "
+        "the stated comparison; otherwise omit it. Continue to optimize recall, coverage, "
+        "diversity, and useful navigation within that grounding rule. If "
         "only broad adjacency remains, return no_more_candidates even below the "
         "requested target. Respect max_inferred_pairs as the maximum "
         "number of candidates in this response. Return as many useful pairs as fit "
