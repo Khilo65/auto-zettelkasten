@@ -246,7 +246,7 @@ def test_named_shared_failure_remains_partial(tmp_path: Path) -> None:
 
     assert result["relationship_discovery_status"] == "partial"
     assert result["relationship_discovery_incomplete_jobs"] == ["complement"]
-    assert result["relationship_stage_complete"] is True
+    assert result["relationship_stage_complete"] is False
 
 
 def test_settled_shared_state_reconciles_old_false_partial_locally(
