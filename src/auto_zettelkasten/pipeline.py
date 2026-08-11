@@ -9296,18 +9296,29 @@ def _run_relationship_reasoning(
             and row.get("disposition") == "selected_for_adjudication"
         ):
             row["reconsideration"] = "inactive_or_retired_reconsidered"
-    if (
-        focus_source_ids
-        and not discovery_identity_changed
-        and not reuse_selected_pool
-    ):
-        focus = set(focus_source_ids)
+    incremental_focus = (
+        set(profile_focus_source_ids)
+        if shared_family_plan
+        and shared_family_plan.get("incremental_source_ids")
+        else set(focus_source_ids)
+    )
+    if incremental_focus and not discovery_identity_changed and not reuse_selected_pool:
         inferred_rows = [
             row
             for row in inferred_rows
-            if str(row.get("source_id") or "") in focus
-            or str(row.get("target_id") or "") in focus
+            if str(row.get("source_id") or "") in incremental_focus
+            or str(row.get("target_id") or "") in incremental_focus
         ]
+        for disposition in candidate_dispositions:
+            pair_values = list(disposition.get("pair", []) or [])
+            if (
+                len(pair_values) == 2
+                and disposition.get("disposition") == "selected_for_adjudication"
+                and not incremental_focus.intersection(
+                    (str(pair_values[0]), str(pair_values[1]))
+                )
+            ):
+                disposition["disposition"] = "unchanged_pair_out_of_scope"
     final_inferred_pairs = {
         canonical_pair(str(row["source_id"]), str(row["target_id"]))
         for row in inferred_rows
@@ -10183,9 +10194,10 @@ def _run_relationship_reasoning(
         "already_visible": 1,
         "current_no_relationship": 2,
         "wrong_scope": 3,
-        "deferred_capacity": 4,
-        "parked_contract_failure": 5,
-        "duplicate_merged": 6,
+        "unchanged_pair_out_of_scope": 4,
+        "deferred_capacity": 5,
+        "parked_contract_failure": 6,
+        "duplicate_merged": 7,
     }
     dispositions_by_pair: dict[tuple[str, str], dict[str, Any]] = {}
     for raw in candidate_dispositions:

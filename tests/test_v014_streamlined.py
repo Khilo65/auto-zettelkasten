@@ -13,6 +13,7 @@ from auto_zettelkasten.literature import (
     _cluster_markdown,
     _prune_stale_generated_markdown,
     _project_planned_cluster_neighbors,
+    _same_provider_inputs,
     _source_notes_with_custody_relations,
     _write_markdown_with_quality_ratchet,
     build_literature_report,
@@ -1290,6 +1291,78 @@ def test_semantic_checkpoint_is_reused_across_run_ids(tmp_path: Path) -> None:
     assert reasoner.calls == 1
     assert second.provider_calls == 0
     assert second.checkpoint_hits == 1
+
+
+def test_cluster_writer_cache_ignores_only_projection_neighbors() -> None:
+    components = {
+        "stage": "same",
+        "key": "same",
+        "method": "same",
+        "provider": "same",
+        "model": "same",
+        "profile_dependencies": "same",
+        "context": "old-context",
+        "policy": "same",
+        "prompt_version": "same",
+        "algorithm_version": "same",
+        "anchor_algorithm_version": "same",
+        "support_envelope_version": "same",
+        "proposition_algorithm_version": "same",
+        "proposition_matrix_version": "same",
+        "gap_rule_version": "same",
+        "family_relation_version": "same",
+        "family_admission_version": "same",
+        "strict_adjudication_version": "same",
+        "study_lineage_version": "same",
+        "independence_algorithm_version": "same",
+        "quantitative_validation_version": "same",
+        "locator_audit_version": "same",
+    }
+    semantic_context = {
+        "cluster": "same",
+        "candidate_input_receipt": "same",
+        "accepted_relationships": "same",
+        "literature_positions": "same",
+        "important_unmapped_literature": "same",
+    }
+    checkpoint = {
+        "dependency_component_hashes": components,
+        "dependency_context_hashes": {
+            **semantic_context,
+            "neighbor_clusters": "old",
+            "planned_neighbor_relationships": "old",
+        },
+    }
+
+    assert _same_provider_inputs(
+        checkpoint,
+        {**components, "context": "new-context"},
+        stage="cluster_synthesis",
+        current_context_hashes={
+            **semantic_context,
+            "neighbor_clusters": "new",
+            "planned_neighbor_relationships": "old",
+        },
+    )
+    assert not _same_provider_inputs(
+        checkpoint,
+        {**components, "context": "new-context"},
+        stage="cluster_synthesis",
+        current_context_hashes={
+            **semantic_context,
+            "neighbor_clusters": "new",
+            "planned_neighbor_relationships": "new",
+        },
+    )
+    assert not _same_provider_inputs(
+        checkpoint,
+        {**components, "context": "new-context"},
+        stage="cluster_synthesis",
+        current_context_hashes={
+            **semantic_context,
+            "accepted_relationships": "changed",
+        },
+    )
 
 
 def test_independent_cluster_writers_run_concurrently_with_full_notes() -> None:

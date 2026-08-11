@@ -521,6 +521,74 @@ def test_shared_plan_keeps_family_discovery_in_separate_packets(
     assert discovery_calls[1][2]["prior_candidate_pairs"] == []
 
 
+def test_incremental_discovery_excludes_unchanged_pairs(tmp_path: Path) -> None:
+    baseline_profiles = [_profile("A", collection="C1"), _profile("B", collection="C2")]
+    baseline = _run(
+        tmp_path,
+        baseline_profiles,
+        _Calls(
+            lambda stage, _profiles, _context: (
+                {"candidates": []}
+                if stage.endswith("candidate_selection")
+                else {"decisions": []}
+            )
+        ),
+    )
+    _commit_relationship_selection_state(
+        tmp_path,
+        baseline,
+        catalogue_revision=baseline["reconciled_catalogue_revision"],
+    )
+    profiles = [*baseline_profiles, _profile("C", collection="C1")]
+
+    def handler(stage, _profiles, context):
+        if stage.endswith("candidate_selection"):
+            return {
+                "candidates": [
+                    {**_candidate("A", "B"), "bridge_job_id": "requested"},
+                    {**_candidate("B", "C", rank=2), "bridge_job_id": "requested"},
+                ],
+                "job_outcomes": [
+                    {"bridge_job_id": "requested", "status": "no_more_candidates"}
+                ],
+            }
+        assert {
+            tuple(sorted(job["pair"].values())) for job in context["pair_jobs"]
+        } == {("B", "C")}
+        return {"decisions": [_decision(context["pair_jobs"][0])]}
+
+    result = _run(
+        tmp_path,
+        profiles,
+        _Calls(handler),
+        shared_family_plan={
+            "lean_index_hash": "incremental",
+            "incremental_source_ids": ["C"],
+            "literature_families": [
+                {"family_id": "requested", "source_ids": ["A", "B", "C"]}
+            ],
+            "discovery_jobs": [
+                {
+                    "job_id": "requested",
+                    "family": "explicit_requested_collection_comparison",
+                    "left_source_ids": ["A", "C"],
+                    "right_source_ids": ["B"],
+                    "requested_collection_pair": ["C1", "C2"],
+                    "candidate_quota": 2,
+                }
+            ],
+        },
+    )
+
+    assert result["pair_job_count"] == 1
+    dispositions = {
+        tuple(row["pair"]): row["disposition"]
+        for row in result["candidate_dispositions"]
+    }
+    assert dispositions[("A", "B")] == "unchanged_pair_out_of_scope"
+    assert dispositions[("B", "C")] == "selected_for_adjudication"
+
+
 def test_complementary_quota_allocation_covers_every_family_stably() -> None:
     jobs = [
         {

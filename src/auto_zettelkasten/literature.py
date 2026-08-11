@@ -2981,6 +2981,7 @@ def _same_provider_inputs(
             "cluster_plan",
             "cluster_proposal",
             "cluster_reconciliation",
+            "cluster_synthesis",
             "gap_adjudication",
         }
         or current_context_hashes is None
@@ -3051,6 +3052,15 @@ def _same_provider_inputs(
             "prior_proposals",
         )
         if stage in {"cluster_proposal", "cluster_reconciliation"}
+        else (
+            "cluster",
+            "candidate_input_receipt",
+            "accepted_relationships",
+            "literature_positions",
+            "important_unmapped_literature",
+            "planned_neighbor_relationships",
+        )
+        if stage == "cluster_synthesis"
         else ("candidates", "internal_search_log")
     )
     return all(
