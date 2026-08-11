@@ -5337,74 +5337,7 @@ def _plan_literature_families(
             [str(row["source_id"]) for row in chunk] for chunk in chunks
         ]
     if incremental_mode:
-        affected = set(incremental_source_ids)
-        patch_families = [
-            dict(row)
-            for row in plan.get("literature_families", []) or []
-            if isinstance(row, Mapping)
-        ]
-        patch_family_ids = {
-            str(row.get("family_id") or "") for row in patch_families
-        }
-        retained_families = [
-            dict(row)
-            for row in prior_plan.get("literature_families", []) or []
-            if isinstance(row, Mapping)
-            and str(row.get("family_id") or "") not in patch_family_ids
-            and affected.isdisjoint(
-                {
-                    str(value)
-                    for value in row.get("source_ids", []) or []
-                }
-            )
-        ]
-        patch_jobs = [
-            dict(row)
-            for row in plan.get("discovery_jobs", []) or []
-            if isinstance(row, Mapping)
-        ]
-        patch_job_ids = {str(row.get("job_id") or "") for row in patch_jobs}
-        retained_jobs = [
-            dict(row)
-            for row in prior_plan.get("discovery_jobs", []) or []
-            if isinstance(row, Mapping)
-            and str(row.get("job_id") or "") not in patch_job_ids
-            and affected.isdisjoint(
-                {
-                    str(value)
-                    for side in ("left_source_ids", "right_source_ids")
-                    for value in row.get(side, []) or []
-                }
-            )
-        ]
-        merged_families = [*retained_families, *patch_families]
-        merged_family_ids = {
-            str(row.get("family_id") or "") for row in merged_families
-        }
-        merged_neighbors: dict[tuple[str, str], dict[str, Any]] = {}
-        for raw in [
-            *(prior_plan.get("neighboring_families", []) or []),
-            *(plan.get("neighboring_families", []) or []),
-        ]:
-            if not isinstance(raw, Mapping):
-                continue
-            left = str(raw.get("left_family_id") or "")
-            right = str(raw.get("right_family_id") or "")
-            if (
-                left in merged_family_ids
-                and right in merged_family_ids
-                and left != right
-            ):
-                merged_neighbors[tuple(sorted((left, right)))] = dict(raw)
-        plan = {
-            "literature_families": merged_families,
-            "discovery_jobs": [*retained_jobs, *patch_jobs],
-            "neighboring_families": list(merged_neighbors.values()),
-            "source_dispositions": [
-                *(prior_plan.get("source_dispositions", []) or []),
-                *(plan.get("source_dispositions", []) or []),
-            ],
-        }
+        plan = _merge_literature_family_plans(prior_plan, plan)
     validated = _validate_literature_family_plan(
         plan,
         lean_rows=lean_rows,
@@ -5521,17 +5454,17 @@ def _plan_literature_families(
                     failed_packet_ids.extend(completion_failures)
             except Exception as exc:
                 completion_status = f"partial_failure:{type(exc).__name__}"
-    unaccounted_source_ids = sorted(
-        str(row.get("source_id") or "")
-        for row in validated.get("source_dispositions", []) or []
-        if isinstance(row, Mapping)
-        and str(row.get("disposition") or "") == "pending"
-    )
     validated, reconciliation_warnings = _reconcile_overlapping_family_cards(
         validated,
         request=request,
         reasoner=reasoner,
         reasoner_calls=reasoner_calls,
+    )
+    unaccounted_source_ids = sorted(
+        str(row.get("source_id") or "")
+        for row in validated.get("source_dispositions", []) or []
+        if isinstance(row, Mapping)
+        and str(row.get("disposition") or "") == "pending"
     )
     plan_is_partial = bool(
         unaccounted_source_ids
@@ -5634,7 +5567,10 @@ def _plan_literature_families(
             "planning_jobs",
         )
     }
-    if (read_yaml(plan_path, {}) or {}) != persisted_plan:
+    if not (
+        result["plan_status"] == "partial"
+        and str(prior_plan.get("plan_status") or "") == "complete"
+    ) and (read_yaml(plan_path, {}) or {}) != persisted_plan:
         write_yaml(plan_path, persisted_plan)
     result["receipt_path"] = str(receipt_path)
     result["plan_path"] = str(plan_path)
@@ -5901,15 +5837,34 @@ def _merge_literature_family_plans(
             )
             for source_id in source_ids
         }
-        current["candidate_cluster"] = bool(
-            current.get("candidate_cluster") or row.get("candidate_cluster")
-        )
+        for field in ("label", "organizing_problem"):
+            if row.get(field):
+                current[field] = row[field]
+        if "candidate_cluster" in row:
+            current["candidate_cluster"] = bool(row["candidate_cluster"])
     jobs = {
         str(row["job_id"]): dict(row)
         for row in primary.get("discovery_jobs", []) or []
     }
-    for row in additions.get("discovery_jobs", []) or []:
-        jobs.setdefault(str(row["job_id"]), dict(row))
+    for raw in additions.get("discovery_jobs", []) or []:
+        row = dict(raw)
+        job_id = str(row["job_id"])
+        if job_id not in jobs:
+            jobs[job_id] = row
+            continue
+        current = jobs[job_id]
+        for side in ("left_source_ids", "right_source_ids"):
+            current[side] = sorted(
+                set(current.get(side, []) or []) | set(row.get(side, []) or [])
+            )
+        for field in (
+            "family",
+            "requested_collection_pair",
+            "discovery_goal",
+            "candidate_quota",
+        ):
+            if row.get(field):
+                current[field] = row[field]
     neighbors: dict[tuple[str, str], dict[str, Any]] = {}
     for row in [
         *(primary.get("neighboring_families", []) or []),
@@ -6231,10 +6186,6 @@ def _validate_literature_family_plan(
         and str(row.get("left_family_id") or "")
         != str(row.get("right_family_id") or "")
     ]
-    assigned_by_source: dict[str, list[str]] = defaultdict(list)
-    for family in families:
-        for source_id in family.get("source_ids", []) or []:
-            assigned_by_source[str(source_id)].append(str(family["family_id"]))
     declared: dict[str, dict[str, Any]] = {}
     assigned_only_to_singleton_family: set[str] = set()
     if isinstance(raw_dispositions, list):
@@ -6266,6 +6217,19 @@ def _validate_literature_family_plan(
                 "family_ids": admitted_family_ids,
                 "reason": str(raw.get("reason") or "").strip(),
             }
+    families_by_id = {str(row["family_id"]): row for row in families}
+    for source_id, row in declared.items():
+        if row["disposition"] not in {"assigned", "overlap"}:
+            continue
+        for family_id in row["family_ids"]:
+            family = families_by_id[family_id]
+            if source_id not in family["source_ids"]:
+                family["source_ids"] = sorted([*family["source_ids"], source_id])
+                family["proposed_roles"][source_id] = "supporting"
+    assigned_by_source: dict[str, list[str]] = defaultdict(list)
+    for family in families:
+        for source_id in family.get("source_ids", []) or []:
+            assigned_by_source[str(source_id)].append(str(family["family_id"]))
     source_dispositions: list[dict[str, Any]] = []
     for source_id in sorted(available):
         if assigned_by_source.get(source_id):

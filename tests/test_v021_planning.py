@@ -164,13 +164,13 @@ def test_incremental_family_plan_preserves_unaffected_families(
                     "year": "2020",
                     "collection_keys": ["C1"],
                 }
-                for source_id in ("A", "B", "C", "D")
+                for source_id in ("A", "B", "C", "D", "E", "F")
             ],
             "collections": [
                 {
                     "key": "C1",
                     "name": "Collection",
-                    "direct_source_ids": ["A", "B", "C", "D"],
+                    "direct_source_ids": ["A", "B", "C", "D", "E", "F"],
                 }
             ],
         },
@@ -235,14 +235,23 @@ def test_incremental_family_plan_preserves_unaffected_families(
             "thesis": "Changed thesis A",
         },
     }
+    changed_profiles.append(
+        {
+            "source_id": "E",
+            "context": {
+                "thesis": "Thesis E",
+                "method_or_knowledge_basis": "Comparative analysis",
+            },
+        }
+    )
     patch = {
         "literature_families": [
             {
                 "family_id": "family-ab",
                 "label": "AB revised",
                 "organizing_problem": "Problem AB",
-                "source_ids": ["A", "B"],
-                "proposed_roles": {"A": "core", "B": "supporting"},
+                "source_ids": ["A", "E"],
+                "proposed_roles": {"A": "core", "E": "supporting"},
             }
         ],
         "discovery_jobs": [
@@ -250,7 +259,7 @@ def test_incremental_family_plan_preserves_unaffected_families(
                 "job_id": "discover-ab",
                 "family": "family-ab",
                 "left_source_ids": ["A"],
-                "right_source_ids": ["B"],
+                "right_source_ids": ["E"],
             }
         ],
         "neighboring_families": [],
@@ -266,11 +275,82 @@ def test_incremental_family_plan_preserves_unaffected_families(
 
     assert first is not None and second is not None
     assert second["planning_path"] == "incremental_patch"
-    assert second["incremental_source_ids"] == ["A"]
+    assert second["incremental_source_ids"] == ["A", "E"]
     assert {
         row["family_id"]: row["label"]
         for row in second["literature_families"]
     } == {"family-ab": "AB revised", "family-cd": "CD"}
+    families = {
+        row["family_id"]: row for row in second["literature_families"]
+    }
+    assert families["family-ab"]["source_ids"] == ["A", "B", "E"]
+    jobs = {row["job_id"]: row for row in second["discovery_jobs"]}
+    assert jobs["discover-ab"]["right_source_ids"] == ["B", "E"]
+    plan_path = (
+        tmp_path / "02_source_memory" / "indexes" / "literature_family_plan.yml"
+    )
+    last_good = plan_path.read_bytes()
+    partial = _plan_literature_families(
+        tmp_path,
+        profiles=[
+            *changed_profiles,
+            {
+                "source_id": "F",
+                "context": {
+                    "thesis": "Thesis F",
+                    "method_or_knowledge_basis": "Comparative analysis",
+                },
+            },
+        ],
+        catalogue={"catalogue_path": str(catalogue_path)},
+        reasoner=Reasoner(),
+        reasoner_calls=Calls(
+            [
+                {
+                    "literature_families": [],
+                    "discovery_jobs": [],
+                    "source_dispositions": [
+                        {
+                            "source_id": "F",
+                            "disposition": "assigned",
+                            "family_ids": ["unknown-family"],
+                        }
+                    ],
+                }
+            ]
+        ),
+        request=request,
+    )
+    assert partial["plan_status"] == "partial"
+    assert plan_path.read_bytes() == last_good
+
+
+def test_declared_assignment_extends_an_existing_family_card() -> None:
+    result = _validate_literature_family_plan(
+        {
+            "literature_families": [
+                {"family_id": "family", "source_ids": ["A", "B"]}
+            ],
+            "discovery_jobs": [],
+            "source_dispositions": [
+                {
+                    "source_id": "C",
+                    "disposition": "assigned",
+                    "family_ids": ["family"],
+                }
+            ],
+        },
+        lean_rows=[
+            {"source_id": source_id, "collection_keys": []}
+            for source_id in "ABC"
+        ],
+        requested_collection_keys=[],
+        allow_empty=True,
+    )
+
+    assert result["literature_families"][0]["source_ids"] == ["A", "B", "C"]
+    assert result["literature_families"][0]["proposed_roles"]["C"] == "supporting"
+    assert result["unaccounted_source_ids"] == []
 
 
 def test_identical_initial_family_plan_keeps_the_same_job_key(
