@@ -438,6 +438,97 @@ def test_oversized_cluster_is_partitioned_before_writers(tmp_path: Path) -> None
     } == {"D"}
 
 
+def test_unchanged_oversized_parent_reuses_published_children(tmp_path: Path) -> None:
+    profiles = [_profile(source_id) for source_id in "ABCD"]
+    plan_calls: list[bool] = []
+
+    class Reasoner:
+        name = "local"
+        model = "test"
+
+        def cluster_synthesis_fits(self, projected, request, *, context=None):
+            return len(projected) <= 2
+
+        def plan_clusters(self, projected, request, *, context=None):
+            plan_calls.append(True)
+            return {
+                "clusters": [
+                    {
+                        "cluster_id": "left",
+                        "semantic_identity": "left",
+                        "members": [
+                            {"source_id": "A", "role": "core"},
+                            {"source_id": "B", "role": "core"},
+                        ],
+                    },
+                    {
+                        "cluster_id": "right",
+                        "semantic_identity": "right",
+                        "members": [
+                            {"source_id": "C", "role": "core"},
+                            {"source_id": "D", "role": "core"},
+                        ],
+                    },
+                ],
+                "neighbor_relationships": [],
+                "unclustered_sources": [],
+            }
+
+        def synthesize_cluster(self, projected, request, *, context=None):
+            return _streamlined_response(context["cluster"], projected)
+
+    shared_plan = {
+        "literature_families": [
+            {
+                "family_id": "oversized",
+                "label": "Oversized",
+                "organizing_problem": "One broad problem",
+                "source_ids": list("ABCD"),
+                "proposed_roles": {source_id: "core" for source_id in "ABCD"},
+                "candidate_cluster": True,
+            }
+        ],
+        "discovery_jobs": [],
+        "neighboring_families": [],
+    }
+    notes = [
+        {
+            "source_id": row["source_id"],
+            "title": row["title"],
+            "source_scope": "full_document",
+            "body": "Complete note.",
+        }
+        for row in profiles
+    ]
+    first = build_literature_report(
+        profiles,
+        reasoner=Reasoner(),
+        request=LiteratureMapRequest(tmp_path),
+        source_notes=notes,
+        shared_literature_plan=shared_plan,
+    )
+    child_ids = {
+        row["cluster_id"] for row in first["cluster_registry"]["clusters"]
+    }
+    plan_calls.clear()
+    second = build_literature_report(
+        profiles,
+        previous_registry={
+            **first["cluster_registry"],
+            "cluster_syntheses": first["cluster_syntheses"],
+        },
+        reasoner=Reasoner(),
+        request=LiteratureMapRequest(tmp_path),
+        source_notes=notes,
+        shared_literature_plan=shared_plan,
+    )
+
+    assert plan_calls == []
+    assert {
+        row["cluster_id"] for row in second["cluster_registry"]["clusters"]
+    } == child_ids
+
+
 def test_partition_writer_uses_preserved_planner_role_class() -> None:
     warnings: list[str] = []
     roles = _cluster_writer_member_roles(

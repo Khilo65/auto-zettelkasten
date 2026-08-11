@@ -1220,14 +1220,21 @@ def test_partition_supersedes_parent_acquisition_revision(tmp_path: Path) -> Non
         [],
         state="active",
     )
-    _persist_cluster_acquisition_revisions(path, [parent])
+    stale = _cluster_acquisition_revision(
+        {"cluster_id": "stale", "revision_hash": "stale-r1"},
+        [],
+        state="active",
+    )
+    _persist_cluster_acquisition_revisions(path, [parent, stale])
 
     ledger = _persist_cluster_acquisition_revisions(
         path,
         [child],
         superseded_cluster_ids={"parent"},
+        current_cluster_ids={"child"},
     )
 
     by_id = {row["cluster_id"]: row for row in ledger["revisions"]}
     assert by_id["parent"]["state"] == "superseded_by_partition"
+    assert by_id["stale"]["state"] == "superseded"
     assert by_id["child"]["parent_cluster_id"] == "parent"

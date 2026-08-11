@@ -19416,6 +19416,7 @@ def _persist_cluster_acquisition_revisions(
     *,
     mapped_external_source_ids: set[str] | None = None,
     superseded_cluster_ids: set[str] | None = None,
+    current_cluster_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     existing = read_yaml(path, {}) if path is not None else {}
     by_key = {
@@ -19464,6 +19465,12 @@ def _persist_cluster_acquisition_revisions(
             and row.get("state") == "active"
         ):
             row["state"] = "superseded_by_partition"
+        elif (
+            current_cluster_ids is not None
+            and str(row.get("cluster_id") or "") not in current_cluster_ids
+            and row.get("state") == "active"
+        ):
+            row["state"] = "superseded"
     for row in by_key.values():
         for candidate in row.get("candidates", []) or []:
             if str(candidate.get("external_source_id") or "") in (
@@ -20344,6 +20351,89 @@ def build_literature_report(
             cluster["candidate_roles"] = dict(
                 proposal.get("candidate_roles", {}) or {}
             )
+        prior_syntheses = _as_mapping(
+            (previous_registry or {}).get("cluster_syntheses")
+        )
+
+        def parent_plan_signature(
+            response: Mapping[str, Any], proposal_id: str
+        ) -> str:
+            if not proposal_id:
+                return ""
+            parent_rows = [
+                dict(row)
+                for row in _as_mapping(response).get("clusters", []) or []
+                if isinstance(row, Mapping)
+                and str(row.get("cluster_id") or row.get("proposal_id") or "")
+                == proposal_id
+            ]
+            if len(parent_rows) != 1:
+                return ""
+            neighbors = [
+                dict(row)
+                for row in _as_mapping(response).get(
+                    "neighbor_relationships", []
+                )
+                or []
+                if isinstance(row, Mapping)
+                and proposal_id
+                in {
+                    str(row.get("left_cluster_id") or ""),
+                    str(row.get("right_cluster_id") or ""),
+                }
+            ]
+            return _stable_hash(
+                {
+                    "parent": parent_rows[0],
+                    "neighbors": sorted(neighbors, key=_stable_hash),
+                }
+            )
+
+        reused_clusters: list[dict[str, Any]] = []
+        for cluster in clustered.get("clusters", []) or []:
+            root_id = str(cluster.get("cluster_id") or "")
+            proposal_id = str(cluster.get("proposal_id") or "")
+            parent_ids = set(cluster.get("source_ids", []) or [])
+            prior_children = [
+                dict(row)
+                for row in (previous_registry or {}).get("clusters", []) or []
+                if isinstance(row, Mapping)
+                and str(row.get("partition_root_id") or "") == root_id
+            ]
+            prior_parent_signature = parent_plan_signature(
+                prior_plan_response, proposal_id
+            )
+            current_parent_signature = parent_plan_signature(
+                plan_response, proposal_id
+            )
+            if (
+                prior_children
+                and all(
+                    _cluster_projection_is_publishable(
+                        _as_mapping(prior_syntheses.get(str(row["cluster_id"])))
+                    )
+                    for row in prior_children
+                )
+                and {
+                    str(source_id)
+                    for child in prior_children
+                    for source_id in child.get("source_ids", []) or []
+                }
+                == parent_ids
+                and prior_plan_state.get("planning_identity")
+                == planning_identity
+                and all(
+                    prior_card_hashes.get(source_id)
+                    == source_card_hashes.get(source_id)
+                    for source_id in parent_ids
+                )
+                and bool(prior_parent_signature)
+                and prior_parent_signature == current_parent_signature
+            ):
+                reused_clusters.extend(prior_children)
+            else:
+                reused_clusters.append(cluster)
+        clustered["clusters"] = reused_clusters
     failed_plan_source_ids = {
         str(source_id)
         for row in global_plan_parked
@@ -21348,6 +21438,7 @@ def build_literature_report(
     partitioned_parent_ids: set[str] = set()
     partition_roots: dict[str, dict[str, Any]] = {}
     partition_neighbor_specs: list[dict[str, Any]] = []
+
     while partition_queue:
         cluster = partition_queue.pop(0)
         synthesis_profiles, synthesis_context = cluster_job_inputs(cluster)
@@ -22209,27 +22300,6 @@ def build_literature_report(
 
     if partition_roots:
         clustered["clusters"] = list(registry["clusters"])
-    acquisition_ledger = _persist_cluster_acquisition_revisions(
-        acquisition_ledger_path,
-        [
-            _cluster_acquisition_revision(
-                cluster_input_clusters[cluster_id],
-                cluster_inputs_by_id[cluster_id][1].get(
-                    "important_unmapped_literature", []
-                ),
-                state=state,
-                dispositions=acquisition_dispositions_by_cluster.get(
-                    cluster_id, []
-                ),
-                default_disposition=acquisition_default_dispositions.get(
-                    cluster_id, ""
-                ),
-            )
-            for cluster_id, state in acquisition_revision_states.items()
-        ],
-        mapped_external_source_ids=mapped_external_source_ids,
-        superseded_cluster_ids=successful_partition_root_ids,
-    )
     previous_publishable_cluster_ids = {
         str(row.get("cluster_id") or "")
         for row in (previous_registry or {}).get("clusters", []) or []
@@ -22338,6 +22408,32 @@ def build_literature_report(
         **registry,
         **final_lifecycle,
     }
+    acquisition_ledger = _persist_cluster_acquisition_revisions(
+        acquisition_ledger_path,
+        [
+            _cluster_acquisition_revision(
+                cluster_input_clusters[cluster_id],
+                cluster_inputs_by_id[cluster_id][1].get(
+                    "important_unmapped_literature", []
+                ),
+                state=state,
+                dispositions=acquisition_dispositions_by_cluster.get(
+                    cluster_id, []
+                ),
+                default_disposition=acquisition_default_dispositions.get(
+                    cluster_id, ""
+                ),
+            )
+            for cluster_id, state in acquisition_revision_states.items()
+        ],
+        mapped_external_source_ids=mapped_external_source_ids,
+        superseded_cluster_ids=successful_partition_root_ids,
+        current_cluster_ids={
+            str(row.get("cluster_id") or "")
+            for row in registry.get("clusters", []) or []
+            if isinstance(row, Mapping) and row.get("cluster_id")
+        },
+    )
     current_or_parked_ids = {
         str(row.get("cluster_id") or "")
         for row in registry["clusters"]
