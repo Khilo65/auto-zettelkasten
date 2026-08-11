@@ -20910,6 +20910,78 @@ def build_literature_report(
             *clustered["rejected_proposals"],
             *rejected_matrix_clusters,
         ]
+    prior_clusters_by_id = {
+        str(row.get("cluster_id") or ""): row
+        for row in (previous_registry or {}).get("clusters", []) or []
+        if isinstance(row, Mapping) and row.get("cluster_id")
+    }
+    prior_syntheses = _as_mapping(
+        (previous_registry or {}).get("cluster_syntheses")
+    )
+    stable_role_fields = (
+        "semantic_identity",
+        "label",
+        "organizing_mode",
+        "organizing_problem",
+        "shared_question",
+        "bounded_object",
+        "guiding_question",
+        "central_tension",
+        "coherence_rationale",
+    )
+    for cluster in clustered["clusters"]:
+        cluster_id = str(cluster.get("cluster_id") or "")
+        prior = _as_mapping(prior_clusters_by_id.get(cluster_id))
+        source_ids = sorted(str(value) for value in cluster.get("source_ids", []) or [])
+        prior_roles = _proposal_source_roles(prior)
+        if (
+            prior
+            and _cluster_projection_is_publishable(
+                _as_mapping(prior_syntheses.get(cluster_id))
+            )
+            and source_ids
+            == sorted(str(value) for value in prior.get("source_ids", []) or [])
+            and all(cluster.get(field) == prior.get(field) for field in stable_role_fields)
+            and set(prior_roles) == set(source_ids)
+        ):
+            cluster["source_roles"] = [
+                {"source_id": source_id, "role": prior_roles[source_id]}
+                for source_id in source_ids
+            ]
+            for role, field in (
+                ("core", "core_source_ids"),
+                ("context", "context_source_ids"),
+                ("bridge", "bridge_source_ids"),
+            ):
+                cluster[field] = [
+                    source_id
+                    for source_id in source_ids
+                    if prior_roles[source_id] == role
+                ]
+            cluster["core_study_family_ids"] = list(
+                prior.get("core_study_family_ids", []) or []
+            )
+            cluster["core_evidence_base_group_ids"] = list(
+                prior.get("core_evidence_base_group_ids", []) or []
+            )
+            cluster["representative_sources"] = [
+                {
+                    **dict(row),
+                    "cluster_role": prior_roles.get(
+                        str(row.get("source_id") or ""), "context"
+                    ),
+                }
+                for row in cluster.get("representative_sources", []) or []
+                if isinstance(row, Mapping)
+            ]
+            cluster["revision_hash"] = _stable_hash(
+                {
+                    "semantic_identity": cluster.get("semantic_identity", ""),
+                    "source_ids": source_ids,
+                    "source_roles": prior_roles,
+                    "cluster_writer_contract": "streamlined-full-note-v2",
+                }
+            )
     registry = reconcile_cluster_registry(
         [
             cluster
@@ -21977,16 +22049,6 @@ def build_literature_report(
     acquisition_default_dispositions: dict[str, str] = {}
     acquisition_dispositions_by_cluster: dict[str, list[dict[str, Any]]] = {}
     for cluster in synthesis_order:
-        cluster_id = str(cluster.get("cluster_id") or "")
-        prior = _as_mapping(
-            _as_mapping(
-                (previous_registry or {}).get("cluster_syntheses")
-            ).get(cluster_id)
-        )
-        if cluster.get("refresh_pending") and _cluster_projection_is_publishable(
-            prior
-        ):
-            continue
         runnable.append(cluster)
     _persist_cluster_acquisition_revisions(
         acquisition_ledger_path,
@@ -22108,22 +22170,6 @@ def build_literature_report(
                 (previous_registry or {}).get("cluster_syntheses")
             ).get(cluster_id)
         )
-        if (
-            cluster.get("refresh_pending")
-            and _cluster_projection_is_publishable(prior_synthesis)
-        ):
-            cluster_syntheses[cluster_id] = {
-                **dict(prior_synthesis),
-                "refresh_pending": True,
-                "last_good_revision_hash": str(
-                    cluster.get("revision_hash") or ""
-                ),
-                "pending_revision_hash": "",
-                "refresh_pending_source_ids": list(
-                    cluster.get("refresh_pending_source_ids", []) or []
-                ),
-            }
-            continue
         _notify_stage(stage_callback, "cluster_synthesis", active_cluster=cluster_id)
         synthesis_profiles, synthesis_context = cluster_inputs_by_id[cluster_id]
         try:

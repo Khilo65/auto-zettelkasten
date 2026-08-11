@@ -1535,6 +1535,122 @@ def test_cluster_writer_reuses_explicitly_dropped_candidate_subset(
     assert mismatch_reasoner.calls == 2
 
 
+def test_refresh_pending_cluster_reaches_checkpoint_resolver(tmp_path: Path) -> None:
+    profiles = [_profile("A"), _profile("B")]
+    shared_plan = {
+        "literature_families": [
+            {
+                "family_id": "family",
+                "label": "Family",
+                "organizing_problem": "What do the studies find?",
+                "source_ids": ["A", "B"],
+                "proposed_roles": {"A": "core", "B": "core"},
+                "candidate_cluster": True,
+            }
+        ],
+        "discovery_jobs": [],
+        "neighboring_families": [],
+    }
+
+    class Reasoner:
+        name = "local"
+        model = "test"
+
+        def cluster_synthesis_fits(self, projected, request, *, context=None):
+            return True
+
+        def synthesize_cluster(self, projected, request, *, context=None):
+            return _streamlined_response(context["cluster"], projected)
+
+    initial = build_literature_report(
+        profiles,
+        reasoner=Reasoner(),
+        request=LiteratureMapRequest(tmp_path),
+        shared_literature_plan=shared_plan,
+    )
+    previous = {
+        **initial["cluster_registry"],
+        "cluster_syntheses": initial["cluster_syntheses"],
+    }
+    previous["clusters"][0]["refresh_pending"] = True
+    calls: list[str] = []
+
+    def cached_call(stage, key, method_name, projected, context):
+        calls.append(stage)
+        return _streamlined_response(context["cluster"], projected)
+
+    repaired = build_literature_report(
+        profiles,
+        previous_registry=previous,
+        reasoner=Reasoner(),
+        reasoner_call=cached_call,
+        request=LiteratureMapRequest(tmp_path),
+        shared_literature_plan=shared_plan,
+    )
+
+    assert "cluster_synthesis" in calls
+    assert repaired["cluster_registry"]["pending_revisions"] == []
+    assert repaired["cluster_registry"]["clusters"][0]["refresh_pending"] is False
+
+
+def test_stable_cluster_preserves_writer_final_roles_before_retry(tmp_path: Path) -> None:
+    profiles = [_profile("A"), _profile("B")]
+    shared_plan = {
+        "literature_families": [
+            {
+                "family_id": "family",
+                "label": "Family",
+                "organizing_problem": "What do the studies find?",
+                "source_ids": ["A", "B"],
+                "proposed_roles": {"A": "core", "B": "core"},
+                "candidate_cluster": True,
+            }
+        ],
+        "discovery_jobs": [],
+        "neighboring_families": [],
+    }
+
+    class Reasoner:
+        name = "local"
+        model = "test"
+
+        def __init__(self, *, fail: bool = False) -> None:
+            self.fail = fail
+
+        def cluster_synthesis_fits(self, projected, request, *, context=None):
+            return True
+
+        def synthesize_cluster(self, projected, request, *, context=None):
+            if self.fail:
+                return {}
+            response = _streamlined_response(context["cluster"], projected)
+            response["member_roles"] = {"A": "core", "B": "context"}
+            return response
+
+    initial = build_literature_report(
+        profiles,
+        reasoner=Reasoner(),
+        request=LiteratureMapRequest(tmp_path),
+        shared_literature_plan=shared_plan,
+    )
+    retried = build_literature_report(
+        profiles,
+        previous_registry={
+            **initial["cluster_registry"],
+            "cluster_syntheses": initial["cluster_syntheses"],
+        },
+        reasoner=Reasoner(fail=True),
+        request=LiteratureMapRequest(tmp_path),
+        shared_literature_plan=shared_plan,
+    )
+
+    pending = retried["cluster_registry"]["pending_revisions"][0]["cluster"]
+    assert pending["source_roles"] == [
+        {"source_id": "A", "role": "core"},
+        {"source_id": "B", "role": "context"},
+    ]
+
+
 def test_independent_cluster_writers_run_concurrently_with_full_notes() -> None:
     profiles = [_profile(source_id) for source_id in ("A", "B", "C", "D")]
     notes = [
