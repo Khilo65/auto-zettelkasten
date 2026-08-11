@@ -3392,8 +3392,8 @@ def test_mandatory_pairs_fail_preflight_before_any_provider_call(
     write_yaml(
         tmp_path / "02_source_memory" / "indexes" / "typed_links.yml",
         {
-            "relations": [
-                {
+                    "relations": [
+                        {
                     "relation_id": f"explicit-{index}",
                     "source_id": "A",
                     "target_source_id": f"S{index}",
@@ -3869,10 +3869,23 @@ def test_only_active_current_relationship_satisfies_a_discovered_pair(
                         "relation_id": "current-relation",
                         "source_id": "A",
                         "target_source_id": "B",
-                        "relation_type": "supports",
-                        "active": active,
-                    }
-                ],
+                            "relation_type": "supports",
+                            "active": active,
+                        },
+                        *(
+                            [
+                                {
+                                    "relation_id": "citation-relation",
+                                    "source_id": "A",
+                                    "target_source_id": "B",
+                                    "relation_type": "cites",
+                                    "active": True,
+                                }
+                            ]
+                            if active
+                            else []
+                        ),
+                    ],
                 "current_pair_decisions": [
                     {
                         "source_ids": ["A", "B"],

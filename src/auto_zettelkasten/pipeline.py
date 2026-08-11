@@ -7000,6 +7000,8 @@ def _run_relationship_reasoning(
                 "refresh_pending": True,
             }
         )
+    for pair in visible_pairs:
+        mandatory_basis.pop(pair, None)
     negative_pairs: set[tuple[str, str]] = set()
     current_pair_rows_present = "current_pair_decisions" in registry
     current_negative_rows: dict[tuple[str, str], dict[str, Any]] = {}
