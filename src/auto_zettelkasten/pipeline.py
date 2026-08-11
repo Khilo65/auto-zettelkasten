@@ -5105,6 +5105,11 @@ def _plan_literature_families(
         / "literature_family_plan.yml"
     )
     prior_plan = read_yaml(plan_path, {}) or {}
+    reviewed_family_exclusions = [
+        dict(row)
+        for row in prior_plan.get("reviewed_family_exclusions", []) or []
+        if isinstance(row, Mapping)
+    ]
     lean_source_hashes = {
         str(row["source_id"]): stable_hash(row) for row in lean_rows
     }
@@ -5454,11 +5459,17 @@ def _plan_literature_families(
                     failed_packet_ids.extend(completion_failures)
             except Exception as exc:
                 completion_status = f"partial_failure:{type(exc).__name__}"
+    validated = _apply_reviewed_family_exclusions(
+        validated, reviewed_family_exclusions
+    )
     validated, reconciliation_warnings = _reconcile_overlapping_family_cards(
         validated,
         request=request,
         reasoner=reasoner,
         reasoner_calls=reasoner_calls,
+    )
+    validated = _apply_reviewed_family_exclusions(
+        validated, reviewed_family_exclusions
     )
     unaccounted_source_ids = sorted(
         str(row.get("source_id") or "")
@@ -5500,6 +5511,7 @@ def _plan_literature_families(
         "planning_jobs": planning_jobs,
         "failed_packet_ids": sorted(set(failed_packet_ids)),
         "reconciliation_warnings": reconciliation_warnings,
+        "reviewed_family_exclusions": reviewed_family_exclusions,
     }
     result["source_dispositions"] = [
         *validated.get("source_dispositions", []),
@@ -5561,6 +5573,7 @@ def _plan_literature_families(
             "unaccounted_source_ids",
             "failed_packet_ids",
             "reconciliation_warnings",
+            "reviewed_family_exclusions",
             "source_dispositions",
             "primary_routes",
             "secondary_routes",
@@ -5912,6 +5925,72 @@ def _merge_literature_family_plans(
         "source_dispositions": [
             dispositions[key] for key in sorted(dispositions)
         ],
+    }
+
+
+def _apply_reviewed_family_exclusions(
+    plan: Mapping[str, Any], exclusions: Sequence[Mapping[str, Any]]
+) -> dict[str, Any]:
+    excluded = {
+        (str(row.get("family_id") or ""), str(row.get("source_id") or ""))
+        for row in exclusions
+        if row.get("family_id") and row.get("source_id")
+    }
+    if not excluded:
+        return dict(plan)
+
+    families = []
+    for raw in plan.get("literature_families", []) or []:
+        row = dict(raw)
+        family_id = str(row.get("family_id") or "")
+        row["source_ids"] = [
+            str(source_id)
+            for source_id in row.get("source_ids", []) or []
+            if (family_id, str(source_id)) not in excluded
+        ]
+        row["proposed_roles"] = {
+            str(source_id): role
+            for source_id, role in dict(row.get("proposed_roles", {}) or {}).items()
+            if (family_id, str(source_id)) not in excluded
+        }
+        families.append(row)
+
+    jobs = []
+    for raw in plan.get("discovery_jobs", []) or []:
+        row = dict(raw)
+        family_id = str(row.get("family") or "")
+        for side in ("left_source_ids", "right_source_ids"):
+            row[side] = [
+                str(source_id)
+                for source_id in row.get(side, []) or []
+                if (family_id, str(source_id)) not in excluded
+            ]
+        jobs.append(row)
+
+    dispositions = []
+    for raw in plan.get("source_dispositions", []) or []:
+        row = dict(raw)
+        source_id = str(row.get("source_id") or "")
+        row["family_ids"] = [
+            str(family_id)
+            for family_id in row.get("family_ids", []) or []
+            if (str(family_id), source_id) not in excluded
+        ]
+        if not row["family_ids"] and any(
+            excluded_source_id == source_id
+            for _, excluded_source_id in excluded
+        ):
+            row.update(
+                disposition="currently_unclustered",
+                reason="reviewed_family_membership_exclusion",
+            )
+        dispositions.append(row)
+
+    return {
+        **dict(plan),
+        "literature_families": families,
+        "discovery_jobs": jobs,
+        "source_dispositions": dispositions,
     }
 
 

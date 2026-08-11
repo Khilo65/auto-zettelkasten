@@ -8,10 +8,48 @@ from auto_zettelkasten.indexes import lean_discovery_projection
 from auto_zettelkasten.literature import _validate_literature_family_plan_response
 from auto_zettelkasten.models import LiteratureMappingPolicy, LiteratureMapRequest
 from auto_zettelkasten.pipeline import (
+    _apply_reviewed_family_exclusions,
     _merge_literature_family_plans,
     _plan_literature_families,
     _validate_literature_family_plan,
 )
+
+
+def test_reviewed_family_exclusion_keeps_other_memberships() -> None:
+    result = _apply_reviewed_family_exclusions(
+        {
+            "literature_families": [
+                {"family_id": "gaza", "source_ids": ["A", "B", "C"]},
+                {"family_id": "media", "source_ids": ["A", "D"]},
+            ],
+            "discovery_jobs": [
+                {
+                    "job_id": "gaza-job",
+                    "family": "gaza",
+                    "left_source_ids": ["A", "B"],
+                    "right_source_ids": ["C"],
+                }
+            ],
+            "source_dispositions": [
+                {"source_id": "A", "disposition": "assigned", "family_ids": ["gaza", "media"]},
+                {"source_id": "B", "disposition": "assigned", "family_ids": ["gaza"]},
+            ],
+        },
+        [
+            {"family_id": "gaza", "source_id": "A"},
+            {"family_id": "gaza", "source_id": "B"},
+        ],
+    )
+
+    families = {row["family_id"]: row for row in result["literature_families"]}
+    dispositions = {
+        row["source_id"]: row for row in result["source_dispositions"]
+    }
+    assert families["gaza"]["source_ids"] == ["C"]
+    assert families["media"]["source_ids"] == ["A", "D"]
+    assert result["discovery_jobs"][0]["left_source_ids"] == []
+    assert dispositions["A"]["family_ids"] == ["media"]
+    assert dispositions["B"]["disposition"] == "currently_unclustered"
 
 
 def test_lean_discovery_projection_preserves_complete_profile_text() -> None:
