@@ -2987,6 +2987,30 @@ def _same_provider_inputs(
     )
     if exact_match:
         return True
+    if (
+        stage
+        in {
+            "relationship_candidate_selection",
+            "relationship_bridge_candidate_selection",
+        }
+        and current_context_hashes is not None
+        and all(
+            str(prior_hashes.get(component) or "")
+            == str(current_component_hashes.get(component) or "")
+            for component in _PROVIDER_INPUT_DEPENDENCY_COMPONENTS - {"context"}
+        )
+    ):
+        prior_context_hashes = checkpoint.get("dependency_context_hashes")
+        if isinstance(prior_context_hashes, Mapping):
+            context_components = (
+                set(prior_context_hashes) | set(current_context_hashes)
+            ) - {"catalogue_revision"}
+            if all(
+                str(prior_context_hashes.get(component) or "")
+                == str(current_context_hashes.get(component) or "")
+                for component in context_components
+            ):
+                return True
     # Provider adapters use compact stage-specific packets. A successful call
     # remains reusable when every provider-visible input is unchanged even if a
     # richer local context gained projection-only records.

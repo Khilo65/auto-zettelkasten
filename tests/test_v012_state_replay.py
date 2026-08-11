@@ -267,6 +267,7 @@ def test_truncated_candidate_checkpoint_recovers_without_retry(
     reasoner = CandidateReasoner()
     request = _request(tmp_path)
     context = {
+        "catalogue_revision": "old-global-revision",
         "bridge_jobs": [
             {
                 "bridge_job_id": "job-ab",
@@ -300,7 +301,7 @@ def test_truncated_candidate_checkpoint_recovers_without_retry(
         "packet",
         "select_relationship_candidates",
         [],
-        context,
+        {**context, "catalogue_revision": "new-global-revision"},
     ) == response
     assert reasoner.calls == 1
 

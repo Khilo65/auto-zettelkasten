@@ -5177,6 +5177,39 @@ def _plan_literature_families(
         raise ValueError(
             "unknown comparison collection keys: " + ", ".join(unknown_requested)
         )
+    reviewed_prior_plan = _apply_reviewed_family_exclusions(
+        prior_plan, reviewed_family_exclusions
+    )
+    if (
+        prior_plan.get("literature_families")
+        and prior_source_hashes == lean_source_hashes
+        and str(prior_plan.get("planning_identity") or "") == planning_identity
+        and list(prior_plan.get("requested_collection_keys", []) or [])
+        == requested_keys
+        and str(prior_plan.get("plan_status") or "") == "complete"
+        and not prior_plan.get("unaccounted_source_ids")
+        and not prior_plan.get("failed_packet_ids")
+        and not prior_plan.get("reconciliation_warnings")
+        and all(
+            prior_plan.get(field) == reviewed_prior_plan.get(field)
+            for field in (
+                "literature_families",
+                "discovery_jobs",
+                "source_dispositions",
+            )
+        )
+    ):
+        return {
+            **dict(prior_plan),
+            "semantic_noop": True,
+            "receipt_path": str(
+                workspace
+                / "02_source_memory"
+                / "indexes"
+                / "lean_discovery_receipt.yml"
+            ),
+            "plan_path": str(plan_path),
+        }
     context = {
         "planning_mode": (
             "incremental_patch" if incremental_mode else "initial_global"

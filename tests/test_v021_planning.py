@@ -391,7 +391,7 @@ def test_declared_assignment_extends_an_existing_family_card() -> None:
     assert result["unaccounted_source_ids"] == []
 
 
-def test_identical_initial_family_plan_keeps_the_same_job_key(
+def test_identical_family_plan_replays_without_another_call(
     tmp_path: Path,
 ) -> None:
     class Reasoner:
@@ -481,6 +481,18 @@ def test_identical_initial_family_plan_keeps_the_same_job_key(
     plan_path = (
         tmp_path / "02_source_memory" / "indexes" / "literature_family_plan.yml"
     )
+    plan_bytes = plan_path.read_bytes()
+    replay = _plan_literature_families(
+        tmp_path,
+        profiles=profiles,
+        catalogue={"catalogue_path": str(catalogue_path)},
+        reasoner=Reasoner(),
+        reasoner_calls=calls,
+        request=request,
+    )
+    assert replay["semantic_noop"] is True
+    assert len(calls.keys) == 1
+    assert plan_path.read_bytes() == plan_bytes
     legacy_plan = read_yaml(plan_path, {})
     legacy_plan["planning_identity"] = "legacy-planning-identity"
     legacy_plan.pop("planning_job_identity", None)
@@ -511,7 +523,8 @@ def test_identical_initial_family_plan_keeps_the_same_job_key(
     assert first["incremental_source_ids"] == []
     assert second["incremental_source_ids"] == []
     assert third["incremental_source_ids"] == []
-    assert calls.keys[1] == calls.keys[2]
+    assert third["semantic_noop"] is True
+    assert len(calls.keys) == 2
     assert second["planning_job_identity"] == "legacy-planning-identity"
     assert third["planning_job_identity"] == "legacy-planning-identity"
     assert read_yaml(plan_path, {})["planning_job_identity"] == (

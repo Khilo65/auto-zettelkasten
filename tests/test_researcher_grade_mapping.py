@@ -2253,6 +2253,65 @@ def test_gap_checkpoint_ignores_projection_only_synthesis_changes() -> None:
     )
 
 
+def test_candidate_checkpoint_ignores_only_global_catalogue_revision() -> None:
+    components = {
+        key: f"hash-{key}"
+        for key in (
+            "stage",
+            "key",
+            "method",
+            "provider",
+            "model",
+            "profile_dependencies",
+            "context",
+            "policy",
+            "prompt_version",
+        )
+    }
+    prior_context = {
+        "catalogue_revision": "old-global-revision",
+        "catalogue": "same-catalogue",
+        "bridge_jobs": "same-jobs",
+        "literature_families": "same-families",
+        "excluded_candidate_pairs": "same-exclusions",
+    }
+    checkpoint = {
+        "dependency_component_hashes": {
+            **components,
+            "context": "old-full-context",
+        },
+        "dependency_context_hashes": prior_context,
+    }
+    current_components = {**components, "context": "new-full-context"}
+    current_context = {
+        **prior_context,
+        "catalogue_revision": "new-global-revision",
+    }
+
+    for stage in (
+        "relationship_candidate_selection",
+        "relationship_bridge_candidate_selection",
+    ):
+        assert _same_provider_inputs(
+            checkpoint,
+            current_components,
+            stage=stage,
+            current_context_hashes=current_context,
+        )
+        assert not _same_provider_inputs(
+            checkpoint,
+            current_components,
+            stage=stage,
+            current_context_hashes={**current_context, "bridge_jobs": "changed-jobs"},
+        )
+        assert not _same_provider_inputs(
+            checkpoint,
+            {**current_components, "profile_dependencies": "changed-profiles"},
+            stage=stage,
+            current_context_hashes=current_context,
+        )
+
+
 def test_cluster_proposal_checkpoint_tracks_every_provider_visible_family_input() -> (
     None
 ):
