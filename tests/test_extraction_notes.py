@@ -194,6 +194,7 @@ def test_atomic_note_validator_requires_lineage_and_all_sections() -> None:
     analysis = {key: f"Grounded {key}; see page 1." for key in SECTION_KEYS}
     text = render_atomic_note(frontmatter, analysis)
     assert validate_atomic_note(text).passed
+    assert "## Key Concepts and Definitions" in text
     assert "## Strengths and Contributions" in text
     broken = text.replace("a" * 64, "not-a-hash")
     assert "invalid_inspected_content_hash" in validate_atomic_note(broken).errors
@@ -212,6 +213,18 @@ def test_atomic_note_validator_requires_lineage_and_all_sections() -> None:
         'https://example.org/report, heading "Findings"',
     )
     assert "untraceable_locators" not in validate_atomic_note(web_locator).errors
+
+    without_definitions = dict(analysis)
+    without_definitions.pop("key_concepts_and_definitions")
+    current_frontmatter = {**frontmatter, "prompt_version": "12"}
+    current_validation = validate_atomic_note(
+        render_atomic_note(current_frontmatter, without_definitions)
+    )
+    assert "missing_section:key-concepts-and-definitions" in current_validation.errors
+    legacy_frontmatter = {**frontmatter, "prompt_version": "11"}
+    assert validate_atomic_note(
+        render_atomic_note(legacy_frontmatter, without_definitions)
+    ).passed
 
 
 def test_atomic_note_validator_requires_lay_explanation_of_statistical_findings() -> None:

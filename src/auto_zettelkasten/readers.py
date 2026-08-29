@@ -24,6 +24,7 @@ import yaml
 from .fidelity import ANALYSIS_SECTION_KEYS, validate_atomic_replacements
 from .files import require_loopback_http_url
 from .models import (
+    CURRENT_ATOMIC_PROMPT_VERSION,
     ClusterProposal,
     ClusterSynthesis,
     EvidenceAnchor,
@@ -130,6 +131,7 @@ def reset_provider_completion() -> None:
 
 SECTION_KEYS = (
     "thesis",
+    "key_concepts_and_definitions",
     "method_and_research_design",
     "evidence_and_data",
     "detailed_findings",
@@ -144,6 +146,7 @@ SECTION_KEYS = (
 
 CHUNK_EVIDENCE_KEYS = (
     "summary",
+    "key_concepts_and_definitions",
     "claims_and_findings",
     "statistical_context",
     "methods_and_data",
@@ -158,7 +161,7 @@ DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
-SOURCE_BUNDLE_PROMPT_VERSION = "6"
+SOURCE_BUNDLE_PROMPT_VERSION = "7"
 SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v2"
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
@@ -1686,12 +1689,18 @@ class OllamaReader(_CapabilityAwareReader):
 def _system_prompt() -> str:
     keys = ", ".join(SECTION_KEYS)
     return (
-        "You create source-faithful atomic notes using Auto-Zettelkasten atomic prompt v11. "
+        f"You create source-faithful atomic notes using Auto-Zettelkasten atomic prompt v{CURRENT_ATOMIC_PROMPT_VERSION}. "
         "Adapt the analysis to the source actually supplied: it may be an academic article or book, a report, policy or legal "
         "document, archival material, conference or meeting record, practitioner guidance, speech, working paper, blog post, "
         "or another evidence-bearing source. Do not force a nonacademic source into an academic-study template. "
         "Return only one JSON object. Do not infer facts absent from the source. "
         f"Every value must be a non-empty string. Required keys: {keys}. "
+        "In key_concepts_and_definitions, capture only consequential terms that the source explicitly defines, operationalizes, "
+        "or uses in a distinctive way. Preserve the source's meaning rather than importing a general or external definition. "
+        "Prefer a short exact quotation when the wording is recoverable, followed by its page number when supplied; otherwise use "
+        "a section, heading, or explicit text anchor. Clearly label a source-grounded paraphrase as a paraphrase, never present it "
+        "as a quotation, and never invent a page number. Use concise Markdown bullets such as '**Term** — “source wording” (p. 12).' "
+        "If the source contains no consequential source-defined term, say so briefly. "
         "Always preserve source-reported numbers, their original scale, comparison, reference group, denominator, and uncertainty. "
         "A simple derived explanation is allowed only when every required input is explicit in the source; label it as derived, retain "
         "the original statistic beside it, and never invent a missing baseline, denominator, model quantity, or uncertainty measure. "
@@ -1742,11 +1751,16 @@ def _system_prompt() -> str:
 def _source_bundle_system_prompt() -> str:
     keys = ", ".join(SECTION_KEYS)
     return (
-        "You are the source-reading reasoner for Auto-Zettelkasten source bundle prompt v6. "
+        "You are the source-reading reasoner for Auto-Zettelkasten source bundle prompt v7. "
         "Capture the thesis, knowledge basis, important evidence, detailed findings, limitations, literature position, "
         "and distinct contribution. Include the consequential data, examples, historical analogies, mechanisms, nulls, "
         "counterexamples, and qualifications needed to evaluate the argument. Distinguish reported observations, modeled "
         "estimates, author interpretations, recommendations, and your explanation. Stay within the recovered-document scope. "
+        "In key_concepts_and_definitions, capture only consequential terms that the source explicitly defines, operationalizes, "
+        "or uses distinctively. Preserve the source's meaning without importing external definitions. Prefer a short exact "
+        "quotation with a supplied page number; otherwise cite a section, heading, or explicit text anchor. Clearly label "
+        "source-grounded paraphrases, never disguise them as quotations, and never invent locators. Use concise Markdown bullets "
+        "such as '**Term** — “source wording” (p. 12).' If no consequential source-defined term appears, say so briefly. "
         "Adapt to the source form: quantitative work retains population, period, sample, unit, variables, baseline, "
         "comparison, estimates, uncertainty, interactions, robustness, and design limits; qualitative and comparative work "
         "retains case selection, evidence, chronology, mechanisms, decisive examples, alternatives, and generalization limits; "
@@ -2971,6 +2985,8 @@ def _chunk_system_prompt() -> str:
         "Return only one JSON object and do not infer facts absent from the chunk. "
         f"Every value must be a non-empty string. Required keys: {keys}. "
         "Preserve concrete claims, methods, data, qualifications, and contradictions, but avoid prose repetition. "
+        "In key_concepts_and_definitions, preserve consequential source-defined or operationalized terms, preferably with a short "
+        "exact quotation and available page, section, heading, or text-anchor locator. Label paraphrases and invent nothing. "
         "Statistical context must retain exact estimates and units plus any sample size, denominator, baseline, comparison "
         "group, reference category, uncertainty measure, significance statement, and caveat needed for later plain-English explanation. "
         "If the chunk contains no quantitative result, say so briefly in statistical_context. "

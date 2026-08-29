@@ -19,6 +19,7 @@ from .files import (
     write_yaml,
 )
 from .notes import (
+    COMPATIBILITY_REQUIRED_SECTION_HEADINGS,
     REVIEW_STATUS_TARGET_ARTIFACT_SCHEMA_VERSION,
     REVIEW_STATUS_TARGET_ENGINE_VERSION,
     SECTION_HEADINGS,
@@ -32,6 +33,7 @@ from .notes import (
 )
 from .models import (
     CURRENT_ARTIFACT_SCHEMA_VERSION,
+    CURRENT_ATOMIC_PROMPT_VERSION,
     CURRENT_ENGINE_VERSION,
     NavigationPolicy,
 )
@@ -1903,7 +1905,12 @@ def migrate_v016_metadata(
             "artifact_schema_version": CURRENT_ARTIFACT_SCHEMA_VERSION,
         }
         if relative == "auto-zettelkasten.yml":
-            updated["prompt_version"] = "11"
+            prompt_version = str(updated.get("prompt_version") or "")
+            if not prompt_version or (
+                prompt_version.isdigit()
+                and int(prompt_version) < int(CURRENT_ATOMIC_PROMPT_VERSION)
+            ):
+                updated["prompt_version"] = CURRENT_ATOMIC_PROMPT_VERSION
         elif relative == "11_state/workspace_manifest.yml":
             updated["workspace"] = str(root)
         cleaned = yaml.safe_dump(
@@ -1996,7 +2003,7 @@ def migrate_v016_metadata(
         "migration_id": V016_MIGRATION_ID,
         "target_engine_version": CURRENT_ENGINE_VERSION,
         "target_artifact_schema_version": CURRENT_ARTIFACT_SCHEMA_VERSION,
-        "prompt_version": "11",
+        "prompt_version": CURRENT_ATOMIC_PROMPT_VERSION,
         "rewritten_files": [
             {
                 "source": str(path.relative_to(root)),
@@ -2546,7 +2553,10 @@ def _legacy_analysis_checkpoint(
             for key, raw in value["analysis"].items()
             if str(raw).strip()
         }
-        if all(analysis.get(key) for key, _ in SECTION_HEADINGS):
+        if all(
+            analysis.get(key)
+            for key, _ in COMPATIBILITY_REQUIRED_SECTION_HEADINGS
+        ):
             identity = value.get("identity", {})
             if isinstance(identity, Mapping):
                 return analysis, identity
@@ -2577,7 +2587,9 @@ def _legacy_bundle_from_note_profile(
         or profile_coverage.get("source_scope")
         or "full_document"
     )
-    analytical = all(analysis.get(key) for key, _ in SECTION_HEADINGS)
+    analytical = all(
+        analysis.get(key) for key, _ in COMPATIBILITY_REQUIRED_SECTION_HEADINGS
+    )
     legacy_excluded = bool(profile.get("excluded_from_synthesis", False))
     substantive = analytical and (
         scope in {"full_document", "partial_document"}

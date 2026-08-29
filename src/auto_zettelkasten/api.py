@@ -29,6 +29,7 @@ from .literature import (
 )
 from .migration import finalize_v029_lean_state, migrate_workspace
 from .models import (
+    CURRENT_ATOMIC_PROMPT_VERSION,
     ArtifactManifest,
     ExtractionPolicy,
     LiteratureMapReport,
@@ -2395,7 +2396,7 @@ def build_map(
         max_provider_spend_usd=max_provider_spend_usd,
         question=question,
         extraction_version=str(extraction_config.get("version") or "2"),
-        prompt_version=str(config.get("prompt_version") or "11"),
+        prompt_version=CURRENT_ATOMIC_PROMPT_VERSION,
         retry_terminal_failures=retry_terminal_failures,
         extraction_policy=ExtractionPolicy.from_dict(extraction_config),
         processing=ProcessingPolicy.from_dict(

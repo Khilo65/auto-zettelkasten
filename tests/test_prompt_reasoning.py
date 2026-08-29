@@ -33,10 +33,15 @@ def _completion(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def test_atomic_prompt_v11_is_source_adaptive_and_statistics_aware() -> None:
+def test_atomic_prompt_v12_is_source_adaptive_and_statistics_aware() -> None:
     prompt = _system_prompt()
 
-    assert "atomic prompt v11" in prompt
+    assert "atomic prompt v12" in prompt
+    assert "key_concepts_and_definitions" in prompt
+    assert "short exact quotation" in prompt
+    assert "page number when supplied" in prompt
+    assert "source-grounded paraphrase as a paraphrase" in prompt
+    assert "never invent a page number" in prompt
     assert "blog post" in prompt
     assert "conference or meeting record" in prompt
     assert "findings, arguments, observations, interpretations, or recommendations" in prompt

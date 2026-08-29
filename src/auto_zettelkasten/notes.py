@@ -19,6 +19,7 @@ from .files import (
     slugify,
     write_yaml,
 )
+from .models import CURRENT_ATOMIC_PROMPT_VERSION
 
 # Immutable target of the historical review-status migration. These must not
 # follow the package's current release constants.
@@ -27,6 +28,7 @@ REVIEW_STATUS_TARGET_ARTIFACT_SCHEMA_VERSION = "1.4"
 
 SECTION_HEADINGS = (
     ("thesis", "Thesis"),
+    ("key_concepts_and_definitions", "Key Concepts and Definitions"),
     ("method_and_research_design", "Method and Research Design"),
     ("evidence_and_data", "Evidence and Data"),
     ("detailed_findings", "Detailed Findings"),
@@ -37,6 +39,10 @@ SECTION_HEADINGS = (
     ("what_this_source_can_support", "What This Source Can Support"),
     ("what_this_source_cannot_support", "What This Source Cannot Support"),
     ("locators", "Locators"),
+)
+# Older accepted notes predate the definitions section and remain valid.
+COMPATIBILITY_REQUIRED_SECTION_HEADINGS = tuple(
+    row for row in SECTION_HEADINGS if row[0] != "key_concepts_and_definitions"
 )
 
 REQUIRED_FRONTMATTER = {
@@ -347,7 +353,14 @@ def validate_atomic_note(text: str) -> NoteValidation:
         )
     if not re.fullmatch(r"[0-9a-f]{64}", str(frontmatter.get("inspected_content_hash", ""))):
         errors.append("invalid_inspected_content_hash")
-    for _, heading in SECTION_HEADINGS:
+    current_prompt = str(frontmatter.get("prompt_version") or "")
+    required_headings = (
+        SECTION_HEADINGS
+        if current_prompt.isdigit()
+        and int(current_prompt) >= int(CURRENT_ATOMIC_PROMPT_VERSION)
+        else COMPATIBILITY_REQUIRED_SECTION_HEADINGS
+    )
+    for _, heading in required_headings:
         match = re.search(rf"^## {re.escape(heading)}\s*$\n+(.*?)(?=^## |\Z)", body, flags=re.MULTILINE | re.DOTALL)
         if not match or not match.group(1).strip():
             errors.append(f"missing_section:{slugify(heading)}")

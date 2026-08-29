@@ -8,6 +8,7 @@ import pytest
 
 SECTION_KEYS = (
     "thesis",
+    "key_concepts_and_definitions",
     "method_and_research_design",
     "evidence_and_data",
     "detailed_findings",

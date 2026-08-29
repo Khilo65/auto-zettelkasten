@@ -11,6 +11,7 @@ from typing import Any, Literal, Mapping
 CURRENT_ENGINE_VERSION = "0.29.10"
 CURRENT_ARTIFACT_SCHEMA_VERSION = "1.20"
 CURRENT_PROFILE_SCHEMA_VERSION = "1.3"
+CURRENT_ATOMIC_PROMPT_VERSION = "12"
 
 
 FAMILY_RELATION_TYPES = frozenset(
@@ -622,7 +623,7 @@ class MapRequest:
     max_provider_spend_usd: Decimal | None = None
     limit: int = 0
     extraction_version: str = "2"
-    prompt_version: str = "11"
+    prompt_version: str = CURRENT_ATOMIC_PROMPT_VERSION
     retry_terminal_failures: bool = False
     extraction_policy: ExtractionPolicy = field(default_factory=ExtractionPolicy)
     processing: ProcessingPolicy = field(default_factory=ProcessingPolicy)
@@ -633,6 +634,9 @@ class MapRequest:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "workspace", Path(self.workspace).expanduser())
+        object.__setattr__(
+            self, "prompt_version", CURRENT_ATOMIC_PROMPT_VERSION
+        )
         _require_bool(self.allow_cloud, field="allow_cloud")
         _require_bool(
             self.retry_terminal_failures, field="retry_terminal_failures"
@@ -752,7 +756,9 @@ class MapRequest:
             max_provider_spend_usd=payload.get("max_provider_spend_usd"),
             limit=int(payload.get("limit", 0)),
             extraction_version=str(payload.get("extraction_version", "2")),
-            prompt_version=str(payload.get("prompt_version", "11")),
+            # Built-in prompts are not selectable; resumed requests use the
+            # implementation currently shipped by this package.
+            prompt_version=CURRENT_ATOMIC_PROMPT_VERSION,
             retry_terminal_failures=_strict_bool(
                 payload.get("retry_terminal_failures", False),
                 field="retry_terminal_failures",

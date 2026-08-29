@@ -35,6 +35,18 @@ def test_identical_atomic_write_preserves_file_metadata(tmp_path: Path) -> None:
     assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
 
 
+def test_v016_migration_upgrades_previous_prompt_version(tmp_path: Path) -> None:
+    initialize(tmp_path)
+    config_path = tmp_path / "auto-zettelkasten.yml"
+    config = read_yaml(config_path)
+    config["prompt_version"] = "11"
+    write_yaml(config_path, config)
+
+    migrate_v016_metadata(tmp_path)
+
+    assert read_yaml(config_path)["prompt_version"] == "12"
+
+
 def test_unchanged_cluster_does_not_append_a_lifecycle_event() -> None:
     cluster = {
         "cluster_id": "cluster-a",

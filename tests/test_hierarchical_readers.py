@@ -201,10 +201,13 @@ def test_deepseek_chunk_prompt_parsing_and_per_call_bounds(monkeypatch: pytest.M
     assert body["max_tokens"] == 700
     assert timeout == pytest.approx(3, abs=1e-4)
     prompt = body["messages"][1]["content"]
+    system_prompt = body["messages"][0]["content"]
     assert "chunk-0007" in prompt
     assert "Findings, pages 42-44" in prompt
     assert '"page_start": 42' in prompt
     assert "COARSE INSPECTED SOURCE CHUNK" in prompt
+    assert "key_concepts_and_definitions" in system_prompt
+    assert "exact quotation" in system_prompt
 
 
 def test_deepseek_synthesis_returns_pipeline_analysis_and_uses_final_cap(monkeypatch: pytest.MonkeyPatch) -> None:

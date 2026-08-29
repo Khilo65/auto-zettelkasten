@@ -67,6 +67,7 @@ from .literature import (
 )
 from .migration import migrate_workspace, review_hash_aliases
 from .models import (
+    CURRENT_ATOMIC_PROMPT_VERSION,
     ArtifactManifest,
     EvidenceAnchor,
     EvidenceProfile,
@@ -16421,9 +16422,14 @@ def _reusable_note(
             == str(row.get("source_scope", "")),
             str(frontmatter.get("extraction_version", ""))
             == request.extraction_version,
-            str(frontmatter.get("prompt_version", "")) == request.prompt_version,
+            str(frontmatter.get("prompt_version", ""))
+            in (
+                {request.prompt_version, "11"}
+                if request.prompt_version == CURRENT_ATOMIC_PROMPT_VERSION
+                else {request.prompt_version}
+            ),
             str(frontmatter.get("source_bundle_prompt_version", ""))
-            in {"5", SOURCE_BUNDLE_PROMPT_VERSION},
+            in {"5", "6", SOURCE_BUNDLE_PROMPT_VERSION},
         )
     )
     if not reusable:
@@ -16646,7 +16652,9 @@ def _read_document(
         "document_hash": document_hash,
         "provider": str(getattr(reader, "name", "unknown")),
         "model": str(getattr(reader, "model", "unknown")),
-        "prompt_version": request.prompt_version if request else "11",
+        "prompt_version": (
+            request.prompt_version if request else CURRENT_ATOMIC_PROMPT_VERSION
+        ),
         "source_bundle_prompt_version": SOURCE_BUNDLE_PROMPT_VERSION,
         "chunking_version": CHUNKING_VERSION,
         "content_classifier_version": CONTENT_CLASSIFIER_VERSION,
@@ -17047,9 +17055,14 @@ def _ensure_source_result_contract(result: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _ensure_analysis_contract(analysis: Mapping[str, Any]) -> dict[str, Any]:
-    """Keep legacy ReaderProvider integrations usable after the prompt-v2 note contract."""
+    """Keep legacy ReaderProvider integrations usable after prompt additions."""
 
     completed = dict(analysis)
+    if not str(completed.get("key_concepts_and_definitions") or "").strip():
+        completed["key_concepts_and_definitions"] = (
+            "Key concepts and definitions were not separately returned by this "
+            "legacy reader; consult the source before relying on a definition."
+        )
     if str(completed.get("plain_english_interpretation") or "").strip():
         return completed
     findings = str(

@@ -7,6 +7,7 @@ from typing import Any, Iterable, Mapping
 from .files import ensure_dir, now_iso, read_yaml, sha256_file, write_yaml
 from .models import (
     CURRENT_ARTIFACT_SCHEMA_VERSION,
+    CURRENT_ATOMIC_PROMPT_VERSION,
     CURRENT_ENGINE_VERSION,
     ArtifactManifest,
     ExtractionPolicy,
@@ -107,7 +108,7 @@ def initialize(workspace: Path | str, *, overwrite: bool = False) -> ArtifactMan
                     **ExtractionPolicy().to_dict(),
                     "vision": "configured_only",
                 },
-                "prompt_version": "11",
+                "prompt_version": CURRENT_ATOMIC_PROMPT_VERSION,
                 "parallel": 4,
                 "provider_concurrency": "auto",
                 "processing": {

@@ -1095,7 +1095,7 @@ def test_ordinary_bundle_source_uses_one_call_and_no_profile_or_fidelity_call(
     assert profile["source_role"] == "journal article"
     assert profile["coverage"]["status"] == "partial"
     note = read_note(tmp_path / report.items[0]["note_path"])
-    assert note["frontmatter"]["source_bundle_prompt_version"] == "6"
+    assert note["frontmatter"]["source_bundle_prompt_version"] == "7"
 
 
 def test_source_calls_share_the_cumulative_profile_budget_and_replay_is_free(

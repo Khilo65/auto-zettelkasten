@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from auto_zettelkasten.files import read_yaml, write_yaml
 from auto_zettelkasten.api import (
     _progress_items_from_source_set,
     build_map,
@@ -624,13 +625,19 @@ def test_current_prompt_replaces_prompt_v1_note_instead_of_reusing_it(
 ) -> None:
     first_reader = FakeReader()
     first = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1", prompt_version="1"),
+        MapRequest(tmp_path, provider="ollama", model="fake-1"),
         client=FakeZotero(sample_items[:1]),
         reader=first_reader,
         run_id="prompt-v1",
     )
     assert first.validated_note_count == 1
     assert first_reader.calls == 1
+    first_note = tmp_path / first.items[0]["note_path"]
+    note_id = str(read_note(first_note)["frontmatter"]["note_id"])
+    metadata_path = tmp_path / "11_state" / "note_metadata" / f"{note_id}.yml"
+    metadata = read_yaml(metadata_path)
+    metadata["frontmatter"]["prompt_version"] = "1"
+    write_yaml(metadata_path, metadata)
 
     second_reader = FakeReader()
     second = run_map(
@@ -644,11 +651,11 @@ def test_current_prompt_replaces_prompt_v1_note_instead_of_reusing_it(
     note = tmp_path / second.items[0]["note_path"]
     frontmatter = read_note(note)["frontmatter"]
     _, body = parse_atomic_note(note.read_text())
-    assert frontmatter["prompt_version"] == "11"
+    assert frontmatter["prompt_version"] == "12"
     assert "## Plain-English Interpretation" in body
 
 
-def test_legacy_reader_without_plain_english_field_uses_disclosed_compatibility_fallback(
+def test_legacy_reader_without_new_fields_uses_disclosed_compatibility_fallback(
     tmp_path: Path, sample_items
 ) -> None:
     class LegacyReader(FakeReader):
@@ -657,7 +664,11 @@ def test_legacy_reader_without_plain_english_field_uses_disclosed_compatibility_
             return {
                 key: f"Legacy source-grounded {key}; see page 1."
                 for key in __import__("conftest").SECTION_KEYS
-                if key != "plain_english_interpretation"
+                if key
+                not in {
+                    "key_concepts_and_definitions",
+                    "plain_english_interpretation",
+                }
             }
 
     report = run_map(
@@ -671,6 +682,7 @@ def test_legacy_reader_without_plain_english_field_uses_disclosed_compatibility_
     assert (
         "this legacy reader did not provide a separate translation" in note.read_text()
     )
+    assert "consult the source before relying on a definition" in note.read_text()
 
 
 def test_long_document_uses_bounded_chunk_reader_route(

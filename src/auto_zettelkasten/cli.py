@@ -20,6 +20,7 @@ from .api import (
     sync_zotero,
 )
 from .models import (
+    CURRENT_ATOMIC_PROMPT_VERSION,
     ExtractionPolicy,
     LiteratureMappingPolicy,
     MapRequest,
@@ -259,7 +260,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ),
                 limit=args.limit if args.limit is not None else 0,
                 extraction_version=str(extraction_config.get("version") or "2"),
-                prompt_version=str(config.get("prompt_version") or "11"),
+                prompt_version=CURRENT_ATOMIC_PROMPT_VERSION,
                 extraction_policy=_extraction_policy(args, config),
                 processing=_processing_policy(args, config),
                 literature_policy=_literature_policy(args, config),
