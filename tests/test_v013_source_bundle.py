@@ -1126,7 +1126,7 @@ def test_ordinary_bundle_source_uses_one_call_and_no_profile_or_fidelity_call(
     ]
     assert profile["coverage"]["status"] == "partial"
     note = read_note(tmp_path / report.items[0]["note_path"])
-    assert note["frontmatter"]["source_bundle_prompt_version"] == "16"
+    assert note["frontmatter"]["source_bundle_prompt_version"] == "17"
 
 
 def test_source_calls_share_the_cumulative_profile_budget_and_replay_is_free(
@@ -3539,6 +3539,42 @@ def test_quantitative_provenance_auxiliary_disambiguates_repeated_estimate() -> 
         )
         is not None
     )
+
+
+def test_quantitative_provenance_accepts_rephrased_reporting_qualifier() -> None:
+    payload = _bundle_payload()
+    payload["evidence_anchors"][0]["quantitative_result"] = {
+        "estimate": "three cases",
+        "comparison_group": "8 initially reported",
+        "provenance": "source_reported",
+    }
+
+    assert (
+        _source_bundle_from_result(
+            payload,
+            {
+                "source_id": "source-zotero-A1",
+                "zotero_item_key": "A1",
+                "text": "The audit found three cases, not 8 as originally reported.",
+            },
+            "full_document",
+        )
+        is not None
+    )
+
+    payload["evidence_anchors"][0]["quantitative_result"][
+        "comparison_group"
+    ] = "8 initially reported cases"
+    with pytest.raises(SourceBundleQuantitativeProvenanceError):
+        _source_bundle_from_result(
+            payload,
+            {
+                "source_id": "source-zotero-A1",
+                "zotero_item_key": "A1",
+                "text": "The audit found three cases, not 8 as originally reported people.",
+            },
+            "full_document",
+        )
 
 
 @pytest.mark.parametrize(

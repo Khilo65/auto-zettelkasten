@@ -16868,9 +16868,13 @@ def _following_unit(value: str, offset: int) -> str:
     skipped = {
         "a",
         "an",
+        "as",
+        "asserted",
         "average",
+        "initially",
         "net",
         "negative",
+        "originally",
         "positive",
         "reported",
         "the",

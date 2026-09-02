@@ -83,10 +83,10 @@ def test_atomic_prompt_v14_is_source_adaptive_and_statistics_aware() -> None:
     assert "silently reread" in prompt
 
 
-def test_source_bundle_prompt_v16_preserves_formatting_and_attribution_scope() -> None:
+def test_source_bundle_prompt_v17_preserves_formatting_and_attribution_scope() -> None:
     prompt = _source_bundle_system_prompt()
 
-    assert "source bundle prompt v16" in prompt
+    assert "source bundle prompt v17" in prompt
     assert "apply a footnote, only when the alignment or marker is explicit" in prompt
     assert "A footnote qualifies only the values bearing its explicit marker" in prompt
     assert "page metadata is not a statistic's observation date" in prompt
@@ -124,13 +124,19 @@ def test_source_bundle_prompt_requires_a_final_quantitative_copy_gate() -> None:
 
     assert "FINAL QUANTITATIVE COPY GATE" in prompt
     assert "One quantitative_result is one observation" in prompt
-    assert "split distinct categories" in prompt
+    assert "split distinct outcomes, categories" in prompt
+    assert "Overall rank, sub-index score, and sub-index rank" in prompt
+    assert "Sample size and geographic coverage are not components" in prompt
+    assert "A prose sentence or list is not a joint statistic" in prompt
+    assert "Never copy a footnote period or qualifier" in prompt
     assert "omit a lower-salience result instead of combining observations" in prompt
-    assert "same source sentence explicitly binds it to that exact estimate" in prompt
+    assert "same source sentence explicitly binds the same number and noun" in prompt
+    assert 'set that optional string to ""' in prompt
+    assert "Do not copy study-level sample or coverage" in prompt
     assert "set quantitative_result to null" in prompt
     assert "INSPECTED SOURCE CONTENT" in prompt
-    assert prompt.index("FINAL QUANTITATIVE COPY GATE") < prompt.index(
-        "INSPECTED SOURCE CONTENT"
+    assert prompt.index("INSPECTED SOURCE CONTENT") < prompt.index(
+        "FINAL QUANTITATIVE COPY GATE"
     )
 
 
@@ -148,7 +154,7 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     assert {
         "atomic_prompt_v14": digest(_system_prompt()),
         "chunk_prompt_v14": digest(_chunk_system_prompt()),
-        "source_bundle_prompt_v16": digest(_source_bundle_system_prompt()),
+        "source_bundle_prompt_v17": digest(_source_bundle_system_prompt()),
         "codex_source_bundle_schema": bundle_identity["schema_hash"],
         "codex_source_bundle_contract": digest(bundle_identity),
         "codex_chunk_evidence_schema": chunk_identity["schema_hash"],
@@ -156,7 +162,7 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     } == {
         "atomic_prompt_v14": "8db9f2990d175816cb0100b92d84734ae7c2f930aade66825ed0412b22da3705",
         "chunk_prompt_v14": "3c2eabca75c5ad487a35a5096664e0ec6999d04b738927a60fce2e11cfb15cd5",
-        "source_bundle_prompt_v16": "640035c6bfffea0a76c0d1f751da15565c57a850c766a63e6c5b7e87672994d7",
+        "source_bundle_prompt_v17": "65599a34463cde01d8ecbfd76fd53b364da385eaa2175ba2066dac806b66077e",
         "codex_source_bundle_schema": "1e8081c4c0e9a81f6880d6fe00c22421e1bbd29da961076559c0121f1e73efcc",
         "codex_source_bundle_contract": "0f7d0ae53a03bbe5b11f38f8e463bb3119a0413e52811319cca43d2c03c4115b",
         "codex_chunk_evidence_schema": "2df4a0fe634405df5e891283a59bfc7bee18995b5e970a51c5569b5c4eafed8e",
