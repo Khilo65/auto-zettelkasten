@@ -233,7 +233,7 @@ DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
-SOURCE_BUNDLE_PROMPT_VERSION = "12"
+SOURCE_BUNDLE_PROMPT_VERSION = "13"
 SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v2"
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
@@ -1694,6 +1694,12 @@ class _CapabilityAwareReader:
             )
         system_prompt = _source_bundle_system_prompt()
         user_prompt = _source_bundle_prompt(text, metadata, question)
+        if attachments:
+            user_prompt = (
+                "The attached page images are the inspected source content in page order. "
+                "Read them directly; an empty extracted-text block does not mean the source "
+                "is empty or unavailable.\n\n" + user_prompt
+            )
         output_tokens = self._reserved_output_tokens("source_bundle", min(
             int(self.capabilities["supported_output_tokens"]),
             SOURCE_BUNDLE_MAX_OUTPUT_TOKENS,
@@ -4011,6 +4017,8 @@ def _source_bundle_system_prompt() -> str:
         "retains assumptions, logical sequence, propositions, rivals, examples, and scope; institutional or practitioner work "
         "separates evidence and consultations from recommendations and implementation constraints; reviews retain the "
         "organizing debate, important cited positions, evidence bases, unresolved questions, and the author's contribution. "
+        "Legal, policy, and institutional sources must preserve explicitly stated operative dates, deadlines, effective dates, and signing dates, "
+        "keep their distinct roles, and never substitute bibliographic metadata. "
         "For a book-like source, identify whether it is an authored monograph, edited volume, collected work, chapter or "
         "contribution, partial excerpt, or composition-uncertain. An authored monograph needs book-level analysis and a bounded "
         "chapter outline in source_structure_and_organization when headings are recoverable. An edited or collected volume needs "

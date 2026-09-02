@@ -172,6 +172,7 @@ def test_codex_contract_capabilities_and_typed_retry_policy() -> None:
 def test_codex_image_bundle_without_evidence_is_typed_invalid(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    prompts: list[str] = []
     payload = {
         "analysis_sections": {
             key: "No recovered source text is available." for key in SECTION_KEYS
@@ -192,11 +193,11 @@ def test_codex_image_bundle_without_evidence_is_typed_invalid(
         "literature_positions": [],
         "observed_bibliographic_identity": {"title": "", "creators": [], "date": ""},
     }
-    monkeypatch.setattr(
-        CodexReader,
-        "_generate_with_reasoning",
-        lambda *_args, **_kwargs: payload,
-    )
+    def generate(_reader: CodexReader, _system: str, user: str, *_args, **_kwargs):
+        prompts.append(user)
+        return payload
+
+    monkeypatch.setattr(CodexReader, "_generate_with_reasoning", generate)
     reader = CodexReader("gpt-5.6-luna", allow_cloud=True)
 
     with pytest.raises(ProviderInvalidSourceBundle):
@@ -205,6 +206,7 @@ def test_codex_image_bundle_without_evidence_is_typed_invalid(
             {"_source_context": {"source_id": "source-zotero-A1", "zotero_key": "A1"}},
             attachment_paths=[tmp_path / "page.png"],
         )
+    assert "attached page images are the inspected source content" in prompts[0]
 
 
 def test_codex_evidence_profile_contract_remains_dormant_in_production(
