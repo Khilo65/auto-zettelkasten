@@ -3437,6 +3437,32 @@ def test_quantitative_provenance_accepts_percentage_baseline_comparison() -> Non
     )
 
 
+def test_quantitative_provenance_ignores_hyphenated_label_numbers() -> None:
+    payload = _bundle_payload()
+    payload["evidence_anchors"][0]["quantitative_result"] = {
+        "estimate": "first case",
+        "outcome_definition": "First confirmed TEST-19 case within Zone Alpha",
+        "period": "17 April 2098",
+        "provenance": "source_reported",
+    }
+
+    assert (
+        _source_bundle_from_result(
+            payload,
+            {
+                "source_id": "source-zotero-A1",
+                "zotero_item_key": "A1",
+                "text": (
+                    "On 17 April 2098, the lab confirmed its first case of "
+                    "TEST-19 within Zone Alpha."
+                ),
+            },
+            "full_document",
+        )
+        is not None
+    )
+
+
 def test_quantitative_provenance_auxiliary_uses_discriminating_anchor() -> None:
     cases = (
         (

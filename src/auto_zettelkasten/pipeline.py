@@ -15547,7 +15547,9 @@ def _normalized_quantity_text(value: str) -> str:
 
 
 def _quantity_token_list(value: str) -> list[str]:
-    return _fidelity_numeric_tokens(_normalized_quantity_text(value))
+    normalized = _normalized_quantity_text(value)
+    normalized = re.sub(r"(?<=[^\W\d_])-(?=\d)", "_", normalized)
+    return _fidelity_numeric_tokens(normalized)
 
 
 def _quantity_tokens(value: str) -> set[str]:
