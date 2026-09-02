@@ -396,22 +396,28 @@ def _exhaustive_inputs(
 
 def _completed_review(packet_path: Path, packet: dict) -> dict:
     judgments = []
+    packet_sha256 = sha256_file(packet_path)
     for row in packet["rows"]:
         judgment = {
             "review_id": row["review_id"],
             "artifact_sha256": row["artifact_sha256"],
             "row_sha256": row["row_sha256"],
+            "packet_sha256": packet_sha256,
+            "reviewer_task_id": f"task-{row['review_id']}",
+            "model": "gpt-5.6-sol",
+            "reasoning_effort": "high",
         }
         for field in row["required_judgments"]:
             judgment[field] = not field.endswith(
                 ("material_error", "materially_worse", "severe_overmerge")
             )
+        judgment["judgment_sha256"] = audit_tool._digest(judgment)
         judgments.append(judgment)
     return {
-        "review_schema_version": "1",
+        "review_schema_version": "2",
         "evidence_status": "autonomous_provisional",
         "never_production_input": True,
-        "packet_sha256": sha256_file(packet_path),
+        "packet_sha256": packet_sha256,
         "judgments": judgments,
     }
 
@@ -524,6 +530,12 @@ def test_release_quality_packet_is_deterministic_private_and_stale_safe(
     assert report["metrics"]["material_error_count"] == 0
     assert report["metrics"]["relationship_correctness"]["wilson_95_lower"] >= 0.80
     assert report["metrics"]["membership_correctness"]["wilson_95_lower"] >= 0.80
+    assert len(report["judgment_sha256"]) == first["selection_counts"]["total"]
+    assert all(
+        reviewer["model"] == "gpt-5.6-sol"
+        and reviewer["reasoning_effort"] == "high"
+        for reviewer in report["reviewers"]
+    )
     assert "relationship_wilson_lower_at_least_0_80" not in report["checks"]
     assert report["checks"]["all_current_note_statuses_correct"] is True
     assert report["checks"]["all_metadata_only_notes_non_pretending"] is True
@@ -550,6 +562,8 @@ def test_release_quality_packet_is_deterministic_private_and_stale_safe(
     current_prefix = f"variant_{binding['current_variant'].casefold()}_"
     failed_judgment[current_prefix + "status_correct"] = False
     failed_judgment[current_prefix + "metadata_only_non_pretense"] = False
+    failed_judgment.pop("judgment_sha256")
+    failed_judgment["judgment_sha256"] = audit_tool._digest(failed_judgment)
     write_yaml(failed_review_path, failed_review)
     failed_report = audit_tool.score(
         workspace,
@@ -561,6 +575,19 @@ def test_release_quality_packet_is_deterministic_private_and_stale_safe(
     assert failed_report["status"] == "failed"
     assert failed_report["checks"]["all_metadata_only_notes_non_pretending"] is False
     assert failed_report["checks"]["all_current_note_statuses_correct"] is False
+
+    stale_review_path = private / "stale-review.yml"
+    stale_review = _completed_review(first_path, first)
+    stale_review["judgments"][0]["reviewer_task_id"] = "different-task"
+    write_yaml(stale_review_path, stale_review)
+    with pytest.raises(ValueError, match="stale or bound"):
+        audit_tool.score(
+            workspace,
+            first_path,
+            stale_review_path,
+            private / "stale-report.yml",
+            bindings_path=first_bindings,
+        )
 
     protected_packet = baseline / "review-packet.yml"
     protected_bindings = custody_manifest.parent / "review-bindings.yml"
@@ -709,6 +736,97 @@ def test_exhaustive_packet_accepts_custody_manifest_at_workspace_root(
         bindings_path=bindings_path,
     )
     assert report["status"] == "passed"
+
+
+def test_exhaustive_packet_accepts_strategic40_json_and_custody_sources(
+    tmp_path: Path,
+) -> None:
+    case_root = tmp_path / "strategic40"
+    workspace = _workspace(case_root)
+    baseline, baseline_manifest, legacy_custody = _exhaustive_inputs(case_root, workspace)
+    legacy_cases = read_yaml(legacy_custody)["cases"]
+    for index, case in enumerate(legacy_cases):
+        source_id = case["source_id"]
+        note_path = workspace / "02_source_memory" / "notes" / f"note-{index:03d}.md"
+        note_path.write_text(
+            "---\n"
+            f"source_id: {source_id}\n"
+            f"note_id: note-{index:03d}\n"
+            f"note_status: {case['expected']['note_status']}\n"
+            f"source_scope: {case['expected']['source_scope']}\n"
+            "---\n\n"
+            f"Source-grounded analysis for {source_id}.\n",
+            encoding="utf-8",
+        )
+    source_manifest = workspace / "PRIVATE_MANIFEST.json"
+    source_manifest.write_text(
+        json.dumps({
+            "schema_version": "1",
+            "cases": [
+                {
+                    "case_id": case["case_id"],
+                    "source_id": case["source_id"],
+                    "zotero_parent": case["zotero_parent"],
+                }
+                for case in legacy_cases
+            ],
+        }, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    custody_sources = []
+    for case in legacy_cases:
+        metadata_only = case["expected"]["terminal_status"] == "limited_note"
+        raw = None
+        if not metadata_only:
+            source_path = legacy_custody.parent / case["file"]
+            raw = {
+                "attachment_key": f"attachment-{case['source_id']}",
+                "media_type": case["media_type"],
+                "path": case["file"],
+                "sha256": sha256_file(source_path),
+                "size": source_path.stat().st_size,
+            }
+        custody_sources.append({
+            "parent_key": case["case_id"],
+            "parent_record": case["zotero_parent"],
+            "source_id": case["source_id"],
+            "disposition": "metadata_only" if metadata_only else "substantive_raw_source",
+            "raw": raw,
+            "selected": {
+                "media_type": case["media_type"],
+                "route": case["expected"]["content_route"],
+                "scope": case["expected"]["source_scope"],
+                "terminal_status": case["expected"]["terminal_status"],
+            },
+        })
+    custody_manifest = legacy_custody.parent / "PRIVATE_CUSTODY_MANIFEST.json"
+    custody_manifest.write_text(
+        json.dumps({"schema_version": 1, "sources": custody_sources}, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    private = tmp_path / "private-review"
+    packet_path = private / "packet.yml"
+    bindings_path = private / "bindings.yml"
+
+    packet = audit_tool.prepare(
+        workspace,
+        "exhaustive40",
+        packet_path,
+        source_manifest_path=source_manifest,
+        baseline_workspace=baseline,
+        baseline_manifest_path=baseline_manifest,
+        custody_manifest_path=custody_manifest,
+        bindings_path=bindings_path,
+    )
+
+    assert packet["selection_counts"]["notes"] == 40
+    assert any(
+        artifact["path"] == "PRIVATE_MANIFEST.json"
+        for artifact in packet["artifacts"]
+    )
+    assert read_yaml(bindings_path)["custody_manifest_artifact"]["path"].endswith(
+        "PRIVATE_CUSTODY_MANIFEST.json"
+    )
 
 
 def test_package_audit_accepts_clean_sdist_built_wheel_and_artifact(

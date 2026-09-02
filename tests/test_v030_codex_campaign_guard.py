@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import stat
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -126,6 +127,56 @@ def _start(fixture: dict[str, Any], **overrides: Any) -> Any:
 
 def _rows(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_campaign_initializer_cli_creates_hash_locked_authorization_and_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _run("git", "init", "-q", cwd=repository)
+    _run("git", "config", "user.email", "test@example.invalid", cwd=repository)
+    _run("git", "config", "user.name", "Test", cwd=repository)
+    (repository / "tracked.txt").write_text("fixed\n", encoding="utf-8")
+    _run("git", "add", "tracked.txt", cwd=repository)
+    _run("git", "commit", "-qm", "fixture", cwd=repository)
+    private = tmp_path / "private"
+    private.mkdir()
+    manifest = private / "manifest.json"
+    manifest.write_text('{"schema_version":1}\n', encoding="utf-8")
+    authorization = (private / "authorization.json").resolve()
+    ledger = (private / "attempts.jsonl").resolve()
+    monkeypatch.setattr(sys, "argv", [
+        "v030_codex_campaign_guard.py", "--repository-root", str(repository),
+        "--manifest", str(manifest), "--authorization", str(authorization),
+        "--ledger", str(ledger), "--authorization-id", "campaign-auth-001",
+        "--evaluation-id", "strategic-eight", "--run-id", "run-001",
+        "--stage", "strategic8", "--source-attempt-limit", "8",
+        "--relationship-attempt-limit", "12",
+    ])
+
+    assert guard_module.main() == 0
+    summary = json.loads(capsys.readouterr().out)
+    payload = json.loads(authorization.read_text(encoding="ascii"))
+    assert summary["authorization_sha256"] == hashlib.sha256(
+        authorization.read_bytes()
+    ).hexdigest()
+    assert payload["manifest_sha256"] == hashlib.sha256(manifest.read_bytes()).hexdigest()
+    assert payload["code_commit"] == _run("git", "rev-parse", "HEAD", cwd=repository)
+    assert payload["total_attempt_limit"] == 20
+    assert stat.S_IMODE(authorization.stat().st_mode) == 0o400
+    assert _rows(ledger)[0]["record"] == "authorization"
+    with pytest.raises(FileExistsError):
+        guard_module.initialize_codex_campaign(
+            manifest, authorization, ledger,
+            repository_root=repository,
+            authorization_id="campaign-auth-001",
+            evaluation_id="strategic-eight",
+            run_id="run-001",
+            stage="strategic8",
+            source_attempt_limit=8,
+            relationship_attempt_limit=12,
+        )
 
 
 def test_role_and_total_ceilings_are_reserved_before_spawn(tmp_path: Path) -> None:

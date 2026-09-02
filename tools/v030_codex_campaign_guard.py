@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import fcntl
 import hashlib
 import json
@@ -251,6 +252,92 @@ def initialize_codex_campaign_ledger(
         os.close(descriptor)
     _fsync_parent(ledger_path)
     return ledger_path
+
+
+def initialize_codex_campaign(
+    manifest_path: Path,
+    authorization_path: Path,
+    ledger_path: Path,
+    *,
+    repository_root: Path,
+    authorization_id: str,
+    evaluation_id: str,
+    run_id: str,
+    stage: str,
+    source_attempt_limit: int,
+    relationship_attempt_limit: int,
+) -> dict[str, Any]:
+    """Create one hash-bound authorization and its count-before-launch ledger."""
+    root = repository_root.expanduser().resolve()
+    manifest = _private_file(manifest_path, root, label="campaign manifest")
+    authorization = _private_output(authorization_path, root, label="campaign authorization")
+    ledger = _private_output(ledger_path, root, label="campaign ledger")
+    if len({manifest, authorization, ledger}) != 3:
+        raise ValueError("campaign manifest, authorization, and ledger must be distinct")
+    for label, value in (
+        ("authorization_id", authorization_id),
+        ("evaluation_id", evaluation_id),
+        ("run_id", run_id),
+        ("stage", stage),
+    ):
+        if not _SAFE_ID.fullmatch(value):
+            raise ValueError(f"{label} is invalid")
+    source_limit = _positive_limit(source_attempt_limit, label="source_attempt_limit")
+    relationship_limit = _positive_limit(
+        relationship_attempt_limit, label="relationship_attempt_limit"
+    )
+    total_limit = source_limit + relationship_limit
+    if total_limit <= 0:
+        raise ValueError("campaign total attempt limit must be positive")
+    payload = {
+        "schema_version": 1,
+        "authorization_id": authorization_id,
+        "ledger": str(ledger),
+        "code_commit": _clean_commit(root),
+        "manifest_sha256": _sha256(manifest),
+        "evaluation_id": evaluation_id,
+        "run_id": run_id,
+        "stage": stage,
+        "source_attempt_limit": source_limit,
+        "relationship_attempt_limit": relationship_limit,
+        "total_attempt_limit": total_limit,
+    }
+    encoded = (
+        json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True) + "\n"
+    ).encode("ascii")
+    authorization_descriptor = ledger_descriptor = -1
+    try:
+        authorization_descriptor = _open_regular(
+            authorization, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        )
+        ledger_descriptor = _open_regular(ledger, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+        view = memoryview(encoded)
+        while view:
+            view = view[os.write(authorization_descriptor, view) :]
+        os.fsync(authorization_descriptor)
+        authorization_sha256 = hashlib.sha256(encoded).hexdigest()
+        _append(ledger_descriptor, _header(_binding(payload, authorization_sha256)))
+    except Exception:
+        for path, descriptor in (
+            (authorization, authorization_descriptor),
+            (ledger, ledger_descriptor),
+        ):
+            if descriptor >= 0:
+                os.close(descriptor)
+                path.unlink(missing_ok=True)
+        raise
+    os.close(authorization_descriptor)
+    os.close(ledger_descriptor)
+    os.chmod(authorization, 0o400)
+    _fsync_parent(authorization)
+    if ledger.parent != authorization.parent:
+        _fsync_parent(ledger)
+    return {
+        **payload,
+        "authorization": str(authorization),
+        "authorization_sha256": authorization_sha256,
+        "manifest": str(manifest),
+    }
 
 
 def _contract_role(contract_id: str) -> Literal["source", "relationship"]:
@@ -630,3 +717,36 @@ class CodexCampaignGuard:
             os.close(descriptor)
         fcntl.flock(self._run_lock_descriptor, fcntl.LOCK_UN)
         os.close(self._run_lock_descriptor)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repository-root", type=Path, required=True)
+    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--authorization", type=Path, required=True)
+    parser.add_argument("--ledger", type=Path, required=True)
+    parser.add_argument("--authorization-id", required=True)
+    parser.add_argument("--evaluation-id", required=True)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--stage", required=True)
+    parser.add_argument("--source-attempt-limit", type=int, required=True)
+    parser.add_argument("--relationship-attempt-limit", type=int, required=True)
+    args = parser.parse_args()
+    result = initialize_codex_campaign(
+        args.manifest,
+        args.authorization,
+        args.ledger,
+        repository_root=args.repository_root,
+        authorization_id=args.authorization_id,
+        evaluation_id=args.evaluation_id,
+        run_id=args.run_id,
+        stage=args.stage,
+        source_attempt_limit=args.source_attempt_limit,
+        relationship_attempt_limit=args.relationship_attempt_limit,
+    )
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -24,7 +24,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from auto_zettelkasten.files import read_yaml, sha256_file, write_yaml
-from auto_zettelkasten.notes import source_id_for_item
+from auto_zettelkasten.notes import read_note, source_id_for_item
 
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -92,6 +92,9 @@ _HISTORICAL_TEST_SENTINELS = {
     ),
 }
 _PRIVATE_LITERAL_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+_REVIEWER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}")
+_REVIEWER_MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+_REASONING_EFFORTS = {"low", "medium", "high", "xhigh", "max", "ultra"}
 
 
 class _ArchiveAuditError(ValueError):
@@ -408,8 +411,62 @@ def _row_group(row: Mapping[str, Any], strata: Mapping[str, str]) -> str:
 
 
 def _load_sources(
-    workspace: Path, mode: str
+    workspace: Path,
+    mode: str,
+    manifest_path: Path | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, str], list[dict[str, str]]]:
+    if manifest_path is None and mode == "exhaustive40":
+        candidate = workspace / "PRIVATE_MANIFEST.json"
+        manifest_path = candidate if candidate.is_file() else None
+    if manifest_path is not None:
+        path = _workspace_file(workspace, str(manifest_path), label="Strategic40 private manifest")
+        try:
+            manifest = _mapping(
+                json.loads(path.read_text(encoding="utf-8")),
+                label="Strategic40 private manifest",
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError("Strategic40 private manifest must be valid JSON") from exc
+        expected = _MODES[mode]
+        cases = [
+            _mapping(row, label="Strategic40 manifest case")
+            for row in manifest.get("cases", []) or []
+        ]
+        if len(cases) != expected:
+            raise ValueError(f"{mode} requires exactly {expected} manifest cases")
+        strata: dict[str, str] = {}
+        for case in cases:
+            parent = _mapping(case.get("zotero_parent", {}), label="Strategic40 Zotero parent")
+            source_id = str(case.get("source_id") or source_id_for_item(parent))
+            if not source_id or source_id in strata:
+                raise ValueError("Strategic40 source IDs must be non-empty and unique")
+            strata[source_id] = str(case.get("primary_stratum_id") or "unstratified")
+        notes: dict[str, tuple[Path, dict[str, Any]]] = {}
+        for note_path in sorted((workspace / "02_source_memory" / "notes").glob("*.md")):
+            note = read_note(note_path)
+            frontmatter = _mapping(
+                note.get("frontmatter", {}), label="Strategic40 note frontmatter"
+            )
+            source_id = str(frontmatter.get("source_id") or "")
+            if source_id in notes:
+                raise ValueError("Strategic40 notes repeat a source ID")
+            if source_id in strata:
+                notes[source_id] = (note_path, frontmatter)
+        if set(notes) != set(strata):
+            raise ValueError("Strategic40 notes must account for every manifest source")
+        contexts = []
+        for source_id in sorted(strata):
+            note_path, frontmatter = notes[source_id]
+            text, note_sha256 = _stable_text(note_path, label=f"note for {source_id}")
+            contexts.append({
+                "source_id": source_id,
+                "note_id": str(frontmatter.get("note_id") or note_path.stem),
+                "primary_stratum_id": strata[source_id],
+                "note_artifact": _artifact(note_path, workspace, note_sha256),
+                "note_text": text,
+            })
+        return contexts, strata, [_artifact(path, workspace, sha256_file(path))]
+
     manifest_path = workspace / "11_state" / "harness_bakeoff_manifest.yml"
     manifest, manifest_sha256 = _stable_yaml(
         manifest_path, label="harness bakeoff manifest"
@@ -492,9 +549,56 @@ def _custody_records(
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, str]]]:
     manifest, manifest_sha256 = _stable_yaml(manifest_path, label="custody manifest")
     manifest_artifact = _artifact(manifest_path, workspace, manifest_sha256)
-    cases = [
-        _mapping(row, label="custody case") for row in manifest.get("cases", []) or []
-    ]
+    if manifest.get("sources") is not None:
+        cases = []
+        for raw_source in manifest.get("sources", []) or []:
+            source = _mapping(raw_source, label="custody source")
+            selected = _mapping(source.get("selected", {}), label="custody source selection")
+            raw = source.get("raw")
+            raw_file = _mapping(raw, label="custody raw source") if raw is not None else None
+            terminal_status = str(selected.get("terminal_status") or "")
+            metadata_only = terminal_status == "limited_note"
+            case: dict[str, Any] = {
+                "case_id": str(source.get("parent_key") or ""),
+                "source_id": str(source.get("source_id") or ""),
+                "media_type": str(selected.get("media_type") or ""),
+                "expected": {
+                    "content_route": str(selected.get("route") or ""),
+                    "terminal_status": terminal_status,
+                    "source_scope": str(selected.get("scope") or ""),
+                    "note_status": (
+                        "metadata_only_source_note"
+                        if metadata_only
+                        else "analytical_atomic_note"
+                    ),
+                },
+                "zotero_parent": _mapping(
+                    source.get("parent_record", {}), label="custody source parent"
+                ),
+            }
+            if raw_file is not None:
+                attachment_key = str(raw_file.get("attachment_key") or "")
+                raw_path = str(raw_file.get("path") or "")
+                case.update({
+                    "file": raw_path,
+                    "sha256": str(raw_file.get("sha256") or ""),
+                    "zotero_attachment": {
+                        "key": attachment_key,
+                        "data": {
+                            "key": attachment_key,
+                            "parentItem": str(source.get("parent_key") or ""),
+                            "itemType": "attachment",
+                            "contentType": str(raw_file.get("media_type") or ""),
+                            "filename": Path(raw_path).name,
+                        },
+                    },
+                })
+            cases.append(case)
+    else:
+        cases = [
+            _mapping(row, label="custody case")
+            for row in manifest.get("cases", []) or []
+        ]
     records: dict[str, dict[str, Any]] = {}
     artifacts = [manifest_artifact]
     for case in cases:
@@ -1478,6 +1582,7 @@ def prepare(
     baseline_manifest_path: Path | None = None,
     custody_manifest_path: Path | None = None,
     bindings_path: Path | None = None,
+    source_manifest_path: Path | None = None,
 ) -> dict[str, Any]:
     if mode not in _MODES:
         raise ValueError(f"unsupported review mode: {mode}")
@@ -1485,7 +1590,7 @@ def prepare(
     if not workspace.is_dir():
         raise ValueError("workspace does not exist")
     packet_path = _private_yaml_path(packet_path, workspace, label="review packet")
-    sources, strata, artifacts = _load_sources(workspace, mode)
+    sources, strata, artifacts = _load_sources(workspace, mode, source_manifest_path)
     exhaustive = mode == "exhaustive40"
     note_bindings: list[dict[str, Any]] = []
     baseline_manifest_artifact: dict[str, str] | None = None
@@ -2022,7 +2127,7 @@ def score(
         )
     review = _mapping(read_yaml(review_path, None), label="review")
     if (
-        review.get("review_schema_version") != "1"
+        review.get("review_schema_version") != "2"
         or review.get("evidence_status") != "autonomous_provisional"
         or review.get("never_production_input") is not True
         or review.get("packet_sha256") != sha256_file(packet_path)
@@ -2040,9 +2145,16 @@ def score(
         raise ValueError("review judgments must cover every packet row exactly once")
     for row in rows:
         judgment = by_id[str(row["review_id"])]
+        judgment_payload = dict(judgment)
+        judgment_sha256 = str(judgment_payload.pop("judgment_sha256", ""))
         if (
             judgment.get("artifact_sha256") != row["artifact_sha256"]
             or judgment.get("row_sha256") != row["row_sha256"]
+            or judgment.get("packet_sha256") != sha256_file(packet_path)
+            or not _REVIEWER_ID.fullmatch(str(judgment.get("reviewer_task_id") or ""))
+            or not _REVIEWER_MODEL.fullmatch(str(judgment.get("model") or ""))
+            or judgment.get("reasoning_effort") not in _REASONING_EFFORTS
+            or judgment_sha256 != _digest(judgment_payload)
         ):
             raise ValueError("review judgment is stale or bound to another row")
         for field in row.get("required_judgments", []) or []:
@@ -2229,6 +2341,25 @@ def score(
         "mode": packet["mode"],
         "packet_sha256": sha256_file(packet_path),
         "review_sha256": sha256_file(review_path),
+        "reviewers": [
+            {
+                "reviewer_task_id": task_id,
+                "model": model,
+                "reasoning_effort": effort,
+            }
+            for task_id, model, effort in sorted({
+                (
+                    str(judgment["reviewer_task_id"]),
+                    str(judgment["model"]),
+                    str(judgment["reasoning_effort"]),
+                )
+                for judgment in judgments
+            })
+        ],
+        "judgment_sha256": {
+            str(judgment["review_id"]): str(judgment["judgment_sha256"])
+            for judgment in sorted(judgments, key=lambda value: str(value["review_id"]))
+        },
         "bindings_sha256": (
             sha256_file(bindings_path) if bindings_path is not None else None
         ),
@@ -2263,6 +2394,7 @@ def main() -> int:
     prepare_parser.add_argument("--baseline-manifest", type=Path)
     prepare_parser.add_argument("--custody-manifest", type=Path)
     prepare_parser.add_argument("--bindings", type=Path)
+    prepare_parser.add_argument("--source-manifest", type=Path)
     score_parser = commands.add_parser("score")
     score_parser.add_argument("--workspace", type=Path, required=True)
     score_parser.add_argument("--packet", type=Path, required=True)
@@ -2288,6 +2420,7 @@ def main() -> int:
             baseline_manifest_path=args.baseline_manifest,
             custody_manifest_path=args.custody_manifest,
             bindings_path=args.bindings,
+            source_manifest_path=args.source_manifest,
         )
         summary = {
             "status": result["evidence_status"],
