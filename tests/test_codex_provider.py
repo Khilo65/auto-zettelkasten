@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import io
 import json
-import os
 import subprocess
 import sys
 import threading
@@ -12,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from pypdf import PdfWriter
 
 from auto_zettelkasten.api import (
     _provider_check,
@@ -65,6 +67,7 @@ from auto_zettelkasten.readers import (
     _codex_error_item_category,
     _codex_failure,
     _codex_json_schema,
+    _codex_pdf_helper_manifest,
     _redact_codex_diagnostic,
     cancel_active_provider_responses,
     codex_contract_for_stage,
@@ -709,6 +712,10 @@ def test_codex_diagnostics_redact_credentials_and_account_identity(
     tmp_path: Path,
 ) -> None:
     credential_root = tmp_path / "synthetic-codex-home"
+    pdf_payload = base64.b64encode(b"%PDF-1.7\nprivate-pdf-sentinel\n%%EOF\n").decode(
+        "ascii"
+    )
+    pdf_data_url = "data:application/pdf;base64," + pdf_payload
     message = "\n".join(
         (
             "quota exhausted",
@@ -720,6 +727,7 @@ def test_codex_diagnostics_redact_credentials_and_account_identity(
             str(credential_root / "auth.json"),
             "sk-" + "SYNTHETICINVALID0000",
             "eyJsyntheticA." + "eyJsyntheticB.syntheticC",
+            pdf_data_url,
         )
     )
 
@@ -737,8 +745,12 @@ def test_codex_diagnostics_redact_credentials_and_account_identity(
         str(credential_root),
         "sk-" + "SYNTHETICINVALID0000",
         "eyJ" + "syntheticA",
+        pdf_payload,
+        pdf_data_url,
     ):
         assert sensitive not in redacted
+    assert "data:application/pdf;base64,[REDACTED]" in redacted
+    assert "data:application/pdf;base64,[REDACTED]" in str(failure)
 
 
 def test_codex_doctor_checks_both_requested_model_roles(
@@ -1084,20 +1096,53 @@ for line in sys.stdin:
     path.chmod(0o755)
 
 
-def _fake_pdf_preflight(tmp_path: Path, executable: Path) -> dict[str, object]:
+def _fake_pdf_preflight(
+    tmp_path: Path,
+    executable: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, object]:
+    patch_hash = "b" * 64
+    binary_hash = hashlib.sha256(executable.read_bytes()).hexdigest()
+    manifest_path = executable.with_name(executable.name + ".manifest.json")
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "manifest_version": 1,
+                "upstream_tag": "rust-v0.152.1",
+                "upstream_commit": "5adb68a49933ae446bf11935662c83dba55a0804",
+                "platform": "macos-arm64",
+                "license": "Apache-2.0",
+                "notice": "NOTICE",
+                "input_file_protocol_revision": "input_file-v1",
+                "patch_sha256": patch_hash,
+                "binary_sha256": binary_hash,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "auto_zettelkasten.readers._CODEX_PDF_HELPER_TRUST",
+        {"macos-arm64": frozenset({(patch_hash, binary_hash)})},
+    )
+    monkeypatch.setattr("auto_zettelkasten.readers.platform.system", lambda: "Darwin")
+    monkeypatch.setattr("auto_zettelkasten.readers.platform.machine", lambda: "arm64")
+    manifest = _codex_pdf_helper_manifest(executable)
+    assert manifest is not None
     status = fake_codex_preflight(tmp_path, executable)
     status.update(
         version="0.152.1",
         helper_version="0.152.1+azpdf1",
         helper_manifest_valid=True,
         pdf_input_file_capability=True,
-        _helper_manifest_identity={"manifest_sha256": "a" * 64},
+        _helper_manifest_identity=manifest,
     )
     return status
 
 
 def test_codex_pdf_app_server_sends_exact_ordered_file_text_and_contract(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     executable = tmp_path / "auto-zettelkasten-codex"
     capture = tmp_path / "capture.json"
@@ -1106,7 +1151,7 @@ def test_codex_pdf_app_server_sends_exact_ordered_file_text_and_contract(
     pdf_bytes = b"%PDF-1.7\nprivate-pdf-sentinel\n%%EOF\n"
     pdf.write_bytes(pdf_bytes)
     reader = CodexReader("gpt-5.6-luna", allow_cloud=True)
-    reader._preflight = _fake_pdf_preflight(tmp_path, executable)
+    reader._preflight = _fake_pdf_preflight(tmp_path, executable, monkeypatch)
 
     result = reader.read_source_bundle(
         "",
@@ -1183,14 +1228,17 @@ def test_codex_pdf_rejects_unverified_helper_before_process_spawn(
         )
 
 
-def test_codex_pdf_reserves_attempt_before_app_server_spawn(tmp_path: Path) -> None:
+def test_codex_pdf_reserves_attempt_before_app_server_spawn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     executable = tmp_path / "auto-zettelkasten-codex"
     capture = tmp_path / "capture.json"
     _fake_codex_app_server(executable, capture)
     pdf = tmp_path / "source.pdf"
     pdf.write_bytes(b"%PDF-1.7\n%%EOF\n")
     reader = CodexReader("gpt-5.6-luna", allow_cloud=True)
-    reader._preflight = _fake_pdf_preflight(tmp_path, executable)
+    reader._preflight = _fake_pdf_preflight(tmp_path, executable, monkeypatch)
 
     with deny_codex_attempts(), pytest.raises(
         CodexAttemptStateError, match="calls are forbidden"
@@ -1216,6 +1264,7 @@ def test_codex_pdf_reserves_attempt_before_app_server_spawn(tmp_path: Path) -> N
 )
 def test_codex_pdf_app_server_fails_closed_on_protocol_violations(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     mode: str,
     failure_type: type[Exception],
     match: str,
@@ -1226,7 +1275,7 @@ def test_codex_pdf_app_server_fails_closed_on_protocol_violations(
     pdf = tmp_path / "source.pdf"
     pdf.write_bytes(b"%PDF-1.7\nprivate-pdf-sentinel\n%%EOF\n")
     reader = CodexReader("gpt-5.6-luna", allow_cloud=True)
-    reader._preflight = _fake_pdf_preflight(tmp_path, executable)
+    reader._preflight = _fake_pdf_preflight(tmp_path, executable, monkeypatch)
 
     with pytest.raises(failure_type, match=match) as raised:
         reader.read_source_bundle(
@@ -1241,6 +1290,7 @@ def test_codex_pdf_app_server_fails_closed_on_protocol_violations(
 
 def test_codex_pdf_app_server_types_preinference_attachment_rejection(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     executable = tmp_path / "auto-zettelkasten-codex"
     capture = tmp_path / "capture.json"
@@ -1248,7 +1298,7 @@ def test_codex_pdf_app_server_types_preinference_attachment_rejection(
     pdf = tmp_path / "source.pdf"
     pdf.write_bytes(b"%PDF-1.7\nprivate-pdf-sentinel\n%%EOF\n")
     reader = CodexReader("gpt-5.6-luna", allow_cloud=True)
-    reader._preflight = _fake_pdf_preflight(tmp_path, executable)
+    reader._preflight = _fake_pdf_preflight(tmp_path, executable, monkeypatch)
 
     with pytest.raises(ProviderUnsupportedAttachment, match="unsupported"):
         reader.read_source_bundle(
@@ -1258,14 +1308,17 @@ def test_codex_pdf_app_server_types_preinference_attachment_rejection(
         )
 
 
-def test_codex_pdf_app_server_rejects_child_auth_rotation(tmp_path: Path) -> None:
+def test_codex_pdf_app_server_rejects_child_auth_rotation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     executable = tmp_path / "auto-zettelkasten-codex"
     capture = tmp_path / "capture.json"
     _fake_codex_app_server(executable, capture, mutate_auth=True)
     pdf = tmp_path / "source.pdf"
     pdf.write_bytes(b"%PDF-1.7\nprivate-pdf-sentinel\n%%EOF\n")
     reader = CodexReader("gpt-5.6-luna", allow_cloud=True)
-    reader._preflight = _fake_pdf_preflight(tmp_path, executable)
+    reader._preflight = _fake_pdf_preflight(tmp_path, executable, monkeypatch)
 
     with pytest.raises(ProviderIsolationFailure, match="authentication state"):
         reader.read_source_bundle(
@@ -1275,14 +1328,17 @@ def test_codex_pdf_app_server_rejects_child_auth_rotation(tmp_path: Path) -> Non
         )
 
 
-def test_codex_pdf_app_server_timeout_is_typed(tmp_path: Path) -> None:
+def test_codex_pdf_app_server_timeout_is_typed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     executable = tmp_path / "auto-zettelkasten-codex"
     capture = tmp_path / "capture.json"
     _fake_codex_app_server(executable, capture, mode="timeout")
     pdf = tmp_path / "source.pdf"
     pdf.write_bytes(b"%PDF-1.7\nprivate-pdf-sentinel\n%%EOF\n")
     reader = CodexReader("gpt-5.6-luna", allow_cloud=True)
-    reader._preflight = _fake_pdf_preflight(tmp_path, executable)
+    reader._preflight = _fake_pdf_preflight(tmp_path, executable, monkeypatch)
 
     token = _SOURCE_BUNDLE_ATTACHMENTS.set((pdf,))
     try:
@@ -1299,14 +1355,17 @@ def test_codex_pdf_app_server_timeout_is_typed(tmp_path: Path) -> None:
         _SOURCE_BUNDLE_ATTACHMENTS.reset(token)
 
 
-def test_codex_pdf_app_server_external_cancellation_is_typed(tmp_path: Path) -> None:
+def test_codex_pdf_app_server_external_cancellation_is_typed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     executable = tmp_path / "auto-zettelkasten-codex"
     capture = tmp_path / "capture.json"
     _fake_codex_app_server(executable, capture, mode="timeout")
     pdf = tmp_path / "source.pdf"
     pdf.write_bytes(b"%PDF-1.7\nprivate-pdf-sentinel\n%%EOF\n")
     reader = CodexReader("gpt-5.6-luna", allow_cloud=True)
-    reader._preflight = _fake_pdf_preflight(tmp_path, executable)
+    reader._preflight = _fake_pdf_preflight(tmp_path, executable, monkeypatch)
 
     def invoke() -> object:
         token = _SOURCE_BUNDLE_ATTACHMENTS.set((pdf,))
@@ -1860,7 +1919,10 @@ def test_standalone_codex_build_map_installs_one_lazy_quota_stop_event(
     assert submitted == [0, 1]
 
 
-def _fake_public_map_codex(path: Path, calls_path: Path) -> None:
+def _fake_public_map_codex(path: Path, calls_path: Path) -> Path:
+    exec_path = path.with_name(path.name + "-exec")
+    app_server_path = path.with_name(path.name + "-app-server")
+    app_server_capture = path.with_name(path.name + "-app-server.json")
     body = f'''#!{sys.executable}
 import json, re, sys
 from pathlib import Path
@@ -2060,8 +2122,27 @@ print(json.dumps({{"type": "turn.started"}}), flush=True)
 print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", "text": json.dumps(payload)}}}}), flush=True)
 print(json.dumps({{"type": "turn.completed", "usage": {{"input_tokens": 1, "output_tokens": 1}}}}), flush=True)
 '''
-    path.write_text(body, encoding="utf-8")
+    exec_path.write_text(body, encoding="utf-8")
+    exec_path.chmod(0o755)
+    _fake_codex_app_server(app_server_path, app_server_capture)
+    wrapper = f'''#!{sys.executable}
+import os, sys
+
+target = {str(app_server_path)!r} if sys.argv[1:2] == ["app-server"] else {str(exec_path)!r}
+os.execv(target, [target, *sys.argv[1:]])
+'''
+    path.write_text(wrapper, encoding="utf-8")
     path.chmod(0o755)
+    return app_server_capture
+
+
+def _synthetic_blank_pdf(title: str) -> bytes:
+    stream = io.BytesIO()
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    writer.add_metadata({"/Title": title})
+    writer.write(stream)
+    return stream.getvalue()
 
 
 def test_public_codex_map_runs_relationships_and_replays_without_calls_or_semantic_changes(
@@ -2073,9 +2154,41 @@ def test_public_codex_map_runs_relationships_and_replays_without_calls_or_semant
     provider_root.mkdir()
     executable = provider_root / "codex"
     calls_path = provider_root / "calls.jsonl"
-    _fake_public_map_codex(executable, calls_path)
+    app_server_capture = _fake_public_map_codex(executable, calls_path)
     workspace = tmp_path / "workspace"
     preflight_calls: list[tuple[str, tuple[str, ...]]] = []
+    pdf_bytes = _synthetic_blank_pdf("Institutions and Reform")
+
+    class MixedSourceZotero(FakeZotero):
+        def children(self, item_key: str) -> list[dict[str, object]]:
+            if item_key != "ITEMA":
+                return super().children(item_key)
+            self.children_calls += 1
+            return [
+                {
+                    "key": "ITEMAPDF",
+                    "data": {
+                        "key": "ITEMAPDF",
+                        "parentItem": "ITEMA",
+                        "itemType": "attachment",
+                        "contentType": "application/pdf",
+                        "filename": "Institutions and Reform.pdf",
+                        "title": "Full Text PDF",
+                    },
+                }
+            ]
+
+        def fulltext(self, item_key: str) -> dict[str, object] | None:
+            if item_key != "ITEMAPDF":
+                return super().fulltext(item_key)
+            self.fulltext_calls += 1
+            return None
+
+        def file(self, item_key: str) -> tuple[bytes, str] | None:
+            if item_key != "ITEMAPDF":
+                return super().file(item_key)
+            self.file_calls += 1
+            return pdf_bytes, "application/pdf"
 
     def preflight(
         model: str,
@@ -2089,11 +2202,7 @@ def test_public_codex_map_runs_relationships_and_replays_without_calls_or_semant
             workspace.resolve() / "11_state" / "runs" / "public-codex-map",
         )
         preflight_calls.append((model, additional_models))
-        return fake_codex_preflight(
-            tmp_path,
-            executable,
-            {"PATH": os.environ["PATH"]},
-        )
+        return _fake_pdf_preflight(tmp_path, executable, monkeypatch)
 
     monkeypatch.setattr("auto_zettelkasten.pipeline.codex_preflight_status", preflight)
     request = MapRequest(
@@ -2113,7 +2222,7 @@ def test_public_codex_map_runs_relationships_and_replays_without_calls_or_semant
     items[0]["data"].pop("relations", None)
     first = run_map(
         request,
-        client=FakeZotero(items),
+        client=MixedSourceZotero(items),
         run_id="public-codex-map",
     )
 
@@ -2125,7 +2234,7 @@ def test_public_codex_map_runs_relationships_and_replays_without_calls_or_semant
         contract: sum(row["contract"] == contract for row in calls)
         for contract in {row["contract"] for row in calls}
     } == {
-        "source_bundle": 2,
+        "source_bundle": 1,
         "relationship_candidate_selection": 1,
         "relationship_adjudication": 1,
         "literature_family_plan": 1,
@@ -2136,6 +2245,29 @@ def test_public_codex_map_runs_relationships_and_replays_without_calls_or_semant
     assert any(row["contract"] == "relationship_candidate_selection" for row in calls)
     assert any(row["contract"] == "relationship_adjudication" for row in calls)
     assert any(row["contract"] == "cluster_synthesis" for row in calls)
+    captured = json.loads(app_server_capture.read_text(encoding="utf-8"))
+    requests = [row for row in captured["messages"] if row.get("id") is not None]
+    assert [row["method"] for row in requests] == [
+        "initialize",
+        "thread/start",
+        "thread/inject_items",
+        "turn/start",
+    ]
+    assert requests[1]["params"]["model"] == "gpt-5.6-luna"
+    input_file = requests[2]["params"]["items"][0]["content"][0]
+    assert input_file["type"] == "input_file"
+    assert input_file["filename"] == "ITEMAPDF.pdf"
+    assert base64.b64decode(input_file["file_data"].split(",", 1)[1]) == pdf_bytes
+    route = read_yaml(
+        workspace
+        / "11_state"
+        / "runs"
+        / "public-codex-map"
+        / "items"
+        / "ITEMA"
+        / "document_route.yml"
+    )
+    assert route["identity_payload"]["route"] == "codex_pdf_input_file"
     registry = read_yaml(
         workspace / "02_source_memory" / "indexes" / "typed_links.yml"
     )
@@ -2165,12 +2297,14 @@ def test_public_codex_map_runs_relationships_and_replays_without_calls_or_semant
     assert synthesis["retained_member_ids"] == cluster["source_ids"]
 
     before_calls = calls_path.read_bytes()
+    before_app_server_capture = app_server_capture.read_bytes()
     run_root = workspace / "11_state" / "runs" / "public-codex-map"
     semantic_roots = (
         workspace / "02_source_memory",
         workspace / "03_literature_synthesis",
         workspace / "11_state" / "relationship_jobs",
         workspace / "11_state" / "semantic_jobs",
+        run_root / "items",
         run_root / "literature",
         run_root / "relationship_batches",
         run_root / "relationship_jobs",
@@ -2198,7 +2332,7 @@ def test_public_codex_map_runs_relationships_and_replays_without_calls_or_semant
         replay = resume_map(
             workspace,
             "public-codex-map",
-            client=FakeZotero(items),
+            client=MixedSourceZotero(items),
         )
 
     assert replay.status == "completed"
@@ -2206,6 +2340,7 @@ def test_public_codex_map_runs_relationships_and_replays_without_calls_or_semant
     assert replay.source_set["dependency_hash"] == first.source_set["dependency_hash"]
     assert preflight_calls == [("gpt-5.6-luna", ("gpt-5.6-terra",))]
     assert calls_path.read_bytes() == before_calls
+    assert app_server_capture.read_bytes() == before_app_server_capture
     after_files = semantic_snapshot()
     changed = [
         (path.relative_to(workspace), before_files.get(path), after_files.get(path))
