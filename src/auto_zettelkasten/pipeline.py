@@ -16035,8 +16035,8 @@ def _source_year_values(value: str) -> set[str]:
         if (
             stripped == year
             or re.search(
-                r"\b(?:cohort|during|edition|election|for|from|fy|in|index|since|"
-                r"study|survey|through|wave|year)\s*$",
+                r"\b(?:cohort|during|early|edition|election|for|from|fy|in|index|"
+                r"late|mid|since|study|survey|through|wave|year)\s*$",
                 prefix,
                 flags=re.IGNORECASE,
             )
@@ -17089,6 +17089,9 @@ def _quantity_token_units(value: str) -> dict[str, set[str]]:
     for match in re.finditer(_DERIVATION_NUMBER, normalized):
         token = _quantity_token_list(match.group())[0]
         if token in claimed:
+            if token.endswith("%"):
+                units.setdefault(token, set())
+                continue
             unit = _following_unit(normalized, match.end())
             if unit:
                 units[token].add(_unit_key(unit))

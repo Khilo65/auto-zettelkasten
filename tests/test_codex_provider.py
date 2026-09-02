@@ -48,6 +48,7 @@ from auto_zettelkasten.readers import (
     CodexReader,
     ProviderError,
     ProviderInterrupted,
+    ProviderInvalidSourceBundle,
     ProviderIsolationFailure,
     ProviderQuotaExhausted,
     ProviderTimeout,
@@ -166,6 +167,44 @@ def test_codex_contract_capabilities_and_typed_retry_policy() -> None:
         ),
         ProviderUnsupportedAttachment,
     )
+
+
+def test_codex_image_bundle_without_evidence_is_typed_invalid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payload = {
+        "analysis_sections": {
+            key: "No recovered source text is available." for key in SECTION_KEYS
+        },
+        "compact_profile": {
+            "thesis": "No thesis is recoverable.",
+            "method_or_knowledge_basis": "",
+            "source_genre": "",
+            "inferential_design": "",
+            "mechanisms": [],
+            "outcomes": [],
+            "cases": [],
+            "populations": [],
+            "periods": [],
+            "datasets": [],
+        },
+        "evidence_anchors": [],
+        "literature_positions": [],
+        "observed_bibliographic_identity": {"title": "", "creators": [], "date": ""},
+    }
+    monkeypatch.setattr(
+        CodexReader,
+        "_generate_with_reasoning",
+        lambda *_args, **_kwargs: payload,
+    )
+    reader = CodexReader("gpt-5.6-luna", allow_cloud=True)
+
+    with pytest.raises(ProviderInvalidSourceBundle):
+        reader.read_source_bundle(
+            "",
+            {"_source_context": {"source_id": "source-zotero-A1", "zotero_key": "A1"}},
+            attachment_paths=[tmp_path / "page.png"],
+        )
 
 
 def test_codex_evidence_profile_contract_remains_dormant_in_production(

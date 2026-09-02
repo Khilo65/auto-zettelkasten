@@ -3390,6 +3390,53 @@ def test_quantitative_provenance_checks_auxiliary_numeric_fields() -> None:
             )
 
 
+def test_quantitative_provenance_accepts_qualified_year() -> None:
+    payload = _bundle_payload()
+    payload["evidence_anchors"][0]["quantitative_result"] = {
+        "estimate": "early 2002",
+        "period": "early 2002",
+        "provenance": "source_reported",
+    }
+
+    assert (
+        _source_bundle_from_result(
+            payload,
+            {
+                "source_id": "source-zotero-A1",
+                "zotero_item_key": "A1",
+                "text": "The program was created in early 2002.",
+            },
+            "full_document",
+        )
+        is not None
+    )
+
+
+def test_quantitative_provenance_accepts_percentage_baseline_comparison() -> None:
+    payload = _bundle_payload()
+    payload["evidence_anchors"][0]["quantitative_result"] = {
+        "estimate": "additional ten percent",
+        "baseline": "45 percent versus 65 percent expected proportion of the vote",
+        "provenance": "source_reported",
+    }
+
+    assert (
+        _source_bundle_from_result(
+            payload,
+            {
+                "source_id": "source-zotero-A1",
+                "zotero_item_key": "A1",
+                "text": (
+                    "The expected vote for nonincumbents was 45 percent vs. 65 percent, "
+                    "but incumbency could still add an additional ten percent."
+                ),
+            },
+            "full_document",
+        )
+        is not None
+    )
+
+
 def test_quantitative_provenance_auxiliary_uses_discriminating_anchor() -> None:
     cases = (
         (

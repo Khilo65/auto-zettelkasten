@@ -1714,11 +1714,14 @@ class _CapabilityAwareReader:
         finally:
             _SOURCE_BUNDLE_ATTACHMENTS.reset(attachment_token)
         try:
-            return _parse_source_bundle_response(
+            bundle = _parse_source_bundle_response(
                 raw,
                 label="source analysis bundle response",
                 expected_identity=_source_bundle_expected_identity(metadata),
             )
+            if attachments and not bundle.get("evidence_anchors"):
+                raise ValueError("image-backed source bundle contains no evidence")
+            return bundle
         except Exception as exc:
             _preserve_provider_failure(exc, raw)
             if attachments:
