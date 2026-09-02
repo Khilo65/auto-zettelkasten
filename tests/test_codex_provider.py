@@ -835,6 +835,25 @@ def test_codex_doctor_reports_version_and_auth_failures(
     assert reason in status["reason"]
 
 
+def test_codex_doctor_coarsens_unexpected_preflight_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_path = "/Users/private/.codex/auth.json"
+
+    def fail(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise OSError(f"cannot inspect {private_path}")
+
+    monkeypatch.setattr("auto_zettelkasten.api.codex_preflight_status", fail)
+    status = _provider_check(
+        "codex",
+        "gpt-5.6-luna",
+        {"literature_model": "gpt-5.6-terra"},
+    )
+
+    assert status["reason"] == "OSError: Codex preflight failed"
+    assert private_path not in json.dumps(status)
+
+
 def test_combined_codex_replay_without_new_calls_skips_live_preflight(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

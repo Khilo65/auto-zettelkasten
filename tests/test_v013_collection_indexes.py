@@ -7,7 +7,7 @@ from typing import Any, Mapping
 from auto_zettelkasten.api import export_to_obsidian, initialize_workspace, sync_zotero
 from auto_zettelkasten.files import read_yaml, write_yaml
 from auto_zettelkasten.indexes import build_source_catalogue
-from auto_zettelkasten.models import MapRequest
+from auto_zettelkasten.models import ExtractionPolicy, MapRequest
 from auto_zettelkasten.pipeline import _source_set_graph_inputs
 from auto_zettelkasten.zotero import (
     ZoteroLocalClient,
@@ -601,7 +601,60 @@ def test_changed_and_new_sources_are_the_only_frozen_processing_inventory(
 
     assert result["processed_item_keys"] == ["ITEM1", "ITEM2"]
     assert frozen == current_items
+    assert read_yaml(
+        tmp_path
+        / "11_state"
+        / "runs"
+        / "incremental-changes"
+        / "request.yml"
+    )["extraction_policy"]["pdf_fallback"] == "none"
     assert result["relationship_discovery_performed"] is True
+
+
+def test_pending_sync_preserves_frozen_pdf_fallback(
+    tmp_path: Path, monkeypatch
+) -> None:
+    initialize_workspace(tmp_path)
+    run_id = "pending-sync"
+    run_root = tmp_path / "11_state" / "runs" / run_id
+    run_root.mkdir(parents=True)
+    (run_root / "inventory.json").write_text("[]\n", encoding="utf-8")
+    frozen_request = MapRequest(
+        tmp_path,
+        provider="ollama",
+        model="unused",
+        extraction_policy=ExtractionPolicy(pdf_fallback="images"),
+    )
+    write_yaml(run_root / "request.yml", frozen_request.to_dict())
+    captured: list[MapRequest] = []
+
+    class Report:
+        status = "completed"
+        provider_call_count = 0
+
+        def to_dict(self) -> dict[str, Any]:
+            return {"status": self.status, "provider_call_count": 0}
+
+    def run(request: MapRequest, **_kwargs: Any) -> Report:
+        captured.append(request)
+        return Report()
+
+    monkeypatch.setattr("auto_zettelkasten.api.run_map", run)
+    sync_zotero(
+        MapRequest(
+            tmp_path,
+            provider="ollama",
+            model="unused",
+            extraction_policy=ExtractionPolicy(pdf_fallback="ocr"),
+        ),
+        client=SyncClient(_collections(), _items(), []),  # type: ignore[arg-type]
+        run_id=run_id,
+    )
+
+    assert captured[0].extraction_policy.pdf_fallback == "images"
+    assert read_yaml(run_root / "request.yml")["extraction_policy"][
+        "pdf_fallback"
+    ] == "images"
 
 
 def test_removed_source_uses_full_snapshot_for_local_retirement_and_preserves_note(

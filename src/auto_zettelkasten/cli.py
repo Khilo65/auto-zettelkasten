@@ -87,6 +87,9 @@ def build_parser() -> argparse.ArgumentParser:
     map_parser.add_argument("--run-id", default="")
     map_parser.add_argument("--ocr", choices=("auto", "off", "required"), default=None)
     map_parser.add_argument(
+        "--pdf-fallback", choices=("none", "images", "ocr"), default=None
+    )
+    map_parser.add_argument(
         "--ocr-language",
         action="append",
         default=None,
@@ -149,6 +152,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sync_parser.add_argument("--max-provider-spend-usd", default=None)
     sync_parser.add_argument("--run-id", default="")
+    sync_parser.add_argument(
+        "--pdf-fallback", choices=("none", "images", "ocr"), default=None
+    )
     _add_literature_policy_arguments(sync_parser)
     _add_navigation_policy_arguments(sync_parser)
 
@@ -322,6 +328,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if provider == configured_provider
                 else None
             )
+            extraction_config = (
+                config.get("extraction", {})
+                if isinstance(config.get("extraction", {}), dict)
+                else {}
+            )
             request = MapRequest(
                 workspace=args.workspace,
                 scope=args.scope or str(config.get("scope") or "library"),
@@ -345,6 +356,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     if args.max_provider_spend_usd is not None
                     else config.get("max_provider_spend_usd")
                 ),
+                extraction_version=str(extraction_config.get("version") or "2"),
+                extraction_policy=_extraction_policy(args, config),
                 literature_policy=_literature_policy(args, config),
                 navigation_policy=_navigation_policy(args, config),
             )
@@ -561,8 +574,17 @@ def _extraction_policy(
     )
     defaults = ExtractionPolicy.from_dict(configured)
     return ExtractionPolicy(
-        ocr=args.ocr if args.ocr is not None else defaults.ocr,
-        languages=tuple(args.ocr_language or defaults.languages),
+        ocr=(
+            args.ocr
+            if getattr(args, "ocr", None) is not None
+            else defaults.ocr
+        ),
+        languages=tuple(getattr(args, "ocr_language", None) or defaults.languages),
+        pdf_fallback=(
+            args.pdf_fallback
+            if getattr(args, "pdf_fallback", None) is not None
+            else defaults.pdf_fallback
+        ),
     )
 
 

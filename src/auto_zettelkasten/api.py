@@ -70,6 +70,7 @@ from .readers import (
     DEFAULT_PROMPT_RESERVE_TOKENS,
     MODEL_CONTEXT_WINDOWS,
     PROVIDER_CONTEXT_WINDOW_DEFAULTS,
+    ProviderError,
     codex_preflight_status,
     codex_suite_identity,
     provider_from_name,
@@ -1045,6 +1046,14 @@ def sync_zotero(
     changed = any(changes.values())
     effective_run_id = run_id or f"zotero-sync-{current['fingerprint'][:16]}"
     pending_run = (run_directory(root, effective_run_id) / "inventory.json").is_file()
+    if pending_run:
+        frozen_request = read_yaml(
+            run_directory(root, effective_run_id) / "request.yml", {}
+        ) or {}
+        if frozen_request:
+            request = MapRequest.from_dict(
+                {**frozen_request, "workspace": str(root)}
+            )
     if not changed and previous and not pending_run:
         return {
             "status": "unchanged",
@@ -1263,6 +1272,7 @@ def _freeze_incremental_run(
             )
         return
     run_dir.mkdir(parents=True, exist_ok=True)
+    write_yaml(run_dir / "request.yml", request.to_dict())
     normalized_items = [dict(row) for row in items]
     write_json(frozen_inventory_path, normalized_items)
     write_yaml(frozen_snapshot_path, dict(collection_snapshot))
@@ -2911,7 +2921,7 @@ def _provider_check(
                 (literature_model,) if literature_model else (),
                 **kwargs,
             )
-        except Exception as exc:
+        except ProviderError as exc:
             return {
                 "status": "unavailable",
                 "provider": provider,
@@ -2921,14 +2931,26 @@ def _provider_check(
                 "experimental": True,
                 "quota": "unknown",
             }
+        except Exception as exc:
+            return {
+                "status": "unavailable",
+                "provider": provider,
+                "model": model,
+                "cloud": True,
+                "reason": f"{type(exc).__name__}: Codex preflight failed",
+                "experimental": True,
+                "quota": "unknown",
+            }
         public_status = {
             key: status[key]
             for key in (
                 "status",
                 "provider",
                 "cloud",
-                "executable",
                 "version",
+                "helper_version",
+                "helper_manifest_valid",
+                "pdf_input_file_capability",
                 "auth_method",
                 "auth_status",
                 "model",

@@ -510,10 +510,13 @@ class ExtractionPolicy:
 
     ocr: Literal["auto", "off", "required"] = "auto"
     languages: tuple[str, ...] = ("eng",)
+    pdf_fallback: Literal["none", "images", "ocr"] = "none"
 
     def __post_init__(self) -> None:
         if self.ocr not in {"auto", "off", "required"}:
             raise ValueError("extraction.ocr must be auto, off, or required")
+        if self.pdf_fallback not in {"none", "images", "ocr"}:
+            raise ValueError("extraction.pdf_fallback must be none, images, or ocr")
         languages = self.languages
         if isinstance(languages, str):
             languages = (languages,)
@@ -548,6 +551,7 @@ class ExtractionPolicy:
         return cls(
             ocr=str(values.get("ocr", "auto")),  # type: ignore[arg-type]
             languages=tuple(str(value) for value in languages),
+            pdf_fallback=str(values.get("pdf_fallback", "none")),  # type: ignore[arg-type]
         )
 
 
