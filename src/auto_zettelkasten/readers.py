@@ -233,7 +233,7 @@ DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
-SOURCE_BUNDLE_PROMPT_VERSION = "15"
+SOURCE_BUNDLE_PROMPT_VERSION = "16"
 SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v2"
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
@@ -4125,7 +4125,13 @@ def _source_bundle_prompt(
         "against the same local passage in INSPECTED SOURCE CONTENT. For source_reported "
         "values, every numeric token in estimate and every numeric date or year endpoint in "
         "period must appear verbatim in that passage. Do not round, approximate, infer "
-        "endpoints, or borrow dates from metadata or context. For system_derived values, "
+        "endpoints, or borrow dates from metadata or context. One quantitative_result is one "
+        "observation: split distinct categories, dates, groups, models, table rows, and footnote "
+        "scopes into separate evidence anchors even when the source lists them together. If the "
+        "24-row limit would be exceeded, omit a lower-salience result instead of combining "
+        "observations. Before emitting a row, keep a numeric optional field only when the same "
+        "source sentence explicitly binds it to that exact estimate; otherwise omit that field. "
+        "For system_derived values, "
         "every input must be explicit in that passage. If any check fails, set "
         "quantitative_result to null and remove the unsupported number or date from the "
         "anchor claim, plain-English meaning, and analysis prose; retain only supported "

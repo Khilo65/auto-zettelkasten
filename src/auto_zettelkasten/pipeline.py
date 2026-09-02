@@ -16649,6 +16649,7 @@ def _source_value_is_locally_supported(
     }
     expected_units = _quantity_token_units(value)
     supported_anchors: set[int] = set()
+    joint_support = False
     for index in range(len(source_lines)):
         groups = [(index,)]
         if (
@@ -16727,7 +16728,7 @@ def _source_value_is_locally_supported(
                     for segment in matching_segments
                 ):
                     continue
-                supported_anchors.update(
+                local_anchors = {
                     anchor_line
                     for anchor_line in anchor_lines
                     if any(
@@ -16739,9 +16740,22 @@ def _source_value_is_locally_supported(
                         )
                         for line in group
                     )
+                }
+                supported_anchors.update(local_anchors)
+                joint_support = joint_support or bool(
+                    primary_tokens
+                    and local_anchors
+                    and any(
+                        primary_tokens.issubset(
+                            _claimed_quantity_tokens(segment)
+                        )
+                        for segment in matching_segments
+                    )
                 )
     if not supported_anchors:
         return False
+    if joint_support:
+        return True
     for anchor_line in anchor_lines - supported_anchors:
         nearby_tokens = {
             token

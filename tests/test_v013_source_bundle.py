@@ -1126,7 +1126,7 @@ def test_ordinary_bundle_source_uses_one_call_and_no_profile_or_fidelity_call(
     ]
     assert profile["coverage"]["status"] == "partial"
     note = read_note(tmp_path / report.items[0]["note_path"])
-    assert note["frontmatter"]["source_bundle_prompt_version"] == "15"
+    assert note["frontmatter"]["source_bundle_prompt_version"] == "16"
 
 
 def test_source_calls_share_the_cumulative_profile_budget_and_replay_is_free(
@@ -3510,6 +3510,35 @@ def test_quantitative_provenance_auxiliary_uses_discriminating_anchor() -> None:
                 },
                 "full_document",
             )
+
+
+def test_quantitative_provenance_auxiliary_disambiguates_repeated_estimate() -> None:
+    payload = _bundle_payload()
+    payload["evidence_anchors"][0]["quantitative_result"] = {
+        "estimate": "12",
+        "baseline": "30,000",
+        "period": "October 7",
+        "provenance": "source_reported",
+    }
+    text = (
+        "On October 7, another 12 events affected 20 people.\n"
+        + ("Context without quantities.\n" * 20)
+        + "The source accused 12 of its 30,000 employees of participating "
+        "in the October 7 attacks."
+    )
+
+    assert (
+        _source_bundle_from_result(
+            payload,
+            {
+                "source_id": "source-zotero-A1",
+                "zotero_item_key": "A1",
+                "text": text,
+            },
+            "full_document",
+        )
+        is not None
+    )
 
 
 @pytest.mark.parametrize(
