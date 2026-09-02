@@ -233,7 +233,7 @@ DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
-SOURCE_BUNDLE_PROMPT_VERSION = "13"
+SOURCE_BUNDLE_PROMPT_VERSION = "14"
 SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v2"
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
@@ -4067,7 +4067,9 @@ def _source_bundle_system_prompt() -> str:
         "causal, associational, descriptive, mechanism_evidence, conceptual, methodological, normative, or "
         "practitioner_guidance. quantitative_result may use statistic, estimand_type, outcome_definition, estimate, unit, "
         "scale, baseline, reference_group, comparison_group, denominator, sample, uncertainty, population, period, model, "
-        "and provenance. literature_positions contains approximately three to eight important substantively engaged works, "
+        "and provenance. Within quantitative_result, statistic names the reported measure or statistic type, while estimate "
+        "holds its numeric value or values. Do not repeat or concatenate numeric estimates in statistic. literature_positions "
+        "contains approximately three to eight important substantively engaged works, "
         "not the whole bibliography. Each row uses raw_citation, author, year, title, identifiers, engagement, "
         "relation_label, and locator. observed_bibliographic_identity is a diagnostic object using title, creators, and date "
         "when visible in the source. Do not return stable IDs, source ownership, scope classification, support-envelope "
