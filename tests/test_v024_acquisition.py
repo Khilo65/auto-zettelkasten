@@ -722,6 +722,48 @@ def test_two_empty_literature_responses_are_terminal_after_two_attempts(
     assert failure["retry_on_resume"] is True
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ProviderEmptyResponse(),
+        ProviderTransportError("temporary", transport_kind="test"),
+    ],
+)
+def test_codex_literature_failures_never_retry(
+    tmp_path: Path, failure: Exception
+) -> None:
+    class Reasoner:
+        name = "codex"
+        model = "gpt-5.6-terra"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def propose_clusters(self, profiles, request, *, context=None):
+            self.calls += 1
+            raise failure
+
+    reasoner = Reasoner()
+    calls = _CheckpointedReasonerCalls(
+        tmp_path,
+        "codex-no-retry",
+        reasoner,
+        LiteratureMapRequest(
+            tmp_path,
+            provider="codex",
+            model="gpt-5.6-terra",
+            reasoning_effort="medium",
+            allow_cloud=True,
+        ),
+    )
+
+    with pytest.raises(type(failure)):
+        calls("cluster_proposal", "all", "propose_clusters", [], {})
+
+    assert reasoner.calls == 1
+    assert calls.cumulative_provider_calls == 1
+
+
 def test_cluster_empty_retry_uses_high_reasoning_and_then_replays(
     tmp_path: Path,
 ) -> None:
@@ -1050,6 +1092,26 @@ def test_unchanged_plan_reuses_cluster_writers_and_localizes_relationship_change
     first_calls = _CheckpointedReasonerCalls(
         tmp_path, "localized-clusters", reasoner, first_request
     )
+    baseline_relationships = [
+        {
+            "relation_id": f"baseline-{left}-{right}",
+            "source_id": left,
+            "target_source_id": right,
+            "relation_type": "complements",
+            "provenance": "human_curated",
+            "cluster_evidence_eligible": True,
+            "active": True,
+            "source_evidence": {
+                "source_id": left,
+                "evidence_anchor_id": f"anchor-{left}",
+            },
+            "target_evidence": {
+                "source_id": right,
+                "evidence_anchor_id": f"anchor-{right}",
+            },
+        }
+        for left, right in (("A", "B"), ("C", "D"))
+    ]
     first = build_literature_report(
         profiles,
         reasoner=reasoner,
@@ -1057,6 +1119,7 @@ def test_unchanged_plan_reuses_cluster_writers_and_localizes_relationship_change
         request=first_request,
         source_notes=notes,
         shared_literature_plan=shared_plan,
+        accepted_relationships=baseline_relationships,
         acquisition_ledger_path=ledger_path,
     )
     assert len(reasoner.cluster_calls) == 2
@@ -1071,7 +1134,16 @@ def test_unchanged_plan_reuses_cluster_writers_and_localizes_relationship_change
         "target_source_id": "C",
         "relation_type": "supports",
         "provenance": "human_curated",
+        "cluster_evidence_eligible": True,
         "active": True,
+        "source_evidence": {
+            "source_id": "A",
+            "evidence_anchor_id": "anchor-A",
+        },
+        "target_evidence": {
+            "source_id": "C",
+            "evidence_anchor_id": "anchor-C",
+        },
     }
     replay_calls = _CheckpointedReasonerCalls(
         tmp_path, "localized-clusters", reasoner, first_request
@@ -1084,7 +1156,7 @@ def test_unchanged_plan_reuses_cluster_writers_and_localizes_relationship_change
         request=first_request,
         source_notes=notes,
         shared_literature_plan=shared_plan,
-        accepted_relationships=[outside_relationship],
+        accepted_relationships=[*baseline_relationships, outside_relationship],
         acquisition_ledger_path=ledger_path,
     )
     assert replay_calls.provider_calls == 0
@@ -1114,7 +1186,11 @@ def test_unchanged_plan_reuses_cluster_writers_and_localizes_relationship_change
         request=changed_request,
         source_notes=notes,
         shared_literature_plan=shared_plan,
-        accepted_relationships=[outside_relationship, internal_relationship],
+        accepted_relationships=[
+            *baseline_relationships,
+            outside_relationship,
+            internal_relationship,
+        ],
         acquisition_ledger_path=ledger_path,
     )
 

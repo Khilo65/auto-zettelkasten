@@ -13,7 +13,7 @@ from auto_zettelkasten.pipeline import (
 )
 from auto_zettelkasten.readers import (
     ProviderError,
-    SECTION_KEYS,
+    REQUIRED_SECTION_KEYS,
     _normalize_source_bundle_payload,
 )
 from auto_zettelkasten.relationships import (
@@ -44,7 +44,7 @@ def test_v016_migration_upgrades_previous_prompt_version(tmp_path: Path) -> None
 
     migrate_v016_metadata(tmp_path)
 
-    assert read_yaml(config_path)["prompt_version"] == "12"
+    assert read_yaml(config_path)["prompt_version"] == "14"
 
 
 def test_unchanged_cluster_does_not_append_a_lifecycle_event() -> None:
@@ -106,7 +106,11 @@ def test_source_bundle_fills_only_noncritical_missing_sections() -> None:
 
     normalized = _normalize_source_bundle_payload(payload)
 
-    assert set(normalized["analysis_sections"]) == set(SECTION_KEYS)
+    assert set(normalized["analysis_sections"]) == set(REQUIRED_SECTION_KEYS)
+    assert "key_concepts_and_definitions" not in normalized["analysis_sections"]
+    assert (
+        "source_structure_and_organization" not in normalized["analysis_sections"]
+    )
     assert normalized["analysis_sections"]["limitations"].startswith(
         "Not separately returned"
     )
@@ -114,6 +118,41 @@ def test_source_bundle_fills_only_noncritical_missing_sections() -> None:
         row["severity"] == "advisory"
         for row in normalized["component_diagnostics"]
     )
+
+
+def test_source_bundle_preserves_optional_source_outline() -> None:
+    outline = "- Introduction (pp. 1-3)\n- Findings (pp. 4-9)"
+    payload = {
+        "analysis_sections": {
+            key: f"Bounded {key}." for key in REQUIRED_SECTION_KEYS
+        }
+    }
+    payload["analysis_sections"]["source_structure_and_organization"] = outline
+
+    normalized = _normalize_source_bundle_payload(payload)
+
+    assert (
+        normalized["analysis_sections"]["source_structure_and_organization"]
+        == outline
+    )
+
+
+def test_source_bundle_uses_analysis_thesis_in_compact_profile() -> None:
+    payload = {
+        "analysis_sections": {
+            key: f"Bounded {key}." for key in REQUIRED_SECTION_KEYS
+        },
+        "compact_profile": {"thesis": "The intent claim is established fact."},
+    }
+    payload["analysis_sections"]["thesis"] = (
+        "The author argues that the policy served an unstated intent."
+    )
+
+    normalized = _normalize_source_bundle_payload(payload)
+
+    assert normalized["compact_profile"]["thesis"] == payload[
+        "analysis_sections"
+    ]["thesis"]
 
 
 def test_source_bundle_rejects_missing_core_analysis() -> None:

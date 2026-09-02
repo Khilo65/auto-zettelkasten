@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
@@ -11,10 +12,13 @@ from auto_zettelkasten.readers import (
     DeepSeekReader,
     OpenRouterReader,
     ProviderError,
+    _chunk_system_prompt,
     _cluster_synthesis_system_prompt,
     _gap_adjudication_system_prompt,
+    _source_bundle_system_prompt,
     _source_prompt,
     _system_prompt,
+    codex_contract_identity,
 )
 
 
@@ -33,11 +37,21 @@ def _completion(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def test_atomic_prompt_v12_is_source_adaptive_and_statistics_aware() -> None:
+def test_atomic_prompt_v14_is_source_adaptive_and_statistics_aware() -> None:
     prompt = _system_prompt()
 
-    assert "atomic prompt v12" in prompt
-    assert "key_concepts_and_definitions" in prompt
+    assert "atomic prompt v14" in prompt
+    assert "optional key_concepts_and_definitions" in prompt
+    assert "omit key_concepts_and_definitions entirely" in prompt
+    assert "optional source_structure_and_organization" in prompt
+    assert "short source-native navigation outline, not an argument map" in prompt
+    assert (
+        "include major headings and only consequential first-level subheadings"
+        in prompt
+    )
+    assert "For a partial source, label the outline partial" in prompt
+    assert "Do not infer missing headings" in prompt
+    assert "Omit source_structure_and_organization entirely" in prompt
     assert "short exact quotation" in prompt
     assert "page number when supplied" in prompt
     assert "source-grounded paraphrase as a paraphrase" in prompt
@@ -66,6 +80,56 @@ def test_atomic_prompt_v12_is_source_adaptive_and_statistics_aware() -> None:
     assert "PDF extraction may flatten tables" in prompt
     assert "never invent an exact row-column relationship" in prompt
     assert "silently reread" in prompt
+
+
+def test_source_bundle_prompt_v11_preserves_formatting_and_attribution_scope() -> None:
+    prompt = _source_bundle_system_prompt()
+
+    assert "source bundle prompt v11" in prompt
+    assert "apply a footnote, only when the alignment or marker is explicit" in prompt
+    assert "A footnote qualifies only the values bearing its explicit marker" in prompt
+    assert "page metadata is not a statistic's observation date" in prompt
+    assert "omit the year rather than borrowing it from page metadata" in prompt
+    assert "Every numeric date or year endpoint" in prompt
+    assert "never attach a global conflict or study start date" in prompt
+    assert "Put a derived number only in estimate" in prompt
+    assert "Every numeric statistic" in prompt
+    assert "do not expand them into newly calculated full integers" in prompt
+    assert "Do not infer a subgroup claim from an aggregate count" in prompt
+    assert "singular or plural cardinality" in prompt
+    assert "do not infer a group's position" in prompt
+    assert "selected journalistic examples are not a survey" in prompt
+    assert "Each literature-position row represents exactly one distinct work" in prompt
+
+
+def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
+    def digest(value: str | dict[str, Any]) -> str:
+        text = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    bundle_identity = codex_contract_identity(
+        "source_bundle", "gpt-5.6-luna", "medium"
+    )
+    chunk_identity = codex_contract_identity(
+        "chunk_evidence", "gpt-5.6-luna", "medium"
+    )
+    assert {
+        "atomic_prompt_v14": digest(_system_prompt()),
+        "chunk_prompt_v14": digest(_chunk_system_prompt()),
+        "source_bundle_prompt_v11": digest(_source_bundle_system_prompt()),
+        "codex_source_bundle_schema": bundle_identity["schema_hash"],
+        "codex_source_bundle_contract": digest(bundle_identity),
+        "codex_chunk_evidence_schema": chunk_identity["schema_hash"],
+        "codex_chunk_evidence_contract": digest(chunk_identity),
+    } == {
+        "atomic_prompt_v14": "8db9f2990d175816cb0100b92d84734ae7c2f930aade66825ed0412b22da3705",
+        "chunk_prompt_v14": "3c2eabca75c5ad487a35a5096664e0ec6999d04b738927a60fce2e11cfb15cd5",
+        "source_bundle_prompt_v11": "209cca3e88a0f24e2b1235f150cc0686e38eb27587d6042b75170e782de2a32a",
+        "codex_source_bundle_schema": "1e8081c4c0e9a81f6880d6fe00c22421e1bbd29da961076559c0121f1e73efcc",
+        "codex_source_bundle_contract": "0f7d0ae53a03bbe5b11f38f8e463bb3119a0413e52811319cca43d2c03c4115b",
+        "codex_chunk_evidence_schema": "2df4a0fe634405df5e891283a59bfc7bee18995b5e970a51c5569b5c4eafed8e",
+        "codex_chunk_evidence_contract": "122375b5eb8daeadd5a6461903004ec177e2b5547822d0258c7420c28852b332",
+    }
 
 
 def test_source_prompt_includes_only_compact_extraction_context() -> None:
@@ -113,7 +177,7 @@ def test_partial_source_prompt_prohibits_complete_document_inference() -> None:
 def test_cluster_prompt_preserves_inference_and_case_evidence() -> None:
     prompt = _cluster_synthesis_system_prompt()
 
-    assert "cluster synthesis prompt v35" in prompt
+    assert "cluster synthesis prompt v36" in prompt
     assert "Read every supplied atomic_note_markdown" in prompt
     assert "Every retained member" in prompt
     assert "specific study finding" in prompt

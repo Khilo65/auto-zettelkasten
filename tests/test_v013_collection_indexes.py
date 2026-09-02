@@ -261,10 +261,40 @@ def test_collection_tree_indexes_use_direct_members_and_replay_byte_identically(
     export_root = Path(exported.metadata["export_root"])
     assert (export_root / "Indexes" / "collections" / "PARENT" / "INDEX.md").exists()
     assert (export_root / "Indexes" / "collections" / "CHILD" / "sources-001.md").exists()
+    assert not (
+        export_root
+        / "Indexes"
+        / "collections"
+        / "CHILD"
+        / "relationships-001.md"
+    ).exists()
+    assert "## Graph connections" not in (
+        export_root / "Indexes" / "collections" / "CHILD" / "INDEX.md"
+    ).read_text()
+    assert read_yaml(tmp_path / "vault" / ".obsidian" / "graph.json") == {
+        "hideUnresolved": True,
+        "search": '-path:"Indexes"',
+        "showAttachments": False,
+        "showOrphans": False,
+        "showTags": False,
+    }
     assert not any(
         row["target"].startswith("collections/")
         for row in exported.metadata["missing_wikilinks"]
     )
+
+
+def test_new_vault_preserves_existing_graph_settings(tmp_path: Path) -> None:
+    initialize_workspace(tmp_path)
+    graph_settings = tmp_path / "vault" / ".obsidian" / "graph.json"
+    graph_settings.parent.mkdir(parents=True)
+    sentinel = b'{\n  "search": "tag:#keep",\n  "showTags": true\n}\n'
+    graph_settings.write_bytes(sentinel)
+
+    result = export_to_obsidian(tmp_path, tmp_path / "vault", new_vault=True)
+
+    assert result.status == "exported"
+    assert graph_settings.read_bytes() == sentinel
 
 
 def test_incremental_sync_returns_without_provider_calls_when_snapshot_is_unchanged(

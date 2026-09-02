@@ -7,5 +7,12 @@ __pycache__/
 build/
 dist/
 .venv/
+.codex/
+auth.json
+.env
+.env.*
+credentials*.json
+*.pem
+*.key
 auto-zettelkasten.yml
 .DS_Store

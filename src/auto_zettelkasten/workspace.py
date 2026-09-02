@@ -22,6 +22,8 @@ CONFIG_FIELDS = {
     "scope",
     "provider",
     "model",
+    "literature_model",
+    "reasoning_effort",
     "privacy",
     "extraction",
     "prompt_version",
@@ -124,7 +126,9 @@ def initialize(workspace: Path | str, *, overwrite: bool = False) -> ArtifactMan
                     "context_window_fraction": 0.5,
                     "estimated_chars_per_token": 3.5,
                 },
-                "literature_mapping": LiteratureMappingPolicy().to_dict(),
+                "literature_mapping": LiteratureMappingPolicy(
+                    cluster_generation_enabled=False
+                ).to_dict(),
                 "navigation": NavigationPolicy().to_dict(),
                 "obsidian": {"vault": ""},
             },
@@ -214,6 +218,16 @@ def load_config(workspace: Path | str) -> dict[str, Any]:
     unknown = sorted(set(config) - CONFIG_FIELDS)
     if unknown:
         raise ValueError(f"unknown workspace config fields: {', '.join(unknown)}")
+    provider = str(config.get("provider") or "deepseek")
+    if provider != "codex" and any(
+        config.get(field_name) is not None
+        for field_name in ("literature_model", "reasoning_effort")
+    ):
+        raise ValueError(
+            "literature_model and reasoning_effort are supported only by Codex"
+        )
+    if config.get("reasoning_effort") not in {None, "medium", "high", "max"}:
+        raise ValueError("reasoning_effort must be medium, high, or max")
     if "processing" in config:
         if not isinstance(config["processing"], Mapping):
             raise ValueError("processing must be a mapping")

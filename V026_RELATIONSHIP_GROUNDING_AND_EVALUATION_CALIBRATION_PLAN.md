@@ -13,7 +13,7 @@ source prompt `5`, and commits `b936285` and `e89b83d`.
 **Primary evidence:**
 
 - `V025_GRAPH_COMPLETION_AND_EVALUATION_CALIBRATION_PLAN.md`;
-- `/Users/khalilalwazir/Documents/Auto-Zettelkasten-test/mediation-relapse-v025-targeted-completion-evaluation-20260802/evaluation/v025-targeted-completion-comparison.md`;
+- `<private-evaluation-root>/mediation-relapse-v025-targeted-completion-evaluation-20260802/evaluation/v025-targeted-completion-comparison.md`;
 - the frozen 87 v0.25 relationship pair jobs and their complete atomic-note
   inputs;
 - the v0.16–v0.25 plans and comparative evaluations; and
@@ -618,7 +618,7 @@ build, migration tests, and replay tests with no regressions.
 
 Create:
 
-`/Users/khalilalwazir/Documents/Auto-Zettelkasten-test/mediation-relapse-v026-relationship-evaluation-20260802`
+`<private-evaluation-root>/mediation-relapse-v026-relationship-evaluation-20260802`
 
 Use a fresh isolated clone containing:
 

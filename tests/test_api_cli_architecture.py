@@ -52,7 +52,7 @@ def test_release_metadata_matches_engine_version() -> None:
     pyproject = Path(__file__).parents[1] / "pyproject.toml"
     payload = tomllib.loads(pyproject.read_text(encoding="utf-8"))
 
-    assert payload["project"]["version"] == "0.29.10"
+    assert payload["project"]["version"] == "0.30.0"
 
 
 def test_standalone_literature_map_forwards_provider_concurrency(
@@ -94,6 +94,7 @@ def test_build_map_cli_prints_compact_receipt(
                 "run_id": "compact",
                 "artifacts": [{"path": "a"}, {"path": "b"}],
                 "metadata": {
+                    "migration": {"status": "already_current"},
                     "literature_map": {
                         "cluster_count": 2,
                         "large_payload": {"rows": list(range(100))},
@@ -108,7 +109,68 @@ def test_build_map_cli_prints_compact_receipt(
 
     assert "artifacts" not in result
     assert result["artifact_count"] == 2
-    assert result["metadata"] == {"literature_map": {"cluster_count": 2}}
+    assert result["metadata"] == {
+        "literature_map": {"cluster_count": 2},
+        "migration": {"status": "already_current"},
+    }
+
+
+def test_estimate_cli_can_enable_synthesis_and_clusters_together(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    initialize_workspace(tmp_path)
+    config = read_yaml(tmp_path / "auto-zettelkasten.yml")
+    config["literature_mapping"].update(
+        synthesis_enabled=False,
+        cluster_generation_enabled=False,
+    )
+    write_yaml(tmp_path / "auto-zettelkasten.yml", config)
+    captured: dict[str, object] = {}
+
+    def fake_estimate(*_args, **kwargs):
+        captured.update(kwargs)
+        return {"status": "estimated", "provider_calls": 0}
+
+    monkeypatch.setattr("auto_zettelkasten.cli.estimate_cost", fake_estimate)
+
+    assert main(
+        [
+            "estimate",
+            "--workspace",
+            str(tmp_path),
+            "--graph-only",
+            "--synthesis",
+            "--clusters",
+        ]
+    ) == 0
+    assert json.loads(capsys.readouterr().out)["provider_calls"] == 0
+    policy = captured["literature_policy"]
+    assert policy.synthesis_enabled is True
+    assert policy.cluster_generation_enabled is True
+
+
+@pytest.mark.parametrize("flags", [("--clusters",), ("--no-synthesis", "--clusters")])
+def test_estimate_cli_rejects_clusters_while_synthesis_is_disabled(
+    tmp_path: Path, monkeypatch, flags: tuple[str, ...]
+) -> None:
+    initialize_workspace(tmp_path)
+    config = read_yaml(tmp_path / "auto-zettelkasten.yml")
+    config["literature_mapping"].update(
+        synthesis_enabled=False,
+        cluster_generation_enabled=False,
+    )
+    write_yaml(tmp_path / "auto-zettelkasten.yml", config)
+    provider_calls = 0
+
+    def fake_estimate(*_args, **_kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        return {"status": "estimated", "provider_calls": 0}
+
+    monkeypatch.setattr("auto_zettelkasten.cli.estimate_cost", fake_estimate)
+
+    assert main(["estimate", "--workspace", str(tmp_path), *flags]) == 2
+    assert provider_calls == 0
 
 
 def test_run_ids_cannot_escape_workspace_state(tmp_path: Path, sample_items) -> None:

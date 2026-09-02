@@ -19,7 +19,7 @@ from .files import (
     write_yaml,
 )
 from .notes import (
-    COMPATIBILITY_REQUIRED_SECTION_HEADINGS,
+    REQUIRED_SECTION_HEADINGS,
     REVIEW_STATUS_TARGET_ARTIFACT_SCHEMA_VERSION,
     REVIEW_STATUS_TARGET_ENGINE_VERSION,
     SECTION_HEADINGS,
@@ -443,6 +443,7 @@ def migrate_workspace(workspace: Path | str, *, dry_run: bool = False) -> dict[s
         "v013": v013,
         "v014": v014,
         "v015": v015,
+        "v016": v016,
         "v029": v029,
     }
 
@@ -2555,7 +2556,7 @@ def _legacy_analysis_checkpoint(
         }
         if all(
             analysis.get(key)
-            for key, _ in COMPATIBILITY_REQUIRED_SECTION_HEADINGS
+            for key, _ in REQUIRED_SECTION_HEADINGS
         ):
             identity = value.get("identity", {})
             if isinstance(identity, Mapping):
@@ -2588,7 +2589,7 @@ def _legacy_bundle_from_note_profile(
         or "full_document"
     )
     analytical = all(
-        analysis.get(key) for key, _ in COMPATIBILITY_REQUIRED_SECTION_HEADINGS
+        analysis.get(key) for key, _ in REQUIRED_SECTION_HEADINGS
     )
     legacy_excluded = bool(profile.get("excluded_from_synthesis", False))
     substantive = analytical and (

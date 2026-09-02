@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from itertools import permutations
 from typing import Any
 
 from auto_zettelkasten import literature
@@ -71,6 +72,15 @@ def _profile(source_id: str, *, evidence_base: str | None = None) -> dict[str, A
             }
         ],
     }
+
+
+def _dataset_profile(source_id: str, dataset: str) -> dict[str, Any]:
+    profile = _profile(source_id)
+    profile["title"] = source_id
+    profile["study_family_id"] = f"title:{source_id}"
+    profile["study_lineage"] = None
+    profile["datasets"] = [dataset]
+    return profile
 
 
 def test_future_observed_evidence_flags_a_bibliographic_identity_conflict() -> None:
@@ -2464,6 +2474,194 @@ def test_same_author_and_interview_count_reconcile_shared_fieldwork() -> None:
     )
     normalized_unrelated = normalize_evidence_profiles(unrelated)
     assert len({row["evidence_base_group_id"] for row in normalized_unrelated}) == 2
+
+
+def test_named_dataset_reconciles_brand_finance_publications_stably() -> None:
+    profiles = [
+        _dataset_profile(
+            "source-zotero-dataset-publication",
+            "Brand Finance Global Soft Power Index 2024; prior index iterations "
+            "for five-iteration comparisons",
+        ),
+        _dataset_profile(
+            "source-zotero-dataset-interface",
+            "Brand Finance Global Soft Power Index 2024 results interface",
+        ),
+    ]
+
+    forward = normalize_evidence_profiles(profiles)
+    reversed_rows = normalize_evidence_profiles(list(reversed(profiles)))
+
+    expected_basis = "shared_named_dataset:2024 brand finance global index power soft"
+    forward_group_ids = {row["evidence_base_group_id"] for row in forward}
+    assert len(forward_group_ids) == 1
+    assert forward_group_ids == {row["evidence_base_group_id"] for row in reversed_rows}
+    assert all(row["study_lineage"]["group_basis"] == expected_basis for row in forward)
+    assert all(
+        row["study_lineage"]["independence_status"] == "overlapping_evidence_base"
+        for row in forward
+    )
+    assert all(
+        claim["independence_status"] == "overlapping_evidence_base"
+        for row in forward
+        for claim in row["claims"]
+    )
+
+    independence = literature.build_independence_records(forward)
+    assert len(independence["evidence_base_groups"]) == 1
+    assert independence["evidence_base_groups"][0]["source_ids"] == [
+        "source-zotero-dataset-interface",
+        "source-zotero-dataset-publication",
+    ]
+    assert independence["evidence_base_groups"][0]["relationship"] == (
+        "overlapping_evidence_base"
+    )
+    assert (
+        independence["independence_assessments"][0]["effective_evidence_base_count"]
+        == 1
+    )
+    cluster = map_overlapping_clusters(forward)["clusters"][0]
+    assert cluster["effective_evidence_base_count"] == 1
+    assert cluster["qualification_status"] == "evidence_concentrated_cluster"
+
+
+def test_named_dataset_fallback_rejects_ambiguous_or_distinct_editions() -> None:
+    negative_pairs = (
+        (
+            "Brand Finance Global Soft Power Index 2023 results interface",
+            "Brand Finance Global Soft Power Index 2024; prior comparisons",
+        ),
+        (
+            "Brand Finance Global Soft Power Index 2024 results interface",
+            "Brand Finance Global Brand Value Index 2024; historical comparisons",
+        ),
+        (
+            "Brand Finance 2024 results interface",
+            "Brand Finance 2024; prior comparisons",
+        ),
+        (
+            "Brand Finance Global Soft Power Index 2024 Israel sample",
+            "Brand Finance Global Soft Power Index 2024 Canada sample",
+        ),
+        (
+            "Brand Finance Global Soft Power Index 2024 wave 1",
+            "Brand Finance Global Soft Power Index 2024 wave 2",
+        ),
+        (
+            "Brand Finance Global Soft Power Index 2024; wave 1",
+            "Brand Finance Global Soft Power Index 2024; wave 2",
+        ),
+        (
+            "Brand Finance Global Soft Power Index 2024; sample 1",
+            "Brand Finance Global Soft Power Index 2024; sample 2",
+        ),
+        (
+            "Brand Finance Global Soft Power Index 2024; Israel sample",
+            "Brand Finance Global Soft Power Index 2024; Canada sample",
+        ),
+        (
+            "Brand Finance Global Soft Power Index 2024; edition 2",
+            "Brand Finance Global Soft Power Index 2024; edition 3",
+        ),
+        (
+            "Brand Finance Global Soft Power Index 2024; sample Israel",
+            "Brand Finance Global Soft Power Index 2024; sample Canada",
+        ),
+        (
+            "Brand Finance Global Soft Power Index 2024; 2nd edition",
+            "Brand Finance Global Soft Power Index 2024; 3rd edition",
+        ),
+        (
+            "Brand Finance Global Soft Power Index 2024; second edition",
+            "Brand Finance Global Soft Power Index 2024; third edition",
+        ),
+        (
+            "Brand Finance Global Soft Power Index 2024; wave 1st",
+            "Brand Finance Global Soft Power Index 2024; wave 2nd",
+        ),
+        (
+            "Brand Finance Global Soft Power Index 2024; first wave",
+            "Brand Finance Global Soft Power Index 2024; second wave",
+        ),
+        (
+            "Brand Finance Global Soft Power Index 2024; sample 1; sample Israel",
+            "Brand Finance Global Soft Power Index 2024; sample 1; sample Canada",
+        ),
+        (
+            "Brand Finance Global Soft Power Index 2024; version v1.2",
+            "Brand Finance Global Soft Power Index 2024; version v1.3",
+        ),
+        (
+            "Brand Finance Global Soft Power Index 2024; sample US",
+            "Brand Finance Global Soft Power Index 2024; sample UK",
+        ),
+        (
+            "Brand Finance Global Soft Power Index 2024; release 2024-Q1",
+            "Brand Finance Global Soft Power Index 2024; release 2024-Q2",
+        ),
+    )
+
+    for index, (left_dataset, right_dataset) in enumerate(negative_pairs):
+        normalized = normalize_evidence_profiles(
+            [
+                _dataset_profile(f"negative-{index}-left", left_dataset),
+                _dataset_profile(f"negative-{index}-right", right_dataset),
+            ]
+        )
+        assert len({row["evidence_base_group_id"] for row in normalized}) == 2, (
+            left_dataset,
+            right_dataset,
+        )
+
+
+def test_named_dataset_fallback_preserves_conflicting_sample_groups() -> None:
+    dataset = "Brand Finance Global Soft Power Index 2024"
+    profiles = (
+        _dataset_profile("sample-unknown", f"{dataset}; prior comparisons"),
+        _dataset_profile("sample-israel", f"{dataset} results interface"),
+        _dataset_profile("sample-canada", f"{dataset}; historical comparisons"),
+    )
+    profiles[1]["study_lineage"] = {"sample_ids": ["Israel"]}
+    profiles[2]["study_lineage"] = {"sample_ids": ["Canada"]}
+
+    for ordered in permutations(profiles):
+        normalized = normalize_evidence_profiles(ordered)
+        assert len({row["evidence_base_group_id"] for row in normalized}) == 3
+
+
+def test_named_dataset_fallback_requires_matching_sample_ids() -> None:
+    dataset = "Brand Finance Global Soft Power Index 2024"
+    profiles = [
+        _dataset_profile("sample-israel-a", f"{dataset}; prior comparisons"),
+        _dataset_profile("sample-israel-b", f"{dataset} results interface"),
+    ]
+    for profile in profiles:
+        profile["study_lineage"] = {"sample_ids": ["Israel"]}
+
+    normalized = normalize_evidence_profiles(profiles)
+    assert len({row["evidence_base_group_id"] for row in normalized}) == 1
+
+
+def test_named_dataset_fallback_does_not_duplicate_exact_dataset_signal() -> None:
+    dataset = "Brand Finance Global Soft Power Index 2024"
+    normalized = normalize_evidence_profiles(
+        [
+            _dataset_profile("exact-left", dataset),
+            _dataset_profile("exact-right", dataset),
+        ]
+    )
+
+    assert len({row["evidence_base_group_id"] for row in normalized}) == 1
+    assert all(
+        "shared_named_dataset:" not in row["study_lineage"]["group_basis"]
+        for row in normalized
+    )
+
+
+def test_named_dataset_lineage_versions_are_explicit() -> None:
+    assert literature.LITERATURE_ALGORITHM_VERSION == "38"
+    assert literature.STUDY_LINEAGE_VERSION == "3"
+    assert literature.INDEPENDENCE_ALGORITHM_VERSION == "3"
 
 
 def test_thread_locator_is_repaired_only_from_a_supporting_source_anchor() -> None:

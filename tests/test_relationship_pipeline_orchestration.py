@@ -521,6 +521,281 @@ def test_shared_plan_keeps_family_discovery_in_separate_packets(
     assert discovery_calls[1][2]["prior_candidate_pairs"] == []
 
 
+def test_complementary_family_breadth_covers_pairs_inside_planner_sides(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile(source_id) for source_id in "ABCD"]
+    discovery_passes: list[str] = []
+
+    def handler(stage, _profiles, context):
+        if stage.endswith("candidate_selection"):
+            discovery_pass = str(context["discovery_pass"])
+            discovery_passes.append(discovery_pass)
+            job = context["bridge_jobs"][0]
+            job_id = str(job["bridge_job_id"])
+            assert context["literature_families"][0]["family_id"] == "family-one"
+            if discovery_pass == "complement":
+                pairs = (("A", "C"), ("A", "D"), ("B", "C"), ("B", "D"))
+            else:
+                assert set(job["left_source_ids"]) == set("ABCD")
+                assert set(job["right_source_ids"]) == set("ABCD")
+                assert {
+                    tuple(pair) for pair in context["excluded_candidate_pairs"]
+                } >= {
+                    ("A", "C"),
+                    ("A", "D"),
+                    ("B", "C"),
+                    ("B", "D"),
+                }
+                pairs = (("A", "B"), ("C", "D"))
+            return {
+                "candidates": [
+                    {**_candidate(left, right, rank=index), "bridge_job_id": job_id}
+                    for index, (left, right) in enumerate(pairs, start=1)
+                ],
+                "job_outcomes": [
+                    {"bridge_job_id": job_id, "status": "completed"}
+                ],
+            }
+        return {"decisions": [_decision(job) for job in context["pair_jobs"]]}
+
+    result = _run(
+        tmp_path,
+        profiles,
+        _Calls(handler),
+        shared_family_plan={
+            "lean_index_hash": "lean",
+            "literature_families": [
+                {
+                    "family_id": "family-one",
+                    "label": "Named family",
+                    "source_ids": list("ABCD"),
+                }
+            ],
+            "discovery_jobs": [
+                {
+                    "job_id": "family-job",
+                    "family": "Named family",
+                    "left_source_ids": ["A", "B"],
+                    "right_source_ids": ["C", "D"],
+                    "candidate_quota": 6,
+                }
+            ],
+        },
+    )
+
+    assert discovery_passes == ["complement", "breadth_completion"]
+    assert result["pair_job_count"] == 6
+    accounting = next(
+        row
+        for row in result["relationship_discovery_jobs"]
+        if row["bridge_job_id"] == "family-job"
+    )
+    assert accounting["planner_target_candidates"] == 6
+    assert accounting["valid_unique_candidates"] == 6
+    assert accounting["breadth_added_unique_candidates"] == 2
+    assert accounting["planner_target_met"] is True
+
+
+def test_complementary_breadth_runs_after_cross_pairs_are_resolved(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile(source_id) for source_id in "ABCD"]
+    write_yaml(
+        tmp_path / "02_source_memory" / "indexes" / "typed_links.yml",
+        {
+            "relations": [
+                {
+                    "source_id": left,
+                    "target_source_id": right,
+                    "relation_type": "cites",
+                }
+                for left in "AB"
+                for right in "CD"
+            ]
+        },
+    )
+    discovery_passes: list[str] = []
+
+    def handler(stage, _profiles, context):
+        if stage.endswith("candidate_selection"):
+            discovery_passes.append(str(context["discovery_pass"]))
+            job_id = str(context["bridge_jobs"][0]["bridge_job_id"])
+            return {
+                "candidates": [
+                    {**_candidate("A", "B"), "bridge_job_id": job_id},
+                    {**_candidate("C", "C", rank=2), "bridge_job_id": job_id},
+                ],
+                "job_outcomes": [
+                    {"bridge_job_id": job_id, "status": "no_more_candidates"}
+                ],
+            }
+        return {"decisions": [_decision(job) for job in context["pair_jobs"]]}
+
+    result = _run(
+        tmp_path,
+        profiles,
+        _Calls(handler),
+        shared_family_plan={
+            "lean_index_hash": "lean",
+            "literature_families": [
+                {"family_id": "family", "source_ids": list("ABCD")}
+            ],
+            "discovery_jobs": [
+                {
+                    "job_id": "family-job",
+                    "family": "family",
+                    "left_source_ids": ["A", "B"],
+                    "right_source_ids": ["C", "D"],
+                    "candidate_quota": 6,
+                }
+            ],
+        },
+    )
+
+    assert discovery_passes == ["breadth_completion"]
+    accounting = result["relationship_discovery_jobs"][0]
+    assert accounting["planner_target_candidates"] == 2
+    assert accounting["valid_unique_candidates"] == 1
+    assert accounting["planner_target_met"] is False
+    assert result["pair_job_count"] == 5
+    assert {
+        tuple(row["pair"]): row["disposition"]
+        for row in result["candidate_dispositions"]
+    }[("C", "C")] == "parked_contract_failure"
+
+
+def test_split_complementary_breadth_routes_each_pair_once(
+    tmp_path: Path, monkeypatch
+) -> None:
+    profiles = [_profile(source_id) for source_id in "ABCD"]
+    original = pipeline_module._reasoner_packet_chars
+
+    def measured(profiles, context):
+        if (
+            context.get("discovery_pass") == "breadth_completion"
+            and len(context.get("catalogue", []) or []) > 2
+        ):
+            return 10**9
+        return original(profiles, context)
+
+    monkeypatch.setattr(pipeline_module, "_reasoner_packet_chars", measured)
+    breadth_pairs: list[tuple[str, str]] = []
+
+    def handler(stage, _profiles, context):
+        if stage.endswith("candidate_selection"):
+            job = context["bridge_jobs"][0]
+            job_id = str(job["bridge_job_id"])
+            if context["discovery_pass"] == "complement":
+                pairs = [("A", "C"), ("B", "D")]
+            else:
+                excluded = {
+                    tuple(pair) for pair in context["excluded_candidate_pairs"]
+                }
+                pairs = sorted(
+                    {
+                        tuple(sorted((left, right)))
+                        for left in job["left_source_ids"]
+                        for right in job["right_source_ids"]
+                        if left != right and tuple(sorted((left, right))) not in excluded
+                    }
+                )
+                breadth_pairs.extend(pairs)
+            return {
+                "candidates": [
+                    {**_candidate(left, right), "bridge_job_id": job_id}
+                    for left, right in pairs
+                ],
+                "job_outcomes": [
+                    {"bridge_job_id": job_id, "status": "completed"}
+                ],
+            }
+        return {"decisions": [_decision(job) for job in context["pair_jobs"]]}
+
+    result = _run(
+        tmp_path,
+        profiles,
+        _Calls(handler),
+        shared_family_plan={
+            "lean_index_hash": "lean",
+            "literature_families": [
+                {"family_id": "family", "source_ids": list("ABCD")}
+            ],
+            "discovery_jobs": [
+                {
+                    "job_id": "family-job",
+                    "family": "family",
+                    "left_source_ids": ["A", "B"],
+                    "right_source_ids": ["C", "D"],
+                    "candidate_quota": 6,
+                }
+            ],
+        },
+    )
+
+    assert len(breadth_pairs) == len(set(breadth_pairs)) == 4
+    assert set(breadth_pairs) == {
+        ("A", "B"),
+        ("A", "D"),
+        ("B", "C"),
+        ("C", "D"),
+    }
+    assert result["pair_job_count"] == 6
+    assert result["relationship_discovery_jobs"][0]["planner_target_met"] is True
+
+
+def test_fully_resolved_requested_job_skips_candidate_discovery(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile(source_id) for source_id in "ABCD"]
+    write_yaml(
+        tmp_path / "02_source_memory" / "indexes" / "typed_links.yml",
+        {
+            "relations": [
+                {
+                    "source_id": left,
+                    "target_source_id": right,
+                    "relation_type": "cites",
+                }
+                for left in "AB"
+                for right in "CD"
+            ]
+        },
+    )
+    calls = _Calls(
+        lambda stage, _profiles, context: (
+            {"decisions": [_decision(job) for job in context["pair_jobs"]]}
+            if stage == "relationship_adjudication"
+            else (_ for _ in ()).throw(AssertionError(stage))
+        )
+    )
+
+    result = _run(
+        tmp_path,
+        profiles,
+        calls,
+        shared_family_plan={
+            "lean_index_hash": "lean",
+            "literature_families": [
+                {"family_id": "requested", "source_ids": list("ABCD")}
+            ],
+            "discovery_jobs": [
+                {
+                    "job_id": "requested-job",
+                    "family": "requested",
+                    "left_source_ids": ["A", "B"],
+                    "right_source_ids": ["C", "D"],
+                    "requested_collection_pair": ["C1", "C2"],
+                    "candidate_quota": 4,
+                }
+            ],
+        },
+    )
+
+    assert all(not stage.endswith("candidate_selection") for stage, _, _ in calls.seen)
+    assert result["relationship_discovery_jobs"][0]["status"] == "completed"
+
+
 def test_incremental_discovery_excludes_unchanged_pairs(tmp_path: Path) -> None:
     baseline_profiles = [_profile("A", collection="C1"), _profile("B", collection="C2")]
     baseline = _run(
@@ -2901,7 +3176,7 @@ def test_duplicate_provider_rows_park_the_pair_without_caching_an_edge(
     result = _run(tmp_path, profiles, _Calls(handler))
 
     assert result["accepted"] == []
-    assert result["relationship_stage_complete"] is True
+    assert result["relationship_stage_complete"] is False
     assert [row["reason"] for row in result["parked"]] == [
         "duplicate_pair_job_decision"
     ]
@@ -3063,7 +3338,14 @@ def test_schema3_selected_dispositions_migrate_without_discovery(
     tmp_path: Path,
 ) -> None:
     profiles = [_profile("A"), _profile("B")]
-    map_request = _request(tmp_path)
+    map_request = LiteratureMapRequest(
+        workspace=tmp_path,
+        provider="test-provider",
+        model="test-model",
+        literature_policy=LiteratureMappingPolicy(
+            cluster_generation_enabled=False
+        ),
+    )
     first = _run(
         tmp_path,
         profiles,
@@ -3092,7 +3374,7 @@ def test_schema3_selected_dispositions_migrate_without_discovery(
             "adjudication_prompt_version": "14",
             "output_contract": "relationship-decision-v4",
             "decision_normalization_version": pipeline_module.RELATIONSHIP_DECISION_NORMALIZATION_VERSION,
-            "policy_identity": stable_hash(map_request.literature_policy.to_dict()),
+            "policy_identity": stable_hash(LiteratureMappingPolicy().to_dict()),
         }
     )
     state["candidate_dispositions"] = [
@@ -3834,7 +4116,7 @@ def test_current_negative_pairs_reach_initial_shared_packets_and_replay(
         context["discovery_pass"]
         for stage, _key, context in calls.seen
         if stage.endswith("candidate_selection")
-    } == {"broad", "complement", "breadth_completion"}
+    } == {"broad", "breadth_completion"}
     assert result["pair_job_count"] == 3
     registry_bytes = (
         tmp_path / "02_source_memory" / "indexes" / "typed_links.yml"

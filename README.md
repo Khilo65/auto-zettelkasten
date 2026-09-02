@@ -1,14 +1,14 @@
 # Auto-Zettelkasten
 
 Auto-Zettelkasten turns a Zotero Desktop library or collection into atomic
-Markdown notes, typed links, full-note literature syntheses, optional
+Markdown notes, typed relationships, optional full-note cluster syntheses and
 candidate-gap records, and an Obsidian-ready vault projection.
 
 It is a standalone, file-first Python package. It does not require Research OS,
 does not read `zotero.sqlite`, and never writes to Zotero.
 
-> **Release status:** v0.15 is an alpha-quality CLI and Python API using artifact
-> schema 1.13 and evidence-profile schema 1.3. Mapped gaps are claims about the
+> **Release status:** v0.30.0 is a relationship-first alpha release candidate using artifact
+> schema 1.20 and evidence-profile schema 1.3. Mapped gaps are claims about the
 > frozen collection only, never literature-wide novelty claims.
 
 ## What it produces
@@ -95,20 +95,29 @@ notes instead of empty analytical templates. Their statuses are
 `abstract_only_atomic_note`, `metadata_only_source_note`, or
 `fulltext_available`. They remain searchable and linkable, but cannot support
 substantive cluster findings. Evidence-bounded partial documents can participate
-in relationships and clusters, with their recovered scope carried into the
-synthesis.
+in relationships and, when enabled, clusters, with their recovered scope
+carried into synthesis.
 
 For PDF sources, the mapper prefers the actual primary Zotero attachment and
-preserves page markers throughout extraction. Born-digital pages use `pypdf`.
-A lightweight text sniff sends only suspicious pages to PDFium rendering plus
-Tesseract OCR, with one orientation-aware retry; good embedded-text pages are
-never discarded. Poppler is a fallback when PDFium is unavailable. Extraction
-provenance records the page count, embedded-text pages, OCR pages, unresolved
-pages, and route in machine metadata. A visibly textual page that remains
-unreadable produces a limited note rather than a falsely complete analysis.
-Tables may be flattened when their labels, values, and surrounding explanation
-remain readable; the note prompt asks the reader to use that context without
-inventing row-column relationships.
+preserves page markers throughout extraction. One no-OCR structural probe
+records per-page text quality, visual resources, suspicious pages, render
+candidates, and custody evidence before routing. Adequate born-digital text uses
+`pypdf`. With `ocr=auto`, explicit cloud consent, and the pinned Codex CLI
+profile, inadequate pages may instead be rendered as ordered PNG attachments to
+the source-bundle call: at most 16 pages, maximum side 2,048 pixels, and no
+enlargement. The 200,000-token preflight includes image, reasoning, output, and
+uncertainty reservations. Codex CLI 0.145.0 does not support original-PDF input.
+The existing `ocr=off` and `ocr=required` semantics are unchanged. OpenAI API
+[PDF file preprocessing](https://developers.openai.com/api/docs/guides/file-inputs)
+is a separate transport capability and is not used by this CLI route.
+
+The existing bounded PDFium/Tesseract route remains available for local OCR and
+typed attachment recovery. Quota, timeout, and interruption pause without local
+recovery; authentication, isolation, integrity, and unknown capability failures
+remain fail-closed. Extraction provenance records the selected route and page
+coverage. A visibly textual page that remains unreadable produces a limited note
+rather than a falsely complete analysis. Tables may be flattened only when their
+labels, values, and surrounding explanation remain readable.
 
 Original Zotero tags and their normalized forms remain provenance. The graph
 projection derives conservative, typed subject tags from existing profile
@@ -122,12 +131,20 @@ entries for model-led relationship discovery without loading every full note.
 Substantive links are adjudicated from two-sided evidence anchors and stored in
 the canonical typed-link registry. Models return relationship records only;
 local code projects reciprocal, explained links into explicit managed graph
-blocks in both atomic notes. Graph projection is committed before cluster
-synthesis, leaves the source-analysis semantic hash unchanged, and is
+blocks in both atomic notes. Graph projection is committed before any enabled
+cluster synthesis, leaves the source-analysis semantic hash unchanged, and is
 provider-call-free on an unchanged replay.
 
+Fresh v0.30 workspaces generate relationships with clusters and gaps off.
+`map`, `sync`, `build-map`, and `estimate` accept `--clusters` or
+`--no-clusters`. When clusters are off, existing cluster/gap artifacts and exact
+membership rows are preserved but not updated, and reports expose historical
+values only as `preserved_clusters`. Legacy workspaces without an explicit
+setting retain their prior full-clustering behavior. Clusters cannot be enabled
+while synthesis is disabled.
+
 A `topic_neighborhood` remains a machine-sidecar retrieval signal rather than a
-competing researcher-facing map. Analytical clusters are model-planned,
+competing researcher-facing map. When enabled, analytical clusters are model-planned,
 coherent research conversations organized around a question, debate,
 mechanism, outcome, method, case, historical problem, or practice problem.
 Shared vocabulary alone is insufficient. Every retained analytical member must
@@ -158,11 +175,14 @@ reprints, overlapping samples, shared datasets, and within-program reports do
 not inflate support. Gap discovery is no longer part of the default map build;
 existing gap memory remains readable for an explicit downstream workflow.
 
-The generated **Literature Map** is the main human entry point. It reports frozen-collection coverage, explains specific reasons for
-unclustered analytical sources, catalogs admitted clusters and their verdicts, links collection-relative gaps, and points to source,
-cluster, and gap indexes. Topic neighborhoods and complete audit matrices remain machine-readable sidecars.
+The generated **Literature Map** is the main human entry point. It reports
+frozen-collection and relationship coverage and points to the source index.
+When clusters are enabled, it also explains unclustered analytical sources and
+catalogs admitted clusters and their verdicts. Preserved historical cluster/gap
+outputs remain linked without being refreshed. Topic neighborhoods and complete
+audit matrices remain machine-readable sidecars.
 
-The planner reads compact catalogue entries. Each cluster then receives every
+With `--clusters`, the planner reads compact catalogue entries. Each cluster then receives every
 complete, projection-free atomic note for its proposed members in one
 checkpointed call. The writer may refine the organizing problem, drop a
 decorative member, and arrange specific findings into lines of inquiry. Local
@@ -182,8 +202,8 @@ notes with high reasoning and cluster synthesis with maximum reasoning. Paid
 calls are checkpointed; replaying an unchanged completed run reuses them.
 
 Existing gap notes and ledgers remain canonical and readable. A later explicit
-gap workflow may use the completed graph and clusters; gap failure cannot make
-the default graph or cluster map partial.
+gap workflow may use the completed graph and enabled or preserved clusters; gap
+failure cannot make the default relationship graph partial.
 
 ## Install
 
@@ -280,6 +300,9 @@ The export is a generated projection. Canonical YAML registries remain in the
 workspace and are never edited through Obsidian. The exported source, cluster,
 and gap Markdown files retain their native subject tags and reciprocal
 wikilinks. The exported literature map keeps its human-readable collection name.
+Collection indexes omit relationship shards and managed graph blocks. A new
+vault receives conservative graph defaults, but an existing `.obsidian/graph.json`
+is never overwritten.
 
 ## Privacy and provider routes
 
@@ -294,6 +317,62 @@ consent.
 | OpenRouter | `OPENROUTER_API_KEY` | yes | alternate/model experiment |
 | Gemini | `GEMINI_API_KEY` | yes | text and document vision |
 | Ollama | none | no | local text reader |
+| Codex CLI | ChatGPT login | yes | subscription source/relationship reader with bounded source-bundle page images |
+
+### Codex CLI provider
+
+Codex support uses a local `codex` CLI process authenticated through an
+existing ChatGPT subscription. It is a cloud provider, not a local model. V1
+supports Codex CLI 0.145.0 only and requires explicit source and literature
+models:
+
+```bash
+codex login
+auto-zettelkasten map \
+  --workspace ~/Research/my-map \
+  --scope collection \
+  --collection COLLECTION_KEY \
+  --provider codex \
+  --model gpt-5.6-luna \
+  --literature-model gpt-5.6-terra \
+  --reasoning-effort medium \
+  --provider-concurrency auto \
+  --allow-cloud
+```
+
+Luna with medium reasoning handles source bundles. Terra with medium reasoning
+handles relationship and other literature contracts.
+
+The equivalent workspace configuration is:
+
+```yaml
+provider: codex
+model: gpt-5.6-luna
+literature_model: gpt-5.6-terra
+reasoning_effort: medium
+```
+
+For atomic notes without synthesis, pass `--no-synthesis` and omit
+`--literature-model`. Run `auto-zettelkasten doctor --workspace WORKSPACE`
+before a new call to verify the CLI version, ChatGPT login, requested model,
+context, effort, and pinned feature manifest. Doctor makes no model call and
+does not estimate remaining subscription quota.
+
+The calibrated Codex profile uses 16 concurrent source calls and 16 concurrent
+literature calls when concurrency is `auto`. An explicit Codex concurrency must
+be between 1 and 32. A quota, timeout, or
+interruption produces a resumable partial run. Repeat the same command (or use
+`auto-zettelkasten resume --workspace WORKSPACE --run-id RUN_ID`) after quota
+is available; completed calls
+remain checkpointed. Subscription usage has no dollar-spend estimate.
+
+The adapter disables every tool-capable surface known to the pinned CLI and
+rejects any JSONL tool event. Tool execution is therefore fail-closed, but zero
+tool visibility is not promised because the supported models are code-mode
+models. Ordered PNGs are permitted only on the source-bundle contract; all
+literature contracts and attachment-free frozen hashes remain unchanged.
+Evidence-profile generation remains deterministic in production; its Codex
+contract is available only for direct evaluation.
 
 Built-in Zotero and Ollama endpoints are restricted to loopback hosts. The
 local extraction ladder ranks complete PDF text above clean full-article HTML,
@@ -334,10 +413,11 @@ report = run_map(
         provider_concurrency="auto",
         processing=ProcessingPolicy(
             max_calls_per_document_run=24,
-            request_deadline_seconds=120,
+            request_deadline_seconds=600,
             document_deadline_seconds=900,
         ),
         literature_policy=LiteratureMappingPolicy(
+            cluster_generation_enabled=False,
             source_backed_threshold=3,
             max_memberships=3,
             external_discovery="disabled",
@@ -377,9 +457,10 @@ providers fail before inventory.
 
 Processing defaults can be overridden through `auto-zettelkasten.yml`,
 `ProcessingPolicy`, or the matching `map` flags. The defaults use a 120,000
-character fallback only for unknown model contexts, a 64-chunk hard coverage
-limit, 24 provider calls per document invocation, a 120-second request
-deadline, and a 900-second document deadline.
+character fallback only for unknown model contexts, 60,000-character chunks,
+a 60-second connection timeout, and a 600-second request idle timeout. A zero
+chunk, call, or document-deadline limit means no additional fixed cap; the
+provider context and run-level safety boundaries still apply.
 
 ## Terminal accounting and resume
 
@@ -404,9 +485,12 @@ versions, prompt version, and effective provider and model. Display metadata,
 run IDs, timeouts, registry revisions, and Markdown projections do not enter
 semantic identities. Harmless Zotero metadata corrections therefore update the
 projection without another source call.
-Prompt version 2 keeps technical figures in `Detailed Findings` and requires a
-separate statistical interpretation for non-specialists. Remapping an older
-prompt-version note invalidates its old fingerprint and replaces it in place.
+Source prompt version 14 and source-bundle prompt version 9 keep technical
+figures in `Detailed Findings`, require a separate interpretation for
+non-specialists, and make optional source definitions and document structure
+explicit. Remapping an older prompt-version note invalidates its old
+fingerprint and replaces it in place; completed prompt/bundle 12/7 and 13/8
+checkpoints remain exactly reusable.
 `status` reads live `progress.yml`; it exposes the active literature stage,
 profile, proposition, subject-tag, typed-relation, topic-neighborhood, singleton-facet, and unclustered counts, clusters,
 debates, gaps, packet checkpoints,
@@ -420,9 +504,10 @@ algorithm fingerprints reuses those checkpoints and makes no paid model calls.
 and updates only changed work. A partial CLI run exits with code 3.
 
 The run source set records exactly what source generation attempted. The
-canonical literature graph and cluster registry span all eligible workspace
-notes; Zotero collections and subcollections are deterministic, provider-free
-views of that global state. An explicit source-set remains available when a
+canonical literature graph spans all eligible workspace notes. An enabled
+cluster registry uses that same global source set; with clusters off, legacy
+cluster state is preserved rather than regenerated. Zotero collections and
+subcollections are deterministic, provider-free views of global state. An explicit source-set remains available when a
 separate semantic resynthesis is deliberately requested. Limited
 `fulltext_available` or metadata/abstract notes remain searchable and can
 participate in structural links, but cannot support substantive cluster
@@ -433,7 +518,7 @@ notes, evidence profiles, cluster/gap identities, or the underlying collection
 map. Research OS may use the lens for downstream ranking without mutating the
 base map.
 
-Artifact schemas 1.0-1.13 and evidence-profile schemas 1.0-1.3 remain readable.
+Artifact schemas 1.0-1.20 and evidence-profile schemas 1.0-1.3 remain readable.
 The idempotent schema-1.9 migration retires the standalone Literature Neighborhoods Markdown projection, archives superseded current cluster and gap
 projections, preserves historical maps, profiles, analytical identities, and
 atomic-note bytes, and makes no model or Zotero call. Existing schema-1.5
@@ -453,7 +538,7 @@ Legacy unmarked `## Graph Links` sections are converted to bounded
 `auto-zettelkasten:graph` markers on their next graph projection; source prose,
 profiles, and human-authored sections are not rewritten.
 
-## Scope deliberately deferred from v0.15
+## Scope deliberately deferred from v0.30.0
 
 - direct `zotero.sqlite` ingestion;
 - Zotero writes or collection synchronization;

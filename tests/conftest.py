@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 from copy import deepcopy
+from pathlib import Path
 from typing import Any, Mapping
 
 import pytest
@@ -8,7 +10,6 @@ import pytest
 
 SECTION_KEYS = (
     "thesis",
-    "key_concepts_and_definitions",
     "method_and_research_design",
     "evidence_and_data",
     "detailed_findings",
@@ -19,7 +20,35 @@ SECTION_KEYS = (
     "what_this_source_can_support",
     "what_this_source_cannot_support",
     "locators",
+    "key_concepts_and_definitions",
+    "source_structure_and_organization",
 )
+
+
+def fake_codex_preflight(
+    root: Path,
+    executable: Path | str,
+    environment: Mapping[str, str] | None = None,
+) -> dict[str, object]:
+    credential_root = root / "synthetic-codex-home"
+    credential_root.mkdir(parents=True, exist_ok=True)
+    (credential_root / "auth.json").write_text(
+        '{"auth_mode":"chatgpt","tokens":'
+        '{"access_token":"e30.eyJleHAiOjQxMDI0NDQ4MDB9."}}\n',
+        encoding="utf-8",
+    )
+    (credential_root / "models_cache.json").write_text(
+        '{"models":[]}\n', encoding="utf-8"
+    )
+    return {
+        "executable": str(executable),
+        "_environment": dict(
+            environment
+            if environment is not None
+            else {"PATH": os.environ.get("PATH", "")}
+        ),
+        "_credential_root": str(credential_root),
+    }
 
 
 class FakeReader:

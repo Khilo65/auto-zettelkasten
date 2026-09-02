@@ -257,7 +257,10 @@ def test_streamlined_cluster_rebinds_locator_only_finding_evidence() -> None:
         "evidence"
     ] == [{"source_id": "A", "locator": "p. 10"}]
     assert validated["status"] == "partial"
-    assert validated["quality_errors"] == ["cluster_requires_two_retained_members"]
+    assert validated["quality_errors"] == [
+        "cluster_requires_two_retained_members",
+        "retained_member_without_specific_finding",
+    ]
     assert validated["retained_member_ids"] == ["A"]
     assert set(validated["quality_warnings"]) == {
         "retained_member_without_specific_finding_removed",
@@ -316,7 +319,7 @@ def test_streamlined_cluster_ignores_only_cross_owned_evidence_rows() -> None:
         response, cluster, profiles
     )
 
-    assert validated["status"] == "reasoned"
+    assert validated["status"] == "partial"
     assert validated["retained_member_ids"] == ["A", "B", "C"]
     assert all(
         len(row.get("evidence", []) or []) == 1
@@ -330,6 +333,7 @@ def test_streamlined_cluster_ignores_only_cross_owned_evidence_rows() -> None:
     assert "study_finding_evidence_source_mismatch_ignored" in validated[
         "quality_warnings"
     ]
+    assert "study_finding_cross_owned_evidence" in validated["quality_errors"]
 
 
 def test_oversized_cluster_is_partitioned_before_writers(tmp_path: Path) -> None:
@@ -437,6 +441,209 @@ def test_oversized_cluster_is_partitioned_before_writers(tmp_path: Path) -> None
         row["source_id"]
         for row in report["cluster_registry"]["unclustered_sources"]
     } == {"D"}
+
+
+def test_relationship_first_partition_rejects_disconnected_child(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile(source_id) for source_id in ("A", "B", "C", "D")]
+    writer_called = False
+
+    class Reasoner:
+        name = "local"
+        model = "test"
+
+        def cluster_synthesis_fits(self, projected, request, *, context=None):
+            return len(projected) <= 2
+
+        def plan_clusters(self, projected, request, *, context=None):
+            return {
+                "clusters": [
+                    {
+                        "cluster_id": "disconnected",
+                        "members": [
+                            {"source_id": "A", "role": "core"},
+                            {"source_id": "D", "role": "core"},
+                        ],
+                    },
+                    {
+                        "cluster_id": "connected",
+                        "members": [
+                            {"source_id": "B", "role": "core"},
+                            {"source_id": "C", "role": "core"},
+                        ],
+                    },
+                ],
+                "neighbor_relationships": [],
+                "unclustered_sources": [],
+            }
+
+        def synthesize_cluster(self, projected, request, *, context=None):
+            nonlocal writer_called
+            writer_called = True
+            return _streamlined_response(context["cluster"], projected)
+
+    report = build_literature_report(
+        profiles,
+        reasoner=Reasoner(),
+        request=LiteratureMapRequest(tmp_path),
+        source_notes=[
+            {
+                "source_id": row["source_id"],
+                "title": row["title"],
+                "source_scope": "full_document",
+                "body": f"# {row['title']}\n\nComplete note.",
+            }
+            for row in profiles
+        ],
+        accepted_relationships=[
+            {
+                "relation_id": f"relationship-{left}-{right}",
+                "source_id": left,
+                "target_source_id": right,
+                "relation_type": "contextual_connection",
+                "provenance": "human_curated",
+                "cluster_evidence_eligible": True,
+                "active": True,
+                "reason": "The accepted pair addresses the same bounded problem.",
+                "source_evidence": {
+                    "source_id": left,
+                    "evidence_anchor_id": f"anchor-{left}",
+                    "locator": "p. 10",
+                },
+                "target_evidence": {
+                    "source_id": right,
+                    "evidence_anchor_id": f"anchor-{right}",
+                    "locator": "p. 10",
+                },
+            }
+            for left, right in (("A", "B"), ("B", "C"), ("C", "D"))
+        ],
+        shared_literature_plan={
+            "literature_families": [
+                {
+                    "family_id": "oversized",
+                    "label": "Oversized",
+                    "source_ids": ["A", "B", "C", "D"],
+                    "proposed_roles": {
+                        source_id: "core" for source_id in ("A", "B", "C", "D")
+                    },
+                    "candidate_cluster": True,
+                }
+            ],
+            "discovery_jobs": [],
+            "neighboring_families": [],
+        },
+    )
+
+    assert writer_called is False
+    assert any(
+        "cluster_partition_relationship_graph_disconnected"
+        in synthesis.get("quality_errors", [])
+        for synthesis in report["cluster_syntheses"].values()
+    )
+
+
+def test_relationship_first_partition_preserves_accepted_relation_lineage(
+    tmp_path: Path,
+) -> None:
+    profiles = [_profile(source_id) for source_id in "ABCD"]
+    writer_clusters: list[dict[str, Any]] = []
+
+    class Reasoner:
+        name = "local"
+        model = "test"
+
+        def cluster_synthesis_fits(self, projected, request, *, context=None):
+            return len(projected) <= 2
+
+        def plan_clusters(self, projected, request, *, context=None):
+            return {
+                "clusters": [
+                    {
+                        "cluster_id": label,
+                        "title": label,
+                        "members": [
+                            {"source_id": source_id} for source_id in source_ids
+                        ],
+                    }
+                    for label, source_ids in (
+                        ("left", ("A", "B")),
+                        ("right", ("C", "D")),
+                    )
+                ],
+                "neighbor_relationships": [],
+                "unclustered_sources": [],
+            }
+
+        def synthesize_cluster(self, projected, request, *, context=None):
+            writer_clusters.append(dict(context["cluster"]))
+            return _streamlined_response(context["cluster"], projected)
+
+    report = build_literature_report(
+        profiles,
+        reasoner=Reasoner(),
+        request=LiteratureMapRequest(tmp_path),
+        source_notes=[
+            {
+                "source_id": row["source_id"],
+                "title": row["title"],
+                "source_scope": "full_document",
+                "body": f"# {row['title']}\n\nComplete note.",
+            }
+            for row in profiles
+        ],
+        accepted_relationships=[
+            {
+                "relation_id": f"relationship-{left}-{right}",
+                "source_id": left,
+                "target_source_id": right,
+                "relation_type": "contextual_connection",
+                "provenance": "human_curated",
+                "cluster_evidence_eligible": True,
+                "active": True,
+                "source_evidence": {
+                    "source_id": left,
+                    "evidence_anchor_id": f"anchor-{left}",
+                },
+                "target_evidence": {
+                    "source_id": right,
+                    "evidence_anchor_id": f"anchor-{right}",
+                },
+            }
+            for left, right in (("A", "B"), ("B", "C"), ("C", "D"))
+        ],
+        shared_literature_plan={
+            "literature_families": [
+                {
+                    "family_id": "oversized",
+                    "source_ids": list("ABCD"),
+                    "proposed_roles": {source_id: "core" for source_id in "ABCD"},
+                    "candidate_cluster": True,
+                }
+            ],
+            "discovery_jobs": [],
+            "neighboring_families": [],
+        },
+    )
+
+    assert len(writer_clusters) == 2
+    by_members = {
+        tuple(cluster["source_ids"]): cluster
+        for cluster in report["cluster_registry"]["clusters"]
+    }
+    assert by_members[("A", "B")]["family_relation_ids"] == [
+        "relationship-A-B"
+    ]
+    assert by_members[("C", "D")]["family_relation_ids"] == [
+        "relationship-C-D"
+    ]
+    assert by_members[("A", "B")]["core_source_ids"] == ["A", "B"]
+    assert by_members[("C", "D")]["core_source_ids"] == ["C", "D"]
+    assert all(
+        cluster["relationship_first_admission"] for cluster in by_members.values()
+    )
+    assert len(by_members) == 2
 
 
 def test_unchanged_oversized_parent_reuses_published_children(tmp_path: Path) -> None:
@@ -1188,7 +1395,7 @@ def test_streamlined_cluster_requires_one_specific_finding_per_member() -> None:
     assert "study_finding_requires_finding" in empty["quality_warnings"]
 
 
-def test_streamlined_cluster_publishes_valid_members_when_one_contribution_is_missing() -> None:
+def test_streamlined_cluster_parks_when_one_retained_contribution_is_missing() -> None:
     profiles = normalize_evidence_profiles(
         [_profile("A"), _profile("B"), _profile("C")]
     )
@@ -1204,7 +1411,8 @@ def test_streamlined_cluster_publishes_valid_members_when_one_contribution_is_mi
         response, cluster, profiles
     )
 
-    assert result["status"] == "reasoned"
+    assert result["status"] == "partial"
+    assert result["parked_for_review"] is True
     assert result["retained_member_ids"] == ["A", "B"]
     assert result["dropped_members"] == [
         {
@@ -1212,7 +1420,9 @@ def test_streamlined_cluster_publishes_valid_members_when_one_contribution_is_mi
             "reason": "writer_omitted_specific_contribution",
         }
     ]
-    assert result["quality_errors"] == []
+    assert result["quality_errors"] == [
+        "retained_member_without_specific_finding"
+    ]
 
 
 def test_streamlined_markdown_is_source_specific_and_has_no_gap_boilerplate() -> None:
@@ -1817,6 +2027,44 @@ def test_cluster_writer_drop_updates_all_projected_membership() -> None:
             }
             for source_id in ("A", "B", "C")
         ],
+        accepted_relationships=[
+            {
+                "relation_id": f"relationship-{left}-{right}",
+                "source_id": left,
+                "target_source_id": right,
+                "relation_type": "contextual_connection",
+                "provenance": "human_curated",
+                "cluster_evidence_eligible": True,
+                "active": True,
+                "reason": "The accepted pair addresses the same bounded problem.",
+                "source_evidence": {
+                    "source_id": left,
+                    "evidence_anchor_id": f"anchor-{left}",
+                    "locator": "p. 10",
+                },
+                "target_evidence": {
+                    "source_id": right,
+                    "evidence_anchor_id": f"anchor-{right}",
+                    "locator": "p. 10",
+                },
+            }
+            for left, right in (("A", "B"), ("B", "C"))
+        ],
+        shared_literature_plan={
+            "literature_families": [
+                {
+                    "family_id": "trimmed",
+                    "label": "Trimmed",
+                    "source_ids": ["A", "B", "C"],
+                    "proposed_roles": {
+                        source_id: "core" for source_id in ("A", "B", "C")
+                    },
+                    "candidate_cluster": True,
+                }
+            ],
+            "discovery_jobs": [],
+            "neighboring_families": [],
+        },
     )
 
     cluster = report["cluster_registry"]["clusters"][0]
@@ -1826,6 +2074,11 @@ def test_cluster_writer_drop_updates_all_projected_membership() -> None:
         {"source_id": "A", "role": "core"},
         {"source_id": "B", "role": "core"},
     ]
+    assert cluster["family_relation_ids"] == ["relationship-A-B"]
+    assert cluster["relation_ids"] == ["relationship-A-B"]
+    assert [
+        row["relation_id"] for row in cluster["family_relations"]
+    ] == ["relationship-A-B"]
     assert [
         row["source_id"]
         for row in report["cluster_registry"]["unclustered_sources"]

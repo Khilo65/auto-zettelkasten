@@ -55,8 +55,9 @@ def test_profile_versions_are_explicit() -> None:
     assert PROFILE_SCHEMA_VERSION == "1.3"
     assert PROFILE_PROMPT_VERSION == profiles.profile_prompt_version == "6"
     assert PROFILE_CLASSIFIER_VERSION == profiles.profile_classifier_version == "3"
-    assert PROFILE_ALGORITHM_VERSION == profiles.profile_algorithm_version == "5"
-    assert ANCHOR_ALGORITHM_VERSION == SUPPORT_ENVELOPE_VERSION == "1"
+    assert PROFILE_ALGORITHM_VERSION == profiles.profile_algorithm_version == "9"
+    assert ANCHOR_ALGORITHM_VERSION == "2"
+    assert SUPPORT_ENVELOPE_VERSION == "1"
     assert COMMITTED_NOTE_ANCHOR_AUGMENTATION_VERSION == "8"
 
 
@@ -67,6 +68,117 @@ def test_actor_position_labels_are_not_misread_as_page_locators() -> None:
     assert profiles._first_locator("See pages 12-14") == "pages 12-14"
 
 
+def test_methods_ignore_negated_terms_in_mixed_prose() -> None:
+    cases = (
+        (
+            "This article uses interviews but does not report a systematic sample, "
+            "survey, experiment, or linear regression.",
+            ["interviews"],
+        ),
+        ("A survey was not conducted.", []),
+        ("Survey evidence is absent.", []),
+        ("Rather than a survey, the article compares documents.", []),
+        (
+            "The report has no sample-size information and relies on interviews.",
+            ["interviews"],
+        ),
+        (
+            "The article did not use random sampling and instead conducted interviews.",
+            ["interviews"],
+        ),
+        (
+            "The article reports results from online surveys. It is not itself a survey.",
+            ["survey"],
+        ),
+        (
+            "The summary does not describe respondent selection, survey fieldwork "
+            "dates, or weighting.",
+            ["survey"],
+        ),
+        ("The survey was not weighted.", ["survey"]),
+        ("The study did not conduct survey fieldwork.", []),
+        ("The report never used survey data.", []),
+        ("The article lacks survey results.", []),
+        ("There are no reliable survey data.", []),
+        ("The researchers did not collect survey data.", []),
+        ("Survey fieldwork was not conducted.", []),
+        ("The report does not describe whether survey fieldwork dates exist.", []),
+        (
+            "The report does not provide survey fieldwork dates because no survey "
+            "was conducted.",
+            [],
+        ),
+    )
+
+    for text, expected in cases:
+        assert profiles._methods({"Method and Research Design": text}) == expected
+
+
+def test_methods_use_affirmed_evidence_section_terms() -> None:
+    assert profiles._methods(
+        {
+            "Method and Research Design": "The article reports repeated polling.",
+            "Evidence and Data": "The evidence comes from daily opt-in online surveys.",
+        }
+    ) == ["survey"]
+    assert profiles._methods(
+        {
+            "Method and Research Design": "This is selected journalistic reporting.",
+            "Evidence and Data": "The article does not use a survey or systematic sample.",
+        }
+    ) == []
+
+
+def test_current_profile_algorithm_refreshes_stale_bundle_methods_without_a_call() -> None:
+    note = _analytical_note()
+    profile = deterministic_profile(note)
+    profile.methods = ["Provider-described mixed method", "survey", "panel regression"]
+    profile.context["profile_generation_route"] = "source_analysis_bundle"
+    profile.validity.update(
+        algorithm_version="7",
+        committed_note_anchor_augmentation_version=(
+            COMMITTED_NOTE_ANCHOR_AUGMENTATION_VERSION
+        ),
+    )
+
+    refreshed, changed = augment_profile_from_committed_note(
+        profile,
+        note,
+        source_set_id="",
+        provider="codex",
+        model="gpt-5.6-luna",
+    )
+
+    assert changed is True
+    assert refreshed.methods == [
+        "Provider-described mixed method",
+        "panel regression",
+        "survey",
+    ]
+    assert refreshed.validity["algorithm_version"] == "9"
+
+
+def test_mismatched_plain_english_rows_do_not_shift_between_findings() -> None:
+    rows = profiles._extract_findings(
+        "- The program started in 2002.\n"
+        "- It targeted more than 400,000 combatants.\n"
+        "- Outcomes were higher than the comparison group.\n"
+        "- Participation was higher than 5%.",
+        "- The program operated at substantial scale.",
+        "p. 1",
+        note_id="note-1",
+        populations=[],
+        outcomes=[],
+    )
+
+    assert [row["plain_english_meaning"] for row in rows] == [
+        row["claim"] for row in rows
+    ]
+    assert rows[1]["comparison"] == "not_reported"
+    assert rows[2]["comparison"].startswith("higher than")
+    assert rows[3]["comparison"].startswith("higher than 5%")
+
+
 def test_canonical_anchor_collision_rebinds_nested_ids() -> None:
     anchors = [
         EvidenceAnchor.from_dict(
@@ -75,36 +187,44 @@ def test_canonical_anchor_collision_rebinds_nested_ids() -> None:
                 "evidence_role": "associational",
                 "claim": f"Claim {index}",
                 "locator": "p. 10",
-                "magnitude": magnitude,
-                "source_locators": [
-                    {
-                        "locator_id": f"locator-{index}",
-                        "source_id": "source-a",
-                        "evidence_anchor_id": "stale-anchor",
-                        "locator_type": "page",
-                        "value": "10",
-                        "page_start": 10,
-                        "page_end": 10,
-                        "source_native": True,
-                        "supports_strong_assertion": True,
-                    }
-                ],
-                "quantitative_result": {
-                    "quantitative_result_id": f"result-{index}",
-                    "source_id": "source-a",
-                    "evidence_anchor_id": "stale-anchor",
-                    "statistic": magnitude,
-                    "provenance": "unknown",
-                },
             }
         )
-        for index, magnitude in enumerate(("0.2", "0.4"), start=1)
+        for index in range(1, 3)
     ]
 
     canonical = _canonicalize_anchor_ids(anchors)
+    ids_before = {anchor.claim: anchor.evidence_anchor_id for anchor in canonical}
+    enriched = []
+    for index, anchor in enumerate(canonical, start=1):
+        payload = anchor.to_dict()
+        payload["revision_hash"] = ""
+        payload["source_locators"] = [
+            {
+                "locator_id": f"locator-{index}",
+                "source_id": "source-a",
+                "evidence_anchor_id": anchor.evidence_anchor_id,
+                "locator_type": "page",
+                "value": "10",
+                "page_start": 10,
+                "page_end": 10,
+                "source_native": True,
+                "supports_strong_assertion": True,
+            }
+        ]
+        payload["quantitative_result"] = {
+            "quantitative_result_id": f"result-{index}",
+            "source_id": "source-a",
+            "evidence_anchor_id": "stale-anchor",
+            "statistic": str(index),
+            "provenance": "unknown",
+        }
+        enriched.append(EvidenceAnchor.from_dict(payload))
+
+    canonical = _canonicalize_anchor_ids(enriched)
 
     assert len(canonical) == 2
     assert len({anchor.evidence_anchor_id for anchor in canonical}) == 2
+    assert {anchor.claim: anchor.evidence_anchor_id for anchor in canonical} == ids_before
     assert all(
         locator.evidence_anchor_id == anchor.evidence_anchor_id
         for anchor in canonical
@@ -116,6 +236,20 @@ def test_canonical_anchor_collision_rebinds_nested_ids() -> None:
         == anchor.evidence_anchor_id
         for anchor in canonical
     )
+
+
+def test_incidental_heading_word_is_not_source_native_support() -> None:
+    rows = profiles._source_locator_payloads(
+        'Section “Faulty Justifications,” UNRWA discussion',
+        source_id="source-a",
+        evidence_anchor_id="anchor-a",
+    )
+
+    assert [
+        (row["locator_type"], row["value"])
+        for row in rows
+        if row["supports_strong_assertion"]
+    ] == [("quote_span", "“Faulty Justifications,”")]
 
 
 def test_central_contribution_gets_a_locator_matched_conceptual_anchor() -> None:
@@ -209,6 +343,57 @@ def test_complete_reasoner_profile_is_not_padded_with_mechanical_summary_anchors
     assert all(
         anchor.support_envelope.coverage == "full_text"
         for anchor in augmented.evidence_anchors
+    )
+
+
+def test_source_bundle_profile_is_not_padded_with_mechanical_anchors() -> None:
+    note = _analytical_note()
+    payload = profile_to_dict(deterministic_profile(note))
+    template = payload["evidence_anchors"][0]
+    payload["evidence_anchors"] = [
+        {
+            **copy.deepcopy(template),
+            "evidence_anchor_id": "",
+            "revision_hash": "",
+            "claim": f"Provider-selected contribution {index}.",
+        }
+        for index in range(1, 6)
+    ]
+    payload["evidence_anchors"][0]["locator"] = (
+        'Section “Faulty Justifications,” UNRWA discussion'
+    )
+    payload["evidence_anchors"][0]["source_locators"] = [
+        {
+            "locator_id": "locator-stale",
+            "source_id": payload["source_id"],
+            "evidence_anchor_id": "anchor-stale",
+            "locator_type": "source_heading",
+            "value": "discussion",
+            "source_native": True,
+            "supports_strong_assertion": True,
+        }
+    ]
+    payload["context"] = {
+        **dict(payload.get("context") or {}),
+        "profile_generation_route": "source_analysis_bundle",
+    }
+    payload["validity"].pop("committed_note_anchor_augmentation_version", None)
+
+    augmented, changed = augment_profile_from_committed_note(
+        profile_from_dict(payload),
+        note,
+        source_set_id="source-set-1",
+        provider="codex",
+        model="gpt-5.6-luna",
+    )
+
+    assert changed is True
+    assert len(augmented.evidence_anchors) == 5
+    assert augmented.validity["committed_note_anchor_count_added"] == 0
+    assert all(
+        locator.value.casefold() != "discussion"
+        for anchor in augmented.evidence_anchors
+        for locator in anchor.source_locators
     )
 
 
@@ -456,12 +641,12 @@ def test_analytical_note_is_extracted_and_validated_from_committed_markdown() ->
     }
     assert profile.validity["profile_prompt_version"] == "6"
     assert profile.validity["classifier_version"] == "3"
-    assert profile.validity["algorithm_version"] == "5"
+    assert profile.validity["algorithm_version"] == "9"
     assert profile.research_questions
     assert {"participation", "trust"} <= set(profile.concepts)
     assert profile.theories == ["contact theory"]
     assert profile.mechanisms == ["learning"]
-    assert profile.methods == ["panel regression"]
+    assert profile.methods == ["panel regression", "survey"]
     assert profile.cases == ["Case A"]
     assert profile.datasets == profile.data == ["panel survey"]
     assert profile.geography == ["Region A"]
@@ -767,9 +952,9 @@ def test_profile_fingerprint_includes_every_declared_dependency() -> None:
     assert payload["note_semantic_hash"] == shared_semantic_note_hash(note)
     assert payload["profile_prompt_version"] == "6"
     assert payload["classifier_version"] == "3"
-    assert payload["algorithm_version"] == "5"
+    assert payload["algorithm_version"] == "9"
     assert payload["profile_schema_version"] == "1.3"
-    assert payload["anchor_algorithm_version"] == "1"
+    assert payload["anchor_algorithm_version"] == "2"
     assert payload["support_envelope_version"] == "1"
     assert baseline == profile_dependency_fingerprint(
         _with_generated_graph(note), **kwargs
@@ -796,13 +981,13 @@ def test_profile_fingerprint_includes_every_declared_dependency() -> None:
         note, **kwargs, profile_classifier_version="4"
     )
     assert baseline != profile_dependency_fingerprint(
-        note, **kwargs, profile_algorithm_version="6"
+        note, **kwargs, profile_algorithm_version="10"
     )
     assert baseline != profile_dependency_fingerprint(
         note, **kwargs, profile_schema_version="1.0"
     )
     assert baseline != profile_dependency_fingerprint(
-        note, **kwargs, anchor_algorithm_version="2"
+        note, **kwargs, anchor_algorithm_version="3"
     )
     assert baseline != profile_dependency_fingerprint(
         note, **kwargs, support_envelope_version="2"

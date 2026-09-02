@@ -173,8 +173,8 @@ def test_incremental_family_plan_preserves_unaffected_families(
     tmp_path: Path,
 ) -> None:
     class Reasoner:
-        name = "local"
-        model = "test"
+        name = "codex"
+        model = "gpt-5.6-sol"
 
         def literature_family_plan_fits(self, profiles, request, *, context=None):
             return True
@@ -256,7 +256,13 @@ def test_incremental_family_plan_preserves_unaffected_families(
         ],
         "neighboring_families": [],
     }
-    request = LiteratureMapRequest(tmp_path)
+    request = LiteratureMapRequest(
+        tmp_path,
+        provider="codex",
+        model="gpt-5.6-sol",
+        reasoning_effort="max",
+        allow_cloud=True,
+    )
     first = _plan_literature_families(
         tmp_path,
         profiles=profiles,

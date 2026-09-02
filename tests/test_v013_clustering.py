@@ -14,6 +14,7 @@ from auto_zettelkasten.literature import (
     _global_plan_proposals,
     _project_planned_cluster_neighbors,
     build_literature_report,
+    map_overlapping_clusters,
     normalize_evidence_profiles,
 )
 from auto_zettelkasten.readers import _validate_literature_response
@@ -131,6 +132,151 @@ def test_global_plan_uses_only_source_owned_member_and_neighbor_anchors() -> Non
         row["evidence_anchor_id"]
         for row in proposals[0]["supporting_evidence"]
     } == {"a-anchor-1", "b-anchor-1"}
+
+
+def test_relationship_first_global_plan_requires_verified_pair_connectivity() -> None:
+    profiles = normalize_evidence_profiles(
+        [_profile(source_id) for source_id in ("a", "b", "c", "x", "y")]
+    )
+    response = {
+        "clusters": [
+            {
+                "cluster_id": "connected",
+                "title": "Connected measurement family",
+                "shared_question": "How is one bounded construct measured?",
+                "coherence_rationale": "The studies compare one bounded construct.",
+                "members": [
+                    {
+                        "source_id": source_id,
+                        "role": "core",
+                        "evidence_anchor_ids": [f"{source_id}-anchor-1"],
+                    }
+                    for source_id in ("a", "b", "c")
+                ],
+            },
+            {
+                "cluster_id": "unsupported",
+                "title": "Topical adjacency only",
+                "shared_question": "Are these works one family?",
+                "coherence_rationale": "The planner grouped the titles.",
+                "members": [
+                    {
+                        "source_id": source_id,
+                        "role": "core",
+                        "evidence_anchor_ids": [f"{source_id}-anchor-1"],
+                    }
+                    for source_id in ("x", "y")
+                ],
+            },
+        ]
+    }
+    accepted = [
+        {
+            "relation_id": relation_id,
+            "source_ids": [left, right],
+            "relation_type": "contextual_connection",
+            "reason": "The pair supports a bounded comparison.",
+            "cluster_evidence_eligible": True,
+            "evidence": [
+                {
+                    "source_id": source_id,
+                    "evidence_anchor_id": f"{source_id}-anchor-2",
+                }
+                for source_id in (left, right)
+            ],
+        }
+        for relation_id, left, right in (
+            ("relationship-a-b", "a", "b"),
+            ("relationship-b-c", "b", "c"),
+        )
+    ]
+    accepted.append(
+        {
+            "relation_id": "citation-x-y",
+            "source_ids": ["x", "y"],
+            "relation_type": "cites",
+            "cluster_evidence_eligible": False,
+        }
+    )
+
+    proposals, _, _, _ = _global_plan_proposals(
+        response,
+        profiles,
+        accepted_relationships=accepted,
+    )
+    mapped = map_overlapping_clusters(profiles, proposals=proposals)
+
+    assert len(mapped["clusters"]) == 1
+    assert mapped["clusters"][0]["core_source_ids"] == ["a", "b", "c"]
+    assert mapped["clusters"][0]["relation_ids"] == [
+        "relationship-a-b",
+        "relationship-b-c",
+    ]
+    assert all(
+        len(row["source_ids"]) == 2
+        for row in mapped["clusters"][0]["family_relations"]
+    )
+    assert {
+        reference["evidence_anchor_id"]
+        for row in mapped["clusters"][0]["family_relations"]
+        for reference in row["evidence"]
+    } == {"a-anchor-2", "b-anchor-2", "c-anchor-2"}
+    assert any(
+        row["proposal_id"] == "unsupported"
+        and row["reason"] == "no_valid_connected_family_relation"
+        for row in mapped["rejected_proposals"]
+    )
+
+
+def test_relationship_first_cluster_discards_unconnected_auxiliary_member() -> None:
+    profiles = normalize_evidence_profiles(
+        [_profile(source_id) for source_id in ("a", "b", "c")]
+    )
+    response = {
+        "clusters": [
+            {
+                "cluster_id": "connected",
+                "title": "Connected pair",
+                "shared_question": "How is one bounded construct measured?",
+                "coherence_rationale": "A and B support the comparison.",
+                "members": [
+                    {
+                        "source_id": source_id,
+                        "role": "context" if source_id == "c" else "core",
+                        "evidence_anchor_ids": [f"{source_id}-anchor-1"],
+                    }
+                    for source_id in ("a", "b", "c")
+                ],
+            }
+        ]
+    }
+    proposals, _, _, _ = _global_plan_proposals(
+        response,
+        profiles,
+        accepted_relationships=[
+            {
+                "relation_id": "relationship-a-b",
+                "source_ids": ["a", "b"],
+                "relation_type": "contextual_connection",
+                "cluster_evidence_eligible": True,
+                "evidence": [
+                    {
+                        "source_id": source_id,
+                        "evidence_anchor_id": f"{source_id}-anchor-2",
+                    }
+                    for source_id in ("a", "b")
+                ],
+            }
+        ],
+    )
+
+    mapped = map_overlapping_clusters(profiles, proposals=proposals)
+
+    assert mapped["clusters"][0]["source_ids"] == ["a", "b"]
+    assert mapped["clusters"][0]["context_source_ids"] == []
+    assert any(
+        row["source_id"] == "c" for row in mapped["unclustered_sources"]
+    )
 
 
 def test_member_without_planner_anchor_uses_source_owned_profile_evidence() -> None:
@@ -549,6 +695,44 @@ def test_global_plan_publishes_usable_synthesis_with_advisory_quality_warnings(
     assert synthesis["quality_status"] == "warning"
     assert _cluster_projection_is_publishable(synthesis)
     assert synthesis["quality_warnings"] == ["advisory_quality_warning"]
+
+
+@pytest.mark.parametrize(
+    "fatal_error",
+    [
+        "retained_member_without_specific_finding",
+        "study_finding_cross_owned_evidence",
+    ],
+)
+def test_global_plan_keeps_fatal_membership_synthesis_parked(
+    monkeypatch: pytest.MonkeyPatch,
+    fatal_error: str,
+) -> None:
+    reasoner = _WarningBearingGlobalReasoner()
+    original_validator = literature.validate_cluster_synthesis
+
+    def fatal_validator(*args, **kwargs):
+        result = original_validator(*args, **kwargs)
+        result.update(
+            status="partial",
+            quality_status="incomplete",
+            quality_errors=[fatal_error],
+            parked_for_review=True,
+        )
+        return result
+
+    monkeypatch.setattr(literature, "validate_cluster_synthesis", fatal_validator)
+    report = build_literature_report(
+        [_profile("a"), _profile("b")],
+        reasoner=reasoner,
+        request={"source_set_id": "set", "literature_policy": {}},
+        source_set={"source_set_id": "set", "collection_name": "Test"},
+    )
+
+    synthesis = next(iter(report["cluster_syntheses"].values()))
+    assert synthesis["status"] == "partial"
+    assert synthesis["parked_for_review"] is True
+    assert not _cluster_projection_is_publishable(synthesis)
 
 
 class _ShardedPlanReasoner:

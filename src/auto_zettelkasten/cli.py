@@ -35,6 +35,7 @@ DEFAULT_MODELS = {
     "gemini": "gemini-2.5-flash",
     "ollama": "llama3.2",
 }
+PROVIDER_CHOICES = ("deepseek", "openrouter", "gemini", "ollama", "codex")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -63,8 +64,12 @@ def build_parser() -> argparse.ArgumentParser:
     map_parser.add_argument("--scope", choices=("library", "collection", "selected"), default=None)
     map_parser.add_argument("--collection", default="")
     map_parser.add_argument("--question", default="")
-    map_parser.add_argument("--provider", choices=("deepseek", "openrouter", "gemini", "ollama"), default=None)
+    map_parser.add_argument("--provider", choices=PROVIDER_CHOICES, default=None)
     map_parser.add_argument("--model", default=None)
+    map_parser.add_argument("--literature-model", default=None)
+    map_parser.add_argument(
+        "--reasoning-effort", choices=("medium", "high", "max"), default=None
+    )
     map_parser.add_argument("--allow-cloud", action="store_true", default=None)
     map_parser.add_argument(
         "--parallel",
@@ -122,10 +127,14 @@ def build_parser() -> argparse.ArgumentParser:
     sync_parser.add_argument("--collection", default="")
     sync_parser.add_argument(
         "--provider",
-        choices=("deepseek", "openrouter", "gemini", "ollama"),
+        choices=PROVIDER_CHOICES,
         default=None,
     )
     sync_parser.add_argument("--model", default=None)
+    sync_parser.add_argument("--literature-model", default=None)
+    sync_parser.add_argument(
+        "--reasoning-effort", choices=("medium", "high", "max"), default=None
+    )
     sync_parser.add_argument("--allow-cloud", action="store_true", default=None)
     sync_parser.add_argument(
         "--parallel",
@@ -168,9 +177,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Estimate graph work from committed notes without inventorying live Zotero.",
     )
     estimate_parser.add_argument(
-        "--provider", choices=("deepseek", "openrouter", "gemini", "ollama"), default=None
+        "--provider", choices=PROVIDER_CHOICES, default=None
     )
     estimate_parser.add_argument("--model", default=None)
+    estimate_parser.add_argument(
+        "--synthesis", action=argparse.BooleanOptionalAction, default=None
+    )
+    estimate_parser.add_argument(
+        "--clusters", action=argparse.BooleanOptionalAction, default=None
+    )
 
     build_parser_command = commands.add_parser("build-map", help="Rebuild typed links, clusters, gaps, and indexes from validated notes.")
     build_parser_command.add_argument("--workspace", type=Path, required=True)
@@ -184,8 +199,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Zotero collection key to compare directly; repeat for each collection.",
     )
     build_parser_command.add_argument("--question", default="")
-    build_parser_command.add_argument("--provider", choices=("deepseek", "openrouter", "gemini", "ollama"), default=None)
+    build_parser_command.add_argument("--provider", choices=PROVIDER_CHOICES, default=None)
     build_parser_command.add_argument("--model", default=None)
+    build_parser_command.add_argument("--literature-model", default=None)
+    build_parser_command.add_argument(
+        "--reasoning-effort", choices=("medium", "high", "max"), default=None
+    )
     build_parser_command.add_argument("--allow-cloud", action="store_true", default=None)
     build_parser_command.add_argument(
         "--provider-concurrency",
@@ -235,6 +254,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             provider = args.provider or configured_provider
             configured_model = str(config.get("model") or "") if provider == configured_provider else ""
             model = args.model or configured_model or DEFAULT_MODELS.get(provider, "")
+            literature_model = args.literature_model or (
+                str(config.get("literature_model") or "")
+                if provider == configured_provider
+                else ""
+            )
+            reasoning_effort = args.reasoning_effort or (
+                config.get("reasoning_effort")
+                if provider == configured_provider
+                else None
+            )
             extraction_config = (
                 config.get("extraction", {})
                 if isinstance(config.get("extraction", {}), dict)
@@ -247,6 +276,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 question=args.question or None,
                 provider=provider,
                 model=model,
+                literature_model=literature_model or None,
+                reasoning_effort=reasoning_effort,
                 allow_cloud=args.allow_cloud is True,
                 parallel=args.parallel if args.parallel is not None else int(config.get("parallel", 4)),
                 provider_concurrency=_provider_concurrency(
@@ -281,12 +312,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 or configured_model
                 or DEFAULT_MODELS.get(provider, "")
             )
+            literature_model = args.literature_model or (
+                str(config.get("literature_model") or "")
+                if provider == configured_provider
+                else ""
+            )
+            reasoning_effort = args.reasoning_effort or (
+                config.get("reasoning_effort")
+                if provider == configured_provider
+                else None
+            )
             request = MapRequest(
                 workspace=args.workspace,
                 scope=args.scope or str(config.get("scope") or "library"),
                 collection_key=args.collection or None,
                 provider=provider,
                 model=model,
+                literature_model=literature_model or None,
+                reasoning_effort=reasoning_effort,
                 allow_cloud=args.allow_cloud is True,
                 parallel=(
                     args.parallel
@@ -333,13 +376,34 @@ def main(argv: Sequence[str] | None = None) -> int:
                 provider=provider,
                 model=model,
                 graph_only=args.graph_only,
+                literature_policy=_literature_policy(args, config),
             )
         elif args.command == "build-map":
             config = load_config(args.workspace)
             configured_provider = str(config.get("provider") or "deepseek")
             provider = args.provider or configured_provider
             configured_model = str(config.get("model") or "") if provider == configured_provider else ""
-            model = args.model or configured_model or DEFAULT_MODELS.get(provider, "")
+            configured_literature_model = (
+                str(config.get("literature_model") or "")
+                if provider == configured_provider
+                else ""
+            )
+            if args.model and args.literature_model and args.model != args.literature_model:
+                raise ValueError(
+                    "build-map --model and --literature-model must match when both are set"
+                )
+            model = (
+                args.literature_model
+                or args.model
+                or configured_literature_model
+                or configured_model
+                or DEFAULT_MODELS.get(provider, "")
+            )
+            reasoning_effort = args.reasoning_effort or (
+                config.get("reasoning_effort")
+                if provider == configured_provider
+                else None
+            )
             manifest = build_map(
                 args.workspace,
                 run_id=args.run_id or None,
@@ -347,6 +411,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 question=args.question or None,
                 provider=provider,
                 model=model,
+                reasoning_effort=reasoning_effort,
                 allow_cloud=args.allow_cloud is True,
                 provider_concurrency=_provider_concurrency(
                     args.provider_concurrency,
@@ -373,7 +438,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     for key, value in literature.items()
                     if isinstance(value, (str, int, float, bool))
                     or value is None
-                }
+                },
+                "migration": (
+                    metadata.get("migration", {})
+                    if isinstance(metadata, dict)
+                    else {}
+                ),
             }
         elif args.command == "migrate":
             result = migrate_workspace(args.workspace, dry_run=args.dry_run)
@@ -498,6 +568,7 @@ def _extraction_policy(
 
 def _add_literature_policy_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--synthesis", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--clusters", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--require-question", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--auto-promote-clusters", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--auto-promote-debates", action=argparse.BooleanOptionalAction, default=None)
@@ -520,6 +591,7 @@ def _literature_policy(args: argparse.Namespace, config: dict[str, Any]) -> Lite
     defaults = LiteratureMappingPolicy.from_dict(configured)
     overrides = {
         "synthesis_enabled": getattr(args, "synthesis", None),
+        "cluster_generation_enabled": getattr(args, "clusters", None),
         "require_question": getattr(args, "require_question", None),
         "auto_promote_clusters": getattr(args, "auto_promote_clusters", None),
         "auto_promote_debates": getattr(args, "auto_promote_debates", None),

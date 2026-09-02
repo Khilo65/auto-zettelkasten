@@ -6,7 +6,7 @@ from auto_zettelkasten.models import MapRequest
 
 
 def test_v013_versions() -> None:
-    assert ENGINE_VERSION == "0.29.10"
+    assert ENGINE_VERSION == "0.30.0"
     assert ARTIFACT_SCHEMA_VERSION == "1.20"
 
 
@@ -45,3 +45,13 @@ def test_retry_terminal_literature_cli_flags() -> None:
 
     assert build_args.retry_terminal_literature is True
     assert resume_args.retry_terminal_literature is True
+
+
+def test_cluster_generation_cli_flags_cover_every_mapping_flow() -> None:
+    parser = build_parser()
+
+    for command in ("map", "sync", "build-map", "estimate"):
+        prefix = [command, "--workspace", "/tmp/workspace"]
+        assert parser.parse_args([*prefix, "--clusters"]).clusters is True
+        assert parser.parse_args([*prefix, "--no-clusters"]).clusters is False
+        assert parser.parse_args(prefix).clusters is None

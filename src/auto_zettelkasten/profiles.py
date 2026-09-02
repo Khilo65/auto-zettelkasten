@@ -31,9 +31,9 @@ PROFILE_SIDECAR_VERSION = "1"
 PROFILE_CHECKPOINT_VERSION = "1"
 PROFILE_PROMPT_VERSION = "6"
 PROFILE_CLASSIFIER_VERSION = "3"
-PROFILE_ALGORITHM_VERSION = "5"
+PROFILE_ALGORITHM_VERSION = "9"
 COMMITTED_NOTE_ANCHOR_AUGMENTATION_VERSION = "8"
-ANCHOR_ALGORITHM_VERSION = "1"
+ANCHOR_ALGORITHM_VERSION = "2"
 SUPPORT_ENVELOPE_VERSION = "1"
 
 # Public lower-case aliases match the names persisted in dependency records.
@@ -106,7 +106,8 @@ _UNCERTAINTY = re.compile(
     flags=re.IGNORECASE,
 )
 _COMPARISON = re.compile(
-    r"(?:compared (?:with|to)[^;(]*|relative to[^;(]*|versus[^;(]*|than (?:the )?[^;(]*|"
+    r"(?:compared (?:with|to)[^;(]*|relative to[^;(]*|versus[^;(]*|"
+    r"(?:higher|lower|greater|smaller|larger|fewer)\s+than\s+[^;(]*|"
     r"(?:control|reference|baseline) (?:group|category|period|value)?[^;(]*)",
     flags=re.IGNORECASE,
 )
@@ -442,9 +443,7 @@ def build_profile_prompt(note_text: str) -> str:
         "or source-native heading may be used. Do not use a generated atomic-note heading such as Detailed Findings (1) as the locator. "
         "Statistical anchors also need a plain-English meaning. Preserve whether a number is an "
         "observed rate, model-predicted probability, coefficient, marginal effect, odds ratio, raw percentage, or other estimand; "
-        "do not transform or equate them. Extract one source-local study_lineage record, including authors, institutions, datasets, "
-        "sampling frame, unit of analysis, population, period, publication relationships, institutional series, and overlap signals "
-        "only when the committed note supplies them. Use empty strings, lists, objects, or null when unsupported.\n\n"
+        "do not transform or equate them.\n\n"
         f"COMMITTED MARKDOWN NOTE:\n{committed_note}"
     )
 
@@ -735,11 +734,32 @@ def augment_profile_from_committed_note(
         sections=sections,
     )
     payload = profile_to_dict(profile)
+    profile_generation_route = str(
+        (payload.get("context") or {}).get("profile_generation_route") or ""
+    )
     validity = dict(payload.get("validity") or {})
+    methods_refreshed = False
+    if str(validity.get("algorithm_version") or "") != PROFILE_ALGORITHM_VERSION:
+        canonical_methods = {term.casefold() for term in _METHOD_TERMS}
+        refreshed_methods = _dedupe(
+            [
+                *[
+                    str(value).strip()
+                    for value in payload.get("methods", []) or []
+                    if str(value).strip().casefold() not in canonical_methods
+                ],
+                *_methods(sections),
+            ]
+        )
+        payload["methods"] = refreshed_methods
+        validity["algorithm_version"] = PROFILE_ALGORITHM_VERSION
+        payload["validity"] = validity
+        profile = profile_from_dict(payload)
+        methods_refreshed = True
     if str(validity.get("committed_note_anchor_augmentation_version") or "") == (
         COMMITTED_NOTE_ANCHOR_AUGMENTATION_VERSION
     ):
-        return profile, False
+        return profile, methods_refreshed
     generated = profile_to_dict(
         deterministic_profile(
             note_text,
@@ -761,7 +781,13 @@ def augment_profile_from_committed_note(
     # no independent plain-English gloss. Mechanical augmentation remains useful
     # for legacy or genuinely sparse profiles only.
     reasoned_profile_complete = (
-        len(existing_anchors) >= 8
+        (
+            len(existing_anchors) >= 8
+            or (
+                bool(existing_anchors)
+                and profile_generation_route == "source_analysis_bundle"
+            )
+        )
         and str(provider).casefold() not in {"deterministic", "mechanical"}
     )
     if reasoned_profile_complete:
@@ -1087,6 +1113,10 @@ def _enrich_profile_v12_records(
     prior_augmentation_version = str(
         validity.get("committed_note_anchor_augmentation_version") or ""
     )
+    source_bundle_route = (
+        str((payload.get("context") or {}).get("profile_generation_route") or "")
+        == "source_analysis_bundle"
+    )
     note_locator_text = sections.get("Locators", "")
     prior_aggregate_fallback = _bounded_note_locator(note_locator_text)
     note_locator_matches = _dedupe(
@@ -1164,7 +1194,9 @@ def _enrich_profile_v12_records(
                     )
                 ]
             anchor["revision_hash"] = ""
-        if "source_locators" in anchor_fields and not anchor.get("source_locators"):
+        if "source_locators" in anchor_fields and (
+            source_bundle_route or not anchor.get("source_locators")
+        ):
             anchor["source_locators"] = _source_locator_payloads(
                 str(anchor.get("locator") or ""),
                 source_id=source_id,
@@ -1960,28 +1992,102 @@ def _split_values(value: str) -> list[str]:
     return [piece.strip(" -") for piece in pieces if piece.strip(" -")]
 
 
+_METHOD_TERMS = (
+    "randomized controlled trial",
+    "difference-in-differences",
+    "regression discontinuity",
+    "instrumental variables",
+    "process tracing",
+    "case study",
+    "comparative case study",
+    "survey",
+    "interviews",
+    "ethnography",
+    "content analysis",
+    "panel regression",
+    "logistic regression",
+    "linear regression",
+    "meta-analysis",
+)
+
+
+def _method_term_is_affirmed(text: str, pattern: str) -> bool:
+    for match in re.finditer(pattern, text):
+        prefix = text[max(0, match.start() - 160) : match.start()]
+        suffix_clause = re.split(
+            r"[.;:\n]", text[match.end() :], maxsplit=1
+        )[0]
+        reported_omission = re.search(
+            r"\b(?:does|do|did)\s+not\s+"
+            r"(?:describe|disclose|document|provide|report|specify|state)\b"
+            r"[^.;:\n]*$",
+            prefix,
+        )
+        if (
+            match.group(0).startswith("survey")
+            and reported_omission
+            and not re.search(r"\b(?:any|whether)\b", reported_omission.group(0))
+            and re.match(
+                r"\s+fieldwork\s+(?:dates?|period|timing)\b",
+                text[match.end() :],
+            )
+            and not re.search(
+                r"\b(?:lack(?:ed|ing|s)?|never|no|without)\b|"
+                r"\bnot\b(?!\s+only\b)",
+                suffix_clause,
+            )
+        ):
+            return True
+        clause_prefix = re.split(
+            r"[.;:\n]|\b(?:although|but|however|whereas|yet)\b|"
+            r"\b(?:and|or)\s+(?=(?:instead\s+)?(?:conduct(?:ed|s)?|"
+            r"employ(?:ed|s)?|includ(?:e|ed|es|ing)|rel(?:ied|ies|y)\s+on|"
+            r"use[sd]?|using)\b)",
+            text[: match.start()],
+        )[-1]
+        if re.search(
+            r"\b(?:lack(?:ed|ing|s)?|neither|never|no|nor|without)\b|"
+            r"\bnot\b(?!\s+only\b)|\brather\s+than\b",
+            clause_prefix,
+        ):
+            continue
+        clause_suffix = re.split(
+            r"[.;:\n]|\b(?:although|but|however|whereas|yet)\b",
+            text[match.end() :],
+            maxsplit=1,
+        )[0]
+        if re.match(
+            r"^\W*(?:(?:approach|data|design|evidence|fieldwork|"
+            r"method(?:s|ology)?|respondents?|results?)\W+)?"
+            r"(?:(?:are|is|was|were)\W+)?(?:absent|missing|unavailable|"
+            r"(?:never|not)\W+(?:administered|available|collected|conducted|"
+            r"performed|present|recruited|reported|used))\b",
+            clause_suffix,
+        ):
+            continue
+        return True
+    return False
+
+
 def _methods(sections: Mapping[str, str]) -> list[str]:
-    text = sections.get("Method and Research Design", "")
-    explicit = _labeled_values(text, "methods")
-    terms = (
-        "randomized controlled trial",
-        "difference-in-differences",
-        "regression discontinuity",
-        "instrumental variables",
-        "process tracing",
-        "case study",
-        "comparative case study",
-        "survey",
-        "interviews",
-        "ethnography",
-        "content analysis",
-        "panel regression",
-        "logistic regression",
-        "linear regression",
-        "meta-analysis",
+    text = "\n".join(
+        (
+            sections.get("Method and Research Design", ""),
+            sections.get("Evidence and Data", ""),
+        )
     )
+    explicit = _labeled_values(text, "methods")
     lowered = text.casefold()
-    return _dedupe([*explicit, *(term for term in terms if term in lowered)])
+    affirmed = []
+    for term in _METHOD_TERMS:
+        pattern = (
+            rf"\b{re.escape(term)}(?:s)?\b"
+            if term == "survey"
+            else rf"\b{re.escape(term)}\b"
+        )
+        if _method_term_is_affirmed(lowered, pattern):
+            affirmed.append(term)
+    return _dedupe([*explicit, *affirmed])
 
 
 def _data_sources(sections: Mapping[str, str]) -> list[str]:
@@ -2203,6 +2309,7 @@ def _extract_findings(
 ) -> list[dict[str, Any]]:
     claims = _content_items(detailed)
     meanings = _content_items(plain_english)
+    aligned_meanings = meanings if len(meanings) == len(claims) else claims
     fallback_locator = _first_locator(locator_text)
     findings: list[dict[str, Any]] = []
     for index, claim in enumerate(claims):
@@ -2220,7 +2327,7 @@ def _extract_findings(
             )
         )
         statistical = bool(_STATISTICAL_FIGURE.search(claim))
-        meaning = meanings[min(index, len(meanings) - 1)] if meanings else ""
+        meaning = aligned_meanings[index]
         condition = _match_text(_CONDITION, claim)
         magnitude = _match_text(_NUMBERED_MAGNITUDE, claim)
         uncertainty = _match_text(_UNCERTAINTY, claim)
@@ -2476,7 +2583,6 @@ def _source_locator_payloads(
         ("chapter", _CHAPTER_LOCATOR),
         ("paragraph", _PARAGRAPH_LOCATOR),
         ("quote_span", _QUOTE_SPAN_LOCATOR),
-        ("source_heading", _SOURCE_HEADING_LOCATOR),
     ):
         for match in pattern.finditer(locator):
             value = match.group(0).strip()
@@ -2485,6 +2591,16 @@ def _source_locator_payloads(
             ):
                 continue
             records.append((locator_type, value, None, None, True, True))
+    for fragment in generated_fragments:
+        heading = re.sub(
+            r"^(?:section|heading)\s+", "", fragment, flags=re.IGNORECASE
+        ).strip()
+        if (
+            _SOURCE_HEADING_LOCATOR.fullmatch(heading)
+            and not _GENERATED_NOTE_HEADING.fullmatch(heading)
+            and not _WEAK_BARE_LOCATOR.fullmatch(heading)
+        ):
+            records.append(("source_heading", heading, None, None, True, True))
     seen: set[tuple[str, str]] = set()
     payloads: list[dict[str, Any]] = []
     for locator_type, value, page_start, page_end, source_native, strong in records:

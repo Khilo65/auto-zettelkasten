@@ -815,7 +815,7 @@ def test_build_map_constructs_configured_builtin_reasoner(
         reader=FakeReader(),
         run_id="build-map-source",
     )
-    reasoner = _ExplicitReasoner()
+    reasoner = _ReplayableRelationshipReasoner()
     constructed: list[tuple[str, str, bool]] = []
 
     def fake_provider(name: str, model: str, *, allow_cloud: bool):
@@ -1268,7 +1268,7 @@ def test_current_mechanical_profile_reuses_unchanged_inspected_source_content(
         {
             "profile_prompt_version": "6",
             "classifier_version": "3",
-                "algorithm_version": "5",
+            "algorithm_version": "9",
             "legacy_profile_upgraded_mechanically": True,
         }
     )
@@ -1289,6 +1289,55 @@ def test_current_mechanical_profile_reuses_unchanged_inspected_source_content(
     assert manifest.status == "built"
     assert replay_reasoner.profile_calls == 0
     assert profile_path.read_bytes() == frozen_profile
+
+
+def test_stale_deterministic_profile_refreshes_methods_and_dependency_without_a_call(
+    tmp_path: Path,
+    sample_items,
+) -> None:
+    first_reasoner = _RecoveringReasoner()
+    first = run_map(
+        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        client=FakeZotero(sample_items[:1]),
+        reader=FakeReader(),
+        literature_reasoner=first_reasoner,
+        run_id="stale-deterministic-profile-first",
+    )
+    profile = _only_profile(tmp_path)
+    expected_methods = list(profile.methods)
+    profile.methods.append("survey")
+    profile.validity["algorithm_version"] = "7"
+    profile.dependency_hash = "stale-profile-dependency"
+    save_profile(tmp_path / "02_source_memory" / "profiles", profile)
+    replay_reasoner = _RecoveringReasoner()
+
+    result = build_map(
+        tmp_path,
+        run_id="stale-deterministic-profile-replay",
+        source_set=first.source_set,
+        provider="ollama",
+        model="fake-1",
+        reasoner=replay_reasoner,
+    )
+
+    refreshed = _only_profile(tmp_path)
+    checkpoint = yaml.safe_load(
+        next(
+            (
+                tmp_path
+                / "11_state"
+                / "runs"
+                / "stale-deterministic-profile-replay"
+                / "literature"
+                / "profile_calls"
+            ).glob("*.yml")
+        ).read_text(encoding="utf-8")
+    )
+    assert result.status == "built"
+    assert replay_reasoner.profile_calls == 0
+    assert refreshed.methods == expected_methods
+    assert refreshed.validity["algorithm_version"] == "9"
+    assert refreshed.dependency_hash == checkpoint["fingerprint"]
 
 
 def test_explicit_reasoner_takes_precedence_over_builtin_reader(
@@ -1357,6 +1406,34 @@ def test_limited_note_uses_deterministic_profile_without_builtin_call(
     assert progress["source_provider_call_count"] == 0
     assert progress["literature_provider_call_count"] == 0
     assert progress["provider_call_count"] == 0
+
+    profile.validity["algorithm_version"] = "7"
+    profile.dependency_hash = "stale-profile-dependency"
+    save_profile(tmp_path / "02_source_memory" / "profiles", profile)
+    replay = build_map(
+        tmp_path,
+        run_id="limited-profile-replay",
+        source_set=report.source_set,
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        allow_cloud=True,
+    )
+    refreshed = _only_profile(tmp_path)
+    checkpoint = yaml.safe_load(
+        next(
+            (
+                tmp_path
+                / "11_state"
+                / "runs"
+                / "limited-profile-replay"
+                / "literature"
+                / "profile_calls"
+            ).glob("*.yml")
+        ).read_text(encoding="utf-8")
+    )
+    assert replay.status == "built"
+    assert refreshed.validity["algorithm_version"] == "9"
+    assert refreshed.dependency_hash == checkpoint["fingerprint"]
 
 
 def test_builtin_route_reuses_current_deterministic_profile_then_replay_is_zero_call(
@@ -1751,7 +1828,7 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
     ]
     assert synthesis["cluster_contract"] == "streamlined-full-note-v2"
     assert synthesis["lines_of_inquiry"][0]["study_findings"][0]["source_id"] == "source-a"
-    assert "cluster synthesis prompt v35" in system_prompts["full-note cluster writer"]
+    assert "cluster synthesis prompt v36" in system_prompts["full-note cluster writer"]
     assert "Read every supplied atomic_note_markdown" in system_prompts[
         "full-note cluster writer"
     ]

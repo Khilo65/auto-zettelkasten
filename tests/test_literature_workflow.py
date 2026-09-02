@@ -54,6 +54,9 @@ def test_canonical_map_replay_is_idempotent_and_uses_profile_sidecars(
         source_set=first_report.source_set,
         provider="ollama",
         model="fake-1",
+        literature_policy=LiteratureMappingPolicy(
+            cluster_generation_enabled=True
+        ),
     )
 
     assert rebuilt.status == "built"
@@ -76,6 +79,9 @@ def test_canonical_map_replay_is_idempotent_and_uses_profile_sidecars(
         source_set=first_report.source_set,
         provider="ollama",
         model="fake-1",
+        literature_policy=LiteratureMappingPolicy(
+            cluster_generation_enabled=True
+        ),
     )
 
     assert replayed.status == "built"
@@ -161,6 +167,7 @@ def test_external_discovery_mode_requires_an_injected_provider_before_inventory(
     )
     assert report.status == "blocked"
     assert report.errors[0]["reason"] == "external_discovery_disabled_in_standalone_mapper:per_run"
+    assert report.literature_report["migration"]["status"] == "completed"
     assert client.inventory_calls == []
 
 

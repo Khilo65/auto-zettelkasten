@@ -1121,7 +1121,7 @@ content is not unnecessarily excluded.
 
 Create a new private workspace:
 
-`/Users/khalilalwazir/Documents/Auto-Zettelkasten-test/mediation-relapse-v014-evaluation-20260728`
+`<private-evaluation-root>/mediation-relapse-v014-evaluation-20260728`
 
 Use the same frozen Zotero collections:
 

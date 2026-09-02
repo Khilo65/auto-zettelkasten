@@ -8,7 +8,7 @@ import re
 import threading
 import time
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, is_dataclass
 from decimal import Decimal
 from itertools import combinations
@@ -39,6 +39,7 @@ from .relationships import (
 )
 
 from .navigation import (
+    NAVIGATION_RELATION_VERSION,
     build_navigation_graph,
     build_proposition_source_relations,
     build_typed_source_relations,
@@ -81,13 +82,13 @@ GAP_RULES = (
     "cross_cluster_integration",
     "author_stated_gap",
 )
-LITERATURE_ALGORITHM_VERSION = "37"
+LITERATURE_ALGORITHM_VERSION = "38"
 LITERATURE_FAMILY_PLAN_PROMPT_VERSION = "10"
 CLUSTER_PLAN_PROMPT_VERSION = "6"
 CLUSTER_PROPOSAL_PROMPT_VERSION = "17"
-CLUSTER_SYNTHESIS_PROMPT_VERSION = "35"
+CLUSTER_SYNTHESIS_PROMPT_VERSION = "36"
 CLUSTER_PARTITION_POLICY_VERSION = "3"
-CLUSTER_VALIDATION_POLICY_VERSION = "1"
+CLUSTER_VALIDATION_POLICY_VERSION = "3"
 CLUSTER_EMPTY_RETRY_POLICY_VERSION = "1"
 GAP_REASONING_PROMPT_VERSION = "12"
 ANCHOR_ALGORITHM_VERSION = "3"
@@ -98,12 +99,12 @@ GAP_RULE_VERSION = "3"
 
 FAMILY_RELATION_VERSION = "6"
 
-FAMILY_ADMISSION_VERSION = "9"
+FAMILY_ADMISSION_VERSION = "10"
 
 STRICT_ADJUDICATION_VERSION = "3"
 
-STUDY_LINEAGE_VERSION = "2"
-INDEPENDENCE_ALGORITHM_VERSION = "2"
+STUDY_LINEAGE_VERSION = "3"
+INDEPENDENCE_ALGORITHM_VERSION = "3"
 QUANTITATIVE_VALIDATION_VERSION = "2"
 LOCATOR_AUDIT_VERSION = "2"
 
@@ -340,6 +341,7 @@ _PROVIDER_INPUT_DEPENDENCY_COMPONENTS = {
     "method",
     "provider",
     "model",
+    "provider_execution_identity",
     "source_set_id",
     "profile_dependencies",
     "context",
@@ -1340,6 +1342,7 @@ def _semantic_literature_policy(policy: Mapping[str, Any]) -> dict[str, Any]:
     """Exclude transport, concurrency, and accounting controls from job identity."""
 
     nonsemantic = {
+        "cluster_generation_enabled",
         "literature_deadline_seconds",
         "max_profile_calls",
         "max_synthesis_calls",
@@ -1356,11 +1359,44 @@ def _provider_worker_count(request: Any, ready_jobs: int) -> int:
     configured = _as_mapping(request).get("provider_concurrency", "auto")
     if configured in {None, "auto"}:
         provider = str(_as_mapping(request).get("provider") or "").casefold()
+        if provider == "codex":
+            return max(1, min(ready_jobs or 1, 16))
         return max(
             1,
             ready_jobs if provider != "ollama" else min(ready_jobs or 1, 4),
         )
     return max(1, min(ready_jobs or 1, int(configured)))
+
+
+def _bounded_provider_futures(
+    executor: ThreadPoolExecutor,
+    jobs: Sequence[Any],
+    submit: Callable[[ThreadPoolExecutor, Any], Future[Any]],
+    *,
+    workers: int,
+    stop_event: threading.Event | None = None,
+) -> Iterable[tuple[Future[Any], Any]]:
+    """Submit at most ``workers`` calls and stop replenishing after quota."""
+
+    iterator = iter(jobs)
+    pending: dict[Future[Any], Any] = {}
+
+    def fill() -> None:
+        while len(pending) < workers and not (
+            stop_event is not None and stop_event.is_set()
+        ):
+            try:
+                job = next(iterator)
+            except StopIteration:
+                return
+            pending[submit(executor, job)] = job
+
+    fill()
+    while pending:
+        completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+        for future in completed:
+            yield future, pending.pop(future)
+        fill()
 
 
 def _schedule_cluster_writers(
@@ -1413,6 +1449,9 @@ class _CheckpointedReasonerCalls:
             retry_terminal_failures
             or request_values.get("retry_terminal_failures", False)
         )
+        self.reasoning_effort = str(
+            request_values.get("reasoning_effort") or "medium"
+        )
         usage = read_yaml(self.usage_path, {}) or {}
         if isinstance(usage, Mapping):
             self.cumulative_provider_calls = int(
@@ -1446,6 +1485,7 @@ class _CheckpointedReasonerCalls:
         self.synthesized_clusters = 0
         self._synthesized_cluster_ids: set[str] = set()
         self._state_lock = threading.RLock()
+        self.quota_stop_event = getattr(reasoner, "quota_stop_event", None)
 
     def __call__(
         self,
@@ -1486,6 +1526,22 @@ class _CheckpointedReasonerCalls:
         if stage == "literature_family_plan":
             exact_fit = getattr(
                 self.reasoner, "literature_family_plan_fits", None
+            )
+            if callable(exact_fit):
+                context_char_budget = (
+                    packet_chars
+                    if bool(
+                        exact_fit(
+                            profiles,
+                            self.request,
+                            context=enriched_context,
+                        )
+                    )
+                    else 0
+                )
+        elif stage == "relationship_adjudication":
+            exact_fit = getattr(
+                self.reasoner, "relationship_adjudication_fits", None
             )
             if callable(exact_fit):
                 context_char_budget = (
@@ -1563,6 +1619,14 @@ class _CheckpointedReasonerCalls:
                 else ""
             ),
         }
+        if str(getattr(self.reasoner, "name", "")).casefold() == "codex":
+            from .readers import codex_stage_identity
+
+            dependency["provider_execution_identity"] = codex_stage_identity(
+                stage,
+                str(getattr(self.reasoner, "model", "")),
+                self.reasoning_effort,
+            )
         fingerprint = _stable_hash(dependency)
         dependency_component_hashes = {
             str(component): _stable_hash(value)
@@ -1939,6 +2003,10 @@ class _CheckpointedReasonerCalls:
         # A reservation without a completion event means the prior process was
         # interrupted. It remains charged, but is retryable on resume.
         with self._state_lock:
+            if self.quota_stop_event is not None and self.quota_stop_event.is_set():
+                from .readers import ProviderQuotaExhausted
+
+                raise ProviderQuotaExhausted("Codex quota is paused for this run")
             if (
                 self.max_spend_usd is not None
                 and self.cumulative_spend_usd >= self.max_spend_usd
@@ -2019,10 +2087,18 @@ class _CheckpointedReasonerCalls:
                 except Exception as call_exc:
                     failure_class = _synthesis_failure_class(call_exc)
                     may_retry = (
-                        failure_class == "transport" and not transport_retry_attempted
-                    ) or (
-                        failure_class == "provider_empty_response"
-                        and not empty_retry_attempted
+                        str(getattr(self.reasoner, "name", "")).casefold()
+                        != "codex"
+                        and (
+                            (
+                                failure_class == "transport"
+                                and not transport_retry_attempted
+                            )
+                            or (
+                                failure_class == "provider_empty_response"
+                                and not empty_retry_attempted
+                            )
+                        )
                     )
                     if not may_retry:
                         raise
@@ -2195,11 +2271,20 @@ class _CheckpointedReasonerCalls:
                 return recovered_response
             self._record_failure()
             failure_class = _synthesis_failure_class(exc)
+            if failure_class == "quota" and self.quota_stop_event is not None:
+                self.quota_stop_event.set()
             deferred_empty_retry = str(
                 getattr(exc, "empty_retry_deferred", "") or ""
             )
             terminal = not deferred_empty_retry and (
-                failure_class not in {"transport", "provider_empty_response"}
+                failure_class
+                not in {
+                    "transport",
+                    "quota",
+                    "timeout",
+                    "interruption",
+                    "provider_empty_response",
+                }
                 or (
                     failure_class == "provider_empty_response"
                     and stage == "cluster_synthesis"
@@ -2483,11 +2568,23 @@ def _notify_stage(
 def _synthesis_failure_class(exc: BaseException) -> str:
     """Classify retry safety without coupling checkpoints to one provider."""
 
-    from .readers import CloudPermissionError, ProviderTransportError
+    from .readers import (
+        CloudPermissionError,
+        ProviderInterrupted,
+        ProviderQuotaExhausted,
+        ProviderTimeout,
+        ProviderTransportError,
+    )
 
     message = str(exc).casefold()
     if _is_provider_empty_response(exc):
         return "provider_empty_response"
+    if isinstance(exc, ProviderQuotaExhausted):
+        return "quota"
+    if isinstance(exc, ProviderTimeout):
+        return "timeout"
+    if isinstance(exc, ProviderInterrupted):
+        return "interruption"
     if isinstance(exc, ProviderTransportError):
         return "transport"
     if isinstance(exc, CloudPermissionError) or any(
@@ -2521,6 +2618,15 @@ def _synthesis_failure_class(exc: BaseException) -> str:
     ):
         return "transport"
     return "contract"
+
+
+def _synthesis_retry_on_resume(exc: BaseException) -> bool:
+    return _synthesis_failure_class(exc) in {
+        "transport",
+        "quota",
+        "timeout",
+        "interruption",
+    }
 
 
 def _is_provider_empty_response(exc: BaseException) -> bool:
@@ -3575,13 +3681,13 @@ def _as_mapping(value: Any) -> dict[str, Any]:
         return {}
     if isinstance(value, Mapping):
         return dict(value)
-    if is_dataclass(value):
-        return dict(asdict(value))
     to_dict = getattr(value, "to_dict", None)
     if callable(to_dict):
         result = to_dict()
         if isinstance(result, Mapping):
             return dict(result)
+    if is_dataclass(value):
+        return dict(asdict(value))
     result: dict[str, Any] = {}
     for name in getattr(value, "__slots__", ()):
         if hasattr(value, name):
@@ -4368,6 +4474,98 @@ def _lineage_values(value: Any) -> list[str]:
     )
 
 
+_DATASET_IDENTITY_QUALIFIER = re.compile(
+    r"\b(?P<label>wave|round|phase|version|revision|edition|sample|extract|release)"
+    r"[\s:_-]+(?P<value>[^\n;,]+)",
+    flags=re.I,
+)
+_DATASET_NAMED_SAMPLE_QUALIFIER = re.compile(
+    r"\b(?P<value>[a-z][\w'-]*(?:\s+[a-z][\w'-]*){0,3})\s+sample\b",
+    flags=re.I,
+)
+_DATASET_RESERVED_QUALIFIER_RE = re.compile(
+    r"\b(wave|round|phase|version|revision|edition|sample|extract|release)\b",
+    flags=re.I,
+)
+_NAMED_DATASET_MARKERS = {
+    "barometer",
+    "census",
+    "database",
+    "index",
+    "panel",
+    "registry",
+    "study",
+    "survey",
+}
+_NAMED_DATASET_PRESENTATION_SUFFIX = re.compile(
+    r"\s+results?\s+interface\s*$", flags=re.I
+)
+
+
+def _dataset_identity_qualifiers(value: Any) -> list[str]:
+    qualifiers = {
+            f"{match.group('label').casefold()}:{match.group('value').casefold().strip()}"
+            for row in _flatten_values(value)
+            for match in _DATASET_IDENTITY_QUALIFIER.finditer(row)
+    }
+    qualifiers.update(
+        f"sample:{match.group('value').casefold()}"
+        for row in _flatten_values(value)
+        for tail in row.split(";")[1:]
+        for match in _DATASET_NAMED_SAMPLE_QUALIFIER.finditer(tail)
+    )
+    return sorted(qualifiers)
+
+
+def _canonical_dataset_identity(value: Any) -> str:
+    identity = _canonical_phrase(value)
+    qualifiers = _dataset_identity_qualifiers(value)
+    return " ".join([identity, *qualifiers]).strip()
+
+
+def _lineage_dataset_values(value: Any) -> list[str]:
+    return sorted(
+        {
+            _canonical_dataset_identity(row) or str(row).casefold()
+            for row in _flatten_values(value)
+            if str(row).strip()
+        }
+    )
+
+
+def _named_dataset_identities(row: Mapping[str, Any]) -> set[str]:
+    """Return exact, edition-bearing dataset names from explicit data fields."""
+
+    identities: set[str] = set()
+    data_values = _as_mapping(row.get("dimensions")).get("data", []) or []
+    for raw_value in _flatten_values(data_values):
+        primary_value = raw_value.split(";", 1)[0].strip()
+        tail = ";".join(raw_value.split(";")[1:])
+        qualifiers = _dataset_identity_qualifiers(raw_value)
+        residual_tail = _DATASET_IDENTITY_QUALIFIER.sub("", tail)
+        residual_tail = _DATASET_NAMED_SAMPLE_QUALIFIER.sub("", residual_tail)
+        if _DATASET_RESERVED_QUALIFIER_RE.search(residual_tail):
+            continue
+        core_value = _NAMED_DATASET_PRESENTATION_SUFFIX.sub("", primary_value).strip()
+        years = re.findall(r"\b(?:19|20)\d{2}\b", core_value)
+        tokens = _tokens(core_value)
+        if (
+            len(years) != 1
+            or len(tokens - set(years)) < 5
+            or not tokens.intersection(_NAMED_DATASET_MARKERS)
+        ):
+            continue
+        identity = " ".join(
+            [
+                _canonical_phrase(core_value),
+                *qualifiers,
+            ]
+        ).strip()
+        if identity:
+            identities.add(identity)
+    return identities
+
+
 def _lineage_fieldwork_signals(*values: Any) -> list[str]:
     """Extract conservative reusable-fieldwork signals from profile prose.
 
@@ -4416,7 +4614,7 @@ def _normalized_study_lineage(
         or raw.get("research_program")
         or raw.get("program_id")
     )
-    dataset_ids = _lineage_values(
+    dataset_ids = _lineage_dataset_values(
         supplied.get("dataset_ids")
         or supplied.get("dataset_id")
         or supplied.get("datasets")
@@ -4751,9 +4949,25 @@ def _reconcile_evidence_base_groups(rows: list[dict[str, Any]]) -> None:
 
     def values(lineage: Mapping[str, Any], key: str) -> set[str]:
         return {
-            _canonical_phrase(value) or str(value).casefold()
+            (
+                str(value).casefold().strip()
+                if key == "dataset_ids"
+                else _canonical_phrase(value)
+            )
+            or str(value).casefold()
             for value in lineage.get(key, []) or []
             if str(value)
+        }
+
+    def root_samples(index: int) -> set[str]:
+        root = find(index)
+        return {
+            sample
+            for row_index, row in enumerate(rows)
+            if find(row_index) == root
+            for sample in values(
+                _as_mapping(row.get("study_lineage")), "sample_ids"
+            )
         }
 
     generic_lineage_values = {
@@ -4767,6 +4981,7 @@ def _reconcile_evidence_base_groups(rows: list[dict[str, Any]]) -> None:
     }
     source_ids = {str(row.get("source_id") or "") for row in rows}
     overlap_index: dict[tuple[str, str], set[int]] = defaultdict(set)
+    named_dataset_index: dict[str, set[int]] = defaultdict(set)
     for index, row in enumerate(rows):
         lineage = _as_mapping(row.get("study_lineage"))
         family = str(row.get("study_family_id") or "")
@@ -4811,6 +5026,8 @@ def _reconcile_evidence_base_groups(rows: list[dict[str, Any]]) -> None:
             institution = _canonical_phrase(lineage.get("institution"))
             if institution:
                 overlap_index[("institutional_guidance", institution)].add(index)
+        for identity in _named_dataset_identities(row):
+            named_dataset_index[identity].add(index)
 
     for (label, value), member_indexes in sorted(overlap_index.items()):
         members = sorted(member_indexes)
@@ -4821,6 +5038,24 @@ def _reconcile_evidence_base_groups(rows: list[dict[str, Any]]) -> None:
         for member_index in members[1:]:
             union(members[0], member_index, [reason])
 
+    # This is a fallback for presentation-qualified names, not a second reason
+    # for rows that the exact lineage signals have already joined.
+    for value, member_indexes in sorted(named_dataset_index.items()):
+        representatives_by_root: dict[int, int] = {}
+        for member_index in sorted(member_indexes):
+            representatives_by_root.setdefault(find(member_index), member_index)
+        representatives = list(representatives_by_root.values())
+        if len(representatives) < 2:
+            continue
+        reason = f"shared_named_dataset:{value}"
+        anchor = representatives[0]
+        for member_index in representatives[1:]:
+            anchor_samples = root_samples(anchor)
+            member_samples = root_samples(member_index)
+            if anchor_samples != member_samples:
+                continue
+            union(anchor, member_index, [reason])
+
     members_by_root: dict[int, list[int]] = defaultdict(list)
     for index in range(len(rows)):
         members_by_root[find(index)].append(index)
@@ -4829,6 +5064,11 @@ def _reconcile_evidence_base_groups(rows: list[dict[str, Any]]) -> None:
             continue
         reasons = sorted(reasons_by_root.get(find(root), set()))
         group_id = f"evidence-base-{_stable_hash(reasons or [rows[index]['source_id'] for index in member_indexes])[:16]}"
+        independence_status = (
+            "institutional_series"
+            if any(reason.startswith("institutional_guidance:") for reason in reasons)
+            else "overlapping_evidence_base"
+        )
         for index in member_indexes:
             row = rows[index]
             row["evidence_base_group_id"] = group_id
@@ -4836,20 +5076,14 @@ def _reconcile_evidence_base_groups(rows: list[dict[str, Any]]) -> None:
             lineage.update(
                 evidence_base_group_id=group_id,
                 group_basis=";".join(reasons),
-                independence_status=(
-                    "institutional_series"
-                    if any(
-                        reason.startswith("institutional_guidance:")
-                        for reason in reasons
-                    )
-                    else "overlapping_evidence_base"
-                ),
+                independence_status=independence_status,
                 counted_as_independent=True,
             )
             row["study_lineage"] = lineage
             for claim in row.get("claims", []) or []:
                 claim["evidence_base_group_id"] = group_id
                 claim["evidence_base_counted"] = True
+                claim["independence_status"] = independence_status
 
 
 def normalize_evidence_profiles(profiles: Sequence[Any]) -> list[dict[str, Any]]:
@@ -6049,7 +6283,7 @@ def _proposal_source_roles(proposal: Mapping[str, Any]) -> dict[str, str]:
             if not isinstance(row, Mapping):
                 continue
             source_id = str(row.get("source_id") or "")
-            role = str(row.get("role") or "").casefold()
+            role = str(row.get("role") or row.get("proposed_role") or "").casefold()
             if source_id:
                 result[source_id] = role
     return {
@@ -6123,6 +6357,28 @@ def _cluster_writer_member_roles(
                 preserved_partition_class = True
         if preserved_partition_class:
             warnings.append("partition_member_role_class_preserved")
+    if bool(cluster.get("relationship_first_admission")):
+        core_source_ids = {
+            source_id for source_id, role in result.items() if role == "core"
+        }
+        if not _family_relation_graph_connected(
+            core_source_ids, cluster.get("family_relations", []) or []
+        ):
+            admitted_roles = {
+                source_id: canonical.get(source_id, "context")
+                for source_id in sorted(retained)
+            }
+            admitted_core_source_ids = {
+                source_id
+                for source_id, role in admitted_roles.items()
+                if role == "core"
+            }
+            if _family_relation_graph_connected(
+                admitted_core_source_ids,
+                cluster.get("family_relations", []) or [],
+            ):
+                result = admitted_roles
+                warnings.append("member_role_connectivity_fallback")
     if used_fallback and (candidate or bool(rows)):
         warnings.append("member_role_fallback_applied")
     return result
@@ -6752,6 +7008,50 @@ def _proposal_family_relations(
         )
         if len(source_ids) < 2:
             continue
+        accepted_relationship_id = str(
+            raw.get("relation_id")
+            or _as_mapping(raw.get("comparability")).get(
+                "accepted_relationship_id"
+            )
+            or ""
+        )
+        if (
+            proposal.get("_requires_accepted_relationship_connectivity")
+            and accepted_relationship_id
+        ):
+            evidence = [
+                dict(reference)
+                for reference in raw.get("evidence", []) or []
+                if isinstance(reference, Mapping)
+                and str(reference.get("source_id") or "") in source_ids
+                and (
+                    str(reference.get("claim") or "").strip()
+                    or any(
+                        str(claim.get("evidence_anchor_id") or claim.get("claim_id") or "")
+                        == str(reference.get("evidence_anchor_id") or "")
+                        for claim in profile_by_source[
+                            str(reference.get("source_id") or "")
+                        ].get("claims", [])
+                        or []
+                        if str(reference.get("evidence_anchor_id") or "")
+                    )
+                )
+            ]
+            if {
+                str(reference.get("source_id") or "") for reference in evidence
+            } != set(source_ids):
+                continue
+            relations.append(
+                {
+                    "relation_id": accepted_relationship_id,
+                    "relation_type": relation_type,
+                    "source_ids": source_ids,
+                    "rationale": str(raw.get("rationale") or ""),
+                    "evidence": evidence,
+                    "comparability": dict(_as_mapping(raw.get("comparability"))),
+                }
+            )
+            continue
         evidence = _resolve_reasoner_evidence(
             raw.get("evidence", []) or [],
             profile_by_source,
@@ -6829,7 +7129,11 @@ def _proposal_family_relations(
 
     # Existing reasoners remain compatible: an admitted exact proposition is
     # itself sufficient evidence for a same-proposition family relationship.
-    for proposition in admitted_propositions:
+    for proposition in (
+        []
+        if proposal.get("_requires_accepted_relationship_connectivity")
+        else admitted_propositions
+    ):
         source_ids = sorted(
             {
                 str(value)
@@ -6868,7 +7172,10 @@ def _proposal_family_relations(
         and set(core_source_ids) <= set(relation.get("source_ids", []) or [])
         for relation in relations
     )
-    if not shared_problem_covers_all_core_sources:
+    if (
+        not proposal.get("_requires_accepted_relationship_connectivity")
+        and not shared_problem_covers_all_core_sources
+    ):
         membership_evidence, assessment = _proposal_membership_evidence(
             proposal,
             core_source_ids,
@@ -8235,6 +8542,16 @@ def map_overlapping_clusters(
                 for source_id in proposal_sources
                 if roles.get(source_id) == "bridge"
             }
+            if proposal.get("_requires_accepted_relationship_connectivity"):
+                connected_auxiliary_sources = {
+                    source_id
+                    for relation in validated_relations
+                    if set(relation.get("source_ids", []) or []) & component
+                    for source_id in set(relation.get("source_ids", []) or [])
+                    - component
+                }
+                context_sources &= connected_auxiliary_sources
+                bridge_sources &= connected_auxiliary_sources
             # Preserve the parent literature's human label and question when
             # admission merely narrows one weak source.  Invent a component
             # label only when the proposal truly splits into multiple
@@ -9043,6 +9360,9 @@ def map_overlapping_clusters(
                 "formation_route": str(
                     proposal.get("formation_route") or "reasoner_debate_family"
                 ),
+                "relationship_first_admission": bool(
+                    proposal.get("_requires_accepted_relationship_connectivity")
+                ),
                 "mapping_mode": (
                     "comparative_proposition"
                     if cluster_propositions
@@ -9110,6 +9430,11 @@ def map_overlapping_clusters(
                         for source_id in included
                         for value in relation_ids_by_source[source_id]
                         if value
+                    }
+                    | {
+                        str(relation.get("relation_id") or "")
+                        for relation in family_relations
+                        if relation.get("relation_id")
                     }
                 ),
                 "representative_sources": [
@@ -11279,6 +11604,7 @@ def validate_streamlined_cluster_synthesis(
                 valid_evidence.append(resolved)
             if cross_owned_evidence:
                 warnings.append("cross_owned_study_finding_omitted")
+                errors.append("study_finding_cross_owned_evidence")
                 continue
             if not valid_evidence:
                 warnings.append("study_finding_requires_source_owned_evidence")
@@ -11335,12 +11661,24 @@ def validate_streamlined_cluster_synthesis(
     missing = retained - finding_source_ids
     if missing:
         warnings.append("retained_member_without_specific_finding_removed")
+        errors.append("retained_member_without_specific_finding")
         retained -= missing
     if len(retained) < 2:
         errors.append("cluster_requires_two_retained_members")
     member_roles = _cluster_writer_member_roles(
         response, cluster, retained, warnings
     )
+    if bool(cluster.get("relationship_first_admission")):
+        writer_core_source_ids = {
+            source_id
+            for source_id, role in member_roles.items()
+            if role == "core"
+        }
+        if not _family_relation_graph_connected(
+            writer_core_source_ids,
+            cluster.get("family_relations", []) or [],
+        ):
+            errors.append("writer_core_relationship_graph_disconnected")
     source_contributions = [
         {
             **row,
@@ -18375,6 +18713,8 @@ def _cluster_plan_call_settings(
 def _global_plan_proposals(
     response: Mapping[str, Any],
     profiles: Sequence[Mapping[str, Any]],
+    *,
+    accepted_relationships: Sequence[Mapping[str, Any]] | None = None,
 ) -> tuple[
     list[dict[str, Any]],
     list[dict[str, Any]],
@@ -18531,6 +18871,78 @@ def _global_plan_proposals(
         semantic_identity = str(
             raw_cluster.get("semantic_identity") or label or question
         ).strip()
+        if accepted_relationships is None:
+            family_relations = [
+                {
+                    "relation_type": "shared_research_problem",
+                    "source_ids": core_ids,
+                    "rationale": rationale,
+                    "comparability": {
+                        "passed": True,
+                        "provider_statement": rationale,
+                    },
+                    "evidence": core_evidence,
+                }
+            ]
+        else:
+            family_relations = []
+            for relationship in accepted_relationships:
+                if not isinstance(relationship, Mapping) or not bool(
+                    relationship.get("cluster_evidence_eligible")
+                ):
+                    continue
+                pair = sorted(
+                    {
+                        str(value)
+                        for value in relationship.get("source_ids", []) or []
+                        if str(value) in roles
+                    }
+                )
+                relationship_evidence = [
+                    dict(reference)
+                    for reference in relationship.get("evidence", []) or []
+                    if isinstance(reference, Mapping)
+                    and str(reference.get("source_id") or "") in pair
+                    and (
+                        (
+                            str(reference.get("evidence_anchor_id") or "")
+                            in anchors_by_source.get(
+                                str(reference.get("source_id") or ""), {}
+                            )
+                        )
+                        or str(reference.get("claim") or "").strip()
+                    )
+                ]
+                relationship_id = str(relationship.get("relation_id") or "")
+                if (
+                    len(pair) != 2
+                    or not relationship_id
+                    or {
+                        str(reference.get("source_id") or "")
+                        for reference in relationship_evidence
+                    }
+                    != set(pair)
+                ):
+                    continue
+                family_relations.append(
+                    {
+                        "relation_id": relationship_id,
+                        "relation_type": "shared_research_problem",
+                        "source_ids": pair,
+                        "rationale": str(
+                            relationship.get("reason")
+                            or "An accepted source relationship connects this pair within the planned family."
+                        ),
+                        "comparability": {
+                            "passed": True,
+                            "accepted_relationship_id": relationship_id,
+                            "accepted_relation_type": str(
+                                relationship.get("relation_type") or ""
+                            ),
+                        },
+                        "evidence": relationship_evidence,
+                    }
+                )
         proposals.append(
             {
                 "proposal_id": plan_id,
@@ -18555,18 +18967,10 @@ def _global_plan_proposals(
                 },
                 "supporting_evidence": supporting_evidence,
                 "propositions": [],
-                "family_relations": [
-                    {
-                        "relation_type": "shared_research_problem",
-                        "source_ids": core_ids,
-                        "rationale": rationale,
-                        "comparability": {
-                            "passed": True,
-                            "provider_statement": rationale,
-                        },
-                        "evidence": core_evidence,
-                    }
-                ],
+                "family_relations": family_relations,
+                "_requires_accepted_relationship_connectivity": (
+                    accepted_relationships is not None
+                ),
                 "formation_route": "global_cluster_plan",
             }
         )
@@ -19401,6 +19805,9 @@ def _cluster_relationship_context(
                 "provenance": provenance,
                 "reason": str(relation.get("reason") or "")[:500],
                 "confidence": relation.get("confidence"),
+                "cluster_evidence_eligible": bool(
+                    relation.get("cluster_evidence_eligible")
+                ),
                 "evidence": [
                     {
                         "kind": "verified_relationship:"
@@ -19410,6 +19817,7 @@ def _cluster_relationship_context(
                             value.get("evidence_anchor_id") or ""
                         ),
                         "locator": str(value.get("locator") or ""),
+                        "claim": str(value.get("claim") or ""),
                     }
                     for value in (
                         relation.get("source_evidence"),
@@ -19730,7 +20138,7 @@ def build_literature_report(
     source_notes: Sequence[Mapping[str, Any]] = (),
     navigation_policy: Any = None,
     source_set: Mapping[str, Any] | None = None,
-    accepted_relationships: Sequence[Mapping[str, Any]] = (),
+    accepted_relationships: Sequence[Mapping[str, Any]] | None = None,
     relationship_candidates: Sequence[Mapping[str, Any]] = (),
     catalogue_shards: Sequence[Mapping[str, Any]] = (),
     shared_literature_plan: Mapping[str, Any] | None = None,
@@ -19740,6 +20148,7 @@ def build_literature_report(
     prebuilt_navigation: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Pure end-to-end mapper over already-built evidence profiles."""
+    accepted_relationship_rows = accepted_relationships or ()
     normalized = normalize_evidence_profiles(profiles)
     independence = build_independence_records(normalized)
     locator_audit = build_locator_audit(normalized)
@@ -19865,7 +20274,7 @@ def build_literature_report(
             (source_set or {}).get("collection_views", []) or []
         )
         accepted_plan_relationships = _cluster_relationship_context(
-            accepted_relationships,
+            accepted_relationship_rows,
             analytical_source_ids,
         )
         rejected_pair_memory = list(
@@ -20033,7 +20442,7 @@ def build_literature_report(
                 )
                 packet_context = {
                     "accepted_relationships": _cluster_relationship_context(
-                        accepted_relationships, packet_source_ids
+                        accepted_relationship_rows, packet_source_ids
                     ),
                     "literature_positions": [
                         dict(position)
@@ -20115,28 +20524,32 @@ def build_literature_report(
                 return _namespace_cluster_plan(response, packet_id)
 
             local_by_index: dict[int, dict[str, Any]] = {}
+            workers = _provider_worker_count(request, len(prepared_packets))
             with ThreadPoolExecutor(
-                max_workers=_provider_worker_count(
-                    request, len(prepared_packets)
-                ),
+                max_workers=workers,
                 thread_name_prefix="auto-zettelkasten-cluster-plan",
             ) as executor:
-                future_map = {
-                    executor.submit(
-                        run_plan_packet, packet, packet_context
-                    ): (index, packet)
-                    for index, (packet, packet_context) in enumerate(
-                        prepared_packets
-                    )
-                }
-                for future in as_completed(future_map):
-                    index, packet = future_map[future]
+                jobs = list(enumerate(prepared_packets))
+                for future, job in _bounded_provider_futures(
+                    executor,
+                    jobs,
+                    lambda pool, row: pool.submit(
+                        run_plan_packet, row[1][0], row[1][1]
+                    ),
+                    workers=workers,
+                    stop_event=getattr(reasoner, "quota_stop_event", None),
+                ):
+                    index, (packet, _packet_context) = job
                     try:
                         local_by_index[index] = future.result()
                     except BaseException as exc:
-                        retry_on_resume = (
-                            _synthesis_failure_class(exc) == "transport"
-                        )
+                        if _synthesis_failure_class(exc) in {
+                            "quota",
+                            "timeout",
+                            "interruption",
+                        }:
+                            raise
+                        retry_on_resume = _synthesis_retry_on_resume(exc)
                         source_ids = sorted(
                             str(card.get("source_id") or "")
                             for card in packet.get("cards", []) or []
@@ -20185,7 +20598,7 @@ def build_literature_report(
                 bridge_relations = [
                     row
                     for row in _cluster_relationship_context(
-                        accepted_relationships, analytical_source_ids
+                        accepted_relationship_rows, analytical_source_ids
                     )
                     if len(
                         {
@@ -20322,25 +20735,31 @@ def build_literature_report(
                     return _namespace_cluster_plan(response, packet_id)
 
                 bridge_by_index: dict[int, dict[str, Any]] = {}
+                workers = _provider_worker_count(request, len(bridge_packets))
                 with ThreadPoolExecutor(
-                    max_workers=_provider_worker_count(
-                        request, len(bridge_packets)
-                    ),
+                    max_workers=workers,
                     thread_name_prefix="auto-zettelkasten-cluster-bridge",
                 ) as executor:
-                    futures = {
-                        executor.submit(
-                            run_bridge_packet, packet_id, cards, context
-                        ): (index, packet_id)
-                        for index, (packet_id, cards, context) in enumerate(
-                            bridge_packets
-                        )
-                    }
-                    for future in as_completed(futures):
-                        index, packet_id = futures[future]
+                    jobs = list(enumerate(bridge_packets))
+                    for future, job in _bounded_provider_futures(
+                        executor,
+                        jobs,
+                        lambda pool, row: pool.submit(
+                            run_bridge_packet, *row[1]
+                        ),
+                        workers=workers,
+                        stop_event=getattr(reasoner, "quota_stop_event", None),
+                    ):
+                        index, (packet_id, _cards, _context) = job
                         try:
                             bridge_by_index[index] = future.result()
                         except Exception as exc:
+                            if _synthesis_failure_class(exc) in {
+                                "quota",
+                                "timeout",
+                                "interruption",
+                            }:
+                                raise
                             bridge_by_index[index] = {
                                 "clusters": [],
                                 "neighbor_relationships": [],
@@ -20369,7 +20788,15 @@ def build_literature_report(
             global_plan_parked,
             global_plan_neighbors,
             global_plan_unclustered,
-        ) = _global_plan_proposals(plan_response, normalized)
+        ) = _global_plan_proposals(
+            plan_response,
+            normalized,
+            accepted_relationships=(
+                accepted_plan_relationships
+                if shared_plan and accepted_relationships is not None
+                else None
+            ),
+        )
         planning_failed = any(
             "cluster_plan_packet_failed" in str(row.get("reason") or "")
             for row in global_plan_parked
@@ -20391,7 +20818,7 @@ def build_literature_report(
         partitions = _cluster_proposal_partitions(
             normalized,
             catalogue_shards,
-            accepted_relationships,
+            accepted_relationship_rows,
             reasoner=reasoner,
             request=request,
         )
@@ -20408,7 +20835,7 @@ def build_literature_report(
             if str(row.get("source_id") or "") in partition_source_ids
         ]
         compact_verified_relations = _cluster_relationship_context(
-            accepted_relationships,
+            accepted_relationship_rows,
             partition_source_ids,
         )
         partition_context = {
@@ -20486,7 +20913,7 @@ def build_literature_report(
             for source_id in proposal.get("source_ids", []) or []
         }
         reconciliation_relationships = _cluster_relationship_context(
-            accepted_relationships,
+            accepted_relationship_rows,
             reconciliation_source_ids,
         )
         reconciliation_context = {
@@ -20770,7 +21197,7 @@ def build_literature_report(
             if str(row.get("source_id") or "") in audit_source_id_set
         ]
         compact_verified_relations = _cluster_relationship_context(
-            accepted_relationships,
+            accepted_relationship_rows,
             audit_source_id_set,
         )
         audit_context = {
@@ -21206,11 +21633,45 @@ def build_literature_report(
             if isinstance(row, Mapping)
             and str(row.get("source_id") or "") in retained
         ]
+        prior_family_relations = [
+            dict(row)
+            for row in cluster.get("family_relations", []) or []
+            if isinstance(row, Mapping)
+        ]
+        cluster["family_relations"] = [
+            row
+            for row in prior_family_relations
+            if (relation_sources := set(row.get("source_ids", []) or []))
+            and relation_sources <= retained
+        ]
+        prior_family_relation_ids = {
+            str(row.get("relation_id") or "")
+            for row in prior_family_relations
+            if row.get("relation_id")
+        }
+        family_relation_ids = sorted(
+            str(row.get("relation_id") or "")
+            for row in cluster["family_relations"]
+            if row.get("relation_id")
+        )
+        cluster["family_relation_ids"] = family_relation_ids
+        cluster["relation_ids"] = sorted(
+            (
+                {
+                    str(value)
+                    for value in cluster.get("relation_ids", []) or []
+                    if str(value)
+                }
+                - prior_family_relation_ids
+            )
+            | set(family_relation_ids)
+        )
         cluster["revision_hash"] = _stable_hash(
             {
                 "semantic_identity": cluster.get("semantic_identity", ""),
                 "source_ids": ordered,
                 "source_roles": roles,
+                "family_relations": cluster["family_relations"],
                 "cluster_writer_contract": "streamlined-full-note-v2",
             }
         )
@@ -21488,7 +21949,7 @@ def build_literature_report(
             "cluster": cluster_card,
             "candidate_input_receipt": candidate_input_receipt,
             "accepted_relationships": _cluster_relationship_context(
-                accepted_relationships, member_ids
+                accepted_relationship_rows, member_ids
             ),
             "literature_positions": member_literature_positions,
             "important_unmapped_literature": [
@@ -21507,6 +21968,12 @@ def build_literature_report(
         member_ids = [
             str(value) for value in cluster.get("source_ids", []) or [] if str(value)
         ]
+        roles = _proposal_source_roles(cluster)
+        core_member_ids = [
+            source_id
+            for source_id in member_ids
+            if roles.get(source_id) == "core"
+        ]
         work_ids = sorted(
             {
                 _canonical_work_identity(normalized_by_source[source_id])
@@ -21516,15 +21983,27 @@ def build_literature_report(
         )
         work_member_counts = Counter(
             _canonical_work_identity(normalized_by_source[source_id])
-            for source_id in member_ids
+            for source_id in core_member_ids
             if source_id in normalized_by_source
         )
         counted_work_ids = sorted(
             {
                 _canonical_work_identity(normalized_by_source[source_id])
-                for source_id in member_ids
+                for source_id in core_member_ids
                 if source_id in normalized_by_source
                 and _profile_evidence_base_id(normalized_by_source[source_id])
+            }
+        )
+        core_evidence_base_ids = sorted(
+            {
+                evidence_base_id
+                for source_id in core_member_ids
+                if source_id in normalized_by_source
+                and (
+                    evidence_base_id := _profile_evidence_base_id(
+                        normalized_by_source[source_id]
+                    )
+                )
             }
         )
         evidence_bases = sorted(
@@ -21534,7 +22013,7 @@ def build_literature_report(
                     if work_member_counts[work_id] > 1
                     else f"evidence-base:{evidence_base_id}"
                 )
-                for source_id in member_ids
+                for source_id in core_member_ids
                 if source_id in normalized_by_source
                 and (
                     evidence_base_id := _profile_evidence_base_id(
@@ -21552,26 +22031,70 @@ def build_literature_report(
         cluster["canonical_work_count"] = len(work_ids)
         cluster["effective_evidence_base_count"] = len(evidence_bases)
         cluster["independent_study_family_count"] = len(evidence_bases)
+        cluster["core_study_family_ids"] = sorted(
+            {
+                str(
+                    normalized_by_source[source_id].get("study_family_id")
+                    or source_id
+                )
+                for source_id in core_member_ids
+                if source_id in normalized_by_source
+            }
+        )
+        cluster["core_evidence_base_group_ids"] = core_evidence_base_ids
         cluster["independence_status"] = (
             "independence_unknown"
-            if len(counted_work_ids) < len(work_ids)
+            if len(counted_work_ids) < len(set(work_member_counts))
             else "lineage_accounted"
         )
         cluster["synthesis_lineage"] = (
             "single_work_multi_component"
-            if len(work_ids) == 1 and len(member_ids) > 1
+            if len(work_member_counts) == 1 and len(core_member_ids) > 1
             else "multi_work"
         )
         if cluster["synthesis_lineage"] == "single_work_multi_component":
-            cluster["qualification_status"] = "evidence_concentrated_cluster"
-            cluster["source_backed"] = False
-            if bool(cluster.get("promoted")):
-                cluster["status"] = "evidence_concentrated_cluster"
+            qualification = "evidence_concentrated_cluster"
+        elif len(evidence_bases) >= max(
+            3, int(_policy_value(policy, "source_backed_threshold", 3))
+        ):
+            qualification = "source_backed_cluster"
         else:
-            cluster["source_backed"] = (
-                str(cluster.get("qualification_status") or "")
-                == "source_backed_cluster"
+            qualification = (
+                "emerging_cluster"
+                if len(evidence_bases) >= 2
+                else "evidence_concentrated_cluster"
             )
+        cluster["qualification_status"] = qualification
+        cluster["source_backed"] = qualification == "source_backed_cluster"
+        if bool(cluster.get("promoted")):
+            cluster["status"] = qualification
+
+    def partition_family_relations(
+        parent: Mapping[str, Any], child_ids: Sequence[str]
+    ) -> list[dict[str, Any]]:
+        child_source_ids = set(child_ids)
+        return [
+            {
+                **dict(relation),
+                "source_ids": sorted(
+                    child_source_ids
+                    & {str(value) for value in relation.get("source_ids", []) or []}
+                ),
+                "evidence": [
+                    dict(reference)
+                    for reference in relation.get("evidence", []) or []
+                    if isinstance(reference, Mapping)
+                    and str(reference.get("source_id") or "") in child_source_ids
+                ],
+            }
+            for relation in parent.get("family_relations", []) or []
+            if isinstance(relation, Mapping)
+            and len(
+                child_source_ids
+                & {str(value) for value in relation.get("source_ids", []) or []}
+            )
+            >= 2
+        ]
 
     def partition_child(
         parent: Mapping[str, Any], raw_child: Mapping[str, Any], child_ids: list[str]
@@ -21591,13 +22114,9 @@ def build_literature_report(
             }
         )[:16]
         parent_roles = _proposal_source_roles(parent)
-        raw_roles = {
-            str(row.get("source_id") or ""): _normalized_cluster_member_role(
-                row.get("role") or row.get("proposed_role") or "context"
-            )
-            for row in raw_child.get("members", []) or []
-            if isinstance(row, Mapping) and row.get("source_id")
-        }
+        raw_roles = _proposal_source_roles(
+            {"source_roles": raw_child.get("members", []) or []}
+        )
         roles = {
             source_id: raw_roles.get(
                 source_id, parent_roles.get(source_id, "context")
@@ -21605,6 +22124,7 @@ def build_literature_report(
             for source_id in child_ids
         }
         child_source_set = set(child_ids)
+        family_relations = partition_family_relations(parent, child_ids)
         inherited_neighbors = []
         for row in parent.get("planned_neighbor_relationships", []) or []:
             if not isinstance(row, Mapping):
@@ -21742,16 +22262,24 @@ def build_literature_report(
             ],
             "proposition_ids": [],
             "propositions": [],
-            "family_relation_ids": [],
-            "family_relations": [],
+            "family_relation_ids": [
+                str(row.get("relation_id") or "")
+                for row in family_relations
+                if row.get("relation_id")
+            ],
+            "family_relations": family_relations,
             "planned_neighbor_relationships": inherited_neighbors,
             "formation_route": "partitioned_cluster_plan",
+            "relationship_first_admission": bool(
+                parent.get("relationship_first_admission")
+            ),
         }
         child["revision_hash"] = _stable_hash(
             {
                 "parent_revision": parent_revision,
                 "semantic_identity": semantic_identity,
                 "source_roles": roles,
+                "family_relations": family_relations,
                 "cluster_writer_contract": "streamlined-full-note-v2",
             }
         )
@@ -21904,6 +22432,19 @@ def build_literature_report(
             partition_child(cluster, raw_child, child_ids)
             for raw_child, child_ids in child_rows
         ]
+        if any(
+            child.get("relationship_first_admission")
+            and not _family_relation_graph_connected(
+                set(child.get("core_source_ids", []) or []),
+                child.get("family_relations", []) or [],
+            )
+            for child in children
+        ):
+            cluster["cluster_synthesis_preflight_error"] = (
+                "cluster_partition_relationship_graph_disconnected"
+            )
+            synthesis_order.append(cluster)
+            continue
         root_id = str(
             cluster.get("partition_root_id") or cluster.get("cluster_id") or ""
         )
@@ -22105,21 +22646,28 @@ def build_literature_report(
                     active_jobs -= 1
 
         synthesis_started = time.monotonic()
+        workers = _provider_worker_count(request, len(scheduled))
         with ThreadPoolExecutor(
-            max_workers=_provider_worker_count(request, len(scheduled)),
+            max_workers=workers,
             thread_name_prefix="auto-zettelkasten-cluster",
         ) as executor:
-            future_map = {
-                executor.submit(run_cluster_job, cluster): str(
-                    cluster.get("cluster_id") or ""
-                )
-                for cluster in scheduled
-            }
-            for future in as_completed(future_map):
-                cluster_id = future_map[future]
+            for future, cluster in _bounded_provider_futures(
+                executor,
+                scheduled,
+                lambda pool, row: pool.submit(run_cluster_job, row),
+                workers=workers,
+                stop_event=getattr(reasoner, "quota_stop_event", None),
+            ):
+                cluster_id = str(cluster.get("cluster_id") or "")
                 try:
                     concurrent_results[cluster_id] = future.result()
                 except BaseException as exc:
+                    if _synthesis_failure_class(exc) in {
+                        "quota",
+                        "timeout",
+                        "interruption",
+                    }:
+                        raise
                     concurrent_results[cluster_id] = exc
         for cluster in completion_pending:
             cluster_id = str(cluster.get("cluster_id") or "")
@@ -22213,16 +22761,6 @@ def build_literature_report(
                     all_clusters=registry["clusters"],
                 )
             )
-            if validated_synthesis.get("status") == "reasoned":
-                retained_ids = list(
-                    validated_synthesis.get("retained_member_ids", []) or []
-                )
-                if retained_ids:
-                    apply_writer_membership(
-                        cluster,
-                        retained_ids,
-                        _as_mapping(validated_synthesis.get("member_roles")),
-                    )
             if uses_global_cluster_plan and not synthesis_response:
                 validated_synthesis["status"] = "partial"
                 validated_synthesis["parked_for_review"] = True
@@ -22244,12 +22782,27 @@ def build_literature_report(
                 )
                 and validated_synthesis.get("supporting_evidence")
                 and validated_synthesis.get("synthesis_assertions")
+                and not {
+                    "retained_member_without_specific_finding",
+                    "study_finding_cross_owned_evidence",
+                    "writer_core_relationship_graph_disconnected",
+                }.intersection(validated_synthesis.get("quality_errors", []) or [])
             ):
                 validated_synthesis["quality_warnings"] = list(
                     validated_synthesis.get("quality_errors", []) or []
                 )
                 validated_synthesis["quality_status"] = "warning"
                 validated_synthesis["status"] = "reasoned"
+            if validated_synthesis.get("status") == "reasoned":
+                retained_ids = list(
+                    validated_synthesis.get("retained_member_ids", []) or []
+                )
+                if retained_ids:
+                    apply_writer_membership(
+                        cluster,
+                        retained_ids,
+                        _as_mapping(validated_synthesis.get("member_roles")),
+                    )
             acquisition_revision_states[cluster_id] = (
                 "active"
                 if validated_synthesis.get("status") == "reasoned"
@@ -22284,7 +22837,7 @@ def build_literature_report(
                     mapped_external_source_ids=mapped_external_source_ids,
                 )
                 raise
-            retry_on_resume = _synthesis_failure_class(exc) == "transport"
+            retry_on_resume = _synthesis_retry_on_resume(exc)
             synthesis_response = {}
             validated_synthesis = validate_cluster_synthesis(
                 {},
@@ -27041,6 +27594,37 @@ def _write_projection_yaml(path: Path, value: Any) -> None:
     write_yaml(path, value)
 
 
+def _persist_typed_source_relation_projection(
+    workspace: Path,
+    registry: Mapping[str, Any],
+) -> Path:
+    """Project canonical active source edges without cluster membership rows."""
+
+    links = [
+        dict(row)
+        for row in registry.get("links", []) or []
+        if isinstance(row, Mapping)
+        and bool(row.get("active", True))
+        and str(row.get("source_kind") or "source") == "source"
+        and str(row.get("target_kind") or "source") == "source"
+    ]
+    path = workspace / "03_literature_synthesis" / "typed_source_relations.yml"
+    _write_projection_yaml(
+        path,
+        {
+            "updated_at": now_iso(),
+            "navigation_relation_version": NAVIGATION_RELATION_VERSION,
+            "graph_projection_hash": _stable_hash(links),
+            "relation_counts": dict(
+                sorted(Counter(str(row.get("relation_type") or "") for row in links).items())
+            ),
+            "relations": links,
+            "links": links,
+        },
+    )
+    return path
+
+
 def _preserve_existing_projection_fields(
     path: Path,
     value: Mapping[str, Any],
@@ -27249,16 +27833,6 @@ def persist_literature_report(
         "tag_reconciliation_version": navigation.get("tag_reconciliation_version", "1"),
         "assignments": navigation.get("assignments", []),
     }
-    typed_relations_payload = {
-        "updated_at": generated_at,
-        "navigation_relation_version": navigation.get(
-            "navigation_relation_version", "1"
-        ),
-        "graph_projection_hash": navigation.get("graph_projection_hash", ""),
-        "relation_counts": navigation.get("typed_relation_counts", {}),
-        "relations": navigation.get("typed_relations", []),
-        "links": navigation.get("typed_relations", []),
-    }
     navigation_audit_payload = {
         "updated_at": generated_at,
         "graph_projection_hash": navigation.get("graph_projection_hash", ""),
@@ -27275,7 +27849,6 @@ def persist_literature_report(
     for path, payload in (
         (subject_tag_registry_path, tag_registry_payload),
         (subject_tag_assignments_path, tag_assignments_payload),
-        (typed_relations_path, typed_relations_payload),
         (navigation_audit_path, navigation_audit_payload),
     ):
         write_yaml(path, payload)
@@ -27304,11 +27877,36 @@ def persist_literature_report(
         )
     from .relationships import persist_relationship_registry
 
-    persist_relationship_registry(
+    typed_registry = persist_relationship_registry(
         workspace,
         structural_relations=navigation.get("typed_relations", []),
         preserve_unmentioned_structural=True,
     )
+    typed_projection_path = _persist_typed_source_relation_projection(
+        workspace, typed_registry
+    )
+    typed_projection = _as_mapping(read_yaml(typed_projection_path, {}) or {})
+    canonical_relation_manifest = {
+        "relation_count": len(typed_projection.get("links", []) or []),
+        "typed_relation_counts": dict(
+            _as_mapping(typed_projection.get("relation_counts"))
+        ),
+        "graph_projection_hash": str(
+            typed_projection.get("graph_projection_hash") or ""
+        ),
+    }
+    canonical_manifest = {
+        **dict(_as_mapping(report.get("manifest"))),
+        **canonical_relation_manifest,
+    }
+    report = {
+        **dict(report),
+        "manifest": canonical_manifest,
+        "packet": {
+            **dict(_as_mapping(report.get("packet"))),
+            "counts": canonical_manifest,
+        },
+    }
     write_yaml(
         proposition_path,
         {"updated_at": generated_at, "propositions": report.get("propositions", [])},
@@ -27923,7 +28521,7 @@ def build_literature_map(
     stage_callback: Any = None,
     navigation_policy: Any = None,
     reasoner_calls: Any = None,
-    accepted_relationships: Sequence[Mapping[str, Any]] = (),
+    accepted_relationships: Sequence[Mapping[str, Any]] | None = None,
     relationship_candidates: Sequence[Mapping[str, Any]] = (),
     catalogue_shards: Sequence[Mapping[str, Any]] = (),
     shared_literature_plan: Mapping[str, Any] | None = None,
@@ -28339,6 +28937,8 @@ def run_literature_map(
         else Path(str(value))
         for key, value in artifacts.items()
     }
+    canonical_counts = dict(_as_mapping(canonical_manifest))
+    canonical_counts.pop("artifacts", None)
     return LiteratureMapReport(
         status="completed",
         map_id=map_id,
@@ -28347,7 +28947,7 @@ def run_literature_map(
             source_set.get("source_set_id") or values.get("source_set_id") or ""
         ),
         stage="completed",
-        counts={**dict(report["manifest"]), "written_artifact_count": len(paths)},
+        counts={**canonical_counts, "written_artifact_count": len(paths)},
         artifact_paths=artifact_paths,
     )
 

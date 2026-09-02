@@ -33,6 +33,7 @@ from auto_zettelkasten.models import (
 
 def test_literature_mapping_policy_defaults_and_validation() -> None:
     policy = LiteratureMappingPolicy()
+    assert policy.cluster_generation_enabled is None
     assert policy.to_dict() == {
         "synthesis_enabled": True,
         "require_question": False,
@@ -52,12 +53,25 @@ def test_literature_mapping_policy_defaults_and_validation() -> None:
         "require_executable_gap_design": True,
     }
     assert LiteratureMappingPolicy.from_dict(policy.to_dict()) == policy
+    for enabled in (False, True):
+        explicit = LiteratureMappingPolicy(cluster_generation_enabled=enabled)
+        assert explicit.to_dict()["cluster_generation_enabled"] is enabled
+        assert LiteratureMappingPolicy.from_dict(explicit.to_dict()) == explicit
     with pytest.raises(ValueError, match="external_discovery"):
         LiteratureMappingPolicy(external_discovery="sometimes")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="source_backed_threshold"):
         LiteratureMappingPolicy.from_dict({"source_backed_threshold": "3"})
     with pytest.raises(ValueError, match="synthesis_enabled"):
         LiteratureMappingPolicy.from_dict({"synthesis_enabled": 1})
+    with pytest.raises(ValueError, match="cluster_generation_enabled"):
+        LiteratureMappingPolicy.from_dict({"cluster_generation_enabled": 1})
+    with pytest.raises(ValueError, match="cluster_generation_enabled"):
+        LiteratureMappingPolicy.from_dict({"cluster_generation_enabled": "false"})
+    with pytest.raises(ValueError, match="cannot be true"):
+        LiteratureMappingPolicy(
+            synthesis_enabled=False,
+            cluster_generation_enabled=True,
+        )
     with pytest.raises(ValueError, match="unknown literature_mapping fields"):
         LiteratureMappingPolicy.from_dict({"model_enthusiasm": 1})
     with pytest.raises(ValueError, match="weak_gap_handling"):
@@ -521,7 +535,15 @@ def test_map_request_round_trips_literature_policy(tmp_path: Path) -> None:
         ),
     )
     assert request.to_dict()["literature_policy"]["external_discovery"] == "per_run"
+    assert "cluster_generation_enabled" not in request.to_dict()["literature_policy"]
     assert MapRequest.from_dict(request.to_dict()) == request
+    explicit = MapRequest(
+        tmp_path,
+        literature_policy=LiteratureMappingPolicy(
+            cluster_generation_enabled=False
+        ),
+    )
+    assert explicit.to_dict()["literature_policy"]["cluster_generation_enabled"] is False
     with pytest.raises(ValueError, match="literature_policy must be"):
         MapRequest.from_dict({"workspace": str(tmp_path), "literature_policy": []})
     with pytest.raises(ValueError, match="requires a question"):
@@ -632,7 +654,15 @@ def test_literature_request_and_report_are_serializable(tmp_path: Path) -> None:
     )
     assert request.question is None
     assert request.to_dict()["workspace"] == str(tmp_path)
+    assert "cluster_generation_enabled" not in request.to_dict()["literature_policy"]
     assert LiteratureMapRequest.from_dict(request.to_dict()) == request
+    explicit = LiteratureMapRequest(
+        workspace=tmp_path,
+        literature_policy=LiteratureMappingPolicy(
+            cluster_generation_enabled=True
+        ),
+    )
+    assert explicit.to_dict()["literature_policy"]["cluster_generation_enabled"] is True
     with pytest.raises(ValueError, match="requires a question"):
         LiteratureMapRequest(
             workspace=tmp_path,
@@ -673,7 +703,7 @@ def test_all_report_models_default_to_current_versions(tmp_path: Path) -> None:
         LiteratureMapReport(status="ok"),
     )
     assert {(report.engine_version, report.artifact_schema_version) for report in reports} == {
-        ("0.29.10", "1.20")
+        ("0.30.0", "1.20")
     }
     assert run_report.literature_map == {}
     assert run_report.literature_report == {}

@@ -14,7 +14,7 @@ synthesis prompt `28`, source catalogue schema `4`, and note metadata schema
 
 - `V019_LEAN_GRAPH_AND_FULL_COMPARATIVE_EVALUATION_PLAN.md`;
 - the v0.19 evaluation at
-  `/Users/khalilalwazir/Documents/Auto-Zettelkasten-test/mediation-relapse-v019-evaluation-20260730/evaluation/v019-full-comparison.md`;
+  `<private-evaluation-root>/mediation-relapse-v019-evaluation-20260730/evaluation/v019-full-comparison.md`;
 - manual inspection of the Berg atomic note and the Fortna peacekeeping
   cluster; and
 - the architectural discussion about whole-library, collection-incremental,
@@ -1242,7 +1242,7 @@ If either gate fails, stop before the full evaluation.
 
 Create:
 
-`/Users/khalilalwazir/Documents/Auto-Zettelkasten-test/mediation-relapse-v020-evaluation-20260730`
+`<private-evaluation-root>/mediation-relapse-v020-evaluation-20260730`
 
 Use the unchanged Zotero collections:
 

@@ -351,6 +351,7 @@ def test_frozen_sources_fill_provider_pool_while_local_workers_are_blocked(
         write_yaml(root / "frozen_content.yml", {"content_hash": key})
 
     release_local = threading.Event()
+    first_commit_started = threading.Event()
     lock = threading.Lock()
     local_active = 0
     local_peak = 0
@@ -391,11 +392,14 @@ def test_frozen_sources_fill_provider_pool_while_local_workers_are_blocked(
                 provider_started_while_local_blocked += 1
                 if provider_started_while_local_blocked >= 32:
                     release_local.set()
-        time.sleep(0.01)
+        key = str(item["key"])
+        if key == "ITEM0004":
+            first_commit_started.wait(5)
+        else:
+            time.sleep(0.01)
         with lock:
             provider_active -= 1
             provider_completed += 1
-        key = str(item["key"])
         return {
             "inventory_index": index,
             "item": dict(item),
@@ -414,6 +418,7 @@ def test_frozen_sources_fill_provider_pool_while_local_workers_are_blocked(
         with lock:
             if first_commit_provider_active < 0:
                 first_commit_provider_active = provider_active
+                first_commit_started.set()
         time.sleep(0.01)
         return pipeline._public_terminal_row(row), None, [], []
 

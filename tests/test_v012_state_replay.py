@@ -29,6 +29,7 @@ from auto_zettelkasten.pipeline import (
     _run_relationship_reasoning,
     _write_relationship_run_ledger,
 )
+from auto_zettelkasten.readers import CodexReader
 
 
 class _CallReasoner:
@@ -438,6 +439,52 @@ def test_oversized_cluster_synthesis_is_rejected_before_provider_call(
         )
     assert reasoner.calls == 0
     assert replay.cumulative_provider_calls == 0
+
+
+def test_relationship_adjudication_uses_exact_codex_fit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reader = CodexReader(
+        model="gpt-5.6-terra",
+        allow_cloud=True,
+        reasoning_effort="medium",
+    )
+    provider_calls = 0
+
+    def adjudicate(
+        _self: CodexReader,
+        _profiles: Sequence[Any],
+        _request: Any,
+        *,
+        context: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        nonlocal provider_calls
+        provider_calls += 1
+        assert context["evidence"].startswith("x")
+        return {"decisions": {}}
+
+    monkeypatch.setattr(CodexReader, "adjudicate_relationships", adjudicate)
+    request = LiteratureMapRequest(
+        workspace=tmp_path,
+        run_id="run",
+        provider="codex",
+        model="gpt-5.6-terra",
+        reasoning_effort="medium",
+        allow_cloud=True,
+    )
+    calls = _CheckpointedReasonerCalls(tmp_path, "run", reader, request)
+
+    result = calls(
+        "relationship_adjudication",
+        "large-but-valid",
+        "adjudicate_relationships",
+        [],
+        {"evidence": "x" * 263_000},
+    )
+
+    assert result == {"decisions": []}
+    assert provider_calls == 1
 
 
 def test_interrupted_attempt_is_retryable_on_resume(

@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import shutil
+import threading
 from dataclasses import fields, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -45,8 +46,10 @@ from .obsidian import export_obsidian
 from .notes import item_key, semantic_note_hash, source_id_for_item
 from .pipeline import (
     _RunProgress,
+    _active_source_relation_count,
     _analytical_profile_source_ids,
     _apply_reader_policy,
+    _cluster_preservation_snapshot,
     all_workspace_note_rows,
     rebuild_map,
     run_pipeline,
@@ -67,6 +70,8 @@ from .readers import (
     DEFAULT_PROMPT_RESERVE_TOKENS,
     MODEL_CONTEXT_WINDOWS,
     PROVIDER_CONTEXT_WINDOW_DEFAULTS,
+    codex_preflight_status,
+    codex_suite_identity,
     provider_from_name,
 )
 from .relationships import (
@@ -141,7 +146,7 @@ def doctor(workspace: Path | str, *, client: ZoteroClient | None = None) -> Stat
         checks["zotero"] = {"status": "unavailable", "reason": f"{type(exc).__name__}: {exc}", "read_only": True}
     provider_name = str(config.get("provider") or "deepseek")
     model = str(config.get("model") or "deepseek-v4-flash")
-    checks["provider"] = _provider_check(provider_name, model)
+    checks["provider"] = _provider_check(provider_name, model, config, workspace=root)
     checks["pdf_extraction"] = {
         "status": "available" if importlib.util.find_spec("pypdf") else "missing",
         "tool": "pypdf",
@@ -331,6 +336,7 @@ def estimate_cost(
     provider: str = "deepseek",
     model: str = "deepseek-v4-flash",
     graph_only: bool = False,
+    literature_policy: LiteratureMappingPolicy | Mapping[str, Any] | None = None,
     zotero_client: ZoteroClient | None = None,
 ) -> dict[str, Any]:
     """Estimate paid work from a read-only inventory and existing checkpoints."""
@@ -563,10 +569,19 @@ def estimate_cost(
         return total
 
     config = read_yaml(root / "auto-zettelkasten.yml", {}) or {}
+    if not isinstance(config, Mapping):
+        raise ValueError("workspace config must be a mapping")
     literature_config = config.get("literature_mapping", {}) or {}
-    literature_context_fraction = float(
-        literature_config.get("deepseek_packet_context_fraction", 0.8) or 0.8
+    policy = (
+        literature_policy
+        if isinstance(literature_policy, LiteratureMappingPolicy)
+        else LiteratureMappingPolicy.from_dict(
+            literature_policy
+            if literature_policy is not None
+            else literature_config
+        )
     )
+    literature_context_fraction = policy.deepseek_packet_context_fraction
     context_window_tokens = MODEL_CONTEXT_WINDOWS.get(
         (provider, model), PROVIDER_CONTEXT_WINDOW_DEFAULTS.get(provider, 128_000)
     )
@@ -671,8 +686,46 @@ def estimate_cost(
         )
         for bound, rate in {"low": 0.03, "expected": 0.05, "high": 0.07}.items()
     }
+    cluster_stage_calls = {
+        "cluster_planning": stage_calls(
+            planning_profile_count, (180, 125, 80)
+        ),
+        "cluster_synthesis": cluster_calls,
+        "cluster_partition_planning": {
+            bound: len(oversized_cluster_ids)
+            for bound in ("low", "expected", "high")
+        },
+        "cluster_child_synthesis": cluster_child_writer_counts,
+        "gap_adjudication": {
+            bound: int(cluster_calls[bound] > 0)
+            for bound in ("low", "expected", "high")
+        },
+        "empty_response_recovery": {
+            bound: len(eligible_empty_recoveries)
+            for bound in ("low", "expected", "high")
+        },
+    }
+    clusters_enabled = (
+        policy.cluster_generation_enabled is not False and policy.synthesis_enabled
+    )
+    if not clusters_enabled:
+        oversized_cluster_ids = set()
+        oversized_writer_input_characters = {}
+        cluster_child_writer_counts = {
+            bound: 0 for bound in ("low", "expected", "high")
+        }
+        eligible_empty_recoveries = {}
+        eligible_empty_recovery_input_tokens = 0
+        cluster_stage_calls = {
+            stage: {bound: 0 for bound in ("low", "expected", "high")}
+            for stage in cluster_stage_calls
+        }
     graph_call_components = {
-        "family_planning": stage_calls(planning_profile_count, (180, 125, 80)),
+        "family_planning": (
+            stage_calls(planning_profile_count, (180, 125, 80))
+            if clusters_enabled
+            else {bound: 0 for bound in ("low", "expected", "high")}
+        ),
         "direct_discovery": {
             bound: 0 if graph_profile_counts[bound] < 2 else 1
             for bound in ("low", "expected", "high")
@@ -683,25 +736,24 @@ def estimate_cost(
             for bound in ("low", "expected", "high")
         },
         "relationship_adjudication": relationship_calls,
-        "cluster_synthesis": cluster_calls,
-        "cluster_partition_planning": {
-            bound: len(oversized_cluster_ids) for bound in ("low", "expected", "high")
-        },
-        "cluster_child_synthesis": cluster_child_writer_counts,
-        "empty_response_recovery": {
-            bound: len(eligible_empty_recoveries)
-            for bound in ("low", "expected", "high")
-        },
+        **cluster_stage_calls,
     }
+    if not policy.synthesis_enabled:
+        graph_call_components = {
+            stage: {bound: 0 for bound in ("low", "expected", "high")}
+            for stage in graph_call_components
+        }
     input_multipliers = {
         "family_planning": (0.04, 0.08, 0.2),
         "direct_discovery": (0.03, 0.05, 0.1),
         "complementary_discovery": (0.05, 0.15, 0.4),
         "breadth_completion": (0.05, 0.15, 0.4),
         "relationship_adjudication": (5.0, 14.0, 24.0),
+        "cluster_planning": (0.04, 0.08, 0.2),
         "cluster_synthesis": (1.0, 4.0, 8.0),
         "cluster_partition_planning": (1.0, 1.0, 1.0),
         "cluster_child_synthesis": (1.0, 1.0, 1.0),
+        "gap_adjudication": (1.0, 4.0, 8.0),
         "empty_response_recovery": (1.0, 1.0, 1.0),
     }
     output_tokens_per_call = {
@@ -710,9 +762,11 @@ def estimate_cost(
         "complementary_discovery": (5_000, 12_000, 24_000),
         "breadth_completion": (5_000, 12_000, 24_000),
         "relationship_adjudication": (10_000, 30_000, 40_000),
+        "cluster_planning": (3_000, 6_000, 12_000),
         "cluster_synthesis": (12_000, 30_000, 50_000),
         "cluster_partition_planning": (8_000, 16_000, 32_000),
         "cluster_child_synthesis": (12_000, 30_000, 50_000),
+        "gap_adjudication": (6_000, 12_288, 12_288),
         "empty_response_recovery": (12_000, 30_000, 50_000),
     }
     full_note_stages = {
@@ -720,6 +774,7 @@ def estimate_cost(
         "cluster_synthesis",
         "cluster_partition_planning",
         "cluster_child_synthesis",
+        "gap_adjudication",
         "empty_response_recovery",
     }
     oversized_writer_input_tokens = max(
@@ -834,11 +889,19 @@ def estimate_cost(
             "graph_neighborhood_profile_count": graph_profile_count,
             "graph_neighborhood_profile_counts": graph_profile_counts,
             "incremental_profile_count": incremental_profile_count,
+            "cluster_generation_enabled": clusters_enabled,
+            "synthesis_enabled": policy.synthesis_enabled,
             "candidate_pairs": {
-                bound: int(graph_profile_counts[bound] * candidate_rates[bound])
+                bound: (
+                    int(graph_profile_counts[bound] * candidate_rates[bound])
+                    if policy.synthesis_enabled
+                    else 0
+                )
                 for bound in bounds
             },
-            "breadth_completion_waves": 1 if projected_profiles >= 2 else 0,
+            "breadth_completion_waves": (
+                1 if policy.synthesis_enabled and projected_profiles >= 2 else 0
+            ),
             "oversized_cluster_parent_count": len(oversized_cluster_ids),
             "oversized_cluster_ids": sorted(oversized_cluster_ids),
             "cluster_writer_input_budget_characters": (
@@ -1241,6 +1304,7 @@ def _refresh_sync_projections(
         literature_policy=replace(
             request.literature_policy,
             synthesis_enabled=False,
+            cluster_generation_enabled=False,
         ),
     )
     return rebuild_map(
@@ -1380,7 +1444,19 @@ def get_status(workspace: Path | str, run_id: str | None = None) -> StatusReport
         return StatusReport(status="blocked", workspace=root, run_id=run_id, message="run_not_found")
     report = read_yaml(report_path, {}) or {} if report_path and report_path.exists() else {}
     progress = read_yaml(progress_path, {}) or {} if progress_path and progress_path.exists() else {}
-    live = progress if progress.get("status") == "running" else (report or progress)
+    progress_is_newer = bool(progress) and (
+        not report
+        or (
+            progress_path is not None
+            and report_path is not None
+            and progress_path.stat().st_mtime_ns > report_path.stat().st_mtime_ns
+        )
+    )
+    live = (
+        progress
+        if progress.get("status") == "running" or progress_is_newer
+        else report
+    )
     literature_live = live.get("literature_map", {}) if isinstance(live.get("literature_map", {}), Mapping) else {}
     clusters = (report.get("cluster_map", {}) or {}).get("clusters", [])
     gaps = (report.get("gap_map", {}) or {}).get("gap_candidates", [])
@@ -1719,6 +1795,7 @@ def _build_map_semantic_fingerprint(
     source_set: Mapping[str, Any],
     provider: str,
     model: str,
+    reasoning_effort: str | None = None,
     question: str | None,
     policy: LiteratureMappingPolicy,
     navigation: NavigationPolicy,
@@ -1838,6 +1915,10 @@ def _build_map_semantic_fingerprint(
             {str(value) for value in comparison_collection_keys if str(value)}
         ),
     }
+    if provider == "codex" and policy.synthesis_enabled:
+        payload["provider_execution_identity"] = codex_suite_identity(
+            model, reasoning_effort or "medium"
+        )
     return sha256_text(
         json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
     )
@@ -1891,6 +1972,7 @@ def _build_map_receipt_identity(
     *,
     provider: str,
     model: str,
+    reasoning_effort: str | None = None,
     question: str | None,
     policy: LiteratureMappingPolicy,
     navigation: NavigationPolicy,
@@ -1901,9 +1983,7 @@ def _build_map_receipt_identity(
         source_set_identity: Any = dict(source_set)
     else:
         source_set_identity = str(source_set or "")
-    return sha256_text(
-        json.dumps(
-            {
+    payload = {
                 "engine_version": ENGINE_VERSION,
                 "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
                 "relationship_discovery_prompt_version": RELATIONSHIP_DISCOVERY_PROMPT_VERSION,
@@ -1918,11 +1998,13 @@ def _build_map_receipt_identity(
                 "navigation_policy": navigation.to_dict(),
                 "comparison_collection_keys": sorted(comparison_collection_keys),
                 "source_set": source_set_identity,
-            },
-            sort_keys=True,
-            ensure_ascii=False,
-            default=str,
+            }
+    if provider == "codex" and policy.synthesis_enabled:
+        payload["provider_execution_identity"] = codex_suite_identity(
+            model, reasoning_effort or "medium"
         )
+    return sha256_text(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
     )
 
 
@@ -2243,6 +2325,14 @@ def _reusable_build_map_receipt(
         )
         if current_notes != expected_notes:
             return None
+    summary = dict(payload.get("summary", {}) or {})
+    protected_hash = str(summary.get("protected_cluster_state_hash") or "")
+    if (
+        protected_hash
+        and _cluster_preservation_snapshot(root).get("snapshot_hash")
+        != protected_hash
+    ):
+        raise ValueError("protected_cluster_state_changed:receipt_replay")
     artifacts = [
         dict(row)
         for row in payload.get("artifacts", []) or []
@@ -2269,6 +2359,7 @@ def build_map(
     question: str | None = None,
     provider: str | None = None,
     model: str | None = None,
+    reasoning_effort: str | None = None,
     allow_cloud: bool = False,
     provider_concurrency: int | str | None = None,
     max_provider_spend_usd: Any = None,
@@ -2303,6 +2394,26 @@ def build_map(
         if isinstance(literature_policy, LiteratureMappingPolicy)
         else LiteratureMappingPolicy.from_dict(literature_policy if isinstance(literature_policy, Mapping) else configured_policy)
     )
+    if provider == "codex":
+        if max_provider_spend_usd is not None:
+            raise ValueError(
+                "Codex subscription use does not support dollar spend caps"
+            )
+        if reasoning_effort not in {None, "medium", "high", "max"}:
+            raise ValueError(
+                "Codex reasoning_effort must be medium, high, max, or None"
+            )
+        if policy.synthesis_enabled and model not in {
+            "gpt-5.6-terra",
+            "gpt-5.6-sol",
+        }:
+            raise ValueError(
+                "Codex literature model must be gpt-5.6-terra or gpt-5.6-sol"
+            )
+        if isinstance(provider_concurrency, int) and provider_concurrency > 32:
+            raise ValueError("Codex provider_concurrency must be between 1 and 32")
+    elif reasoning_effort is not None:
+        raise ValueError("reasoning_effort is supported only by Codex")
     configured_navigation = config.get("navigation", {}) if isinstance(config.get("navigation", {}), Mapping) else {}
     navigation = (
         navigation_policy
@@ -2322,6 +2433,7 @@ def build_map(
     receipt_identity = _build_map_receipt_identity(
         provider=provider,
         model=model,
+        reasoning_effort=reasoning_effort,
         question=question,
         policy=policy,
         navigation=navigation,
@@ -2364,18 +2476,29 @@ def build_map(
         source_set=selected_source_set,
         provider=provider,
         model=model,
+        reasoning_effort=reasoning_effort,
         question=question,
         policy=policy,
         navigation=navigation,
         comparison_collection_keys=comparison_collection_keys,
     )
     if reasoner is None and policy.synthesis_enabled and allow_cloud:
-        built_in_reasoner = provider_from_name(provider, model, allow_cloud=allow_cloud)
+        provider_kwargs = {"allow_cloud": allow_cloud}
+        if provider == "codex":
+            provider_kwargs["reasoning_effort"] = reasoning_effort
+        built_in_reasoner = provider_from_name(provider, model, **provider_kwargs)
         if not isinstance(built_in_reasoner, LiteratureReasoner):
             raise ValueError(f"provider {provider} does not implement literature reasoning")
         reasoner = built_in_reasoner
     if reasoner is not None and bool(getattr(reasoner, "is_cloud", True)) and not allow_cloud:
         raise ValueError("cloud literature reasoner requires allow_cloud=True")
+    if provider == "codex" and reasoner is not None:
+        setattr(
+            reasoner,
+            "credential_forbidden_roots",
+            (root, run_directory(root, run_id)),
+        )
+        setattr(reasoner, "quota_stop_event", threading.Event())
     if external_discovery is not None and bool(getattr(external_discovery, "is_cloud", True)) and not allow_cloud:
         raise ValueError("cloud external discovery provider requires allow_cloud=True")
     extraction_config = (
@@ -2386,7 +2509,11 @@ def build_map(
     map_request = MapRequest(
         workspace=root,
         provider=provider,
-        model=model,
+        model="gpt-5.6-luna" if provider == "codex" else model,
+        literature_model=(
+            model if provider == "codex" and policy.synthesis_enabled else None
+        ),
+        reasoning_effort=reasoning_effort,
         allow_cloud=allow_cloud,
         provider_concurrency=(
             provider_concurrency
@@ -2541,6 +2668,7 @@ def build_map(
             "gap_map": result["gap_map"],
             "literature_packet": result["literature_packet"],
             "literature_map": literature_summary,
+            "migration": result.get("migration", {}),
             "semantic_build_fingerprint": semantic_fingerprint,
             "semantic_replayable": semantic_replayable,
         },
@@ -2554,13 +2682,21 @@ def build_map(
     }
     summary = {
         "literature_map": compact_literature_summary,
+        "migration": result.get("migration", {}),
         "semantic_build_fingerprint": semantic_fingerprint,
         "semantic_replayable": semantic_replayable,
         "source_count": len(result["source_set"].get("source_ids", []) or []),
-        "relationship_count": len((result.get("typed_links", {}) or {}).get("links", []) or []),
+        "relationship_count": _active_source_relation_count(
+            result.get("typed_links", {}) or {}
+        ),
         "cluster_count": len(result["cluster_map"].get("clusters", []) or []),
         "gap_count": len(result["gap_map"].get("gap_candidates", []) or []),
     }
+    preservation = result["cluster_map"].get("preservation", {}) or {}
+    if preservation.get("after_hash"):
+        summary["protected_cluster_state_hash"] = str(
+            preservation["after_hash"]
+        )
     compact_manifest = {
         "status": manifest.status,
         "workspace": str(root),
@@ -2655,6 +2791,7 @@ def run_literature_map(
         question=request.question,
         provider=request.provider,
         model=request.model,
+        reasoning_effort=request.reasoning_effort,
         allow_cloud=request.allow_cloud,
         provider_concurrency=request.provider_concurrency,
         max_provider_spend_usd=request.max_provider_spend_usd,
@@ -2718,7 +2855,13 @@ def export_to_obsidian(
     )
 
 
-def _provider_check(provider: str, model: str) -> dict[str, Any]:
+def _provider_check(
+    provider: str,
+    model: str,
+    config: Mapping[str, Any] | None = None,
+    *,
+    workspace: Path | None = None,
+) -> dict[str, Any]:
     env_by_provider = {
         "deepseek": "DEEPSEEK_API_KEY",
         "openrouter": "OPENROUTER_API_KEY",
@@ -2726,6 +2869,84 @@ def _provider_check(provider: str, model: str) -> dict[str, Any]:
     }
     if provider == "ollama":
         return {"status": "configured_local", "provider": provider, "model": model, "key_required": False, "cloud": False}
+    if provider == "codex":
+        effort = str((config or {}).get("reasoning_effort") or "medium")
+        literature_model = str((config or {}).get("literature_model") or "")
+        literature_config = (config or {}).get("literature_mapping")
+        synthesis_enabled = not isinstance(literature_config, Mapping) or bool(
+            literature_config.get("synthesis_enabled", True)
+        )
+        role_error = ""
+        if model not in {"gpt-5.6-luna", "gpt-5.6-sol"}:
+            role_error = "Codex source model must be gpt-5.6-luna or gpt-5.6-sol"
+        elif synthesis_enabled and not literature_model:
+            role_error = "Codex synthesis requires literature_model"
+        elif literature_model and literature_model not in {
+            "gpt-5.6-terra",
+            "gpt-5.6-sol",
+        }:
+            role_error = (
+                "Codex literature_model must be gpt-5.6-terra or gpt-5.6-sol"
+            )
+        if role_error:
+            return {
+                "status": "unavailable",
+                "provider": provider,
+                "model": model,
+                "literature_model": literature_model,
+                "cloud": True,
+                "reason": role_error,
+                "experimental": True,
+                "quota": "unknown",
+            }
+        try:
+            kwargs = (
+                {"forbidden_credential_roots": (workspace,)}
+                if workspace is not None
+                else {}
+            )
+            status = codex_preflight_status(
+                model,
+                effort,
+                (literature_model,) if literature_model else (),
+                **kwargs,
+            )
+        except Exception as exc:
+            return {
+                "status": "unavailable",
+                "provider": provider,
+                "model": model,
+                "cloud": True,
+                "reason": f"{type(exc).__name__}: {exc}",
+                "experimental": True,
+                "quota": "unknown",
+            }
+        public_status = {
+            key: status[key]
+            for key in (
+                "status",
+                "provider",
+                "cloud",
+                "executable",
+                "version",
+                "auth_method",
+                "auth_status",
+                "model",
+                "models",
+                "reasoning_effort",
+                "context_window_tokens",
+                "model_compatibility",
+                "context_window_compatibility",
+                "reasoning_effort_compatibility",
+                "feature_manifest",
+                "experimental",
+                "tool_execution",
+                "quota",
+            )
+            if key in status
+        }
+        public_status["literature_model"] = literature_model
+        return public_status
     env = env_by_provider.get(provider)
     return {
         "status": "configured" if env and os.getenv(env) else "missing_key",

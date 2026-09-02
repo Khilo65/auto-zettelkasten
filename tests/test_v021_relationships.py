@@ -86,7 +86,7 @@ def test_v8_salvages_valid_connections_and_keeps_anchors_optional() -> None:
 def test_v18_is_compact_domain_neutral_source_owned_and_complete() -> None:
     prompt = _relationship_adjudication_system_prompt()
 
-    assert "relationship prompt v18" in prompt
+    assert "relationship prompt v19" in prompt
     assert "source_a_basis describes only the supplied left_source_id" in prompt
     assert "source_b_basis only the supplied right_source_id" in prompt
     assert "whole work versus chapter, excerpt, or component" in prompt
@@ -98,6 +98,7 @@ def test_v18_is_compact_domain_neutral_source_owned_and_complete() -> None:
     assert "qualifies means the actor establishes a condition" in prompt
     assert "sequential_relationship means the actor precedes the reference" in prompt
     assert "contextual_connection are symmetric" in prompt
+    assert "directional types require exact supplied endpoints as actor/reference" in prompt
     assert "ACTOR [relation type] REFERENCE" in prompt
     assert "every ID appears exactly once" in prompt
     assert "use no_relationship rather than omitting a pair" in prompt

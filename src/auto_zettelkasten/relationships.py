@@ -10,7 +10,7 @@ from .models import RelationshipDecision, RelationshipPairJob
 from .navigation import TYPED_SOURCE_RELATIONS, rank_human_related_links
 
 
-RELATIONSHIP_PROMPT_VERSION = "18"
+RELATIONSHIP_PROMPT_VERSION = "19"
 RELATIONSHIP_DISCOVERY_PROMPT_VERSION = "20"
 RELATIONSHIP_REGISTRY_SCHEMA_VERSION = "7"
 RELATIONSHIP_DECISION_SCHEMA_VERSION = "8"
@@ -1284,6 +1284,7 @@ def persist_relationship_registry(
     no_relationship_decisions: Sequence[Mapping[str, Any]] = (),
     parked_rows: Sequence[Mapping[str, Any]] = (),
     preserve_unmentioned_structural: bool = False,
+    protected_structural_relations: Sequence[Mapping[str, Any]] = (),
     orphaned_source_ids: Sequence[str] = (),
     reconcile_machine_prompt_version: str | None = None,
 ) -> dict[str, Any]:
@@ -1606,6 +1607,19 @@ def persist_relationship_registry(
     for accepted in final_accepted_relations:
         row = dict(accepted)
         rows_by_id[str(row["relation_id"])] = row
+    for protected in protected_structural_relations:
+        if (
+            not isinstance(protected, Mapping)
+            or not bool(protected.get("active", True))
+            or str(protected.get("relation_type") or "")
+            not in {"cluster_member", "has_member"}
+        ):
+            continue
+        row = dict(protected)
+        identity = str(
+            row.get("relation_id") or row.get("link_id") or stable_hash(row)
+        )
+        rows_by_id[identity] = row
 
     relations = sorted(
         rows_by_id.values(),

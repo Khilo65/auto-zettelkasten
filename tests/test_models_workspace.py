@@ -19,9 +19,10 @@ def test_map_request_is_versioned_serializable_and_validated(tmp_path: Path) -> 
     )
     assert MapRequest.from_dict(request.to_dict()) == request
     assert request.processing.max_calls_per_document_run == 7
-    assert request.prompt_version == "12"
+    assert request.prompt_version == "14"
     assert request.extraction_version == "2"
     assert request.extraction_policy.ocr == "auto"
+    assert "cluster_generation_enabled" not in request.to_dict()["literature_policy"]
     with pytest.raises(ValueError, match="collection_key"):
         MapRequest(tmp_path, scope="collection")
     with pytest.raises(ValueError, match="limit"):
@@ -29,7 +30,7 @@ def test_map_request_is_versioned_serializable_and_validated(tmp_path: Path) -> 
     assert MapRequest.from_dict({"workspace": str(tmp_path), "allow_cloud": "false"}).allow_cloud is False
     assert MapRequest.from_dict(
         {"workspace": str(tmp_path), "prompt_version": "11"}
-    ).prompt_version == "12"
+    ).prompt_version == "14"
     with pytest.raises(ValueError, match="allow_cloud must be a boolean"):
         MapRequest(tmp_path, allow_cloud="false")  # type: ignore[arg-type]
     assert MapRequest(tmp_path, allow_cloud=False).allow_cloud is False
@@ -59,7 +60,7 @@ def test_initialize_creates_compatible_file_first_workspace(tmp_path: Path) -> N
     workspace = tmp_path / "workspace"
     manifest = initialize(workspace)
     assert manifest.status == "initialized"
-    assert manifest.engine_version == "0.29.10"
+    assert manifest.engine_version == "0.30.0"
     assert manifest.artifact_schema_version == "1.20"
     for relative in (
         "01_custody",
@@ -73,14 +74,22 @@ def test_initialize_creates_compatible_file_first_workspace(tmp_path: Path) -> N
     config_text = (workspace / "auto-zettelkasten.yml").read_text()
     config = read_yaml(workspace / "auto-zettelkasten.yml")
     assert "API_KEY" not in config_text
-    assert config["engine_version"] == "0.29.10"
+    assert config["engine_version"] == "0.30.0"
     assert config["artifact_schema_version"] == "1.20"
     assert config["privacy"]["allow_cloud"] is False
-    assert config["prompt_version"] == "12"
+    assert config["prompt_version"] == "14"
     assert config["extraction"]["version"] == "2"
     assert config["extraction"]["ocr"] == "auto"
     assert config["literature_mapping"]["synthesis_enabled"] is True
+    assert config["literature_mapping"]["cluster_generation_enabled"] is False
     assert config["literature_mapping"]["external_discovery"] == "disabled"
+
+    config["literature_mapping"].pop("cluster_generation_enabled")
+    write_yaml(workspace / "auto-zettelkasten.yml", config)
+    legacy_policy = LiteratureMappingPolicy.from_dict(
+        load_config(workspace)["literature_mapping"]
+    )
+    assert legacy_policy.cluster_generation_enabled is None
 
 
 def test_newer_artifact_schema_is_rejected(tmp_path: Path) -> None:

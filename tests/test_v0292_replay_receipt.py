@@ -16,7 +16,7 @@ def _receipt_identity() -> str:
         provider="ollama",
         model="fake-1",
         question=None,
-        policy=LiteratureMappingPolicy(),
+        policy=LiteratureMappingPolicy(cluster_generation_enabled=False),
         navigation=NavigationPolicy(),
         comparison_collection_keys=(),
         source_set=None,
@@ -273,6 +273,30 @@ def test_machine_graph_state_and_generated_source_sets_do_not_change_fingerprint
     assert api_module._build_map_semantic_fingerprint(tmp_path, **arguments) != before
 
 
+def test_cluster_generation_setting_changes_only_explicit_build_identity(
+    tmp_path: Path,
+) -> None:
+    arguments = {
+        "note_rows": [],
+        "source_set": {"source_set_id": "workspace", "source_ids": []},
+        "provider": "ollama",
+        "model": "fake-1",
+        "question": None,
+        "navigation": NavigationPolicy(),
+    }
+
+    identities = {
+        api_module._build_map_semantic_fingerprint(
+            tmp_path,
+            **arguments,
+            policy=LiteratureMappingPolicy(cluster_generation_enabled=value),
+        )
+        for value in (None, False, True)
+    }
+
+    assert len(identities) == 3
+
+
 def test_machine_relationship_changes_do_not_invalidate_receipt_but_human_links_do(
     tmp_path: Path,
 ) -> None:
@@ -422,7 +446,7 @@ def test_empty_source_set_still_uses_workspace_membership_guard(
         provider="ollama",
         model="fake-1",
         question=None,
-        policy=LiteratureMappingPolicy(),
+        policy=LiteratureMappingPolicy(cluster_generation_enabled=False),
         navigation=NavigationPolicy(),
         comparison_collection_keys=(),
         source_set={},

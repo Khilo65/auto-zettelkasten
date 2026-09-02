@@ -95,6 +95,62 @@ def test_clean_full_article_html_passes_full_document_gate() -> None:
     assert adequacy.metrics["paragraph_count"] == 4
 
 
+def test_visible_html_preserves_selected_option_despite_footer_purchase() -> None:
+    paragraph = (
+        "This public profile reports comparative reputation measures, rankings, "
+        "and country-specific evidence for interpretation. " * 30
+    )
+    raw_html = f"""
+    <html>
+      <head><meta name="description" content="A compact nation profile summary for public use."></head>
+      <body>
+        <select>
+          <option>France
+          <option selected>Israel
+          <option>Italy
+        </select>
+        <section>
+          <h1>Nation results</h1>
+          <p>{paragraph}</p><p>{paragraph}</p>
+          <p>{paragraph}</p><p>{paragraph}</p>
+        </section>
+        <footer>Purchase FAQs</footer>
+      </body>
+    </html>
+    """
+
+    result = extract_bytes(
+        raw_html.encode(), media_type="text/html", filename="nation.html"
+    )
+
+    assert result.adequacy is not None
+    assert result.adequacy.classification == ContentAdequacyClass.FULL_ARTICLE_HTML
+    assert result.source_scope == "full_document"
+    assert "Selected option: Israel" in result.text
+    assert "Selected option: Israel Italy" not in result.text
+
+
+def test_explicit_abstract_with_long_sidebar_stays_behind_paywall() -> None:
+    abstract = " ".join(["bounded abstract evidence"] * 40)
+    sidebar = " ".join(["related citation navigation"] * 150)
+    raw_html = f"""
+    <html>
+      <head><meta name="citation_abstract" content="{abstract}"></head>
+      <body>
+        <div>{sidebar}</div><div>{sidebar}</div>
+        <div>{sidebar}</div><div>{sidebar}</div>
+        <div>{sidebar}</div><div>Purchase access</div>
+      </body>
+    </html>
+    """
+
+    adequacy = classify_html_content(raw_html)
+
+    assert adequacy.classification == ContentAdequacyClass.ABSTRACT_PAYWALL_HTML
+    assert adequacy.source_scope == "abstract_only"
+    assert adequacy.metrics["explicit_abstract"] is True
+
+
 def test_abstract_paywall_html_stays_limited_when_indexed_chars_are_complete() -> None:
     abstract = "This abstract states the question, method, and one bounded finding without exposing the article body."
     raw_html = f"""
@@ -195,6 +251,10 @@ def test_atomic_note_validator_requires_lineage_and_all_sections() -> None:
     text = render_atomic_note(frontmatter, analysis)
     assert validate_atomic_note(text).passed
     assert "## Key Concepts and Definitions" in text
+    assert "## Source Structure and Organization" in text
+    assert text.rfind("## Source Structure and Organization") > text.rfind(
+        "## Locators"
+    )
     assert "## Strengths and Contributions" in text
     broken = text.replace("a" * 64, "not-a-hash")
     assert "invalid_inspected_content_hash" in validate_atomic_note(broken).errors
@@ -216,15 +276,17 @@ def test_atomic_note_validator_requires_lineage_and_all_sections() -> None:
 
     without_definitions = dict(analysis)
     without_definitions.pop("key_concepts_and_definitions")
-    current_frontmatter = {**frontmatter, "prompt_version": "12"}
-    current_validation = validate_atomic_note(
-        render_atomic_note(current_frontmatter, without_definitions)
+    without_definitions_text = render_atomic_note(frontmatter, without_definitions)
+    assert validate_atomic_note(without_definitions_text).passed
+    assert "## Key Concepts and Definitions" not in without_definitions_text
+
+    without_optional_sections = dict(without_definitions)
+    without_optional_sections.pop("source_structure_and_organization")
+    without_optional_text = render_atomic_note(
+        frontmatter, without_optional_sections
     )
-    assert "missing_section:key-concepts-and-definitions" in current_validation.errors
-    legacy_frontmatter = {**frontmatter, "prompt_version": "11"}
-    assert validate_atomic_note(
-        render_atomic_note(legacy_frontmatter, without_definitions)
-    ).passed
+    assert validate_atomic_note(without_optional_text).passed
+    assert "## Source Structure and Organization" not in without_optional_text
 
 
 def test_atomic_note_validator_requires_lay_explanation_of_statistical_findings() -> None:

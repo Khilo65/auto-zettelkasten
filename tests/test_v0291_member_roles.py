@@ -39,7 +39,7 @@ def _profile(source_id: str) -> dict[str, Any]:
         "title": f"Source {source_id}",
         "thesis": f"Thesis for {source_id}.",
         "methods": ["comparative analysis"],
-        "study_family_id": source_id,
+        "study_family_id": f"study-family-{source_id}",
         "evidence_anchors": [anchor],
         "claims": [anchor],
     }
@@ -122,6 +122,32 @@ def test_writer_roles_survive_validation_and_contributions() -> None:
     assert validated["quality_errors"] == []
 
 
+def test_disconnected_writer_core_roles_fall_back_to_admitted_roles() -> None:
+    profiles = [_profile(source_id) for source_id in ("A", "B", "C")]
+    cluster = {
+        "cluster_id": "cluster-one",
+        "formation_route": "reasoner_debate_family_component",
+        "relationship_first_admission": True,
+        "source_ids": ["A", "B", "C"],
+        "source_roles": [
+            {"source_id": source_id, "role": "core"}
+            for source_id in ("A", "B", "C")
+        ],
+        "family_relations": [
+            {"relation_type": "shared_research_problem", "source_ids": ["A", "B"]},
+            {"relation_type": "shared_research_problem", "source_ids": ["B", "C"]},
+        ],
+    }
+    response = _response(cluster, profiles)
+    response["member_roles"] = {"A": "core", "B": "context", "C": "core"}
+
+    validated = validate_streamlined_cluster_synthesis(response, cluster, profiles)
+
+    assert validated["status"] == "reasoned"
+    assert validated["member_roles"] == {"A": "core", "B": "core", "C": "core"}
+    assert "member_role_connectivity_fallback" in validated["quality_warnings"]
+
+
 def test_missing_or_invalid_writer_roles_fall_back_without_parking() -> None:
     profiles = [_profile(source_id) for source_id in ("A", "B", "C")]
     cluster = {
@@ -181,8 +207,8 @@ def test_writer_roles_propagate_through_registry_round_trip() -> None:
             response = _response(context["cluster"], projected)
             response["member_roles"] = {
                 "A": "core",
-                "B": "context",
-                "C": "bridge",
+                "B": "core",
+                "C": "context",
             }
             return response
 
@@ -203,19 +229,103 @@ def test_writer_roles_propagate_through_registry_round_trip() -> None:
     cluster = report["cluster_registry"]["clusters"][0]
     assert cluster["source_roles"] == [
         {"source_id": "A", "role": "core"},
-        {"source_id": "B", "role": "context"},
-        {"source_id": "C", "role": "bridge"},
+        {"source_id": "B", "role": "core"},
+        {"source_id": "C", "role": "context"},
     ]
+    assert cluster["independent_study_family_count"] == 2
+    assert cluster["effective_evidence_base_count"] == 2
+    assert cluster["core_evidence_base_group_ids"] == sorted(
+        str(row["evidence_base_group_id"])
+        for row in report["profiles"]
+        if row["source_id"] in {"A", "B"}
+    )
+    assert cluster["qualification_status"] == "emerging_cluster"
+    assert cluster["source_backed"] is False
     assert {
         row["source_id"]: row["cluster_role"]
         for row in report["cluster_source_contributions"][cluster["cluster_id"]]
-    } == {"A": "core", "B": "context", "C": "bridge"}
+    } == {"A": "core", "B": "core", "C": "context"}
 
 
-def test_cluster_prompt_requires_member_roles_v35() -> None:
+def test_relationship_first_writer_cannot_drop_connecting_core() -> None:
+    profiles = [_profile(source_id) for source_id in ("A", "B", "C")]
+
+    class Reasoner:
+        name = "local"
+        model = "one"
+
+        def synthesize_cluster(self, projected, request, *, context=None):
+            response = _response(context["cluster"], projected)
+            response["retained_member_ids"] = ["A", "C"]
+            response["member_roles"] = {"A": "core", "C": "core"}
+            response["lines_of_inquiry"][0]["study_findings"] = [
+                row
+                for row in response["lines_of_inquiry"][0]["study_findings"]
+                if row["source_id"] in {"A", "C"}
+            ]
+            return response
+
+    report = build_literature_report(
+        profiles,
+        reasoner=Reasoner(),
+        request=LiteratureMapRequest(Path(".")),
+        source_notes=[
+            {
+                "source_id": source_id,
+                "body": f"# {source_id}\n\n## Thesis\n\nFull note {source_id}.",
+            }
+            for source_id in ("A", "B", "C")
+        ],
+        accepted_relationships=[
+            {
+                "relation_id": f"relationship-{left}-{right}",
+                "source_id": left,
+                "target_source_id": right,
+                "relation_type": "contextual_connection",
+                "provenance": "human_curated",
+                "cluster_evidence_eligible": True,
+                "active": True,
+                "source_evidence": {
+                    "source_id": left,
+                    "evidence_anchor_id": f"anchor-{left}",
+                },
+                "target_evidence": {
+                    "source_id": right,
+                    "evidence_anchor_id": f"anchor-{right}",
+                },
+            }
+            for left, right in (("A", "B"), ("B", "C"))
+        ],
+        shared_literature_plan={
+            "literature_families": [
+                {
+                    "family_id": "family",
+                    "label": "Connected family",
+                    "source_ids": ["A", "B", "C"],
+                    "proposed_roles": {
+                        source_id: "core" for source_id in ("A", "B", "C")
+                    },
+                    "candidate_cluster": True,
+                }
+            ],
+            "discovery_jobs": [],
+            "neighboring_families": [],
+        },
+    )
+
+    synthesis = next(iter(report["cluster_syntheses"].values()))
+    assert synthesis["status"] == "partial"
+    assert "writer_core_relationship_graph_disconnected" in synthesis[
+        "quality_errors"
+    ]
+
+
+def test_cluster_prompt_requires_connected_member_roles_v36() -> None:
     prompt = _cluster_synthesis_system_prompt()
-    assert "prompt v35" in prompt
+    assert "prompt v36" in prompt
     assert "member_roles must map every retained source_id" in prompt
+    assert "at least two core sources connected by accepted relationships" in prompt
+    assert "different instruments, samples, or time windows" in prompt
 
 
 def test_final_roles_reach_reciprocal_membership_relations() -> None:

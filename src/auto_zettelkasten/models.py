@@ -8,10 +8,10 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
-CURRENT_ENGINE_VERSION = "0.29.10"
+CURRENT_ENGINE_VERSION = "0.30.0"
 CURRENT_ARTIFACT_SCHEMA_VERSION = "1.20"
 CURRENT_PROFILE_SCHEMA_VERSION = "1.3"
-CURRENT_ATOMIC_PROMPT_VERSION = "12"
+CURRENT_ATOMIC_PROMPT_VERSION = "14"
 
 
 FAMILY_RELATION_TYPES = frozenset(
@@ -307,6 +307,7 @@ class LiteratureMappingPolicy:
     """Serializable limits and promotion rules for literature synthesis."""
 
     synthesis_enabled: bool = True
+    cluster_generation_enabled: bool | None = None
     require_question: bool = False
     auto_promote_clusters: bool = True
     auto_promote_debates: bool = True
@@ -334,6 +335,16 @@ class LiteratureMappingPolicy:
         ):
             _require_bool(
                 getattr(self, field_name), field=f"literature_mapping.{field_name}"
+            )
+        if self.cluster_generation_enabled is not None:
+            _require_bool(
+                self.cluster_generation_enabled,
+                field="literature_mapping.cluster_generation_enabled",
+            )
+        if not self.synthesis_enabled and self.cluster_generation_enabled is True:
+            raise ValueError(
+                "literature_mapping.cluster_generation_enabled cannot be true "
+                "when synthesis_enabled is false"
             )
         for field_name in ("source_backed_threshold", "profile_workers"):
             _require_positive_int(
@@ -381,7 +392,10 @@ class LiteratureMappingPolicy:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return _jsonable(self)
+        payload = _jsonable(self)
+        if self.cluster_generation_enabled is None:
+            payload.pop("cluster_generation_enabled")
+        return payload
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any] | None) -> LiteratureMappingPolicy:
@@ -394,6 +408,7 @@ class LiteratureMappingPolicy:
             raise ValueError(f"unknown literature_mapping fields: {', '.join(unknown)}")
         return cls(
             synthesis_enabled=values.get("synthesis_enabled", True),
+            cluster_generation_enabled=values.get("cluster_generation_enabled"),
             require_question=values.get("require_question", False),
             auto_promote_clusters=values.get("auto_promote_clusters", True),
             auto_promote_debates=values.get("auto_promote_debates", True),
@@ -617,6 +632,8 @@ class MapRequest:
     question: str | None = None
     provider: str = "deepseek"
     model: str = "deepseek-v4-flash"
+    literature_model: str | None = None
+    reasoning_effort: Literal["medium", "high", "max"] | None = None
     allow_cloud: bool = False
     parallel: int = 4
     provider_concurrency: int | Literal["auto"] | None = None
@@ -687,6 +704,41 @@ class MapRequest:
             raise ValueError("provider cannot be empty")
         if not self.model.strip():
             raise ValueError("model cannot be empty")
+        if not isinstance(self.literature_policy, LiteratureMappingPolicy):
+            if isinstance(self.literature_policy, Mapping):
+                object.__setattr__(
+                    self,
+                    "literature_policy",
+                    LiteratureMappingPolicy.from_dict(self.literature_policy),
+                )
+            else:
+                raise ValueError(
+                    "literature_policy must be a LiteratureMappingPolicy or mapping"
+                )
+        if self.provider == "codex":
+            if self.provider_concurrency is None:
+                object.__setattr__(self, "provider_concurrency", "auto")
+            if self.model not in {"gpt-5.6-luna", "gpt-5.6-sol"}:
+                raise ValueError("Codex source model must be gpt-5.6-luna or gpt-5.6-sol")
+            if self.literature_policy.synthesis_enabled and not self.literature_model:
+                raise ValueError("Codex synthesis requires literature_model")
+            if self.literature_model and self.literature_model not in {
+                "gpt-5.6-terra",
+                "gpt-5.6-sol",
+            }:
+                raise ValueError(
+                    "Codex literature_model must be gpt-5.6-terra or gpt-5.6-sol"
+                )
+            if self.reasoning_effort not in {None, "medium", "high", "max"}:
+                raise ValueError("Codex reasoning_effort must be medium, high, max, or None")
+            if self.max_provider_spend_usd is not None:
+                raise ValueError("Codex subscription use does not support dollar spend caps")
+            if isinstance(self.provider_concurrency, int) and self.provider_concurrency > 32:
+                raise ValueError("Codex provider_concurrency must be between 1 and 32")
+        elif self.literature_model is not None or self.reasoning_effort is not None:
+            raise ValueError(
+                "literature_model and reasoning_effort are supported only by Codex"
+            )
         if not isinstance(self.extraction_policy, ExtractionPolicy):
             if isinstance(self.extraction_policy, Mapping):
                 object.__setattr__(
@@ -705,17 +757,6 @@ class MapRequest:
                 )
             else:
                 raise ValueError("processing must be a ProcessingPolicy or mapping")
-        if not isinstance(self.literature_policy, LiteratureMappingPolicy):
-            if isinstance(self.literature_policy, Mapping):
-                object.__setattr__(
-                    self,
-                    "literature_policy",
-                    LiteratureMappingPolicy.from_dict(self.literature_policy),
-                )
-            else:
-                raise ValueError(
-                    "literature_policy must be a LiteratureMappingPolicy or mapping"
-                )
         if not isinstance(self.navigation_policy, NavigationPolicy):
             if isinstance(self.navigation_policy, Mapping):
                 object.__setattr__(
@@ -731,7 +772,12 @@ class MapRequest:
             raise ValueError("literature_policy requires a question")
 
     def to_dict(self) -> dict[str, Any]:
-        return _jsonable(self)
+        payload = _jsonable(self)
+        payload["literature_policy"] = self.literature_policy.to_dict()
+        if self.provider != "codex":
+            payload.pop("literature_model", None)
+            payload.pop("reasoning_effort", None)
+        return payload
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> MapRequest:
@@ -742,6 +788,8 @@ class MapRequest:
             question=payload.get("question") or None,
             provider=str(payload.get("provider", "deepseek")),
             model=str(payload.get("model", "deepseek-v4-flash")),
+            literature_model=payload.get("literature_model") or None,
+            reasoning_effort=payload.get("reasoning_effort") or None,
             allow_cloud=_strict_bool(
                 payload.get("allow_cloud", False), field="allow_cloud"
             ),
@@ -1724,15 +1772,22 @@ def _canonicalize_anchor_ids(anchors: list[EvidenceAnchor]) -> list[EvidenceAnch
         span_hash = _stable_json_hash(span_identity)
         canonical.append((base, span_hash))
     collisions: dict[str, int] = {}
+    span_collisions: dict[tuple[str, str], int] = {}
     for anchor, _ in canonical:
         collisions[anchor.evidence_anchor_id] = (
             collisions.get(anchor.evidence_anchor_id, 0) + 1
         )
+    for anchor, span_hash in canonical:
+        key = (anchor.evidence_anchor_id, span_hash)
+        span_collisions[key] = span_collisions.get(key, 0) + 1
     result: list[EvidenceAnchor] = []
     for anchor, span_hash in canonical:
         anchor_id = anchor.evidence_anchor_id
         if collisions[anchor_id] > 1:
             anchor_id = f"{anchor_id}-{span_hash[:12]}"
+            if span_collisions[(anchor.evidence_anchor_id, span_hash)] > 1:
+                claim_identity = re.sub(r"\s+", " ", anchor.claim).casefold().strip()
+                anchor_id = f"{anchor_id}-{_stable_json_hash({'claim': claim_identity})[:12]}"
         result.append(
             EvidenceAnchor.from_dict(
                 _anchor_payload_with_bound_nested_ids(anchor, anchor_id)
@@ -2099,6 +2154,11 @@ class SourceAnalysisBundle:
                 self.component_diagnostics,
                 field="source analysis bundle.component_diagnostics",
             ),
+        )
+        object.__setattr__(
+            self,
+            "evidence_anchors",
+            _canonicalize_anchor_ids(list(self.evidence_anchors)),
         )
 
     def semantic_dict(self) -> dict[str, Any]:
@@ -5419,6 +5479,7 @@ class LiteratureMapRequest:
     question: str | None = None
     provider: str = "deepseek"
     model: str = "deepseek-v4-flash"
+    reasoning_effort: Literal["medium", "high", "max"] | None = None
     allow_cloud: bool = False
     provider_concurrency: int | Literal["auto"] = "auto"
     max_provider_spend_usd: Decimal | None = None
@@ -5434,6 +5495,19 @@ class LiteratureMapRequest:
             raise ValueError("provider cannot be empty")
         if not self.model.strip():
             raise ValueError("model cannot be empty")
+        if self.provider == "codex":
+            if self.model not in {"gpt-5.6-terra", "gpt-5.6-sol"}:
+                raise ValueError(
+                    "Codex literature model must be gpt-5.6-terra or gpt-5.6-sol"
+                )
+            if self.reasoning_effort not in {None, "medium", "high", "max"}:
+                raise ValueError("Codex reasoning_effort must be medium, high, max, or None")
+            if self.max_provider_spend_usd is not None:
+                raise ValueError("Codex subscription use does not support dollar spend caps")
+            if isinstance(self.provider_concurrency, int) and self.provider_concurrency > 32:
+                raise ValueError("Codex provider_concurrency must be between 1 and 32")
+        elif self.reasoning_effort is not None:
+            raise ValueError("reasoning_effort is supported only by Codex")
         if self.provider_concurrency != "auto" and (
             isinstance(self.provider_concurrency, bool)
             or not isinstance(self.provider_concurrency, int)
@@ -5486,7 +5560,11 @@ class LiteratureMapRequest:
             raise ValueError("literature_policy requires a question")
 
     def to_dict(self) -> dict[str, Any]:
-        return _jsonable(self)
+        payload = _jsonable(self)
+        payload["literature_policy"] = self.literature_policy.to_dict()
+        if self.provider != "codex":
+            payload.pop("reasoning_effort", None)
+        return payload
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> LiteratureMapRequest:
@@ -5498,6 +5576,7 @@ class LiteratureMapRequest:
             question=payload.get("question") or None,
             provider=str(payload.get("provider", "deepseek")),
             model=str(payload.get("model", "deepseek-v4-flash")),
+            reasoning_effort=payload.get("reasoning_effort") or None,
             allow_cloud=_strict_bool(
                 payload.get("allow_cloud", False), field="allow_cloud"
             ),

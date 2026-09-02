@@ -1,0 +1,1112 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from auto_zettelkasten.api import initialize_workspace
+from auto_zettelkasten.codex_attempt_guard import (
+    CodexAttemptDeny,
+    CodexAttemptStateError,
+    reserve_codex_attempt,
+)
+from auto_zettelkasten.files import append_jsonl, read_yaml, sha256_file, write_yaml
+from auto_zettelkasten.workspace import IncompatibleArtifactSchemaError
+
+
+TOOLS = Path(__file__).parents[1] / "tools"
+sys.path.insert(0, str(TOOLS))
+SPEC = importlib.util.spec_from_file_location(
+    "v030_codex_pdf_eval",
+    TOOLS / "v030_codex_pdf_eval.py",
+)
+assert SPEC and SPEC.loader
+runner = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(runner)
+CODE_COMMIT = "a" * 40
+
+
+def _clean_repo() -> tuple[str, bool]:
+    return CODE_COMMIT, False
+
+
+class _FakeAttemptGuard:
+    def __init__(self, events: list[tuple[Any, ...]]) -> None:
+        self.events = events
+
+    @contextmanager
+    def activate(self) -> Any:
+        self.events.append(("activate",))
+        yield self
+
+    def finish(self, state: str, *, reason: str = "") -> None:
+        self.events.append(("finish", state, reason))
+
+
+def _guard_factory(
+    events: list[tuple[Any, ...]],
+) -> Any:
+    def factory(path: Path, digest: str, **kwargs: Any) -> _FakeAttemptGuard:
+        assert kwargs["evaluation_id"] == "synthetic-four-pdf"
+        assert kwargs["run_id"] == "synthetic-four-pdf-run"
+        assert kwargs["source_attempt_limit"] == 6
+        assert kwargs["relationship_attempt_limit"] == 8
+        assert kwargs["total_attempt_limit"] == 14
+        events.append(
+            (
+                "start",
+                path,
+                digest,
+                kwargs["stage"],
+                kwargs["resume_reason"],
+            )
+        )
+        return _FakeAttemptGuard(events)
+
+    return factory
+
+
+def _authorization(root: Path) -> tuple[Path, str]:
+    path = root / "PRIVATE_AUTHORIZATION.json"
+    path.write_text("{}\n", encoding="utf-8")
+    return path, sha256_file(path)
+
+
+def _manifest(root: Path) -> Path:
+    custody = root / "01_custody" / "files"
+    custody.mkdir(parents=True)
+    initialize_workspace(root)
+    cases = []
+    for index in range(4):
+        parent_key = f"P{index + 1}"
+        attachment_key = f"A{index + 1}"
+        path = custody / f"case-{index + 1}.pdf"
+        path.write_bytes(f"synthetic PDF {index + 1}".encode())
+        image_route = index >= 2
+        cases.append(
+            {
+                "case_id": f"case-{index + 1}",
+                "pdf": str(path.relative_to(root)),
+                "sha256": sha256_file(path),
+                "expected": {
+                    "content_route": (
+                        runner.IMAGE_ROUTE if image_route else runner.TEXT_ROUTE
+                    ),
+                    "selected_pages": [index - 1] if image_route else [],
+                    "audited_facts": [f"Synthetic source {index + 1}"],
+                    "audited_locators": [f"Audited locator {index + 1}"],
+                    "expected_answers": [f"Expected answer {index + 1}"],
+                },
+                "zotero_parent": {
+                    "key": parent_key,
+                    "data": {
+                        "key": parent_key,
+                        "itemType": "journalArticle",
+                        "title": f"Synthetic source {index + 1}",
+                        "date": "2026",
+                        "creators": [],
+                    },
+                },
+                "zotero_attachment": {
+                    "key": attachment_key,
+                    "data": {
+                        "key": attachment_key,
+                        "parentItem": parent_key,
+                        "itemType": "attachment",
+                        "contentType": "application/pdf",
+                        "filename": path.name,
+                    },
+                },
+            }
+        )
+    path = root / "PRIVATE_MANIFEST.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "code_commit": CODE_COMMIT,
+                "evaluation_id": "synthetic-four-pdf",
+                "run_id": "synthetic-four-pdf-run",
+                "workspace": str(root),
+                "question": "How do the four synthetic sources relate?",
+                "cases": cases,
+            },
+            sort_keys=True,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _completion(*, source: bool, contract_id: str) -> dict[str, Any]:
+    model = runner.SOURCE_MODEL if source else runner.RELATIONSHIP_MODEL
+    identity = runner.codex_contract_identity(
+        contract_id, model, runner.REASONING_EFFORT
+    )
+    return {
+        **identity,
+        "codex_cli_version": "0.145.0",
+        "finish_reason": "turn.completed",
+        "max_output_tokens": identity["output_reservation"],
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+    }
+
+
+def _usage_row(number: int, *, source: bool, contract_id: str) -> dict[str, Any]:
+    return {
+        "attempt_id": f"attempt-{source}-{number}",
+        "stage": contract_id,
+        "key": f"key-{number}",
+        "fingerprint": f"fingerprint-{number}",
+        "attempt": 1,
+        "status": "completed",
+        "provider_completion": _completion(source=source, contract_id=contract_id),
+    }
+
+
+def test_four_pdf_source_contract_remains_source_bundle_only() -> None:
+    hierarchical = _usage_row(1, source=True, contract_id="chunk_evidence")
+
+    assert runner._completion_error(hierarchical, source=True) == (
+        "source_contract_mismatch"
+    )
+    assert (
+        runner._completion_error(
+            hierarchical,
+            source=True,
+            settings=runner.GateSettings(kind="raw_e2e"),
+        )
+        == ""
+    )
+
+
+def test_four_pdf_replay_snapshot_covers_every_existing_workspace_artifact(
+    tmp_path: Path,
+) -> None:
+    initialize_workspace(tmp_path)
+    custody_ledger = tmp_path / "01_custody" / "read_attempts.jsonl"
+    custody_ledger.write_text('{"status":"preserved"}\n', encoding="utf-8")
+    evaluation = tmp_path / "11_state" / "evaluations" / "replay.yml"
+    evaluation.parent.mkdir(parents=True)
+    evaluation.write_text("ignored\n", encoding="utf-8")
+    attempt_ledger = tmp_path / runner.FOUR_PDF_GATE.attempt_ledger_name
+    attempt_ledger.write_text("ignored\n", encoding="utf-8")
+
+    snapshot = runner._gate_snapshot(tmp_path)
+
+    assert "auto-zettelkasten.yml" in snapshot
+    assert "01_custody/read_attempts.jsonl" in snapshot
+    assert "11_state/evaluations/replay.yml" in snapshot
+    assert runner.FOUR_PDF_GATE.attempt_ledger_name in snapshot
+
+
+def _preflight(dimensions: list[tuple[int, int]]) -> dict[str, Any]:
+    document_tokens = 100
+    image_tokens = runner._image_token_estimate(dimensions)
+    uncertainty = 16_384
+    return {
+        "document_input_tokens": document_tokens,
+        "image_tokens": image_tokens,
+        "reasoning_reservation_tokens": 32_768,
+        "output_reservation_tokens": 32_768,
+        "uncertainty_tokens": uncertainty,
+        "combined_tokens": (
+            document_tokens + image_tokens + 32_768 + 32_768 + uncertainty
+        ),
+        "ceiling_tokens": 200_000,
+        "admitted": True,
+    }
+
+
+def _write_accepted_run(
+    workspace: Path, request: Any, client: Any, run_id: str
+) -> dict[str, Any]:
+    assert request.provider == "codex"
+    assert request.model == runner.SOURCE_MODEL
+    assert request.literature_model == runner.RELATIONSHIP_MODEL
+    assert request.reasoning_effort == "medium"
+    assert request.provider_concurrency == "auto"
+    assert request.retry_terminal_failures is False
+    assert request.extraction_policy.ocr == "auto"
+    assert request.processing.max_calls_per_document_run == 2
+    assert request.literature_policy.cluster_generation_enabled is False
+    assert request.literature_policy.max_profile_calls == 6
+    assert request.literature_policy.max_synthesis_calls == 8
+    items = client.inventory("library")
+    assert len(items) == 4
+    for item in items:
+        attachment = client.children(item["key"])[0]
+        data, media_type = client.file(attachment["key"])
+        assert data.startswith(b"synthetic PDF")
+        assert media_type == "application/pdf"
+
+    run_root = workspace / "11_state" / "runs" / run_id
+    run_root.mkdir(parents=True, exist_ok=True)
+    (run_root / "inventory.json").write_text(
+        json.dumps(items, sort_keys=True), encoding="utf-8"
+    )
+    note_root = workspace / "02_source_memory" / "notes"
+    profile_root = workspace / "02_source_memory" / "profiles"
+    source_ids = [runner.source_id_for_item(item) for item in items]
+    report_items = []
+    for index, source_id in enumerate(source_ids, 1):
+        parent_key = f"P{index}"
+        case = client._by_parent[parent_key]
+        item_root = run_root / "items" / parent_key
+        item_root.mkdir(parents=True, exist_ok=True)
+        route = str(case["expected_route"])
+        write_yaml(
+            item_root / "frozen_content.yml",
+            {
+                "checkpoint_version": "1",
+                "text_hash": "0" * 64,
+                "captured_at": "synthetic",
+                "content_hash": case["sha256"],
+                "source_file": str(case["path"]),
+                "content_route": route,
+                "media_type": "application/pdf",
+                "source_scope": "full_document",
+            },
+        )
+        (item_root / "source.txt").write_text("", encoding="utf-8")
+        if route == runner.IMAGE_ROUTE:
+            pages = list(case["expected_selected_pages"])
+            dimensions = [(1_024, 1_024)]
+            preflight = _preflight(dimensions)
+            probe_pages = [
+                {
+                    "page_number": page_number,
+                    "printed_page": str(page_number),
+                    "width": 1_024,
+                    "height": 1_024,
+                    "embedded_text_sha256": "0" * 64,
+                    "embedded_char_count": 0,
+                    "embedded_word_count": 0,
+                    "text_quality": "empty",
+                    "resource_types": ["image"],
+                    "resource_count": 1,
+                    "xobject_count": 1,
+                    "image_count": 1,
+                    "suspicious": page_number in pages,
+                    "visually_consequential": page_number in pages,
+                    "render_candidate": page_number in pages,
+                    "error_type": "",
+                }
+                for page_number in range(1, pages[0] + 1)
+            ]
+            identity = {
+                "route_version": "1",
+                "route": runner.IMAGE_ROUTE,
+                "custody_file": str(case["path"]),
+                "custody_sha256": case["sha256"],
+                "selected_pages": pages,
+                "render_policy": {
+                    "format": "png",
+                    "maximum_side": 2_048,
+                    "maximum_pages": 16,
+                    "enlargement": False,
+                },
+                "attachment_capability": (
+                    runner.codex_source_bundle_attachment_identity()
+                ),
+                "probe_evidence": {
+                    "status": "succeeded",
+                    "reason": "synthetic",
+                    "custody_byte_count": case["path"].stat().st_size,
+                    "page_count": len(probe_pages),
+                    "suspicious_pages": pages,
+                    "render_candidate_pages": pages,
+                    "pages": probe_pages,
+                },
+                "projected_preflight": preflight,
+            }
+            write_yaml(
+                item_root / "document_route.yml",
+                {
+                    "identity_payload": identity,
+                    "identity": runner.stable_hash(identity),
+                    "rendered_images": [
+                        {
+                            "page_number": pages[0],
+                            "sha256": f"{index}" * 64,
+                            "media_type": "image/png",
+                            "width": 1_024,
+                            "height": 1_024,
+                            "byte_count": 1_024,
+                            "renderer": "synthetic",
+                            "renderer_version": "1",
+                            "render_policy_version": "1",
+                        }
+                    ],
+                    "actual_preflight": preflight,
+                    "recovery": {"state": "not_selected"},
+                },
+            )
+        note_path = note_root / f"note-{index}.md"
+        related = []
+        if index == 1:
+            related = [{"note_id": "note-2"}]
+        elif index == 2:
+            related = [{"note_id": "note-1"}]
+        note_path.parent.mkdir(parents=True, exist_ok=True)
+        note_path.write_text(
+            "---\n"
+            + f"source_id: {source_id}\n"
+            + f"note_id: note-{index}\n"
+            + "related_notes: "
+            + json.dumps(related)
+            + "\n---\n"
+            + f"# Synthetic source {index}\n\n"
+            + f"Audited locator {index}. Expected answer {index}.\n",
+            encoding="utf-8",
+        )
+        write_yaml(
+            profile_root / f"note-{index}.yml",
+            {
+                "profile_schema_version": "1",
+                "profile": {"source_id": source_id, "note_id": f"note-{index}"},
+            },
+        )
+        report_items.append(
+            {
+                "source_id": source_id,
+                "note_id": f"note-{index}",
+                "note_path": str(note_path.relative_to(workspace)),
+                "terminal_status": "validated_note",
+            }
+        )
+
+    relation = {
+        "relation_id": "synthetic-relation",
+        "source_id": source_ids[0],
+        "target_source_id": source_ids[1],
+        "relation_type": "complements",
+        "decision_status": "accepted",
+        "active": True,
+    }
+    write_yaml(
+        workspace / "02_source_memory" / "indexes" / "typed_links.yml",
+        {
+            "relations": [relation],
+            "links": [relation],
+            "pair_decisions": [],
+            "current_pair_decisions": [
+                {"source_ids": source_ids[:2], "status": "accepted"}
+            ],
+        },
+    )
+    write_yaml(
+        workspace / "02_source_memory" / "indexes" / "relationship_selection_state.yml",
+        {
+            "relationship_stage_complete": True,
+            "relationship_discovery_status": "complete",
+            "relationship_discovery_incomplete_jobs": [],
+        },
+    )
+    source_rows = [
+        _usage_row(index, source=True, contract_id="source_bundle")
+        for index in range(1, 5)
+    ]
+    source_usage = run_root / "literature" / "profiles" / "provider_usage.yml"
+    write_yaml(
+        source_usage,
+        {
+            "max_calls": 6,
+            "provider_call_count": len(source_rows),
+            "attempts": source_rows,
+        },
+    )
+    for row in source_rows:
+        append_jsonl(
+            source_usage.with_name("provider_events.jsonl"),
+            {"event_id": f"reserved-{row['attempt_id']}", "event_type": "reserved"},
+        )
+        append_jsonl(
+            source_usage.with_name("provider_events.jsonl"),
+            {"event_id": f"finished-{row['attempt_id']}", "event_type": "finished"},
+        )
+    relationship_rows = [
+        _usage_row(
+            1,
+            source=False,
+            contract_id="relationship_candidate_selection",
+        ),
+        _usage_row(2, source=False, contract_id="bridge_shard_selection"),
+        _usage_row(3, source=False, contract_id="relationship_adjudication"),
+    ]
+    write_yaml(
+        run_root / "literature" / "synthesis" / "provider_usage.yml",
+        {
+            "max_calls": 8,
+            "provider_call_count": len(relationship_rows),
+            "attempts": relationship_rows,
+        },
+    )
+    report = {
+        "status": "completed",
+        "inventory_count": 4,
+        "validated_note_count": 4,
+        "profile_count": 4,
+        "profile_valid_count": 4,
+        "profile_excluded_count": 0,
+        "items": report_items,
+        "cluster_map": {
+            "status": "clusters_preserved_not_updated",
+            "clusters": [],
+            "preserved_clusters": [],
+        },
+        "gap_map": {
+            "status": "clusters_preserved_not_updated",
+            "gap_candidates": [],
+        },
+        "cluster_count": 0,
+        "mapped_gap_count": 0,
+        "source_provider_call_count": 4,
+        "literature_provider_call_count": 3,
+        "synthesis_call_count": 3,
+        "provider_call_count": 7,
+    }
+    write_yaml(run_root / "run_report.yml", report)
+    return report
+
+
+def test_hash_and_execute_refusals_precede_map_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert (
+        runner.run_gate.__kwdefaults__["attempt_guard_factory"].__func__
+        is runner.CodexCampaignGuard.start.__func__
+    )
+    manifest = _manifest(tmp_path / "private")
+    called = False
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal called
+        called = True
+        raise AssertionError("map must not run")
+
+    with pytest.raises(ValueError, match="manifest SHA-256 mismatch"):
+        runner.run_gate(
+            mode="run",
+            manifest_path=manifest,
+            manifest_sha256="0" * 64,
+            execute=True,
+            map_runner=forbidden,
+        )
+    with pytest.raises(PermissionError, match="execute=True"):
+        runner.run_gate(
+            mode="run",
+            manifest_path=manifest,
+            manifest_sha256=sha256_file(manifest),
+            map_runner=forbidden,
+        )
+    with pytest.raises(ValueError, match="does not match git HEAD"):
+        runner.run_gate(
+            mode="run",
+            manifest_path=manifest,
+            manifest_sha256=sha256_file(manifest),
+            execute=True,
+            map_runner=forbidden,
+            repository_probe=lambda: ("b" * 40, False),
+        )
+    with pytest.raises(ValueError, match="clean release worktree"):
+        runner.run_gate(
+            mode="run",
+            manifest_path=manifest,
+            manifest_sha256=sha256_file(manifest),
+            execute=True,
+            map_runner=forbidden,
+            repository_probe=lambda: (CODE_COMMIT, True),
+        )
+    monkeypatch.setattr(runner, "_repository_state", _clean_repo)
+    with pytest.raises(ValueError, match="require authorization_path"):
+        runner.run_gate(
+            mode="run",
+            manifest_path=manifest,
+            manifest_sha256=sha256_file(manifest),
+            execute=True,
+            map_runner=forbidden,
+            repository_probe=runner._repository_state,
+        )
+    assert not called
+
+
+def test_prepare_rejects_uninitialized_workspace(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path / "private")
+    (manifest.parent / "11_state" / "workspace_manifest.yml").unlink()
+
+    with pytest.raises(IncompatibleArtifactSchemaError, match="workspace manifest"):
+        runner.run_gate(
+            mode="prepare",
+            manifest_path=manifest,
+            manifest_sha256=sha256_file(manifest),
+        )
+
+
+def test_prepare_run_and_exact_replay_are_provider_free(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(tmp_path / "private")
+    digest = sha256_file(manifest)
+    authorization, authorization_sha256 = _authorization(manifest.parent)
+    guard_events: list[tuple[Any, ...]] = []
+    prepare_path, prepared = runner.run_gate(
+        mode="prepare",
+        manifest_path=manifest,
+        manifest_sha256=digest,
+    )
+    assert prepared["status"] == "prepared"
+    assert prepare_path.stat().st_mode & 0o777 == 0o600
+
+    calls: list[tuple[bool, bool]] = []
+
+    def fake_map(
+        request: Any,
+        *,
+        client: Any,
+        run_id: str,
+        resume: bool,
+        reader: Any = None,
+        literature_reasoner: Any = None,
+    ) -> Any:
+        guarded = isinstance(reader, runner._ReplayCodexReader) and isinstance(
+            literature_reasoner, runner._ReplayCodexReader
+        )
+        calls.append((resume, guarded))
+        if not resume:
+            assert reader is None and literature_reasoner is None
+            return _write_accepted_run(Path(request.workspace), request, client, run_id)
+        assert guarded
+        dynamically_created = runner.CodexReader(
+            runner.SOURCE_MODEL,
+            allow_cloud=True,
+            reasoning_effort=runner.REASONING_EFFORT,
+        )
+        assert isinstance(dynamically_created.attempt_guard, CodexAttemptDeny)
+        with pytest.raises(CodexAttemptStateError, match="forbidden"):
+            reserve_codex_attempt(
+                dynamically_created.attempt_guard,
+                contract_id="source_bundle",
+            )
+        return read_yaml(
+            Path(request.workspace) / "11_state" / "runs" / run_id / "run_report.yml"
+        )
+
+    run_path, first = runner.run_gate(
+        mode="run",
+        manifest_path=manifest,
+        manifest_sha256=digest,
+        authorization_path=authorization,
+        authorization_sha256=authorization_sha256,
+        execute=True,
+        map_runner=fake_map,
+        repository_probe=_clean_repo,
+        attempt_guard_factory=_guard_factory(guard_events),
+    )
+    assert first["status"] == "passed"
+    assert first["source_attempt_count"] == 4
+    assert first["relationship_attempt_count"] == 3
+    assert first["total_attempt_count"] == 7
+    assert first["private_expectation_check_count"] == 12
+    assert first["attempt_reservation_state"] == "accepted"
+    assert run_path.is_file()
+    ledger_path = manifest.parent / runner._ATTEMPT_LEDGER_NAME
+    ledger_before = ledger_path.read_bytes()
+    ledger_mtime_before = ledger_path.stat().st_mtime_ns
+    ledger = json.loads(ledger_before)
+    assert ledger["state"] == "accepted"
+    assert ledger["source_reserved"] == 6
+    assert ledger["relationship_reserved"] == 8
+    assert ledger["total_reserved"] == 14
+
+    with pytest.raises(ValueError, match="reservation is already consumed"):
+        runner.run_gate(
+            mode="run",
+            manifest_path=manifest,
+            manifest_sha256=digest,
+            authorization_path=authorization,
+            authorization_sha256=authorization_sha256,
+            execute=True,
+            map_runner=fake_map,
+            repository_probe=_clean_repo,
+            attempt_guard_factory=_guard_factory(guard_events),
+        )
+
+    replay_path, replay = runner.run_gate(
+        mode="replay",
+        manifest_path=manifest,
+        manifest_sha256=digest,
+        execute=True,
+        map_runner=fake_map,
+        repository_probe=_clean_repo,
+    )
+    assert calls == [(False, False), (True, True)]
+    assert replay["status"] == "passed"
+    assert replay["exact_zero_call_replay"] is True
+    assert replay["semantic_changed_paths"] == []
+    assert replay["semantic_file_count"] > 0
+    assert replay_path.is_file()
+    assert ledger_path.read_bytes() == ledger_before
+    assert ledger_path.stat().st_mtime_ns == ledger_mtime_before
+    assert guard_events == [
+        (
+            "start",
+            authorization,
+            authorization_sha256,
+            runner.ATTEMPT_GUARD_STAGE,
+            None,
+        ),
+        ("activate",),
+        ("finish", "passed", ""),
+    ]
+
+
+def test_typed_timeout_pauses_and_resume_uses_the_same_reservation(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(tmp_path / "private")
+    digest = sha256_file(manifest)
+    authorization, authorization_sha256 = _authorization(manifest.parent)
+    guard_events: list[tuple[Any, ...]] = []
+    calls: list[bool] = []
+
+    def fake_map(request: Any, *, client: Any, run_id: str, resume: bool) -> Any:
+        calls.append(resume)
+        if not resume:
+            run_root = Path(request.workspace) / "11_state" / "runs" / run_id
+            run_root.mkdir(parents=True)
+            (run_root / "inventory.json").write_text("[]\n", encoding="utf-8")
+            raise runner.ProviderTimeout("private diagnostic must not be reported")
+        return _write_accepted_run(Path(request.workspace), request, client, run_id)
+
+    _, paused = runner.run_gate(
+        mode="run",
+        manifest_path=manifest,
+        manifest_sha256=digest,
+        authorization_path=authorization,
+        authorization_sha256=authorization_sha256,
+        execute=True,
+        map_runner=fake_map,
+        repository_probe=_clean_repo,
+        attempt_guard_factory=_guard_factory(guard_events),
+    )
+    assert paused["status"] == "paused"
+    assert paused["paused_by"] == "timeout"
+    assert paused["error_type"] == "ProviderTimeout"
+    assert "private diagnostic" not in json.dumps(paused)
+    assert (
+        json.loads(
+            (manifest.parent / runner._ATTEMPT_LEDGER_NAME).read_text(encoding="utf-8")
+        )["state"]
+        == "paused"
+    )
+
+    _, resumed = runner.run_gate(
+        mode="resume",
+        manifest_path=manifest,
+        manifest_sha256=digest,
+        authorization_path=authorization,
+        authorization_sha256=authorization_sha256,
+        execute=True,
+        map_runner=fake_map,
+        repository_probe=_clean_repo,
+        attempt_guard_factory=_guard_factory(guard_events),
+    )
+    assert calls == [False, True]
+    assert resumed["status"] == "passed"
+    assert resumed["attempt_reservation_state"] == "accepted"
+    assert guard_events == [
+        (
+            "start",
+            authorization,
+            authorization_sha256,
+            runner.ATTEMPT_GUARD_STAGE,
+            None,
+        ),
+        ("activate",),
+        ("finish", "paused", "timeout"),
+        (
+            "start",
+            authorization,
+            authorization_sha256,
+            runner.ATTEMPT_GUARD_STAGE,
+            "timeout",
+        ),
+        ("activate",),
+        ("finish", "passed", ""),
+    ]
+
+
+def test_abandoned_running_reservation_resumes_as_interruption(
+    tmp_path: Path,
+) -> None:
+    manifest_path = _manifest(tmp_path / "private")
+    manifest_sha256 = sha256_file(manifest_path)
+    authorization, authorization_sha256 = _authorization(manifest_path.parent)
+    manifest, cases, workspace = runner._validated_manifest(
+        manifest_path, manifest_sha256
+    )
+    run_id = str(manifest["run_id"])
+    run_root = workspace / "11_state" / "runs" / run_id
+    run_root.mkdir(parents=True)
+    (run_root / "inventory.json").write_text("[]\n", encoding="utf-8")
+    runner._begin_attempt_reservation(
+        workspace,
+        runner._ledger_identity(manifest, manifest_sha256),
+        mode="run",
+        source_count=0,
+        relationship_count=0,
+    )
+    guard_events: list[tuple[Any, ...]] = []
+
+    def fake_map(
+        request: Any, *, client: Any, run_id: str, resume: bool
+    ) -> dict[str, Any]:
+        assert resume is True
+        return _write_accepted_run(Path(request.workspace), request, client, run_id)
+
+    _, report = runner.run_gate(
+        mode="resume",
+        manifest_path=manifest_path,
+        manifest_sha256=manifest_sha256,
+        authorization_path=authorization,
+        authorization_sha256=authorization_sha256,
+        execute=True,
+        map_runner=fake_map,
+        repository_probe=_clean_repo,
+        attempt_guard_factory=_guard_factory(guard_events),
+    )
+
+    assert len(cases) == 4
+    assert report["status"] == "passed"
+    assert guard_events == [
+        (
+            "start",
+            authorization,
+            authorization_sha256,
+            runner.ATTEMPT_GUARD_STAGE,
+            "interruption",
+        ),
+        ("activate",),
+        ("finish", "passed", ""),
+    ]
+
+
+def test_acceptance_rejects_relationship_endpoint_outside_four_sources(
+    tmp_path: Path,
+) -> None:
+    manifest_path = _manifest(tmp_path / "private")
+    manifest, cases, workspace = runner._validated_manifest(
+        manifest_path, sha256_file(manifest_path)
+    )
+    request = runner._request(manifest, workspace)
+    client = runner.ManifestZoteroClient(cases)
+    report = _write_accepted_run(workspace, request, client, str(manifest["run_id"]))
+    path = workspace / "02_source_memory" / "indexes" / "typed_links.yml"
+    registry = read_yaml(path)
+    registry["relations"][0]["target_source_id"] = "source-outside-gate"
+    write_yaml(path, registry)
+
+    errors, _ = runner._acceptance(workspace, str(manifest["run_id"]), cases, report)
+
+    assert "relationship_endpoint_outside_gate" in errors
+
+
+def test_acceptance_allows_complete_empty_relationship_discovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_path = _manifest(tmp_path / "private")
+    manifest_sha256 = sha256_file(manifest_path)
+    manifest, cases, workspace = runner._validated_manifest(
+        manifest_path, manifest_sha256
+    )
+    request = runner._request(manifest, workspace)
+    client = runner.ManifestZoteroClient(cases)
+    run_id = str(manifest["run_id"])
+    report = _write_accepted_run(workspace, request, client, run_id)
+    write_yaml(
+        workspace / "02_source_memory" / "indexes" / "typed_links.yml",
+        {
+            "relations": [],
+            "links": [],
+            "pair_decisions": [],
+            "current_pair_decisions": [],
+        },
+    )
+    usage_path = (
+        workspace
+        / "11_state"
+        / "runs"
+        / run_id
+        / "literature"
+        / "synthesis"
+        / "provider_usage.yml"
+    )
+    usage = read_yaml(usage_path)
+    usage["attempts"] = usage["attempts"][:2]
+    usage["provider_call_count"] = 2
+    write_yaml(usage_path, usage)
+    report.update(
+        literature_provider_call_count=2,
+        synthesis_call_count=2,
+        provider_call_count=6,
+    )
+    write_yaml(workspace / "11_state" / "runs" / run_id / "run_report.yml", report)
+
+    errors, acceptance = runner._acceptance(workspace, run_id, cases, report)
+
+    assert errors == []
+    assert acceptance["relationship_attempt_count"] == 2
+
+    state_path = (
+        workspace
+        / "02_source_memory"
+        / "indexes"
+        / "relationship_selection_state.yml"
+    )
+    state = read_yaml(state_path)
+    state["selected_candidates"] = [{"source_ids": ["source-a", "source-b"]}]
+    write_yaml(state_path, state)
+    selected_errors, _ = runner._acceptance(workspace, run_id, cases, report)
+    assert "required_relationship_contracts_missing" in selected_errors
+    state["selected_candidates"] = []
+    write_yaml(state_path, state)
+
+    identity = runner._ledger_identity(manifest, manifest_sha256)
+    runner._begin_attempt_reservation(
+        workspace,
+        identity,
+        mode="run",
+        source_count=0,
+        relationship_count=0,
+    )
+    runner._finish_attempt_reservation(
+        workspace,
+        identity,
+        state="failed",
+        source_count=4,
+        relationship_count=2,
+    )
+    ledger_path = workspace / runner._ATTEMPT_LEDGER_NAME
+    ledger_before = ledger_path.read_bytes()
+
+    def fake_resume(
+        root: Path,
+        resumed_run_id: str,
+        *,
+        client: Any,
+        reader: Any,
+        literature_reasoner: Any,
+    ) -> Any:
+        del client
+        assert root == workspace
+        assert resumed_run_id == run_id
+        assert isinstance(reader, runner._ReplayCodexReader)
+        assert isinstance(literature_reasoner, runner._ReplayCodexReader)
+        return read_yaml(
+            workspace / "11_state" / "runs" / resumed_run_id / "run_report.yml"
+        )
+
+    monkeypatch.setattr(runner, "resume_map", fake_resume)
+    _, revalidated = runner.run_gate(
+        mode="revalidate",
+        manifest_path=manifest_path,
+        manifest_sha256=manifest_sha256,
+        execute=True,
+        repository_probe=_clean_repo,
+    )
+
+    assert revalidated["status"] == "passed"
+    assert revalidated["attempt_reservation_state"] == "failed_preserved"
+    assert revalidated["exact_zero_call_replay"] is True
+    assert revalidated["semantic_changed_paths"] == []
+    assert ledger_path.read_bytes() == ledger_before
+
+
+def test_cumulative_attempt_history_uses_latest_logical_outcome(tmp_path: Path) -> None:
+    manifest_path = _manifest(tmp_path / "private")
+    manifest, cases, workspace = runner._validated_manifest(
+        manifest_path, sha256_file(manifest_path)
+    )
+    request = runner._request(manifest, workspace)
+    client = runner.ManifestZoteroClient(cases)
+    run_id = str(manifest["run_id"])
+    report = _write_accepted_run(workspace, request, client, run_id)
+    report["historical_provider_failures"] = [{"error_type": "ProviderTimeout"}]
+    usage_path = (
+        workspace
+        / "11_state"
+        / "runs"
+        / run_id
+        / "literature"
+        / "synthesis"
+        / "provider_usage.yml"
+    )
+    usage = read_yaml(usage_path)
+    completed = {**usage["attempts"][0], "attempt_id": "candidate-2", "attempt": 2}
+    failed = {
+        "attempt_id": "candidate-1",
+        "stage": completed["stage"],
+        "key": completed["key"],
+        "fingerprint": completed["fingerprint"],
+        "attempt": 1,
+        "status": "failed",
+        "failure_class": "timeout",
+        "error_type": "ProviderTimeout",
+        "provider_completion": {},
+    }
+    rows = [failed, completed, *usage["attempts"][1:]]
+
+    def persist() -> tuple[list[str], list[dict[str, Any]]]:
+        usage["attempts"] = rows
+        usage["provider_call_count"] = len(rows)
+        write_yaml(usage_path, usage)
+        report.update(
+            literature_provider_call_count=len(rows),
+            synthesis_call_count=len(rows),
+            provider_call_count=4 + len(rows),
+        )
+        write_yaml(workspace / "11_state" / "runs" / run_id / "run_report.yml", report)
+        errors, _ = runner._acceptance(workspace, run_id, cases, report)
+        source, relationship = runner._attempts(workspace, run_id)
+        return errors, [*source["rows"], *relationship["rows"]]
+
+    errors, attempts = persist()
+    assert errors == []
+    assert runner._pause_reason(report, attempts) == ""
+
+    failed.update(
+        failure_class="isolation",
+        error_type="ProviderIsolationFailure",
+    )
+    errors, attempts = persist()
+    assert "unfinished_relationship_attempt" in errors
+    assert runner._pause_reason(report, attempts) == ""
+
+    failed.update(failure_class="timeout", error_type="ProviderTimeout")
+    rows.append(
+        {
+            **failed,
+            "attempt_id": "candidate-3",
+            "attempt": 3,
+            "status": "interrupted",
+            "failure_class": "transport",
+            "error_type": "InterruptedProviderAttempt",
+            "transport_kind": "interrupted_process",
+            "retry_on_resume": True,
+        }
+    )
+    errors, attempts = persist()
+    assert "unfinished_relationship_attempt" in errors
+    assert runner._pause_reason(report, attempts) == "interruption"
+
+    rows.append({**completed, "attempt_id": "candidate-4", "attempt": 4})
+    errors, attempts = persist()
+    assert errors == []
+    assert runner._pause_reason(report, attempts) == ""
+
+
+def test_expected_answer_matching_accepts_one_span_paraphrases() -> None:
+    spans = [
+        runner._normalized_text(
+            "The auxiliary sensor is one small but critical part of the broader "
+            "control system."
+        ),
+        runner._normalized_text(
+            "A watchdog is a limited but critical component of fault recovery."
+        ),
+        runner._normalized_text(
+            "The weaker form of checksum validation permits different seed values."
+        ),
+    ]
+    text = runner._normalized_text("\n".join(spans))
+
+    assert runner._answer_matches(text, spans, "part of broader control system")
+    assert runner._answer_matches(text, spans, "part of fault recovery")
+    assert runner._answer_matches(text, spans, "weaker than checksum validation")
+    assert not runner._answer_matches(text, spans, "critical checksum validation")
+
+
+def test_private_locator_matching_accepts_numbered_ranges_without_prefix_collisions(
+    tmp_path: Path,
+) -> None:
+    source_id = "source-zotero-synth001"
+    note_path = tmp_path / "synthetic-report.md"
+    note_path.write_text(
+        "Instrument calibration completed.\n\n"
+        "## Locators\n\nSupplied page image: numbered clauses 1–3.\n\n"
+        "The system resumes nominal operation.\n",
+        encoding="utf-8",
+    )
+    errors, passed = runner._private_expectation_errors(
+        [
+            {
+                "case_id": "synthetic-image-page",
+                "parent": {"key": "SYNTH001"},
+                "expectations": {
+                    "audited_facts": {
+                        "all_of": ["instrument calibration completed"],
+                        "any_of": [],
+                    },
+                    "audited_locators": {
+                        "all_of": [],
+                        "any_of": ["Clause 1"],
+                    },
+                    "expected_answers": {
+                        "all_of": [],
+                        "any_of": ["resumes nominal operation"],
+                    },
+                },
+            }
+        ],
+        {source_id: note_path},
+    )
+
+    assert errors == []
+    assert passed == 3
+    assert not runner._locator_matches(
+        runner._normalized_text("Page 10 and clause 10"), "page 1"
+    )
+    assert not runner._locator_matches(
+        runner._normalized_text("Page 10 and clause 10"), "clause 1"
+    )
+    assert runner._locator_matches(runner._normalized_text("p. 1"), "page 1")
+    assert runner._locator_matches(runner._normalized_text("pp. 1–3"), "page 2")
+    assert not runner._locator_matches(runner._normalized_text("p. 10"), "page 1")
+    for text in ("p1", "p 1", "page1"):
+        assert not runner._locator_matches(runner._normalized_text(text), "page 1")
+
+
+def test_acceptance_rejects_malformed_codex_usage_telemetry(tmp_path: Path) -> None:
+    manifest_path = _manifest(tmp_path / "private")
+    manifest, cases, workspace = runner._validated_manifest(
+        manifest_path, sha256_file(manifest_path)
+    )
+    request = runner._request(manifest, workspace)
+    client = runner.ManifestZoteroClient(cases)
+    run_id = str(manifest["run_id"])
+    report = _write_accepted_run(workspace, request, client, run_id)
+    usage_path = (
+        workspace
+        / "11_state"
+        / "runs"
+        / run_id
+        / "literature"
+        / "profiles"
+        / "provider_usage.yml"
+    )
+    usage = read_yaml(usage_path)
+    usage["attempts"][0]["provider_completion"]["usage"]["input_tokens"] = True
+    write_yaml(usage_path, usage)
+
+    errors, _ = runner._acceptance(workspace, run_id, cases, report)
+
+    assert "provider_usage_invalid" in errors

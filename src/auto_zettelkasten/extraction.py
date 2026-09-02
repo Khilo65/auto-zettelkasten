@@ -1,18 +1,22 @@
 from __future__ import annotations
 
+import hashlib
 import html
+import importlib.metadata
 import io
+import math
 import mimetypes
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Callable, Literal, Mapping
+from typing import Any, Callable, Literal, Mapping, Sequence
 
 
 SourceScope = Literal[
@@ -66,6 +70,8 @@ ACCESS_MARKERS = (
 _ARTICLE_SECTION_MARKERS = ("introduction", "methods", "methodology", "results", "discussion", "conclusion")
 _ABSTRACT_META_NAMES = ("citation_abstract", "dc.description", "dcterms.abstract", "prism.abstract")
 _DESCRIPTION_META_NAMES = ("description", "og:description", "twitter:description")
+# ponytail: global PDFium lock; use a renderer process if PDF-heavy throughput becomes limiting.
+_PDFIUM_RENDER_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +129,132 @@ class ExtractionResult:
         return dict(self.adequacy.metrics or {}) if self.adequacy else {}
 
 
+PDFPageTextQuality = Literal[
+    "good",
+    "partial",
+    "image_only",
+    "suspicious",
+    "corrupted",
+    "encrypted_or_unavailable",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class PDFPageEvidence:
+    page_number: int
+    printed_page: str
+    width: int
+    height: int
+    embedded_text: str
+    embedded_text_sha256: str
+    embedded_char_count: int
+    embedded_word_count: int
+    text_quality: PDFPageTextQuality
+    resource_types: tuple[str, ...]
+    resource_count: int
+    xobject_count: int
+    image_count: int
+    suspicious: bool
+    visually_consequential: bool
+    render_candidate: bool
+    error_type: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "page_number": self.page_number,
+            "printed_page": self.printed_page,
+            "width": self.width,
+            "height": self.height,
+            "embedded_text": self.embedded_text,
+            "embedded_text_sha256": self.embedded_text_sha256,
+            "embedded_char_count": self.embedded_char_count,
+            "embedded_word_count": self.embedded_word_count,
+            "text_quality": self.text_quality,
+            "resource_types": list(self.resource_types),
+            "resource_count": self.resource_count,
+            "xobject_count": self.xobject_count,
+            "image_count": self.image_count,
+            "suspicious": self.suspicious,
+            "visually_consequential": self.visually_consequential,
+            "render_candidate": self.render_candidate,
+            "error_type": self.error_type,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class PDFStructuralProbe:
+    status: Literal["succeeded", "partial", "failed"]
+    reason: str
+    media_type: str
+    custody_sha256: str
+    custody_byte_count: int
+    page_count: int
+    pages: tuple[PDFPageEvidence, ...]
+    embedded_text: str
+    adequacy: ContentAdequacy | None
+    document_analysis: Mapping[str, Any]
+    suspicious_pages: tuple[int, ...]
+    render_candidate_pages: tuple[int, ...]
+    page_labels: tuple[str, ...]
+
+    @property
+    def embedded_pages(self) -> tuple[str, ...]:
+        return tuple(page.embedded_text for page in self.pages)
+
+    @property
+    def page_errors(self) -> tuple[tuple[int, str], ...]:
+        return tuple(
+            (page.page_number, page.error_type)
+            for page in self.pages
+            if page.error_type
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "reason": self.reason,
+            "media_type": self.media_type,
+            "custody_sha256": self.custody_sha256,
+            "custody_byte_count": self.custody_byte_count,
+            "page_count": self.page_count,
+            "pages": [page.to_dict() for page in self.pages],
+            "embedded_text": self.embedded_text,
+            "adequacy": self.adequacy.to_dict() if self.adequacy else None,
+            "document_analysis": dict(self.document_analysis),
+            "suspicious_pages": list(self.suspicious_pages),
+            "render_candidate_pages": list(self.render_candidate_pages),
+            "page_labels": list(self.page_labels),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class PDFPageImage:
+    page_number: int
+    path: Path
+    media_type: str
+    width: int
+    height: int
+    sha256: str
+    byte_count: int
+    renderer: str
+    renderer_version: str
+    render_policy_version: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "page_number": self.page_number,
+            "path": str(self.path),
+            "media_type": self.media_type,
+            "width": self.width,
+            "height": self.height,
+            "sha256": self.sha256,
+            "byte_count": self.byte_count,
+            "renderer": self.renderer,
+            "renderer_version": self.renderer_version,
+            "render_policy_version": self.render_policy_version,
+        }
+
+
 class _HTMLTextExtractor(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
@@ -138,10 +270,13 @@ class _HTMLTextExtractor(HTMLParser):
         self.article_paragraph_count = 0
         self.heading_count = 0
         self.article_heading_count = 0
+        self.selected_option_parts: list[str] | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
         attributes = {str(key).casefold(): str(value or "") for key, value in attrs}
+        if tag == "option":
+            self._finish_selected_option()
         if tag in {"script", "style", "noscript"}:
             self.hidden_depth += 1
         if tag == "meta":
@@ -149,6 +284,10 @@ class _HTMLTextExtractor(HTMLParser):
             content = attributes.get("content", "").strip()
             if name and content and name not in self.meta:
                 self.meta[name] = content
+        if tag == "option" and any(
+            str(key).casefold() == "selected" for key, _value in attrs
+        ):
+            self.selected_option_parts = []
         if tag in {"article", "main"}:
             self.article_depth += 1
             self.has_article_container = True
@@ -172,6 +311,8 @@ class _HTMLTextExtractor(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
+        if tag in {"option", "select"}:
+            self._finish_selected_option()
         if tag in {"script", "style", "noscript"} and self.hidden_depth:
             self.hidden_depth -= 1
         if self._abstract_containers and tag == self._abstract_containers[-1]:
@@ -182,10 +323,29 @@ class _HTMLTextExtractor(HTMLParser):
     def handle_data(self, data: str) -> None:
         if not self.hidden_depth:
             self.parts.append(data)
+            if self.selected_option_parts is not None:
+                self.selected_option_parts.append(data)
             if self.article_depth:
                 self.article_parts.append(data)
             if self._abstract_containers:
                 self.abstract_parts.append(data)
+
+    def close(self) -> None:
+        super().close()
+        self._finish_selected_option()
+
+    def _finish_selected_option(self) -> None:
+        if self.selected_option_parts is None:
+            return
+        label = " ".join(" ".join(self.selected_option_parts).split())
+        if label:
+            marker = f"\nSelected option: {label}\n"
+            self.parts.append(marker)
+            if self.article_depth:
+                self.article_parts.append(marker)
+            if self._abstract_containers:
+                self.abstract_parts.append(marker)
+        self.selected_option_parts = None
 
 
 def classify_pdf_text(
@@ -441,12 +601,23 @@ def classify_html_content(
         and jstor_body_word_count >= 500
         and jstor_body_word_count < expected_page_count * 250
     )
+    explicit_abstract = bool(
+        any(parser.meta.get(name) for name in _ABSTRACT_META_NAMES)
+        or parser.abstract_parts
+        or re.search(
+            r"(?:^|\n)\s*abstract\s*[:.-]?",
+            visible,
+            flags=re.IGNORECASE,
+        )
+    )
+    body_word_count = (
+        article_word_count
+        if explicit_abstract
+        else article_word_count or metrics["word_count"]
+    )
     abstract_dominates = bool(
         abstract
-        and (
-            not article_word_count
-            or article_word_count <= max(120, int(abstract_word_count * 1.5))
-        )
+        and body_word_count <= max(120, int(abstract_word_count * 1.5))
     )
     enclosing_paywall = bool(paywall_markers) and (
         not full_article_evidence or abstract_dominates
@@ -464,6 +635,7 @@ def classify_html_content(
             "has_article_container": parser.has_article_container,
             "strong_article_body": strong_article_body,
             "strong_visible_body": strong_visible_body,
+            "explicit_abstract": explicit_abstract,
             "enclosing_paywall": enclosing_paywall,
             "abstract_char_count": len(abstract),
             "paywall_marker_count": len(paywall_markers),
@@ -657,6 +829,262 @@ _BOILERPLATE_TERMS = (
     "sage publications",
 )
 
+PDF_PAGE_IMAGE_MAX_COUNT = 16
+PDF_PAGE_IMAGE_MAX_SIDE = 2_048
+PDF_PAGE_IMAGE_RENDER_POLICY_VERSION = "1"
+
+
+def _pdf_object(value: Any) -> Any:
+    getter = getattr(value, "get_object", None)
+    return getter() if callable(getter) else value
+
+
+def _pdf_page_resource_evidence(
+    page: Any,
+) -> tuple[tuple[str, ...], int, int, int]:
+    """Inspect page resources without decoding images or rasterizing the page."""
+
+    try:
+        resources = _pdf_object(page.get("/Resources"))
+        if not isinstance(resources, Mapping):
+            return (), 0, 0, 0
+        resource_types = tuple(
+            sorted(str(key).removeprefix("/") for key in resources)
+        )
+        xobjects = _pdf_object(resources.get("/XObject"))
+        if not isinstance(xobjects, Mapping):
+            return resource_types, len(resources), 0, 0
+        image_count = 0
+        for value in xobjects.values():
+            candidate = _pdf_object(value)
+            if isinstance(candidate, Mapping) and str(candidate.get("/Subtype")) == "/Image":
+                image_count += 1
+        return resource_types, len(resources), len(xobjects), image_count
+    except Exception:
+        return (), 0, 0, 0
+
+
+def _pdf_page_projected_dimensions(page: Any) -> tuple[int, int]:
+    """Project the canonical 300-DPI render size without rasterizing the page."""
+
+    try:
+        raw_user_unit = abs(float(page.get("/UserUnit", 1) or 1))
+        user_unit = raw_user_unit if raw_user_unit > 0 else 1.0
+        width_points = abs(float(page.mediabox.width)) * user_unit
+        height_points = abs(float(page.mediabox.height)) * user_unit
+        rotation = int(page.get("/Rotate", 0) or 0) % 360
+        if rotation in {90, 270}:
+            width_points, height_points = height_points, width_points
+        width = max(1, math.ceil(width_points * 300 / 72))
+        height = max(1, math.ceil(height_points * 300 / 72))
+        scale = min(1.0, PDF_PAGE_IMAGE_MAX_SIDE / max(width, height))
+        return (
+            max(1, min(PDF_PAGE_IMAGE_MAX_SIDE, math.ceil(width * scale))),
+            max(1, min(PDF_PAGE_IMAGE_MAX_SIDE, math.ceil(height * scale))),
+        )
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return PDF_PAGE_IMAGE_MAX_SIDE, PDF_PAGE_IMAGE_MAX_SIDE
+
+
+def _pdf_visual_span_pages(adequacy: ContentAdequacy) -> set[int]:
+    metrics = adequacy.metrics or {}
+    pages: set[int] = set()
+    for key in ("table_spans", "figure_spans"):
+        spans = metrics.get(key, ())
+        if not isinstance(spans, (list, tuple)):
+            continue
+        for span in spans:
+            if not isinstance(span, Mapping):
+                continue
+            page_number = _positive_int(span.get("page_ordinal"))
+            if page_number is not None:
+                pages.add(page_number)
+    return pages
+
+
+def probe_pdf_bytes(
+    data: bytes,
+    *,
+    cancelled: Callable[[], bool] | None = None,
+) -> PDFStructuralProbe:
+    """Collect embedded-text and structural PDF evidence without OCR or rendering."""
+
+    custody_sha256 = hashlib.sha256(data).hexdigest()
+    failure = {
+        "status": "failed",
+        "media_type": "application/pdf",
+        "custody_sha256": custody_sha256,
+        "custody_byte_count": len(data),
+        "page_count": 0,
+        "pages": (),
+        "embedded_text": "",
+        "adequacy": None,
+        "document_analysis": {},
+        "suspicious_pages": (),
+        "render_candidate_pages": (),
+        "page_labels": (),
+    }
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return PDFStructuralProbe(reason="pypdf_not_installed", **failure)
+
+    _raise_if_cancelled(cancelled)
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        page_count = len(reader.pages)
+        if page_count <= 0:
+            return PDFStructuralProbe(
+                reason="pdf_page_count_unavailable",
+                **failure,
+            )
+        try:
+            page_labels = tuple(str(value) for value in reader.page_labels)
+        except (AttributeError, TypeError, ValueError):
+            page_labels = ()
+    except ExtractionCancelled:
+        raise
+    except Exception as exc:
+        return PDFStructuralProbe(
+            reason=f"pdf_error:{type(exc).__name__}",
+            **failure,
+        )
+
+    embedded_pages: list[str] = []
+    page_errors: list[str] = []
+    resource_evidence: list[tuple[tuple[str, ...], int, int, int]] = []
+    projected_dimensions: list[tuple[int, int]] = []
+    encrypted = bool(getattr(reader, "is_encrypted", False))
+    for index in range(page_count):
+        _raise_if_cancelled(cancelled)
+        try:
+            page = reader.pages[index]
+        except Exception as exc:
+            embedded_pages.append("")
+            page_errors.append(type(exc).__name__)
+            resource_evidence.append(((), 0, 0, 0))
+            projected_dimensions.append(
+                (PDF_PAGE_IMAGE_MAX_SIDE, PDF_PAGE_IMAGE_MAX_SIDE)
+            )
+            continue
+        resource_evidence.append(_pdf_page_resource_evidence(page))
+        projected_dimensions.append(_pdf_page_projected_dimensions(page))
+        try:
+            embedded_pages.append(_clean_text(page.extract_text() or ""))
+            page_errors.append("")
+        except ExtractionCancelled:
+            raise
+        except Exception as exc:
+            embedded_pages.append("")
+            page_errors.append(type(exc).__name__)
+
+    repeated = _repeated_pdf_units(embedded_pages)
+    locally_suspicious = {
+        index
+        for index, page_text in enumerate(embedded_pages)
+        if page_errors[index]
+        or _page_text_is_suspicious(page_text, repeated_units=repeated)
+    }
+    document_analysis = _document_text_analysis(embedded_pages)
+    suspicious = set(locally_suspicious)
+    if document_analysis["document_suspicious"]:
+        suspicious.update(range(page_count))
+
+    printed_pages = tuple(
+        page_labels[index] if index < len(page_labels) and page_labels[index] else str(index + 1)
+        for index in range(page_count)
+    )
+    embedded_text = _page_marked_text(embedded_pages)
+    coverage_metadata = {
+        "embedded_text_page_count": page_count - len(suspicious),
+        "ocr_page_count": 0,
+        "unresolved_pages": tuple(index + 1 for index in sorted(suspicious)),
+        "extraction_route": "pypdf_text",
+        "page_routes": tuple(
+            "unresolved" if index in suspicious else "embedded_text"
+            for index in range(page_count)
+        ),
+        "orientation_retry_pages": (),
+        "repeated_boilerplate_ratio": document_analysis[
+            "dominant_repeated_ratio"
+        ],
+        "ordinal_to_printed_page": {
+            str(index): label
+            for index, label in enumerate(printed_pages, start=1)
+            if label
+        },
+    }
+    adequacy = classify_pdf_text(
+        embedded_text,
+        page_count=page_count,
+        coverage_metadata=coverage_metadata,
+    )
+    visual_span_pages = _pdf_visual_span_pages(adequacy)
+
+    pages: list[PDFPageEvidence] = []
+    for index, text in enumerate(embedded_pages):
+        page_number = index + 1
+        width, height = projected_dimensions[index]
+        resource_types, resource_count, xobject_count, image_count = resource_evidence[index]
+        error_type = page_errors[index]
+        if error_type:
+            text_quality: PDFPageTextQuality = (
+                "encrypted_or_unavailable" if encrypted else "corrupted"
+            )
+        elif not text and image_count:
+            text_quality = "image_only"
+        elif index in locally_suspicious:
+            text_quality = "suspicious"
+        elif index in suspicious:
+            text_quality = "partial"
+        else:
+            text_quality = "good"
+        visually_consequential = bool(
+            xobject_count or page_number in visual_span_pages
+        )
+        render_candidate = index in suspicious or visually_consequential
+        pages.append(
+            PDFPageEvidence(
+                page_number=page_number,
+                printed_page=printed_pages[index],
+                width=width,
+                height=height,
+                embedded_text=text,
+                embedded_text_sha256=hashlib.sha256(
+                    text.encode("utf-8")
+                ).hexdigest(),
+                embedded_char_count=len(text),
+                embedded_word_count=len(_alphabetic_words(text)),
+                text_quality=text_quality,
+                resource_types=resource_types,
+                resource_count=resource_count,
+                xobject_count=xobject_count,
+                image_count=image_count,
+                suspicious=index in suspicious,
+                visually_consequential=visually_consequential,
+                render_candidate=render_candidate,
+                error_type=error_type,
+            )
+        )
+
+    return PDFStructuralProbe(
+        status="partial" if any(page_errors) else "succeeded",
+        reason="partial_page_text" if any(page_errors) else "",
+        media_type="application/pdf",
+        custody_sha256=custody_sha256,
+        custody_byte_count=len(data),
+        page_count=page_count,
+        pages=tuple(pages),
+        embedded_text=embedded_text,
+        adequacy=adequacy,
+        document_analysis=document_analysis,
+        suspicious_pages=tuple(index + 1 for index in sorted(suspicious)),
+        render_candidate_pages=tuple(
+            page.page_number for page in pages if page.render_candidate
+        ),
+        page_labels=page_labels,
+    )
+
 
 def _extract_pdf(
     data: bytes,
@@ -665,46 +1093,54 @@ def _extract_pdf(
     ocr_languages: tuple[str, ...] = ("eng",),
     cancelled: Callable[[], bool] | None = None,
 ) -> ExtractionResult:
-    try:
-        from pypdf import PdfReader
-    except ImportError:
-        return ExtractionResult(status="failed", route="pypdf_text", reason="pypdf_not_installed", media_type="application/pdf")
-    try:
-        reader = PdfReader(io.BytesIO(data))
-        page_count = len(reader.pages)
-        if page_count <= 0:
-            return ExtractionResult(
-                status="failed",
-                route="pypdf_text",
-                reason="pdf_page_count_unavailable",
-                media_type="application/pdf",
-            )
-        embedded_pages = []
-        for page in reader.pages:
-            _raise_if_cancelled(cancelled)
-            embedded_pages.append(_clean_text(page.extract_text() or ""))
-        try:
-            page_labels = tuple(str(value) for value in reader.page_labels)
-        except (AttributeError, TypeError, ValueError):
-            page_labels = ()
-    except Exception as exc:
+    probe = probe_pdf_bytes(data, cancelled=cancelled)
+    return extract_pdf_from_probe(
+        data,
+        probe,
+        ocr_mode=ocr_mode,
+        ocr_languages=ocr_languages,
+        cancelled=cancelled,
+    )
+
+
+def extract_pdf_from_probe(
+    data: bytes,
+    probe: PDFStructuralProbe,
+    *,
+    ocr_mode: Literal["auto", "off", "required"] = "auto",
+    ocr_languages: tuple[str, ...] = ("eng",),
+    cancelled: Callable[[], bool] | None = None,
+) -> ExtractionResult:
+    """Continue the existing PDF/OCR route from verified structural evidence."""
+
+    if ocr_mode not in {"auto", "off", "required"}:
+        raise ValueError("ocr_mode must be one of: auto, off, required")
+    if (
+        probe.custody_byte_count != len(data)
+        or probe.custody_sha256 != hashlib.sha256(data).hexdigest()
+    ):
+        raise ValueError("PDF probe custody does not match source bytes")
+    if probe.status == "failed":
         return ExtractionResult(
             status="failed",
             route="pypdf_text",
-            reason=f"pdf_error:{type(exc).__name__}",
+            reason=probe.reason,
             media_type="application/pdf",
         )
-    repeated = _repeated_pdf_units(embedded_pages)
+    if probe.page_errors and ocr_mode == "off":
+        return ExtractionResult(
+            status="failed",
+            route="pypdf_text",
+            reason=f"pdf_error:{probe.page_errors[0][1]}",
+            media_type="application/pdf",
+        )
+    page_count = probe.page_count
+    embedded_pages = list(probe.embedded_pages)
+    page_labels = probe.page_labels
     suspicious_pages = {
-        index
-        for index, page_text in enumerate(embedded_pages)
-        if _page_text_is_suspicious(page_text, repeated_units=repeated)
+        page_number - 1 for page_number in probe.suspicious_pages
     }
-    embedded_analysis = _document_text_analysis(embedded_pages)
-    if embedded_analysis["document_suspicious"]:
-        # The document-level test catches publisher-error PDFs such as Touval,
-        # where every page has enough characters to evade a blank-page test.
-        suspicious_pages.update(range(page_count))
+    embedded_analysis = dict(probe.document_analysis)
 
     final_pages = list(embedded_pages)
     page_routes = ["embedded_text" if index not in suspicious_pages else "unresolved" for index in range(page_count)]
@@ -912,21 +1348,31 @@ def _render_pdf_page(
     try:
         import pypdfium2 as pdfium
 
-        document = pdfium.PdfDocument(data)
+        while True:
+            _raise_if_cancelled(cancelled)
+            if _PDFIUM_RENDER_LOCK.acquire(timeout=0.1):
+                break
         try:
-            page = document[page_index]
+            _raise_if_cancelled(cancelled)
+            document = pdfium.PdfDocument(data)
             try:
-                bitmap = page.render(scale=300 / 72)
+                page = document[page_index]
                 try:
-                    image_path = temporary_root / f"page-{page_index + 1}.png"
-                    bitmap.to_pil().save(image_path, format="PNG")
+                    bitmap = page.render(scale=300 / 72)
+                    try:
+                        image_path = temporary_root / f"page-{page_index + 1}.png"
+                        bitmap.to_pil().save(image_path, format="PNG")
+                    finally:
+                        bitmap.close()
                 finally:
-                    bitmap.close()
+                    page.close()
             finally:
-                page.close()
+                document.close()
         finally:
-            document.close()
+            _PDFIUM_RENDER_LOCK.release()
         return image_path, "pdfium"
+    except ExtractionCancelled:
+        raise
     except (ImportError, OSError, RuntimeError, ValueError):
         pass
 
@@ -956,6 +1402,103 @@ def _render_pdf_page(
     )
     image_path = output_root.with_suffix(".png")
     return (image_path, "poppler") if completed.returncode == 0 and image_path.exists() else None
+
+
+def _pdf_renderer_version(renderer: str) -> str:
+    if renderer == "pdfium":
+        try:
+            return importlib.metadata.version("pypdfium2")
+        except importlib.metadata.PackageNotFoundError:
+            return "unknown"
+    return "system" if renderer == "poppler" else "unknown"
+
+
+def render_pdf_pages(
+    data: bytes,
+    page_numbers: Sequence[int],
+    output_dir: Path,
+    *,
+    cancelled: Callable[[], bool] | None = None,
+) -> list[PDFPageImage]:
+    """Render selected 1-based PDF pages as canonical, bounded PNG files."""
+
+    requested = list(page_numbers)
+    if len(requested) > PDF_PAGE_IMAGE_MAX_COUNT:
+        raise ValueError(
+            f"at most {PDF_PAGE_IMAGE_MAX_COUNT} PDF pages may be rendered"
+        )
+    if any(
+        isinstance(page_number, bool)
+        or not isinstance(page_number, int)
+        or page_number <= 0
+        for page_number in requested
+    ):
+        raise ValueError("PDF page numbers must be positive 1-based integers")
+    if len(set(requested)) != len(requested):
+        raise ValueError("PDF page numbers must be unique")
+    ordered = sorted(requested)
+    if not ordered:
+        return []
+
+    from PIL import Image
+
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    rendered_pages: list[PDFPageImage] = []
+    for page_number in ordered:
+        _raise_if_cancelled(cancelled)
+        with tempfile.TemporaryDirectory(
+            prefix=".auto-zettelkasten-pdf-page-",
+            dir=output_root,
+        ) as temporary:
+            temporary_root = Path(temporary)
+            rendered = _render_pdf_page(
+                data,
+                page_number - 1,
+                temporary_root,
+                cancelled=cancelled,
+            )
+            if rendered is None:
+                raise RuntimeError(f"pdf_page_render_failed:{page_number}")
+            raw_path, renderer = rendered
+            canonical_path = temporary_root / "canonical.png"
+            _raise_if_cancelled(cancelled)
+            with Image.open(raw_path) as source:
+                image = source.convert("RGB")
+            try:
+                if max(image.size) > PDF_PAGE_IMAGE_MAX_SIDE:
+                    image.thumbnail(
+                        (PDF_PAGE_IMAGE_MAX_SIDE, PDF_PAGE_IMAGE_MAX_SIDE),
+                        Image.Resampling.LANCZOS,
+                    )
+                width, height = image.size
+                image.save(
+                    canonical_path,
+                    format="PNG",
+                    optimize=False,
+                    compress_level=9,
+                )
+            finally:
+                image.close()
+            _raise_if_cancelled(cancelled)
+            final_path = output_root / f"page-{page_number:04d}.png"
+            canonical_path.replace(final_path)
+
+        rendered_pages.append(
+            PDFPageImage(
+                page_number=page_number,
+                path=final_path,
+                media_type="image/png",
+                width=width,
+                height=height,
+                sha256=hashlib.sha256(final_path.read_bytes()).hexdigest(),
+                byte_count=final_path.stat().st_size,
+                renderer=renderer,
+                renderer_version=_pdf_renderer_version(renderer),
+                render_policy_version=PDF_PAGE_IMAGE_RENDER_POLICY_VERSION,
+            )
+        )
+    return rendered_pages
 
 
 def _run_tesseract(

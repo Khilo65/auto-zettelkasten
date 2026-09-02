@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from auto_zettelkasten.cli import _extraction_policy, build_parser
-from auto_zettelkasten.files import read_yaml
+from auto_zettelkasten.files import read_yaml, sha256_bytes
 from auto_zettelkasten.extraction import ExtractionResult, classify_pdf_text
 from auto_zettelkasten.models import ExtractionPolicy, MapRequest
 from auto_zettelkasten.pipeline import (
@@ -29,7 +29,7 @@ def test_extraction_policy_is_serializable_and_validated(tmp_path: Path) -> None
     assert restored == request
     assert restored.extraction_policy.languages == ("eng", "ara")
     assert restored.extraction_version == "2"
-    assert restored.prompt_version == "12"
+    assert restored.prompt_version == "14"
     with pytest.raises(ValueError, match="auto, off, or required"):
         ExtractionPolicy(ocr="sometimes")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="language code"):
@@ -45,7 +45,7 @@ def test_workspace_and_cli_extraction_precedence(tmp_path: Path) -> None:
         "languages": ["eng"],
         "vision": "configured_only",
     }
-    assert config["prompt_version"] == "12"
+    assert config["prompt_version"] == "14"
 
     args = build_parser().parse_args(
         [
@@ -94,6 +94,35 @@ def test_actual_primary_pdf_outranks_index_and_supplement() -> None:
     assert actual_rank is not None
     assert supplement_rank is not None
     assert actual_rank > indexed_rank > supplement_rank
+
+
+def test_html_supplements_and_reviewer_responses_do_not_outrank_main_text() -> None:
+    parent = {"title": "Mediation in Internationalized Civil Wars"}
+
+    assert _attachment_candidate_rank(
+        {"title": "Full text"},
+        parent,
+        media_type="text/html",
+        actual_file=True,
+    ) == 90
+    assert _attachment_candidate_rank(
+        {"title": "Supporting information"},
+        parent,
+        media_type="text/html",
+        actual_file=True,
+    ) == 60
+    assert _attachment_candidate_rank(
+        {"title": "Supporting information"},
+        parent,
+        media_type="text/html",
+        actual_file=False,
+    ) == 50
+    assert _attachment_candidate_rank(
+        {"title": "Response to Reviewers"},
+        parent,
+        media_type="text/html",
+        actual_file=True,
+    ) == 40
 
 
 def test_sparse_actual_pdf_metadata_still_outranks_its_indexed_text() -> None:
@@ -224,7 +253,7 @@ def test_acquisition_prefers_actual_primary_pdf_over_complete_zotero_index(
             return None
 
     monkeypatch.setattr(
-        "auto_zettelkasten.pipeline.extract_path",
+        "auto_zettelkasten.pipeline.extract_pdf_from_probe",
         lambda *args, **kwargs: ExtractionResult(
             status="succeeded",
             text=actual_text,
@@ -256,7 +285,7 @@ def test_acquisition_prefers_actual_primary_pdf_over_complete_zotero_index(
     )
 
     monkeypatch.setattr(
-        "auto_zettelkasten.pipeline.extract_path",
+        "auto_zettelkasten.pipeline.extract_pdf_from_probe",
         lambda *args, **kwargs: ExtractionResult(
             status="failed",
             text="--- Page 1 ---\n\n--- Page 2 ---",
@@ -293,3 +322,83 @@ def test_acquisition_prefers_actual_primary_pdf_over_complete_zotero_index(
     assert failed["coverage_reason"] == "primary_pdf_unreadable_abstract_available"
     assert "examines mediation outcomes" in failed["text"]
     assert failed["content_route"] != "zotero_fulltext"
+
+
+def test_acquisition_prefers_full_raw_html_with_selected_state(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    initialize(workspace)
+    paragraph = (
+        "Comparative country evidence reports reputation measures, rankings, "
+        "and respondent results for interpretation. " * 35
+    )
+    indexed_blocks = "".join(f"<p>{paragraph}</p>" for _ in range(5))
+    raw_blocks = "".join(f"<p>{paragraph}</p>" for _ in range(4))
+    indexed_html = (
+        f"<html><body><h1>Nation results</h1>{indexed_blocks}</body></html>"
+    )
+    raw_html = f"""
+    <html><body>
+      <select><option>France<option selected>Israel<option>Italy</select>
+      <select><option>2023<option selected>2024</select>
+      <select><option selected>Global<option>Business</select>
+      <h1>Nation results</h1>{raw_blocks}
+    </body></html>
+    """
+    parent = {
+        "key": "ITEM1",
+        "data": {
+            "key": "ITEM1",
+            "itemType": "webpage",
+            "title": "Nation Results",
+        },
+    }
+    child = {
+        "key": "HTML1",
+        "data": {
+            "key": "HTML1",
+            "parentItem": "ITEM1",
+            "itemType": "attachment",
+            "title": "Nation Results",
+            "filename": "nation.html",
+            "contentType": "text/html",
+        },
+    }
+
+    class Zotero:
+        def children(self, item_key: str):
+            return [child]
+
+        def fulltext(self, item_key: str):
+            if item_key == "HTML1":
+                return {"content": indexed_html, "contentType": "text/html"}
+            return None
+
+        def file(self, item_key: str):
+            if item_key == "HTML1":
+                return raw_html.encode(), "text/html"
+            return None
+
+    content = _acquire_content(
+        workspace,
+        parent,
+        Zotero(),  # type: ignore[arg-type]
+        {
+            "attempts": [],
+            "source_id": "source-zotero-item1",
+            "zotero_item_key": "ITEM1",
+        },
+        MapRequest(workspace, provider="ollama", model="fake"),
+        None,
+    )
+
+    assert content is not None
+    assert content["content_route"] == "html_text"
+    assert content["content_hash"] == sha256_bytes(raw_html.encode())
+    assert Path(content["source_file"]).is_relative_to(
+        workspace / "01_custody" / "files"
+    )
+    assert "Selected option: Israel" in content["text"]
+    assert "Selected option: 2024" in content["text"]
+    assert "Selected option: Global" in content["text"]

@@ -8,13 +8,20 @@ from auto_zettelkasten.literature import (
     _cluster_wikilink,
     _navigation_profile_rows,
     _obsidian_note_link,
+    _persist_typed_source_relation_projection,
     _replace_source_keys_in_markdown_body,
     _report_projection_profiles,
     _streamlined_cluster_markdown,
     _write_managed_cluster_projection,
     build_literature_map,
+    run_literature_map,
 )
+from auto_zettelkasten.models import LiteratureMapRequest
 from auto_zettelkasten.readers import _validate_streamlined_cluster_response
+from auto_zettelkasten.relationships import (
+    persist_relationship_registry,
+    stable_hash,
+)
 
 
 def test_empty_profile_path_uses_canonical_note_path_for_wikilinks() -> None:
@@ -40,6 +47,52 @@ def test_empty_profile_path_uses_canonical_note_path_for_wikilinks() -> None:
     assert _obsidian_note_link(hydrated) == (
         "[[Paris2004 - At war's end [9mh7lag9]|At war's end]]"
     )
+
+
+def test_typed_source_relation_projection_uses_canonical_source_edges_once(
+    tmp_path: Path,
+) -> None:
+    provider_relation = {
+        "relation_id": "relationship-a-b",
+        "source_kind": "source",
+        "source_id": "source-a",
+        "target_kind": "source",
+        "target_source_id": "source-b",
+        "relation_type": "contextual_connection",
+        "provenance": "probabilistic_relationship_adjudication_v8",
+        "active": True,
+    }
+    membership = {
+        "relation_id": "cluster-member-a",
+        "source_kind": "source",
+        "source_id": "source-a",
+        "target_kind": "cluster",
+        "target_cluster_id": "cluster-one",
+        "relation_type": "cluster_member",
+        "active": True,
+    }
+    reciprocal_membership = {
+        "relation_id": "cluster-has-member-a",
+        "source_kind": "cluster",
+        "source_id": "cluster-one",
+        "target_kind": "source",
+        "target_source_id": "source-a",
+        "relation_type": "has_member",
+        "active": True,
+    }
+    registry = {
+        "links": [provider_relation, membership, reciprocal_membership],
+    }
+
+    path = _persist_typed_source_relation_projection(tmp_path, registry)
+    before = (path.read_bytes(), path.stat().st_mtime_ns)
+    _persist_typed_source_relation_projection(tmp_path, registry)
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+    assert payload["relations"] == payload["links"] == [provider_relation]
+    assert payload["relation_counts"] == {"contextual_connection": 1}
+    assert payload["graph_projection_hash"] == stable_hash([provider_relation])
+    assert (path.read_bytes(), path.stat().st_mtime_ns) == before
 
 
 def test_stale_profile_path_is_replaced_and_unknown_target_is_not_linked() -> None:
@@ -446,7 +499,22 @@ def test_report_to_persist_uses_canonical_source_note_paths(tmp_path: Path) -> N
         },
     ]
 
-    _cluster_map, _gap_map, _packet, paths = build_literature_map(
+    persist_relationship_registry(
+        tmp_path,
+        structural_relations=[
+            {
+                "relation_id": "relationship-a-b",
+                "source_kind": "source",
+                "source_id": "source-a",
+                "target_kind": "source",
+                "target_source_id": "source-b",
+                "relation_type": "contextual_connection",
+                "provenance": "human_curated",
+                "active": True,
+            }
+        ],
+    )
+    _cluster_map, _gap_map, packet, paths = build_literature_map(
         tmp_path,
         source_set={"source_set_id": "canonical-test"},
         notes=notes,
@@ -464,3 +532,41 @@ def test_report_to_persist_uses_canonical_source_note_paths(tmp_path: Path) -> N
     assert "[[Canonical Source B [BBB222]|Source B]]" in rendered
     assert "[[Stale A" not in rendered
     assert "[[Stale B" not in rendered
+    typed = yaml.safe_load(
+        (
+            tmp_path / "03_literature_synthesis" / "typed_source_relations.yml"
+        ).read_text(encoding="utf-8")
+    )
+    for manifest_path in (
+        path for path in paths if path.name == "manifest.yml"
+    ):
+        manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+        assert manifest["relation_count"] == len(typed["links"])
+        assert manifest["typed_relation_counts"] == typed["relation_counts"]
+        assert manifest["graph_projection_hash"] == typed["graph_projection_hash"]
+    assert packet["graph_projection_hash"] == typed["graph_projection_hash"]
+
+    result = run_literature_map(
+        LiteratureMapRequest(
+            workspace=tmp_path,
+            source_set_id="canonical-test",
+            run_id="canonical-report",
+        ),
+        profiles=profiles,
+        source_set={"source_set_id": "canonical-test"},
+    )
+    manifest = yaml.safe_load(
+        (tmp_path / result.artifact_paths["manifest"]).read_text(encoding="utf-8")
+    )
+    typed = yaml.safe_load(
+        (
+            tmp_path / "03_literature_synthesis" / "typed_source_relations.yml"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert result.counts["relation_count"] == len(typed["links"])
+    assert result.counts["typed_relation_counts"] == typed["relation_counts"]
+    assert result.counts["graph_projection_hash"] == typed["graph_projection_hash"]
+    assert result.counts["relation_count"] == manifest["relation_count"]
+    assert result.counts["typed_relation_counts"] == manifest["typed_relation_counts"]
+    assert result.counts["graph_projection_hash"] == manifest["graph_projection_hash"]

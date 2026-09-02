@@ -2,6 +2,7 @@ from pathlib import Path
 
 from auto_zettelkasten.api import estimate_cost
 from auto_zettelkasten.files import write_yaml
+from auto_zettelkasten.models import LiteratureMappingPolicy
 
 
 def _frozen_profiles(root: Path, count: int) -> None:
@@ -35,7 +36,7 @@ def test_graph_estimate_does_not_treat_zero_validated_count_as_empty(
     result = estimate_cost(tmp_path, graph_only=True)
 
     assert result["new_source_jobs"] == 0
-    assert result["graph_calls"]["expected"] == 122
+    assert result["graph_calls"]["expected"] == 127
     assert result["graph_calls"]["high"] >= 113
     assert result["graph_cost_usd"]["high_usd"] >= 3.55
     assert result["graph_call_components"]["breadth_completion"] == {
@@ -74,7 +75,7 @@ def test_incremental_estimate_prices_delta_and_bounded_neighborhood(
         "expected": 125,
         "high": 450,
     }
-    assert result["graph_calls"]["expected"] == 38
+    assert result["graph_calls"]["expected"] == 40
     assert result["source_cost_usd"]["expected_usd"] == 0
     assert result["provider_calls"] == 0
 
@@ -188,3 +189,98 @@ def test_graph_estimate_prices_known_cluster_completion_work(
         ]
         == 12_345
     )
+
+    relationship_first = estimate_cost(
+        tmp_path,
+        graph_only=True,
+        literature_policy=LiteratureMappingPolicy(
+            cluster_generation_enabled=False
+        ),
+    )["graph_estimate_provenance"]
+    assert relationship_first["oversized_cluster_parent_count"] == 0
+    assert relationship_first["oversized_cluster_ids"] == []
+    assert relationship_first["cluster_child_writer_counts"] == {
+        "low": 0,
+        "expected": 0,
+        "high": 0,
+    }
+    assert relationship_first["eligible_empty_recovery_count"] == 0
+    assert relationship_first["eligible_empty_recovery_cluster_ids"] == []
+    assert relationship_first["eligible_empty_recovery_input_tokens"] == 0
+
+
+def test_relationship_first_estimate_zeros_every_cluster_and_gap_stage(
+    tmp_path: Path,
+) -> None:
+    _frozen_profiles(tmp_path, 12)
+    _source_set(tmp_path, inventory=12, validated=12)
+
+    enabled = estimate_cost(tmp_path, graph_only=True)
+    disabled = estimate_cost(
+        tmp_path,
+        graph_only=True,
+        literature_policy=LiteratureMappingPolicy(
+            cluster_generation_enabled=False
+        ),
+    )
+
+    retained_stages = {
+        "direct_discovery",
+        "complementary_discovery",
+        "breadth_completion",
+        "relationship_adjudication",
+    }
+    disabled_stages = {
+        "family_planning",
+        "cluster_planning",
+        "cluster_synthesis",
+        "cluster_partition_planning",
+        "cluster_child_synthesis",
+        "gap_adjudication",
+        "empty_response_recovery",
+    }
+    zeroes = {"low": 0, "expected": 0, "high": 0}
+
+    assert disabled["source_calls"] == enabled["source_calls"]
+    assert disabled["source_cost_usd"] == enabled["source_cost_usd"]
+    assert any(
+        disabled["graph_call_components"][stage]["expected"]
+        for stage in retained_stages
+    )
+    for stage in disabled_stages:
+        assert disabled["graph_call_components"][stage] == zeroes
+        assert all(
+            estimate["calls"] == 0
+            and estimate["input_tokens"] == 0
+            and estimate["output_tokens"] == 0
+            and estimate["retry_attempts"] == 0
+            for estimate in disabled["graph_stage_estimates"][stage].values()
+        )
+    assert disabled["graph_calls"] == {
+        bound: sum(
+            disabled["graph_stage_estimates"][stage][bound]["calls"]
+            + disabled["graph_stage_estimates"][stage][bound]["retry_attempts"]
+            for stage in retained_stages
+        )
+        for bound in ("low", "expected", "high")
+    }
+    assert disabled["graph_estimate_provenance"]["cluster_generation_enabled"] is False
+    assert disabled["provider_calls"] == 0
+
+    synthesis_disabled = estimate_cost(
+        tmp_path,
+        graph_only=True,
+        literature_policy=LiteratureMappingPolicy(
+            synthesis_enabled=False,
+            cluster_generation_enabled=False,
+        ),
+    )
+    assert all(
+        calls == {"low": 0, "expected": 0, "high": 0}
+        for calls in synthesis_disabled["graph_call_components"].values()
+    )
+    assert synthesis_disabled["graph_calls"] == {
+        "low": 0,
+        "expected": 0,
+        "high": 0,
+    }

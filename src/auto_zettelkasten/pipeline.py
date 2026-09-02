@@ -5,12 +5,14 @@ import mimetypes
 import os
 import queue
 import re
+import tempfile
 import threading
 import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
 from decimal import Decimal
+from itertools import combinations
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -19,11 +21,16 @@ from .controller import LocalController
 from .extraction import (
     ContentAdequacy,
     ExtractionCancelled,
+    ExtractionResult,
     classify_content_adequacy,
     classify_metadata_only,
     extract_bytes,
+    extract_pdf_from_probe,
     extract_path,
+    probe_pdf_bytes,
+    render_pdf_pages,
 )
+from .fidelity import _numeric_tokens as _fidelity_numeric_tokens
 from .fidelity import analyze_atomic_fidelity
 from .files import (
     append_jsonl,
@@ -44,7 +51,6 @@ from .indexes import (
     build_source_catalogue,
     commit_tag_reviews,
     lean_discovery_projection,
-    update_catalogue_clusters,
     update_source_set_map,
     write_source_set,
 )
@@ -52,11 +58,15 @@ from .navigation import build_typed_source_relations
 from .literature import (
     LITERATURE_FAMILY_PLAN_PROMPT_VERSION,
     _CheckpointedReasonerCalls,
+    _bounded_provider_futures,
+    _load_map_cluster_registry,
+    _persist_typed_source_relation_projection,
     _preserve_last_valid_clusters_on_refresh_failure,
     _provider_worker_count,
     _reasoner_packet_chars,
     _semantic_literature_policy,
     _synthesis_failure_class,
+    _synthesis_retry_on_resume,
     build_navigation_projection,
     build_literature_map,
     cluster_display_title,
@@ -81,6 +91,8 @@ from .models import (
     SourceAnalysisBundle,
 )
 from .notes import (
+    GRAPH_END_MARKER,
+    GRAPH_START_MARKER,
     internal_note_text,
     item_data,
     item_key,
@@ -142,7 +154,13 @@ from .relationships import (
 from .readers import (
     ProviderEmptyResponse,
     ProviderError,
+    ProviderInterrupted,
+    ProviderInvalidSourceBundle,
+    ProviderIsolationFailure,
+    ProviderQuotaExhausted,
+    ProviderTimeout,
     ProviderTransportError,
+    ProviderUnsupportedAttachment,
     SECTION_KEYS,
     SOURCE_BUNDLE_ENVELOPE_CONTRACT,
     SOURCE_BUNDLE_MAX_OUTPUT_TOKENS,
@@ -152,6 +170,11 @@ from .readers import (
     _normalize_provider_evidence_anchor,
     _parse_source_bundle_response,
     cancel_active_provider_responses,
+    codex_contract_identity,
+    codex_preflight_status,
+    codex_source_bundle_attachment_identity,
+    codex_source_bundle_image_preflight,
+    codex_stage_identity,
     current_provider_completion,
     provider_from_name,
     provider_attempt_cost_usd,
@@ -177,7 +200,7 @@ _RELATIONSHIP_BATCH_MAX_JOBS = 8
 _LEGACY_RELATIONSHIP_BATCH_MAX_JOBS = 8
 _RELATIONSHIP_DISCOVERY_PAGE_SIZE = 64
 _RELATIONSHIP_SELECTION_STATE_SCHEMA_VERSION = "4"
-_RELATIONSHIP_DISCOVERY_POLICY_VERSION = "negative-aware-breadth-v297"
+_RELATIONSHIP_DISCOVERY_POLICY_VERSION = "negative-aware-breadth-v298"
 _RELATIONSHIP_SEMANTIC_POLICY_VERSION = "source-owned-bases-v26"
 _LITERATURE_MEMORY_LOCK = threading.Lock()
 _AUTO_CLOUD_SOURCE_WORKER_LIMIT = 32
@@ -199,6 +222,8 @@ def _source_worker_count(
         and str(getattr(reader, "model", "")).casefold() == "deepseek-v4-flash"
     ):
         configured = _AUTO_DEEPSEEK_SOURCE_WORKER_LIMIT
+    elif str(getattr(reader, "name", "")).casefold() == "codex":
+        configured = 16
     else:
         configured = _AUTO_CLOUD_SOURCE_WORKER_LIMIT
     return max(1, min(pending_count or 1, configured))
@@ -398,7 +423,9 @@ def _allocate_complementary_candidate_quotas(
             str(job.get("bridge_job_id") or ""),
             max(1, int(job.get("target_candidate_count", 0) or 0)),
             (
-                len(set(job.get("left_source_ids", []) or []))
+                int(job["eligible_pair_count"])
+                if "eligible_pair_count" in job
+                else len(set(job.get("left_source_ids", []) or []))
                 * len(set(job.get("right_source_ids", []) or []))
                 if "left_source_ids" in job and "right_source_ids" in job
                 else capacity
@@ -555,6 +582,10 @@ class ProviderSpendLimitReached(RuntimeError):
 
 
 class ProviderCallLimitReached(RuntimeError):
+    pass
+
+
+class SourceBundleQuantitativeProvenanceError(ValueError):
     pass
 
 
@@ -749,7 +780,13 @@ class _ProfileProviderBudget:
             if failure is not None:
                 event.update(
                     failure_class=(
-                        "transport"
+                        "quota"
+                        if isinstance(failure, ProviderQuotaExhausted)
+                        else "timeout"
+                        if isinstance(failure, ProviderTimeout)
+                        else "interruption"
+                        if isinstance(failure, ProviderInterrupted)
+                        else "transport"
                         if isinstance(failure, ProviderTransportError)
                         else "provider_empty"
                         if isinstance(failure, ProviderEmptyResponse)
@@ -1023,6 +1060,12 @@ class _ProfileProviderBudget:
 
 
 def _transport_retryable(exc: BaseException) -> bool:
+    if isinstance(
+        exc, (ProviderQuotaExhausted, ProviderTimeout, ProviderInterrupted)
+    ):
+        return False
+    if hasattr(exc, "retry_immediately"):
+        return bool(getattr(exc, "retry_immediately"))
     if isinstance(exc, (ProviderTransportError, ProviderEmptyResponse)):
         return True
     if not isinstance(exc, ProviderError):
@@ -1055,11 +1098,12 @@ def _provider_call_with_transport_retry(
 ) -> Any:
     """Run one provider operation with at most one counted transport retry."""
 
-    for attempt_number in range(2):
+    for attempt_number in range(1 if budget.provider == "codex" else 2):
         if cancelled is not None and cancelled():
+            if budget.provider == "codex":
+                raise ProviderInterrupted("provider call cancelled")
             raise ProviderTransportError(
-                "provider call cancelled",
-                transport_kind="cancelled",
+                "provider call cancelled", transport_kind="cancelled"
             )
         if before_attempt is not None:
             before_attempt()
@@ -1199,12 +1243,19 @@ class _RunProgress:
             proposition_count=0,
             evidence_base_group_count=0,
             cluster_count=0,
+            evidence_concentrated_cluster_count=0,
             cluster_source_contribution_count=0,
             debate_count=0,
             consensus_count=0,
             mixed_evidence_count=0,
+            strict_consensus_established_count=0,
+            strict_consensus_not_established_count=0,
+            strict_contradiction_established_count=0,
+            strict_contradiction_not_established_count=0,
             mapped_gap_count=0,
             gap_lead_count=0,
+            strong_gap_established_count=0,
+            strong_gap_not_established_count=0,
             synthesized_cluster_count=0,
             rejected_underspecified_gap_count=0,
             rejected_gap_quality_count=0,
@@ -1536,7 +1587,7 @@ def run_pipeline(
     workspace = resolve_workspace(request.workspace)
     initialize(workspace)
     assert_compatible(workspace)
-    migrate_workspace(workspace)
+    workspace_migration = migrate_workspace(workspace)
     assert_compatible(workspace)
     run_id = run_id or _new_run_id()
     validate_opaque_id(run_id, field="run_id")
@@ -1547,19 +1598,80 @@ def run_pipeline(
     client = client or ZoteroLocalClient()
     controller = controller or LocalController()
     try:
-        reader = reader or provider_from_name(
-            request.provider, request.model, allow_cloud=request.allow_cloud
-        )
+        if reader is None:
+            provider_kwargs = {"allow_cloud": request.allow_cloud}
+            if request.provider == "codex":
+                provider_kwargs["reasoning_effort"] = request.reasoning_effort
+            reader = provider_from_name(
+                request.provider,
+                request.model,
+                **provider_kwargs,
+            )
     except Exception as exc:
         return _blocked_report(
-            request, run_id, f"reader_configuration:{type(exc).__name__}:{exc}"
+            request,
+            run_id,
+            f"reader_configuration:{type(exc).__name__}:{exc}",
+            migration=workspace_migration,
         )
     _apply_reader_policy(reader, request.processing)
     preflight_reason = _reader_preflight_reason(reader, request.allow_cloud)
     if preflight_reason:
-        return _blocked_report(request, run_id, preflight_reason)
-    if literature_reasoner is None and isinstance(reader, LiteratureReasoner):
-        literature_reasoner = reader
+        return _blocked_report(
+            request,
+            run_id,
+            preflight_reason,
+            migration=workspace_migration,
+        )
+    if literature_reasoner is None:
+        if request.provider == "codex" and request.literature_policy.synthesis_enabled:
+            literature_reasoner = provider_from_name(
+                "codex",
+                str(request.literature_model),
+                allow_cloud=request.allow_cloud,
+                reasoning_effort=request.reasoning_effort,
+            )
+            _apply_reader_policy(literature_reasoner, request.processing)  # type: ignore[arg-type]
+        elif isinstance(reader, LiteratureReasoner):
+            literature_reasoner = reader
+    if request.provider == "codex":
+        credential_roots = (workspace, run_dir)
+        setattr(reader, "credential_forbidden_roots", credential_roots)
+        if literature_reasoner is not None:
+            setattr(
+                literature_reasoner,
+                "credential_forbidden_roots",
+                credential_roots,
+            )
+        additional_models = (
+            (str(request.literature_model),)
+            if request.literature_policy.synthesis_enabled
+            else ()
+        )
+        preflight_lock = threading.Lock()
+        preflight_result: dict[str, Any] = {}
+
+        def load_codex_preflight() -> dict[str, Any]:
+            with preflight_lock:
+                if not preflight_result:
+                    preflight_result.update(
+                        codex_preflight_status(
+                            request.model,
+                            request.reasoning_effort or "medium",
+                            additional_models,
+                            forbidden_credential_roots=credential_roots,
+                        )
+                    )
+                return dict(preflight_result)
+
+        setattr(reader, "_preflight_loader", load_codex_preflight)
+        if literature_reasoner is not None:
+            setattr(literature_reasoner, "_preflight_loader", load_codex_preflight)
+    if request.provider == "codex":
+        quota_stop_event = threading.Event()
+        setattr(reader, "quota_stop_event", quota_stop_event)
+        if literature_reasoner is not None:
+            setattr(literature_reasoner, "quota_stop_event", quota_stop_event)
     if vision is None and hasattr(reader, "inspect_document"):
         vision = reader  # type: ignore[assignment]
     discovery_mode = request.literature_policy.external_discovery
@@ -1568,10 +1680,14 @@ def run_pipeline(
             request,
             run_id,
             f"external_discovery_disabled_in_standalone_mapper:{discovery_mode}",
+            migration=workspace_migration,
         )
     if external_discovery is not None:
         return _blocked_report(
-            request, run_id, "external_discovery_provider_not_used_by_standalone_mapper"
+            request,
+            run_id,
+            "external_discovery_provider_not_used_by_standalone_mapper",
+            migration=workspace_migration,
         )
     if (
         external_discovery is not None
@@ -1579,7 +1695,10 @@ def run_pipeline(
         and not request.allow_cloud
     ):
         return _blocked_report(
-            request, run_id, "external_discovery_requires_allow_cloud"
+            request,
+            run_id,
+            "external_discovery_requires_allow_cloud",
+            migration=workspace_migration,
         )
     if (
         literature_reasoner is not None
@@ -1587,7 +1706,10 @@ def run_pipeline(
         and not request.allow_cloud
     ):
         return _blocked_report(
-            request, run_id, "literature_reasoner_requires_allow_cloud"
+            request,
+            run_id,
+            "literature_reasoner_requires_allow_cloud",
+            migration=workspace_migration,
         )
 
     inventory_path = (
@@ -1650,7 +1772,10 @@ def run_pipeline(
             )
         except Exception as exc:
             return _blocked_report(
-                request, run_id, f"frozen_inventory:{type(exc).__name__}:{exc}"
+                request,
+                run_id,
+                f"frozen_inventory:{type(exc).__name__}:{exc}",
+                migration=workspace_migration,
             )
     else:
         try:
@@ -1690,7 +1815,10 @@ def run_pipeline(
             )
         except Exception as exc:
             return _blocked_report(
-                request, run_id, f"zotero_inventory:{type(exc).__name__}:{exc}"
+                request,
+                run_id,
+                f"zotero_inventory:{type(exc).__name__}:{exc}",
+                migration=workspace_migration,
             )
         if request.limit:
             items = items[: request.limit]
@@ -1832,6 +1960,7 @@ def run_pipeline(
     requested_concurrency = request.provider_concurrency
     workers = _source_worker_count(reader, request, len(pending))
     local_workers = min(max(1, request.parallel), max(1, len(pending)))
+    local_recovery_gate = _LocalAcquisitionGate(local_workers)
     source_stage_started = time.monotonic()
     concurrency_lock = threading.Lock()
     active_source_jobs = 0
@@ -1841,7 +1970,14 @@ def run_pipeline(
     queue_peaks = {"local": 0, "provider_ready": 0, "completion": 0}
     queue_lock = threading.Lock()
     cancel_event = threading.Event()
-    budget_pause_event = threading.Event()
+    quota_stop_event = getattr(reader, "quota_stop_event", None)
+    source_pause_event = threading.Event()
+
+    def source_paused() -> bool:
+        return source_pause_event.is_set() or bool(
+            quota_stop_event is not None and quota_stop_event.is_set()
+        )
+    source_pause_reason = ""
     provider_input_closed = threading.Event()
     local_queue: queue.Queue[Any] = queue.Queue(maxsize=max(1, len(pending)))
     provider_queue: queue.Queue[Any] = queue.Queue(maxsize=max(1, len(pending)))
@@ -1859,7 +1995,7 @@ def run_pipeline(
     def local_loop() -> None:
         nonlocal active_local_jobs, peak_local_concurrency, local_exits
         try:
-            while not cancel_event.is_set() and not budget_pause_event.is_set():
+            while not cancel_event.is_set() and not source_paused():
                 try:
                     descriptor = local_queue.get(timeout=0.1)
                 except queue.Empty:
@@ -1897,7 +2033,7 @@ def run_pipeline(
                     with concurrency_lock:
                         active_local_jobs -= 1
                 if row is None:
-                    if not budget_pause_event.is_set():
+                    if not source_paused():
                         provider_queue.put((index, dict(item)))
                         record_queue("provider_ready", provider_queue)
                 else:
@@ -1916,10 +2052,10 @@ def run_pipeline(
                     provider_input_closed.set()
 
     def provider_loop() -> None:
-        nonlocal active_source_jobs, peak_source_concurrency
+        nonlocal active_source_jobs, peak_source_concurrency, source_pause_reason
         try:
             while True:
-                if budget_pause_event.is_set():
+                if source_paused():
                     return
                 if cancel_event.is_set():
                     return
@@ -1947,12 +2083,32 @@ def run_pipeline(
                         None,
                         profile_budget,
                         source_match_index,
-                        None,
+                        local_recovery_gate,
                         require_frozen_content=True,
                         cancel_event=cancel_event,
                     )
-                except (ProviderCallLimitReached, ProviderSpendLimitReached):
-                    budget_pause_event.set()
+                except (
+                    ProviderCallLimitReached,
+                    ProviderSpendLimitReached,
+                    ProviderQuotaExhausted,
+                    ProviderTimeout,
+                    ProviderInterrupted,
+                ) as exc:
+                    with concurrency_lock:
+                        if not source_pause_reason:
+                            source_pause_reason = {
+                                ProviderCallLimitReached: "source_profile_call_budget_reached",
+                                ProviderSpendLimitReached: "provider_spend_budget_reached",
+                                ProviderQuotaExhausted: "provider_quota_exhausted",
+                                ProviderTimeout: "provider_timeout",
+                                ProviderInterrupted: "provider_interrupted",
+                            }[type(exc)]
+                    source_pause_event.set()
+                    if (
+                        isinstance(exc, ProviderQuotaExhausted)
+                        and quota_stop_event is not None
+                    ):
+                        quota_stop_event.set()
                     return
                 except Exception as exc:
                     row = _exhausted_result(
@@ -2025,7 +2181,7 @@ def run_pipeline(
                 prepared_path = completion_queue.get(timeout=0.1)
             except queue.Empty:
                 if (
-                    budget_pause_event.is_set()
+                    source_paused()
                     and all(future.done() for future in provider_futures)
                     and all(future.done() for future in local_futures)
                 ):
@@ -2051,8 +2207,8 @@ def run_pipeline(
             committed += 1
         for future in (*local_futures, *provider_futures):
             future.result()
-        if budget_pause_event.is_set():
-            progress.set_stage("paused_budget")
+        if source_paused():
+            progress.set_stage(source_pause_reason or "paused_budget")
     except BaseException:
         cancel_event.set()
         provider_input_closed.set()
@@ -2065,7 +2221,7 @@ def run_pipeline(
         provider_input_closed.set()
         local_executor.shutdown(wait=True, cancel_futures=True)
         provider_executor.shutdown(wait=True, cancel_futures=True)
-    source_budget_paused = budget_pause_event.is_set()
+    source_budget_paused = source_paused()
     canonical_results = {
         int(row.get("inventory_index", -1)): row for row in prepared
     }
@@ -2246,6 +2402,7 @@ def run_pipeline(
             },
             "profile_result": {},
             "profiles": [],
+            "migration": workspace_migration,
             "paths": [],
             "partial_reason": "source_accounting_barrier_incomplete",
         }
@@ -2269,23 +2426,32 @@ def run_pipeline(
                 resume=resume,
                 profile_budget=profile_budget,
                 collection_snapshot=collection_snapshot,
+                migration=workspace_migration,
             )
         except BaseException:
             progress.flush()
             profile_budget.flush()
             raise
     profile_budget.flush()
+    clusters_enabled = (
+        request.literature_policy.cluster_generation_enabled is not False
+    )
     # The v0.4 map is already scoped to this run's frozen source set, so every
     # generated cluster and gap belongs to the run without a second heuristic filter.
     relevant_clusters = list(map_result["cluster_map"]["clusters"])
     relevant_gaps = list(map_result["gap_map"]["gap_candidates"])
-    run_source_set = update_source_set_map(
-        workspace, run_source_set, relevant_clusters, relevant_gaps
-    )
+    if clusters_enabled:
+        run_source_set = update_source_set_map(
+            workspace, run_source_set, relevant_clusters, relevant_gaps
+        )
 
     debate_payload = (
-        read_yaml(workspace / "03_literature_synthesis" / "debate_registry.yml", {})
+        read_yaml(
+            workspace / "03_literature_synthesis" / "debate_registry.yml", {}
+        )
         or {}
+        if clusters_enabled
+        else {}
     )
     debate_rows = (
         debate_payload.get("assessments", [])
@@ -2336,8 +2502,15 @@ def run_pipeline(
         if isinstance(row, Mapping) and row.get("classification") == "mixed_evidence"
     )
     search_payload = (
-        read_yaml(workspace / "03_literature_synthesis" / "internal_search_log.yml", {})
+        read_yaml(
+            workspace
+            / "03_literature_synthesis"
+            / "internal_search_log.yml",
+            {},
+        )
         or {}
+        if clusters_enabled
+        else {}
     )
     searches = (
         search_payload.get("searches", [])
@@ -2375,7 +2548,7 @@ def run_pipeline(
         map_result["literature_packet"].get("synthesis_failure_count", 0) or 0
     )
     literature_partial_reason = (
-        "provider_spend_budget_reached"
+        source_pause_reason
         if source_budget_paused
         else str(map_result.get("partial_reason") or "")
     )
@@ -2942,6 +3115,7 @@ def _commit_source_bundle(
             bundle.evidence_anchors,
             key=lambda anchor: -anchor.salience_priority,
         )[:24]
+        profile.findings = []
     compact = dict(bundle.compact_profile)
     for field_name in (
         "research_questions",
@@ -2962,7 +3136,9 @@ def _commit_source_bundle(
         "gaps",
         "future_research",
     ):
-        values = compact.get(field_name, [])
+        if field_name not in compact:
+            continue
+        values = compact[field_name]
         if isinstance(values, list):
             setattr(
                 profile,
@@ -2981,6 +3157,10 @@ def _commit_source_bundle(
     profile.source_role = str(
         compact.get("source_genre") or profile.source_role or ""
     )
+    profile.features = {
+        **dict(profile.features or {}),
+        "source_role": [profile.source_role] if profile.source_role else [],
+    }
     compact_coverage = compact.get("coverage")
     if isinstance(compact_coverage, Mapping):
         profile.coverage = {**dict(profile.coverage or {}), **compact_coverage}
@@ -3017,17 +3197,22 @@ def _commit_source_bundle(
 def _source_bundle_dependency_fingerprint(
     row: Mapping[str, Any], request: MapRequest
 ) -> str:
-    return stable_hash(
-        {
+    dependency = {
             "source_fingerprint": str(row.get("fingerprint") or ""),
             "content_hash": str(row.get("content_hash") or ""),
             "provider": request.provider,
             "model": request.model,
             "prompt_version": request.prompt_version,
             "source_bundle_prompt_version": SOURCE_BUNDLE_PROMPT_VERSION,
-            "source_bundle_normalization_version": "9",
+            "source_bundle_normalization_version": "11",
         }
-    )
+    if request.provider == "codex":
+        dependency["provider_execution_identity"] = codex_contract_identity(
+            "source_bundle",
+            request.model,
+            request.reasoning_effort or "medium",
+        )
+    return stable_hash(dependency)
 
 
 def _commit_literature_memory(
@@ -5114,8 +5299,7 @@ def _plan_literature_families(
     lean_source_hashes = {
         str(row["source_id"]): stable_hash(row) for row in lean_rows
     }
-    planning_identity = stable_hash(
-        {
+    planning_identity_payload = {
             "provider": str(getattr(reasoner, "name", "")),
             "model": str(getattr(reasoner, "model", "")),
             "prompt_version": LITERATURE_FAMILY_PLAN_PROMPT_VERSION,
@@ -5123,7 +5307,21 @@ def _plan_literature_families(
                 request.literature_policy.to_dict()
             ),
         }
-    )
+    if request.provider == "codex":
+        planning_identity_payload["provider_execution_identity"] = (
+            codex_stage_identity(
+                "literature_family_plan",
+                str(
+                    getattr(
+                        reasoner,
+                        "model",
+                        request.model,
+                    )
+                ),
+                request.reasoning_effort or "medium",
+            )
+        )
+    planning_identity = stable_hash(planning_identity_payload)
     planning_job_identity = str(
         prior_plan.get("planning_job_identity")
         or prior_plan.get("planning_identity")
@@ -5334,19 +5532,29 @@ def _plan_literature_families(
 
         indexed_plans: dict[int, Mapping[str, Any]] = {}
         packet_errors: list[BaseException] = []
+        workers = _provider_worker_count(request, len(chunks))
         with ThreadPoolExecutor(
-            max_workers=_provider_worker_count(request, len(chunks)),
+            max_workers=workers,
             thread_name_prefix="auto-zettelkasten-family-plan",
         ) as executor:
-            futures = {
-                executor.submit(plan_packet, index, chunk): (index, chunk)
-                for index, chunk in enumerate(chunks, start=1)
-            }
-            for future in as_completed(futures):
-                index, chunk = futures[future]
+            jobs = list(enumerate(chunks, start=1))
+            for future, job in _bounded_provider_futures(
+                executor,
+                jobs,
+                lambda pool, row: pool.submit(plan_packet, row[0], row[1]),
+                workers=workers,
+                stop_event=getattr(reasoner, "quota_stop_event", None),
+            ):
+                index, chunk = job
                 try:
                     indexed_plans[index] = future.result()
                 except Exception as exc:
+                    if _synthesis_failure_class(exc) in {
+                        "quota",
+                        "timeout",
+                        "interruption",
+                    }:
+                        raise
                     failed_packet_ids.append(
                         "planning-packet-"
                         + stable_hash(
@@ -5445,24 +5653,31 @@ def _plan_literature_families(
             completion_failures: list[str] = []
             try:
                 indexed_completions: dict[int, Mapping[str, Any]] = {}
+                workers = _provider_worker_count(request, len(completion_chunks))
                 with ThreadPoolExecutor(
-                    max_workers=_provider_worker_count(
-                        request, len(completion_chunks)
-                    ),
+                    max_workers=workers,
                     thread_name_prefix="auto-zettelkasten-family-coverage",
                 ) as executor:
-                    futures = {
-                        executor.submit(complete_packet, index, chunk): (
-                            index,
-                            chunk,
-                        )
-                        for index, chunk in enumerate(completion_chunks, start=1)
-                    }
-                    for future in as_completed(futures):
-                        index, chunk = futures[future]
+                    jobs = list(enumerate(completion_chunks, start=1))
+                    for future, job in _bounded_provider_futures(
+                        executor,
+                        jobs,
+                        lambda pool, row: pool.submit(
+                            complete_packet, row[0], row[1]
+                        ),
+                        workers=workers,
+                        stop_event=getattr(reasoner, "quota_stop_event", None),
+                    ):
+                        index, chunk = job
                         try:
                             indexed_completions[index] = future.result()
-                        except Exception:
+                        except Exception as exc:
+                            if _synthesis_failure_class(exc) in {
+                                "quota",
+                                "timeout",
+                                "interruption",
+                            }:
+                                raise
                             completion_failures.append(
                                 "coverage-packet-"
                                 + stable_hash(
@@ -6164,10 +6379,15 @@ def _validate_literature_family_plan(
         if not family_id or family_id in family_ids or len(source_ids) < 2:
             continue
         family_ids.add(family_id)
+        raw_roles = raw.get("proposed_roles")
         roles = (
-            dict(raw.get("proposed_roles") or {})
-            if isinstance(raw.get("proposed_roles"), Mapping)
-            else {}
+            dict(raw_roles or {})
+            if isinstance(raw_roles, Mapping)
+            else {
+                str(row.get("source_id") or ""): str(row.get("role") or "")
+                for row in raw_roles or []
+                if isinstance(row, Mapping)
+            }
         )
         families.append(
             {
@@ -6186,6 +6406,12 @@ def _validate_literature_family_plan(
         )
     if not families and not allow_empty:
         raise ValueError("literature family plan contained no valid families")
+    family_aliases: dict[str, set[str]] = defaultdict(set)
+    for family in families:
+        family_id = str(family["family_id"])
+        family_aliases[family_id].add(family_id)
+        if label := str(family.get("label") or "").strip():
+            family_aliases[label].add(family_id)
     requested_pairs = {
         tuple(sorted((left_key, right_key)))
         for index, left_key in enumerate(requested_collection_keys)
@@ -6226,10 +6452,16 @@ def _validate_literature_family_plan(
             quota = max(1, int(raw.get("candidate_quota", 24) or 24))
         except (TypeError, ValueError):
             quota = 24
+        family_reference = str(raw.get("family") or "").strip()
+        matching_family_ids = family_aliases.get(family_reference, set())
         jobs.append(
             {
                 "job_id": job_id,
-                "family": str(raw.get("family") or ""),
+                "family": (
+                    next(iter(matching_family_ids))
+                    if len(matching_family_ids) == 1
+                    else family_reference
+                ),
                 "left_source_ids": left,
                 "right_source_ids": right,
                 "requested_collection_pair": list(requested_pair),
@@ -6412,29 +6644,35 @@ def _selected_candidate_rows(
     ]
 
 
-def _relationship_discovery_identity(provider: str, model: str) -> str:
-    return stable_hash(
-        {
+def _relationship_discovery_identity(
+    provider: str, model: str, reasoning_effort: str | None = None
+) -> str:
+    payload = {
             "provider": provider,
             "model": model,
             "discovery_prompt_version": RELATIONSHIP_DISCOVERY_PROMPT_VERSION,
             "discovery_policy": _RELATIONSHIP_DISCOVERY_POLICY_VERSION,
             "completion_policy": "useful_exhaustion-v28",
         }
-    )
+    if provider == "codex":
+        payload["provider_execution_identity"] = codex_stage_identity(
+            "relationship_candidate_selection",
+            model,
+            reasoning_effort or "medium",
+        )
+    return stable_hash(payload)
 
 
 def _relationship_adjudication_identity(
     provider: str,
     model: str,
     decision_contract: str,
+    reasoning_effort: str | None = None,
 ) -> tuple[str, str]:
     policy_identity = stable_hash(
         {"relationship_semantic_policy": _RELATIONSHIP_SEMANTIC_POLICY_VERSION}
     )
-    return (
-        stable_hash(
-            {
+    payload = {
                 "provider": provider,
                 "model": model,
                 "adjudication_prompt_version": RELATIONSHIP_PROMPT_VERSION,
@@ -6444,9 +6682,13 @@ def _relationship_adjudication_identity(
                 ),
                 "semantic_policy_identity": policy_identity,
             }
-        ),
-        policy_identity,
-    )
+    if provider == "codex":
+        payload["provider_execution_identity"] = codex_stage_identity(
+            "relationship_adjudication",
+            model,
+            reasoning_effort or "medium",
+        )
+    return stable_hash(payload), policy_identity
 
 
 def _selected_candidates_from_state(
@@ -6536,7 +6778,9 @@ def _legacy_selection_identity_matches(
         "3",
     }:
         return False
-    policy_identity = stable_hash(policy.to_dict())
+    legacy_policy = policy.to_dict()
+    legacy_policy.pop("cluster_generation_enabled", None)
+    policy_identity = stable_hash(legacy_policy)
     return any(
         prior
         == stable_hash(
@@ -6573,30 +6817,6 @@ def _run_relationship_reasoning(
 ) -> dict[str, Any]:
     """Run global discovery and one complete decision per immutable pair job."""
 
-    selector = getattr(reasoner, "select_relationship_candidates", None)
-    adjudicator = getattr(reasoner, "adjudicate_relationships", None)
-    if (
-        reasoner_calls is None
-        or not callable(selector)
-        or not callable(adjudicator)
-    ):
-        return {
-            "accepted": [],
-            "no_relationship": [],
-            "parked": [],
-            "cluster_candidates": [],
-            "selected_profile_hashes": {},
-            "reconciled_catalogue_revision": "",
-        }
-    decision_contract = str(
-        getattr(reasoner, "relationship_decision_contract", "")
-        or "relationship-decision-v4"
-    )
-    batch_max_jobs = (
-        _RELATIONSHIP_BATCH_MAX_JOBS
-        if decision_contract == RELATIONSHIP_DECISION_CONTRACT
-        else _LEGACY_RELATIONSHIP_BATCH_MAX_JOBS
-    )
     profile_by_source = {
         str(row.get("source_id") or ""): profile
         for profile in profiles
@@ -6605,23 +6825,6 @@ def _run_relationship_reasoning(
         and str(row.get("evidence_eligibility") or "substantive_bounded")
         == "substantive_bounded"
     }
-    if len(profile_by_source) < 2:
-        return {
-            "accepted": [],
-            "no_relationship": [],
-            "parked": [],
-            "cluster_candidates": [],
-            "selected_profile_hashes": {},
-            "reconciled_catalogue_revision": "",
-        }
-    note_row_by_source = {
-        str(row.get("source_id") or ""): row
-        for row in (
-            note_rows if note_rows is not None else all_workspace_note_rows(workspace)
-        )
-        if row.get("source_id") and row.get("note_path")
-    }
-    atomic_note_by_source: dict[str, dict[str, str]] = {}
     catalogue_payload = read_yaml(Path(str(catalogue["catalogue_path"])), {}) or {}
     available_catalogue_ids = {
         str(row.get("source_id") or "")
@@ -6634,15 +6837,74 @@ def _run_relationship_reasoning(
         for source_id, profile in profile_by_source.items()
         if source_id in available_catalogue_ids
     }
+    empty_result = {
+        "accepted": [],
+        "no_relationship": [],
+        "parked": [],
+        "cluster_candidates": [],
+        "selected_profile_hashes": {},
+        "reconciled_catalogue_revision": "",
+        "pair_job_count": 0,
+        "accounted_pair_job_count": 0,
+        "relationship_retry_on_resume": False,
+        "provider_batch_count": 0,
+    }
     if len(profile_by_source) < 2:
         return {
-            "accepted": [],
-            "no_relationship": [],
-            "parked": [],
-            "cluster_candidates": [],
-            "selected_profile_hashes": {},
-            "reconciled_catalogue_revision": "",
+            **empty_result,
+            "relationship_stage_complete": True,
+            "relationship_discovery_status": "complete",
+            "relationship_discovery_incomplete_jobs": [],
         }
+    selector = getattr(reasoner, "select_relationship_candidates", None)
+    adjudicator = getattr(reasoner, "adjudicate_relationships", None)
+    if (
+        reasoner_calls is None
+        or not callable(selector)
+        or not callable(adjudicator)
+    ):
+        if request.literature_policy.cluster_generation_enabled is not False:
+            return {
+                **empty_result,
+                "relationship_stage_complete": True,
+                "relationship_discovery_status": "complete",
+                "relationship_discovery_incomplete_jobs": [],
+            }
+        return {
+            **empty_result,
+            "parked": [
+                {
+                    "reason": "relationship_reasoner_capability_unavailable",
+                    "eligible_profile_count": len(profile_by_source),
+                    "retry_on_resume": False,
+                }
+            ],
+            "pair_job_count": len(profile_by_source)
+            * (len(profile_by_source) - 1)
+            // 2,
+            "relationship_stage_complete": False,
+            "relationship_discovery_status": "blocked",
+            "relationship_discovery_incomplete_jobs": [
+                "relationship_reasoner_capability_unavailable"
+            ],
+        }
+    decision_contract = str(
+        getattr(reasoner, "relationship_decision_contract", "")
+        or "relationship-decision-v4"
+    )
+    batch_max_jobs = (
+        _RELATIONSHIP_BATCH_MAX_JOBS
+        if decision_contract == RELATIONSHIP_DECISION_CONTRACT
+        else _LEGACY_RELATIONSHIP_BATCH_MAX_JOBS
+    )
+    note_row_by_source = {
+        str(row.get("source_id") or ""): row
+        for row in (
+            note_rows if note_rows is not None else all_workspace_note_rows(workspace)
+        )
+        if row.get("source_id") and row.get("note_path")
+    }
+    atomic_note_by_source: dict[str, dict[str, str]] = {}
     entries = [
         _compact_relationship_catalogue_entry(row)
         for row in catalogue_payload.get("sources", []) or []
@@ -6819,13 +7081,14 @@ def _run_relationship_reasoning(
     relationship_provider = str(getattr(reasoner, "name", ""))
     relationship_model = str(getattr(reasoner, "model", ""))
     discovery_identity = _relationship_discovery_identity(
-        relationship_provider, relationship_model
+        relationship_provider, relationship_model, request.reasoning_effort
     )
     adjudication_identity, relationship_policy_identity = (
         _relationship_adjudication_identity(
             relationship_provider,
             relationship_model,
             decision_contract,
+            request.reasoning_effort,
         )
     )
     selection_identity = discovery_identity
@@ -7438,7 +7701,7 @@ def _run_relationship_reasoning(
                         "reason": "relationship_collection_routing_failed",
                         "error_type": type(exc).__name__,
                         "error": str(exc),
-                        "retry_on_resume": failure_class == "transport",
+                        "retry_on_resume": failure_class in {"transport", "quota", "timeout", "interruption"},
                     }
                 )
             selected_collection_keys = {
@@ -7530,7 +7793,7 @@ def _run_relationship_reasoning(
                         "reason": "relationship_catalogue_routing_failed",
                         "error_type": type(exc).__name__,
                         "error": str(exc),
-                        "retry_on_resume": failure_class == "transport",
+                        "retry_on_resume": failure_class in {"transport", "quota", "timeout", "interruption"},
                     }
                 )
             selected_shards = {
@@ -7679,7 +7942,7 @@ def _run_relationship_reasoning(
                                 "reason": "relationship_bridge_routing_continuation_failed",
                                 "error_type": type(exc).__name__,
                                 "error": str(exc),
-                                "retry_on_resume": failure_class == "transport",
+                                "retry_on_resume": failure_class in {"transport", "quota", "timeout", "interruption"},
                             }
                         )
                         break
@@ -7766,7 +8029,7 @@ def _run_relationship_reasoning(
                         "reason": "relationship_bridge_routing_failed",
                         "error_type": type(exc).__name__,
                         "error": str(exc),
-                        "retry_on_resume": failure_class == "transport",
+                        "retry_on_resume": failure_class in {"transport", "quota", "timeout", "interruption"},
                     }
                 )
         elif bridge_cards:
@@ -7958,6 +8221,17 @@ def _run_relationship_reasoning(
         analytical_source_ids = _analytical_profile_source_ids(
             list(profile_by_source.values())
         )
+        family_rows = {
+            str(row.get("family_id") or ""): dict(row)
+            for row in shared_family_plan.get("literature_families", []) or []
+            if isinstance(row, Mapping) and row.get("family_id")
+        }
+        family_aliases: dict[str, set[str]] = defaultdict(set)
+        for family_id, family in family_rows.items():
+            family_aliases[family_id].add(family_id)
+            if label := str(family.get("label") or "").strip():
+                family_aliases[label].add(family_id)
+        resolved_pairs = set(mandatory_basis) | negative_pairs | visible_pairs
         for raw_job in shared_family_plan.get("discovery_jobs", []) or []:
             if not isinstance(raw_job, Mapping):
                 continue
@@ -7998,33 +8272,47 @@ def _run_relationship_reasoning(
                     "packet_status": "not_scheduled",
                 }
                 continue
-            planner_target = min(
-                int(raw_job.get("candidate_quota", 24) or 24),
-                len(left_ids) * len(right_ids),
+            family_reference = str(raw_job.get("family") or "").strip()
+            matching_family_ids = family_aliases.get(family_reference, set())
+            family_id = (
+                next(iter(matching_family_ids))
+                if len(matching_family_ids) == 1
+                else family_reference
             )
+            family_source_ids = sorted(set(left_ids) | set(right_ids))
+            requested_collection_pair = list(
+                raw_job.get("requested_collection_pair", []) or []
+            )
+            quota = int(raw_job.get("candidate_quota", 24) or 24)
+            initial_pairs = {
+                canonical_pair(left, right)
+                for left in left_ids
+                for right in right_ids
+            } - resolved_pairs
+            family_pairs = (
+                set(combinations(family_source_ids, 2)) - resolved_pairs
+                if not requested_collection_pair
+                else initial_pairs
+            )
+            planner_target = min(quota, len(family_pairs))
             job = {
                 "bridge_job_id": job_id,
                 "left_source_ids": left_ids,
                 "right_source_ids": right_ids,
-                "bridge_family": str(raw_job.get("family") or ""),
+                "family_source_ids": family_source_ids,
+                "eligible_pair_count": len(initial_pairs),
+                "family_pair_expansion_required": bool(family_pairs - initial_pairs),
+                "bridge_family": family_id,
                 "why_examine": str(raw_job.get("discovery_goal") or ""),
-                "target_candidate_count": planner_target,
+                "target_candidate_count": min(quota, len(initial_pairs)),
                 "planner_target_candidate_count": planner_target,
-                "requested_collection_pair": list(
-                    raw_job.get("requested_collection_pair", []) or []
-                ),
+                "requested_collection_pair": requested_collection_pair,
             }
             (
                 broad_jobs
                 if job["requested_collection_pair"]
                 else complement_jobs
             ).append(job)
-        family_rows = {
-            str(row.get("family_id") or ""): dict(row)
-            for row in shared_family_plan.get("literature_families", []) or []
-            if isinstance(row, Mapping) and row.get("family_id")
-        }
-
         def shared_plan_task(
             pass_name: str,
             pool: str,
@@ -8040,6 +8328,11 @@ def _run_relationship_reasoning(
             relevant_negative_pairs = [
                 pair
                 for pair in sorted(negative_pairs)
+                if pair[0] in source_ids and pair[1] in source_ids
+            ]
+            relevant_excluded_pairs = [
+                pair
+                for pair in sorted(resolved_pairs)
                 if pair[0] in source_ids and pair[1] in source_ids
             ]
             task_profiles = [
@@ -8070,7 +8363,7 @@ def _run_relationship_reasoning(
                 "prior_negative_pairs": [
                     list(pair) for pair in relevant_negative_pairs
                 ],
-                "excluded_candidate_pairs": relevant_negative_pairs,
+                "excluded_candidate_pairs": relevant_excluded_pairs,
                 "discovery_mode": (
                     "bridge_only"
                     if pool == "bridge"
@@ -8285,6 +8578,53 @@ def _run_relationship_reasoning(
                         continue
                     left = list(candidate.get("left_source_ids", []) or [])
                     right = list(candidate.get("right_source_ids", []) or [])
+                    if set(left) == set(right) and len(set(left)) > 1:
+                        ordered = sorted(set(left))
+                        excluded_pairs = set(prior_pairs) | resolved_pairs
+                        triangular_jobs = [
+                            {
+                                **candidate,
+                                "left_source_ids": [source_id],
+                                "right_source_ids": [
+                                    target_id
+                                    for target_id in ordered[index + 1 :]
+                                    if canonical_pair(source_id, target_id)
+                                    not in excluded_pairs
+                                ],
+                            }
+                            for index, source_id in enumerate(ordered[:-1])
+                        ]
+                        triangular_jobs = [
+                            child
+                            for child in triangular_jobs
+                            if child["right_source_ids"]
+                        ]
+                        allocations = [0] * len(triangular_jobs)
+                        remaining = int(
+                            candidate.get("target_candidate_count", 0) or 0
+                        )
+                        while remaining:
+                            progressed = False
+                            for index, child in enumerate(triangular_jobs):
+                                if allocations[index] >= len(
+                                    child["right_source_ids"]
+                                ):
+                                    continue
+                                allocations[index] += 1
+                                remaining -= 1
+                                progressed = True
+                                if not remaining:
+                                    break
+                            if not progressed:
+                                break
+                        pending[0:0] = [
+                            {**child, "target_candidate_count": allocation}
+                            for child, allocation in zip(
+                                triangular_jobs, allocations, strict=True
+                            )
+                            if allocation
+                        ]
+                        continue
                     side = (
                         "left_source_ids"
                         if len(left) >= len(right)
@@ -8329,6 +8669,7 @@ def _run_relationship_reasoning(
                         candidate.get("target_candidate_count", 0) or 0
                     )
                     unseen_capacities = []
+                    assigned_child_pairs: set[tuple[str, str]] = set()
                     for child_job in children:
                         child_left = set(
                             child_job.get("left_source_ids", []) or []
@@ -8336,25 +8677,21 @@ def _run_relationship_reasoning(
                         child_right = set(
                             child_job.get("right_source_ids", []) or []
                         )
-                        excluded_count = sum(
-                            1
-                            for pair in prior_pairs
-                            if (
-                                pair[0] in child_left
-                                and pair[1] in child_right
-                            )
-                            or (
-                                pair[0] in child_right
-                                and pair[1] in child_left
-                            )
-                        )
+                        possible_child_pairs = {
+                            canonical_pair(left, right)
+                            for left in child_left
+                            for right in child_right
+                            if left != right
+                        }
                         unseen_capacities.append(
-                            max(
-                                0,
-                                len(child_left) * len(child_right)
-                                - excluded_count,
+                            len(
+                                possible_child_pairs
+                                - assigned_child_pairs
+                                - set(prior_pairs)
+                                - resolved_pairs
                             )
                         )
+                        assigned_child_pairs.update(possible_child_pairs)
                     total_capacity = sum(unseen_capacities)
                     allocations = [0, 0]
                     if total_capacity:
@@ -8414,6 +8751,7 @@ def _run_relationship_reasoning(
         if broad_jobs:
             for job in broad_jobs:
                 job_id = str(job["bridge_job_id"])
+                scheduled = bool(job.get("target_candidate_count"))
                 discovery_job_accounting[job_id] = {
                     "bridge_job_id": job_id,
                     "status": "eligible",
@@ -8426,13 +8764,20 @@ def _run_relationship_reasoning(
                     "distinct_left_endpoints": 0,
                     "distinct_right_endpoints": 0,
                     "explicit_no_more_candidates": False,
-                    "packet_status": "scheduled",
+                    "packet_status": "scheduled" if scheduled else "completed",
                 }
-            broad_task = shared_plan_task("broad", "bridge", broad_jobs, 1)
-            if _reasoner_packet_chars(broad_task[2], broad_task[3]) <= context_budget:
+            scheduled_broad_jobs = [
+                job for job in broad_jobs if job.get("target_candidate_count")
+            ]
+            broad_task = shared_plan_task(
+                "broad", "bridge", scheduled_broad_jobs, 1
+            )
+            if scheduled_broad_jobs and _reasoner_packet_chars(
+                broad_task[2], broad_task[3]
+            ) <= context_budget:
                 candidate_tasks.append(broad_task)
-            else:
-                for job in broad_jobs:
+            elif scheduled_broad_jobs:
+                for job in scheduled_broad_jobs:
                     candidate_tasks.extend(
                         split_shared_job("broad", "bridge", job)
                     )
@@ -8444,7 +8789,7 @@ def _run_relationship_reasoning(
                 3 * len(complement_jobs),
             ),
         )
-        allocated_complement_jobs = [
+        accounted_complement_jobs = [
             {
                 **job,
                 "target_candidate_count": complementary_allocations.get(
@@ -8452,12 +8797,13 @@ def _run_relationship_reasoning(
                 ),
             }
             for job in complement_jobs
-            if complementary_allocations.get(
-                str(job.get("bridge_job_id") or ""), 0
-            )
         ]
-        for job in allocated_complement_jobs:
+        allocated_complement_jobs = [
+            job for job in accounted_complement_jobs if job["target_candidate_count"]
+        ]
+        for job in accounted_complement_jobs:
             job_id = str(job["bridge_job_id"])
+            scheduled = bool(job["target_candidate_count"])
             discovery_job_accounting[job_id] = {
                 "bridge_job_id": job_id,
                 "status": "eligible",
@@ -8470,7 +8816,7 @@ def _run_relationship_reasoning(
                 "distinct_left_endpoints": 0,
                 "distinct_right_endpoints": 0,
                 "explicit_no_more_candidates": False,
-                "packet_status": "scheduled",
+                "packet_status": "scheduled" if scheduled else "completed",
             }
         measured_job_sizes: dict[str, int] = {}
         oversized_complement_tasks = []
@@ -8646,6 +8992,10 @@ def _run_relationship_reasoning(
                     or row.get("target_id")
                     or ""
                 )
+                if not left_source_id or left_source_id == right_source_id:
+                    row["_candidate_disposition"] = "parked_contract_failure"
+                    candidates.append(row)
+                    continue
                 if not row.get("bridge_job_id"):
                     matching_job_ids = []
                     for candidate_job_id, candidate_job in jobs.items():
@@ -8728,16 +9078,18 @@ def _run_relationship_reasoning(
             task[3].get("discovery_pass") == "breadth_completion"
             for task in tasks
         )
+        workers = _provider_worker_count(request, len(tasks))
         with ThreadPoolExecutor(
-            max_workers=_provider_worker_count(request, len(tasks)),
+            max_workers=workers,
             thread_name_prefix="auto-zettelkasten-discovery",
         ) as executor:
-            futures = {
-                executor.submit(run_candidate_task, task): task
-                for task in tasks
-            }
-            for future in as_completed(futures):
-                task = futures[future]
+            for future, task in _bounded_provider_futures(
+                executor,
+                tasks,
+                lambda pool, row: pool.submit(run_candidate_task, row),
+                workers=workers,
+                stop_event=getattr(reasoner, "quota_stop_event", None),
+            ):
                 try:
                     pool, responses, continuation_error = future.result()
                     candidate_results[pool].extend(responses)
@@ -8861,11 +9213,13 @@ def _run_relationship_reasoning(
                                     ),
                                     "discovery_task_key": task[1],
                                     "affected_job_ids": affected_job_ids,
-                                    "retry_on_resume": failure_class == "transport",
+                                    "retry_on_resume": failure_class in {"transport", "quota", "timeout", "interruption"},
                                 }
                             )
                 except Exception as exc:
                     failure_class = _synthesis_failure_class(exc)
+                    if failure_class in {"quota", "timeout", "interruption"}:
+                        raise
                     discovery_terminal |= failure_class != "transport"
                     discovery_parked.append(
                         {
@@ -8886,7 +9240,7 @@ def _run_relationship_reasoning(
                                 if isinstance(row, Mapping)
                                 and row.get("bridge_job_id")
                             ),
-                            "retry_on_resume": failure_class == "transport",
+                            "retry_on_resume": failure_class in {"transport", "quota", "timeout", "interruption"},
                         }
                     )
                     for raw_job in task[3].get("bridge_jobs", []) or []:
@@ -8952,6 +9306,7 @@ def _run_relationship_reasoning(
             for _key, response in rows
             for row in response.get("candidates", []) or []
             if isinstance(row, Mapping)
+            and not row.get("_candidate_disposition")
         }
     )
     complement_tasks = [
@@ -8966,7 +9321,7 @@ def _run_relationship_reasoning(
     ]
     execute_candidate_tasks(complement_tasks)
     if shared_discovery_active:
-        shared_jobs = [*broad_jobs, *allocated_complement_jobs]
+        shared_jobs = [*broad_jobs, *accounted_complement_jobs]
 
         def discovered_pairs() -> list[tuple[str, str]]:
             return sorted(
@@ -9073,7 +9428,13 @@ def _run_relationship_reasoning(
                     packet_status != "completed"
                     and not recoverable_transport_failure
                 )
-                or accounting.get("explicit_no_more_candidates")
+                or (
+                    accounting.get("explicit_no_more_candidates")
+                    and not (
+                        job_id not in broad_job_ids
+                        and job.get("family_pair_expansion_required")
+                    )
+                )
                 or current_count >= desired_count
             ):
                 accounting["breadth_completion_status"] = (
@@ -9093,6 +9454,15 @@ def _run_relationship_reasoning(
             ].append(
                 {
                     **job,
+                    **(
+                        {
+                            "left_source_ids": list(job["family_source_ids"]),
+                            "right_source_ids": list(job["family_source_ids"]),
+                        }
+                        if job_id not in broad_job_ids
+                        and job.get("family_source_ids")
+                        else {}
+                    ),
                     "target_candidate_count": requested,
                 }
             )
@@ -9975,23 +10345,28 @@ def _run_relationship_reasoning(
             runnable_packets.append(packet)
     if runnable_packets:
         relationship_started = time.monotonic()
+        workers = _provider_worker_count(request, len(runnable_packets))
         with ThreadPoolExecutor(
-            max_workers=_provider_worker_count(
-                request, len(runnable_packets)
-            ),
+            max_workers=workers,
             thread_name_prefix="auto-zettelkasten-relationship",
         ) as executor:
-            future_map = {
-                executor.submit(adjudicate_packet, packet): tuple(
-                    job.pair_job_id for job in packet
-                )
-                for packet in runnable_packets
-            }
-            for future in as_completed(future_map):
-                packet_key = future_map[future]
+            for future, packet in _bounded_provider_futures(
+                executor,
+                runnable_packets,
+                lambda pool, row: pool.submit(adjudicate_packet, row),
+                workers=workers,
+                stop_event=getattr(reasoner, "quota_stop_event", None),
+            ):
+                packet_key = tuple(job.pair_job_id for job in packet)
                 try:
                     concurrent_batch_results[packet_key] = future.result()
                 except BaseException as exc:
+                    if _synthesis_failure_class(exc) in {
+                        "quota",
+                        "timeout",
+                        "interruption",
+                    }:
+                        raise
                     concurrent_batch_results[packet_key] = exc
         relationship_stage_seconds = round(
             time.monotonic() - relationship_started, 3
@@ -10204,7 +10579,7 @@ def _run_relationship_reasoning(
             )
         except Exception as exc:
             failure_class = _synthesis_failure_class(exc)
-            retry_on_resume = failure_class == "transport"
+            retry_on_resume = failure_class in {"transport", "quota", "timeout", "interruption"}
             write_yaml(
                 batch_root / "batch.yml",
                 {
@@ -10320,9 +10695,17 @@ def _run_relationship_reasoning(
         )
     )
     relationship_stage_complete = bool(
-        (discovery_completed if shared_plan_active else discovery_usable)
+        (
+            discovery_completed
+            if shared_plan_active
+            or request.literature_policy.cluster_generation_enabled is False
+            else discovery_usable
+        )
         and durable_pair_accounting
         and not relationship_retry_on_resume
+        and not preparked
+        and not terminal_rows
+        and not discovery_parked
     )
     disposition_priority = {
         "selected_for_adjudication": 0,
@@ -11258,6 +11641,9 @@ def _write_cross_boundary_ledger(
 ) -> Path:
     """Persist compact routing/accounting references without graph payloads."""
 
+    path = workspace / "02_source_memory" / "indexes" / "cross_boundary_ledger.yml"
+    if relationship_result.get("semantic_noop") and path.is_file():
+        return path
     family_plan = family_plan or {}
     plan_path = str(family_plan.get("plan_path") or "")
     payload = {
@@ -11326,7 +11712,6 @@ def _write_cross_boundary_ledger(
             or []
         ),
     }
-    path = workspace / "02_source_memory" / "indexes" / "cross_boundary_ledger.yml"
     if (read_yaml(path, {}) or {}) != payload:
         write_yaml(path, payload)
     return path
@@ -11735,6 +12120,173 @@ def _resolve_projection_failure(
     )
 
 
+def _catalogue_artifact_paths(catalogue: Mapping[str, Any]) -> list[Path]:
+    return [
+        *(
+            Path(str(catalogue[key]))
+            for key in (
+                "catalogue_path",
+                "master_index_path",
+                "cluster_catalogue_path",
+                "cluster_index_path",
+                "virtual_index_path",
+            )
+            if catalogue.get(key)
+        ),
+        *(
+            Path(str(path))
+            for key in (
+                "shard_paths",
+                "virtual_shard_paths",
+                "collection_index_paths",
+                "collection_shard_paths",
+            )
+            for path in catalogue.get(key, []) or []
+        ),
+    ]
+
+
+def _active_source_relation_count(registry: Mapping[str, Any]) -> int:
+    return sum(
+        1
+        for row in registry.get("links", []) or []
+        if isinstance(row, Mapping)
+        and bool(row.get("active", True))
+        and str(row.get("source_kind") or "source") == "source"
+        and str(row.get("target_kind") or "source") == "source"
+    )
+
+
+def _cluster_preservation_snapshot(workspace: Path) -> dict[str, Any]:
+    synthesis_root = workspace / "03_literature_synthesis"
+    protected_paths = {
+        workspace / "02_source_memory" / "indexes" / name
+        for name in ("cluster_catalogue.yml", "CLUSTERS.md", "gap_candidates.yml")
+    }
+    for pattern in ("cluster_*.yml", "gap_*.yml"):
+        protected_paths.update(synthesis_root.rglob(pattern))
+    for directory_name in ("clusters", "gaps", "closest_prior_work"):
+        for directory in synthesis_root.rglob(directory_name):
+            if directory.is_dir():
+                protected_paths.update(
+                    path for path in directory.rglob("*") if path.is_file()
+                )
+    artifact_hashes = {
+        str(path.relative_to(workspace)): sha256_file(path)
+        for path in sorted(protected_paths)
+        if path.is_file()
+    }
+
+    registry = read_yaml(
+        workspace / "02_source_memory" / "indexes" / "typed_links.yml", {}
+    ) or {}
+    protected_relations = sorted(
+        (
+            dict(row)
+            for row in registry.get("relations", []) or []
+            if isinstance(row, Mapping)
+            and bool(row.get("active", True))
+            and str(row.get("relation_type") or "")
+            in {"cluster_member", "has_member"}
+        ),
+        key=stable_hash,
+    )
+
+    catalogue = read_yaml(
+        workspace / "02_source_memory" / "indexes" / "source_catalogue.yml",
+        {},
+    ) or {}
+    catalogue_clusters = {
+        "clusters": list(catalogue.get("clusters", []) or []),
+        "source_cluster_ids": sorted(
+            (
+                str(row.get("source_id") or ""),
+                list(row.get("cluster_ids", []) or []),
+            )
+            for row in catalogue.get("sources", []) or []
+            if isinstance(row, Mapping)
+            and row.get("source_id")
+            and row.get("cluster_ids")
+        ),
+    }
+
+    note_projections: dict[str, Any] = {}
+    for row in all_workspace_note_rows(workspace):
+        path = workspace / str(row.get("note_path") or "")
+        if not path.is_file():
+            continue
+        note = read_note(path)
+        front = note["frontmatter"]
+        managed_match = re.search(
+            rf"{re.escape(GRAPH_START_MARKER)}(?P<body>.*?){re.escape(GRAPH_END_MARKER)}",
+            str(note.get("body") or ""),
+            flags=re.DOTALL,
+        )
+        managed = managed_match.group("body") if managed_match else ""
+        sections = {}
+        for heading in ("Clusters", "Gaps"):
+            match = re.search(
+                rf"^### {heading}\s*$\n*(.*?)(?=^### |\Z)",
+                managed,
+                flags=re.MULTILINE | re.DOTALL,
+            )
+            sections[heading.casefold()] = (
+                match.group(1).strip() if match else ""
+            )
+        note_id = str(front.get("note_id") or row.get("note_id") or path.name)
+        note_projections[note_id] = {
+            key: list(front.get(key, []) or [])
+            for key in (
+                "clusters",
+                "cluster_links",
+                "cluster_roles",
+                "gaps",
+                "gap_links",
+            )
+        } | sections
+
+    cluster_registry = read_yaml(
+        synthesis_root / "cluster_registry.yml", {}
+    ) or {}
+    snapshot = {
+        "artifact_hashes": artifact_hashes,
+        "protected_relations": protected_relations,
+        "catalogue_clusters": catalogue_clusters,
+        "note_projections": note_projections,
+        "preserved_clusters": [
+            dict(row)
+            for row in cluster_registry.get("clusters", []) or []
+            if isinstance(row, Mapping)
+        ],
+    }
+    snapshot["snapshot_hash"] = stable_hash(snapshot)
+    return snapshot
+
+
+def _verify_cluster_preservation(
+    workspace: Path, expected: Mapping[str, Any]
+) -> dict[str, str]:
+    actual = _cluster_preservation_snapshot(workspace)
+    changed = sorted(
+        key
+        for key in (
+            "artifact_hashes",
+            "protected_relations",
+            "catalogue_clusters",
+            "note_projections",
+            "preserved_clusters",
+        )
+        if actual.get(key) != expected.get(key)
+    )
+    if changed:
+        raise ValueError("protected_cluster_state_changed:" + ",".join(changed))
+    return {
+        "status": "verified",
+        "before_hash": str(expected.get("snapshot_hash") or ""),
+        "after_hash": str(actual.get("snapshot_hash") or ""),
+    }
+
+
 def rebuild_map(
     workspace: Path,
     *,
@@ -11751,12 +12303,28 @@ def rebuild_map(
     resume: bool = False,
     profile_budget: _ProfileProviderBudget | None = None,
     collection_snapshot: Mapping[str, Any] | None = None,
+    migration: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     del (
         external_discovery
     )  # Auto-Zettelkasten 0.4 maps only the frozen internal collection.
     effective_request = request or MapRequest(
         workspace=workspace, provider="ollama", model="deterministic-v1"
+    )
+    migration_result = (
+        dict(migration) if migration is not None else migrate_workspace(workspace)
+    )
+    clusters_enabled = (
+        getattr(
+            effective_request.literature_policy,
+            "cluster_generation_enabled",
+            None,
+        )
+        is not False
+    )
+    prior_cluster_state = _cluster_preservation_snapshot(workspace)
+    protected_cluster_state = (
+        None if clusters_enabled else prior_cluster_state
     )
     collection_snapshot = collection_snapshot or read_yaml(
         workspace / "01_custody" / "zotero" / "collection_snapshot.yml",
@@ -11778,8 +12346,14 @@ def rebuild_map(
                 workspace,
                 structural_relations=relations,
                 orphaned_source_ids=orphaned_source_ids,
+                protected_structural_relations=prior_cluster_state[
+                    "protected_relations"
+                ],
             )
         }
+        typed_projection_path = _persist_typed_source_relation_projection(
+            workspace, typed
+        )
         graph_profiles: Sequence[Any] = (
             workspace_profiles or workspace_note_rows
         )
@@ -11797,15 +12371,30 @@ def rebuild_map(
             workspace_note_rows,
             _cluster_catalogue_rows(workspace),
             collection_snapshot=collection_snapshot,
+            write_cluster_outputs=clusters_enabled,
         )
-        source_index = Path(catalogue["master_index_path"])
+        preservation = (
+            _verify_cluster_preservation(workspace, protected_cluster_state)
+            if protected_cluster_state is not None
+            else {}
+        )
         if progress is not None:
             progress.set_stage("reporting")
         return {
             "source_set": dict(source_set),
             "cluster_map": {
-                "status": "synthesis_disabled",
+                "status": (
+                    "synthesis_disabled"
+                    if clusters_enabled
+                    else "clusters_preserved_not_updated"
+                ),
                 "clusters": [],
+                "preserved_clusters": (
+                    protected_cluster_state["preserved_clusters"]
+                    if protected_cluster_state is not None
+                    else []
+                ),
+                "preservation": preservation,
                 "relations": [],
                 "rejected_proposals": [],
                 "unclustered_sources": [],
@@ -11826,19 +12415,15 @@ def rebuild_map(
                 "failure_count": 0,
                 "profile_packet_count": 0,
             },
-            "migration": {"status": "not_run", "reason": "synthesis_disabled"},
+            "migration": migration_result,
             "paths": [
                 Path(typed["path"]),
                 Path(typed["compatibility_path"]),
-                source_index,
-                Path(catalogue["catalogue_path"]),
-                Path(catalogue["cluster_catalogue_path"]),
-                Path(catalogue["cluster_index_path"]),
-                *(Path(path) for path in catalogue.get("shard_paths", []) or []),
+                typed_projection_path,
+                *_catalogue_artifact_paths(catalogue),
                 *note_paths,
             ],
         }
-    migration = migrate_workspace(workspace)
     if profile_budget is None:
         profile_budget = _ProfileProviderBudget(
             run_directory(workspace, run_id)
@@ -11872,11 +12457,26 @@ def rebuild_map(
         profile_paths = sorted(
             (workspace / "02_source_memory" / "profiles").glob("*.yml")
         )
+        preservation = (
+            _verify_cluster_preservation(workspace, protected_cluster_state)
+            if protected_cluster_state is not None
+            else {}
+        )
         return {
             "source_set": dict(source_set),
             "cluster_map": {
-                "status": "partial",
+                "status": (
+                    "partial"
+                    if clusters_enabled
+                    else "clusters_preserved_not_updated"
+                ),
                 "clusters": [],
+                "preserved_clusters": (
+                    protected_cluster_state["preserved_clusters"]
+                    if protected_cluster_state is not None
+                    else []
+                ),
+                "preservation": preservation,
                 "unclustered_sources": [],
             },
             "gap_map": {
@@ -11888,7 +12488,7 @@ def rebuild_map(
             "typed_links": {"links": [], "link_count": 0},
             "profiles": [],
             "profile_result": {"failure_count": 1, "partial_reason": reason},
-            "migration": migration,
+            "migration": migration_result,
             "partial_reason": reason,
             "paths": [*profile_paths, *checkpoint_paths],
         }
@@ -12008,7 +12608,8 @@ def rebuild_map(
         map_id=global_map_id,
         question=None,
         provider=effective_request.provider,
-        model=effective_request.model,
+        model=effective_request.literature_model or effective_request.model,
+        reasoning_effort=effective_request.reasoning_effort,
         allow_cloud=effective_request.allow_cloud,
         provider_concurrency=(
             effective_request.provider_concurrency or effective_request.parallel
@@ -12073,6 +12674,9 @@ def rebuild_map(
         ],
         preserve_unmentioned_structural=False,
         orphaned_source_ids=orphaned_source_ids,
+        protected_structural_relations=prior_cluster_state[
+            "protected_relations"
+        ],
     )
     catalogue = build_source_catalogue(
         workspace,
@@ -12081,6 +12685,7 @@ def rebuild_map(
         existing_clusters,
         collection_snapshot=collection_snapshot,
         identity_projection=identity_projection,
+        write_cluster_outputs=clusters_enabled,
     )
     catalogue_payload = read_yaml(Path(str(catalogue["catalogue_path"])), {}) or {}
     collection_rows = [
@@ -12106,27 +12711,30 @@ def rebuild_map(
         }
         for row in collection_rows
     ]
+    shared_family_plan: Mapping[str, Any] | None = None
+    family_plan_partial_reason = ""
     try:
-        shared_family_plan = _plan_literature_families(
-            workspace,
-            profiles=workspace_profiles,
-            catalogue=catalogue,
-            reasoner=reasoner,
-            reasoner_calls=reasoner_calls,
-            request=base_literature_request,
-        )
-        family_plan_partial_reason = (
-            "literature_family_plan_partial:"
-            + ",".join(
-                str(value)
-                for value in shared_family_plan.get(
-                    "unaccounted_source_ids", []
-                )[:20]
+        if clusters_enabled:
+            shared_family_plan = _plan_literature_families(
+                workspace,
+                profiles=workspace_profiles,
+                catalogue=catalogue,
+                reasoner=reasoner,
+                reasoner_calls=reasoner_calls,
+                request=base_literature_request,
             )
-            if shared_family_plan
-            and str(shared_family_plan.get("plan_status") or "") == "partial"
-            else ""
-        )
+            family_plan_partial_reason = (
+                "literature_family_plan_partial:"
+                + ",".join(
+                    str(value)
+                    for value in shared_family_plan.get(
+                        "unaccounted_source_ids", []
+                    )[:20]
+                )
+                if shared_family_plan
+                and str(shared_family_plan.get("plan_status") or "") == "partial"
+                else ""
+            )
         relationship_result = _run_relationship_reasoning(
             workspace,
             profiles=workspace_profiles,
@@ -12141,7 +12749,7 @@ def rebuild_map(
     except Exception as exc:
         failure_reason = (
             "literature_family_planning_failure"
-            if "shared_family_plan" not in locals()
+            if clusters_enabled and shared_family_plan is None
             else "relationship_stage_failure"
         )
         relationship_result = {
@@ -12152,7 +12760,7 @@ def rebuild_map(
                     "reason": failure_reason,
                     "error_type": type(exc).__name__,
                     "error": str(exc),
-                    "retry_on_resume": _synthesis_failure_class(exc) == "transport",
+                    "retry_on_resume": _synthesis_retry_on_resume(exc),
                 }
             ],
             "cluster_candidates": [],
@@ -12160,7 +12768,7 @@ def rebuild_map(
             "reconciled_catalogue_revision": "",
             "relationship_stage_complete": False,
             "relationship_retry_on_resume": (
-                _synthesis_failure_class(exc) == "transport"
+                _synthesis_retry_on_resume(exc)
             ),
             "planning_failed": failure_reason
             == "literature_family_planning_failure",
@@ -12171,7 +12779,7 @@ def rebuild_map(
     cross_boundary_ledger_path = _write_cross_boundary_ledger(
         workspace,
         family_plan=(
-            shared_family_plan if "shared_family_plan" in locals() else None
+            shared_family_plan
         ),
         relationship_result=relationship_result,
     )
@@ -12197,9 +12805,27 @@ def rebuild_map(
         parked_rows=relationship_result.get("parked", []) or [],
         preserve_unmentioned_structural=False,
         orphaned_source_ids=orphaned_source_ids,
+        protected_structural_relations=prior_cluster_state[
+            "protected_relations"
+        ],
         # Prompt identity is provenance for new or refreshed pair decisions,
         # not a global retirement trigger for still-valid earlier decisions.
         reconcile_machine_prompt_version=None,
+    )
+    typed_projection_path = _persist_typed_source_relation_projection(
+        workspace, typed
+    )
+    typed_relation_count = _active_source_relation_count(typed)
+    if progress is not None:
+        progress.update_literature(typed_relation_count=typed_relation_count)
+    catalogue = build_source_catalogue(
+        workspace,
+        full_workspace_profiles,
+        full_workspace_note_rows,
+        existing_clusters,
+        collection_snapshot=collection_snapshot,
+        identity_projection=identity_projection,
+        write_cluster_outputs=False,
     )
     global_source_set["rejected_pair_memory"] = [
         {
@@ -12229,19 +12855,168 @@ def rebuild_map(
     graph_paths = [
         Path(typed["path"]),
         Path(typed["compatibility_path"]),
-        Path(catalogue["catalogue_path"]),
-        Path(catalogue["master_index_path"]),
-        Path(catalogue["cluster_catalogue_path"]),
-        Path(catalogue["cluster_index_path"]),
-        *(Path(path) for path in catalogue.get("shard_paths", []) or []),
+        typed_projection_path,
+        *_catalogue_artifact_paths(catalogue),
         relationship_ledger_path,
         cross_boundary_ledger_path,
         *([duplicate_issue_path] if duplicate_issue_path is not None else []),
         *([selection_state_path] if selection_state_path is not None else []),
     ]
+    if not clusters_enabled:
+        note_paths = _project_atomic_graph(
+            workspace,
+            note_rows=full_workspace_note_rows,
+            profiles=full_workspace_profiles,
+            relations=typed.get("links", []) or [],
+            navigation=navigation,
+            navigation_policy=effective_request.navigation_policy,
+        )
+        preservation = _verify_cluster_preservation(
+            workspace, protected_cluster_state or {}
+        )
+        relationship_complete = bool(
+            relationship_result.get("relationship_stage_complete", True)
+        ) and not bool(relationship_result.get("parked"))
+        retry_on_resume = bool(
+            relationship_result.get("relationship_retry_on_resume")
+        )
+        relationship_partial_reason = (
+            ""
+            if relationship_complete
+            else (
+                "relationship_stage_partial:retryable_incomplete_pair_jobs"
+                if retry_on_resume
+                else "relationship_stage_partial:terminal_incomplete_relationships"
+            )
+        )
+        partial_reason = ";".join(
+            reason
+            for reason in (
+                profile_partial_reason,
+                relationship_partial_reason,
+            )
+            if reason
+        )
+        provider_calls = int(
+            getattr(reasoner_calls, "cumulative_provider_calls", 0) or 0
+        )
+        new_provider_calls = int(
+            getattr(reasoner_calls, "provider_calls", 0) or 0
+        )
+        checkpoint_hits = int(
+            getattr(reasoner_calls, "checkpoint_hits", 0) or 0
+        )
+        failures = int(getattr(reasoner_calls, "failures", 0) or 0)
+        if progress is not None:
+            progress.set_stage("reporting")
+            progress.update_literature(
+                unclustered_count=0,
+                topic_neighborhood_count=0,
+                subject_tag_count=int(
+                    navigation.get("promoted_subject_tag_count", 0) or 0
+                ),
+                subject_tag_assignment_count=len(
+                    navigation.get("assignments", []) or []
+                ),
+                typed_relation_count=typed_relation_count,
+                singleton_facet_count=int(
+                    navigation.get("singleton_facet_count", 0) or 0
+                ),
+                proposition_count=0,
+                evidence_base_group_count=0,
+                cluster_count=0,
+                evidence_concentrated_cluster_count=0,
+                cluster_source_contribution_count=0,
+                debate_count=0,
+                consensus_count=0,
+                mixed_evidence_count=0,
+                strict_consensus_established_count=0,
+                strict_consensus_not_established_count=0,
+                strict_contradiction_established_count=0,
+                strict_contradiction_not_established_count=0,
+                mapped_gap_count=0,
+                gap_lead_count=0,
+                strong_gap_established_count=0,
+                strong_gap_not_established_count=0,
+                synthesized_cluster_count=0,
+                rejected_underspecified_gap_count=0,
+                rejected_gap_quality_count=0,
+                merged_gap_count=0,
+                quantitative_comparison_count=0,
+                rejected_quantitative_comparison_count=0,
+                rejected_generated_locator_count=0,
+                coverage_inventory_count=0,
+                coverage_parked_for_review_count=0,
+                coverage_accounting_valid=False,
+                synthesis_call_count=provider_calls,
+                synthesis_new_call_count=new_provider_calls,
+                synthesis_checkpoint_hit_count=checkpoint_hits,
+                synthesis_failure_count=failures,
+                literature_provider_call_count=int(
+                    profile_result.get("provider_calls", 0) or 0
+                )
+                + provider_calls,
+                checkpoint_hit_count=int(
+                    profile_result.get("checkpoint_hits", 0) or 0
+                )
+                + checkpoint_hits,
+                literature_failure_count=int(
+                    profile_result.get("failure_count", 0) or 0
+                )
+                + failures,
+                active_cluster="",
+                active_gap_packet="",
+                active_synthesis_packet="",
+            )
+        result = {
+            "source_set": dict(source_set),
+            "cluster_map": {
+                "status": "clusters_preserved_not_updated",
+                "clusters": [],
+                "preserved_clusters": protected_cluster_state[
+                    "preserved_clusters"
+                ],
+                "navigation": navigation,
+                "relations": [],
+                "unclustered_sources": [],
+                "preservation": preservation,
+            },
+            "gap_map": {
+                "status": "clusters_preserved_not_updated",
+                "gap_candidates": [],
+                "novelty_claimed": False,
+            },
+            "literature_packet": {
+                "status": "partial" if partial_reason else "completed",
+                "reason": partial_reason or "cluster_generation_disabled",
+                "retry_on_resume": retry_on_resume,
+                "synthesis_call_count": provider_calls,
+                "synthesis_new_call_count": new_provider_calls,
+                "synthesis_checkpoint_hit_count": checkpoint_hits,
+                "synthesis_failure_count": failures,
+            },
+            "typed_links": typed,
+            "relationship_result": relationship_result,
+            "profiles": profiles,
+            "profile_result": {
+                key: value
+                for key, value in profile_result.items()
+                if key != "profiles"
+            },
+            "migration": migration_result,
+            "paths": [
+                *graph_paths,
+                *profile_result["paths"],
+                *_existing_source_set_paths(workspace, source_set),
+                *note_paths,
+            ],
+        }
+        if partial_reason:
+            result["partial_reason"] = partial_reason
+        return result
     if not bool(
         relationship_result.get("relationship_stage_complete", True)
-    ):
+    ) or bool(relationship_result.get("parked")):
         retry_on_resume = bool(
             relationship_result.get("relationship_retry_on_resume")
         )
@@ -12252,13 +13027,13 @@ def rebuild_map(
         )
         if progress is not None:
             progress.update_literature(literature_failure_count=1)
-        preserved_clusters, refresh_paths = (
-            _preserve_last_valid_clusters_on_refresh_failure(
-                workspace,
-                global_map_id,
-                reason,
-            )
-        )
+        prior_registry = _load_map_cluster_registry(workspace, global_map_id)
+        preserved_clusters = [
+            dict(row)
+            for row in prior_registry.get("clusters", []) or []
+            if isinstance(row, Mapping) and row.get("cluster_id")
+        ]
+        refresh_paths: list[Path] = []
         partial_note_paths = _project_atomic_graph(
             workspace,
             note_rows=full_workspace_note_rows,
@@ -12268,17 +13043,22 @@ def rebuild_map(
             navigation_policy=effective_request.navigation_policy,
             clusters=preserved_clusters,
         )
+        preservation = _verify_cluster_preservation(
+            workspace, prior_cluster_state
+        )
         return {
             "source_set": dict(source_set),
             "cluster_map": {
                 "status": "partial",
-                "clusters": preserved_clusters,
+                "clusters": [],
+                "preserved_clusters": preserved_clusters,
                 "relations": [],
                 "unclustered_sources": [],
-                "refresh_pending_cluster_count": len(preserved_clusters),
+                "refresh_pending_cluster_count": 0,
                 "planning_refresh_pending": bool(
                     relationship_result.get("planning_failed")
                 ),
+                "preservation": preservation,
             },
             "gap_map": {
                 "status": "partial",
@@ -12311,7 +13091,7 @@ def rebuild_map(
                 for key, value in profile_result.items()
                 if key != "profiles"
             },
-            "migration": migration,
+            "migration": migration_result,
             "partial_reason": reason,
             "paths": [
                 *graph_paths,
@@ -12374,7 +13154,7 @@ def rebuild_map(
             paths = [*paths, acquisition_ledger_path]
     except Exception as exc:
         reason = f"literature_synthesis_partial:{type(exc).__name__}:{exc}"
-        retry_on_resume = _synthesis_failure_class(exc) == "transport"
+        retry_on_resume = _synthesis_retry_on_resume(exc)
         if profile_partial_reason:
             reason = f"{profile_partial_reason};{reason}"
         preserved_clusters, refresh_paths = (
@@ -12453,7 +13233,7 @@ def rebuild_map(
             "profile_result": {
                 key: value for key, value in profile_result.items() if key != "profiles"
             },
-            "migration": migration,
+            "migration": migration_result,
             "partial_reason": reason,
             "paths": [
                 *graph_paths,
@@ -12468,11 +13248,6 @@ def rebuild_map(
         if isinstance(cluster_map.get("navigation"), Mapping)
         else {}
     )
-    navigation_relations = [
-        dict(row)
-        for row in navigation.get("typed_relations", []) or []
-        if isinstance(row, Mapping)
-    ]
     combined_structural = {
         str(
             row.get("relation_id")
@@ -12496,6 +13271,8 @@ def rebuild_map(
         preserve_unmentioned_structural=False,
         orphaned_source_ids=orphaned_source_ids,
     )
+    _persist_typed_source_relation_projection(workspace, typed)
+    typed_relation_count = _active_source_relation_count(typed)
     profile_packet_paths = [
         path
         for path in profile_result["paths"]
@@ -12531,7 +13308,7 @@ def rebuild_map(
             ),
             subject_tag_count=int(navigation.get("promoted_subject_tag_count", 0) or 0),
             subject_tag_assignment_count=len(navigation.get("assignments", []) or []),
-            typed_relation_count=len(navigation_relations),
+            typed_relation_count=typed_relation_count,
             singleton_facet_count=int(navigation.get("singleton_facet_count", 0) or 0),
             proposition_count=int(cluster_map.get("proposition_count", 0) or 0),
             evidence_base_group_count=int(
@@ -12625,9 +13402,13 @@ def rebuild_map(
         for cluster in cluster_map.get("clusters", []) or []
         if isinstance(cluster, Mapping) and cluster.get("cluster_id")
     }
-    catalogue = update_catalogue_clusters(
+    catalogue = build_source_catalogue(
         workspace,
+        full_workspace_profiles,
+        full_workspace_note_rows,
         catalogue_clusters.values(),
+        collection_snapshot=collection_snapshot,
+        identity_projection=identity_projection,
     )
     note_paths = _project_atomic_graph(
         workspace,
@@ -12713,13 +13494,10 @@ def rebuild_map(
         dict.fromkeys(
             [
                 *graph_paths,
+                *_catalogue_artifact_paths(catalogue),
                 Path(typed["path"]),
                 Path(typed["compatibility_path"]),
                 source_index,
-                Path(catalogue["catalogue_path"]),
-                Path(catalogue["cluster_catalogue_path"]),
-                Path(catalogue["cluster_index_path"]),
-                *(Path(path) for path in catalogue.get("shard_paths", []) or []),
                 *note_paths,
                 *profile_result["paths"],
                 *paths,
@@ -12738,7 +13516,7 @@ def rebuild_map(
         "profile_result": {
             key: value for key, value in profile_result.items() if key != "profiles"
         },
-        "migration": migration,
+        "migration": migration_result,
         "relationship_result": relationship_result,
         "paths": result_paths,
     }
@@ -13126,9 +13904,12 @@ def _build_profiles_for_map(
                         existing_validity.update(
                             profile_prompt_version=PROFILE_PROMPT_VERSION,
                             classifier_version=PROFILE_CLASSIFIER_VERSION,
-                            algorithm_version=PROFILE_ALGORITHM_VERSION,
                             legacy_profile_upgraded_mechanically=True,
                         )
+                        if not analytical:
+                            existing_validity["algorithm_version"] = (
+                                PROFILE_ALGORITHM_VERSION
+                            )
                         existing.validity = existing_validity
                         profile = existing
                         checkpoint_hit = 1
@@ -13309,7 +14090,7 @@ def _build_profiles_for_map(
             # analytical route. It binds source-controlled coverage and keeps
             # existing reasoner anchors intact; it is not a second semantic
             # verification pass.
-            profile, _ = augment_profile_from_committed_note(
+            profile, profile_augmented = augment_profile_from_committed_note(
                 profile,
                 text,
                 source_set_id="",
@@ -13317,6 +14098,8 @@ def _build_profiles_for_map(
                 model=request.model,
                 policy=profile_policy,
             )
+            if profile_augmented:
+                profile.dependency_hash = fingerprint
         validation = validate_profile(
             profile,
             require_substantive=analytical,
@@ -13506,6 +14289,7 @@ def _profile_dependency_policy(
     identity = "auto_zettelkasten.profiles.deterministic_profile:v1"
     profile_relevant_policy = request.literature_policy.to_dict()
     for field_name in (
+        "cluster_generation_enabled",
         "weak_gap_handling",
         "cluster_gap_projection",
         "require_executable_gap_design",
@@ -13813,6 +14597,8 @@ def _recover_saved_source_bundle(
     if (
         not isinstance(failure, Mapping)
         or str(failure.get("fingerprint") or "") != fingerprint
+        or str(failure.get("error_type") or "")
+        == "SourceBundleQuantitativeProvenanceError"
     ):
         return None
     raw = failure.get("raw_response")
@@ -13931,6 +14717,28 @@ def _acquire_and_freeze_item(
     return base
 
 
+def _limited_scope_result(
+    base: dict[str, Any],
+    content: Mapping[str, Any],
+    item: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    source_scope = str(content.get("source_scope") or "full_document")
+    if source_scope in {"full_document", "partial_document"}:
+        return None
+    note_status = {
+        "abstract_only": "abstract_only_atomic_note",
+        "metadata_only": "metadata_only_source_note",
+        "fulltext_available": "fulltext_available",
+    }.get(source_scope, "metadata_only_source_note")
+    base.update(
+        terminal_status="limited_note",
+        note_status=note_status,
+        limited_analysis=_limited_analysis(content, item),
+        reason=str(content.get("coverage_reason") or source_scope),
+    )
+    return base
+
+
 def _prepare_item(
     workspace: Path,
     run_dir: Path,
@@ -14016,6 +14824,37 @@ def _prepare_item(
             )
         )
         return base
+    document_route = content.get("document_route")
+    recovery_state = (
+        str((document_route.get("recovery") or {}).get("state") or "")
+        if isinstance(document_route, Mapping)
+        and isinstance(document_route.get("recovery"), Mapping)
+        else ""
+    )
+    if recovery_state == "selected":
+        content = _recover_pdf_image_route(
+            content,
+            request,
+            workspace,
+            checkpoint_root,
+            trigger="resume",
+            acquisition_gate=acquisition_gate,
+            cancel_event=cancel_event,
+        )
+    elif recovery_state == "failed":
+        base.update(
+            terminal_status="parked_for_review",
+            reason="pdf_image_local_recovery_failed",
+        )
+        base["attempts"].append(
+            _attempt(
+                base,
+                "pdf_image_local_recovery",
+                "failed",
+                "terminal_local_recovery_failure_not_retried",
+            )
+        )
+        return base
     content_hash = str(content["content_hash"])
     effective_provider = str(content.get("reader_provider") or base["reader_provider"])
     effective_model = str(content.get("reader_model") or base["reader_model"])
@@ -14027,6 +14866,11 @@ def _prepare_item(
         effective_model,
         str(content.get("source_scope") or "full_document"),
         str(item_data(item).get("itemType") or ""),
+        str(
+            (content.get("document_route") or {}).get("identity")
+            if isinstance(content.get("document_route"), Mapping)
+            else ""
+        ),
     )
     base.update(
         content,
@@ -14113,19 +14957,8 @@ def _prepare_item(
         base["analysis"] = content["analysis"]
         return base
     source_scope = str(content.get("source_scope") or "full_document")
-    if source_scope not in {"full_document", "partial_document"}:
-        note_status = {
-            "abstract_only": "abstract_only_atomic_note",
-            "metadata_only": "metadata_only_source_note",
-            "fulltext_available": "fulltext_available",
-        }.get(source_scope, "metadata_only_source_note")
-        base.update(
-            terminal_status="limited_note",
-            note_status=note_status,
-            limited_analysis=_limited_analysis(content, item),
-            reason=str(content.get("coverage_reason") or source_scope),
-        )
-        return base
+    if limited := _limited_scope_result(base, content, item):
+        return limited
     recovered_source_result = _recover_saved_source_bundle(
         checkpoint_root,
         source_id=str(base["source_id"]),
@@ -14177,68 +15010,89 @@ def _prepare_item(
         if progress is not None:
             progress.update(index, status="active", phase="reading_document")
         extraction_metrics = dict(content.get("coverage_metrics", {}) or {})
-        reader_metadata = {
-            **item_data(item),
-            "_source_context": {
-                "source_id": str(base["source_id"]),
-                "zotero_key": key,
-                "attachment_key": str(
-                    item_data(item).get("parentItem") and key or ""
-                ),
-                "source_file": str(content.get("source_file") or ""),
-                "route": str(content.get("content_route") or ""),
-                "media_type": str(content.get("media_type") or ""),
-                "source_scope": source_scope,
-                "page_count": int(extraction_metrics.get("page_count", 0) or 0),
-                "embedded_text_page_count": int(
-                    extraction_metrics.get("embedded_text_page_count", 0) or 0
-                ),
-                "ocr_page_count": int(
-                    extraction_metrics.get("ocr_page_count", 0) or 0
-                ),
-                "unresolved_pages": list(
-                    extraction_metrics.get("unresolved_pages", []) or []
-                ),
-                "recovered_pages": list(
-                    extraction_metrics.get("recovered_pages", []) or []
-                ),
-                "recovered_page_ratio": extraction_metrics.get(
-                    "recovered_page_ratio"
-                ),
-                "content_kind": str(
-                    extraction_metrics.get("content_kind") or ""
-                ),
-                "ordinal_to_printed_page": dict(
-                    extraction_metrics.get("ordinal_to_printed_page", {}) or {}
-                ),
-                "heading_spans": list(
-                    extraction_metrics.get("heading_spans", []) or []
-                ),
-                "table_spans": list(
-                    extraction_metrics.get("table_spans", []) or []
-                ),
-                "figure_spans": list(
-                    extraction_metrics.get("figure_spans", []) or []
-                ),
-            },
-        }
+        reader_metadata = _source_reader_metadata(
+            item, str(base["source_id"]), key, content
+        )
         if recovered_source_result is not None:
             source_result = recovered_source_result
             reader_route = "local_source_envelope_recovery"
             reader_reason = "saved_provider_response_reparsed_without_call"
         else:
-            source_result, reader_route, reader_reason = _read_document(
-                reader,
-                str(content["text"]),
-                reader_metadata,
-                None,
-                request=request,
-                checkpoint_root=checkpoint_root,
-                progress=progress,
-                inventory_index=index,
-                provider_budget=profile_budget,
-                cancel_event=cancel_event,
-            )
+            try:
+                source_result, reader_route, reader_reason = _read_document(
+                    reader,
+                    str(content["text"]),
+                    reader_metadata,
+                    None,
+                    request=request,
+                    checkpoint_root=checkpoint_root,
+                    progress=progress,
+                    inventory_index=index,
+                    provider_budget=profile_budget,
+                    cancel_event=cancel_event,
+                    document_route=_active_pdf_document_route(content),
+                    expected_custody_hash=content_hash,
+                    expected_custody_file=Path(
+                        str(content.get("source_file") or "")
+                    ),
+                    custody_root=workspace / "01_custody" / "files",
+                )
+            except (
+                ProviderUnsupportedAttachment,
+                ProviderInvalidSourceBundle,
+            ) as exc:
+                if not isinstance(content.get("document_route"), Mapping):
+                    raise
+                content = _recover_pdf_image_route(
+                    content,
+                    request,
+                    workspace,
+                    checkpoint_root,
+                    trigger=type(exc).__name__,
+                    acquisition_gate=acquisition_gate,
+                    cancel_event=cancel_event,
+                )
+                base.update(content)
+                source_scope = str(
+                    content.get("source_scope") or "full_document"
+                )
+                fingerprint = _fingerprint(
+                    key,
+                    content_hash,
+                    request,
+                    effective_provider,
+                    effective_model,
+                    source_scope,
+                    str(item_data(item).get("itemType") or ""),
+                    str(
+                        (content.get("document_route") or {}).get("identity")
+                        if isinstance(content.get("document_route"), Mapping)
+                        else ""
+                    ),
+                )
+                base["fingerprint"] = fingerprint
+                if limited := _limited_scope_result(base, content, item):
+                    return limited
+                extraction_metrics = dict(
+                    content.get("coverage_metrics", {}) or {}
+                )
+                reader_metadata = _source_reader_metadata(
+                    item, str(base["source_id"]), key, content
+                )
+                source_result, reader_route, reader_reason = _read_document(
+                    reader,
+                    str(content["text"]),
+                    reader_metadata,
+                    None,
+                    request=request,
+                    checkpoint_root=checkpoint_root,
+                    progress=progress,
+                    inventory_index=index,
+                    provider_budget=profile_budget,
+                    cancel_event=cancel_event,
+                )
+                reader_route += "_after_pdf_local_recovery"
+                reader_reason += ":after_pdf_local_recovery"
     except DocumentPartialError as exc:
         base.update(
             terminal_status="partial",
@@ -14268,7 +15122,13 @@ def _prepare_item(
             _attempt(base, "hierarchical_reader", "limited", base["reason"])
         )
         return base
-    except (ProviderCallLimitReached, ProviderSpendLimitReached):
+    except (
+        ProviderCallLimitReached,
+        ProviderSpendLimitReached,
+        ProviderQuotaExhausted,
+        ProviderTimeout,
+        ProviderInterrupted,
+    ):
         raise
     except Exception as exc:
         raw_response = str(getattr(exc, "raw_response", "") or "")
@@ -14279,7 +15139,7 @@ def _prepare_item(
             if isinstance(exc, ProviderEmptyResponse)
             else "semantic_contract"
         )
-        retry_on_resume = failure_class == "transport"
+        retry_on_resume = failure_class in {"transport", "quota", "timeout", "interruption"}
         failure_status = "paused_transport" if retry_on_resume else "parked_for_review"
         write_yaml(
             checkpoint_root / "source_failure.yml",
@@ -14317,6 +15177,9 @@ def _prepare_item(
     try:
         bundle = _source_bundle_from_result(source_result, base, source_scope)
     except ValueError as exc:
+        quantitative_provenance = isinstance(
+            exc, SourceBundleQuantitativeProvenanceError
+        )
         write_yaml(
             checkpoint_root / "source_failure.yml",
             {
@@ -14327,13 +15190,19 @@ def _prepare_item(
                 "source_bundle_envelope_contract": SOURCE_BUNDLE_ENVELOPE_CONTRACT,
                 "error_type": type(exc).__name__,
                 "error": str(exc),
+                "failure_class": "semantic_contract",
+                "retry_on_resume": False,
                 "raw_response": dict(source_result),
                 "raw_response_hash": stable_hash(source_result),
                 "provider_completion": {},
                 "updated_at": now_iso(),
             },
         )
-        base["reason"] = f"source_bundle_ownership_invalid:{exc}"
+        base["reason"] = (
+            f"source_bundle_quantitative_provenance_invalid:{exc}"
+            if quantitative_provenance
+            else f"source_bundle_ownership_invalid:{exc}"
+        )
         base["attempts"].append(
             _attempt(base, reader_route, "failed", base["reason"])
         )
@@ -14375,6 +15244,8 @@ def _source_bundle_from_result(
     result: Mapping[str, Any],
     row: Mapping[str, Any],
     source_scope: str,
+    *,
+    validate_quantitative_provenance: bool = True,
 ) -> SourceAnalysisBundle | None:
     if str(result.get("bundle_schema_version") or "") != "1":
         return None
@@ -14539,7 +15410,2774 @@ def _source_bundle_from_result(
             else value
             for value in recommendations
         ]
+    if validate_quantitative_provenance:
+        _validate_quantitative_provenance(payload, row)
     return SourceAnalysisBundle.from_dict(payload)
+
+
+_MONTHS = {
+    name: index
+    for index, names in enumerate(
+        (
+            ("january", "jan"),
+            ("february", "feb"),
+            ("march", "mar"),
+            ("april", "apr"),
+            ("may",),
+            ("june", "jun"),
+            ("july", "jul"),
+            ("august", "aug"),
+            ("september", "sep", "sept"),
+            ("october", "oct"),
+            ("november", "nov"),
+            ("december", "dec"),
+        ),
+        1,
+    )
+    for name in names
+}
+_MONTH_PATTERN = "|".join(sorted(_MONTHS, key=len, reverse=True))
+_MONTH_FIRST_DATE_RE = re.compile(
+    rf"\b({_MONTH_PATTERN})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,?\s+(\d{{4}}))?\b",
+    re.IGNORECASE,
+)
+_DAY_FIRST_DATE_RE = re.compile(
+    rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({_MONTH_PATTERN})\.?(?:,?\s+(\d{{4}}))?\b",
+    re.IGNORECASE,
+)
+_ISO_DATE_RE = re.compile(r"(?<!\d)(\d{4})-(\d{2})-(\d{2})(?!\d)")
+_SLASH_DATE_RE = re.compile(
+    r"(?<!\d)(\d{1,2})/(\d{1,2})/(\d{2}|\d{4})(?!\d)"
+)
+_YEAR_TOKEN = r"(?:1\d{3}|2\d{3})"
+_YEAR_TOKEN_RE = re.compile(rf"(?<!\d)({_YEAR_TOKEN})(?!\d)")
+_YEAR_RANGE_RE = re.compile(
+    rf"(?<!\d)({_YEAR_TOKEN})\s*"
+    rf"(?:[-–—]|\bto\b|\bthrough\b|\bversus\b|\bvs\.?\b)\s*"
+    rf"({_YEAR_TOKEN})(?!\d)",
+    re.IGNORECASE,
+)
+_BETWEEN_YEAR_RANGE_RE = re.compile(
+    rf"\bbetween\s+({_YEAR_TOKEN})\s+and\s+({_YEAR_TOKEN})\b",
+    re.IGNORECASE,
+)
+_FISCAL_YEAR_RANGE_RE = re.compile(
+    rf"\b(?:fy\s*)?({_YEAR_TOKEN})\s*[-–—/]\s*(\d{{2}})(?!\d|[-–—/])",
+    re.IGNORECASE,
+)
+_SEASON_YEAR_RE = re.compile(
+    rf"\b(?:spring|summer|fall|autumn|winter)\s+({_YEAR_TOKEN})\b",
+    re.IGNORECASE,
+)
+_DATE_RANGE_SEPARATOR = r"(?:[-–—]|\bto\b|\bthrough\b)"
+_COMPACT_MONTH_RANGE_RE = re.compile(
+    rf"\b({_MONTH_PATTERN})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?\s*"
+    rf"{_DATE_RANGE_SEPARATOR}\s*(\d{{1,2}})(?:st|nd|rd|th)?"
+    rf"(?:,?\s+(\d{{4}}))?\b",
+    re.IGNORECASE,
+)
+_COMPACT_DAY_FIRST_RANGE_RE = re.compile(
+    rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s*{_DATE_RANGE_SEPARATOR}\s*"
+    rf"(\d{{1,2}})(?:st|nd|rd|th)?\s+({_MONTH_PATTERN})\.?(?:,?\s+(\d{{4}}))?\b",
+    re.IGNORECASE,
+)
+_PAGE_DATE_METADATA_LABEL_RE = re.compile(
+    r"^\s*(?:date\s+published|publication\s+date|published|updated|accessed|retrieved|"
+    r"last\s+(?:modified|updated))"
+    r"(?:\s+on)?\s*:?[ \t]*(.*)$",
+    re.IGNORECASE,
+)
+_QUANTITATIVE_DATE_LOCALITY_LINES = 12
+_QUANTITATIVE_TABLE_MAX_ROWS = 64
+_UNICODE_GROUP_SEPARATOR_RE = re.compile(
+    r"(?<=\d)[\u00a0\u2007\u2009\u202f](?=\d{3}(?:\D|$))"
+)
+_CARDINAL_NUMBERS = {
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "ten": "10",
+    "eleven": "11",
+    "twelve": "12",
+    "dozen": "12",
+}
+_CARDINAL_NUMBER_RE = re.compile(
+    rf"\b({'|'.join(_CARDINAL_NUMBERS)})\b", re.IGNORECASE
+)
+
+
+def _normalized_quantity_text(value: str) -> str:
+    value = value.translate({0x2212: "-", 0xFE63: "-", 0xFF0D: "-"})
+    value = _UNICODE_GROUP_SEPARATOR_RE.sub("", value)
+    value = re.sub(
+        r"(?<![+\-\d.])(\d[\d,]*(?:\.\d+)?)\s*[-–—]\s*"
+        r"(\d[\d,]*(?:\.\d+)?)(?!-\d{2}\b)",
+        r"\1 to \2",
+        value,
+    )
+    value = re.sub(r"\b(from|to)(?=[+-](?:\d|\.\d))", r"\1 ", value, flags=re.I)
+    value = re.sub(r"(?<=\d)(?=[+-](?:\d|\.\d))", " ", value)
+    value = _CARDINAL_NUMBER_RE.sub(
+        lambda match: _CARDINAL_NUMBERS[match.group(1).casefold()], value
+    )
+    value = re.sub(
+        r"(?<=\d)[ \t\u00a0\u2007\u2009\u202f]+(?=%)", "", value
+    )
+    value = re.sub(
+        r"(?<=\d)\s+(?:per\s+cent|percent)\b",
+        "%",
+        value,
+        flags=re.IGNORECASE,
+    )
+    value = re.sub(
+        r"(\d(?:[\d,]*\d)?(?:\.\d+)?)%?"
+        r"\s*(?:[-–—]|\bto\b)\s*"
+        r"(\d(?:[\d,]*\d)?(?:\.\d+)?)%",
+        r"\1% to \2%",
+        value,
+        flags=re.IGNORECASE,
+    )
+    return value
+
+
+def _quantity_token_list(value: str) -> list[str]:
+    return _fidelity_numeric_tokens(_normalized_quantity_text(value))
+
+
+def _quantity_tokens(value: str) -> set[str]:
+    return set(_quantity_token_list(value))
+
+
+def _footnote_quantity_groups(
+    text: str,
+) -> list[tuple[set[str], set[str], str]]:
+    lines = text.splitlines()
+    groups: list[tuple[set[str], set[str], str]] = []
+    for index, line in enumerate(lines):
+        definition = re.match(
+            r"^\s*(\[\d+\]|\(\d+\)|\^\d+|"
+            r"[¹²³⁴⁵⁶⁷⁸⁹⁰]+|[*†‡])(?!\1)\s*(\S.*)$",
+            line,
+        )
+        if not definition or line.rstrip().endswith(definition.group(1)):
+            continue
+        marker = definition.group(1)
+        block: list[str] = []
+        for previous in reversed(lines[max(0, index - 12) : index]):
+            if not previous.strip():
+                continue
+            block.append(previous)
+            if previous.rstrip().endswith(":"):
+                break
+        marked: set[str] = set()
+        unmarked: set[str] = set()
+        for sibling in block:
+            tokens = _quantity_tokens(sibling)
+            if not tokens:
+                continue
+            if marker == "*":
+                marker_matches = list(
+                    re.finditer(r"(?<!\*)\*(?!\*)", sibling)
+                )
+                emphasis_positions = {
+                    position
+                    for match in re.finditer(
+                        r"(?<!\S)\*(?=\S)[^*\n]*?(?<=\S)\*(?!\*)",
+                        sibling,
+                    )
+                    for position in (match.start(), match.end() - 1)
+                }
+            else:
+                marker_matches = list(re.finditer(re.escape(marker), sibling))
+                emphasis_positions = set()
+            marked_tokens: set[str] = set()
+            for marker_match in marker_matches:
+                marker_start = marker_match.start()
+                if marker_start in emphasis_positions or not sibling[:marker_start].rstrip():
+                    continue
+                if (
+                    marker == "*"
+                    and sibling[marker_start - 1].isspace()
+                    and marker_match.end() < len(sibling)
+                    and sibling[marker_match.end()].isspace()
+                ):
+                    continue
+                separators = [sibling.rfind(";", 0, marker_start)]
+                separators.extend(
+                    match.start()
+                    for match in re.finditer(r"(?<!\d),", sibling[:marker_start])
+                )
+                separators.extend(
+                    match.end() - 1
+                    for match in re.finditer(
+                        r"\s+(?:and|or|plus|&)\s+|\s+/\s+|"
+                        r"(?<=[A-Za-z])\s*/\s*(?=\d)",
+                        sibling[:marker_start],
+                        flags=re.IGNORECASE,
+                    )
+                )
+                clause_start = max(separators) + 1
+                marked_tokens.update(
+                    _quantity_tokens(sibling[clause_start:marker_start])
+                )
+            if marked_tokens:
+                marked.update(marked_tokens)
+                unmarked.update(tokens - marked_tokens)
+            else:
+                unmarked.update(tokens)
+        if marked:
+            groups.append((marked, unmarked, definition.group(2)))
+    return groups
+
+
+def _footnote_scope_terms(value: str) -> set[str]:
+    normalized: set[str] = set()
+    for term in re.findall(r"[^\W_]+", value.casefold()):
+        if term in {
+            "as",
+            "based",
+            "during",
+            "in",
+            "of",
+            "on",
+            "that",
+            "the",
+            "these",
+            "this",
+            "those",
+            "to",
+        }:
+            continue
+        if term in {"beginning", "early", "first", "initial", "opening"}:
+            normalized.add("initial")
+        elif term in {
+            "day",
+            "days",
+            "hour",
+            "hours",
+            "month",
+            "months",
+            "week",
+            "weeks",
+            "year",
+            "years",
+        }:
+            normalized.add("duration")
+        else:
+            normalized.add(term)
+    return normalized
+
+
+def _footnote_temporal_scope(value: str) -> set[str]:
+    value = _normalized_quantity_text(value).casefold()
+    scope = _named_period_markers(value)
+    for match in re.finditer(
+        r"\b(\d+)\s*[- ]\s*(day|hour|month|week|year)s?\b", value
+    ):
+        scope.update(match.groups())
+        if re.search(
+            r"\b(?:beginning|early|first|initial|opening)\b",
+            value[max(0, match.start() - 24) : match.start()],
+        ):
+            scope.add("initial")
+    for match in re.finditer(
+        r"\b(day|hour|month|week|year)s?\s+1\s+to\s+(\d+)\b", value
+    ):
+        scope.update((match.group(2), match.group(1), "initial"))
+    for match in re.finditer(
+        r"\b(day|hour|month|week|year)s?\s+(\d+)\s+to\s+(\d+)\b",
+        value,
+    ):
+        scope.update((match.group(2), match.group(3), match.group(1), "range"))
+    for match in re.finditer(
+        r"\b(entire|full|whole)\s+(campaign|conflict|period|study|war)\b",
+        value,
+    ):
+        scope.update(("whole", match.group(2)))
+    for match in re.finditer(
+        r"\b(campaign|conflict|period|study|war)\s+to\s+date\b", value
+    ):
+        scope.update(("to_date", match.group(1)))
+    for match in re.finditer(
+        rf"\b({_MONTH_PATTERN})\s+(?:to|through)\s+({_MONTH_PATTERN})"
+        rf"(?:\s+({_YEAR_TOKEN}))?\b",
+        value,
+    ):
+        scope.update(
+            (
+                "month_range",
+                str(_MONTHS[match.group(1)]),
+                str(_MONTHS[match.group(2)]),
+                match.group(3) or "",
+            )
+        )
+    for match in re.finditer(
+        rf"\b(spring|summer|fall|autumn|winter)\s+(?:to|through)\s+"
+        rf"(spring|summer|fall|autumn|winter)(?:\s+({_YEAR_TOKEN}))?\b",
+        value,
+    ):
+        scope.update(("season_range", *match.groups()))
+    return scope
+
+
+def _footnote_text_scope(value: str) -> set[str]:
+    terms = _footnote_scope_terms(_normalized_quantity_text(value))
+    if "initial" in _footnote_temporal_scope(value):
+        terms.add("initial")
+    return (
+        terms
+        if terms.intersection(
+            {"initial", "period", "phase", "stage", "wave", "window"}
+        )
+        else set()
+    )
+
+
+def _calendar_dates(value: str) -> list[tuple[int, int, int | None]]:
+    dates = [
+        (_MONTHS[month.casefold()], int(day), int(year) if year else None)
+        for month, start, end, year in _COMPACT_MONTH_RANGE_RE.findall(value)
+        for day in (start, end)
+    ]
+    dates.extend(
+        (_MONTHS[month.casefold()], int(day), int(year) if year else None)
+        for start, end, month, year in _COMPACT_DAY_FIRST_RANGE_RE.findall(value)
+        for day in (start, end)
+    )
+    value = _COMPACT_MONTH_RANGE_RE.sub(" ", value)
+    value = _COMPACT_DAY_FIRST_RANGE_RE.sub(" ", value)
+    dates.extend(
+        (_MONTHS[month.casefold()], int(day), int(year) if year else None)
+        for month, day, year in _MONTH_FIRST_DATE_RE.findall(value)
+    )
+    dates.extend(
+        (_MONTHS[month.casefold()], int(day), int(year) if year else None)
+        for day, month, year in _DAY_FIRST_DATE_RE.findall(value)
+    )
+    dates.extend(
+        (int(month), int(day), int(year))
+        for year, month, day in _ISO_DATE_RE.findall(value)
+    )
+    for first, second, raw_year in _SLASH_DATE_RE.findall(value):
+        left, right = int(first), int(second)
+        month, day = (right, left) if left > 12 >= right else (left, right)
+        year = int(raw_year)
+        if year < 100:
+            year += 2000 if year < 70 else 1900
+        if 1 <= month <= 12 and 1 <= day <= 31:
+            dates.append((month, day, year))
+    years = {year for _month, _day, year in dates if year is not None}
+    if len(years) == 1 and re.search(
+        rf"{_DATE_RANGE_SEPARATOR}|\band\b", value, re.IGNORECASE
+    ):
+        shared_year = next(iter(years))
+        dates = [
+            (month, day, year if year is not None else shared_year)
+            for month, day, year in dates
+        ]
+    return dates
+
+
+def _named_period_markers(value: str) -> set[str]:
+    markers: set[str] = set()
+    for match in re.finditer(
+        rf"\b({_MONTH_PATTERN})\.?(?:\s+(?:of\s+)?({_YEAR_TOKEN}))?\s*"
+        rf"(?:[-–—]|\bto\b|\bthrough\b)\s*"
+        rf"({_MONTH_PATTERN})\.?(?:\s+(?:of\s+)?({_YEAR_TOKEN}))?\b",
+        value,
+        re.IGNORECASE,
+    ):
+        first_year, second_year = match.group(2), match.group(4)
+        shared_year = first_year or second_year or ""
+        markers.update(
+            {
+                f"month:{_MONTHS[match.group(1).casefold()]}:{shared_year}",
+                f"month:{_MONTHS[match.group(3).casefold()]}:{shared_year}",
+            }
+        )
+    markers.update(
+        f"month:{_MONTHS[month.casefold()]}:{year}"
+        for month, year in re.findall(
+            rf"\b({_MONTH_PATTERN})\.?\s+(?:of\s+)?({_YEAR_TOKEN})\b",
+            value,
+            re.IGNORECASE,
+        )
+    )
+    quarter_names = {"first": "1", "second": "2", "third": "3", "fourth": "4"}
+    for match in re.finditer(
+        rf"\bq([1-4])\s*(?:[-–—]|\bto\b|\bthrough\b)\s*q([1-4])"
+        rf"(?:\s+(?:of\s+)?({_YEAR_TOKEN}))?\b",
+        value,
+        re.IGNORECASE,
+    ):
+        year = match.group(3) or ""
+        markers.update(
+            {f"quarter:{match.group(1)}:{year}", f"quarter:{match.group(2)}:{year}"}
+        )
+    for match in re.finditer(
+        rf"\b(first|second|third|fourth)\s+quarter\s*"
+        rf"(?:[-–—]|\bto\b|\bthrough\b)\s*"
+        rf"(first|second|third|fourth)\s+quarter"
+        rf"(?:\s+(?:of\s+)?({_YEAR_TOKEN}))?\b",
+        value,
+        re.IGNORECASE,
+    ):
+        year = match.group(3) or ""
+        markers.update(
+            {
+                f"quarter:{quarter_names[match.group(1).casefold()]}:{year}",
+                f"quarter:{quarter_names[match.group(2).casefold()]}:{year}",
+            }
+        )
+    for match in re.finditer(
+        rf"\b(?:q([1-4])|((?:first|second|third|fourth))\s+quarter)"
+        rf"\s+(?:of\s+)?({_YEAR_TOKEN})\b",
+        value,
+        re.IGNORECASE,
+    ):
+        quarter = match.group(1) or quarter_names[match.group(2).casefold()]
+        markers.add(f"quarter:{quarter}:{match.group(3)}")
+    season_names = {"autumn": "fall"}
+    for match in re.finditer(
+        rf"\b(spring|summer|fall|autumn|winter)\s*"
+        rf"(?:[-–—]|\bto\b|\bthrough\b)\s*"
+        rf"(spring|summer|fall|autumn|winter)(?:\s+({_YEAR_TOKEN}))?\b",
+        value,
+        re.IGNORECASE,
+    ):
+        year = match.group(3) or ""
+        markers.update(
+            {
+                f"season:{season_names.get(match.group(1).casefold(), match.group(1).casefold())}:{year}",
+                f"season:{season_names.get(match.group(2).casefold(), match.group(2).casefold())}:{year}",
+            }
+        )
+    markers.update(
+        f"season:{season_names.get(season.casefold(), season.casefold())}:{year}"
+        for season, year in re.findall(
+            rf"\b(spring|summer|fall|autumn|winter)\s+({_YEAR_TOKEN})\b",
+            value,
+            re.IGNORECASE,
+        )
+    )
+    for kind, pattern in (
+        ("fiscal", rf"\b(?:fy\s*|fiscal\s+year\s+)({_YEAR_TOKEN})\b"),
+        ("calendar", rf"\bcalendar\s+year\s+({_YEAR_TOKEN})\b"),
+        ("academic", rf"\bacademic\s+year\s+({_YEAR_TOKEN})\b"),
+    ):
+        markers.update(
+            f"year_kind:{kind}:{year}"
+            for year in re.findall(pattern, value, re.IGNORECASE)
+        )
+    return markers
+
+
+def _without_calendar_dates(value: str) -> str:
+    for pattern in (
+        _COMPACT_MONTH_RANGE_RE,
+        _COMPACT_DAY_FIRST_RANGE_RE,
+        _MONTH_FIRST_DATE_RE,
+        _DAY_FIRST_DATE_RE,
+        _ISO_DATE_RE,
+        _SLASH_DATE_RE,
+    ):
+        value = pattern.sub(" ", value)
+    return value
+
+
+def _page_date_metadata_line(value: str) -> bool:
+    match = _PAGE_DATE_METADATA_LABEL_RE.match(value)
+    if not match:
+        return False
+    remainder = match.group(1).strip()
+    if not remainder:
+        return True
+    remainder = re.sub(
+        r"^\s*(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s*,?\s*",
+        "",
+        remainder,
+        flags=re.IGNORECASE,
+    )
+    remainder = re.sub(
+        r"\b\d{4}-\d{2}-\d{2}T(?:[01]?\d|2[0-3]):[0-5]\d"
+        r"(?::[0-5]\d)?(?:Z|[+-]\d{2}:?\d{2})?\b",
+        " ",
+        remainder,
+        flags=re.IGNORECASE,
+    )
+    remainder = _without_calendar_dates(remainder)
+    remainder = _YEAR_TOKEN_RE.sub(" ", remainder)
+    remainder = re.sub(
+        r"\b\d{1,2}(?::\d{2}(?::\d{2})?)?\s*[ap]\.?m\.?\b",
+        " ",
+        remainder,
+        flags=re.IGNORECASE,
+    )
+    remainder = re.sub(
+        r"\b(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?\b",
+        " ",
+        remainder,
+    )
+    remainder = re.sub(
+        r"\b(?:gmt|utc)(?:[+-]\d{2}:?\d{2})?\b|"
+        r"\b(?:[ecmp][sd]?t|"
+        r"(?:eastern|central|mountain|pacific)(?:\s+(?:standard|daylight))?\s+time)\b",
+        " ",
+        remainder,
+        flags=re.IGNORECASE,
+    )
+    remainder = re.sub(
+        r"\b\d+\s+(?:minute|hour|day|week|month|year)s?\s+ago\b",
+        " ",
+        remainder,
+        flags=re.IGNORECASE,
+    )
+    remainder = re.sub(
+        r"\bby(?:\s+(?!(?:at|on)\b)[^\W\d_][\w'’.-]*){1,5}\b",
+        " ",
+        remainder,
+        flags=re.IGNORECASE,
+    )
+    remainder = re.sub(
+        r"\b(?:at|on)\b",
+        " ",
+        remainder,
+        flags=re.IGNORECASE,
+    )
+    return not re.sub(r"[\W_]+", "", remainder)
+
+
+def _source_dates(
+    text: str,
+) -> list[tuple[int, tuple[int, int, int | None], bool]]:
+    lines = text.splitlines()
+    values: list[tuple[int, tuple[int, int, int | None], bool]] = []
+    for index, line in enumerate(lines):
+        metadata = _source_line_is_page_date_metadata(lines, index)
+        values.extend((index, date, metadata) for date in _calendar_dates(line))
+    return values
+
+
+def _source_line_is_page_date_metadata(
+    source_lines: Sequence[str], index: int
+) -> bool:
+    if _page_date_metadata_line(source_lines[index]):
+        return True
+    for start in range(index - 1, -1, -1):
+        label = _PAGE_DATE_METADATA_LABEL_RE.match(source_lines[start])
+        if label:
+            return _page_date_metadata_line(
+                source_lines[start]
+            ) and _page_date_metadata_line(" ".join(source_lines[start : index + 1]))
+        stripped = source_lines[start].strip()
+        if (
+            not stripped
+            or len(stripped) > 120
+            or stripped.endswith((".", "?", "!"))
+        ):
+            break
+    return False
+
+
+def _source_line_quantity_tokens(
+    source_lines: Sequence[str], index: int
+) -> set[str]:
+    if _source_line_is_page_date_metadata(source_lines, index):
+        return set()
+    return _quantity_tokens(_without_calendar_dates(source_lines[index]))
+
+
+def _source_year_values(value: str) -> set[str]:
+    years = {
+        str(year)
+        for _month, _day, year in _calendar_dates(value)
+        if year is not None
+    }
+    stripped = value.strip()
+    years.update(
+        year
+        for pattern in (_YEAR_RANGE_RE, _BETWEEN_YEAR_RANGE_RE)
+        for match in pattern.finditer(value)
+        for year in match.groups()
+    )
+    years.update(
+        year
+        for match in re.finditer(
+            rf"(?<!\d)({_YEAR_TOKEN})\s*(?:/|\band\b)\s*"
+            rf"({_YEAR_TOKEN})(?!\d)",
+            value,
+            re.IGNORECASE,
+        )
+        for year in match.groups()
+    )
+    years.update(_SEASON_YEAR_RE.findall(value))
+    years.update(
+        marker.rsplit(":", 1)[1]
+        for marker in _named_period_markers(value)
+        if marker.rsplit(":", 1)[1]
+    )
+    for match in _FISCAL_YEAR_RANGE_RE.finditer(value):
+        first = int(match.group(1))
+        second = first // 100 * 100 + int(match.group(2))
+        if second < first:
+            second += 100
+        years.update((str(first), str(second)))
+    for match in _YEAR_TOKEN_RE.finditer(value):
+        year = match.group(1)
+        prefix = value[max(0, match.start() - 30) : match.start()]
+        suffix = value[match.end() : match.end() + 20]
+        if (
+            stripped == year
+            or re.search(
+                r"\b(?:cohort|during|edition|election|for|from|fy|in|index|since|"
+                r"study|survey|through|wave|year)\s*$",
+                prefix,
+                flags=re.IGNORECASE,
+            )
+            or re.match(
+                r"\s*(?:cohort|edition|election|index|report|study|survey|wave|year)\b",
+                suffix,
+                flags=re.IGNORECASE,
+            )
+        ):
+            years.add(year)
+    return years
+
+
+def _line_has_local_date(
+    line: int,
+    matching_dates: Sequence[tuple[int, bool]],
+    source_lines: Sequence[str],
+    metadata_date_lines: set[int],
+) -> bool:
+    for date_line, metadata in matching_dates:
+        if metadata:
+            continue
+        if date_line > line and not (
+            date_line == line + 1
+            and source_lines[line].strip()
+            and not source_lines[line].rstrip().endswith((".", "?", "!"))
+        ):
+            continue
+        start, end = sorted((line, date_line))
+        if any(start < boundary < end for boundary in metadata_date_lines):
+            continue
+        if abs(date_line - line) <= _QUANTITATIVE_DATE_LOCALITY_LINES:
+            return True
+        if _same_quantitative_table(source_lines, date_line, line):
+            return True
+    return False
+
+
+def _same_quantitative_table(
+    source_lines: Sequence[str], date_line: int, value_line: int
+) -> bool:
+    if value_line < date_line:
+        return False
+    header = source_lines[date_line].casefold()
+    if not (
+        header.rstrip().endswith(":")
+        or any(
+            phrase in header
+            for phrase in ("as of", "table", "figures", "results")
+        )
+    ):
+        return False
+    start, end = sorted((date_line, value_line))
+    if end - start > _QUANTITATIVE_TABLE_MAX_ROWS:
+        return False
+    for line in source_lines[start + 1 : end]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _calendar_dates(stripped):
+            return False
+        if len(stripped) > 160 or stripped.endswith((".", "?", "!")):
+            return False
+    return True
+
+
+def _period_years(value: str) -> set[str]:
+    years = set(_YEAR_TOKEN_RE.findall(value))
+    for match in _FISCAL_YEAR_RANGE_RE.finditer(value):
+        first = int(match.group(1))
+        second = first // 100 * 100 + int(match.group(2))
+        if second < first:
+            second += 100
+        years.add(str(second))
+    return years
+
+
+_YEAR_COLUMN_VALUE_RE = re.compile(
+    r"(?:[-+=]|[-+]?(?:\d[\d,]*(?:\.\d+)?|\.\d+)%?)"
+)
+
+
+def _year_column_table_lines(
+    source_lines: Sequence[str],
+) -> dict[str, dict[str, dict[str, set[int]]]]:
+    """Parse the exact Brandirectory year-column table shape."""
+
+    cells = [
+        (index, line.strip())
+        for index, line in enumerate(source_lines)
+        if line.strip()
+    ]
+    for marker, (_line, value) in enumerate(cells):
+        if value.casefold() != "show all years":
+            continue
+        cursor = marker + 1
+        if cursor < len(cells) and cells[cursor][1].casefold() == "expand all":
+            cursor += 1
+        year_cells: list[tuple[int, str]] = []
+        while cursor < len(cells) and _YEAR_TOKEN_RE.fullmatch(
+            cells[cursor][1]
+        ):
+            year_cells.append(cells[cursor])
+            cursor += 1
+        if len(year_cells) < 3 or cursor >= len(cells):
+            continue
+        if cells[cursor][1].casefold() != "pillar":
+            continue
+        cursor += 1
+        if any(
+            cursor + offset + 1 >= len(cells)
+            or cells[cursor + offset][1].casefold() != "score"
+            or cells[cursor + offset + 1][1].casefold() != "rank"
+            for offset in range(0, len(year_cells) * 2, 2)
+        ):
+            continue
+        cursor += len(year_cells) * 2
+        table: dict[str, dict[str, dict[str, set[int]]]] = {
+            year: {} for _line, year in year_cells
+        }
+        parsed_rows = 0
+        while cursor < len(cells) and parsed_rows < 64:
+            label_line, label = cells[cursor]
+            if _YEAR_COLUMN_VALUE_RE.fullmatch(label):
+                return table if parsed_rows else {}
+            cursor += 1
+            values: list[tuple[int, str]] = []
+            while cursor < len(cells) and _YEAR_COLUMN_VALUE_RE.fullmatch(
+                cells[cursor][1]
+            ):
+                values.append(cells[cursor])
+                cursor += 1
+            if not values:
+                break
+            offset = 0
+            groups: list[list[tuple[int, str]]] = []
+            for year_index in range(len(year_cells)):
+                final_year = year_index == len(year_cells) - 1
+                width = 2 if final_year else 4
+                if offset + width > len(values):
+                    return table if parsed_rows else {}
+                group = values[offset : offset + width]
+                offset += width
+                remaining_years = len(year_cells) - year_index - 1
+                minimum_remaining = max(0, remaining_years - 1) * 4 + (
+                    2 if remaining_years else 0
+                )
+                if (
+                    not final_year
+                    and group[-1][1] == "-"
+                    and offset < len(values)
+                    and values[offset][1] == "-"
+                    and len(values) - offset - 1 >= minimum_remaining
+                ):
+                    group.append(values[offset])
+                    offset += 1
+                if (
+                    final_year
+                    and offset + 1 == len(values)
+                    and values[offset][1] == "-"
+                ):
+                    group.append(values[offset])
+                    offset += 1
+                groups.append(group)
+            if offset != len(values):
+                return table if parsed_rows else {}
+            row = " ".join(label.casefold().split())
+            for (_year_line, year), group in zip(year_cells, groups, strict=True):
+                roles = (
+                    ("score", "rank", "trend")[: len(group)]
+                    if len(group) <= 3
+                    else (
+                        "score",
+                        "score_change",
+                        "rank",
+                        "rank_change",
+                        "trend",
+                    )[: len(group)]
+                )
+                table[year][row] = {
+                    role: {_year_line, label_line, line}
+                    for role, (line, _value) in zip(roles, group, strict=True)
+                }
+            parsed_rows += 1
+        if parsed_rows:
+            return table
+    return {}
+
+
+def _year_column_period_years(
+    period: str,
+    table: Mapping[str, Mapping[str, Mapping[str, set[int]]]],
+) -> set[str]:
+    claimed = _period_years(period)
+    if not claimed:
+        return set()
+    if len(claimed) > 1 and re.search(
+        r"[-–—]|\b(?:to|through)\b", period, flags=re.IGNORECASE
+    ):
+        lower, upper = sorted(map(int, claimed))
+        return {year for year in table if lower <= int(year) <= upper}
+    return claimed.intersection(table)
+
+
+def _year_column_value_supported(
+    value: str,
+    period: str,
+    table: Mapping[str, Mapping[str, Mapping[str, set[int]]]],
+    source_lines: Sequence[str],
+    *,
+    bare_year_quantity: bool = False,
+) -> tuple[bool, set[str]]:
+    if not table:
+        return False, set()
+    selected_years = _year_column_period_years(period, table)
+    table_tokens = {
+        year: {
+            row: {
+                role: {
+                    token
+                    for line in lines
+                    for token in _source_line_quantity_tokens(source_lines, line)
+                }
+                for role, lines in roles.items()
+            }
+            for row, roles in rows.items()
+        }
+        for year, rows in table.items()
+    }
+    all_table_tokens = {
+        token
+        for rows in table_tokens.values()
+        for roles in rows.values()
+        for tokens in roles.values()
+        for token in tokens
+        if token not in table
+    }
+    table_lines = {
+        line
+        for rows in table.values()
+        for roles in rows.values()
+        for lines in roles.values()
+        for line in lines
+    }
+    value_tokens = set(_claimed_quantity_token_list(value))
+    contextual_years = {
+        match.group(1)
+        for match in _YEAR_TOKEN_RE.finditer(value)
+        if not (
+            (unit := _following_unit(value, match.end()))
+            and _unit_key(unit) not in _YEAR_CONTEXT_UNITS
+        )
+    }.intersection(table)
+    if bare_year_quantity and _YEAR_TOKEN_RE.fullmatch(value.strip()):
+        contextual_years = set()
+    if selected_years and not contextual_years.issubset(selected_years):
+        return True, set()
+    quantity_years = value_tokens.intersection(table)
+    if bare_year_quantity and _YEAR_TOKEN_RE.fullmatch(value.strip()):
+        quantity_years = set()
+    if quantity_years:
+        for year in quantity_years:
+            unit = _derived_output_unit(value, year)
+            if not unit or not any(
+                not _source_line_is_page_date_metadata(source_lines, index)
+                and any(
+                    match.group(1) == year
+                    and _unit_key(_following_unit(line, match.end()))
+                    == _unit_key(unit)
+                    for match in _YEAR_TOKEN_RE.finditer(line)
+                )
+                for index, line in enumerate(source_lines)
+            ):
+                return True, set()
+        return False, set()
+    if not value_tokens or not value_tokens.issubset(all_table_tokens):
+        return False, set()
+
+    normalized_value = _normalized_quantity_text(value)
+    arbitrary_units: set[tuple[str, str]] = set()
+    for match in re.finditer(_DERIVATION_NUMBER, normalized_value):
+        token = _quantity_token_list(match.group())[0]
+        unit_match = re.match(
+            r"\s+([A-Za-z][\w-]*)", normalized_value[match.end() :]
+        )
+        if (
+            token in value_tokens
+            and unit_match
+            and _unit_key(unit_match.group(1))
+            not in {
+                "and",
+                "change",
+                "point",
+                "rank",
+                "ranking",
+                "score",
+                "to",
+                "versu",
+                "versus",
+                "vs",
+            }
+        ):
+            arbitrary_units.add((token, unit_match.group(1)))
+    if arbitrary_units:
+        narrative_support = set()
+        period_dates = set(_calendar_dates(period))
+        period_years = _period_years(period)
+        period_markers = _named_period_markers(period)
+        source_dates = _source_dates("\n".join(source_lines))
+        metadata_lines = {
+            line for line, _date, metadata in source_dates if metadata
+        }
+        source_year_lines = {
+            year: [
+                index
+                for index, line in enumerate(source_lines)
+                if year in _source_year_values(line)
+                and not _source_line_is_page_date_metadata(source_lines, index)
+            ]
+            for year in period_years
+        }
+        source_period_lines = {
+            marker: [
+                index
+                for index, line in enumerate(source_lines)
+                if marker in _named_period_markers(line)
+                and not _source_line_is_page_date_metadata(source_lines, index)
+            ]
+            for marker in period_markers
+        }
+        for index, line in enumerate(source_lines):
+            if index in table_lines or _source_line_is_page_date_metadata(
+                source_lines, index
+            ):
+                continue
+            if (
+                period_dates
+                and not all(
+                    _line_has_local_date(
+                        index,
+                        [
+                            (source_line, metadata)
+                            for source_line, source_date, metadata in source_dates
+                            if source_date == period_date
+                        ],
+                        source_lines,
+                        metadata_lines,
+                    )
+                    for period_date in period_dates
+                )
+            ) or (
+                period_years
+                and not all(
+                    _line_has_local_year(
+                        index,
+                        source_year_lines[year],
+                        source_lines,
+                        metadata_lines,
+                    )
+                    for year in period_years
+                )
+            ) or (
+                period_markers
+                and not all(
+                    _line_has_local_period_marker(
+                        index, source_period_lines[marker], metadata_lines
+                    )
+                    for marker in period_markers
+                )
+            ):
+                continue
+            normalized_line = _normalized_quantity_text(line)
+            for match in re.finditer(_DERIVATION_NUMBER, normalized_line):
+                token = _quantity_token_list(match.group())[0]
+                unit_match = re.match(
+                    r"\s+([A-Za-z][\w-]*)", normalized_line[match.end() :]
+                )
+                if unit_match:
+                    pair = (token, unit_match.group(1))
+                    if any(
+                        pair[0] == expected[0]
+                        and _unit_key(pair[1]) == _unit_key(expected[1])
+                        for expected in arbitrary_units
+                    ):
+                        narrative_support.add(
+                            next(
+                                expected
+                                for expected in arbitrary_units
+                                if pair[0] == expected[0]
+                                and _unit_key(pair[1]) == _unit_key(expected[1])
+                            )
+                        )
+        return (
+            (False, set())
+            if narrative_support == arbitrary_units
+            else (True, set())
+        )
+
+    year_pattern = re.compile(
+        rf"(?<!\d)({'|'.join(map(re.escape, table))})(?!\d)"
+    )
+    current_year = next(iter(selected_years)) if len(selected_years) == 1 else ""
+    segments: list[tuple[str, str]] = []
+    for clause in value.split(";"):
+        matches = list(year_pattern.finditer(clause))
+        if not matches:
+            segments.append((current_year, clause))
+            continue
+        for index, match in enumerate(matches):
+            current_year = match.group()
+            start = 0 if index == 0 else match.start()
+            end = matches[index + 1].start() if index + 1 < len(matches) else None
+            segments.append((current_year, clause[start:end]))
+
+    all_rows = set().union(*(set(rows) for rows in table.values()))
+    resolved_rows: set[str] = set()
+    active_rows: set[str] | None = None
+    named_role_coverage: dict[str, set[str]] = defaultdict(set)
+    for year, segment in segments:
+        tokens = {
+            token
+            for token in _claimed_quantity_token_list(segment)
+        }
+        if not tokens:
+            continue
+        if year not in table:
+            return True, set()
+        named_rows = {
+            row for row in all_rows if row in segment.casefold()
+        }
+        requested_roles: set[str] = set()
+        lowered_segment = segment.casefold()
+        role_requirements: dict[str, set[str]] = defaultdict(set)
+        residue = lowered_segment
+        for row in sorted(all_rows, key=len, reverse=True):
+            residue = residue.replace(row, " ")
+        residue = re.sub(
+            rf"{_DERIVATION_NUMBER}|{_YEAR_TOKEN}|"
+            r"\b(?:and|change|displayed|rank(?:ing)?|score|to|versus|vs|year)s?\b",
+            " ",
+            residue,
+            flags=re.IGNORECASE,
+        )
+        if re.search(r"[^\W\d_]", residue):
+            return True, set()
+        normalized_segment = _normalized_quantity_text(segment)
+        role_matches = [
+            (
+                match,
+                (
+                    "rank"
+                    if match.group(1).casefold().startswith("rank")
+                    else "score"
+                )
+                + ("_change" if match.group(2) else ""),
+            )
+            for match in re.finditer(
+                r"\b(score|rank(?:ing)?)(?:\s+(change))?\b",
+                normalized_segment,
+                re.IGNORECASE,
+            )
+        ]
+        for number in re.finditer(_DERIVATION_NUMBER, normalized_segment):
+            token = _quantity_token_list(number.group())[0]
+            if token not in tokens or not role_matches:
+                continue
+            distances = [
+                (
+                    number.start() - match.end()
+                    if match.end() <= number.start()
+                    else match.start() - number.end()
+                    if match.start() >= number.end()
+                    else 0,
+                    role,
+                )
+                for match, role in role_matches
+            ]
+            distance, role = min(distances)
+            if sum(candidate == distance for candidate, _role in distances) > 1:
+                return True, set()
+            requested_roles.add(role)
+            role_requirements[role].add(token)
+        candidates = {
+            row
+            for row, roles in table_tokens[year].items()
+            if (not named_rows or row in named_rows)
+            and all(
+                required.issubset(roles.get(role, set()))
+                for role, required in role_requirements.items()
+            )
+            and tokens.issubset(
+                {
+                    token
+                    for role, role_tokens in roles.items()
+                    if not requested_roles or role in requested_roles
+                    for token in role_tokens
+                }
+            )
+        }
+        if not candidates:
+            return True, set()
+        if named_rows and active_rows and not active_rows.intersection(candidates):
+            resolved_rows.update(active_rows)
+            active_rows = None
+        active_rows = (
+            candidates
+            if active_rows is None
+            else active_rows.intersection(candidates)
+        )
+        if not active_rows:
+            return True, set()
+        for row in named_rows.intersection(candidates):
+            if requested_roles:
+                named_role_coverage[row].update(requested_roles)
+            else:
+                named_role_coverage[row].update(
+                    role
+                    for role, role_tokens in table_tokens[year][row].items()
+                    if tokens.intersection(role_tokens)
+                )
+    if active_rows:
+        resolved_rows.update(active_rows)
+    if len(named_role_coverage) > 1 and any(
+        not {"score", "rank"}.issubset(roles)
+        for roles in named_role_coverage.values()
+    ):
+        return True, set()
+    return True, resolved_rows
+
+
+def _same_year_column_table(
+    source_lines: Sequence[str], year_line: int, value_line: int
+) -> bool:
+    year = source_lines[year_line].strip()
+    return any(
+        value_line in lines
+        for roles in _year_column_table_lines(source_lines).get(year, {}).values()
+        for lines in roles.values()
+    )
+
+
+def _line_has_local_year(
+    line: int,
+    matching_lines: Sequence[int],
+    source_lines: Sequence[str],
+    metadata_lines: set[int],
+) -> bool:
+    return any(
+        not any(
+            min(year_line, line) < boundary < max(year_line, line)
+            for boundary in metadata_lines
+        )
+        and (
+            abs(year_line - line) <= _QUANTITATIVE_DATE_LOCALITY_LINES
+            or _same_year_column_table(source_lines, year_line, line)
+        )
+        for year_line in matching_lines
+    )
+
+
+def _line_has_local_period_marker(
+    line: int,
+    matching_lines: Sequence[int],
+    metadata_lines: set[int],
+) -> bool:
+    return any(
+        abs(marker_line - line) <= _QUANTITATIVE_DATE_LOCALITY_LINES
+        and not any(
+            min(marker_line, line) < boundary < max(marker_line, line)
+            for boundary in metadata_lines
+        )
+        for marker_line in matching_lines
+    )
+
+
+def _line_date_is_lower_bound(
+    value: str, expected: tuple[int, int, int | None]
+) -> bool:
+    for match in re.finditer(
+        r"\b(?:since|after|starting(?:\s+(?:on|in))?|"
+        r"beginning(?:\s+(?:on|in))?|from)\s+"
+        r"(?:[A-Za-z]+\s+\d{1,2}(?:,\s*\d{4})?|"
+        r"\d{1,2}\s+[A-Za-z]+(?:\s+\d{4})?|\d{4}-\d{2}-\d{2})",
+        value,
+        flags=re.IGNORECASE,
+    ):
+        if expected in _calendar_dates(match.group()):
+            return True
+    return False
+
+
+def _source_value_is_locally_supported(
+    value: str,
+    anchor_lines: set[int],
+    source_lines: Sequence[str],
+    primary_tokens: set[str],
+    *,
+    excluded_lines: set[int] | None = None,
+) -> bool:
+    expected_tokens = _claimed_quantity_tokens(value)
+    expected_dates = set(_calendar_dates(value))
+    if not expected_tokens and not expected_dates:
+        return True
+    metadata_lines = {
+        index
+        for index in range(len(source_lines))
+        if _source_line_is_page_date_metadata(source_lines, index)
+    }
+    expected_units = _quantity_token_units(value)
+    supported_anchors: set[int] = set()
+    for index in range(len(source_lines)):
+        groups = [(index,)]
+        if (
+            index
+            and source_lines[index - 1].strip()
+            and not source_lines[index - 1].rstrip().endswith((".", "?", "!"))
+        ):
+            groups.append((index - 1, index))
+        for group in groups:
+            if excluded_lines and excluded_lines.intersection(group):
+                continue
+            group_text = "\n".join(source_lines[line] for line in group)
+            tokens = {
+                token
+                for line in group
+                for token in _source_line_quantity_tokens(source_lines, line)
+            }
+            dates = {
+                date
+                for line in group
+                if not _source_line_is_page_date_metadata(source_lines, line)
+                for date in _calendar_dates(source_lines[line])
+            }
+            if (
+                expected_tokens.issubset(tokens)
+                and expected_dates.issubset(dates)
+                and all(
+                    not units
+                    or units.intersection(
+                        _quantity_token_units(group_text).get(token, set())
+                    )
+                    for token, units in expected_units.items()
+                )
+                and bool(anchor_lines)
+            ):
+                segments: list[str] = []
+                for segment in _quantitative_segments(group_text):
+                    start = 0
+                    for conjunction in re.finditer(
+                        r"\band\b", segment, re.IGNORECASE
+                    ):
+                        if (
+                            _claimed_quantity_tokens(
+                                segment[conjunction.end() :]
+                            )
+                            - expected_tokens
+                            - primary_tokens
+                        ):
+                            segments.append(segment[start : conjunction.start()])
+                            start = conjunction.end()
+                    segments.append(segment[start:])
+                matching_segments = [
+                    segment
+                    for segment in segments
+                    if expected_tokens.issubset(
+                        _claimed_quantity_tokens(segment)
+                    )
+                    and expected_dates.issubset(set(_calendar_dates(segment)))
+                    and all(
+                        not units
+                        or units.intersection(
+                            _quantity_token_units(segment).get(token, set())
+                        )
+                        for token, units in expected_units.items()
+                    )
+                ]
+                if len(segments) > 1 and not any(
+                    primary_tokens.intersection(
+                        _claimed_quantity_tokens(segment)
+                    )
+                    or not (
+                        _claimed_quantity_tokens(segment)
+                        - expected_tokens
+                        - primary_tokens
+                    )
+                    for segment in matching_segments
+                ):
+                    continue
+                supported_anchors.update(
+                    anchor_line
+                    for anchor_line in anchor_lines
+                    if any(
+                        abs(anchor_line - line)
+                        <= _QUANTITATIVE_DATE_LOCALITY_LINES
+                        and not any(
+                            min(anchor_line, line) < boundary < max(anchor_line, line)
+                            for boundary in metadata_lines
+                        )
+                        for line in group
+                    )
+                )
+    if not supported_anchors:
+        return False
+    for anchor_line in anchor_lines - supported_anchors:
+        nearby_tokens = {
+            token
+            for index in range(
+                max(0, anchor_line - _QUANTITATIVE_DATE_LOCALITY_LINES),
+                min(
+                    len(source_lines),
+                    anchor_line + _QUANTITATIVE_DATE_LOCALITY_LINES + 1,
+                ),
+            )
+            for token in _source_line_quantity_tokens(source_lines, index)
+        }
+        if nearby_tokens - primary_tokens:
+            return False
+    return True
+
+
+_DERIVATION_NUMBER = r"[-+]?(?:\d[\d,]*(?:\.\d+)?|\.\d+)%?"
+_FORMULA_OPERAND = rf"(?<![A-Za-z]){_DERIVATION_NUMBER}"
+_DERIVATION_INCREASE = (
+    r"(?:gain\w*|grew|grow\w*|higher|improv\w*|increas\w*|rise|rising|rose)"
+)
+_DERIVATION_DECREASE = (
+    r"(?:declin\w*|decreas\w*|down|drop\w*|fall|fell|loss|lower|reduc\w*)"
+)
+_DERIVATION_CHANGE = r"(?:change|delta|difference|gap)"
+_DERIVATION_OPERATION = (
+    rf"(?:{_DERIVATION_INCREASE}|{_DERIVATION_DECREASE}|"
+    rf"{_DERIVATION_CHANGE}|combined|per|percentage\s+points?|product|"
+    r"relative|sum|total)"
+)
+_SOURCE_NEUTRAL_CHANGE_RE = re.compile(
+    rf"\b(?:went|moved|shifted|{_DERIVATION_CHANGE})\b", re.IGNORECASE
+)
+_DIRECT_DECREASE_RE = (
+    r"(?:declin\w*|decreas\w*|drop\w*|fall|fell|reduc\w*)"
+)
+_PERCENTAGE_METRIC_DEFINITION_RE = re.compile(
+    r"\b(?P<metric>[A-Za-z][A-Za-z ]{1,50}?)\s*[—–-]\s*the\s+percentage\b",
+    re.IGNORECASE,
+)
+_DERIVATION_CONJUNCTION_RE = re.compile(
+    rf"(?:,|/|\band\b)(?=\s*"
+    rf"(?=[^;\n,/]{{0,60}}\b{_DERIVATION_OPERATION}\b)"
+    rf"[^;\n,/]{{0,30}}{_DERIVATION_NUMBER})",
+    re.IGNORECASE,
+)
+
+
+def _decimal_token(value: str) -> tuple[Decimal, bool]:
+    token = _quantity_token_list(value)[0]
+    return Decimal(token.removesuffix("%")), token.endswith("%")
+
+
+def _derived_output_unit(estimate: str, token: str) -> str:
+    estimate = _normalized_quantity_text(estimate)
+    for match in re.finditer(_DERIVATION_NUMBER, estimate):
+        if _quantity_token_list(match.group())[0] != token:
+            continue
+        words = re.findall(r"[^\W\d_]+", estimate[match.end() :])[:3]
+        for word in words:
+            if word.casefold() not in {
+                "absolute",
+                "combined",
+                "net",
+                "relative",
+                "reported",
+                "total",
+            }:
+                return word.casefold()
+        return ""
+    return ""
+
+
+def _derived_ratio_units(estimate: str, token: str) -> tuple[str, str]:
+    estimate = _normalized_quantity_text(estimate)
+    for match in re.finditer(_DERIVATION_NUMBER, estimate):
+        if _quantity_token_list(match.group())[0] != token:
+            continue
+        units = re.match(
+            r"\s+([A-Za-z][\w-]*)\s+per\s+([A-Za-z][\w-]*)\b",
+            estimate[match.end() :],
+            flags=re.IGNORECASE,
+        )
+        if units:
+            return units.group(1).casefold(), units.group(2).casefold()
+    return "", ""
+
+
+def _following_unit(value: str, offset: int) -> str:
+    if not re.match(r"\s+", value[offset:]):
+        return ""
+    connectors = {
+        "and",
+        "at",
+        "by",
+        "during",
+        "for",
+        "from",
+        "in",
+        "of",
+        "on",
+        "or",
+        "over",
+        "than",
+        "to",
+        "under",
+        "with",
+    }
+    skipped = {
+        "a",
+        "an",
+        "average",
+        "net",
+        "negative",
+        "positive",
+        "reported",
+        "the",
+        "total",
+    }
+    for unit in re.findall(r"[A-Za-z][\w-]*", value[offset:])[:4]:
+        normalized = unit.casefold()
+        if normalized in connectors:
+            break
+        if normalized not in skipped:
+            return normalized
+    return ""
+
+
+def _derivation_spans(value: str) -> list[str]:
+    lines = value.splitlines()
+    spans: list[str] = []
+    previous = ""
+    for line in lines:
+        current = line.strip()
+        if not current or re.fullmatch(r"---\s*Page\s+\d+\s*---", current, re.I):
+            previous = ""
+            continue
+        spans.append(current)
+        if previous and not previous.rstrip().endswith((".", "?", "!")):
+            spans.append(f"{previous} {current}")
+        previous = current
+    return spans
+
+
+def _quantitative_segments(value: str) -> list[str]:
+    temporal_start = (
+        rf"(?:as\s+of|during|in|on)\b|q[1-4]\b|(?:{_MONTH_PATTERN})\b|"
+        r"(?:spring|summer|fall|autumn|winter)\b|"
+        r"(?:fy|fiscal\s+year|calendar\s+year|academic\s+year)\b"
+    )
+    date_conjunction = "\u0000date-and\u0000"
+    value = re.sub(
+        rf"(?<=\d)\s+and\s+(?=(?:{_MONTH_PATTERN})\.?\s+\d{{1,2}}\b)",
+        date_conjunction,
+        value,
+        flags=re.IGNORECASE,
+    )
+    return [
+        segment.replace(date_conjunction, " and ").strip()
+        for segment in re.split(
+            rf";|\b(?:although|but|whereas|while)\b|"
+            rf"\band\b(?=\s*(?:{temporal_start}))|"
+            rf"\bto\b(?=\s*{_FORMULA_OPERAND}[^;,.!?]{{0,60}}"
+            rf"\b(?:during|in|on)\b)",
+            value,
+            flags=re.IGNORECASE,
+        )
+        if segment.strip()
+    ]
+
+
+def _line_period_association_supported(
+    value: str,
+    estimate_tokens: set[str],
+    period_dates: set[tuple[int, int, int | None]],
+    period_years: set[str],
+    period_markers: set[str],
+) -> bool:
+    segments = _quantitative_segments(value)
+    signatures = {
+        (
+            frozenset(_calendar_dates(segment)),
+            frozenset(_source_year_values(segment)),
+            frozenset(_named_period_markers(segment)),
+        )
+        for segment in segments
+        if _calendar_dates(segment)
+        or _source_year_values(segment)
+        or _named_period_markers(segment)
+    }
+    estimate_segments = [
+        segment
+        for segment in segments
+        if estimate_tokens.issubset(_claimed_quantity_tokens(segment))
+    ]
+    explicit_estimate_segments = [
+        segment
+        for segment in estimate_segments
+        if _calendar_dates(segment)
+        or _source_year_values(segment)
+        or _named_period_markers(segment)
+    ]
+    if explicit_estimate_segments:
+        return any(
+            period_dates.issubset(set(_calendar_dates(segment)))
+            and period_years.issubset(_source_year_values(segment))
+            and period_markers.issubset(_named_period_markers(segment))
+            for segment in explicit_estimate_segments
+        )
+    return len(signatures) <= 1
+
+
+def _defined_percentage_metrics(value: str) -> set[str]:
+    return {
+        " ".join(match.group("metric").casefold().split())
+        for line in value.splitlines()
+        for match in _PERCENTAGE_METRIC_DEFINITION_RE.finditer(line)
+    }
+
+
+def _percentage_metric_precedes(
+    metrics: set[str], source: str, formula_start: int
+) -> bool:
+    prefix = source[:formula_start].casefold()
+    return any(
+        metric in prefix or metric.rsplit(" ", 1)[-1] in prefix
+        for metric in metrics
+    )
+
+
+def _source_formula_direction(
+    source: str, formula_start: int, *, allow_inherited: bool
+) -> str:
+    prefix = source[:formula_start]
+    contrast = re.search(
+        r"\b(?:although|but|whereas|while)\b", prefix, re.IGNORECASE
+    )
+    local = re.split(
+        r"[;.!?]|\b(?:although|but|whereas|while)\b",
+        prefix,
+        flags=re.IGNORECASE,
+    )[-1]
+
+    def latest(value: str) -> str:
+        matches = [
+            (match.start(), direction)
+            for pattern, direction in (
+                (_DERIVATION_INCREASE, "increase"),
+                (_DERIVATION_DECREASE, "decrease"),
+                (_SOURCE_NEUTRAL_CHANGE_RE.pattern, "neutral"),
+            )
+            for match in re.finditer(pattern, value, flags=re.IGNORECASE)
+        ]
+        return max(matches, default=(-1, ""))[1]
+
+    return latest(local) or (
+        latest(prefix) if allow_inherited and not contrast else ""
+    )
+
+
+def _derivation_clauses(value: str) -> list[str]:
+    return [
+        clause
+        for segment in re.split(r"[;\n]", value)
+        for clause in _DERIVATION_CONJUNCTION_RE.split(segment)
+        if clause.strip()
+    ]
+
+
+def _unit_key(value: str) -> str:
+    value = value.casefold()
+    return f"{value[:-3]}y" if value.endswith("ies") else value.removesuffix("s")
+
+
+_YEAR_CONTEXT_UNITS = {
+    "day",
+    "edition",
+    "hour",
+    "index",
+    "month",
+    "quarter",
+    "rank",
+    "report",
+    "score",
+    "study",
+    "week",
+    "year",
+}
+
+
+def _yearlike_operands_have_shared_unit(
+    values: Sequence[str], units: Sequence[str]
+) -> bool:
+    tokens = [_quantity_token_list(value)[0] for value in values]
+    if not any(
+        not token.endswith("%")
+        and re.fullmatch(rf"[+-]?{_YEAR_TOKEN}", token.replace(",", ""))
+        for token in tokens
+    ):
+        return True
+    unit_keys = [_unit_key(unit) for unit in units]
+    return (
+        bool(unit_keys)
+        and all(unit_keys)
+        and len(set(unit_keys)) == 1
+        and unit_keys[0] not in _YEAR_CONTEXT_UNITS
+    )
+
+
+def _without_untyped_yearlike_numbers(value: str) -> str:
+    return _YEAR_TOKEN_RE.sub(
+        lambda match: (
+            match.group()
+            if (
+                value.strip() == match.group()
+                or re.search(
+                    r"\b(?:baseline|denominator|population|rank(?:ing)?|sample|score|"
+                    r"statistic|uncertainty)\s*$",
+                    value[: match.start()],
+                    re.IGNORECASE,
+                )
+                or
+                (unit := _following_unit(value, match.end()))
+                and _unit_key(unit) not in _YEAR_CONTEXT_UNITS
+            )
+            else " "
+        ),
+        value,
+    )
+
+
+def _claimed_quantity_token_list(value: str) -> list[str]:
+    return _quantity_token_list(
+        _without_untyped_yearlike_numbers(_without_calendar_dates(value))
+    )
+
+
+def _claimed_quantity_tokens(value: str) -> set[str]:
+    return set(_claimed_quantity_token_list(value))
+
+
+def _quantity_token_units(value: str) -> dict[str, set[str]]:
+    normalized = _normalized_quantity_text(_without_calendar_dates(value))
+    claimed = _claimed_quantity_tokens(value)
+    units: dict[str, set[str]] = defaultdict(set)
+    for match in re.finditer(_DERIVATION_NUMBER, normalized):
+        token = _quantity_token_list(match.group())[0]
+        if token in claimed:
+            unit = _following_unit(normalized, match.end())
+            if unit:
+                units[token].add(_unit_key(unit))
+            else:
+                units.setdefault(token, set())
+    return units
+
+
+def _reported_direction_supported(estimate: str, source_text: str) -> bool:
+    increase = bool(re.search(rf"\b{_DERIVATION_INCREASE}\b", estimate, re.I))
+    decrease = bool(re.search(rf"\b{_DERIVATION_DECREASE}\b", estimate, re.I))
+    if not increase and not decrease:
+        return True
+    if increase and decrease:
+        return False
+    tokens = _claimed_quantity_tokens(estimate)
+    for span in _derivation_spans(source_text):
+        for clause in re.split(
+            r"[;.!?]|\b(?:although|but|whereas|while)\b",
+            span,
+            flags=re.IGNORECASE,
+        ):
+            if not tokens.issubset(_claimed_quantity_tokens(clause)):
+                continue
+            source_increase = bool(
+                re.search(rf"\b{_DERIVATION_INCREASE}\b", clause, re.I)
+            )
+            source_decrease = bool(
+                re.search(rf"\b{_DERIVATION_DECREASE}\b", clause, re.I)
+            )
+            if increase and source_increase and not source_decrease:
+                return True
+            if decrease and source_decrease and not source_increase:
+                return True
+    return False
+
+
+def _formula_subject_unit(source: str, formula_start: int) -> str:
+    clause = re.split(
+        r"[;.!?]|\b(?:although|but|whereas|while)\b",
+        source[:formula_start],
+        flags=re.IGNORECASE,
+    )[-1]
+    changes = list(
+        re.finditer(
+            rf"\b(?:{_DERIVATION_INCREASE}|{_DERIVATION_DECREASE}|"
+            rf"{_DERIVATION_CHANGE}|moved|ranged?|shifted|went)\b",
+            clause,
+            re.IGNORECASE,
+        )
+    )
+    subject = clause[: changes[-1].start()] if changes else clause
+    generic = r"(?:count|number|percentage|rate|share|total)"
+    if match := re.search(rf"\b{generic}\s+of\s+(.+)$", subject, re.IGNORECASE):
+        subject = match.group(1)
+    else:
+        subject = re.split(
+            r"\b(?:across|among|for|in|with|within)\b",
+            subject,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
+    words = re.findall(r"[^\W\d_]+", subject.casefold())
+    return next(
+        (
+            word
+            for word in reversed(words)
+            if word
+            not in {
+                "a",
+                "an",
+                "count",
+                "number",
+                "percentage",
+                "rate",
+                "share",
+                "the",
+                "total",
+            }
+        ),
+        "",
+    )
+
+
+def _derived_unit_supported(
+    token: str,
+    estimate: str,
+    source_span: str,
+    operand_percentages: Sequence[bool],
+    *,
+    required_unit: str = "",
+    percentage_metric: bool = False,
+) -> bool:
+    if token.endswith("%"):
+        return True
+    unit = _derived_output_unit(estimate, token)
+    if not unit:
+        return False
+    if required_unit and _unit_key(unit) != _unit_key(required_unit):
+        return False
+    source_words = {
+        _unit_key(word)
+        for word in re.findall(r"[^\W\d_]+", source_span)
+    }
+    if unit in {"percent", "percentage"}:
+        return all(operand_percentages) or bool(
+            source_words.intersection({"percent", "percentage"})
+        ) or percentage_metric
+    if _unit_key(unit) == "point":
+        return bool(
+            source_words.intersection({"index", "rating", "score"})
+        ) or percentage_metric
+    if operand_percentages and all(operand_percentages):
+        return False
+    return _unit_key(unit) in source_words
+
+
+def _simple_derived_number(token: str, estimate: str, local_text: str) -> bool:
+    try:
+        target_percent = token.endswith("%")
+        target = Decimal(token.removesuffix("%"))
+    except (ArithmeticError, ValueError):
+        return False
+    tolerance = max(Decimal("0.01"), abs(target) * Decimal("0.001"))
+    estimate_clause = next(
+        (
+            clause
+            for clause in _derivation_clauses(estimate)
+            if token in _quantity_token_list(clause)
+        ),
+        estimate,
+    )
+    estimate_text = estimate_clause.casefold()
+    normalized_estimate = _normalized_quantity_text(estimate_clause)
+    candidates: list[Decimal] = []
+    increase = bool(
+        re.search(rf"\b{_DERIVATION_INCREASE}\b", estimate_text)
+        or any(
+            match.group().startswith("+")
+            and _quantity_token_list(match.group())[0] == token
+            for match in re.finditer(_DERIVATION_NUMBER, normalized_estimate)
+        )
+    )
+    decrease = bool(
+        re.search(rf"\b{_DERIVATION_DECREASE}\b", estimate_text)
+        or (target < 0 and not increase)
+    )
+    neutral_change = bool(re.search(rf"\b{_DERIVATION_CHANGE}\b", estimate_text))
+    percentage_metrics = _defined_percentage_metrics(local_text)
+
+    def add(
+        value: Decimal,
+        source_span: str,
+        operand_percentages: Sequence[bool],
+        *,
+        required_unit: str = "",
+        percentage_metric: bool = False,
+    ) -> None:
+        if _derived_unit_supported(
+            token,
+            estimate,
+            source_span,
+            operand_percentages,
+            required_unit=required_unit,
+            percentage_metric=percentage_metric,
+        ):
+            candidates.append(value)
+
+    def add_change(
+        delta: Decimal,
+        source_span: str,
+        operand_percentages: Sequence[bool],
+        *,
+        required_unit: str = "",
+        percentage_metric: bool = False,
+    ) -> None:
+        if increase:
+            if delta > 0:
+                add(
+                    abs(delta),
+                    source_span,
+                    operand_percentages,
+                    required_unit=required_unit,
+                    percentage_metric=percentage_metric,
+                )
+            return
+        if decrease:
+            if delta < 0:
+                add(
+                    delta,
+                    source_span,
+                    operand_percentages,
+                    required_unit=required_unit,
+                    percentage_metric=percentage_metric,
+                )
+                add(
+                    abs(delta),
+                    source_span,
+                    operand_percentages,
+                    required_unit=required_unit,
+                    percentage_metric=percentage_metric,
+                )
+            return
+        if neutral_change:
+            add(
+                delta,
+                source_span,
+                operand_percentages,
+                required_unit=required_unit,
+                percentage_metric=percentage_metric,
+            )
+            add(
+                abs(delta),
+                source_span,
+                operand_percentages,
+                required_unit=required_unit,
+                percentage_metric=percentage_metric,
+            )
+
+    for raw_span in _derivation_spans(local_text):
+        source = _without_untyped_yearlike_numbers(
+            _normalized_quantity_text(_without_calendar_dates(raw_span))
+        )
+        formula_matches = [
+            (match, 1, 2)
+            for match in re.finditer(
+                rf"\bfrom\b(?:(?!\b(?:from|to)\b)[^.?!;]){{0,120}}?"
+                rf"({_FORMULA_OPERAND})"
+                rf"(?:(?!\bfrom\b)[^.?!;]){{0,120}}?\bto\b"
+                rf"[^.?!;]{{0,120}}?({_FORMULA_OPERAND})",
+                source,
+                flags=re.IGNORECASE,
+            )
+        ]
+        formula_matches.extend(
+            (match, 2, 1)
+            for match in re.finditer(
+                rf"\bto\b(?:(?!\b(?:from|to)\b)[^.?!;]){{0,120}}?"
+                rf"({_FORMULA_OPERAND})"
+                rf"(?:(?!\bto\b)[^.?!;]){{0,120}}?\bfrom\b"
+                rf"[^.?!;]{{0,120}}?({_FORMULA_OPERAND})",
+                source,
+                flags=re.IGNORECASE,
+            )
+        )
+        for match, left_group, right_group in formula_matches:
+            if re.search(
+                rf"\band\b[^;,.!?]{{0,60}}\b(?:{_DERIVATION_INCREASE}|"
+                rf"{_DERIVATION_DECREASE}|{_DERIVATION_CHANGE})\b[^;,.!?]*\bto\b",
+                source[match.end(left_group) : match.start(right_group)],
+                re.IGNORECASE,
+            ):
+                continue
+            operands = (match.group(left_group), match.group(right_group))
+            left, right = map(_decimal_token, operands)
+            span = source[max(0, match.start() - 60) : match.end() + 60]
+            percentages = (left[1], right[1])
+            left_unit = _following_unit(source, match.end(left_group))
+            right_unit = _following_unit(source, match.end(right_group))
+            if not _yearlike_operands_have_shared_unit(
+                operands, (left_unit, right_unit)
+            ):
+                continue
+            if left_unit and right_unit and _unit_key(left_unit) != _unit_key(
+                right_unit
+            ):
+                continue
+            subject_unit = _formula_subject_unit(source, match.start())
+            explicit_unit = left_unit or right_unit
+            if (
+                bool(left_unit) != bool(right_unit)
+                and subject_unit
+                and _unit_key(explicit_unit) != _unit_key(subject_unit)
+            ):
+                continue
+            output_unit = _unit_key(_derived_output_unit(estimate, token))
+            required_unit = ""
+            if output_unit not in {
+                "percent",
+                "percentage",
+                "point",
+            }:
+                required_unit = explicit_unit or subject_unit
+            percentage_metric = _percentage_metric_precedes(
+                percentage_metrics, source, match.start(left_group)
+            )
+            delta = right[0] - left[0]
+            source_direction = _source_formula_direction(
+                source,
+                match.start(),
+                allow_inherited=percentage_metric,
+            )
+            if not source_direction or (
+                source_direction == "increase" and delta <= 0
+            ) or (source_direction == "decrease" and delta >= 0):
+                continue
+            if target_percent and (
+                increase or decrease or neutral_change or "relative" in estimate_text
+            ):
+                if left[0]:
+                    relative = delta / abs(left[0]) * 100
+                    add_change(
+                        relative,
+                        span,
+                        percentages,
+                        required_unit=required_unit,
+                        percentage_metric=percentage_metric,
+                    )
+            elif not target_percent and (
+                increase or decrease or neutral_change
+            ):
+                add_change(
+                    delta,
+                    span,
+                    percentages,
+                    required_unit=required_unit,
+                    percentage_metric=percentage_metric,
+                )
+
+        for match in re.finditer(
+            rf"\b{_DIRECT_DECREASE_RE}\b(?P<bridge>[^.?!]{{0,80}}?)"
+            rf"(?P<number>{_DERIVATION_NUMBER})\s+"
+            rf"(?P<unit>[A-Za-z][\w-]*)\b",
+            source,
+            flags=re.IGNORECASE,
+        ):
+            bridge = match.group("bridge")
+            if not {
+                word.casefold()
+                for word in re.findall(r"[^\W\d_]+", bridge)
+            }.issubset(
+                {
+                    "a",
+                    "about",
+                    "almost",
+                    "an",
+                    "approximately",
+                    "around",
+                    "average",
+                    "by",
+                    "globally",
+                    "just",
+                    "locally",
+                    "nearly",
+                    "of",
+                    "overall",
+                    "roughly",
+                }
+            ):
+                continue
+            magnitude = _decimal_token(match.group("number"))
+            if not _yearlike_operands_have_shared_unit(
+                (match.group("number"),), (match.group("unit"),)
+            ):
+                continue
+            if not magnitude[1]:
+                add_change(
+                    -abs(magnitude[0]),
+                    match.group(),
+                    (False,),
+                    required_unit=match.group("unit"),
+                    percentage_metric=_percentage_metric_precedes(
+                        percentage_metrics, source, match.start("number")
+                    ),
+                )
+
+        for match in re.finditer(
+            rf"({_DERIVATION_NUMBER})\s+([A-Za-z][\w-]*)\b"
+            rf"[^.?!]{{0,100}}?\b(?:and|plus)\b[^.?!]{{0,100}}?"
+            rf"({_DERIVATION_NUMBER})\s+([A-Za-z][\w-]*)\b",
+            source,
+            flags=re.IGNORECASE,
+        ):
+            if not target_percent and re.search(
+                r"\b(?:total|combined|sum)\b", estimate_text
+            ):
+                left, right = map(_decimal_token, (match.group(1), match.group(3)))
+                if (
+                    not left[1]
+                    and not right[1]
+                    and _unit_key(match.group(2)) == _unit_key(match.group(4))
+                    and _yearlike_operands_have_shared_unit(
+                        (match.group(1), match.group(3)),
+                        (match.group(2), match.group(4)),
+                    )
+                ):
+                    add(
+                        left[0] + right[0],
+                        match.group(),
+                        (False, False),
+                        required_unit=match.group(2),
+                    )
+
+        ratio_matches: list[tuple[re.Match[str], str | None, str | None]] = [
+            (match, None, match.group(3))
+            for match in re.finditer(
+                rf"({_DERIVATION_NUMBER})\s*(?:/|\b(?:out\s+of|of|among)\b)\s*"
+                rf"(?:the\s+|every\s+)?({_DERIVATION_NUMBER})"
+                rf"(?:\s+([A-Za-z][\w-]*))?",
+                source,
+                flags=re.IGNORECASE,
+            )
+        ]
+        ratio_matches.extend(
+            (match, match.group(2), match.group(5))
+            for match in re.finditer(
+                rf"({_DERIVATION_NUMBER})\s+([A-Za-z][\w-]*)\s+"
+                rf"(out\s+of|of|among)\s+(?:the\s+|every\s+)?"
+                rf"({_DERIVATION_NUMBER})"
+                rf"\s+([A-Za-z][\w-]*)",
+                source,
+                flags=re.IGNORECASE,
+            )
+        )
+        for match, numerator_unit, denominator_unit in ratio_matches:
+            right_group = 2 if numerator_unit is None else 4
+            if not _yearlike_operands_have_shared_unit(
+                (match.group(1), match.group(right_group)),
+                (numerator_unit or "", denominator_unit or ""),
+            ):
+                continue
+            left, right = map(
+                _decimal_token, (match.group(1), match.group(right_group))
+            )
+            if right[0]:
+                if target_percent:
+                    if numerator_unit is None or (
+                        denominator_unit
+                        and _unit_key(numerator_unit)
+                        == _unit_key(denominator_unit)
+                    ):
+                        add(
+                            left[0] / right[0] * 100,
+                            match.group(),
+                            (left[1], right[1]),
+                        )
+                elif re.search(r"\bper\b", estimate_text):
+                    output_numerator, output_denominator = _derived_ratio_units(
+                        estimate, token
+                    )
+                    if (
+                        numerator_unit
+                        and denominator_unit
+                        and _unit_key(output_numerator)
+                        == _unit_key(numerator_unit)
+                        and _unit_key(output_denominator)
+                        == _unit_key(denominator_unit)
+                    ):
+                        add(
+                            left[0] / right[0],
+                            match.group(),
+                            (left[1], right[1]),
+                            required_unit=numerator_unit,
+                        )
+
+        for match in re.finditer(
+            rf"({_DERIVATION_NUMBER})\s+([A-Za-z][\w-]*)"
+            rf"(?:\s+[A-Za-z][\w-]*){{0,2}}\s+(?:with|at)\s+"
+            rf"({_DERIVATION_NUMBER})\s+([A-Za-z][\w-]*)"
+            rf"(?:\s+[A-Za-z][\w-]*){{0,2}}\s+each\b",
+            source,
+            flags=re.IGNORECASE,
+        ):
+            if not target_percent and re.search(
+                r"\b(?:total|combined|product)\b", estimate_text
+            ):
+                left, right = map(
+                    _decimal_token, (match.group(1), match.group(3))
+                )
+                if (
+                    not left[1]
+                    and not right[1]
+                    and _yearlike_operands_have_shared_unit(
+                        (match.group(1), match.group(3)),
+                        (match.group(2), match.group(4)),
+                    )
+                ):
+                    add(
+                        left[0] * right[0],
+                        match.group(),
+                        (False, False),
+                        required_unit=match.group(4),
+                    )
+
+        connector = re.search(
+            r"\b(?:improving\s+on|an?\s+increase\s+from)\b",
+            source,
+            flags=re.IGNORECASE,
+        )
+        if connector:
+            before = list(
+                re.finditer(_DERIVATION_NUMBER, source[: connector.start()])
+            )
+            after = re.search(
+                _DERIVATION_NUMBER, source[connector.end() :]
+            )
+            if before and after:
+                current = _decimal_token(before[-1].group())
+                prior = _decimal_token(after.group())
+                current_unit = _following_unit(source, before[-1].end())
+                prior_end = connector.end() + after.end()
+                prior_unit = _following_unit(source, prior_end)
+                if not _yearlike_operands_have_shared_unit(
+                    (before[-1].group(), after.group()),
+                    (current_unit, prior_unit),
+                ):
+                    continue
+                if (
+                    current_unit
+                    and prior_unit
+                    and _unit_key(current_unit) != _unit_key(prior_unit)
+                ):
+                    continue
+                span = source[
+                    max(0, before[-1].start() - 60) : connector.end() + after.end()
+                ]
+                add_change(
+                    current[0] - prior[0],
+                    span,
+                    (current[1], prior[1]),
+                    required_unit=current_unit or prior_unit,
+                )
+
+    return any(abs(candidate - target) <= tolerance for candidate in candidates)
+
+
+_DERIVATION_CLAUSE_RE = re.compile(
+    rf"\b{_DERIVATION_OPERATION}\b", re.IGNORECASE
+)
+
+
+def _system_derived_estimate_supported(
+    estimate: str, local_text: str, literal_inputs: set[str]
+) -> bool:
+    for clause in _derivation_clauses(estimate):
+        tokens = _quantity_token_list(_without_calendar_dates(clause))
+        if not tokens:
+            continue
+        if re.search(
+            rf"\b{_DERIVATION_INCREASE}\b", clause, flags=re.IGNORECASE
+        ) and re.search(
+            rf"\b{_DERIVATION_DECREASE}\b", clause, flags=re.IGNORECASE
+        ):
+            return False
+        derived = {
+            token
+            for token in tokens
+            if _simple_derived_number(token, clause, local_text)
+        }
+        if any(token not in literal_inputs and token not in derived for token in tokens):
+            return False
+        if _DERIVATION_CLAUSE_RE.search(clause) and not derived:
+            return False
+    return True
+
+
+def _validate_quantitative_provenance(
+    payload: Mapping[str, Any], row: Mapping[str, Any]
+) -> None:
+    if str(row.get("content_route") or "") == "codex_pdf_page_images":
+        return
+    text = str(row.get("text") or "")
+    if not text:
+        for anchor in payload.get("evidence_anchors", []) or []:
+            result = (
+                anchor.get("quantitative_result")
+                if isinstance(anchor, Mapping)
+                else None
+            )
+            if isinstance(result, Mapping) and result:
+                raise SourceBundleQuantitativeProvenanceError(
+                    "derived_estimate_not_supported_by_source_inputs"
+                    if str(result.get("provenance") or "") == "system_derived"
+                    else "reported_estimate_not_found_in_source"
+                )
+        return
+    footnote_groups = _footnote_quantity_groups(text)
+    source_lines = text.splitlines()
+    source_dates = _source_dates(text)
+    all_source_inputs = {
+        token
+        for index in range(len(source_lines))
+        for token in _source_line_quantity_tokens(source_lines, index)
+    }
+    source_year_lines: dict[str, set[int]] = defaultdict(set)
+    source_period_lines: dict[str, set[int]] = defaultdict(set)
+    for index, line in enumerate(source_lines):
+        if _source_line_is_page_date_metadata(source_lines, index):
+            continue
+        for year in _source_year_values(line):
+            source_year_lines[year].add(index)
+        for marker in _named_period_markers(line):
+            source_period_lines[marker].add(index)
+    source_years = set(source_year_lines)
+    year_column_table = _year_column_table_lines(source_lines)
+    year_column_lines = {
+        line
+        for rows in year_column_table.values()
+        for roles in rows.values()
+        for lines in roles.values()
+        for line in lines
+    }
+    metadata_date_lines = {
+        line for line, _date, metadata in source_dates if metadata
+    }
+    for anchor in payload.get("evidence_anchors", []) or []:
+        if not isinstance(anchor, Mapping) or not isinstance(
+            anchor.get("quantitative_result"), Mapping
+        ):
+            continue
+        result = anchor["quantitative_result"]
+        estimate = str(result.get("estimate") or "")
+        estimate_tokens = _claimed_quantity_tokens(estimate)
+        period = str(result.get("period") or "")
+        period_dates = _calendar_dates(period)
+        period_years = _period_years(period)
+        local_period_years = period_years.copy()
+        if period_dates:
+            local_period_years -= {
+                str(year)
+                for _month, _day, year in period_dates
+                if year is not None
+            }
+        matching_by_period: list[list[tuple[int, bool]]] = []
+        for month, day, year in period_dates:
+            matching_dates = [
+                (line, metadata)
+                for line, (source_month, source_day, source_year), metadata in source_dates
+                if month == source_month
+                and day == source_day
+                and (year is None or source_year == year)
+            ]
+            if not matching_dates:
+                raise SourceBundleQuantitativeProvenanceError(
+                    "period_date_not_found_in_source"
+                )
+            matching_by_period.append(matching_dates)
+        period_terms = _footnote_scope_terms(_normalized_quantity_text(period))
+        period_temporal_scope = _footnote_temporal_scope(period)
+        period_text_scope = _footnote_text_scope(period)
+        period_markers = _named_period_markers(period)
+        for marked, unmarked, definition in footnote_groups:
+            definition_terms = _footnote_scope_terms(
+                _normalized_quantity_text(definition)
+            )
+            definition_temporal_scope = _footnote_temporal_scope(definition)
+            definition_text_scope = _footnote_text_scope(definition)
+            definition_dates = set(_calendar_dates(definition))
+            if (
+                estimate_tokens.intersection(marked)
+                and estimate_tokens.intersection(unmarked)
+            ) or (
+                estimate_tokens.intersection(unmarked)
+                and not estimate_tokens.intersection(marked)
+                and period_terms
+                and period_terms.issubset(definition_terms)
+            ) or (
+                estimate_tokens.intersection(marked)
+                and definition_temporal_scope
+                and not definition_temporal_scope.issubset(
+                    period_temporal_scope
+                )
+            ) or (
+                estimate_tokens.intersection(marked)
+                and definition_text_scope
+                and not definition_text_scope.issubset(period_text_scope)
+            ) or (
+                estimate_tokens.intersection(marked)
+                and definition_dates
+                and not definition_dates.issubset(set(period_dates))
+            ):
+                raise SourceBundleQuantitativeProvenanceError(
+                    "footnote_scope_combines_marked_and_unmarked_quantities"
+                )
+        if not period_years.issubset(source_years):
+            raise SourceBundleQuantitativeProvenanceError(
+                "period_date_not_found_in_source"
+            )
+        if not period_markers.issubset(source_period_lines):
+            raise SourceBundleQuantitativeProvenanceError(
+                "period_date_not_found_in_source"
+            )
+        candidates = _claimed_quantity_token_list(estimate)
+        provenance = str(result.get("provenance") or "")
+        estimate_table_handled, estimate_table_rows = _year_column_value_supported(
+            estimate, period, year_column_table, source_lines
+        )
+        if estimate_table_handled and not estimate_table_rows:
+            raise SourceBundleQuantitativeProvenanceError(
+                "derived_estimate_not_supported_by_source_inputs"
+                if provenance == "system_derived"
+                else "reported_estimate_not_found_in_source"
+            )
+        if (
+            provenance != "system_derived"
+            and not estimate_table_handled
+            and not _reported_direction_supported(estimate, text)
+        ):
+            raise SourceBundleQuantitativeProvenanceError(
+                "reported_estimate_not_found_in_source"
+            )
+        anchor_lines: set[int] = set()
+        if provenance != "system_derived":
+            source_groups: list[tuple[tuple[int, ...], set[str]]] = []
+            for index in range(len(source_lines)):
+                groups = [(index,)]
+                if (
+                    index
+                    and source_lines[index - 1].strip()
+                    and not source_lines[index - 1].rstrip().endswith(
+                        (".", "?", "!")
+                    )
+                ):
+                    groups.append((index - 1, index))
+                source_groups.extend(
+                    (
+                        group,
+                        {
+                            token
+                            for line in group
+                            for token in _source_line_quantity_tokens(
+                                source_lines, line
+                            )
+                        },
+                    )
+                    for group in groups
+                )
+            full_groups = [
+                group
+                for group, tokens in source_groups
+                if estimate_tokens and estimate_tokens.issubset(tokens)
+            ]
+            if full_groups:
+                anchor_lines = {
+                    line
+                    for group in full_groups
+                    for line in group
+                    if estimate_tokens.intersection(
+                        _source_line_quantity_tokens(source_lines, line)
+                    )
+                }
+            claim_token_groups = [
+                tokens
+                for clause in re.split(r"[;\n]", estimate)
+                if (tokens := _claimed_quantity_tokens(clause))
+            ]
+            if not anchor_lines:
+                for expected_tokens in claim_token_groups:
+                    group_lines = {
+                        line
+                        for group, tokens in source_groups
+                        if expected_tokens.issubset(tokens)
+                        for line in group
+                        if expected_tokens.intersection(
+                            _source_line_quantity_tokens(source_lines, line)
+                        )
+                    }
+                    if not group_lines:
+                        anchor_lines.clear()
+                        break
+                    anchor_lines.update(group_lines)
+            if estimate_tokens and not estimate_table_handled and not anchor_lines:
+                raise SourceBundleQuantitativeProvenanceError(
+                    "reported_estimate_not_found_in_source"
+                )
+        if provenance == "system_derived":
+            percentage_definitions = [
+                line
+                for line in source_lines
+                if _PERCENTAGE_METRIC_DEFINITION_RE.search(line)
+            ]
+            for index, line in enumerate(source_lines):
+                spans = [line]
+                if (
+                    index
+                    and source_lines[index - 1].strip()
+                    and not source_lines[index - 1].rstrip().endswith(
+                        (".", "?", "!")
+                    )
+                ):
+                    spans.append(f"{source_lines[index - 1]} {line}")
+                base_spans = tuple(spans)
+                spans.extend(
+                    f"{definition}\n{span}"
+                    for definition in percentage_definitions
+                    for span in base_spans
+                )
+                if any(
+                    _simple_derived_number(token, estimate, span)
+                    for token in candidates
+                    for span in spans
+                ):
+                    anchor_lines.add(index)
+        if period_dates:
+            anchor_lines = {
+                line
+                for line in anchor_lines
+                if all(
+                    _line_has_local_date(
+                        line,
+                        matching_dates,
+                        source_lines,
+                        metadata_date_lines,
+                    )
+                    for matching_dates in matching_by_period
+                )
+                and all(
+                    _line_has_local_year(
+                        line,
+                        sorted(source_year_lines[year]),
+                        source_lines,
+                        metadata_date_lines,
+                    )
+                    for year in local_period_years
+                )
+            }
+        elif period_years:
+            anchor_lines = {
+                line
+                for line in anchor_lines
+                if all(
+                    _line_has_local_year(
+                        line,
+                        sorted(source_year_lines[year]),
+                        source_lines,
+                        metadata_date_lines,
+                    )
+                    for year in period_years
+                )
+            }
+        if period_markers:
+            anchor_lines = {
+                line
+                for line in anchor_lines
+                if all(
+                    _line_has_local_period_marker(
+                        line,
+                        sorted(source_period_lines[marker]),
+                        metadata_date_lines,
+                    )
+                    for marker in period_markers
+                )
+            }
+        if provenance != "system_derived" and (
+            period_dates or period_years or period_markers
+        ):
+            anchor_lines = {
+                line
+                for line in anchor_lines
+                if _line_period_association_supported(
+                    source_lines[line],
+                    estimate_tokens,
+                    set(period_dates),
+                    period_years,
+                    period_markers,
+                )
+            }
+            if estimate_tokens and not estimate_table_handled and not anchor_lines:
+                raise SourceBundleQuantitativeProvenanceError(
+                    "period_date_not_local_to_reported_estimate"
+                )
+        auxiliary_values = [
+            (field, str(result.get(field) or ""))
+            for field in (
+                "baseline",
+                "comparison_group",
+                "denominator",
+                "estimand_type",
+                "model",
+                "outcome_definition",
+                "population",
+                "reference_group",
+                "sample",
+                "scale",
+                "statistic",
+                "uncertainty",
+                "unit",
+            )
+        ]
+        for field, auxiliary_value in auxiliary_values:
+            table_handled, table_rows = _year_column_value_supported(
+                auxiliary_value,
+                period,
+                year_column_table,
+                source_lines,
+                bare_year_quantity=field in {"denominator", "population", "sample"},
+            )
+            if (
+                not table_handled
+                and field == "outcome_definition"
+                and estimate_table_handled
+            ):
+                normalized = " ".join(auxiliary_value.casefold().split())
+                table_rows = {
+                    row
+                    for rows in year_column_table.values()
+                    for row in rows
+                    if re.search(
+                        rf"(?<!\w){re.escape(row)}(?!\w)", normalized
+                    )
+                }
+                table_handled = bool(table_rows)
+            if table_handled and (
+                field not in {"baseline", "outcome_definition"}
+                or (field == "outcome_definition" and not estimate_table_handled)
+                or not table_rows
+                or (
+                    estimate_table_handled
+                    and estimate_table_rows
+                    and (
+                        not table_rows.issubset(estimate_table_rows)
+                        if field == "outcome_definition"
+                        else not estimate_table_rows.intersection(table_rows)
+                    )
+                )
+            ):
+                raise SourceBundleQuantitativeProvenanceError(
+                    "reported_estimate_not_found_in_source"
+                )
+            if table_handled:
+                continue
+            if not _source_value_is_locally_supported(
+                auxiliary_value,
+                anchor_lines,
+                source_lines,
+                estimate_tokens,
+                excluded_lines=(
+                    year_column_lines
+                    if field in {"denominator", "population", "sample"}
+                    and _YEAR_TOKEN_RE.fullmatch(auxiliary_value.strip())
+                    else None
+                ),
+            ):
+                raise SourceBundleQuantitativeProvenanceError(
+                    "period_date_not_found_in_source"
+                    if _calendar_dates(auxiliary_value)
+                    else "reported_estimate_not_found_in_source"
+                )
+        if not estimate_tokens:
+            continue
+        if not period_dates:
+            local_text = text
+            local_inputs = all_source_inputs
+            if (
+                period_years
+                and not (estimate_table_handled and provenance == "source_reported")
+            ) or period_markers:
+                supported_lines = {
+                    index
+                    for index in range(len(source_lines))
+                    if (
+                        not period_years
+                        or all(
+                            _line_has_local_year(
+                                index,
+                                sorted(source_year_lines[year]),
+                                source_lines,
+                                metadata_date_lines,
+                            )
+                            for year in period_years
+                        )
+                    )
+                    and all(
+                        _line_has_local_period_marker(
+                            index,
+                            sorted(source_period_lines[marker]),
+                            metadata_date_lines,
+                        )
+                        for marker in period_markers
+                    )
+                }
+                if not supported_lines:
+                    raise SourceBundleQuantitativeProvenanceError(
+                        "period_date_not_local_to_reported_estimate"
+                    )
+                local_text = "\n".join(
+                    source_lines[index] for index in sorted(supported_lines)
+                )
+                local_inputs = {
+                    token
+                    for index in supported_lines
+                    for token in _source_line_quantity_tokens(source_lines, index)
+                }
+            if provenance == "system_derived":
+                invalid = not _system_derived_estimate_supported(
+                    estimate, local_text, local_inputs
+                )
+            elif estimate_table_handled:
+                invalid = False
+            else:
+                invalid = [token for token in candidates if token not in local_inputs]
+            if invalid:
+                raise SourceBundleQuantitativeProvenanceError(
+                    "derived_estimate_not_supported_by_source_inputs"
+                    if provenance == "system_derived"
+                    else "reported_estimate_not_found_in_source"
+                )
+            continue
+        supported_lines = {
+            index
+            for index in range(len(source_lines))
+            if all(
+                _line_has_local_date(
+                    index,
+                    matching_dates,
+                    source_lines,
+                    metadata_date_lines,
+                )
+                for matching_dates in matching_by_period
+            )
+            and all(
+                _line_has_local_year(
+                    index,
+                    sorted(source_year_lines[year]),
+                    source_lines,
+                    metadata_date_lines,
+                )
+                for year in local_period_years
+            )
+        }
+        if not supported_lines:
+            raise SourceBundleQuantitativeProvenanceError(
+                "period_date_not_local_to_reported_estimate"
+            )
+        if (
+            len(period_dates) == 1
+            and not re.search(
+                r"\b(?:since|after|starting|beginning|from)\b",
+                period,
+                flags=re.IGNORECASE,
+            )
+            and str(result.get("provenance") or "") != "system_derived"
+        ):
+            value_lines = {
+                index
+                for index in supported_lines
+                if set(candidates).intersection(
+                    _source_line_quantity_tokens(source_lines, index)
+                )
+            }
+            supporting_date_lines = {
+                date_line
+                for date_line, metadata in matching_by_period[0]
+                if not metadata
+                and any(
+                    _line_has_local_date(
+                        value_line,
+                        [(date_line, False)],
+                        source_lines,
+                        metadata_date_lines,
+                    )
+                    for value_line in value_lines
+                )
+            }
+            if supporting_date_lines and all(
+                _line_date_is_lower_bound(source_lines[index], period_dates[0])
+                for index in supporting_date_lines
+            ):
+                raise SourceBundleQuantitativeProvenanceError(
+                    "period_date_not_local_to_reported_estimate"
+                )
+        local_inputs = {
+            token
+            for index in supported_lines
+            for token in _source_line_quantity_tokens(source_lines, index)
+        }
+        if str(result.get("provenance") or "") == "system_derived":
+            local_text = "\n".join(
+                source_lines[index] for index in sorted(supported_lines)
+            )
+            invalid = not _system_derived_estimate_supported(
+                estimate, local_text, local_inputs
+            )
+        else:
+            invalid = [token for token in candidates if token not in local_inputs]
+        if invalid:
+            reason = (
+                "derived_estimate_not_supported_by_source_inputs"
+                if str(result.get("provenance") or "") == "system_derived"
+                else "period_date_not_local_to_reported_estimate"
+                if all(token in all_source_inputs for token in invalid)
+                else "reported_estimate_not_found_in_source"
+            )
+            raise SourceBundleQuantitativeProvenanceError(reason)
+        if not candidates:
+            if estimate_tokens:
+                raise SourceBundleQuantitativeProvenanceError(
+                    "reported_estimate_not_found_in_source"
+                )
 
 
 def _normalized_bundle_evidence_anchor(
@@ -14763,6 +18401,9 @@ def _write_frozen_content(checkpoint_root: Path, content: Mapping[str, Any]) -> 
         }
     )
     write_yaml(checkpoint_root / "frozen_content.yml", payload)
+    document_route = content.get("document_route")
+    if isinstance(document_route, Mapping):
+        write_yaml(checkpoint_root / "document_route.yml", dict(document_route))
 
 
 def _load_frozen_content(checkpoint_root: Path) -> dict[str, Any] | None:
@@ -14780,11 +18421,156 @@ def _load_frozen_content(checkpoint_root: Path) -> dict[str, Any] | None:
     text = source_path.read_text(encoding="utf-8")
     if str(payload.get("text_hash") or "") != sha256_text(text):
         raise ValueError("frozen source text hash mismatch")
-    return {
+    content = {
         key: value
         for key, value in payload.items()
         if key not in {"checkpoint_version", "text_hash", "captured_at"}
     } | {"text": text}
+    route_path = checkpoint_root / "document_route.yml"
+    if route_path.exists():
+        document_route = read_yaml(route_path, {})
+        if not isinstance(document_route, Mapping):
+            raise ValueError("document route manifest must be a mapping")
+        content["document_route"] = dict(document_route)
+    return content
+
+
+def _recover_pdf_image_route(
+    content: Mapping[str, Any],
+    request: MapRequest,
+    workspace: Path,
+    checkpoint_root: Path,
+    *,
+    trigger: str,
+    acquisition_gate: _LocalAcquisitionGate | None,
+    cancel_event: threading.Event | None,
+) -> dict[str, Any]:
+    route_value = content.get("document_route")
+    if not isinstance(route_value, Mapping):
+        raise ProviderInvalidSourceBundle("PDF image recovery route is missing")
+    route = dict(route_value)
+    route_path = checkpoint_root / "document_route.yml"
+    if route_path.exists():
+        persisted_route = read_yaml(route_path, {})
+        if not isinstance(persisted_route, Mapping):
+            raise ProviderIsolationFailure("PDF image route checkpoint is invalid")
+        if _document_route_identity(persisted_route) != _document_route_identity(
+            route
+        ):
+            raise ProviderIsolationFailure("PDF image route checkpoint identity changed")
+        route = dict(persisted_route)
+    custody_path = _validate_document_route_binding(
+        route,
+        expected_custody_hash=str(content.get("content_hash") or ""),
+        expected_custody_file=Path(str(content.get("source_file") or "")),
+        custody_root=workspace / "01_custody" / "files",
+    )
+    if sha256_file(custody_path) != str(content.get("content_hash") or ""):
+        raise ProviderIsolationFailure("PDF recovery custody integrity check failed")
+    recovery = (
+        dict(route.get("recovery") or {})
+        if isinstance(route.get("recovery"), Mapping)
+        else {}
+    )
+    if (
+        recovery.get("state") == "completed"
+        and str(content.get("content_route") or "").endswith(
+            "_after_codex_image_recovery"
+        )
+    ):
+        return dict(content)
+    if recovery.get("state") not in {"not_selected", "selected"}:
+        raise ProviderInvalidSourceBundle("PDF image recovery state is invalid")
+    recovery.update(
+        {
+            "state": "selected",
+            "trigger": trigger or str(recovery.get("trigger") or "resume"),
+        }
+    )
+    route["recovery"] = recovery
+    write_yaml(route_path, route)
+
+    def recover() -> ExtractionResult:
+        return extract_path(
+            custody_path,
+            ocr_mode="auto",
+            ocr_languages=request.extraction_policy.languages,
+            cancelled=(
+                cancel_event.is_set if cancel_event is not None else None
+            ),
+        )
+
+    try:
+        if acquisition_gate is None:
+            extracted = recover()
+        else:
+            with acquisition_gate:
+                extracted = recover()
+    except ExtractionCancelled as exc:
+        raise ProviderInterrupted("PDF local recovery interrupted") from exc
+    except Exception as exc:
+        route["recovery"] = {
+            **recovery,
+            "state": "failed",
+            "failure": "local_extraction_error",
+        }
+        write_yaml(route_path, route)
+        raise ProviderInvalidSourceBundle("PDF image local recovery failed") from exc
+    if extracted.status != "succeeded" or not str(extracted.text or "").strip():
+        route["recovery"] = {
+            **recovery,
+            "state": "failed",
+            "failure": "local_extraction_failed",
+        }
+        write_yaml(route_path, route)
+        raise ProviderInvalidSourceBundle("PDF image local recovery failed")
+    adequacy = extracted.adequacy or classify_content_adequacy(
+        extracted.text,
+        media_type=extracted.media_type,
+        page_count=extracted.page_count,
+    )
+    recovered = {
+        **dict(content),
+        "text": extracted.text,
+        "content_route": f"{extracted.route}_after_codex_image_recovery",
+        "media_type": extracted.media_type,
+        "source_scope": adequacy.source_scope,
+        "source_coverage": adequacy.to_dict(),
+        "coverage_reason": adequacy.reason,
+        "coverage_metrics": dict(adequacy.metrics or {}),
+    }
+    if (
+        str(content.get("source_scope") or "") == "partial_document"
+        and adequacy.source_scope in {"full_document", "partial_document"}
+    ):
+        recovered.update(
+            source_scope="partial_document",
+            source_coverage=dict(content.get("source_coverage", {}) or {}),
+            coverage_reason=str(
+                content.get("coverage_reason") or "bounded_attachment_excerpt"
+            ),
+        )
+    route["recovery"] = {
+        **recovery,
+        "state": "completed",
+        "content_route": recovered["content_route"],
+        "text_hash": sha256_text(extracted.text),
+    }
+    recovered["document_route"] = route
+    _write_frozen_content(checkpoint_root, recovered)
+    return recovered
+
+
+def _active_pdf_document_route(
+    content: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    route = content.get("document_route")
+    if not isinstance(route, Mapping):
+        return None
+    recovery = route.get("recovery")
+    if isinstance(recovery, Mapping) and recovery.get("state") != "not_selected":
+        return None
+    return dict(route)
 
 
 def _limited_analysis(
@@ -14854,6 +18640,44 @@ def _limited_analysis(
     return {
         "metadata": f"{title}; {data.get('date') or 'date unavailable'}; DOI: {data.get('DOI') or data.get('doi') or 'unavailable'}.",
         "scope_limitation": limitation,
+    }
+
+
+def _source_reader_metadata(
+    item: Mapping[str, Any],
+    source_id: str,
+    zotero_key: str,
+    content: Mapping[str, Any],
+) -> dict[str, Any]:
+    metrics = dict(content.get("coverage_metrics", {}) or {})
+    return {
+        **item_data(item),
+        "_source_context": {
+            "source_id": source_id,
+            "zotero_key": zotero_key,
+            "attachment_key": str(
+                item_data(item).get("parentItem") and zotero_key or ""
+            ),
+            "source_file": str(content.get("source_file") or ""),
+            "route": str(content.get("content_route") or ""),
+            "media_type": str(content.get("media_type") or ""),
+            "source_scope": str(content.get("source_scope") or "full_document"),
+            "page_count": int(metrics.get("page_count", 0) or 0),
+            "embedded_text_page_count": int(
+                metrics.get("embedded_text_page_count", 0) or 0
+            ),
+            "ocr_page_count": int(metrics.get("ocr_page_count", 0) or 0),
+            "unresolved_pages": list(metrics.get("unresolved_pages", []) or []),
+            "recovered_pages": list(metrics.get("recovered_pages", []) or []),
+            "recovered_page_ratio": metrics.get("recovered_page_ratio"),
+            "content_kind": str(metrics.get("content_kind") or ""),
+            "ordinal_to_printed_page": dict(
+                metrics.get("ordinal_to_printed_page", {}) or {}
+            ),
+            "heading_spans": list(metrics.get("heading_spans", []) or []),
+            "table_spans": list(metrics.get("table_spans", []) or []),
+            "figure_spans": list(metrics.get("figure_spans", []) or []),
+        },
     }
 
 
@@ -14992,66 +18816,66 @@ def _acquire_content(
         if local:
             extraction_path = local
             local_media_type = _target_media_type(data)
+            local_hash = sha256_file(local)
             local_primary_pdf = _is_primary_pdf_attachment(
                 data, parent_data, local_media_type
             )
             primary_pdf_attempted = primary_pdf_attempted or local_primary_pdf
             if local.suffix.lower() == ".pdf" or local_media_type == "application/pdf":
+                document = local.read_bytes()
                 custody_path = (
                     workspace
                     / "01_custody"
                     / "files"
                     / f"{safe_filename(target_key)}{local.suffix.lower() or '.pdf'}"
                 )
-                atomic_write_bytes(custody_path, local.read_bytes())
+                atomic_write_bytes(custody_path, document)
                 extraction_path = custody_path
-            extracted = extract_path(
-                extraction_path,
-                ocr_mode=request.extraction_policy.ocr,
-                ocr_languages=request.extraction_policy.languages,
-                cancelled=cancelled,
-            )
+                local_candidate, extracted = _custodied_pdf_candidate(
+                    document,
+                    custody_path,
+                    data,
+                    item,
+                    base,
+                    request,
+                    actual_primary_pdf=local_primary_pdf,
+                    cancelled=cancelled,
+                )
+            else:
+                extracted = extract_path(
+                    extraction_path,
+                    ocr_mode=request.extraction_policy.ocr,
+                    ocr_languages=request.extraction_policy.languages,
+                    cancelled=cancelled,
+                )
+                local_candidate = (
+                    _custodied_pdf_candidate_from_extraction(
+                        extracted,
+                        local_hash,
+                        extraction_path,
+                        data,
+                        item,
+                        local_primary_pdf,
+                    )
+                    if extracted.status == "succeeded"
+                    else None
+                )
             base["attempts"].append(
                 _attempt(
                     base,
                     extracted.route,
                     "succeeded" if extracted.status == "succeeded" else "failed",
                     extracted.reason or "extracted",
-                    input_hash=sha256_file(local),
+                    input_hash=local_hash,
                     output_path=str(extraction_path),
                 )
             )
-            if extracted.status == "succeeded":
-                local_candidate = _content_candidate(
-                    extracted.adequacy
-                    or classify_content_adequacy(
-                        extracted.text,
-                        media_type=extracted.media_type,
-                        page_count=extracted.page_count,
-                    ),
-                    text=extracted.text,
-                    content_hash=sha256_file(local),
-                    source_file=str(extraction_path),
-                    content_route=extracted.route,
-                    media_type=extracted.media_type,
-                    rank_override=_attachment_candidate_rank(
-                        data,
-                        parent_data,
-                        media_type=extracted.media_type,
-                        actual_file=True,
-                    ),
-                )
-                local_candidate = _apply_bibliographic_scope(
-                    local_candidate,
-                    parent_data,
-                    data,
-                )
-                local_candidate["actual_primary_pdf"] = local_primary_pdf
+            if local_candidate is not None:
                 candidates.append(local_candidate)
             elif local_primary_pdf:
                 failed_primary_pdf = _failed_pdf_candidate(
                     extracted,
-                    content_hash=sha256_file(local),
+                    content_hash=local_hash,
                     source_file=str(extraction_path),
                 )
         if target is item and str(data.get("itemType", "")) != "attachment":
@@ -15095,15 +18919,39 @@ def _acquire_content(
             / f"{safe_filename(target_key)}{extension}"
         )
         atomic_write_bytes(custody_path, document)
-        extracted = extract_bytes(
-            document,
-            media_type=media_type,
-            filename=custody_path.name,
-            ocr_mode=request.extraction_policy.ocr,
-            ocr_languages=request.extraction_policy.languages,
-            cancelled=cancelled,
-        )
         document_hash = sha256_bytes(document)
+        if media_type == "application/pdf" or custody_path.suffix.casefold() == ".pdf":
+            downloaded_candidate, extracted = _custodied_pdf_candidate(
+                document,
+                custody_path,
+                data,
+                item,
+                base,
+                request,
+                actual_primary_pdf=downloaded_primary_pdf,
+                cancelled=cancelled,
+            )
+        else:
+            extracted = extract_bytes(
+                document,
+                media_type=media_type,
+                filename=custody_path.name,
+                ocr_mode=request.extraction_policy.ocr,
+                ocr_languages=request.extraction_policy.languages,
+                cancelled=cancelled,
+            )
+            downloaded_candidate = (
+                _custodied_pdf_candidate_from_extraction(
+                    extracted,
+                    document_hash,
+                    custody_path,
+                    data,
+                    item,
+                    downloaded_primary_pdf,
+                )
+                if extracted.status == "succeeded"
+                else None
+            )
         base["attempts"].append(
             _attempt(
                 base,
@@ -15114,32 +18962,7 @@ def _acquire_content(
                 output_path=str(custody_path),
             )
         )
-        if extracted.status == "succeeded":
-            downloaded_candidate = _content_candidate(
-                extracted.adequacy
-                or classify_content_adequacy(
-                    extracted.text,
-                    media_type=extracted.media_type,
-                    page_count=extracted.page_count,
-                ),
-                text=extracted.text,
-                content_hash=document_hash,
-                source_file=str(custody_path),
-                content_route=extracted.route,
-                media_type=extracted.media_type,
-                rank_override=_attachment_candidate_rank(
-                    data,
-                    parent_data,
-                    media_type=extracted.media_type,
-                    actual_file=True,
-                ),
-            )
-            downloaded_candidate = _apply_bibliographic_scope(
-                downloaded_candidate,
-                parent_data,
-                data,
-            )
-            downloaded_candidate["actual_primary_pdf"] = downloaded_primary_pdf
+        if downloaded_candidate is not None:
             candidates.append(downloaded_candidate)
         elif downloaded_primary_pdf:
             failed_primary_pdf = _failed_pdf_candidate(
@@ -15278,6 +19101,9 @@ _GENERIC_ATTACHMENT_LABEL_RE = re.compile(
     r"^(?:pdf|full\s*text|attachment|download(?:_file)?(?:\.pdf)?)$",
     flags=re.IGNORECASE,
 )
+_COLLAPSED_PERCENT_SERIES_RE = re.compile(
+    r"(?<![\d.])(?:\d+(?:\.\d+)?%\s*){4,}"
+)
 
 
 def _apply_bibliographic_scope(
@@ -15388,6 +19214,222 @@ def _apply_bibliographic_scope(
     return row
 
 
+def _custodied_pdf_candidate(
+    document: bytes,
+    custody_path: Path,
+    attachment: Mapping[str, Any],
+    source_item: Mapping[str, Any],
+    base: Mapping[str, Any],
+    request: MapRequest,
+    *,
+    actual_primary_pdf: bool,
+    cancelled: Callable[[], bool] | None,
+) -> tuple[dict[str, Any] | None, ExtractionResult]:
+    probe = probe_pdf_bytes(document, cancelled=cancelled)
+    document_hash = sha256_bytes(document)
+    codex_auto = (
+        request.extraction_policy.ocr == "auto"
+        and request.provider == "codex"
+        and request.allow_cloud
+    )
+    selected_pages = (
+        tuple(
+            page.page_number
+            for page in probe.pages
+            if _COLLAPSED_PERCENT_SERIES_RE.search(page.embedded_text)
+        )
+        if probe.adequacy is not None and probe.adequacy.is_full_publication
+        else probe.render_candidate_pages
+    )
+    route_allowed = (
+        codex_auto
+        and probe.status != "failed"
+        and probe.adequacy is not None
+        and 0 < len(selected_pages) <= 16
+        and all(
+            page.width > 0 and page.height > 0
+            for page in probe.pages
+            if page.page_number in selected_pages
+        )
+    )
+    document_route: dict[str, Any] | None = None
+    if route_allowed:
+        metrics = dict(probe.adequacy.metrics or {})
+        metrics.update(
+            {
+                "page_count": probe.page_count,
+                "embedded_text_page_count": sum(
+                    1 for page in probe.pages if not page.suspicious
+                ),
+                "ocr_page_count": 0,
+                "unresolved_pages": [],
+                "recovered_pages": list(range(1, probe.page_count + 1)),
+                "recovered_page_ratio": 1.0,
+                "ordinal_to_printed_page": {
+                    str(page.page_number): page.printed_page
+                    for page in probe.pages
+                },
+            }
+        )
+        adequacy = ContentAdequacy(
+            classification=probe.adequacy.classification,
+            source_scope="full_document",
+            coverage_gate="passed",
+            reason="codex_pdf_page_images",
+            metrics=metrics,
+        )
+        extracted = ExtractionResult(
+            status="succeeded",
+            text=probe.embedded_text,
+            route="codex_pdf_page_images",
+            media_type="application/pdf",
+            page_count=probe.page_count,
+            adequacy=adequacy,
+        )
+    elif (
+        codex_auto
+        and probe.adequacy is not None
+        and probe.adequacy.is_full_publication
+    ):
+        extracted = ExtractionResult(
+            status="succeeded",
+            text=probe.embedded_text,
+            route="pypdf_text",
+            media_type="application/pdf",
+            page_count=probe.page_count,
+            adequacy=probe.adequacy,
+        )
+    else:
+        extracted = extract_pdf_from_probe(
+            document,
+            probe,
+            ocr_mode=request.extraction_policy.ocr,
+            ocr_languages=request.extraction_policy.languages,
+            cancelled=cancelled,
+        )
+    if extracted.status != "succeeded":
+        return None, extracted
+    candidate = _custodied_pdf_candidate_from_extraction(
+        extracted,
+        document_hash,
+        custody_path,
+        attachment,
+        source_item,
+        actual_primary_pdf,
+    )
+    if extracted.route == "codex_pdf_page_images":
+        reader_metadata = _source_reader_metadata(
+            source_item,
+            str(base.get("source_id") or ""),
+            item_key(source_item),
+            candidate,
+        )
+        selected_pages = list(selected_pages)
+        selected_dimensions = [
+            (page.width, page.height)
+            for page in probe.pages
+            if page.page_number in selected_pages
+        ]
+        projected_preflight = codex_source_bundle_image_preflight(
+            extracted.text,
+            reader_metadata,
+            request.question,
+            selected_dimensions,
+        )
+        if not projected_preflight["admitted"]:
+            extracted = extract_pdf_from_probe(
+                document,
+                probe,
+                ocr_mode="auto",
+                ocr_languages=request.extraction_policy.languages,
+                cancelled=cancelled,
+            )
+            if extracted.status != "succeeded":
+                return None, extracted
+            return _custodied_pdf_candidate_from_extraction(
+                extracted,
+                document_hash,
+                custody_path,
+                attachment,
+                source_item,
+                actual_primary_pdf,
+            ), extracted
+        probe_evidence = {
+            "status": probe.status,
+            "reason": probe.reason,
+            "custody_byte_count": probe.custody_byte_count,
+            "page_count": probe.page_count,
+            "suspicious_pages": list(probe.suspicious_pages),
+            "render_candidate_pages": selected_pages,
+            "pages": [
+                {
+                    key: value
+                    for key, value in page.to_dict().items()
+                    if key != "embedded_text"
+                }
+                for page in probe.pages
+            ],
+        }
+        identity_payload = {
+            "route_version": "1",
+            "route": "codex_pdf_page_images",
+            "custody_file": str(custody_path.resolve()),
+            "custody_sha256": document_hash,
+            "selected_pages": selected_pages,
+            "render_policy": {
+                "format": "png",
+                "maximum_side": 2_048,
+                "maximum_pages": 16,
+                "enlargement": False,
+            },
+            "attachment_capability": codex_source_bundle_attachment_identity(),
+            "probe_evidence": probe_evidence,
+            "projected_preflight": projected_preflight,
+        }
+        document_route = {
+            "identity_payload": identity_payload,
+            "identity": stable_hash(identity_payload),
+            "rendered_images": [],
+            "recovery": {"state": "not_selected"},
+        }
+        candidate["document_route"] = document_route
+    return candidate, extracted
+
+
+def _custodied_pdf_candidate_from_extraction(
+    extracted: ExtractionResult,
+    document_hash: str,
+    custody_path: Path,
+    attachment: Mapping[str, Any],
+    source_item: Mapping[str, Any],
+    actual_primary_pdf: bool,
+) -> dict[str, Any]:
+    candidate = _content_candidate(
+        extracted.adequacy
+        or classify_content_adequacy(
+            extracted.text,
+            media_type=extracted.media_type,
+            page_count=extracted.page_count,
+        ),
+        text=extracted.text,
+        content_hash=document_hash,
+        source_file=str(custody_path),
+        content_route=extracted.route,
+        media_type=extracted.media_type,
+        rank_override=_attachment_candidate_rank(
+            attachment,
+            item_data(source_item),
+            media_type=extracted.media_type,
+            actual_file=True,
+        ),
+    )
+    candidate = _apply_bibliographic_scope(
+        candidate, item_data(source_item), attachment
+    )
+    candidate["actual_primary_pdf"] = actual_primary_pdf
+    return candidate
+
+
 _SUPPLEMENTARY_ATTACHMENT_RE = re.compile(
     r"\b(?:supplement(?:ary)?|supporting\s+(?:information|material)|appendix|"
     r"data\s*set|dataset|codebook|replication\s+(?:data|files?)|tables?\s+only|"
@@ -15417,18 +19459,24 @@ def _attachment_candidate_rank(
     media_type: str,
     actual_file: bool,
 ) -> int | None:
-    """Rank primary PDFs above indexed text without selecting supplements."""
+    """Rank primary source files above their indexed representations."""
 
-    if media_type != "application/pdf":
-        return None
     label = " ".join(
         str(attachment.get(field) or "")
         for field in ("title", "filename", "attachmentPath")
     )
+    if media_type not in {
+        "application/pdf",
+        "text/html",
+        "application/xhtml+xml",
+    }:
+        return None
     if _SUPPLEMENTARY_ATTACHMENT_RE.search(label):
         return 60 if actual_file else 50
     if _NONARTICLE_ATTACHMENT_RE.search(label):
         return 40 if actual_file else 35
+    if media_type != "application/pdf":
+        return 90 if actual_file else None
 
     parent_title = _selection_terms(str(parent.get("title") or ""))
     attachment_title = _selection_terms(label)
@@ -15811,6 +19859,7 @@ def _fingerprint(
     reader_model: str,
     source_scope: str,
     source_item_type: str = "",
+    document_route_identity: str = "",
 ) -> str:
     payload = {
         "zotero_item_key": key,
@@ -15831,6 +19880,8 @@ def _fingerprint(
             )
         ),
     }
+    if document_route_identity:
+        payload["document_route_identity"] = document_route_identity
     return sha256_text(json.dumps(payload, sort_keys=True))
 
 
@@ -16231,13 +20282,20 @@ def _public_terminal_row(row: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _blocked_report(request: MapRequest, run_id: str, reason: str) -> RunReport:
+def _blocked_report(
+    request: MapRequest,
+    run_id: str,
+    reason: str,
+    *,
+    migration: Mapping[str, Any] | None = None,
+) -> RunReport:
     workspace = resolve_workspace(request.workspace)
     report = RunReport(
         status="blocked",
         workspace=workspace,
         run_id=run_id,
         errors=[{"reason": reason}],
+        literature_report={"migration": dict(migration or {})},
     )
     run_dir = run_directory(workspace, run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -16262,6 +20320,7 @@ def _source_replay_request_hash(request: MapRequest) -> str:
     payload.pop("parallel", None)
     payload.pop("provider_concurrency", None)
     payload.pop("max_provider_spend_usd", None)
+    payload.pop("literature_model", None)
     processing = dict(payload.get("processing", {}) or {})
     for key in (
         "connect_timeout_seconds",
@@ -16274,6 +20333,7 @@ def _source_replay_request_hash(request: MapRequest) -> str:
     payload["processing"] = processing
     literature_policy = dict(payload.get("literature_policy", {}) or {})
     for key in (
+        "cluster_generation_enabled",
         "literature_deadline_seconds",
         "max_profile_calls",
         "max_synthesis_calls",
@@ -16402,12 +20462,21 @@ def _reusable_note(
         frontmatter, _ = parse_atomic_note(text)
     except OSError:
         return False
+    image_route = isinstance(row.get("document_route"), Mapping)
+    if image_route and str(frontmatter.get("content_route") or "") != str(
+        row.get("content_route") or ""
+    ):
+        return False
     if not validate_note(text).passed:
         return False
     prior_item_type = str(frontmatter.get("item_type") or "")
     current_item_type = str(item_data(row.get("item", {})).get("itemType") or "")
     if prior_item_type and prior_item_type != current_item_type:
         return False
+    source_contract = (
+        str(frontmatter.get("prompt_version", "")),
+        str(frontmatter.get("source_bundle_prompt_version", "")),
+    )
     reusable = all(
         (
             str(frontmatter.get("zotero_item_key", ""))
@@ -16422,14 +20491,18 @@ def _reusable_note(
             == str(row.get("source_scope", "")),
             str(frontmatter.get("extraction_version", ""))
             == request.extraction_version,
-            str(frontmatter.get("prompt_version", ""))
+            source_contract
             in (
-                {request.prompt_version, "11"}
+                {
+                    (request.prompt_version, SOURCE_BUNDLE_PROMPT_VERSION),
+                    ("11", "5"),
+                    ("11", "6"),
+                    ("12", "7"),
+                    ("13", "8"),
+                }
                 if request.prompt_version == CURRENT_ATOMIC_PROMPT_VERSION
-                else {request.prompt_version}
+                else {(request.prompt_version, SOURCE_BUNDLE_PROMPT_VERSION)}
             ),
-            str(frontmatter.get("source_bundle_prompt_version", ""))
-            in {"5", "6", SOURCE_BUNDLE_PROMPT_VERSION},
         )
     )
     if not reusable:
@@ -16455,6 +20528,8 @@ def _reusable_note(
     expected_dependency = _source_bundle_dependency_fingerprint(row, request)
     if str(bundle.get("dependency_fingerprint") or "") == expected_dependency:
         return True
+    if image_route:
+        return False
     stored_payload = bundle.get("bundle")
     if not isinstance(stored_payload, Mapping):
         return False
@@ -16463,27 +20538,15 @@ def _reusable_note(
             stored_payload,
             row,
             str(row.get("source_scope") or "full_document"),
+            validate_quantitative_provenance=(
+                source_contract
+                == (request.prompt_version, SOURCE_BUNDLE_PROMPT_VERSION)
+            ),
         )
     except (TypeError, ValueError):
         return False
     if normalized is None:
         return False
-    try:
-        stored_bundle = SourceAnalysisBundle.from_dict(stored_payload)
-    except (TypeError, ValueError):
-        stored_bundle = None
-    if (
-        stored_bundle is not None
-        and stored_bundle.semantic_dict() == normalized.semantic_dict()
-    ):
-        write_yaml(
-            bundle_path,
-            {
-                **dict(bundle),
-                "dependency_fingerprint": expected_dependency,
-            },
-        )
-        return True
     _commit_source_bundle(
         path.parents[2],
         {**dict(row), "source_analysis_bundle": normalized.to_dict()},
@@ -16591,6 +20654,133 @@ def _citation_key(data: Mapping[str, Any]) -> str:
     return ""
 
 
+def _document_route_identity(document_route: Mapping[str, Any]) -> str:
+    identity_payload = document_route.get("identity_payload")
+    identity = str(document_route.get("identity") or "")
+    if (
+        not isinstance(identity_payload, Mapping)
+        or identity != stable_hash(identity_payload)
+        or identity_payload.get("route") != "codex_pdf_page_images"
+    ):
+        raise ProviderIsolationFailure("PDF image route identity is invalid")
+    return identity
+
+
+def _validate_document_route_binding(
+    document_route: Mapping[str, Any],
+    *,
+    expected_custody_hash: str,
+    expected_custody_file: Path,
+    custody_root: Path,
+) -> Path:
+    _document_route_identity(document_route)
+    identity_payload = document_route["identity_payload"]
+    route_hash = str(identity_payload.get("custody_sha256") or "")
+    raw_path = Path(str(identity_payload.get("custody_file") or ""))
+    if not expected_custody_hash or route_hash != expected_custody_hash:
+        raise ProviderIsolationFailure("PDF image custody binding is invalid")
+    if not raw_path.is_absolute() or raw_path.is_symlink():
+        raise ProviderIsolationFailure("PDF image custody path is invalid")
+    try:
+        custody_file = raw_path.resolve(strict=True)
+        expected_file = expected_custody_file.resolve(strict=True)
+        allowed_root = custody_root.resolve(strict=True)
+    except OSError as exc:
+        raise ProviderIsolationFailure("PDF image custody path is unavailable") from exc
+    if (
+        custody_file != expected_file
+        or not custody_file.is_file()
+        or not custody_file.is_relative_to(allowed_root)
+    ):
+        raise ProviderIsolationFailure("PDF image custody path is outside custody")
+    return custody_file
+
+
+def _render_document_route_attachments(
+    document_route: Mapping[str, Any],
+    *,
+    text: str,
+    metadata: Mapping[str, Any],
+    question: str | None,
+    checkpoint_root: Path,
+    output_dir: Path,
+    cancelled: Callable[[], bool] | None,
+    expected_custody_hash: str,
+    expected_custody_file: Path,
+    custody_root: Path,
+) -> tuple[Path, ...]:
+    custody_file = _validate_document_route_binding(
+        document_route,
+        expected_custody_hash=expected_custody_hash,
+        expected_custody_file=expected_custody_file,
+        custody_root=custody_root,
+    )
+    identity_payload = document_route["identity_payload"]
+    try:
+        document = custody_file.read_bytes()
+    except OSError as exc:
+        raise ProviderIsolationFailure("PDF image custody file is unreadable") from exc
+    if sha256_bytes(document) != expected_custody_hash:
+        raise ProviderIsolationFailure("PDF image custody hash mismatch")
+    selected_pages = identity_payload.get("selected_pages")
+    if (
+        not isinstance(selected_pages, list)
+        or not selected_pages
+        or len(selected_pages) > 16
+        or selected_pages != sorted(set(selected_pages))
+        or any(
+            isinstance(page, bool) or not isinstance(page, int) or page <= 0
+            for page in selected_pages
+        )
+    ):
+        raise ProviderIsolationFailure("PDF image page selection is invalid")
+    try:
+        images = render_pdf_pages(
+            document,
+            selected_pages,
+            output_dir,
+            cancelled=cancelled,
+        )
+    except ExtractionCancelled:
+        raise
+    except Exception as exc:
+        raise ProviderIsolationFailure("PDF image rendering failed") from exc
+    evidence = [
+        {
+            "page_number": image.page_number,
+            "media_type": image.media_type,
+            "width": image.width,
+            "height": image.height,
+            "sha256": image.sha256,
+            "byte_count": image.byte_count,
+            "renderer": image.renderer,
+            "renderer_version": image.renderer_version,
+            "render_policy_version": image.render_policy_version,
+        }
+        for image in images
+    ]
+    expected = document_route.get("rendered_images")
+    if expected not in (None, []) and expected != evidence:
+        raise ProviderIsolationFailure("PDF image rerender hash mismatch")
+    preflight = codex_source_bundle_image_preflight(
+        text,
+        metadata,
+        question,
+        [(image.width, image.height) for image in images],
+    )
+    if not preflight["admitted"]:
+        raise ProviderIsolationFailure("PDF image route exceeds the token ceiling")
+    write_yaml(
+        checkpoint_root / "document_route.yml",
+        {
+            **dict(document_route),
+            "rendered_images": evidence,
+            "actual_preflight": preflight,
+        },
+    )
+    return tuple(image.path for image in images)
+
+
 def _note_section(body: str, heading: str) -> str:
     import re
 
@@ -16629,6 +20819,10 @@ def _read_document(
     inventory_index: int = 0,
     provider_budget: _ProfileProviderBudget | None = None,
     cancel_event: threading.Event | None = None,
+    document_route: Mapping[str, Any] | None = None,
+    expected_custody_hash: str = "",
+    expected_custody_file: Path | None = None,
+    custody_root: Path | None = None,
 ) -> tuple[Mapping[str, Any], str, str]:
     policy = request.processing if request is not None else ProcessingPolicy()
     context_tokens = int(getattr(reader, "context_window_tokens", 0) or 0)
@@ -16663,6 +20857,29 @@ def _read_document(
         "chunk_output_tokens": source_chunk_output_tokens,
         "synthesis_output_tokens": policy.synthesis_output_tokens,
     }
+    image_route = document_route is not None
+    if image_route:
+        if expected_custody_file is None or custody_root is None:
+            raise ProviderIsolationFailure("PDF image custody binding is missing")
+        _validate_document_route_binding(
+            document_route,
+            expected_custody_hash=expected_custody_hash,
+            expected_custody_file=expected_custody_file,
+            custody_root=custody_root,
+        )
+        common_identity["document_route_identity"] = _document_route_identity(
+            document_route
+        )
+    if str(getattr(reader, "name", "")).casefold() == "codex":
+        effort = request.reasoning_effort if request else None
+        common_identity["provider_execution_identity"] = {
+            contract_id: codex_contract_identity(
+                contract_id,
+                str(getattr(reader, "model", "")),
+                effort or "medium",
+            )
+            for contract_id in ("chunk_evidence", "source_bundle")
+        }
     provider_key = str(
         (
             metadata.get("_source_context", {})
@@ -16673,6 +20890,9 @@ def _read_document(
     )
     started = time.monotonic()
     calls = 0
+    retry_semantic_checkpoint = bool(
+        request is not None and request.retry_terminal_failures
+    )
 
     def record_source_attempt() -> None:
         nonlocal calls
@@ -16694,10 +20914,13 @@ def _read_document(
 
     bundle_reader = getattr(reader, "read_source_bundle", None)
     bundle_fit = getattr(reader, "should_read_source_bundle_directly", None)
-    direct_admitted = len(text) <= direct_limit and (
-        not callable(bundle_reader)
-        or not callable(bundle_fit)
-        or bool(bundle_fit(text, metadata, question))
+    direct_admitted = image_route or (
+        len(text) <= direct_limit
+        and (
+            not callable(bundle_reader)
+            or not callable(bundle_fit)
+            or bool(bundle_fit(text, metadata, question))
+        )
     )
     if direct_admitted:
         direct_path = checkpoint_root / "direct.yml"
@@ -16709,7 +20932,9 @@ def _read_document(
             "mode": "direct",
             "direct_limit": direct_limit,
         }
-        if direct_checkpoint.get("identity") == direct_identity and isinstance(
+        if not retry_semantic_checkpoint and direct_checkpoint.get(
+            "identity"
+        ) == direct_identity and isinstance(
             direct_checkpoint.get("analysis"), Mapping
         ):
             return (
@@ -16717,17 +20942,62 @@ def _read_document(
                 f"{reader.name}_text",
                 "reused_direct_source_checkpoint",
             )
+        attachments: tuple[Path, ...] = ()
+        temporary_images: tempfile.TemporaryDirectory[str] | None = None
+
         def direct_operation() -> Mapping[str, Any]:
             reset_provider_completion()
             if callable(bundle_reader):
-                result = dict(bundle_reader(text, metadata, question))
-                SourceAnalysisBundle.from_dict(result)
+                result = dict(
+                    bundle_reader(
+                        text,
+                        metadata,
+                        question,
+                        attachment_paths=attachments,
+                    )
+                    if attachments
+                    else bundle_reader(text, metadata, question)
+                )
+                try:
+                    SourceAnalysisBundle.from_dict(result)
+                except (TypeError, ValueError) as exc:
+                    if attachments:
+                        raise ProviderInvalidSourceBundle(
+                            "Codex discarded an invalid image-backed source bundle"
+                        ) from exc
+                    raise
                 return result
             return _ensure_analysis_contract(
                 dict(reader.read_source(text, metadata, question))
             )
 
         try:
+            if image_route:
+                if not checkpoint_enabled:
+                    raise ProviderIsolationFailure(
+                        "PDF image routes require a checkpoint directory"
+                    )
+                if not callable(bundle_reader):
+                    raise ProviderUnsupportedAttachment(
+                        "reader does not support source-bundle attachments"
+                    )
+                temporary_images = tempfile.TemporaryDirectory(
+                    prefix="auto-zettelkasten-pdf-images-"
+                )
+                attachments = _render_document_route_attachments(
+                    document_route,
+                    text=text,
+                    metadata=metadata,
+                    question=question,
+                    checkpoint_root=checkpoint_root,
+                    output_dir=Path(temporary_images.name),
+                    cancelled=(
+                        cancel_event.is_set if cancel_event is not None else None
+                    ),
+                    expected_custody_hash=expected_custody_hash,
+                    expected_custody_file=expected_custody_file,
+                    custody_root=custody_root,
+                )
             if provider_budget is not None:
                 analysis = _provider_call_with_transport_retry(
                     provider_budget,
@@ -16758,6 +21028,8 @@ def _read_document(
                 "full_document_source_read",
             )
         except Exception as exc:
+            if image_route:
+                raise
             message = str(exc).casefold()
             if not any(
                 token in message
@@ -16773,6 +21045,9 @@ def _read_document(
                 )
             ):
                 raise
+        finally:
+            if temporary_images is not None:
+                temporary_images.cleanup()
     chunks = _split_document(
         text, chunk_char_limit=chunk_limit, max_chunks=policy.max_total_chunks
     )
@@ -16897,7 +21172,9 @@ def _read_document(
             )
     synthesis_path = checkpoint_root / "synthesis.yml"
     synthesis = read_yaml(synthesis_path, {}) or {} if checkpoint_enabled else {}
-    if synthesis.get("identity") == checkpoint_identity and isinstance(
+    if not retry_semantic_checkpoint and synthesis.get(
+        "identity"
+    ) == checkpoint_identity and isinstance(
         synthesis.get("analysis"), Mapping
     ):
         merged = _ensure_source_result_contract(dict(synthesis["analysis"]))
@@ -17058,11 +21335,6 @@ def _ensure_analysis_contract(analysis: Mapping[str, Any]) -> dict[str, Any]:
     """Keep legacy ReaderProvider integrations usable after prompt additions."""
 
     completed = dict(analysis)
-    if not str(completed.get("key_concepts_and_definitions") or "").strip():
-        completed["key_concepts_and_definitions"] = (
-            "Key concepts and definitions were not separately returned by this "
-            "legacy reader; consult the source before relying on a definition."
-        )
     if str(completed.get("plain_english_interpretation") or "").strip():
         return completed
     findings = str(

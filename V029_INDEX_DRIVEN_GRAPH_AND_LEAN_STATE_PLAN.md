@@ -904,7 +904,7 @@ Run the complete pytest suite, Ruff, package build, migration tests, and determi
 
 Create:
 
-`/Users/khalilalwazir/Documents/Auto-Zettelkasten-test/full-zotero-v029-index-graph-evaluation-20260805`
+`<private-evaluation-root>/full-zotero-v029-index-graph-evaluation-20260805`
 
 Use isolated copies of the frozen v0.28 workspace. Preserve the original evaluation unchanged.
 
@@ -1066,7 +1066,7 @@ Acceptance:
 
 Export the stable result to:
 
-`/Users/khalilalwazir/Documents/Auto-Zettelkasten-test/full-zotero-v029-obsidian-vault-20260805`
+`<private-evaluation-root>/full-zotero-v029-obsidian-vault-20260805`
 
 ## Evaluation Verdicts
 

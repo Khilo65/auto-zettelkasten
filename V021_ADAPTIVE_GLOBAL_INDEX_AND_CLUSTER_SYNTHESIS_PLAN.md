@@ -15,7 +15,7 @@ and the v0.20 implementation through commit `8114a4f`.
 
 - `V020_LIBRARY_SCALE_IDENTITY_AND_GRAPH_RELIABILITY_PLAN.md`;
 - the v0.20 evaluation at
-  `/Users/khalilalwazir/Documents/Auto-Zettelkasten-test/mediation-relapse-v020-evaluation-20260730/evaluation/v020-full-comparison.md`;
+  `<private-evaluation-root>/mediation-relapse-v020-evaluation-20260730/evaluation/v020-full-comparison.md`;
 - manual inspection of the v0.20 Berg atomic note;
 - manual inspection of the v0.20 cluster
   *Ceasefire Design and Peacekeeping Effectiveness: Context and Mechanisms*;
@@ -2131,7 +2131,7 @@ Before paid testing:
 
 Create:
 
-`/Users/khalilalwazir/Documents/Auto-Zettelkasten-test/mediation-relapse-v021-graph-evaluation-20260730`
+`<private-evaluation-root>/mediation-relapse-v021-graph-evaluation-20260730`
 
 Use an isolated clone of the clean frozen v0.20 source layer:
 

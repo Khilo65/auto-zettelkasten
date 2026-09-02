@@ -365,11 +365,11 @@ Run the complete pytest suite, Ruff without rewriting, package build, migration 
 
 Create an APFS copy-on-write clone of:
 
-`/Users/khalilalwazir/Documents/Auto-Zettelkasten-test/full-zotero-v027-evaluation-20260802`
+`<private-evaluation-root>/full-zotero-v027-evaluation-20260802`
 
 at:
 
-`/Users/khalilalwazir/Documents/Auto-Zettelkasten-test/full-zotero-v028-evaluation-20260802`
+`<private-evaluation-root>/full-zotero-v028-evaluation-20260802`
 
 Leave v0.27 evidence unchanged. Resume the frozen source run ID `eval-library-v027-full-20260802` in the clone, recording that it started under v0.27 and completed under v0.28. Do not refresh Zotero inventory or include later additions.
 
@@ -470,7 +470,7 @@ Write:
 
 Export the stable result to:
 
-`/Users/khalilalwazir/Documents/Auto-Zettelkasten-test/full-zotero-v028-obsidian-vault-20260802`
+`<private-evaluation-root>/full-zotero-v028-obsidian-vault-20260802`
 
 Assumptions:
 

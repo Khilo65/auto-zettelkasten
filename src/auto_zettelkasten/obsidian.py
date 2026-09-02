@@ -5,7 +5,15 @@ import shutil
 import unicodedata
 from pathlib import Path
 
-from .files import atomic_write_text, ensure_dir, now_iso, read_yaml, sha256_text, write_yaml
+from .files import (
+    atomic_write_text,
+    ensure_dir,
+    now_iso,
+    read_yaml,
+    sha256_text,
+    write_json,
+    write_yaml,
+)
 from .models import ArtifactManifest
 from .workspace import artifact_rows, assert_compatible, resolve_workspace
 
@@ -70,6 +78,7 @@ def export_obsidian(
     projections.extend(
         (path, Path("Indexes") / "collections" / path.relative_to(collection_indexes))
         for path in sorted(collection_indexes.rglob("*.md"))
+        if not path.name.startswith("relationships-")
     )
     latest_map = _latest_canonical_map(root / "03_literature_synthesis" / "maps")
     cluster_root = (
@@ -129,7 +138,15 @@ def export_obsidian(
     contents: dict[Path, str] = {}
     for source, relative in projections:
         target = export_root / relative
-        contents[target] = source.read_text(encoding="utf-8")
+        content = source.read_text(encoding="utf-8")
+        if relative.parts[:2] == ("Indexes", "collections") and source.name == "INDEX.md":
+            content = re.sub(
+                r"\n## Graph connections\n.*?(?=\n## |\nCatalogue revision:)",
+                "\n",
+                content,
+                flags=re.DOTALL,
+            )
+        contents[target] = content
     contents.setdefault(export_root / "Indexes" / "Source Index.md", "# Source Index\n\nNo validated atomic notes yet.\n")
     contents.setdefault(export_root / "Indexes" / "Cluster Index.md", "# Cluster Index\n\nNo canonical clusters yet.\n")
     contents.setdefault(export_root / "Indexes" / "Gap Index.md", "# Gap Candidate Index\n\nNo candidate gaps yet.\n")
@@ -181,7 +198,19 @@ def export_obsidian(
             },
         )
     if new_vault:
-        ensure_dir(vault_path / ".obsidian")
+        obsidian_root = ensure_dir(vault_path / ".obsidian")
+        graph_settings = obsidian_root / "graph.json"
+        if not graph_settings.exists():
+            write_json(
+                graph_settings,
+                {
+                    "hideUnresolved": True,
+                    "search": '-path:"Indexes"',
+                    "showAttachments": False,
+                    "showOrphans": False,
+                    "showTags": False,
+                },
+            )
     try:
         export_root = _safe_export_root(vault_path, folder_path / project_path)
     except ValueError as exc:

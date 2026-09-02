@@ -19,8 +19,6 @@ from .files import (
     slugify,
     write_yaml,
 )
-from .models import CURRENT_ATOMIC_PROMPT_VERSION
-
 # Immutable target of the historical review-status migration. These must not
 # follow the package's current release constants.
 REVIEW_STATUS_TARGET_ENGINE_VERSION = "0.5.0"
@@ -39,10 +37,14 @@ SECTION_HEADINGS = (
     ("what_this_source_can_support", "What This Source Can Support"),
     ("what_this_source_cannot_support", "What This Source Cannot Support"),
     ("locators", "Locators"),
+    ("source_structure_and_organization", "Source Structure and Organization"),
 )
-# Older accepted notes predate the definitions section and remain valid.
-COMPATIBILITY_REQUIRED_SECTION_HEADINGS = tuple(
-    row for row in SECTION_HEADINGS if row[0] != "key_concepts_and_definitions"
+OPTIONAL_SECTION_KEYS = {
+    "key_concepts_and_definitions",
+    "source_structure_and_organization",
+}
+REQUIRED_SECTION_HEADINGS = tuple(
+    row for row in SECTION_HEADINGS if row[0] not in OPTIONAL_SECTION_KEYS
 )
 
 REQUIRED_FRONTMATTER = {
@@ -255,7 +257,10 @@ def render_atomic_note(frontmatter: Mapping[str, Any], analysis: Mapping[str, An
             ]
         )
     for key, heading in SECTION_HEADINGS:
-        lines.extend([f"## {heading}", "", str(analysis.get(key, "")).strip(), ""])
+        content = str(analysis.get(key, "")).strip()
+        if key in OPTIONAL_SECTION_KEYS and not content:
+            continue
+        lines.extend([f"## {heading}", "", content, ""])
     return "\n".join(lines)
 
 
@@ -353,14 +358,7 @@ def validate_atomic_note(text: str) -> NoteValidation:
         )
     if not re.fullmatch(r"[0-9a-f]{64}", str(frontmatter.get("inspected_content_hash", ""))):
         errors.append("invalid_inspected_content_hash")
-    current_prompt = str(frontmatter.get("prompt_version") or "")
-    required_headings = (
-        SECTION_HEADINGS
-        if current_prompt.isdigit()
-        and int(current_prompt) >= int(CURRENT_ATOMIC_PROMPT_VERSION)
-        else COMPATIBILITY_REQUIRED_SECTION_HEADINGS
-    )
-    for _, heading in required_headings:
+    for _, heading in REQUIRED_SECTION_HEADINGS:
         match = re.search(rf"^## {re.escape(heading)}\s*$\n+(.*?)(?=^## |\Z)", body, flags=re.MULTILINE | re.DOTALL)
         if not match or not match.group(1).strip():
             errors.append(f"missing_section:{slugify(heading)}")

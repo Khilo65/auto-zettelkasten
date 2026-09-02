@@ -14,9 +14,9 @@ the implementation through commit `b9a5cb8`.
 **Primary evidence:**
 
 - the v0.24 evaluation at
-  `/Users/khalilalwazir/Documents/Auto-Zettelkasten-test/mediation-relapse-v024-targeted-graph-acquisition-evaluation-20260801/evaluation/v024-graph-acquisition-comparison.md`;
+  `<private-evaluation-root>/mediation-relapse-v024-targeted-graph-acquisition-evaluation-20260801/evaluation/v024-graph-acquisition-comparison.md`;
 - the post-fix v0.24 graph workspace at
-  `/Users/khalilalwazir/Documents/Auto-Zettelkasten-test/mediation-relapse-v024-postfix-graph-evaluation-20260802`;
+  `<private-evaluation-root>/mediation-relapse-v024-postfix-graph-evaluation-20260802`;
 - the v0.16–v0.24 comparative evaluations;
 - manual review of v0.24 relationship and cluster outputs; and
 - the decisions reached after v0.24 about relationship-label severity,
@@ -511,7 +511,7 @@ migration tests, and replay tests with no regressions.
 
 No source regeneration is needed. Create:
 
-`/Users/khalilalwazir/Documents/Auto-Zettelkasten-test/mediation-relapse-v025-targeted-completion-evaluation-20260802`
+`<private-evaluation-root>/mediation-relapse-v025-targeted-completion-evaluation-20260802`
 
 Use an isolated copy of the v0.24 post-fix workspace and its frozen source
 content:

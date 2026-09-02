@@ -18,7 +18,11 @@ from auto_zettelkasten.api import (
     run_map,
 )
 from auto_zettelkasten.literature import cluster_display_title, cluster_note_stem
-from auto_zettelkasten.models import MapRequest, ProcessingPolicy
+from auto_zettelkasten.models import (
+    LiteratureMappingPolicy,
+    MapRequest,
+    ProcessingPolicy,
+)
 from auto_zettelkasten.notes import (
     parse_atomic_note,
     read_note,
@@ -651,7 +655,7 @@ def test_current_prompt_replaces_prompt_v1_note_instead_of_reusing_it(
     note = tmp_path / second.items[0]["note_path"]
     frontmatter = read_note(note)["frontmatter"]
     _, body = parse_atomic_note(note.read_text())
-    assert frontmatter["prompt_version"] == "12"
+    assert frontmatter["prompt_version"] == "14"
     assert "## Plain-English Interpretation" in body
 
 
@@ -668,6 +672,7 @@ def test_legacy_reader_without_new_fields_uses_disclosed_compatibility_fallback(
                 not in {
                     "key_concepts_and_definitions",
                     "plain_english_interpretation",
+                    "source_structure_and_organization",
                 }
             }
 
@@ -682,7 +687,8 @@ def test_legacy_reader_without_new_fields_uses_disclosed_compatibility_fallback(
     assert (
         "this legacy reader did not provide a separate translation" in note.read_text()
     )
-    assert "consult the source before relying on a definition" in note.read_text()
+    assert "## Key Concepts and Definitions" not in note.read_text()
+    assert "## Source Structure and Organization" not in note.read_text()
 
 
 def test_long_document_uses_bounded_chunk_reader_route(
@@ -869,6 +875,9 @@ def test_collection_build_clears_stale_cluster_projection_across_workspace(
         tmp_path,
         run_id="global-projection-rebuild",
         source_set=selected,
+        literature_policy=LiteratureMappingPolicy(
+            cluster_generation_enabled=True
+        ),
     )
 
     frontmatter = read_note(stale_path)["frontmatter"]
@@ -1027,7 +1036,7 @@ def test_build_map_reconstructs_progress_for_legacy_source_set_without_rows(
             / "progress.yml"
         ).read_text()
     )
-    assert progress["status"] == "completed"
+    assert progress["status"] == "partial"
     assert progress["inventory_count"] == 2
     assert progress["validated_note_count"] == 2
     assert progress["terminal_count"] == 2
@@ -1171,6 +1180,7 @@ def test_large_document_checkpoints_and_resume_avoid_repeated_calls(
     first = run_map(request, client=client, reader=reader, run_id="checkpoint-run")
     assert first.status == "partial"
     assert first.partial_count == 1
+    assert first.literature_report["migration"]["status"] == "completed"
     first_chunk_ids = list(reader.chunk_ids)
     assert first_chunk_ids == ["chunk-0001", "chunk-0002"]
 

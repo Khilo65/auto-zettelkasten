@@ -61,7 +61,8 @@ def commit_tag_reviews(
 ) -> dict[str, Any]:
     proposal_path = workspace / "02_source_memory" / "indexes" / "tag_proposals.yml"
     registry_path = workspace / "02_source_memory" / "indexes" / "tag_registry.yml"
-    existing_rows = (read_yaml(proposal_path, {}) or {}).get("proposals", [])
+    existing_proposals = read_yaml(proposal_path, {}) or {}
+    existing_rows = existing_proposals.get("proposals", [])
     by_id = {
         str(row.get("proposal_id")): dict(row)
         for row in existing_rows
@@ -69,13 +70,27 @@ def commit_tag_reviews(
     }
     for row in proposals:
         if row.get("proposal_id"):
-            by_id[str(row["proposal_id"])] = dict(row)
+            proposal_id = str(row["proposal_id"])
+            by_id[proposal_id] = {**by_id.get(proposal_id, {}), **dict(row)}
     for row in decisions:
         proposal_id = str(row.get("proposal_id", ""))
         if proposal_id:
-            by_id[proposal_id] = {**by_id.get(proposal_id, {}), **dict(row), "reviewed_at": now_iso()}
+            prior = by_id.get(proposal_id, {})
+            merged = {**prior, **dict(row)}
+            prior_semantic = {
+                key: value for key, value in prior.items() if key != "reviewed_at"
+            }
+            merged_semantic = {
+                key: value for key, value in merged.items() if key != "reviewed_at"
+            }
+            if merged_semantic != prior_semantic or not prior.get("reviewed_at"):
+                merged["reviewed_at"] = now_iso()
+            else:
+                merged["reviewed_at"] = prior["reviewed_at"]
+            by_id[proposal_id] = merged
     reviewed = sorted(by_id.values(), key=lambda row: str(row.get("proposal_id", "")))
-    write_yaml(proposal_path, {"updated_at": now_iso(), "proposals": reviewed})
+    if existing_rows != reviewed:
+        write_yaml(proposal_path, {"updated_at": now_iso(), "proposals": reviewed})
 
     accepted = [row for row in reviewed if row.get("decision") == "accepted"]
     registry: dict[str, dict[str, Any]] = {}
@@ -94,7 +109,10 @@ def commit_tag_reviews(
         ):
             if value and value not in entry[key]:
                 entry[key].append(value)
-    write_yaml(registry_path, {"updated_at": now_iso(), "tags": sorted(registry.values(), key=lambda row: row["normalized_tag"])})
+    tag_rows = sorted(registry.values(), key=lambda row: row["normalized_tag"])
+    existing_registry = read_yaml(registry_path, {}) or {}
+    if existing_registry.get("tags", []) != tag_rows:
+        write_yaml(registry_path, {"updated_at": now_iso(), "tags": tag_rows})
     return {
         "proposal_path": str(proposal_path),
         "registry_path": str(registry_path),
@@ -398,9 +416,28 @@ def build_source_catalogue(
     clusters: Sequence[Mapping[str, Any]] = (),
     collection_snapshot: Mapping[str, Any] | None = None,
     identity_projection: Mapping[str, Any] | None = None,
+    write_cluster_outputs: bool = True,
 ) -> dict[str, Any]:
     """Project compact, stable source and literature indexes without provider work."""
 
+    existing_catalogue = (
+        read_yaml(
+            workspace / "02_source_memory" / "indexes" / "source_catalogue.yml",
+            {},
+        )
+        or {}
+        if not write_cluster_outputs
+        else {}
+    )
+    preserved_cluster_ids = {
+        str(row.get("source_id") or ""): list(row.get("cluster_ids", []) or [])
+        for row in (
+            existing_catalogue.get("sources", []) or []
+            if isinstance(existing_catalogue, Mapping)
+            else []
+        )
+        if isinstance(row, Mapping) and row.get("source_id")
+    }
     profile_rows = _catalogue_profile_rows(profiles)
     notes_by_source = {
         str(row.get("source_id")): dict(row)
@@ -487,7 +524,16 @@ def build_source_catalogue(
         ):
             cluster_ids_by_source[str(source_id)].add(cluster_id)
     for entry in entries:
-        entry["cluster_ids"] = sorted(cluster_ids_by_source.get(entry["source_id"], set()))
+        entry["cluster_ids"] = (
+            list(
+                preserved_cluster_ids.get(
+                    entry["source_id"],
+                    sorted(cluster_ids_by_source.get(entry["source_id"], set())),
+                )
+            )
+            if not write_cluster_outputs
+            else sorted(cluster_ids_by_source.get(entry["source_id"], set()))
+        )
         entry["relationship_ids"] = sorted(
             relationship_ids_by_source.get(entry["source_id"], set())
         )
@@ -639,7 +685,13 @@ def build_source_catalogue(
                 }
             )
 
-    compact_clusters = _compact_cluster_catalogue(clusters)
+    compact_clusters = (
+        list(existing_catalogue.get("clusters", []) or [])
+        if not write_cluster_outputs
+        and isinstance(existing_catalogue, Mapping)
+        and "clusters" in existing_catalogue
+        else _compact_cluster_catalogue(clusters)
+    )
     collection_projection = _collection_catalogue_projection(
         semantic_entries,
         collection_snapshot,
@@ -888,13 +940,22 @@ def build_source_catalogue(
         ),
         (workspace / "02_source_memory" / "indexes" / "source_catalogue.yml", catalogue_text),
         (workspace / "02_source_memory" / "indexes" / "INDEX.md", master_text),
-        (
-            workspace / "02_source_memory" / "indexes" / "cluster_catalogue.yml",
-            cluster_catalogue_text,
-        ),
-        (
-            workspace / "02_source_memory" / "indexes" / "CLUSTERS.md",
-            cluster_index_text,
+        *(
+            [
+                (
+                    workspace
+                    / "02_source_memory"
+                    / "indexes"
+                    / "cluster_catalogue.yml",
+                    cluster_catalogue_text,
+                ),
+                (
+                    workspace / "02_source_memory" / "indexes" / "CLUSTERS.md",
+                    cluster_index_text,
+                ),
+            ]
+            if write_cluster_outputs
+            else []
         ),
     ]:
         if not path.exists() or path.read_text(encoding="utf-8") != text:
@@ -1589,6 +1650,8 @@ def _catalogue_relationship_rows(workspace: Path) -> list[dict[str, Any]]:
         for row in rows
         if isinstance(row, Mapping)
         and bool(row.get("active", True))
+        and str(row.get("source_kind") or "source") == "source"
+        and str(row.get("target_kind") or "source") == "source"
         and row.get("source_id")
         and row.get("target_source_id")
         and row.get("relation_id", row.get("link_id"))

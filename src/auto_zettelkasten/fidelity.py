@@ -19,6 +19,7 @@ ANALYSIS_SECTION_KEYS = (
     "what_this_source_can_support",
     "what_this_source_cannot_support",
     "locators",
+    "source_structure_and_organization",
 )
 ATOMIC_FIDELITY_VERSION = "6"
 

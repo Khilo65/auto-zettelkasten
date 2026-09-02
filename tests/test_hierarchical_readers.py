@@ -21,6 +21,8 @@ from auto_zettelkasten.readers import (
     ProviderEmptyResponse,
     ProviderError,
     ProviderTransportError,
+    _parse_analysis,
+    _parse_chunk_evidence,
     _post_json,
     _read_openai_stream_response,
 )
@@ -91,6 +93,30 @@ def _analysis() -> dict[str, str]:
 
 def _chunk_memo() -> dict[str, str]:
     return {key: f"Compact {key}; section A, page 2." for key in CHUNK_EVIDENCE_KEYS}
+
+
+def test_additive_fields_are_optional_in_direct_and_chunk_responses() -> None:
+    for payload, parser in (
+        (_analysis(), _parse_analysis),
+        (_chunk_memo(), _parse_chunk_evidence),
+    ):
+        for key in (
+            "key_concepts_and_definitions",
+            "source_structure_and_organization",
+        ):
+            payload.pop(key)
+        assert not {
+            "key_concepts_and_definitions",
+            "source_structure_and_organization",
+        } & parser(payload).keys()
+        payload.update(
+            key_concepts_and_definitions="",
+            source_structure_and_organization="",
+        )
+        assert not {
+            "key_concepts_and_definitions",
+            "source_structure_and_organization",
+        } & parser(payload).keys()
 
 
 def _openai_response(content: dict[str, str], *, fenced: bool = False) -> dict[str, Any]:
@@ -208,6 +234,8 @@ def test_deepseek_chunk_prompt_parsing_and_per_call_bounds(monkeypatch: pytest.M
     assert "COARSE INSPECTED SOURCE CHUNK" in prompt
     assert "key_concepts_and_definitions" in system_prompt
     assert "exact quotation" in system_prompt
+    assert "source_structure_and_organization" in system_prompt
+    assert "source-native headings or chapters" in system_prompt
 
 
 def test_deepseek_synthesis_returns_pipeline_analysis_and_uses_final_cap(monkeypatch: pytest.MonkeyPatch) -> None:

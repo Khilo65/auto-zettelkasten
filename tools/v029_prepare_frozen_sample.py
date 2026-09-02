@@ -403,7 +403,12 @@ def blind_manifest(
     }
 
 
-def prepare(origin: Path, target: Path) -> None:
+def prepare(
+    origin: Path,
+    target: Path,
+    *,
+    historical_benchmark: Path | None = None,
+) -> None:
     if target.exists() and any(target.iterdir()):
         raise FileExistsError(f"target must be absent or empty: {target}")
     catalogue = json.loads(
@@ -477,14 +482,11 @@ def prepare(origin: Path, target: Path) -> None:
     typed_registry = read_yaml(
         origin / "02_source_memory/indexes/typed_links.yml", {}
     ) or {}
-    historical = read_yaml(
-        Path(
-            "/Users/khalilalwazir/Documents/Auto-Zettelkasten-test/"
-            "mediation-relapse-v026-relationship-evaluation-20260802/"
-            "evaluation/curated-bridge-benchmark.yml"
-        ),
-        {},
-    ) or {}
+    historical = (
+        read_yaml(historical_benchmark, {}) or {}
+        if historical_benchmark is not None
+        else {}
+    )
     evaluation = target / "evaluation"
     write_yaml(
         evaluation / "v029-sample-manifest.yml",
@@ -575,6 +577,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--origin", type=Path)
     parser.add_argument("--target", type=Path, required=True)
+    parser.add_argument("--historical-benchmark", type=Path)
     parser.add_argument("--activate-delta", action="store_true")
     args = parser.parse_args()
     if args.activate_delta:
@@ -582,7 +585,15 @@ def main() -> None:
     else:
         if args.origin is None:
             parser.error("--origin is required unless --activate-delta is used")
-        prepare(args.origin.expanduser().resolve(), args.target.expanduser().resolve())
+        prepare(
+            args.origin.expanduser().resolve(),
+            args.target.expanduser().resolve(),
+            historical_benchmark=(
+                args.historical_benchmark.expanduser().resolve()
+                if args.historical_benchmark is not None
+                else None
+            ),
+        )
 
 
 if __name__ == "__main__":
