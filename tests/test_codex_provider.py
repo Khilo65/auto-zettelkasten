@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
@@ -19,7 +20,10 @@ from auto_zettelkasten.api import (
     resume_map,
     run_map,
 )
-from auto_zettelkasten.codex_attempt_guard import deny_codex_attempts
+from auto_zettelkasten.codex_attempt_guard import (
+    CodexAttemptStateError,
+    deny_codex_attempts,
+)
 from auto_zettelkasten.cli import main
 from auto_zettelkasten.files import read_yaml
 from auto_zettelkasten.models import (
@@ -54,8 +58,10 @@ from auto_zettelkasten.readers import (
     ProviderTimeout,
     ProviderTransportError,
     ProviderUnsupportedAttachment,
+    _SOURCE_BUNDLE_ATTACHMENTS,
     _CODEX_TOOL_FEATURE_ARGUMENTS,
     _CODEX_TRANSPORT_INSTRUCTIONS,
+    _codex_executable,
     _codex_error_item_category,
     _codex_failure,
     _codex_json_schema,
@@ -67,6 +73,38 @@ from auto_zettelkasten.readers import (
     codex_stage_identity,
 )
 from conftest import SECTION_KEYS, FakeZotero, fake_codex_preflight
+
+
+def test_codex_executable_prefers_override_then_companion_then_stock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    override = tmp_path / "override-codex"
+    companion = binaries / "auto-zettelkasten-codex"
+    stock = binaries / "codex"
+    for path in (override, companion, stock):
+        path.write_text("#!/bin/sh\n", encoding="utf-8")
+        path.chmod(0o755)
+
+    monkeypatch.setenv("PATH", str(binaries))
+    monkeypatch.setenv("AUTO_ZETTELKASTEN_CODEX", str(override))
+    assert _codex_executable() == override.resolve()
+
+    monkeypatch.delenv("AUTO_ZETTELKASTEN_CODEX")
+    assert _codex_executable() == companion.resolve()
+
+    companion.unlink()
+    assert _codex_executable() == stock.resolve()
+
+
+def test_codex_executable_rejects_invalid_explicit_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("AUTO_ZETTELKASTEN_CODEX", str(tmp_path / "missing"))
+    monkeypatch.setenv("PATH", "")
+    with pytest.raises(ProviderError, match="executable"):
+        _codex_executable()
 
 
 def test_codex_request_roles_and_existing_provider_serialization(tmp_path: Path) -> None:
@@ -520,6 +558,9 @@ def test_codex_preflight_uses_one_sanitized_executable_environment(
     status = codex_preflight_status("gpt-5.6-luna")
     assert status["auth_method"] == "chatgpt"
     assert status["auth_status"] == "authenticated"
+    assert status["helper_version"] == ""
+    assert status["helper_manifest_valid"] is False
+    assert status["pdf_input_file_capability"] is False
     assert status["reasoning_effort_compatibility"] is True
     assert len(calls) == 3
     assert calls[0][1] == calls[2][1]
@@ -714,6 +755,11 @@ def test_codex_doctor_checks_both_requested_model_roles(
         return {
             "status": "configured",
             "provider": "codex",
+            "executable": "/synthetic/private/bin/auto-zettelkasten-codex",
+            "version": "0.152.1",
+            "helper_version": "0.152.1+azpdf1",
+            "helper_manifest_valid": True,
+            "pdf_input_file_capability": True,
             "quota": "unknown",
             "auth_method": "chatgpt",
             "auth_status": "authenticated",
@@ -734,6 +780,11 @@ def test_codex_doctor_checks_both_requested_model_roles(
     assert status["status"] == "configured"
     assert status["quota"] == "unknown"
     assert status["auth_status"] == "authenticated"
+    assert status["version"] == "0.152.1"
+    assert status["helper_version"] == "0.152.1+azpdf1"
+    assert status["helper_manifest_valid"] is True
+    assert status["pdf_input_file_capability"] is True
+    assert "executable" not in status
     assert "account_email" not in status
     assert "credential" not in json.dumps(status)
     assert "synthetic-person" not in json.dumps(status)
@@ -922,6 +973,364 @@ print(json.dumps({{"type": "turn.completed", "usage": {{"input_tokens": 1, "outp
 """
     path.write_text(body, encoding="utf-8")
     path.chmod(0o755)
+
+
+def _valid_source_bundle_payload() -> dict[str, object]:
+    return {
+        "analysis_sections": {
+            key: "Source-grounded analysis from the attached PDF; see p. 1."
+            for key in SECTION_KEYS
+        },
+        "compact_profile": {
+            "thesis": "The attached source supports a bounded claim.",
+            "method_or_knowledge_basis": "Document analysis.",
+            "source_genre": "report",
+            "inferential_design": "descriptive",
+            "mechanisms": [],
+            "outcomes": [],
+            "cases": [],
+            "populations": [],
+            "periods": [],
+            "datasets": [],
+        },
+        "evidence_anchors": [
+            {
+                "claim": "The attached source supports the bounded claim.",
+                "locator": "p. 1",
+                "planning_roles": ["finding"],
+                "salience_priority": 10,
+                "evidence_role": "descriptive",
+                "support_boundary": "The attached PDF only.",
+                "plain_english_meaning": "The source supports the claim.",
+                "uncertainty": "No external evidence was considered.",
+                "quantitative_result": None,
+            }
+        ],
+        "literature_positions": [],
+        "observed_bibliographic_identity": {
+            "title": "",
+            "creators": [],
+            "date": "",
+        },
+    }
+
+
+def _fake_codex_app_server(
+    path: Path,
+    capture_path: Path,
+    *,
+    mode: str = "success",
+    mutate_auth: bool = False,
+) -> None:
+    payload = json.dumps(_valid_source_bundle_payload(), sort_keys=True)
+    body = """#!__PYTHON__
+import json, os, sys, time
+from pathlib import Path
+
+capture = Path(__CAPTURE__)
+mode = __MODE__
+messages = []
+file_data = ""
+for line in sys.stdin:
+    if mode == "malformed" and not messages:
+        print("not-json", flush=True)
+        continue
+    message = json.loads(line)
+    messages.append(message)
+    capture.write_text(json.dumps({"argv": sys.argv, "messages": messages}))
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        print(json.dumps({"id": request_id, "result": {}}), flush=True)
+    elif method == "thread/start":
+        print(json.dumps({"id": request_id, "result": {"thread": {"id": "thread-1", "ephemeral": True}}}), flush=True)
+    elif method == "thread/inject_items":
+        file_data = message["params"]["items"][0]["content"][0]["file_data"]
+        if mode == "reject":
+            print(json.dumps({"id": request_id, "error": {"message": "unsupported input_file attachment"}}), flush=True)
+        else:
+            print(json.dumps({"id": request_id, "result": {}}), flush=True)
+    elif method == "turn/start":
+        if mode == "timeout":
+            time.sleep(10)
+            continue
+        print(json.dumps({"id": request_id, "result": {"turn": {"id": "turn-1"}}}), flush=True)
+        if mode == "tool":
+            print(json.dumps({"method": "item/completed", "params": {"item": {"type": "commandExecution"}}}), flush=True)
+            continue
+        if mode == "reroute":
+            print(json.dumps({"method": "model/rerouted", "params": {"fromModel": "gpt-5.6-luna", "toModel": "other"}}), flush=True)
+            continue
+        if mode == "server_request":
+            print(json.dumps({"id": 99, "method": "item/tool/call", "params": {}}), flush=True)
+            continue
+        if mode == "raw_leak":
+            print(json.dumps({"method": "thread/updated", "params": {"file_data": file_data}}), flush=True)
+            continue
+        if __MUTATE_AUTH__:
+            (Path(os.environ["CODEX_HOME"]) / "auth.json").write_text("mutated")
+        print(json.dumps({"method": "item/completed", "params": {"item": {"type": "agentMessage", "text": __PAYLOAD__}}}), flush=True)
+        status = "mystery" if mode == "unknown_terminal" else "completed"
+        print(json.dumps({"method": "turn/completed", "params": {"turn": {"status": status}}}), flush=True)
+"""
+    body = (
+        body.replace("__PYTHON__", sys.executable)
+        .replace("__CAPTURE__", repr(str(capture_path)))
+        .replace("__MODE__", repr(mode))
+        .replace("__MUTATE_AUTH__", repr(mutate_auth))
+        .replace("__PAYLOAD__", repr(payload))
+    )
+    path.write_text(body, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def _fake_pdf_preflight(tmp_path: Path, executable: Path) -> dict[str, object]:
+    status = fake_codex_preflight(tmp_path, executable)
+    status.update(
+        version="0.152.1",
+        helper_version="0.152.1+azpdf1",
+        helper_manifest_valid=True,
+        pdf_input_file_capability=True,
+        _helper_manifest_identity={"manifest_sha256": "a" * 64},
+    )
+    return status
+
+
+def test_codex_pdf_app_server_sends_exact_ordered_file_text_and_contract(
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "auto-zettelkasten-codex"
+    capture = tmp_path / "capture.json"
+    _fake_codex_app_server(executable, capture)
+    pdf = tmp_path / "source.pdf"
+    pdf_bytes = b"%PDF-1.7\nprivate-pdf-sentinel\n%%EOF\n"
+    pdf.write_bytes(pdf_bytes)
+    reader = CodexReader("gpt-5.6-luna", allow_cloud=True)
+    reader._preflight = _fake_pdf_preflight(tmp_path, executable)
+
+    result = reader.read_source_bundle(
+        "",
+        {
+            "_source_context": {
+                "source_id": "source-zotero-A1",
+                "zotero_key": "A1",
+            }
+        },
+        attachment_paths=[pdf],
+    )
+
+    assert result["evidence_anchors"][0]["locator"] == "p. 1"
+    captured = json.loads(capture.read_text(encoding="utf-8"))
+    assert captured["argv"][1] == "app-server"
+    requests = [row for row in captured["messages"] if row.get("id") is not None]
+    assert [row["method"] for row in requests] == [
+        "initialize",
+        "thread/start",
+        "thread/inject_items",
+        "turn/start",
+    ]
+    thread = requests[1]["params"]
+    assert thread["model"] == "gpt-5.6-luna"
+    assert thread["ephemeral"] is True
+    injected = requests[2]["params"]["items"]
+    assert len(injected) == 1
+    assert injected[0]["role"] == "user"
+    assert [item["type"] for item in injected[0]["content"]] == [
+        "input_file",
+        "input_text",
+    ]
+    file_item = injected[0]["content"][0]
+    assert file_item == {
+        "type": "input_file",
+        "filename": "source.pdf",
+        "file_data": "data:application/pdf;base64,"
+        + base64.b64encode(pdf_bytes).decode("ascii"),
+        "detail": "auto",
+    }
+    assert injected[0]["content"][1] == {
+        "type": "input_text",
+        "text": "This PDF is the source document for the source-bundle request.",
+    }
+    turn = requests[3]["params"]
+    assert turn["model"] == "gpt-5.6-luna"
+    assert turn["effort"] == "medium"
+    assert turn["approvalPolicy"] == "never"
+    assert turn["sandboxPolicy"] == {
+        "type": "readOnly",
+        "networkAccess": False,
+    }
+    assert turn["outputSchema"]["additionalProperties"] is False
+
+
+def test_codex_pdf_rejects_unverified_helper_before_process_spawn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pdf = tmp_path / "source.pdf"
+    pdf.write_bytes(b"%PDF-1.7\n%%EOF\n")
+    reader = CodexReader("gpt-5.6-luna", allow_cloud=True)
+    reader._preflight = fake_codex_preflight(tmp_path, tmp_path / "codex")
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail("unverified helper was started"),
+    )
+
+    with pytest.raises(ProviderUnsupportedAttachment, match="companion|helper"):
+        reader.read_source_bundle(
+            "",
+            {"_source_context": {"source_id": "source-zotero-A1"}},
+            attachment_paths=[pdf],
+        )
+
+
+def test_codex_pdf_reserves_attempt_before_app_server_spawn(tmp_path: Path) -> None:
+    executable = tmp_path / "auto-zettelkasten-codex"
+    capture = tmp_path / "capture.json"
+    _fake_codex_app_server(executable, capture)
+    pdf = tmp_path / "source.pdf"
+    pdf.write_bytes(b"%PDF-1.7\n%%EOF\n")
+    reader = CodexReader("gpt-5.6-luna", allow_cloud=True)
+    reader._preflight = _fake_pdf_preflight(tmp_path, executable)
+
+    with deny_codex_attempts(), pytest.raises(
+        CodexAttemptStateError, match="calls are forbidden"
+    ):
+        reader.read_source_bundle(
+            "",
+            {"_source_context": {"source_id": "source-zotero-A1"}},
+            attachment_paths=[pdf],
+        )
+    assert not capture.exists()
+
+
+@pytest.mark.parametrize(
+    ("mode", "failure_type", "match"),
+    [
+        ("tool", ProviderIsolationFailure, "tool"),
+        ("reroute", ProviderIsolationFailure, "rerout"),
+        ("server_request", ProviderIsolationFailure, "server request"),
+        ("malformed", ProviderIsolationFailure, "invalid JSON"),
+        ("unknown_terminal", ProviderIsolationFailure, "terminal"),
+        ("raw_leak", ProviderIsolationFailure, "raw (?:document|PDF)"),
+    ],
+)
+def test_codex_pdf_app_server_fails_closed_on_protocol_violations(
+    tmp_path: Path,
+    mode: str,
+    failure_type: type[Exception],
+    match: str,
+) -> None:
+    executable = tmp_path / "auto-zettelkasten-codex"
+    capture = tmp_path / "capture.json"
+    _fake_codex_app_server(executable, capture, mode=mode)
+    pdf = tmp_path / "source.pdf"
+    pdf.write_bytes(b"%PDF-1.7\nprivate-pdf-sentinel\n%%EOF\n")
+    reader = CodexReader("gpt-5.6-luna", allow_cloud=True)
+    reader._preflight = _fake_pdf_preflight(tmp_path, executable)
+
+    with pytest.raises(failure_type, match=match) as raised:
+        reader.read_source_bundle(
+            "",
+            {"_source_context": {"source_id": "source-zotero-A1"}},
+            attachment_paths=[pdf],
+        )
+    diagnostic = str(raised.value)
+    assert "private-pdf-sentinel" not in diagnostic
+    assert base64.b64encode(pdf.read_bytes()).decode("ascii") not in diagnostic
+
+
+def test_codex_pdf_app_server_types_preinference_attachment_rejection(
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "auto-zettelkasten-codex"
+    capture = tmp_path / "capture.json"
+    _fake_codex_app_server(executable, capture, mode="reject")
+    pdf = tmp_path / "source.pdf"
+    pdf.write_bytes(b"%PDF-1.7\nprivate-pdf-sentinel\n%%EOF\n")
+    reader = CodexReader("gpt-5.6-luna", allow_cloud=True)
+    reader._preflight = _fake_pdf_preflight(tmp_path, executable)
+
+    with pytest.raises(ProviderUnsupportedAttachment, match="unsupported"):
+        reader.read_source_bundle(
+            "",
+            {"_source_context": {"source_id": "source-zotero-A1"}},
+            attachment_paths=[pdf],
+        )
+
+
+def test_codex_pdf_app_server_rejects_child_auth_rotation(tmp_path: Path) -> None:
+    executable = tmp_path / "auto-zettelkasten-codex"
+    capture = tmp_path / "capture.json"
+    _fake_codex_app_server(executable, capture, mutate_auth=True)
+    pdf = tmp_path / "source.pdf"
+    pdf.write_bytes(b"%PDF-1.7\nprivate-pdf-sentinel\n%%EOF\n")
+    reader = CodexReader("gpt-5.6-luna", allow_cloud=True)
+    reader._preflight = _fake_pdf_preflight(tmp_path, executable)
+
+    with pytest.raises(ProviderIsolationFailure, match="authentication state"):
+        reader.read_source_bundle(
+            "",
+            {"_source_context": {"source_id": "source-zotero-A1"}},
+            attachment_paths=[pdf],
+        )
+
+
+def test_codex_pdf_app_server_timeout_is_typed(tmp_path: Path) -> None:
+    executable = tmp_path / "auto-zettelkasten-codex"
+    capture = tmp_path / "capture.json"
+    _fake_codex_app_server(executable, capture, mode="timeout")
+    pdf = tmp_path / "source.pdf"
+    pdf.write_bytes(b"%PDF-1.7\nprivate-pdf-sentinel\n%%EOF\n")
+    reader = CodexReader("gpt-5.6-luna", allow_cloud=True)
+    reader._preflight = _fake_pdf_preflight(tmp_path, executable)
+
+    token = _SOURCE_BUNDLE_ATTACHMENTS.set((pdf,))
+    try:
+        with pytest.raises(ProviderTimeout):
+            reader._generate_with_reasoning(
+                "system",
+                "user",
+                2_048,
+                0.05,
+                reasoning_effort="medium",
+                output_contract="source_bundle",
+            )
+    finally:
+        _SOURCE_BUNDLE_ATTACHMENTS.reset(token)
+
+
+def test_codex_pdf_app_server_external_cancellation_is_typed(tmp_path: Path) -> None:
+    executable = tmp_path / "auto-zettelkasten-codex"
+    capture = tmp_path / "capture.json"
+    _fake_codex_app_server(executable, capture, mode="timeout")
+    pdf = tmp_path / "source.pdf"
+    pdf.write_bytes(b"%PDF-1.7\nprivate-pdf-sentinel\n%%EOF\n")
+    reader = CodexReader("gpt-5.6-luna", allow_cloud=True)
+    reader._preflight = _fake_pdf_preflight(tmp_path, executable)
+
+    def invoke() -> object:
+        token = _SOURCE_BUNDLE_ATTACHMENTS.set((pdf,))
+        try:
+            return reader._generate_with_reasoning(
+                "system",
+                "user",
+                2_048,
+                10,
+                reasoning_effort="medium",
+                output_contract="source_bundle",
+            )
+        finally:
+            _SOURCE_BUNDLE_ATTACHMENTS.reset(token)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(invoke)
+        deadline = time.monotonic() + 2
+        while not capture.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert capture.exists()
+        assert cancel_active_provider_responses() == 1
+        with pytest.raises(ProviderInterrupted):
+            future.result()
 
 
 def test_codex_transport_is_sanitized_schema_bound_and_tool_fail_closed(

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from auto_zettelkasten.cli import _extraction_policy, build_parser
+from auto_zettelkasten.cli import _extraction_policy, build_parser, main
 from auto_zettelkasten.files import read_yaml, sha256_bytes
 from auto_zettelkasten.extraction import ExtractionResult, classify_pdf_text
 from auto_zettelkasten.models import ExtractionPolicy, MapRequest
@@ -20,7 +21,9 @@ def test_extraction_policy_is_serializable_and_validated(tmp_path: Path) -> None
     request = MapRequest(
         tmp_path,
         extraction_policy=ExtractionPolicy(
-            ocr="required", languages=("eng", "ara", "eng")
+            ocr="required",
+            languages=("eng", "ara", "eng"),
+            pdf_fallback="ocr",
         ),
     )
 
@@ -34,6 +37,8 @@ def test_extraction_policy_is_serializable_and_validated(tmp_path: Path) -> None
         ExtractionPolicy(ocr="sometimes")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="language code"):
         ExtractionPolicy(languages=("eng;rm -rf",))
+    with pytest.raises(ValueError, match="none, images, or ocr"):
+        ExtractionPolicy(pdf_fallback="automatic")  # type: ignore[arg-type]
 
 
 def test_workspace_and_cli_extraction_precedence(tmp_path: Path) -> None:
@@ -43,6 +48,7 @@ def test_workspace_and_cli_extraction_precedence(tmp_path: Path) -> None:
         "version": "2",
         "ocr": "auto",
         "languages": ["eng"],
+        "pdf_fallback": "none",
         "vision": "configured_only",
     }
     assert config["prompt_version"] == "14"
@@ -58,11 +64,61 @@ def test_workspace_and_cli_extraction_precedence(tmp_path: Path) -> None:
             "eng",
             "--ocr-language",
             "ara",
+            "--pdf-fallback",
+            "images",
         ]
     )
     assert _extraction_policy(args, config) == ExtractionPolicy(
-        ocr="required", languages=("eng", "ara")
+        ocr="required", languages=("eng", "ara"), pdf_fallback="images"
     )
+
+    sync_args = build_parser().parse_args(
+        [
+            "sync",
+            "--workspace",
+            str(tmp_path),
+            "--pdf-fallback",
+            "ocr",
+        ]
+    )
+    assert _extraction_policy(sync_args, config).pdf_fallback == "ocr"
+
+
+@pytest.mark.parametrize(
+    ("command", "target"),
+    [("map", "run_map"), ("sync", "sync_zotero")],
+)
+def test_map_and_sync_forward_explicit_pdf_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    command: str,
+    target: str,
+) -> None:
+    initialize(tmp_path)
+    captured: list[MapRequest] = []
+
+    def run(request: MapRequest, **_kwargs):
+        captured.append(request)
+        return (
+            SimpleNamespace(to_dict=lambda: {"status": "completed"})
+            if command == "map"
+            else {"status": "completed"}
+        )
+
+    monkeypatch.setattr(f"auto_zettelkasten.cli.{target}", run)
+    assert (
+        main(
+            [
+                command,
+                "--workspace",
+                str(tmp_path),
+                "--pdf-fallback",
+                "images",
+            ]
+        )
+        == 0
+    )
+    assert captured[0].extraction_policy.pdf_fallback == "images"
 
 
 def test_actual_primary_pdf_outranks_index_and_supplement() -> None:

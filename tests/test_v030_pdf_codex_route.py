@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import sys
@@ -16,7 +17,7 @@ from auto_zettelkasten.extraction import (
     PDFPageImage,
     PDFStructuralProbe,
 )
-from auto_zettelkasten.models import MapRequest
+from auto_zettelkasten.models import ExtractionPolicy, MapRequest
 from auto_zettelkasten.pipeline import (
     _custodied_pdf_candidate,
     _prepare_item,
@@ -28,8 +29,10 @@ from auto_zettelkasten.readers import (
     CloudPermissionError,
     CodexReader,
     ProviderInvalidSourceBundle,
+    ProviderInterrupted,
     ProviderIsolationFailure,
     ProviderQuotaExhausted,
+    ProviderTimeout,
     ProviderUnsupportedAttachment,
     _SOURCE_BUNDLE_ATTACHMENTS,
     _codex_failure,
@@ -81,13 +84,81 @@ def _bundle() -> dict:
     }
 
 
-def _request(workspace: Path) -> MapRequest:
+def _request(workspace: Path, *, pdf_fallback: str = "none") -> MapRequest:
     return MapRequest(
         workspace,
         provider="codex",
         model="gpt-5.6-luna",
         literature_model="gpt-5.6-terra",
         allow_cloud=True,
+        extraction_policy=ExtractionPolicy(pdf_fallback=pdf_fallback),
+    )
+
+
+def _pdf_capable_reader() -> SimpleNamespace:
+    return SimpleNamespace(
+        name="codex",
+        model="gpt-5.6-luna",
+        pdf_input_file_status=lambda: {
+            "version": "0.152.1",
+            "helper_version": "0.152.1",
+            "helper_manifest_valid": True,
+            "pdf_input_file_capability": True,
+            "_helper_manifest_identity": {"manifest_sha256": "a" * 64},
+        },
+    )
+
+
+def _inadequate_probe(
+    document: bytes,
+    *,
+    page_count: int = 1,
+    width: int = 612,
+    height: int = 792,
+    render_candidates: tuple[int, ...] = (1,),
+) -> PDFStructuralProbe:
+    adequacy = ContentAdequacy(
+        ContentAdequacyClass.PARTIAL_PDF_TEXT,
+        "fulltext_available",
+        "limited",
+        "image_only",
+        metrics={"page_count": page_count},
+    )
+    pages = tuple(
+        PDFPageEvidence(
+            number,
+            str(number),
+            width,
+            height,
+            "",
+            hashlib.sha256(b"").hexdigest(),
+            0,
+            0,
+            "image_only",
+            ("/Image",),
+            1,
+            1,
+            1,
+            True,
+            True,
+            True,
+        )
+        for number in range(1, page_count + 1)
+    )
+    return PDFStructuralProbe(
+        "succeeded",
+        "",
+        "application/pdf",
+        hashlib.sha256(document).hexdigest(),
+        len(document),
+        page_count,
+        pages,
+        "",
+        adequacy,
+        {},
+        render_candidates,
+        render_candidates,
+        tuple(str(number) for number in range(1, page_count + 1)),
     )
 
 
@@ -161,7 +232,7 @@ def test_unsupported_attachment_is_typed_and_private_paths_are_redacted(
     assert "[REDACTED_ATTACHMENT]" in str(failure)
 
 
-def test_custodied_auto_pdf_selects_image_route_without_local_ocr(
+def test_custodied_inadequate_pdf_selects_raw_pdf_route_without_local_ocr(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     from auto_zettelkasten import pipeline
@@ -193,13 +264,312 @@ def test_custodied_auto_pdf_selects_image_route_without_local_ocr(
     candidate, extracted = _custodied_pdf_candidate(
         b"pdf", custody, {}, item, {"source_id": "source-zotero-A1"},
         _request(tmp_path),
-        actual_primary_pdf=True, cancelled=None,
+        actual_primary_pdf=True,
+        cancelled=None,
+        reader=_pdf_capable_reader(),
     )
+    assert extracted.route == "codex_pdf_input_file"
+    assert candidate
+    assert candidate["document_route"]["identity_payload"]["route"] == (
+        "codex_pdf_input_file"
+    )
+    assert candidate["document_route"]["identity_payload"]["custody_sha256"] == hashlib.sha256(
+        b"pdf"
+    ).hexdigest()
+    assert "rendered_images" not in candidate["document_route"]
+
+
+@pytest.mark.parametrize(
+    ("document", "probe", "reason"),
+    [
+        (
+            b"pdf",
+            _inadequate_probe(b"pdf", width=0),
+            "unknown_pdf_geometry",
+        ),
+        (
+            b"pdf",
+            _inadequate_probe(
+                b"pdf",
+                page_count=30,
+                width=2_048,
+                height=2_048,
+            ),
+            "pdf_token_ceiling_exceeded",
+        ),
+    ],
+)
+def test_raw_pdf_admission_fails_without_explicit_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    document: bytes,
+    probe: PDFStructuralProbe,
+    reason: str,
+) -> None:
+    from auto_zettelkasten import pipeline
+
+    monkeypatch.setattr(pipeline, "probe_pdf_bytes", lambda *_args, **_kwargs: probe)
+    monkeypatch.setattr(
+        pipeline,
+        "extract_pdf_from_probe",
+        lambda *_args, **_kwargs: pytest.fail("fallback must be explicit"),
+    )
+    custody = tmp_path / "custody.pdf"
+    custody.write_bytes(document)
+    candidate, extracted = _custodied_pdf_candidate(
+        document,
+        custody,
+        {},
+        {"key": "A1", "data": {"key": "A1", "itemType": "journalArticle"}},
+        {"source_id": "source-zotero-A1"},
+        _request(tmp_path),
+        actual_primary_pdf=True,
+        cancelled=None,
+        reader=_pdf_capable_reader(),
+    )
+
+    assert candidate is None
+    assert extracted.status == "failed"
+    assert extracted.reason == reason
+
+
+def test_raw_pdf_admission_requires_decoded_size_below_fifty_million_bytes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from auto_zettelkasten import pipeline
+
+    document = b"%PDF-1.7\n" + b"0" * 49_999_991
+    probe = _inadequate_probe(document)
+    monkeypatch.setattr(pipeline, "probe_pdf_bytes", lambda *_args, **_kwargs: probe)
+    monkeypatch.setattr(
+        pipeline,
+        "extract_pdf_from_probe",
+        lambda *_args, **_kwargs: pytest.fail("fallback must be explicit"),
+    )
+    custody = tmp_path / "custody.pdf"
+    custody.write_bytes(document)
+    candidate, extracted = _custodied_pdf_candidate(
+        document,
+        custody,
+        {},
+        {"key": "A1", "data": {"key": "A1", "itemType": "journalArticle"}},
+        {"source_id": "source-zotero-A1"},
+        _request(tmp_path),
+        actual_primary_pdf=True,
+        cancelled=None,
+        reader=_pdf_capable_reader(),
+    )
+
+    assert candidate is None
+    assert extracted.reason == "pdf_file_size_limit_exceeded"
+
+
+@pytest.mark.parametrize("pdf_fallback", ["none", "images"])
+def test_missing_pdf_helper_uses_only_the_explicit_prelaunch_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, pdf_fallback: str
+) -> None:
+    from auto_zettelkasten import pipeline
+
+    document = b"pdf"
+    probe = _inadequate_probe(document)
+    monkeypatch.setattr(pipeline, "probe_pdf_bytes", lambda *_args, **_kwargs: probe)
+    monkeypatch.setattr(
+        pipeline,
+        "extract_pdf_from_probe",
+        lambda *_args, **_kwargs: pytest.fail("local OCR was not selected"),
+    )
+    custody = tmp_path / "custody.pdf"
+    custody.write_bytes(document)
+
+    candidate, extracted = _custodied_pdf_candidate(
+        document,
+        custody,
+        {},
+        {"key": "A1", "data": {"key": "A1", "itemType": "journalArticle"}},
+        {"source_id": "source-zotero-A1"},
+        _request(tmp_path, pdf_fallback=pdf_fallback),
+        actual_primary_pdf=True,
+        cancelled=None,
+        reader=None,
+    )
+
+    if pdf_fallback == "none":
+        assert candidate is None
+        assert extracted.reason == "pdf_input_file_unavailable"
+    else:
+        assert candidate
+        assert extracted.route == "codex_pdf_page_images"
+
+
+def test_explicit_image_fallback_is_used_only_after_raw_pdf_admission_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from auto_zettelkasten import pipeline
+
+    document = b"pdf"
+    probe = _inadequate_probe(
+        document,
+        page_count=30,
+        width=2_048,
+        height=2_048,
+        render_candidates=(1,),
+    )
+    monkeypatch.setattr(pipeline, "probe_pdf_bytes", lambda *_args, **_kwargs: probe)
+    monkeypatch.setattr(
+        pipeline,
+        "extract_pdf_from_probe",
+        lambda *_args, **_kwargs: pytest.fail("image fallback must not OCR"),
+    )
+    custody = tmp_path / "custody.pdf"
+    custody.write_bytes(document)
+
+    candidate, extracted = _custodied_pdf_candidate(
+        document,
+        custody,
+        {},
+        {"key": "A1", "data": {"key": "A1", "itemType": "journalArticle"}},
+        {"source_id": "source-zotero-A1"},
+        _request(tmp_path, pdf_fallback="images"),
+        actual_primary_pdf=True,
+        cancelled=None,
+        reader=_pdf_capable_reader(),
+    )
+
     assert extracted.route == "codex_pdf_page_images"
-    assert candidate and candidate["document_route"]["identity_payload"]["selected_pages"] == [1]
+    assert candidate
+    assert candidate["document_route"]["identity_payload"]["selected_pages"] == [1]
 
 
-def test_full_text_codex_pdf_images_only_collapsed_percent_charts(
+def test_explicit_ocr_fallback_is_used_only_after_raw_pdf_admission_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from auto_zettelkasten import pipeline
+
+    document = b"pdf"
+    probe = _inadequate_probe(document, width=0)
+    modes: list[str] = []
+
+    def extract(*_args, **kwargs):
+        modes.append(kwargs["ocr_mode"])
+        return ExtractionResult(
+            status="succeeded",
+            text="Locally recovered text.",
+            route="tesseract_ocr",
+            media_type="application/pdf",
+            page_count=1,
+            adequacy=ContentAdequacy(
+                ContentAdequacyClass.FULL_PDF_TEXT,
+                "full_document",
+                "passed",
+                "full_pdf_text",
+            ),
+        )
+
+    monkeypatch.setattr(pipeline, "probe_pdf_bytes", lambda *_args, **_kwargs: probe)
+    monkeypatch.setattr(pipeline, "extract_pdf_from_probe", extract)
+    custody = tmp_path / "custody.pdf"
+    custody.write_bytes(document)
+
+    candidate, extracted = _custodied_pdf_candidate(
+        document,
+        custody,
+        {},
+        {"key": "A1", "data": {"key": "A1", "itemType": "journalArticle"}},
+        {"source_id": "source-zotero-A1"},
+        _request(tmp_path, pdf_fallback="ocr"),
+        actual_primary_pdf=True,
+        cancelled=None,
+        reader=_pdf_capable_reader(),
+    )
+
+    assert extracted.route == "tesseract_ocr"
+    assert candidate
+    assert modes == ["auto"]
+
+
+def test_completed_raw_pdf_checkpoint_bypasses_helper_and_persists_no_pdf_bytes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from auto_zettelkasten import pipeline
+
+    document = b"%PDF-1.7\nprivate-pdf-sentinel\n%%EOF\n"
+    probe = _inadequate_probe(document)
+    monkeypatch.setattr(pipeline, "probe_pdf_bytes", lambda *_args, **_kwargs: probe)
+    monkeypatch.setattr(
+        pipeline,
+        "extract_pdf_from_probe",
+        lambda *_args, **_kwargs: pytest.fail("raw PDF route must not OCR"),
+    )
+    workspace = tmp_path / "workspace"
+    custody_root = workspace / "01_custody" / "files"
+    custody_root.mkdir(parents=True)
+    custody = custody_root / "source.pdf"
+    custody.write_bytes(document)
+    candidate, _ = _custodied_pdf_candidate(
+        document,
+        custody,
+        {},
+        {"key": "A1", "data": {"key": "A1", "itemType": "journalArticle"}},
+        {"source_id": "source-zotero-A1"},
+        _request(workspace),
+        actual_primary_pdf=True,
+        cancelled=None,
+        reader=_pdf_capable_reader(),
+    )
+    assert candidate
+    checkpoint = tmp_path / "checkpoint"
+    seen: list[tuple[Path, ...]] = []
+
+    class Reader:
+        name = "codex"
+        model = "gpt-5.6-luna"
+        context_window_tokens = 272_000
+
+        def read_source_bundle(self, *_args, attachment_paths=(), **_kwargs):
+            seen.append(tuple(attachment_paths))
+            return _bundle()
+
+    first = _read_document(
+        Reader(),
+        "",
+        {"_source_context": {"source_id": "source-zotero-A1", "zotero_key": "A1"}},
+        None,
+        request=_request(workspace),
+        checkpoint_root=checkpoint,
+        document_route=candidate["document_route"],
+        expected_custody_hash=hashlib.sha256(document).hexdigest(),
+        expected_custody_file=custody,
+        custody_root=custody_root,
+    )
+
+    class ReplayReader(Reader):
+        def read_source_bundle(self, *_args, **_kwargs):
+            pytest.fail("completed raw PDF checkpoint started the helper")
+
+    second = _read_document(
+        ReplayReader(),
+        "",
+        {"_source_context": {"source_id": "source-zotero-A1", "zotero_key": "A1"}},
+        None,
+        request=_request(workspace),
+        checkpoint_root=checkpoint,
+        document_route=candidate["document_route"],
+        expected_custody_hash=hashlib.sha256(document).hexdigest(),
+        expected_custody_file=custody,
+        custody_root=custody_root,
+    )
+
+    assert seen == [(custody,)]
+    assert first[0] == second[0]
+    assert second[2] == "reused_direct_source_checkpoint"
+    persisted = b"\n".join(
+        path.read_bytes() for path in checkpoint.rglob("*") if path.is_file()
+    )
+    assert b"private-pdf-sentinel" not in persisted
+    assert base64.b64encode(document) not in persisted
+
+
+def test_adequate_codex_pdf_keeps_embedded_text_route(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     from auto_zettelkasten import pipeline
@@ -252,7 +622,7 @@ def test_full_text_codex_pdf_images_only_collapsed_percent_charts(
     monkeypatch.setattr(
         pipeline,
         "extract_pdf_from_probe",
-        lambda *_args, **_kwargs: pytest.fail("local OCR must not run before routing"),
+        lambda *_args, **_kwargs: pytest.fail("local OCR must not run"),
     )
     custody = tmp_path / "custody.pdf"
     custody.write_bytes(b"pdf")
@@ -267,12 +637,11 @@ def test_full_text_codex_pdf_images_only_collapsed_percent_charts(
         _request(tmp_path),
         actual_primary_pdf=True,
         cancelled=None,
+        reader=_pdf_capable_reader(),
     )
 
-    assert extracted.route == "codex_pdf_page_images"
-    assert candidate and candidate["document_route"]["identity_payload"][
-        "selected_pages"
-    ] == [17]
+    assert extracted.route == "pypdf_text"
+    assert candidate and "document_route" not in candidate
 
 
 def test_non_codex_pdf_keeps_existing_extraction_policy(
@@ -469,7 +838,7 @@ def test_failed_local_recovery_is_terminal_on_resume(
     with pytest.raises(ProviderInvalidSourceBundle, match="local recovery failed"):
         _recover_pdf_image_route(
             content,
-            _request(workspace),
+            _request(workspace, pdf_fallback="ocr"),
             workspace,
             checkpoint,
             trigger="ProviderUnsupportedAttachment",
@@ -493,7 +862,7 @@ def test_failed_local_recovery_is_terminal_on_resume(
         tmp_path / "run",
         0,
         item,
-        _request(workspace),
+        _request(workspace, pdf_fallback="ocr"),
         SimpleNamespace(),
         reader,
         None,
@@ -548,7 +917,7 @@ def test_local_recovery_preserves_rendered_route_evidence(
 
     recovered = _recover_pdf_image_route(
         content,
-        _request(workspace),
+        _request(workspace, pdf_fallback="ocr"),
         workspace,
         checkpoint,
         trigger="ProviderUnsupportedAttachment",
@@ -605,7 +974,7 @@ def test_local_recovery_preserves_metadata_only_downgrade(
 
     recovered = _recover_pdf_image_route(
         content,
-        _request(workspace),
+        _request(workspace, pdf_fallback="ocr"),
         workspace,
         checkpoint,
         trigger="ProviderUnsupportedAttachment",
@@ -670,7 +1039,7 @@ def test_metadata_only_immediate_recovery_stops_before_second_read(
         tmp_path / "run",
         0,
         item,
-        _request(tmp_path),
+        _request(tmp_path, pdf_fallback="ocr"),
         SimpleNamespace(),
         reader,
         None,
@@ -681,17 +1050,24 @@ def test_metadata_only_immediate_recovery_stops_before_second_read(
     assert reads == 1
 
 
-@pytest.mark.parametrize("failure_type", [ProviderUnsupportedAttachment, ProviderInvalidSourceBundle])
-def test_only_typed_attachment_failures_select_one_local_recovery(
+@pytest.mark.parametrize(
+    "failure_type", [ProviderUnsupportedAttachment, ProviderInvalidSourceBundle]
+)
+def test_typed_raw_pdf_failure_recovers_locally_without_second_provider_attempt(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure_type: type[Exception]
 ) -> None:
     from auto_zettelkasten import pipeline
 
     content = {
         "text": "", "content_hash": "hash", "source_file": str(tmp_path / "custody.pdf"),
-        "content_route": "codex_pdf_page_images", "media_type": "application/pdf",
+        "content_route": "codex_pdf_input_file", "media_type": "application/pdf",
         "source_scope": "full_document", "source_coverage": {}, "coverage_reason": "image_only",
-        "coverage_metrics": {}, "document_route": {"recovery": {"state": "not_selected"}, "identity": "id"},
+        "coverage_metrics": {},
+        "document_route": {
+            "identity_payload": {"route": "codex_pdf_input_file"},
+            "recovery": {"state": "not_selected"},
+            "identity": "id",
+        },
     }
     monkeypatch.setattr(pipeline, "_load_frozen_content", lambda *_args: dict(content))
     monkeypatch.setattr(pipeline, "_compatible_committed_note", lambda *_args, **_kwargs: None)
@@ -701,33 +1077,104 @@ def test_only_typed_attachment_failures_select_one_local_recovery(
     def read(*_args, **_kwargs):
         nonlocal reads
         reads += 1
-        if reads == 1:
-            raise failure_type("recoverable")
-        raise ProviderQuotaExhausted("stop after proving one recovery")
+        raise failure_type("recoverable")
 
     def recover(value, *_args, **_kwargs):
         nonlocal recoveries
         recoveries += 1
         recovered = dict(value)
-        recovered["content_route"] = "local_ocr_after_codex_image_recovery"
+        recovered["text"] = "Locally recovered text."
+        recovered["content_route"] = "local_ocr_after_codex_pdf_recovery"
         return recovered
 
     monkeypatch.setattr(pipeline, "_read_document", read)
     monkeypatch.setattr(pipeline, "_recover_pdf_image_route", recover)
     reader = SimpleNamespace(name="codex", model="gpt-5.6-luna", is_cloud=True)
     item = {"key": "A1", "data": {"key": "A1", "itemType": "journalArticle", "title": "A"}}
-    with pytest.raises(ProviderQuotaExhausted):
-        _prepare_item(
-            tmp_path, tmp_path / "run", 0, item,
-                _request(tmp_path),
-            SimpleNamespace(), reader, None,
-        )
-    assert reads == 2 and recoveries == 1
+    result = _prepare_item(
+        tmp_path,
+        tmp_path / "run",
+        0,
+        item,
+        _request(tmp_path, pdf_fallback="ocr"),
+        SimpleNamespace(),
+        reader,
+        None,
+    )
+    assert result["terminal_status"] == "parked_for_review"
+    assert result["reason"] == "pdf_local_recovery_requires_fresh_run"
+    assert reads == 1
+    assert recoveries == 1
+
+
+@pytest.mark.parametrize("pdf_fallback", ["none", "images"])
+def test_started_raw_pdf_attempt_never_selects_provider_or_local_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, pdf_fallback: str
+) -> None:
+    from auto_zettelkasten import pipeline
+
+    content = {
+        "text": "",
+        "content_hash": "hash",
+        "source_file": str(tmp_path / "custody.pdf"),
+        "content_route": "codex_pdf_input_file",
+        "media_type": "application/pdf",
+        "source_scope": "full_document",
+        "source_coverage": {},
+        "coverage_reason": "image_only",
+        "coverage_metrics": {},
+        "document_route": {
+            "identity_payload": {"route": "codex_pdf_input_file"},
+            "recovery": {"state": "not_selected"},
+            "identity": "id",
+        },
+    }
+    monkeypatch.setattr(pipeline, "_load_frozen_content", lambda *_args: dict(content))
+    monkeypatch.setattr(
+        pipeline, "_compatible_committed_note", lambda *_args, **_kwargs: None
+    )
+    reads = 0
+
+    def read(*_args, **_kwargs):
+        nonlocal reads
+        reads += 1
+        raise ProviderUnsupportedAttachment("unsupported")
+
+    monkeypatch.setattr(pipeline, "_read_document", read)
+    monkeypatch.setattr(
+        pipeline,
+        "_recover_pdf_image_route",
+        lambda *_args, **_kwargs: pytest.fail("fallback ran after provider launch"),
+    )
+    reader = SimpleNamespace(name="codex", model="gpt-5.6-luna", is_cloud=True)
+    item = {
+        "key": "A1",
+        "data": {"key": "A1", "itemType": "journalArticle", "title": "A"},
+    }
+    result = _prepare_item(
+        tmp_path,
+        tmp_path / "run",
+        0,
+        item,
+        _request(tmp_path, pdf_fallback=pdf_fallback),
+        SimpleNamespace(),
+        reader,
+        None,
+    )
+
+    assert result["terminal_status"] == "parked_for_review"
+    assert reads == 1
 
 
 @pytest.mark.parametrize(
     "failure",
-    [ProviderQuotaExhausted("quota"), CloudPermissionError("auth"), ProviderIsolationFailure("isolation")],
+    [
+        ProviderQuotaExhausted("quota"),
+        ProviderTimeout("timeout"),
+        ProviderInterrupted("interruption"),
+        CloudPermissionError("auth"),
+        ProviderIsolationFailure("isolation"),
+    ],
 )
 def test_quota_auth_and_isolation_never_select_local_recovery(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: Exception
@@ -736,7 +1183,7 @@ def test_quota_auth_and_isolation_never_select_local_recovery(
 
     content = {
         "text": "", "content_hash": "hash", "source_file": str(tmp_path / "custody.pdf"),
-        "content_route": "codex_pdf_page_images", "media_type": "application/pdf",
+        "content_route": "codex_pdf_input_file", "media_type": "application/pdf",
         "source_scope": "full_document", "source_coverage": {}, "coverage_reason": "image_only",
         "coverage_metrics": {}, "document_route": {"recovery": {"state": "not_selected"}, "identity": "id"},
     }
@@ -748,9 +1195,9 @@ def test_quota_auth_and_isolation_never_select_local_recovery(
     )
     reader = SimpleNamespace(name="codex", model="gpt-5.6-luna", is_cloud=True)
     item = {"key": "A1", "data": {"key": "A1", "itemType": "journalArticle", "title": "A"}}
-    request = _request(tmp_path)
-    if isinstance(failure, ProviderQuotaExhausted):
-        with pytest.raises(ProviderQuotaExhausted):
+    request = _request(tmp_path, pdf_fallback="ocr")
+    if isinstance(failure, (ProviderQuotaExhausted, ProviderTimeout, ProviderInterrupted)):
+        with pytest.raises(type(failure)):
             _prepare_item(tmp_path, tmp_path / "run", 0, item, request, SimpleNamespace(), reader, None)
     else:
         result = _prepare_item(tmp_path, tmp_path / "run", 0, item, request, SimpleNamespace(), reader, None)
