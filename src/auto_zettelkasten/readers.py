@@ -233,7 +233,7 @@ DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
-SOURCE_BUNDLE_PROMPT_VERSION = "17"
+SOURCE_BUNDLE_PROMPT_VERSION = "18"
 SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v2"
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
@@ -330,6 +330,20 @@ _CODEX_QUANTITATIVE_RESULT = _codex_object(
         )
     }
 )
+_CODEX_QUANTITATIVE_RESULT["properties"]["estimate"] = {
+    "type": "string",
+    "description": (
+        "One source-reported observation only; use an empty string when the exact "
+        "numeric value is not stated in one local source passage."
+    ),
+}
+_CODEX_QUANTITATIVE_RESULT["properties"]["period"] = {
+    "type": "string",
+    "description": (
+        "Empty by default; include dates or years only when the same local source "
+        "sentence explicitly states them with this estimate."
+    ),
+}
 _CODEX_COMPARABILITY = _codex_object(
     {
         key: _CODEX_STRING
@@ -368,7 +382,13 @@ CODEX_OUTPUT_CONTRACTS: Mapping[str, Mapping[str, Any]] = {
             "evidence_anchors": _codex_array(
                 _codex_object(
                     {
-                        "claim": _CODEX_STRING,
+                        "claim": {
+                            "type": "string",
+                            "description": (
+                                "One evidence observation; a quantitative claim must "
+                                "not contain unrelated numeric values or dates."
+                            ),
+                        },
                         "locator": _CODEX_STRING,
                         "planning_roles": _CODEX_STRINGS,
                         "salience_priority": _CODEX_INTEGER,
@@ -4139,12 +4159,18 @@ def _source_bundle_prompt(
         "field. Before emitting a row, keep a numeric optional field only when the same source "
         "sentence explicitly binds the same number and noun or measure to that exact estimate; "
         "otherwise set that optional string to \"\". Do not copy study-level sample or coverage "
-        "into a different result. "
+        "into a different result. Set period to \"\" by default. Use period only when the same "
+        "sentence or explicitly marked table row states every date or year with the estimate; "
+        "a document title, report edition, publication date, page metadata, or global study "
+        "timeframe does not qualify. Every numeric value in the anchor claim must belong to and "
+        "be encoded by that row's single quantitative observation; split the anchor or omit the "
+        "extra value otherwise. "
         "For system_derived values, "
-        "every input must be explicit in that passage. If estimate or period fails a check, set "
-        "quantitative_result to null and remove the unsupported number or date from the anchor "
-        "claim, plain-English meaning, and analysis prose; retain only supported nonnumeric "
-        "meaning. Never replace an unsupported numeric value with a prose placeholder such as "
+        "every input must be explicit in that passage. If only period fails a check, set period "
+        "to \"\". Set quantitative_result to null only when estimate fails, and remove that "
+        "unsupported number from the anchor claim, plain-English meaning, and analysis prose; "
+        "retain only supported nonnumeric meaning. Never replace an unsupported numeric value "
+        "with a prose placeholder such as "
         "'not reported'."
     )
 

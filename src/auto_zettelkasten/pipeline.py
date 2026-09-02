@@ -15729,6 +15729,12 @@ def _footnote_temporal_scope(value: str) -> set[str]:
 
 
 def _footnote_text_scope(value: str) -> set[str]:
+    value = re.split(
+        r"\b(?:according\s+to|attributed\s+to|reported\s+by|source\s*:)\b",
+        value,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
     terms = _footnote_scope_terms(_normalized_quantity_text(value))
     if "initial" in _footnote_temporal_scope(value):
         terms.add("initial")
@@ -15788,21 +15794,22 @@ def _calendar_dates(value: str) -> list[tuple[int, int, int | None]]:
 
 def _named_period_markers(value: str) -> set[str]:
     markers: set[str] = set()
-    for match in re.finditer(
+    for pattern in (
         rf"\b({_MONTH_PATTERN})\.?(?:\s+(?:of\s+)?({_YEAR_TOKEN}))?\s*"
         rf"(?:[-–—]|\bto\b|\bthrough\b)\s*"
         rf"({_MONTH_PATTERN})\.?(?:\s+(?:of\s+)?({_YEAR_TOKEN}))?\b",
-        value,
-        re.IGNORECASE,
+        rf"\bbetween\s+({_MONTH_PATTERN})\.?(?:\s+(?:of\s+)?({_YEAR_TOKEN}))?\s+"
+        rf"and\s+({_MONTH_PATTERN})\.?(?:\s+(?:of\s+)?({_YEAR_TOKEN}))?\b",
     ):
-        first_year, second_year = match.group(2), match.group(4)
-        shared_year = first_year or second_year or ""
-        markers.update(
-            {
-                f"month:{_MONTHS[match.group(1).casefold()]}:{shared_year}",
-                f"month:{_MONTHS[match.group(3).casefold()]}:{shared_year}",
-            }
-        )
+        for match in re.finditer(pattern, value, re.IGNORECASE):
+            first_year, second_year = match.group(2), match.group(4)
+            shared_year = first_year or second_year or ""
+            markers.update(
+                {
+                    f"month:{_MONTHS[match.group(1).casefold()]}:{shared_year}",
+                    f"month:{_MONTHS[match.group(3).casefold()]}:{shared_year}",
+                }
+            )
     markers.update(
         f"month:{_MONTHS[month.casefold()]}:{year}"
         for month, year in re.findall(
@@ -16846,7 +16853,7 @@ def _derived_ratio_units(estimate: str, token: str) -> tuple[str, str]:
 
 
 def _following_unit(value: str, offset: int) -> str:
-    if not re.match(r"\s+", value[offset:]):
+    if not re.match(r"(?:\s+|-(?=[A-Za-z]))", value[offset:]):
         return ""
     connectors = {
         "and",
@@ -16872,11 +16879,13 @@ def _following_unit(value: str, offset: int) -> str:
         "asserted",
         "average",
         "initially",
+        "local",
         "net",
         "negative",
         "originally",
         "positive",
         "reported",
+        "surveyed",
         "the",
         "total",
     }
@@ -16915,6 +16924,13 @@ def _quantitative_segments(value: str) -> list[str]:
     value = re.sub(
         rf"(?<=\d)\s+and\s+(?=(?:{_MONTH_PATTERN})\.?\s+\d{{1,2}}\b)",
         date_conjunction,
+        value,
+        flags=re.IGNORECASE,
+    )
+    value = re.sub(
+        rf"(\bbetween\s+(?:{_MONTH_PATTERN})\.?(?:\s+(?:of\s+)?{_YEAR_TOKEN})?)"
+        rf"\s+and\s+(?=(?:{_MONTH_PATTERN})\b)",
+        lambda match: match.group(1) + date_conjunction,
         value,
         flags=re.IGNORECASE,
     )
@@ -17032,7 +17048,8 @@ def _derivation_clauses(value: str) -> list[str]:
 
 def _unit_key(value: str) -> str:
     value = value.casefold()
-    return f"{value[:-3]}y" if value.endswith("ies") else value.removesuffix("s")
+    value = f"{value[:-3]}y" if value.endswith("ies") else value.removesuffix("s")
+    return "person" if value in {"people", "person", "staff"} else value
 
 
 _YEAR_CONTEXT_UNITS = {
@@ -17723,6 +17740,18 @@ def _validate_quantitative_provenance(
         ):
             continue
         result = anchor["quantitative_result"]
+        claim_tokens = _claimed_quantity_tokens(str(anchor.get("claim") or ""))
+        represented_tokens = {
+            token
+            for field, value in result.items()
+            if field
+            not in {"quantitative_result_id", "source_id", "evidence_anchor_id"}
+            for token in _claimed_quantity_tokens(str(value or ""))
+        }
+        if claim_tokens - represented_tokens:
+            raise SourceBundleQuantitativeProvenanceError(
+                "quantitative_anchor_contains_unmodeled_quantity"
+            )
         estimate = str(result.get("estimate") or "")
         estimate_tokens = _claimed_quantity_tokens(estimate)
         period = str(result.get("period") or "")

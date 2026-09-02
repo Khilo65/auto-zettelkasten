@@ -1126,7 +1126,7 @@ def test_ordinary_bundle_source_uses_one_call_and_no_profile_or_fidelity_call(
     ]
     assert profile["coverage"]["status"] == "partial"
     note = read_note(tmp_path / report.items[0]["note_path"])
-    assert note["frontmatter"]["source_bundle_prompt_version"] == "17"
+    assert note["frontmatter"]["source_bundle_prompt_version"] == "18"
 
 
 def test_source_calls_share_the_cumulative_profile_budget_and_replay_is_free(
@@ -1928,6 +1928,12 @@ def test_quantitative_provenance_accepts_split_footnote_and_local_body_date() ->
     row["text"] = (
         "Every hour:\n15 killed; 42 bombs dropped*.\n"
         "*Based on the first six days of the war."
+    )
+    assert _source_bundle_from_result(payload, row, "full_document") is not None
+
+    row["text"] = (
+        "Every hour:\n15 killed; 42 bombs dropped*.\n"
+        "*Based on the first six days of the war, according to the agency."
     )
     assert _source_bundle_from_result(payload, row, "full_document") is not None
 
@@ -3577,6 +3583,48 @@ def test_quantitative_provenance_accepts_rephrased_reporting_qualifier() -> None
         )
 
 
+def test_quantitative_provenance_accepts_hyphenated_people_count() -> None:
+    payload = _bundle_payload()
+    payload["evidence_anchors"][0]["quantitative_result"] = {
+        "estimate": "10 percent",
+        "sample": "12,000 local staff",
+        "provenance": "source_reported",
+    }
+
+    assert (
+        _source_bundle_from_result(
+            payload,
+            {
+                "source_id": "source-zotero-A1",
+                "zotero_item_key": "A1",
+                "text": (
+                    "The review reported that 10 percent of the organization's "
+                    "12,000-person local staff met the criterion."
+                ),
+            },
+            "full_document",
+        )
+        is not None
+    )
+
+    payload["evidence_anchors"][0]["quantitative_result"]["sample"] = (
+        "12,000 local facilities"
+    )
+    with pytest.raises(SourceBundleQuantitativeProvenanceError):
+        _source_bundle_from_result(
+            payload,
+            {
+                "source_id": "source-zotero-A1",
+                "zotero_item_key": "A1",
+                "text": (
+                    "The review reported that 10 percent of the organization's "
+                    "12,000-person local staff met the criterion."
+                ),
+            },
+            "full_document",
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "value", "text"),
     [
@@ -4707,6 +4755,86 @@ from a positive favorability of 12.2 to -10.5 over the same time period."""
         )
         is not None
     )
+
+
+def test_quantitative_provenance_accepts_reported_between_month_range() -> None:
+    payload = _bundle_payload()
+    payload["evidence_anchors"][0]["quantitative_result"] = {
+        "estimate": "18.5 percentage points",
+        "period": "September to December",
+        "provenance": "source_reported",
+    }
+    row = {
+        "source_id": "source-zotero-A1",
+        "zotero_item_key": "A1",
+        "text": (
+            "The score dropped by an average of\n"
+            "18.5 percentage points between September and December."
+        ),
+    }
+
+    assert _source_bundle_from_result(payload, row, "full_document") is not None
+
+    row["text"] = (
+        "The score dropped by 18.5 percentage points.\n"
+        + ("Unrelated prose.\n" * 20)
+        + "A separate series ran between September and December."
+    )
+    with pytest.raises(
+        SourceBundleQuantitativeProvenanceError,
+        match="period_date_not_local_to_reported_estimate",
+    ):
+        _source_bundle_from_result(payload, row, "full_document")
+
+
+def test_quantitative_provenance_accepts_counted_population_modifier() -> None:
+    payload = _bundle_payload()
+    result = {
+        "estimate": "42",
+        "denominator": "43 countries polled",
+        "population": "43 surveyed countries",
+        "period": "September to December",
+        "provenance": "source_reported",
+    }
+    payload["evidence_anchors"][0]["quantitative_result"] = result
+    row = {
+        "source_id": "source-zotero-A1",
+        "zotero_item_key": "A1",
+        "text": (
+            "Between September and December, the measure decreased in "
+            "42 out of the 43 countries polled."
+        ),
+    }
+
+    assert _source_bundle_from_result(payload, row, "full_document") is not None
+
+    result["population"] = "43 surveyed facilities"
+    with pytest.raises(SourceBundleQuantitativeProvenanceError):
+        _source_bundle_from_result(payload, row, "full_document")
+
+
+def test_quantitative_provenance_rejects_unmodeled_anchor_quantity() -> None:
+    payload = _bundle_payload()
+    anchor = payload["evidence_anchors"][0]
+    anchor["claim"] = "The source reports 42 cases among 17 controls."
+    anchor["quantitative_result"] = {
+        "estimate": "42 cases",
+        "provenance": "source_reported",
+    }
+    row = {
+        "source_id": "source-zotero-A1",
+        "zotero_item_key": "A1",
+        "text": "The source reports 42 cases among 17 controls.",
+    }
+
+    with pytest.raises(
+        SourceBundleQuantitativeProvenanceError,
+        match="quantitative_anchor_contains_unmodeled_quantity",
+    ):
+        _source_bundle_from_result(payload, row, "full_document")
+
+    anchor["quantitative_result"]["denominator"] = "17 controls"
+    assert _source_bundle_from_result(payload, row, "full_document") is not None
 
 
 @pytest.mark.parametrize(

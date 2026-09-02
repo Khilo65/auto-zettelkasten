@@ -83,10 +83,10 @@ def test_atomic_prompt_v14_is_source_adaptive_and_statistics_aware() -> None:
     assert "silently reread" in prompt
 
 
-def test_source_bundle_prompt_v17_preserves_formatting_and_attribution_scope() -> None:
+def test_source_bundle_prompt_v18_preserves_formatting_and_attribution_scope() -> None:
     prompt = _source_bundle_system_prompt()
 
-    assert "source bundle prompt v17" in prompt
+    assert "source bundle prompt v18" in prompt
     assert "apply a footnote, only when the alignment or marker is explicit" in prompt
     assert "A footnote qualifies only the values bearing its explicit marker" in prompt
     assert "page metadata is not a statistic's observation date" in prompt
@@ -133,7 +133,7 @@ def test_source_bundle_prompt_requires_a_final_quantitative_copy_gate() -> None:
     assert "same source sentence explicitly binds the same number and noun" in prompt
     assert 'set that optional string to ""' in prompt
     assert "Do not copy study-level sample or coverage" in prompt
-    assert "set quantitative_result to null" in prompt
+    assert "Set quantitative_result to null only when estimate fails" in prompt
     assert "INSPECTED SOURCE CONTENT" in prompt
     assert prompt.index("INSPECTED SOURCE CONTENT") < prompt.index(
         "FINAL QUANTITATIVE COPY GATE"
@@ -154,7 +154,7 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     assert {
         "atomic_prompt_v14": digest(_system_prompt()),
         "chunk_prompt_v14": digest(_chunk_system_prompt()),
-        "source_bundle_prompt_v17": digest(_source_bundle_system_prompt()),
+        "source_bundle_prompt_v18": digest(_source_bundle_system_prompt()),
         "codex_source_bundle_schema": bundle_identity["schema_hash"],
         "codex_source_bundle_contract": digest(bundle_identity),
         "codex_chunk_evidence_schema": chunk_identity["schema_hash"],
@@ -162,9 +162,9 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     } == {
         "atomic_prompt_v14": "8db9f2990d175816cb0100b92d84734ae7c2f930aade66825ed0412b22da3705",
         "chunk_prompt_v14": "3c2eabca75c5ad487a35a5096664e0ec6999d04b738927a60fce2e11cfb15cd5",
-        "source_bundle_prompt_v17": "65599a34463cde01d8ecbfd76fd53b364da385eaa2175ba2066dac806b66077e",
-        "codex_source_bundle_schema": "1e8081c4c0e9a81f6880d6fe00c22421e1bbd29da961076559c0121f1e73efcc",
-        "codex_source_bundle_contract": "0f7d0ae53a03bbe5b11f38f8e463bb3119a0413e52811319cca43d2c03c4115b",
+        "source_bundle_prompt_v18": "60cc6c560a57ecd1da1b66ae41c24879e847ee09462a32052aedde8c021e306e",
+        "codex_source_bundle_schema": "ffd00229ee34f87c2bcc9a32f4b620102be6a907975397126103d5aff032ec3a",
+        "codex_source_bundle_contract": "153d29b42447de280facb4a132bef9808c30676909bcee900b39353ef6451a59",
         "codex_chunk_evidence_schema": "2df4a0fe634405df5e891283a59bfc7bee18995b5e970a51c5569b5c4eafed8e",
         "codex_chunk_evidence_contract": "122375b5eb8daeadd5a6461903004ec177e2b5547822d0258c7420c28852b332",
     }
