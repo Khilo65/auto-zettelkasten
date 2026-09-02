@@ -233,7 +233,7 @@ DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
-SOURCE_BUNDLE_PROMPT_VERSION = "11"
+SOURCE_BUNDLE_PROMPT_VERSION = "12"
 SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v2"
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
@@ -4105,6 +4105,16 @@ def _source_bundle_prompt(
         f"Stable source and extraction context: {json.dumps(stable_context, ensure_ascii=False)}\n"
         f"Question lens: {question or 'none'}\n"
         f"Scope rule: {partial_rule}\n\n"
+        "FINAL QUANTITATIVE COPY GATE: Check every evidence_anchors.quantitative_result "
+        "against the same local passage in INSPECTED SOURCE CONTENT. For source_reported "
+        "values, every numeric token in estimate and every numeric date or year endpoint in "
+        "period must appear verbatim in that passage. Do not round, approximate, infer "
+        "endpoints, or borrow dates from metadata or context. For system_derived values, "
+        "every input must be explicit in that passage. If any check fails, set "
+        "quantitative_result to null and remove the unsupported number or date from the "
+        "anchor claim, plain-English meaning, and analysis prose; retain only supported "
+        "nonnumeric meaning. Do not fill or empty individual quantitative fields to evade "
+        "this gate.\n\n"
         f"INSPECTED SOURCE CONTENT:\n{text}"
     )
 

@@ -15,6 +15,7 @@ from auto_zettelkasten.readers import (
     _chunk_system_prompt,
     _cluster_synthesis_system_prompt,
     _gap_adjudication_system_prompt,
+    _source_bundle_prompt,
     _source_bundle_system_prompt,
     _source_prompt,
     _system_prompt,
@@ -82,10 +83,10 @@ def test_atomic_prompt_v14_is_source_adaptive_and_statistics_aware() -> None:
     assert "silently reread" in prompt
 
 
-def test_source_bundle_prompt_v11_preserves_formatting_and_attribution_scope() -> None:
+def test_source_bundle_prompt_v12_preserves_formatting_and_attribution_scope() -> None:
     prompt = _source_bundle_system_prompt()
 
-    assert "source bundle prompt v11" in prompt
+    assert "source bundle prompt v12" in prompt
     assert "apply a footnote, only when the alignment or marker is explicit" in prompt
     assert "A footnote qualifies only the values bearing its explicit marker" in prompt
     assert "page metadata is not a statistic's observation date" in prompt
@@ -102,6 +103,17 @@ def test_source_bundle_prompt_v11_preserves_formatting_and_attribution_scope() -
     assert "Each literature-position row represents exactly one distinct work" in prompt
 
 
+def test_source_bundle_prompt_requires_a_final_quantitative_copy_gate() -> None:
+    prompt = _source_bundle_prompt("The source reports 42 percent.", {}, None)
+
+    assert "FINAL QUANTITATIVE COPY GATE" in prompt
+    assert "set quantitative_result to null" in prompt
+    assert "INSPECTED SOURCE CONTENT" in prompt
+    assert prompt.index("FINAL QUANTITATIVE COPY GATE") < prompt.index(
+        "INSPECTED SOURCE CONTENT"
+    )
+
+
 def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     def digest(value: str | dict[str, Any]) -> str:
         text = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
@@ -116,7 +128,7 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     assert {
         "atomic_prompt_v14": digest(_system_prompt()),
         "chunk_prompt_v14": digest(_chunk_system_prompt()),
-        "source_bundle_prompt_v11": digest(_source_bundle_system_prompt()),
+        "source_bundle_prompt_v12": digest(_source_bundle_system_prompt()),
         "codex_source_bundle_schema": bundle_identity["schema_hash"],
         "codex_source_bundle_contract": digest(bundle_identity),
         "codex_chunk_evidence_schema": chunk_identity["schema_hash"],
@@ -124,7 +136,7 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     } == {
         "atomic_prompt_v14": "8db9f2990d175816cb0100b92d84734ae7c2f930aade66825ed0412b22da3705",
         "chunk_prompt_v14": "3c2eabca75c5ad487a35a5096664e0ec6999d04b738927a60fce2e11cfb15cd5",
-        "source_bundle_prompt_v11": "209cca3e88a0f24e2b1235f150cc0686e38eb27587d6042b75170e782de2a32a",
+        "source_bundle_prompt_v12": "a6c6f9ef0a22c405b296c6378406acf65f34369d46f20c9aec1bc53011526c71",
         "codex_source_bundle_schema": "1e8081c4c0e9a81f6880d6fe00c22421e1bbd29da961076559c0121f1e73efcc",
         "codex_source_bundle_contract": "0f7d0ae53a03bbe5b11f38f8e463bb3119a0413e52811319cca43d2c03c4115b",
         "codex_chunk_evidence_schema": "2df4a0fe634405df5e891283a59bfc7bee18995b5e970a51c5569b5c4eafed8e",
