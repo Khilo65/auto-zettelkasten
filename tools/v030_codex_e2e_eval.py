@@ -55,7 +55,7 @@ _STRATEGIC_TEMPLATE_MANIFEST_SHA256 = (
 )
 _STRATEGIC_QUESTION = "How do the frozen sources relate?"
 _RAW_CONFIG_SHA256 = (
-    "0708f9fb0b12d4106ce28c48c88147e22b619d81bff9c12b31b4d8efeaff9ef1"
+    "30c031ef07a78a8f0c3f0d63cfd1bca1ad4fee8d786bf560884718f039162d4d"
 )
 _STRATEGIC_CUSTODY_MANIFEST_SHA256 = {
     8: "9cdd578f41529ecbedb57978493bb1169d6432fda7bee3cf2cf94a55593ee3cd",
@@ -226,7 +226,7 @@ def _private_json(path: Path, expected_sha256: str, *, label: str) -> dict[str, 
 
 
 def _provider_free_pdf_route(
-    case: Mapping[str, Any], request: Any
+    case: Mapping[str, Any], request: Any, *, reader: CodexReader
 ) -> tuple[str, list[int]]:
     path = case.get("path")
     attachment = case.get("attachment")
@@ -235,6 +235,17 @@ def _provider_free_pdf_route(
         raise ValueError("PDF route validation requires bound custody evidence")
     if not isinstance(parent, Mapping):
         raise ValueError("PDF route validation requires a bound parent record")
+    status = reader.pdf_input_file_status()
+    if (
+        status.get("version") != base.DIRECT_PDF_CLI_VERSION
+        or status.get("helper_version") != base.DIRECT_PDF_CLI_VERSION
+        or status.get("helper_manifest_valid") is not True
+        or status.get("pdf_input_file_capability") is not True
+        or not base._direct_pdf_helper_identity_valid(
+            status.get("_helper_manifest_identity")
+        )
+    ):
+        raise ValueError("PDF route validation requires the verified Codex PDF helper")
     candidate, extracted = _custodied_pdf_candidate(
         path.read_bytes(),
         path,
@@ -244,6 +255,7 @@ def _provider_free_pdf_route(
         request,
         actual_primary_pdf=True,
         cancelled=None,
+        reader=reader,
     )
     if candidate is None or extracted.status != "succeeded":
         raise ValueError(f"{case['case_id']} PDF route probe did not succeed")
@@ -275,7 +287,9 @@ def _pdf_route_request_identity(request: Any) -> dict[str, Any]:
             "processing",
         )
     } | {
-        "attachment_capability": base.codex_source_bundle_attachment_identity()
+        "attachment_capability": base.codex_source_bundle_attachment_identity(
+            base.DIRECT_PDF_CLI_VERSION
+        )
     }
 
 
@@ -349,6 +363,7 @@ def _validated_route_oracle(
             or route
             not in {
                 base.IMAGE_ROUTE,
+                base.PDF_INPUT_ROUTE,
                 "pypdf_text",
                 "pypdf_pdfium_tesseract",
                 "pypdf_poppler_tesseract",
@@ -474,7 +489,12 @@ def _validated_custody_sources(
             ):
                 raise ValueError("source custody origin raw file changed")
         allowed_routes = (
-            {"pypdf_text", "pypdf_poppler_tesseract", base.IMAGE_ROUTE}
+            {
+                "pypdf_text",
+                "pypdf_poppler_tesseract",
+                base.IMAGE_ROUTE,
+                base.PDF_INPUT_ROUTE,
+            }
             if media_type == "application/pdf"
             else {"html_text", "zotero_fulltext"}
         )
@@ -634,6 +654,18 @@ def _validate_strategic_custody(
     ]:
         raise ValueError("live case order differs from the canonical custody order")
     request = base._request(manifest, live_workspace, settings)
+    route_reader = (
+        CodexReader(
+            base.SOURCE_MODEL,
+            allow_cloud=True,
+            reasoning_effort=base.REASONING_EFFORT,
+            credential_forbidden_roots=tuple(
+                dict.fromkeys((live_workspace, *protected_roots))
+            ),
+        )
+        if compute_pdf_routes
+        else None
+    )
     oracle_routes = (
         {}
         if compute_pdf_routes
@@ -689,8 +721,9 @@ def _validate_strategic_custody(
             raise ValueError("live raw case differs from source custody")
         if case["media_type"] == "application/pdf":
             if compute_pdf_routes:
+                assert route_reader is not None
                 expected_live_route, expected_pages = _provider_free_pdf_route(
-                    case, request
+                    case, request, reader=route_reader
                 )
             else:
                 route_row = oracle_routes.get(case["case_id"])
@@ -898,6 +931,7 @@ def _manifest_settings(
         allow_metadata_only=kind == "raw_e2e",
         require_private_expectations=False,
         require_direct_image_route=False,
+        require_direct_pdf_route=False,
         report_directory="codex-e2e",
         attempt_ledger_name=".v030-codex-e2e-attempt-ledger.json",
         attempt_lock_name=".v030-codex-e2e-attempt-ledger.lock",

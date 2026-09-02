@@ -9,6 +9,7 @@ from copy import deepcopy
 from collections.abc import Mapping
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -362,7 +363,7 @@ def _strategic_manifests(root: Path) -> tuple[Path, Path, Path, Path]:
             content_route = (
                 "html_text"
                 if source["selected"]["media_type"] == "text/html"
-                else runner.base.IMAGE_ROUTE
+                else runner.base.PDF_INPUT_ROUTE
                 if frozen_route == "pypdf_poppler_tesseract"
                 else frozen_route
             )
@@ -373,7 +374,7 @@ def _strategic_manifests(root: Path) -> tuple[Path, Path, Path, Path]:
                 "expected": {
                     "terminal_status": source["selected"]["terminal_status"],
                     "content_route": content_route,
-                    "selected_pages": [1] if content_route == runner.base.IMAGE_ROUTE else [],
+                    "selected_pages": [],
                 },
             }
             if source.get("cluster_expectation"):
@@ -459,10 +460,13 @@ def _bind_synthetic_strategic_fixture(
         if row["selected"]["route"] == "pypdf_text"
     }
 
-    def route(case: dict[str, Any], _request: Any) -> tuple[str, list[int]]:
+    def route(
+        case: dict[str, Any], _request: Any, *, reader: Any
+    ) -> tuple[str, list[int]]:
+        assert isinstance(reader, runner.CodexReader)
         if case["case_id"] in text_pdf_ids:
             return "pypdf_text", []
-        return runner.base.IMAGE_ROUTE, [1]
+        return runner.base.PDF_INPUT_ROUTE, []
 
     monkeypatch.setattr(runner, "_provider_free_pdf_route", route)
     root = custody8.parent.parent
@@ -693,11 +697,14 @@ print(json.dumps({{"type": "turn.completed", "usage": {{"input_tokens": 1, "outp
 def _completion(contract_id: str, *, source: bool) -> dict[str, Any]:
     model = runner.base.SOURCE_MODEL if source else runner.base.RELATIONSHIP_MODEL
     identity = runner.base.codex_contract_identity(
-        contract_id, model, runner.base.REASONING_EFFORT
+        contract_id,
+        model,
+        runner.base.REASONING_EFFORT,
+        runner.base.DIRECT_PDF_CLI_VERSION,
     )
     return {
         **identity,
-        "codex_cli_version": "0.145.0",
+        "codex_cli_version": runner.base.DIRECT_PDF_CLI_VERSION,
         "finish_reason": "turn.completed",
         "max_output_tokens": identity["output_reservation"],
         "usage": {"input_tokens": 10, "output_tokens": 5},
@@ -1043,6 +1050,73 @@ def _write_graph_run(workspace: Path, kwargs: Mapping[str, Any]) -> None:
     )
 
 
+def test_raw_workspace_config_hash_matches_current_initialized_config(
+    tmp_path: Path,
+) -> None:
+    initialize_workspace(tmp_path)
+
+    assert sha256_file(tmp_path / "auto-zettelkasten.yml") == (
+        runner._RAW_CONFIG_SHA256
+    )
+
+
+def test_provider_free_pdf_route_uses_verified_reader_without_model_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    helper = {
+        "manifest_version": 1,
+        "upstream_tag": "rust-v0.152.1",
+        "upstream_commit": "5adb68a49933ae446bf11935662c83dba55a0804",
+        "platform": "macos-arm64",
+        "license": "Apache-2.0",
+        "notice": "NOTICE",
+        "input_file_protocol_revision": "input_file-v1",
+        "patch_sha256": "1" * 64,
+        "binary_sha256": "2" * 64,
+        "manifest_sha256": "3" * 64,
+    }
+    reader = runner.CodexReader(
+        runner.base.SOURCE_MODEL,
+        allow_cloud=True,
+        reasoning_effort=runner.base.REASONING_EFFORT,
+    )
+    reader._preflight = {
+        "version": runner.base.DIRECT_PDF_CLI_VERSION,
+        "helper_version": runner.base.DIRECT_PDF_CLI_VERSION,
+        "helper_manifest_valid": True,
+        "pdf_input_file_capability": True,
+        "_helper_manifest_identity": helper,
+    }
+    path = tmp_path / "source.pdf"
+    path.write_bytes(b"%PDF-1.4\nsynthetic\n%%EOF\n")
+    parent = {"key": "P1", "data": {"key": "P1"}}
+    case = {
+        "case_id": "p1",
+        "path": path,
+        "parent": parent,
+        "attachment": {"key": "A1", "data": {"key": "A1"}},
+    }
+    request = SimpleNamespace()
+    calls: list[Any] = []
+
+    def candidate(*args: Any, **kwargs: Any) -> tuple[dict[str, Any], Any]:
+        calls.append(kwargs.get("reader"))
+        assert args[0] == path.read_bytes()
+        return {}, SimpleNamespace(
+            status="succeeded", route=runner.base.PDF_INPUT_ROUTE
+        )
+
+    monkeypatch.setattr(runner, "_custodied_pdf_candidate", candidate)
+
+    with runner.base.deny_codex_attempts():
+        route, pages = runner._provider_free_pdf_route(
+            case, request, reader=reader
+        )
+
+    assert (route, pages) == (runner.base.PDF_INPUT_ROUTE, [])
+    assert calls == [reader]
+
+
 def test_mixed_raw_fresh_run_and_exact_replay(tmp_path: Path) -> None:
     manifest = _manifest(tmp_path / "private")
     digest = sha256_file(manifest)
@@ -1352,6 +1426,20 @@ def test_strategic_manifests_bind_exact_private_custody_and_derivation(
     assert [row["case_id"] for row in oracle["routes"]] == sorted(
         row["case_id"] for row in oracle["routes"]
     )
+    assert [row["content_route"] for row in oracle["routes"]].count(
+        runner.base.TEXT_ROUTE
+    ) == 2
+    assert [row["content_route"] for row in oracle["routes"]].count(
+        runner.base.PDF_INPUT_ROUTE
+    ) == 7
+    assert oracle["request_identity"]["attachment_capability"] == (
+        runner.base.codex_source_bundle_attachment_identity(
+            runner.base.DIRECT_PDF_CLI_VERSION
+        )
+    )
+    assert "helper_manifest" not in oracle["request_identity"][
+        "attachment_capability"
+    ]
     custody40_payload = json.loads(custody40.read_text(encoding="utf-8"))
     legacy_ocr_index = next(
         index
@@ -1360,8 +1448,8 @@ def test_strategic_manifests_bind_exact_private_custody_and_derivation(
     )
     live40_payload = json.loads(live40.read_text(encoding="utf-8"))
     assert live40_payload["cases"][legacy_ocr_index]["expected"] == {
-        "content_route": runner.base.IMAGE_ROUTE,
-        "selected_pages": [1],
+        "content_route": runner.base.PDF_INPUT_ROUTE,
+        "selected_pages": [],
         "terminal_status": "validated_note",
     }
     report_path, report = runner.run_gate(
@@ -1424,6 +1512,36 @@ def test_strategic_route_oracle_is_strict_and_hash_bound(
     live8.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match="oracle identity is invalid"):
         runner._manifest_settings(live8, sha256_file(live8))
+
+
+def test_strategic_route_oracle_keeps_legacy_image_routes_compatible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _live8, live40, custody8, custody40 = _strategic_manifests(tmp_path)
+    _bind_synthetic_strategic_fixture(monkeypatch, custody8, custody40)
+    manifest = json.loads(live40.read_text(encoding="utf-8"))
+    oracle_path = Path(manifest["pdf_route_oracle"])
+    oracle = json.loads(oracle_path.read_text(encoding="utf-8"))
+    legacy = next(
+        row
+        for row in oracle["routes"]
+        if row["content_route"] == runner.base.PDF_INPUT_ROUTE
+    )
+    legacy["content_route"] = runner.base.IMAGE_ROUTE
+    legacy["selected_pages"] = [1]
+    oracle_path.write_text(json.dumps(oracle), encoding="utf-8")
+    case = next(
+        row for row in manifest["cases"] if row["case_id"] == legacy["case_id"]
+    )
+    case["expected"]["content_route"] = runner.base.IMAGE_ROUTE
+    case["expected"]["selected_pages"] = [1]
+    manifest["pdf_route_oracle_sha256"] = sha256_file(oracle_path)
+    live40.write_text(json.dumps(manifest), encoding="utf-8")
+
+    validated, settings = runner._manifest_settings(live40, sha256_file(live40))
+
+    assert settings.case_count == 40
+    assert validated["pdf_route_oracle_sha256"] == sha256_file(oracle_path)
 
 
 def test_route_oracle_freeze_rejects_protected_custody_output_before_probe(

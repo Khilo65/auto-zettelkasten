@@ -87,17 +87,15 @@ def _manifest(root: Path) -> Path:
         attachment_key = f"A{index + 1}"
         path = custody / f"case-{index + 1}.pdf"
         path.write_bytes(f"synthetic PDF {index + 1}".encode())
-        image_route = index >= 2
+        route = runner.FOUR_PDF_ROUTE_ORACLE[index]
         cases.append(
             {
                 "case_id": f"case-{index + 1}",
                 "pdf": str(path.relative_to(root)),
                 "sha256": sha256_file(path),
                 "expected": {
-                    "content_route": (
-                        runner.IMAGE_ROUTE if image_route else runner.TEXT_ROUTE
-                    ),
-                    "selected_pages": [index - 1] if image_route else [],
+                    "content_route": route,
+                    "selected_pages": [],
                     "audited_facts": [f"Synthetic source {index + 1}"],
                     "audited_locators": [f"Audited locator {index + 1}"],
                     "expected_answers": [f"Expected answer {index + 1}"],
@@ -145,21 +143,62 @@ def _manifest(root: Path) -> Path:
     return path
 
 
-def _completion(*, source: bool, contract_id: str) -> dict[str, Any]:
+def _helper_identity() -> dict[str, Any]:
+    return {
+        "manifest_version": 1,
+        "upstream_tag": "rust-v0.152.1",
+        "upstream_commit": "5adb68a49933ae446bf11935662c83dba55a0804",
+        "platform": "macos-arm64",
+        "license": "Apache-2.0",
+        "notice": "NOTICE",
+        "input_file_protocol_revision": "input_file-v1",
+        "patch_sha256": "1" * 64,
+        "binary_sha256": "2" * 64,
+        "manifest_sha256": "3" * 64,
+    }
+
+
+def _completion(
+    *,
+    source: bool,
+    contract_id: str,
+    cli_version: str = runner.DIRECT_PDF_CLI_VERSION,
+    pdf_hash: str = "",
+) -> dict[str, Any]:
     model = runner.SOURCE_MODEL if source else runner.RELATIONSHIP_MODEL
     identity = runner.codex_contract_identity(
-        contract_id, model, runner.REASONING_EFFORT
+        contract_id, model, runner.REASONING_EFFORT, cli_version
     )
-    return {
+    completion = {
         **identity,
-        "codex_cli_version": "0.145.0",
+        "codex_cli_version": cli_version,
         "finish_reason": "turn.completed",
         "max_output_tokens": identity["output_reservation"],
         "usage": {"input_tokens": 10, "output_tokens": 5},
     }
+    if pdf_hash:
+        helper = _helper_identity()
+        completion.update(
+            attachment_transport={
+                **runner.codex_source_bundle_attachment_identity(
+                    runner.DIRECT_PDF_CLI_VERSION, helper
+                ),
+                "adapter_protocol": "codex-app-server-jsonrpc-v2",
+            },
+            attachment_count=1,
+            attachment_hashes=[pdf_hash],
+        )
+    return completion
 
 
-def _usage_row(number: int, *, source: bool, contract_id: str) -> dict[str, Any]:
+def _usage_row(
+    number: int,
+    *,
+    source: bool,
+    contract_id: str,
+    cli_version: str = runner.DIRECT_PDF_CLI_VERSION,
+    pdf_hash: str = "",
+) -> dict[str, Any]:
     return {
         "attempt_id": f"attempt-{source}-{number}",
         "stage": contract_id,
@@ -167,7 +206,12 @@ def _usage_row(number: int, *, source: bool, contract_id: str) -> dict[str, Any]
         "fingerprint": f"fingerprint-{number}",
         "attempt": 1,
         "status": "completed",
-        "provider_completion": _completion(source=source, contract_id=contract_id),
+        "provider_completion": _completion(
+            source=source,
+            contract_id=contract_id,
+            cli_version=cli_version,
+            pdf_hash=pdf_hash,
+        ),
     }
 
 
@@ -185,6 +229,56 @@ def test_four_pdf_source_contract_remains_source_bundle_only() -> None:
         )
         == ""
     )
+
+
+def test_four_pdf_manifest_requires_the_direct_pdf_route_oracle(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(tmp_path / "private")
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["cases"][0]["expected"]["content_route"] = runner.PDF_INPUT_ROUTE
+    payload["cases"][1]["expected"]["content_route"] = runner.TEXT_ROUTE
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="four-PDF routes must be"):
+        runner._validated_manifest(manifest, sha256_file(manifest))
+
+
+def test_legacy_cli_and_image_route_evidence_remain_accepted(tmp_path: Path) -> None:
+    legacy = _usage_row(
+        1,
+        source=True,
+        contract_id="source_bundle",
+        cli_version=runner.LEGACY_CODEX_CLI_VERSION,
+    )
+    assert runner._completion_error(legacy, source=True) == ""
+
+    manifest_path = _manifest(tmp_path / "private")
+    manifest, cases, workspace = runner._validated_manifest(
+        manifest_path, sha256_file(manifest_path)
+    )
+    cases[1]["expected_route"] = runner.IMAGE_ROUTE
+    cases[1]["expected_selected_pages"] = [1]
+    client = runner.ManifestZoteroClient(cases)
+    _write_accepted_run(
+        workspace,
+        runner._request(manifest, workspace),
+        client,
+        str(manifest["run_id"]),
+    )
+    settings = runner.GateSettings(
+        kind="raw_e2e",
+        allow_html=True,
+        require_private_expectations=False,
+        require_direct_image_route=False,
+        require_direct_pdf_route=False,
+    )
+
+    errors, _ = runner._route_errors(
+        workspace, str(manifest["run_id"]), cases, settings
+    )
+
+    assert errors == []
 
 
 def test_four_pdf_replay_snapshot_covers_every_existing_workspace_artifact(
@@ -235,6 +329,7 @@ def _write_accepted_run(
     assert request.provider_concurrency == "auto"
     assert request.retry_terminal_failures is False
     assert request.extraction_policy.ocr == "auto"
+    assert request.extraction_policy.pdf_fallback == "none"
     assert request.processing.max_calls_per_document_run == 2
     assert request.literature_policy.cluster_generation_enabled is False
     assert request.literature_policy.max_profile_calls == 6
@@ -276,7 +371,70 @@ def _write_accepted_run(
             },
         )
         (item_root / "source.txt").write_text("", encoding="utf-8")
-        if route == runner.IMAGE_ROUTE:
+        if route == runner.PDF_INPUT_ROUTE:
+            dimensions = [(1_024, 1_024)]
+            helper = _helper_identity()
+            identity = {
+                "route_version": "1",
+                "route": runner.PDF_INPUT_ROUTE,
+                "custody_file": str(case["path"]),
+                "custody_sha256": case["sha256"],
+                "custody_byte_count": case["path"].stat().st_size,
+                "file_policy": {
+                    "media_type": "application/pdf",
+                    "maximum_bytes_exclusive": 50_000_000,
+                    "detail": "auto",
+                },
+                "model_profile": {
+                    "model": runner.SOURCE_MODEL,
+                    "reasoning_effort": runner.REASONING_EFFORT,
+                    "cli_version": runner.DIRECT_PDF_CLI_VERSION,
+                },
+                "fallback_policy": "none",
+                "attachment_capability": (
+                    runner.codex_source_bundle_attachment_identity(
+                        runner.DIRECT_PDF_CLI_VERSION, helper
+                    )
+                ),
+                "probe_evidence": {
+                    "status": "succeeded",
+                    "reason": "synthetic",
+                    "custody_byte_count": case["path"].stat().st_size,
+                    "page_count": 1,
+                    "suspicious_pages": [1],
+                    "render_candidate_pages": [1],
+                    "pages": [
+                        {
+                            "page_number": 1,
+                            "printed_page": "1",
+                            "width": 1_024,
+                            "height": 1_024,
+                            "embedded_text_sha256": "0" * 64,
+                            "embedded_char_count": 0,
+                            "embedded_word_count": 0,
+                            "text_quality": "empty",
+                            "resource_types": ["image"],
+                            "resource_count": 1,
+                            "xobject_count": 1,
+                            "image_count": 1,
+                            "suspicious": True,
+                            "visually_consequential": True,
+                            "render_candidate": True,
+                            "error_type": "",
+                        }
+                    ],
+                },
+                "projected_preflight": _preflight(dimensions),
+            }
+            write_yaml(
+                item_root / "document_route.yml",
+                {
+                    "identity_payload": identity,
+                    "identity": runner.stable_hash(identity),
+                    "recovery": {"state": "not_selected"},
+                },
+            )
+        elif route == runner.IMAGE_ROUTE:
             pages = list(case["expected_selected_pages"])
             dimensions = [(1_024, 1_024)]
             preflight = _preflight(dimensions)
@@ -411,7 +569,17 @@ def _write_accepted_run(
         },
     )
     source_rows = [
-        _usage_row(index, source=True, contract_id="source_bundle")
+        _usage_row(
+            index,
+            source=True,
+            contract_id="source_bundle",
+            pdf_hash=(
+                str(client._by_parent[f"P{index}"]["sha256"])
+                if client._by_parent[f"P{index}"]["expected_route"]
+                == runner.PDF_INPUT_ROUTE
+                else ""
+            ),
+        )
         for index in range(1, 5)
     ]
     source_usage = run_root / "literature" / "profiles" / "provider_usage.yml"
@@ -817,6 +985,58 @@ def test_acceptance_rejects_relationship_endpoint_outside_four_sources(
     errors, _ = runner._acceptance(workspace, str(manifest["run_id"]), cases, report)
 
     assert "relationship_endpoint_outside_gate" in errors
+
+
+def test_acceptance_binds_direct_pdf_route_and_transport_evidence(
+    tmp_path: Path,
+) -> None:
+    manifest_path = _manifest(tmp_path / "private")
+    manifest, cases, workspace = runner._validated_manifest(
+        manifest_path, sha256_file(manifest_path)
+    )
+    request = runner._request(manifest, workspace)
+    client = runner.ManifestZoteroClient(cases)
+    run_id = str(manifest["run_id"])
+    report = _write_accepted_run(workspace, request, client, run_id)
+
+    errors, _ = runner._acceptance(workspace, run_id, cases, report)
+    assert errors == []
+
+    route_path = (
+        workspace
+        / "11_state"
+        / "runs"
+        / run_id
+        / "items"
+        / "P2"
+        / "document_route.yml"
+    )
+    route_bytes = route_path.read_bytes()
+    route = read_yaml(route_path)
+    route["identity_payload"]["fallback_policy"] = "images"
+    route["identity"] = runner.stable_hash(route["identity_payload"])
+    write_yaml(route_path, route)
+    route_errors, _ = runner._acceptance(workspace, run_id, cases, report)
+    assert "case-2:route_identity_mismatch" in route_errors
+
+    route_path.write_bytes(route_bytes)
+    usage_path = (
+        workspace
+        / "11_state"
+        / "runs"
+        / run_id
+        / "literature"
+        / "profiles"
+        / "provider_usage.yml"
+    )
+    usage = read_yaml(usage_path)
+    usage["attempts"][1]["provider_completion"]["attachment_transport"][
+        "adapter_protocol"
+    ] = "codex-cli-jsonl-v1"
+    write_yaml(usage_path, usage)
+    transport_errors, _ = runner._acceptance(workspace, run_id, cases, report)
+    assert "direct_pdf_transport_invalid" in transport_errors
+    assert "direct_pdf_transport_mismatch" in transport_errors
 
 
 def test_acceptance_allows_complete_empty_relationship_discovery(

@@ -62,7 +62,19 @@ STAGE_DEADLINE_SECONDS = 8_460
 ATTEMPT_GUARD_STAGE = "final_four_pdf_public_path"
 CASE_COUNT = 4
 IMAGE_ROUTE = "codex_pdf_page_images"
+PDF_INPUT_ROUTE = "codex_pdf_input_file"
 TEXT_ROUTE = "pypdf_text"
+DIRECT_PDF_CLI_VERSION = "0.152.1"
+LEGACY_CODEX_CLI_VERSION = "0.145.0"
+FOUR_PDF_ROUTE_ORACLE = (
+    TEXT_ROUTE,
+    PDF_INPUT_ROUTE,
+    TEXT_ROUTE,
+    PDF_INPUT_ROUTE,
+)
+_SUPPORTED_CODEX_CLI_VERSIONS = frozenset(
+    {LEGACY_CODEX_CLI_VERSION, DIRECT_PDF_CLI_VERSION}
+)
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _GIT_COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}")
@@ -108,6 +120,7 @@ class GateSettings:
         "allow_metadata_only",
         "require_private_expectations",
         "require_direct_image_route",
+        "require_direct_pdf_route",
         "report_directory",
         "attempt_ledger_name",
         "attempt_lock_name",
@@ -129,6 +142,7 @@ class GateSettings:
         allow_metadata_only: bool = False,
         require_private_expectations: bool = True,
         require_direct_image_route: bool = True,
+        require_direct_pdf_route: bool = False,
         report_directory: str = "codex-pdf",
         attempt_ledger_name: str = _ATTEMPT_LEDGER_NAME,
         attempt_lock_name: str = _ATTEMPT_LOCK_NAME,
@@ -160,6 +174,7 @@ class GateSettings:
             "allow_metadata_only",
             "require_private_expectations",
             "require_direct_image_route",
+            "require_direct_pdf_route",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"gate {name} must be a boolean")
@@ -188,7 +203,10 @@ class GateSettings:
         }
 
 
-FOUR_PDF_GATE = GateSettings()
+FOUR_PDF_GATE = GateSettings(
+    require_direct_image_route=False,
+    require_direct_pdf_route=True,
+)
 
 
 class _ReplayCodexReader(CodexReader):
@@ -671,9 +689,14 @@ def _expected_route(
         or row.get("audited_route")
         or ""
     )
-    if not settings.allow_html and route not in {TEXT_ROUTE, IMAGE_ROUTE}:
+    if not settings.allow_html and route not in {
+        TEXT_ROUTE,
+        IMAGE_ROUTE,
+        PDF_INPUT_ROUTE,
+    }:
         raise ValueError(
-            "case expected route must be pypdf_text or codex_pdf_page_images"
+            "case expected route must be pypdf_text, codex_pdf_input_file, "
+            "or codex_pdf_page_images"
         )
     if settings.allow_html and (
         not route or not re.fullmatch(r"[a-z0-9][a-z0-9_]{0,63}", route)
@@ -899,8 +922,8 @@ def _validated_manifest(
             fulltext.get("contentType") or media_type
         ) != media_type:
             raise ValueError(f"{case_id} zotero_fulltext contentType mismatch")
-        if route == IMAGE_ROUTE and media_type != "application/pdf":
-            raise ValueError(f"{case_id} image route requires application/pdf")
+        if route in {IMAGE_ROUTE, PDF_INPUT_ROUTE} and media_type != "application/pdf":
+            raise ValueError(f"{case_id} attachment route requires application/pdf")
         cluster_expectation = str(row.get("cluster_expectation") or "")
         if cluster_expectation not in {"", "related_candidate", "control"}:
             raise ValueError(f"{case_id} cluster_expectation is invalid")
@@ -924,6 +947,13 @@ def _validated_manifest(
         seen_keys.update(keys)
         if path is not None:
             seen_paths.add(path)
+    if settings.kind == "four_pdf" and tuple(
+        str(row["expected_route"]) for row in cases
+    ) != FOUR_PDF_ROUTE_ORACLE:
+        raise ValueError(
+            "four-PDF routes must be pypdf_text, codex_pdf_input_file, "
+            "pypdf_text, codex_pdf_input_file in manifest order"
+        )
     if settings.kind == "raw_e2e" and settings.case_count == 8:
         role_counts = Counter(row["cluster_expectation"] for row in cases)
         if role_counts != Counter({"related_candidate": 4, "control": 4}):
@@ -1025,7 +1055,7 @@ def _request(
         parallel=settings.case_count,
         provider_concurrency="auto",
         retry_terminal_failures=False,
-        extraction_policy=ExtractionPolicy(ocr="auto"),
+        extraction_policy=ExtractionPolicy(ocr="auto", pdf_fallback="none"),
         processing=ProcessingPolicy(
             max_calls_per_document_run=settings.document_attempt_limit,
             request_deadline_seconds=600.0,
@@ -1125,6 +1155,51 @@ def _latest_attempt_rows(
     return [entry[2] for entry in sorted(latest.values(), key=lambda entry: entry[1])]
 
 
+def _direct_pdf_transport_errors(
+    cases: Sequence[Mapping[str, Any]], attempts: Sequence[Mapping[str, Any]]
+) -> list[str]:
+    expected = Counter(
+        str(row["sha256"])
+        for row in cases
+        if row.get("expected_route") == PDF_INPUT_ROUTE
+    )
+    if not expected:
+        return []
+    observed: Counter[str] = Counter()
+    invalid = False
+    for row in _latest_attempt_rows(attempts):
+        if row.get("status") != "completed":
+            continue
+        completion = row.get("provider_completion")
+        if not isinstance(completion, Mapping):
+            continue
+        transport = completion.get("attachment_transport")
+        direct_transport = isinstance(transport, Mapping) and (
+            transport.get("adapter_protocol") == "codex-app-server-jsonrpc-v2"
+            or "helper_manifest" in transport
+        )
+        if not direct_transport:
+            continue
+        hashes = completion.get("attachment_hashes")
+        if (
+            completion.get("codex_cli_version") != DIRECT_PDF_CLI_VERSION
+            or not _direct_pdf_transport_valid(transport)
+            or completion.get("attachment_count") != 1
+            or not isinstance(hashes, list)
+            or len(hashes) != 1
+            or not _SHA256.fullmatch(str(hashes[0] or ""))
+        ):
+            invalid = True
+            continue
+        observed[str(hashes[0])] += 1
+    errors = []
+    if invalid:
+        errors.append("direct_pdf_transport_invalid")
+    if observed != expected:
+        errors.append("direct_pdf_transport_mismatch")
+    return errors
+
+
 def _attempt_pause_reason(row: Mapping[str, Any]) -> str:
     status = str(row.get("status") or "")
     failure_class = str(row.get("failure_class") or "")
@@ -1171,13 +1246,14 @@ def _completion_error(
     )
     if not source and contract not in allowed_relationship_contracts:
         return "relationship_contract_mismatch"
+    cli_version = str(completion.get("codex_cli_version") or "")
+    if cli_version not in _SUPPORTED_CODEX_CLI_VERSIONS:
+        return "provider_completion_cli_mismatch"
     expected_identity = codex_contract_identity(
-        contract, expected_model, REASONING_EFFORT
+        contract, expected_model, REASONING_EFFORT, cli_version
     )
     if any(completion.get(key) != value for key, value in expected_identity.items()):
         return "provider_completion_identity_mismatch"
-    if completion.get("codex_cli_version") != "0.145.0":
-        return "provider_completion_cli_mismatch"
     maximum = completion.get("max_output_tokens")
     if (
         isinstance(maximum, bool)
@@ -1248,6 +1324,54 @@ def _preflight_valid(value: Any, *, expected_image_tokens: int | None = None) ->
         and value.get("admitted") is True
         and combined <= 200_000
     )
+
+
+def _direct_pdf_helper_identity_valid(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    expected = {
+        "manifest_version": 1,
+        "upstream_tag": "rust-v0.152.1",
+        "upstream_commit": "5adb68a49933ae446bf11935662c83dba55a0804",
+        "platform": "macos-arm64",
+        "license": "Apache-2.0",
+        "notice": "NOTICE",
+        "input_file_protocol_revision": "input_file-v1",
+    }
+    return (
+        set(value) == {*expected, "patch_sha256", "binary_sha256", "manifest_sha256"}
+        and all(value.get(key) == expected_value for key, expected_value in expected.items())
+        and all(
+            _SHA256.fullmatch(str(value.get(key) or ""))
+            for key in ("patch_sha256", "binary_sha256", "manifest_sha256")
+        )
+    )
+
+
+def _direct_pdf_attachment_capability_valid(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    helper = value.get("helper_manifest")
+    return _direct_pdf_helper_identity_valid(helper) and dict(value) == (
+        codex_source_bundle_attachment_identity(DIRECT_PDF_CLI_VERSION, helper)
+    )
+
+
+def _image_attachment_capability_valid(value: Any) -> bool:
+    return any(
+        value == codex_source_bundle_attachment_identity(version)
+        for version in _SUPPORTED_CODEX_CLI_VERSIONS
+    )
+
+
+def _direct_pdf_transport_valid(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    helper = value.get("helper_manifest")
+    return _direct_pdf_helper_identity_valid(helper) and dict(value) == {
+        **codex_source_bundle_attachment_identity(DIRECT_PDF_CLI_VERSION, helper),
+        "adapter_protocol": "codex-app-server-jsonrpc-v2",
+    }
 
 
 def _probe_dimensions(
@@ -1325,6 +1449,24 @@ def _probe_dimensions(
     return [by_number[number] for number in selected if number in by_number], valid
 
 
+def _direct_probe_dimensions(probe: Any) -> tuple[list[tuple[int, int]], bool]:
+    if not isinstance(probe, Mapping):
+        return [], False
+    render_candidates = probe.get("render_candidate_pages")
+    if not isinstance(render_candidates, list):
+        return [], False
+    _, valid = _probe_dimensions(probe, render_candidates)
+    if not valid:
+        return [], False
+    pages = probe.get("pages")
+    assert isinstance(pages, list)
+    return [
+        (int(row["width"]), int(row["height"]))
+        for row in pages
+        if isinstance(row, Mapping)
+    ], True
+
+
 def _rendered_dimensions(
     rendered: Any, selected_pages: Sequence[int]
 ) -> tuple[list[tuple[int, int]], bool]:
@@ -1369,6 +1511,7 @@ def _route_errors(
     errors: list[str] = []
     results: list[dict[str, Any]] = []
     direct_image_routes = 0
+    direct_pdf_routes = 0
     custody_root = (workspace / "01_custody" / "files").resolve()
     for row in cases:
         case_id = str(row["case_id"])
@@ -1445,7 +1588,78 @@ def _route_errors(
             errors.append(f"{case_id}:custody_binding_mismatch")
         recovery = "not_applicable"
         selected_pages: list[int] = []
-        if expected_route != IMAGE_ROUTE:
+        if expected_route == PDF_INPUT_ROUTE:
+            route = read_yaml(root / "document_route.yml", {}) or {}
+            identity = (
+                route.get("identity_payload") if isinstance(route, Mapping) else None
+            )
+            if (
+                not isinstance(identity, Mapping)
+                or identity.get("route") != PDF_INPUT_ROUTE
+            ):
+                errors.append(f"{case_id}:pdf_input_route_missing")
+                identity = {}
+            if (
+                identity.get("route_version") != "1"
+                or Path(str(identity.get("custody_file") or "")).resolve()
+                != source_file
+                or identity.get("custody_sha256") != str(row["sha256"])
+                or identity.get("custody_byte_count") != source_file_size
+                or identity.get("file_policy")
+                != {
+                    "media_type": "application/pdf",
+                    "maximum_bytes_exclusive": 50_000_000,
+                    "detail": "auto",
+                }
+                or identity.get("model_profile")
+                != {
+                    "model": SOURCE_MODEL,
+                    "reasoning_effort": REASONING_EFFORT,
+                    "cli_version": DIRECT_PDF_CLI_VERSION,
+                }
+                or identity.get("fallback_policy") != "none"
+                or not _direct_pdf_attachment_capability_valid(
+                    identity.get("attachment_capability")
+                )
+                or not isinstance(route, Mapping)
+                or route.get("identity") != stable_hash(identity)
+            ):
+                errors.append(f"{case_id}:route_identity_mismatch")
+            probe_dimensions, probe_valid = _direct_probe_dimensions(
+                identity.get("probe_evidence")
+            )
+            if not probe_valid:
+                errors.append(f"{case_id}:probe_evidence_invalid")
+            probe = identity.get("probe_evidence")
+            if (
+                not isinstance(probe, Mapping)
+                or probe.get("custody_byte_count") != source_file_size
+            ):
+                errors.append(f"{case_id}:probe_custody_evidence_mismatch")
+            if not _preflight_valid(
+                identity.get("projected_preflight"),
+                expected_image_tokens=(
+                    _image_token_estimate(probe_dimensions) if probe_valid else None
+                ),
+            ):
+                errors.append(f"{case_id}:pdf_input_preflight_not_admitted")
+            recovery_row = route.get("recovery") if isinstance(route, Mapping) else None
+            recovery = (
+                str(recovery_row.get("state") or "")
+                if isinstance(recovery_row, Mapping)
+                else ""
+            )
+            if recovery != "not_selected":
+                errors.append(f"{case_id}:invalid_recovery_state")
+            if (
+                str(content.get("content_route") or "") != PDF_INPUT_ROUTE
+                or route.get("rendered_images") not in (None, [])
+                or route.get("actual_preflight") is not None
+            ):
+                errors.append(f"{case_id}:route_mismatch")
+            else:
+                direct_pdf_routes += 1
+        elif expected_route != IMAGE_ROUTE:
             actual_route = str(content.get("content_route") or "")
             if settings.kind == "raw_e2e":
                 if actual_route != expected_route:
@@ -1468,8 +1682,9 @@ def _route_errors(
                 or Path(str(identity.get("custody_file") or "")).resolve()
                 != source_file
                 or identity.get("custody_sha256") != str(row["sha256"])
-                or identity.get("attachment_capability")
-                != codex_source_bundle_attachment_identity()
+                or not _image_attachment_capability_valid(
+                    identity.get("attachment_capability")
+                )
                 or not isinstance(route, Mapping)
                 or route.get("identity") != stable_hash(identity)
             ):
@@ -1545,6 +1760,8 @@ def _route_errors(
         )
     if settings.require_direct_image_route and direct_image_routes < 1:
         errors.append("no_direct_image_route_completed")
+    if settings.require_direct_pdf_route and direct_pdf_routes < 1:
+        errors.append("no_direct_pdf_route_completed")
     return errors, results
 
 
@@ -1985,6 +2202,7 @@ def _acceptance(
         error = _completion_error(row, source=True, settings=settings)
         if error:
             errors.append(error)
+    errors.extend(_direct_pdf_transport_errors(cases, source["rows"]))
     relationship_contracts: set[str] = set()
     for row in relationship["rows"]:
         if str(row.get("status") or "") in {"failed", "interrupted"} and not (
