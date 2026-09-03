@@ -83,6 +83,7 @@ _HISTORICAL_TEST_SENTINELS = {
         b"Bearer " + b"synthetic-authorization-value",
         b"eyJsyntheticA." + b"eyJsyntheticB.syntheticC",
         b"sk-" + b"SYNTHETICINVALID0000",
+        b"/" + b"Users" + b"/private/.codex/auth.json",
     ),
     "tests/test_v030_codex_provider_eval.py": (
         b"Bearer " + b"synthetic-authorization-value",
@@ -1017,8 +1018,19 @@ def _historical_content_findings(
             unrecognized = False
             for match in pattern.finditer(line):
                 value = match.group(0)
-                if value in allowed:
-                    counts[value] += 1
+                # Approved historical fixture only: never allow a private-root prefix.
+                sentinel = next(
+                    (
+                        item for item in allowed
+                        if value == item or (
+                            label == "private_root"
+                            and line.strip() == b'private_path = "' + item + b'"'
+                        )
+                    ),
+                    None,
+                )
+                if sentinel is not None:
+                    counts[sentinel] += 1
                 else:
                     unrecognized = True
             if unrecognized:

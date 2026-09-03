@@ -902,9 +902,9 @@ def test_codex_doctor_reports_version_and_auth_failures(
 
 
 def test_codex_doctor_coarsens_unexpected_preflight_failures(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
-    private_path = "/Users/private/.codex/auth.json"
+    private_path = str(tmp_path / ".codex" / "auth.json")
 
     def fail(*_args: object, **_kwargs: object) -> dict[str, object]:
         raise OSError(f"cannot inspect {private_path}")

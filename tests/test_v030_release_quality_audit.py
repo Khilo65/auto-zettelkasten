@@ -1889,6 +1889,49 @@ def test_history_sentinel_exemption_requires_an_exact_token_match(
         assert report["history_test_sentinel_policy"]["exemptions"]
 
 
+@pytest.mark.parametrize(
+    ("relative", "suffix", "keep_current", "accepted"),
+    [
+        ("tests/test_codex_provider.py", "", False, True),
+        ("tests/test_codex_provider.py", ".backup", False, False),
+        ("tests/test_other.py", "", False, False),
+        ("tests/test_codex_provider.py", "", True, False),
+    ],
+)
+def test_historical_private_path_exception_is_exact_and_history_only(
+    tmp_path: Path, relative: str, suffix: str, keep_current: bool, accepted: bool
+) -> None:
+    repository, sdist, wheel = _release_repository(tmp_path)
+    base = _run_git(repository, "rev-parse", "HEAD")
+    path = repository / relative
+    path.parent.mkdir()
+    sentinel = "/" + "Users" + "/private/.codex/auth.json" + suffix
+    path.write_text(f'    private_path = "{sentinel}"\n', encoding="utf-8")
+    _run_git(repository, "add", relative)
+    _run_git(repository, "commit", "-qm", "historical synthetic path")
+    if not keep_current:
+        path.unlink()
+        _run_git(repository, "add", "-u")
+        _run_git(repository, "commit", "-qm", "remove synthetic path")
+
+    report = audit_tool.package_audit(
+        repository, sdist, wheel, tmp_path / "private" / "path-sentinel.yml",
+        base_ref=base,
+    )
+
+    assert (report["status"] == "passed") is accepted
+    if accepted:
+        assert report["history_test_sentinel_policy"]["exemptions"] == [
+            {
+                "object_id": _run_git(repository, "rev-parse", f"HEAD~1:{relative}"),
+                "sentinel_sha256": hashlib.sha256(sentinel.encode()).hexdigest(),
+                "occurrences": 1,
+            }
+        ]
+    else:
+        assert any(finding.endswith(":private_root") for finding in report["findings"])
+
+
 def test_package_audit_rejects_tracked_codex_credentials_directory(
     tmp_path: Path,
 ) -> None:
