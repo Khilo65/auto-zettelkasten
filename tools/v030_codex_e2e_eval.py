@@ -8,12 +8,19 @@ import json
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
+from dataclasses import replace
 from itertools import combinations
 from pathlib import Path
 from typing import Any
 
 import v030_codex_pdf_eval as base
 from auto_zettelkasten.api import build_map
+from auto_zettelkasten.extraction import (
+    _ocr_pdf_page,
+    _page_text_is_suspicious,
+    _short_ocr_text_is_readable,
+    probe_pdf_bytes,
+)
 from auto_zettelkasten.models import LiteratureMappingPolicy, NavigationPolicy
 from auto_zettelkasten.notes import read_note, semantic_note_hash
 from auto_zettelkasten.pipeline import _custodied_pdf_candidate
@@ -242,7 +249,11 @@ def _private_json(
 
 
 def _provider_free_pdf_route(
-    case: Mapping[str, Any], request: Any, *, reader: CodexReader
+    case: Mapping[str, Any],
+    request: Any,
+    *,
+    reader: CodexReader,
+    frozen_fallback_route: str,
 ) -> tuple[str, list[int]]:
     path = case.get("path")
     attachment = case.get("attachment")
@@ -262,17 +273,57 @@ def _provider_free_pdf_route(
         )
     ):
         raise ValueError("PDF route validation requires the verified Codex PDF helper")
+    fallback = request.extraction_policy.pdf_fallback
+    probe_request = (
+        replace(
+            request,
+            extraction_policy=replace(request.extraction_policy, pdf_fallback="none"),
+        )
+        if fallback == "ocr"
+        else request
+    )
+    document = path.read_bytes()
     candidate, extracted = _custodied_pdf_candidate(
-        path.read_bytes(),
+        document,
         path,
         attachment,
         parent,
         {"source_id": base.source_id_for_item(parent)},
-        request,
+        probe_request,
         actual_primary_pdf=True,
         cancelled=None,
         reader=reader,
     )
+    if (
+        candidate is None
+        and extracted.route == "codex_pdf_unsupported"
+        and extracted.reason == "pdf_token_ceiling_exceeded"
+        and fallback == "ocr"
+    ):
+        if frozen_fallback_route not in {
+            "pypdf_pdfium_tesseract",
+            "pypdf_poppler_tesseract",
+        }:
+            raise ValueError(f"{case['case_id']} frozen OCR fallback route is invalid")
+        probe = probe_pdf_bytes(document)
+        if probe.status == "failed" or not probe.suspicious_pages:
+            raise ValueError(f"{case['case_id']} OCR renderer probe is unavailable")
+        # ponytail: one accepted PDFium page pins the aggregate route; otherwise stop.
+        recovered = _ocr_pdf_page(
+            document,
+            probe.suspicious_pages[0] - 1,
+            request.extraction_policy.languages,
+        )
+        if (
+            not recovered.available
+            or recovered.route != "pdfium_tesseract"
+            or (
+                _page_text_is_suspicious(recovered.text)
+                and not _short_ocr_text_is_readable(recovered.text)
+            )
+        ):
+            raise ValueError(f"{case['case_id']} OCR renderer probe failed")
+        return f"pypdf_{recovered.route}", []
     if candidate is None or extracted.status != "succeeded":
         raise ValueError(f"{case['case_id']} PDF route probe did not succeed")
     selected_pages: list[int] = []
@@ -747,7 +798,10 @@ def _validate_strategic_custody(
             if compute_pdf_routes:
                 assert route_reader is not None
                 expected_live_route, expected_pages = _provider_free_pdf_route(
-                    case, request, reader=route_reader
+                    case,
+                    request,
+                    reader=route_reader,
+                    frozen_fallback_route=str(selected["route"]),
                 )
             else:
                 route_row = oracle_routes.get(case["case_id"])

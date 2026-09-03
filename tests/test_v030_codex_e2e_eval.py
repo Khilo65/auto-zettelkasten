@@ -29,6 +29,7 @@ from auto_zettelkasten.files import (
     sha256_text,
     write_yaml,
 )
+from auto_zettelkasten.models import ExtractionPolicy, MapRequest
 from auto_zettelkasten.notes import semantic_note_hash
 from conftest import fake_codex_preflight
 
@@ -482,9 +483,14 @@ def _bind_synthetic_strategic_fixture(
     }
 
     def route(
-        case: dict[str, Any], _request: Any, *, reader: Any
+        case: dict[str, Any],
+        _request: Any,
+        *,
+        reader: Any,
+        frozen_fallback_route: str,
     ) -> tuple[str, list[int]]:
         assert isinstance(reader, runner.CodexReader)
+        assert frozen_fallback_route
         if case["case_id"] in text_pdf_ids:
             return "pypdf_text", []
         return runner.base.PDF_INPUT_ROUTE, []
@@ -1129,7 +1135,7 @@ def test_provider_free_pdf_route_uses_verified_reader_without_model_turn(
         "parent": parent,
         "attachment": {"key": "A1", "data": {"key": "A1"}},
     }
-    request = SimpleNamespace()
+    request = SimpleNamespace(extraction_policy=SimpleNamespace(pdf_fallback="none"))
     calls: list[Any] = []
 
     def candidate(*args: Any, **kwargs: Any) -> tuple[dict[str, Any], Any]:
@@ -1143,11 +1149,137 @@ def test_provider_free_pdf_route_uses_verified_reader_without_model_turn(
 
     with runner.base.deny_codex_attempts():
         route, pages = runner._provider_free_pdf_route(
-            case, request, reader=reader
+            case,
+            request,
+            reader=reader,
+            frozen_fallback_route="pypdf_text",
         )
 
     assert (route, pages) == (runner.base.PDF_INPUT_ROUTE, [])
     assert calls == [reader]
+
+
+@pytest.mark.parametrize(
+    ("ocr_text", "ocr_route", "accepted"),
+    [
+        ("Readable title", "pdfium_tesseract", True),
+        ("", "pdfium_tesseract", False),
+        ("Readable title", "poppler_tesseract", False),
+    ],
+)
+def test_provider_free_pdf_route_only_probes_one_ocr_page_for_token_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ocr_text: str,
+    ocr_route: str,
+    accepted: bool,
+) -> None:
+    reader = runner.CodexReader(
+        runner.base.SOURCE_MODEL,
+        allow_cloud=True,
+        reasoning_effort=runner.base.REASONING_EFFORT,
+    )
+    reader._preflight = {
+        "version": runner.base.DIRECT_PDF_CLI_VERSION,
+        "helper_version": runner.base.DIRECT_PDF_CLI_VERSION,
+        "helper_manifest_valid": True,
+        "pdf_input_file_capability": True,
+        "_helper_manifest_identity": {
+            "manifest_version": 1,
+            "upstream_tag": "rust-v0.152.1",
+            "upstream_commit": "5adb68a49933ae446bf11935662c83dba55a0804",
+            "platform": "macos-arm64",
+            "license": "Apache-2.0",
+            "notice": "NOTICE",
+            "input_file_protocol_revision": "input_file-v1",
+            "patch_sha256": "1" * 64,
+            "binary_sha256": "2" * 64,
+            "manifest_sha256": "3" * 64,
+        },
+    }
+    path = tmp_path / "source.pdf"
+    path.write_bytes(b"%PDF-1.4\nsynthetic\n%%EOF\n")
+    parent = {"key": "P1", "data": {"key": "P1"}}
+    case = {
+        "case_id": "p1",
+        "path": path,
+        "parent": parent,
+        "attachment": {"key": "A1", "data": {"key": "A1"}},
+        "expected_route": "pypdf_text",
+    }
+    request = MapRequest(
+        tmp_path,
+        provider="codex",
+        model=runner.base.SOURCE_MODEL,
+        literature_model=runner.base.RELATIONSHIP_MODEL,
+        reasoning_effort=runner.base.REASONING_EFFORT,
+        allow_cloud=True,
+        extraction_policy=ExtractionPolicy(pdf_fallback="ocr"),
+    )
+
+    unsupported_reason = "pdf_token_ceiling_exceeded"
+    probe_calls: list[int] = []
+
+    def candidate(*args: Any, **kwargs: Any) -> tuple[None, Any]:
+        assert args[5].extraction_policy.pdf_fallback == "none"
+        return None, SimpleNamespace(
+            status="failed",
+            route="codex_pdf_unsupported",
+            reason=unsupported_reason,
+        )
+
+    monkeypatch.setattr(runner, "_custodied_pdf_candidate", candidate)
+    monkeypatch.setattr(
+        runner,
+        "probe_pdf_bytes",
+        lambda _document: SimpleNamespace(
+            status="succeeded", suspicious_pages=(4,)
+        ),
+    )
+
+    def ocr_page(
+        _document: bytes, page_index: int, _languages: tuple[str, ...]
+    ) -> Any:
+        probe_calls.append(page_index)
+        return SimpleNamespace(available=True, route=ocr_route, text=ocr_text)
+
+    monkeypatch.setattr(runner, "_ocr_pdf_page", ocr_page)
+
+    if not accepted:
+        with runner.base.deny_codex_attempts(), pytest.raises(
+            ValueError, match="OCR renderer probe failed"
+        ):
+            runner._provider_free_pdf_route(
+                case,
+                request,
+                reader=reader,
+                frozen_fallback_route="pypdf_poppler_tesseract",
+            )
+        assert probe_calls == [3]
+        return
+
+    with runner.base.deny_codex_attempts():
+        route, pages = runner._provider_free_pdf_route(
+            case,
+            request,
+            reader=reader,
+            frozen_fallback_route="pypdf_poppler_tesseract",
+        )
+
+    assert (route, pages) == ("pypdf_pdfium_tesseract", [])
+    assert probe_calls == [3]
+
+    unsupported_reason = "pdf_structural_probe_failed"
+    with runner.base.deny_codex_attempts(), pytest.raises(
+        ValueError, match="route probe did not succeed"
+    ):
+        runner._provider_free_pdf_route(
+            case,
+            request,
+            reader=reader,
+            frozen_fallback_route="pypdf_poppler_tesseract",
+        )
+    assert probe_calls == [3]
 
 
 def test_mixed_raw_fresh_run_and_exact_replay(tmp_path: Path) -> None:
