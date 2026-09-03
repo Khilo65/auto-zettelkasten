@@ -1344,7 +1344,14 @@ _CODEX_PDF_MAX_BYTES = 50_000_000
 # Packaging replaces this empty set with the reviewed patch/binary hash pair.
 # A companion manifest can describe a build, but it cannot grant itself trust.
 _CODEX_PDF_HELPER_TRUST: Mapping[str, frozenset[tuple[str, str]]] = {
-    "macos-arm64": frozenset()
+    "macos-arm64": frozenset(
+        {
+            (
+                "9a3b9c919c94fb51726f0d14ae85c3e0de8906f226cdc0e6f02fe279e2758c3b",
+                "5239c4a1648e1d63b03e941096d78e2b013f50a9078bca5586cd403512899b18",
+            )
+        }
+    )
 }
 
 
