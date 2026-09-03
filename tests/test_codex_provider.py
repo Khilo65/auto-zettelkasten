@@ -1139,7 +1139,19 @@ for line in sys.stdin:
             time.sleep(10)
             continue
         print(json.dumps({"id": request_id, "result": {"turn": {"id": "turn-1"}}}), flush=True)
-        if mode == "tool":
+        if mode in {"code_mode_warning", "code_mode_warning_tool", "unknown_warning"}:
+            warning = (
+                "Code Mode is unavailable because code-mode host is disabled. "
+                "Code mode will fail closed; enable `features.code_mode_host` and "
+                "install `codex-code-mode-host`."
+                if mode != "unknown_warning"
+                else "unrecognized private warning"
+            )
+            print(json.dumps({"method": "warning", "params": {
+                "threadId": "thread-1",
+                "message": warning,
+            }}), flush=True)
+        if mode in {"tool", "code_mode_warning_tool"}:
             print(json.dumps({"method": "item/completed", "params": {
                 "threadId": "thread-1",
                 "turnId": "turn-1",
@@ -1302,6 +1314,34 @@ def test_codex_pdf_app_server_sends_exact_ordered_file_text_and_contract(
         "networkAccess": False,
     }
     assert turn["outputSchema"]["additionalProperties"] is False
+
+
+def test_codex_pdf_app_server_accepts_only_the_expected_code_mode_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = tmp_path / "auto-zettelkasten-codex"
+    capture = tmp_path / "capture.json"
+    pdf = tmp_path / "source.pdf"
+    pdf.write_bytes(b"%PDF-1.7\nprivate-pdf-sentinel\n%%EOF\n")
+
+    def invoke(mode: str) -> dict[str, object]:
+        _fake_codex_app_server(executable, capture, mode=mode)
+        reader = CodexReader("gpt-5.6-luna", allow_cloud=True)
+        reader._preflight = _fake_pdf_preflight(tmp_path, executable, monkeypatch)
+        return dict(
+            reader.read_source_bundle(
+                "",
+                {"_source_context": {"source_id": "source-zotero-A1"}},
+                attachment_paths=[pdf],
+            )
+        )
+
+    assert invoke("code_mode_warning")["evidence_anchors"]
+    with pytest.raises(ProviderIsolationFailure, match="warning"):
+        invoke("unknown_warning")
+    with pytest.raises(ProviderIsolationFailure, match="tool"):
+        invoke("code_mode_warning_tool")
 
 
 def test_codex_pdf_rejects_unverified_helper_before_process_spawn(

@@ -4119,6 +4119,7 @@ class CodexReader(_CapabilityAwareReader):
                 "thread/tokenUsage/updated",
                 "turn/completed",
                 "turn/started",
+                "warning",
             }
 
             turn_methods = {
@@ -4198,7 +4199,10 @@ class CodexReader(_CapabilityAwareReader):
                             "Codex app-server emitted a malformed thread event"
                         )
                     event_thread_id = str(event_thread.get("id") or "")
-                elif method in turn_methods or method == "thread/status/changed":
+                elif method in turn_methods or method in {
+                    "thread/status/changed",
+                    "warning",
+                }:
                     event_thread_id = str(params.get("threadId") or "")
                 if method in turn_methods:
                     if method.startswith("turn/"):
@@ -4219,6 +4223,7 @@ class CodexReader(_CapabilityAwareReader):
                 elif method in turn_methods or method in {
                     "thread/started",
                     "thread/status/changed",
+                    "warning",
                 }:
                     raise ProviderIsolationFailure(
                         "Codex app-server event is missing its thread binding"
@@ -4233,7 +4238,19 @@ class CodexReader(_CapabilityAwareReader):
                     raise ProviderIsolationFailure(
                         "Codex app-server event is missing its turn binding"
                     )
-                if method in {"item/started", "item/completed"}:
+                if method == "warning":
+                    message_value = params.get("message")
+                    category = (
+                        _codex_error_item_category(message_value)
+                        if isinstance(message_value, str)
+                        else "unknown"
+                    )
+                    if category != "code_mode_disabled":
+                        raise ProviderIsolationFailure(
+                            "Codex app-server emitted an unexpected warning: "
+                            + category
+                        )
+                elif method in {"item/started", "item/completed"}:
                     item = params.get("item")
                     if not isinstance(item, Mapping) or not str(item.get("id") or ""):
                         raise ProviderIsolationFailure(
