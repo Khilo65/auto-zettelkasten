@@ -487,7 +487,7 @@ def test_provider_response_reuse_requires_same_codex_execution_identity() -> Non
     )
 
 
-def test_codex_auto_concurrency_defaults_to_sixteen(
+def test_codex_auto_concurrency_uses_calibrated_role_limits(
     tmp_path: Path,
 ) -> None:
     request = MapRequest(
@@ -498,7 +498,7 @@ def test_codex_auto_concurrency_defaults_to_sixteen(
     )
     reader = CodexReader("gpt-5.6-luna")
     assert request.provider_concurrency == "auto"
-    assert _source_worker_count(reader, request, 20) == 16
+    assert _source_worker_count(reader, request, 20) == 8
     assert _provider_worker_count(
         LiteratureMapRequest(
             tmp_path,
