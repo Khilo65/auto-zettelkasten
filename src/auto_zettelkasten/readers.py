@@ -1195,11 +1195,16 @@ _CODEX_SKILL_ARGUMENTS = (
     "-c",
     "skills.include_instructions=false",
 )
+_CODEX_NO_RETRY_PROVIDER_ID = "auto_zettelkasten_openai"
 _CODEX_NO_RETRY_ARGUMENTS = (
     "-c",
-    "model_providers.openai.request_max_retries=0",
+    f'model_provider="{_CODEX_NO_RETRY_PROVIDER_ID}"',
     "-c",
-    "model_providers.openai.stream_max_retries=0",
+    f"model_providers.{_CODEX_NO_RETRY_PROVIDER_ID}="
+    '{ name = "OpenAI", wire_api = "responses", '
+    "requires_openai_auth = true, supports_websockets = true, "
+    "supports_standalone_web_search = true, request_max_retries = 0, "
+    "stream_max_retries = 0 }",
 )
 
 
@@ -4399,10 +4404,15 @@ class CodexReader(_CapabilityAwareReader):
                         "Codex app-server did not create an ephemeral thread"
                     )
                 thread_id = str(thread["id"])
+                expected_provider = (
+                    _CODEX_NO_RETRY_PROVIDER_ID
+                    if version == "0.152.1"
+                    else "openai"
+                )
                 if (
                     thread_result.get("model") != self.model
-                    or thread_result.get("modelProvider") != "openai"
-                    or thread.get("modelProvider") != "openai"
+                    or thread_result.get("modelProvider") != expected_provider
+                    or thread.get("modelProvider") != expected_provider
                 ):
                     raise ProviderIsolationFailure(
                         "Codex app-server changed the requested model or provider"
@@ -4851,6 +4861,14 @@ class CodexReader(_CapabilityAwareReader):
             except (KeyboardInterrupt, InterruptedError) as exc:
                 _terminate_codex_process(process)
                 request_failure = ProviderInterrupted("Codex request interrupted")
+                request_failure_cause = exc
+            except (BrokenPipeError, OSError) as exc:
+                _terminate_codex_process(process)
+                request_failure = ProviderTransportError(
+                    "Codex CLI transport failed",
+                    transport_kind="codex_cli",
+                    cause=exc,
+                )
                 request_failure_cause = exc
             finally:
                 stdout_thread.join(timeout=2)

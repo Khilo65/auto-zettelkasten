@@ -67,6 +67,7 @@ from auto_zettelkasten.readers import (
     _codex_failure,
     _codex_json_schema,
     _codex_pdf_helper_manifest,
+    _codex_retry_arguments,
     _codex_tool_feature_arguments,
     _redact_codex_diagnostic,
     cancel_active_provider_responses,
@@ -76,6 +77,20 @@ from auto_zettelkasten.readers import (
     codex_stage_identity,
 )
 from conftest import SECTION_KEYS, FakeZotero, fake_codex_preflight
+
+
+def test_codex_0152_no_retry_config_does_not_override_reserved_provider() -> None:
+    arguments = _codex_retry_arguments("0.152.1")
+
+    assert all("model_providers.openai." not in value for value in arguments)
+    assert 'model_provider="auto_zettelkasten_openai"' in arguments
+    provider = next(
+        value
+        for value in arguments
+        if value.startswith("model_providers.auto_zettelkasten_openai=")
+    )
+    assert "request_max_retries = 0" in provider
+    assert "stream_max_retries = 0" in provider
 
 
 def test_codex_executable_prefers_override_then_companion_then_stock(
@@ -1075,7 +1090,7 @@ for line in sys.stdin:
     if method == "initialize":
         print(json.dumps({"id": request_id, "result": {}}), flush=True)
     elif method == "thread/start":
-        provider = "other" if mode == "wrong_provider" else "openai"
+        provider = "other" if mode == "wrong_provider" else "auto_zettelkasten_openai"
         print(json.dumps({"id": request_id, "result": {
             "model": "gpt-5.6-luna",
             "modelProvider": provider,
@@ -1217,8 +1232,13 @@ def test_codex_pdf_app_server_sends_exact_ordered_file_text_and_contract(
     assert result["evidence_anchors"][0]["locator"] == "p. 1"
     captured = json.loads(capture.read_text(encoding="utf-8"))
     assert captured["argv"][1] == "app-server"
-    assert "model_providers.openai.request_max_retries=0" in captured["argv"]
-    assert "model_providers.openai.stream_max_retries=0" in captured["argv"]
+    assert 'model_provider="auto_zettelkasten_openai"' in captured["argv"]
+    assert any(
+        value.startswith("model_providers.auto_zettelkasten_openai=")
+        and "request_max_retries = 0" in value
+        and "stream_max_retries = 0" in value
+        for value in captured["argv"]
+    )
     requests = [row for row in captured["messages"] if row.get("id") is not None]
     assert [row["method"] for row in requests] == [
         "initialize",
@@ -1558,8 +1578,13 @@ def test_codex_transport_is_sanitized_schema_bound_and_tool_fail_closed(
     assert captured["argv"][-len(_codex_tool_feature_arguments("0.152.1")):] == list(
         _codex_tool_feature_arguments("0.152.1")
     )
-    assert "model_providers.openai.request_max_retries=0" in captured["argv"]
-    assert "model_providers.openai.stream_max_retries=0" in captured["argv"]
+    assert 'model_provider="auto_zettelkasten_openai"' in captured["argv"]
+    assert any(
+        value.startswith("model_providers.auto_zettelkasten_openai=")
+        and "request_max_retries = 0" in value
+        and "stream_max_retries = 0" in value
+        for value in captured["argv"]
+    )
     assert "OPENAI_API_KEY" not in captured["env"]
     assert captured["env"]["PATH"] == "preflight-snapshot"
     assert captured["codex_home_entries"] == ["auth.json", "models_cache.json"]
@@ -1585,6 +1610,28 @@ def test_codex_transport_is_sanitized_schema_bound_and_tool_fail_closed(
         captured["argv"][captured["argv"].index("--output-schema") + 1]
     )
     assert schema_path.parent != Path(captured["cwd"])
+
+
+def test_codex_early_stdin_close_is_typed_transport_failure(tmp_path: Path) -> None:
+    executable = tmp_path / "codex"
+    executable.write_text(
+        f"#!{sys.executable}\nimport os, time\nos.close(0)\ntime.sleep(2)\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    reader = CodexReader("gpt-5.6-luna", allow_cloud=True)
+    reader._preflight = fake_codex_preflight(tmp_path, executable, {})
+    reader._preflight["version"] = "0.152.1"
+
+    with pytest.raises(ProviderTransportError, match="CLI transport failed"):
+        reader._generate_with_reasoning(
+            "system",
+            "user" * 300_000,
+            2_048,
+            5,
+            reasoning_effort="medium",
+            output_contract="chunk_evidence",
+        )
 
 
 @pytest.mark.parametrize(
