@@ -1195,16 +1195,18 @@ _CODEX_SKILL_ARGUMENTS = (
     "-c",
     "skills.include_instructions=false",
 )
-_CODEX_NO_RETRY_PROVIDER_ID = "auto_zettelkasten_openai"
+_CODEX_NO_RETRY_PROVIDER_ID = "openai"
 _CODEX_NO_RETRY_ARGUMENTS = (
     "-c",
     f'model_provider="{_CODEX_NO_RETRY_PROVIDER_ID}"',
     "-c",
-    f"model_providers.{_CODEX_NO_RETRY_PROVIDER_ID}="
-    '{ name = "OpenAI", wire_api = "responses", '
-    "requires_openai_auth = true, supports_websockets = true, "
-    "supports_standalone_web_search = true, request_max_retries = 0, "
-    "stream_max_retries = 0 }",
+    'openai_base_url="https://chatgpt.com/backend-api/codex"',
+    "-c",
+    'chatgpt_base_url="https://chatgpt.com/backend-api/"',
+    "-c",
+    f"model_providers.{_CODEX_NO_RETRY_PROVIDER_ID}.request_max_retries=0",
+    "-c",
+    f"model_providers.{_CODEX_NO_RETRY_PROVIDER_ID}.stream_max_retries=0",
 )
 
 
@@ -1348,8 +1350,8 @@ _CODEX_PDF_HELPER_TRUST: Mapping[str, frozenset[tuple[str, str]]] = {
     "macos-arm64": frozenset(
         {
             (
-                "9a3b9c919c94fb51726f0d14ae85c3e0de8906f226cdc0e6f02fe279e2758c3b",
-                "438690df109d2f51c7c6f6dbaf4c7fb5877c05d0ad297c30b72d142e6bea4ec9",
+                "0bce6029e189dd21acd31492278c4377694a5012a2ddff14bbc8aef3a9fafcad",
+                "2f3bffb94ed05de1d32b285d638747d92bc6f2104eb8f551492c9db2d6b78547",
             )
         }
     )
@@ -3505,6 +3507,7 @@ def codex_preflight_status(
         feature_environment["CODEX_HOME"] = clean_codex_home
         features = _parse_codex_features(
             check(
+                *_codex_retry_arguments(version),
                 *_codex_tool_feature_arguments(version),
                 "features", "list",
                 check_environment=feature_environment,

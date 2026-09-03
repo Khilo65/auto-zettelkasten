@@ -60,6 +60,7 @@ from auto_zettelkasten.readers import (
     ProviderTimeout,
     ProviderTransportError,
     ProviderUnsupportedAttachment,
+    _OUTPUT_CONTRACT,
     _SOURCE_BUNDLE_ATTACHMENTS,
     _CODEX_TRANSPORT_INSTRUCTIONS,
     _codex_executable,
@@ -79,18 +80,14 @@ from auto_zettelkasten.readers import (
 from conftest import SECTION_KEYS, FakeZotero, fake_codex_preflight
 
 
-def test_codex_0152_no_retry_config_does_not_override_reserved_provider() -> None:
+def test_codex_0152_no_retry_config_uses_guarded_builtin_overrides() -> None:
     arguments = _codex_retry_arguments("0.152.1")
 
-    assert all("model_providers.openai." not in value for value in arguments)
-    assert 'model_provider="auto_zettelkasten_openai"' in arguments
-    provider = next(
-        value
-        for value in arguments
-        if value.startswith("model_providers.auto_zettelkasten_openai=")
-    )
-    assert "request_max_retries = 0" in provider
-    assert "stream_max_retries = 0" in provider
+    assert 'model_provider="openai"' in arguments
+    assert 'openai_base_url="https://chatgpt.com/backend-api/codex"' in arguments
+    assert 'chatgpt_base_url="https://chatgpt.com/backend-api/"' in arguments
+    assert "model_providers.openai.request_max_retries=0" in arguments
+    assert "model_providers.openai.stream_max_retries=0" in arguments
 
 
 def test_codex_executable_prefers_override_then_companion_then_stock(
@@ -589,7 +586,10 @@ def test_codex_preflight_uses_one_sanitized_executable_environment(
     base_codex_home = base_environment.pop("CODEX_HOME", None)
     assert feature_environment == base_environment
     assert calls[1][1]["CODEX_HOME"] != base_codex_home
-    assert calls[1][0][1:-2] == list(_codex_tool_feature_arguments(cli_profile))
+    assert calls[1][0][1:-2] == [
+        *_codex_retry_arguments(cli_profile),
+        *_codex_tool_feature_arguments(cli_profile),
+    ]
     assert all(args[0] == str(executable) for args, _ in calls)
     assert all("DEEPSEEK_API_KEY" not in environment for _, environment in calls)
     assert all(
@@ -615,6 +615,32 @@ def test_codex_preflight_uses_one_sanitized_executable_environment(
     )
     with pytest.raises(ProviderError, match="does not support medium effort"):
         codex_preflight_status("gpt-5.6-luna")
+
+
+def test_codex_preflight_failure_precedes_attempt_reservation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reader = CodexReader("gpt-5.6-luna", allow_cloud=True)
+
+    def reject_preflight() -> dict[str, object]:
+        raise ProviderError("Codex CLI preflight failed: unsupported retry override")
+
+    reader._preflight_loader = reject_preflight
+    monkeypatch.setattr(
+        "auto_zettelkasten.readers.reserve_codex_attempt",
+        lambda *_args, **_kwargs: pytest.fail("failed preflight reserved an attempt"),
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail("failed preflight spawned Codex"),
+    )
+    token = _OUTPUT_CONTRACT.set("source_bundle")
+    try:
+        with pytest.raises(ProviderError, match="unsupported retry override"):
+            reader._generate_text("system", "user", 128, 5)
+    finally:
+        _OUTPUT_CONTRACT.reset(token)
 
 
 def test_codex_rejects_credential_root_inside_workspace_before_cli(
@@ -1090,7 +1116,7 @@ for line in sys.stdin:
     if method == "initialize":
         print(json.dumps({"id": request_id, "result": {}}), flush=True)
     elif method == "thread/start":
-        provider = "other" if mode == "wrong_provider" else "auto_zettelkasten_openai"
+        provider = "other" if mode == "wrong_provider" else "openai"
         print(json.dumps({"id": request_id, "result": {
             "model": "gpt-5.6-luna",
             "modelProvider": provider,
@@ -1232,13 +1258,11 @@ def test_codex_pdf_app_server_sends_exact_ordered_file_text_and_contract(
     assert result["evidence_anchors"][0]["locator"] == "p. 1"
     captured = json.loads(capture.read_text(encoding="utf-8"))
     assert captured["argv"][1] == "app-server"
-    assert 'model_provider="auto_zettelkasten_openai"' in captured["argv"]
-    assert any(
-        value.startswith("model_providers.auto_zettelkasten_openai=")
-        and "request_max_retries = 0" in value
-        and "stream_max_retries = 0" in value
-        for value in captured["argv"]
-    )
+    assert 'model_provider="openai"' in captured["argv"]
+    assert 'openai_base_url="https://chatgpt.com/backend-api/codex"' in captured["argv"]
+    assert 'chatgpt_base_url="https://chatgpt.com/backend-api/"' in captured["argv"]
+    assert "model_providers.openai.request_max_retries=0" in captured["argv"]
+    assert "model_providers.openai.stream_max_retries=0" in captured["argv"]
     requests = [row for row in captured["messages"] if row.get("id") is not None]
     assert [row["method"] for row in requests] == [
         "initialize",
@@ -1578,13 +1602,11 @@ def test_codex_transport_is_sanitized_schema_bound_and_tool_fail_closed(
     assert captured["argv"][-len(_codex_tool_feature_arguments("0.152.1")):] == list(
         _codex_tool_feature_arguments("0.152.1")
     )
-    assert 'model_provider="auto_zettelkasten_openai"' in captured["argv"]
-    assert any(
-        value.startswith("model_providers.auto_zettelkasten_openai=")
-        and "request_max_retries = 0" in value
-        and "stream_max_retries = 0" in value
-        for value in captured["argv"]
-    )
+    assert 'model_provider="openai"' in captured["argv"]
+    assert 'openai_base_url="https://chatgpt.com/backend-api/codex"' in captured["argv"]
+    assert 'chatgpt_base_url="https://chatgpt.com/backend-api/"' in captured["argv"]
+    assert "model_providers.openai.request_max_retries=0" in captured["argv"]
+    assert "model_providers.openai.stream_max_retries=0" in captured["argv"]
     assert "OPENAI_API_KEY" not in captured["env"]
     assert captured["env"]["PATH"] == "preflight-snapshot"
     assert captured["codex_home_entries"] == ["auth.json", "models_cache.json"]
