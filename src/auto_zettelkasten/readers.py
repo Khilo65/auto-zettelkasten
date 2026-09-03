@@ -1230,6 +1230,7 @@ _CODEX_TOOL_ITEM_TYPES = frozenset(
 _CODEX_ERROR_ITEM_CATEGORIES = frozenset(
     {
         "deprecation_notice",
+        "code_mode_disabled",
         "managed_config_fallback",
         "model_catalog_fallback",
         "model_reroute",
@@ -3674,6 +3675,12 @@ def _codex_error_item_category(message: str) -> str:
         "disable unused skills or plugins to leave more room for the rest.",
     }:
         return "skills_context_budget"
+    if normalized == (
+        "code mode is unavailable because code-mode host is disabled. "
+        "code mode will fail closed; enable `features.code_mode_host` and "
+        "install `codex-code-mode-host`."
+    ):
+        return "code_mode_disabled"
     if (
         normalized.startswith("configured value for `")
         and " is disallowed" in normalized
@@ -4802,7 +4809,10 @@ class CodexReader(_CapabilityAwareReader):
                             and isinstance(message, str)
                         ):
                             category = _codex_error_item_category(message)
-                            if category == "skills_context_budget":
+                            if category in {
+                                "code_mode_disabled",
+                                "skills_context_budget",
+                            }:
                                 continue
                             stream_failure.append(
                                 ProviderError(

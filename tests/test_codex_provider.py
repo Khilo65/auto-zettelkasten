@@ -1764,6 +1764,11 @@ def test_codex_rejects_every_tool_event_category(
             "Codex can still see every skill, but some descriptions are shorter. "
             "Disable unused skills or plugins to leave more room for the rest."
         ),
+        (
+            "Code Mode is unavailable because code-mode host is disabled. "
+            "Code mode will fail closed; enable `features.code_mode_host` and install "
+            "`codex-code-mode-host`."
+        ),
     ],
 )
 def test_codex_accepts_nonfatal_error_item_without_reporting_a_tool(
@@ -1880,6 +1885,12 @@ def test_codex_rejects_non_mapping_item_event(tmp_path: Path) -> None:
         (
             "Falling back from WebSockets to HTTPS transport.",
             "transport_fallback",
+        ),
+        (
+            "Code Mode is unavailable because code-mode host is disabled. "
+            "Code mode will fail closed; enable `features.code_mode_host` and install "
+            "`codex-code-mode-host`.",
+            "code_mode_disabled",
         ),
         ("unrecognized private warning", "unknown"),
     ],
