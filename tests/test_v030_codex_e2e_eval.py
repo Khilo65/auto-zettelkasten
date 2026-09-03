@@ -2227,6 +2227,87 @@ def test_runner_rejects_auto_zettelkasten_from_another_checkout(
         )
 
 
+def test_strategic8_two_core_revalidation_preserves_failed_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, _path40, custody8, custody40 = _strategic_manifests(tmp_path / "private")
+    _bind_synthetic_strategic_fixture(monkeypatch, custody8, custody40)
+    digest = sha256_file(path)
+    manifest, settings = runner._manifest_settings(path, digest)
+    _, cases, workspace = runner.base._validated_manifest(path, digest, settings)
+    oracle = manifest["_strategic8_semantic_oracle"]
+    source_by_key = {
+        str(case["parent"]["key"]).casefold(): runner.base.source_id_for_item(case["parent"])
+        for case in cases
+    }
+    cores = [source_by_key[key] for key in oracle["core_parent_keys"]]
+    members = [*cores, source_by_key[oracle["context_parent_key"]]]
+    report = {
+        "status": "completed",
+        "cluster_map": {"clusters": [{
+            "source_ids": members,
+            "source_roles": {
+                source: "core" if source in cores[:2] else "context"
+                for source in members
+            },
+        }]},
+    }
+    write_yaml(workspace / "02_source_memory" / "indexes" / "typed_links.yml", {
+        "relations": [
+            {"source_id": cores[0], "target_source_id": source,
+             "decision_status": "accepted", "active": True}
+            for source in members[1:]
+        ],
+        "current_pair_decisions": [
+            {"source_ids": list(pair)} for pair in combinations(members, 2)
+        ],
+    })
+    run_id = manifest["run_id"]
+    run_root = workspace / "11_state" / "runs" / run_id
+    write_yaml(run_root / "run_report.yml", report)
+    (run_root / "inventory.json").write_text("[]", encoding="utf-8")
+    counts = {"source_attempt_count": 8, "relationship_attempt_count": 8,
+              "total_attempt_count": 16}
+    # Other acceptance dimensions have their own full-path tests.
+    monkeypatch.setattr(runner.base, "_acceptance", lambda *args: ([], counts))
+    monkeypatch.setattr(runner.base, "_attempts", lambda *args: (
+        {"count": 8, "rows": []}, {"count": 8, "rows": []},
+    ))
+    identity = runner.base._ledger_identity(manifest, digest, settings)
+    runner.base._begin_attempt_reservation(
+        workspace, identity, mode="run", source_count=0, relationship_count=0,
+        settings=settings,
+    )
+    runner.base._finish_attempt_reservation(
+        workspace, identity, state="failed", source_count=8, relationship_count=8,
+        settings=settings,
+    )
+    before = runner.base._gate_snapshot(workspace)
+    resumed = []
+
+    def resume(root: Path, identity: str, **kwargs: Any) -> Any:
+        assert root == workspace and identity == run_id
+        assert isinstance(_ACTIVE_GUARD.get(), CodexAttemptDeny)
+        assert isinstance(kwargs["reader"], runner.base._ReplayCodexReader)
+        resumed.append(identity)
+        return read_yaml(run_root / "run_report.yml")
+
+    monkeypatch.setattr(runner.base, "resume_map", resume)
+    receipt_path, receipt = runner.run_gate(
+        mode="revalidate", manifest_path=path, manifest_sha256=digest,
+        execute=True, repository_probe=lambda: (CODE_COMMIT, False),
+    )
+    assert resumed == [run_id]
+    assert receipt["status"] == "passed"
+    assert receipt["attempt_reservation_state"] == "failed_preserved"
+    assert receipt["exact_zero_call_replay"] is True
+    assert receipt["strategic8_actual_core_count"] == 2
+    assert receipt["strategic8_role_policy"] == "at_least_two_connected_cores_v1"
+    after = runner.base._gate_snapshot(workspace)
+    assert after.pop(str(receipt_path.relative_to(workspace)))
+    assert before == after
+
+
 def test_private_strategic8_cluster_labels_never_enter_provider_inputs(
     tmp_path: Path,
 ) -> None:

@@ -960,7 +960,9 @@ def test_revalidation_allows_only_the_gate_evaluator_to_change(
             command,
             0,
             "tools/v030_codex_pdf_eval.py\n"
-            "tests/test_v030_codex_pdf_eval.py\n",
+            "tests/test_v030_codex_pdf_eval.py\n"
+            "tools/v030_codex_e2e_eval.py\n"
+            "tests/test_v030_codex_e2e_eval.py\n",
             "",
         )
 
@@ -975,6 +977,20 @@ def test_revalidation_allows_only_the_gate_evaluator_to_change(
         )
 
     monkeypatch.setattr(runner.subprocess, "run", production_change)
+    with pytest.raises(ValueError, match="evaluation-only changes"):
+        runner._verify_revalidation_repository(base)
+
+    monkeypatch.setattr(runner, "_repository_state", lambda: (head, True))
+    with pytest.raises(ValueError, match="clean release worktree"):
+        runner._verify_revalidation_repository(base)
+    monkeypatch.setattr(runner, "_repository_state", lambda: (head, False))
+    monkeypatch.setattr(
+        runner.subprocess, "run",
+        lambda command, **kwargs: runner.subprocess.CompletedProcess(
+            command, 1 if command[1] == "merge-base" else 0,
+            "tools/v030_codex_e2e_eval.py\n", "",
+        ),
+    )
     with pytest.raises(ValueError, match="evaluation-only changes"):
         runner._verify_revalidation_repository(base)
 

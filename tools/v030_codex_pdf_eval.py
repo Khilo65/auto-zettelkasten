@@ -103,7 +103,12 @@ _CLUSTER_CONTRACTS = {
 _PAUSE_REASONS = frozenset({"quota", "timeout", "interruption"})
 _PROVIDER_FREE_MODES = frozenset({"replay", "revalidate"})
 _REVALIDATION_ONLY_PATHS = frozenset(
-    {"tools/v030_codex_pdf_eval.py", "tests/test_v030_codex_pdf_eval.py"}
+    {
+        "tools/v030_codex_pdf_eval.py",
+        "tests/test_v030_codex_pdf_eval.py",
+        "tools/v030_codex_e2e_eval.py",
+        "tests/test_v030_codex_e2e_eval.py",
+    }
 )
 
 
