@@ -272,6 +272,172 @@ def test_controlled_pdf_gate_is_one_direct_pdf_attempt(tmp_path: Path) -> None:
     }
     assert cases[0]["expected_route"] == runner.PDF_INPUT_ROUTE
 
+    payload["cases"][0]["expected"]["content_route"] = runner.TEXT_ROUTE
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(
+        ValueError, match="controlled PDF gate requires codex_pdf_input_file"
+    ):
+        runner._validated_manifest(
+            manifest,
+            sha256_file(manifest),
+            runner.CONTROLLED_PDF_GATE,
+        )
+
+
+def test_controlled_pdf_reader_sends_verified_custody_pdf_with_empty_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = _manifest(tmp_path / "private")
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["cases"] = [payload["cases"][1]]
+    payload["gate"] = runner.CONTROLLED_PDF_GATE.manifest_binding()
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    _validated, cases, workspace = runner._validated_manifest(
+        manifest,
+        sha256_file(manifest),
+        runner.CONTROLLED_PDF_GATE,
+    )
+    case = cases[0]
+    helper = _helper_identity()
+    events: list[Any] = []
+
+    def fake_status(_self: Any) -> dict[str, Any]:
+        events.append("preflight")
+        return {
+            "version": runner.DIRECT_PDF_CLI_VERSION,
+            "helper_version": runner.DIRECT_PDF_CLI_VERSION,
+            "helper_manifest_valid": True,
+            "pdf_input_file_capability": True,
+            "_helper_manifest_identity": helper,
+        }
+
+    def fake_read(
+        _self: Any,
+        text: str,
+        metadata: Any,
+        question: str | None = None,
+        *,
+        attachment_paths: Any = (),
+    ) -> dict[str, Any]:
+        events.append((text, metadata, question, tuple(attachment_paths)))
+        return {"accepted": True}
+
+    monkeypatch.setattr(runner.CodexReader, "pdf_input_file_status", fake_status)
+    monkeypatch.setattr(runner.CodexReader, "read_source_bundle", fake_read)
+    reader = runner._ControlledPdfReader(
+        runner.SOURCE_MODEL,
+        allow_cloud=True,
+        reasoning_effort=runner.REASONING_EFFORT,
+        controlled_workspace=workspace,
+        controlled_case=case,
+    )
+    copied_custody_path = case["path"].with_name("A2.pdf")
+    copied_custody_path.write_bytes(case["path"].read_bytes())
+    metadata = {
+        **case["parent"]["data"],
+        "_source_context": {
+            "source_id": runner.source_id_for_item(case["parent"]),
+            "zotero_key": case["parent"]["key"],
+            "source_file": str(copied_custody_path),
+            "custody_sha256": case["sha256"],
+            "route": runner.TEXT_ROUTE,
+            "media_type": "application/pdf",
+            "source_scope": "full_document",
+        },
+    }
+
+    assert reader.should_read_source_bundle_directly(
+        "adequate embedded text", metadata
+    )
+    assert reader.read_source_bundle(
+        "adequate embedded text", metadata, "question"
+    ) == {"accepted": True}
+    assert events == [
+        "preflight",
+        "preflight",
+        ("", metadata, "question", (copied_custody_path,)),
+    ]
+
+    outside = workspace / "outside.pdf"
+    outside.write_bytes(case["path"].read_bytes())
+    outside_metadata = json.loads(json.dumps(metadata))
+    outside_metadata["_source_context"]["source_file"] = str(outside)
+    with pytest.raises(
+        runner.ProviderIsolationFailure,
+        match="does not match the manifest",
+    ):
+        reader.should_read_source_bundle_directly("", outside_metadata)
+
+
+def test_controlled_route_keeps_honest_text_acquisition_and_requires_pdf_transport(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(tmp_path / "private")
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["cases"] = [payload["cases"][1]]
+    payload["gate"] = runner.CONTROLLED_PDF_GATE.manifest_binding()
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    validated, cases, workspace = runner._validated_manifest(
+        manifest,
+        sha256_file(manifest),
+        runner.CONTROLLED_PDF_GATE,
+    )
+    case = cases[0]
+    item_root = (
+        workspace
+        / "11_state"
+        / "runs"
+        / str(validated["run_id"])
+        / "items"
+        / str(case["parent"]["key"])
+    )
+    write_yaml(
+        item_root / "frozen_content.yml",
+        {
+            "content_hash": case["sha256"],
+            "source_file": str(case["path"]),
+            "content_route": runner.TEXT_ROUTE,
+            "media_type": "application/pdf",
+            "source_scope": "full_document",
+        },
+    )
+
+    errors, routes = runner._route_errors(
+        workspace,
+        str(validated["run_id"]),
+        cases,
+        runner.CONTROLLED_PDF_GATE,
+    )
+    assert errors == []
+    assert routes == [
+        {
+            "case_id": case["case_id"],
+            "expected_route": runner.PDF_INPUT_ROUTE,
+            "acquisition_route": runner.TEXT_ROUTE,
+            "selected_pages": [],
+            "recovery": "not_applicable",
+        }
+    ]
+    assert runner._direct_pdf_transport_errors(
+        cases,
+        [
+            _usage_row(
+                1,
+                source=True,
+                contract_id="source_bundle",
+                pdf_hash=str(case["sha256"]),
+            )
+        ],
+    ) == []
+    four_pdf_errors, _routes = runner._route_errors(
+        workspace,
+        str(validated["run_id"]),
+        cases,
+        runner.FOUR_PDF_GATE,
+    )
+    assert f"{case['case_id']}:pdf_input_route_missing" in four_pdf_errors
+
 
 def test_private_gate_binds_explicit_pdf_fallback(tmp_path: Path) -> None:
     manifest_path = _manifest(tmp_path / "private")

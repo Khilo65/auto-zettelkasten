@@ -41,6 +41,7 @@ from auto_zettelkasten.notes import read_note, source_id_for_item
 from auto_zettelkasten.readers import (
     CodexReader,
     ProviderInterrupted,
+    ProviderIsolationFailure,
     ProviderQuotaExhausted,
     ProviderTimeout,
     codex_contract_identity,
@@ -236,6 +237,118 @@ class _ReplayCodexReader(CodexReader):
     ) -> Any:
         del system_prompt, user_prompt, output_tokens, deadline_seconds
         raise ProviderInterrupted("provider calls are disabled during exact replay")
+
+
+class _ControlledPdfReader(CodexReader):
+    """Exercise raw-PDF transport without changing normal PDF routing."""
+
+    __slots__ = (
+        "_controlled_custody_root",
+        "_controlled_path",
+        "_controlled_sha256",
+        "_controlled_size",
+        "_controlled_source_id",
+        "_controlled_zotero_key",
+    )
+
+    def __init__(
+        self,
+        model: str,
+        *,
+        controlled_workspace: Path,
+        controlled_case: Mapping[str, Any],
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(model, **kwargs)
+        self._controlled_custody_root = (
+            controlled_workspace / "01_custody" / "files"
+        ).resolve()
+        self._controlled_path = Path(controlled_case["path"]).resolve()
+        self._controlled_sha256 = str(controlled_case["sha256"])
+        self._controlled_size = self._controlled_path.stat().st_size
+        self._controlled_source_id = source_id_for_item(controlled_case["parent"])
+        self._controlled_zotero_key = str(controlled_case["parent"]["key"])
+        if not _inside(self._controlled_path, self._controlled_custody_root):
+            raise ProviderIsolationFailure(
+                "controlled PDF is outside the verified custody directory"
+            )
+
+    def _controlled_attachment(self, metadata: Mapping[str, Any]) -> Path:
+        context = metadata.get("_source_context")
+        source_file = (
+            str(context.get("source_file") or "")
+            if isinstance(context, Mapping)
+            else ""
+        )
+        source_path = Path(source_file) if source_file else None
+        path = source_path.resolve() if source_path is not None else None
+        if (
+            not isinstance(context, Mapping)
+            or source_path is None
+            or not source_path.is_absolute()
+            or source_path.is_symlink()
+            or path is None
+            or path.parent != self._controlled_custody_root
+            or not path.is_file()
+            or path.suffix.casefold() != ".pdf"
+            or path.stat().st_size != self._controlled_size
+            or context.get("custody_sha256") != self._controlled_sha256
+            or context.get("media_type") != "application/pdf"
+            or context.get("route") != TEXT_ROUTE
+            or context.get("source_scope") != "full_document"
+            or context.get("source_id") != self._controlled_source_id
+            or context.get("zotero_key") != self._controlled_zotero_key
+            or sha256_file(path) != self._controlled_sha256
+        ):
+            raise ProviderIsolationFailure(
+                "controlled PDF custody metadata does not match the manifest"
+            )
+        return path
+
+    def _require_pdf_capability(self) -> None:
+        status = self.pdf_input_file_status()
+        if (
+            status.get("version") != DIRECT_PDF_CLI_VERSION
+            or status.get("helper_version") != DIRECT_PDF_CLI_VERSION
+            or status.get("helper_manifest_valid") is not True
+            or status.get("pdf_input_file_capability") is not True
+            or not _direct_pdf_helper_identity_valid(
+                status.get("_helper_manifest_identity")
+            )
+        ):
+            raise ProviderIsolationFailure(
+                "controlled PDF gate requires the verified Codex 0.152.1 helper"
+            )
+
+    def should_read_source_bundle_directly(
+        self,
+        text: str,
+        metadata: Mapping[str, Any],
+        question: str | None = None,
+    ) -> bool:
+        del text
+        self._controlled_attachment(metadata)
+        self._require_pdf_capability()
+        return super().should_read_source_bundle_directly("", metadata, question)
+
+    def read_source_bundle(
+        self,
+        text: str,
+        metadata: Mapping[str, Any],
+        question: str | None = None,
+        *,
+        attachment_paths: Sequence[Path | str] = (),
+    ) -> Mapping[str, Any]:
+        del text
+        if attachment_paths:
+            raise ProviderIsolationFailure(
+                "controlled PDF gate received an unexpected attachment"
+            )
+        path = self._controlled_attachment(metadata)
+        self._require_pdf_capability()
+        return super().read_source_bundle(
+            "", metadata, question, attachment_paths=(path,)
+        )
 
 
 def _mapping(value: Any, *, label: str) -> dict[str, Any]:
@@ -972,6 +1085,11 @@ def _validated_manifest(
             "four-PDF routes must be pypdf_text, codex_pdf_input_file, "
             "pypdf_text, codex_pdf_input_file in manifest order"
         )
+    if (
+        settings.kind == "controlled_pdf"
+        and cases[0]["expected_route"] != PDF_INPUT_ROUTE
+    ):
+        raise ValueError("controlled PDF gate requires codex_pdf_input_file")
     if settings.kind == "raw_e2e" and settings.case_count == 8:
         role_counts = Counter(row["cluster_expectation"] for row in cases)
         if role_counts != Counter({"related_candidate": 4, "control": 4}):
@@ -1608,7 +1726,16 @@ def _route_errors(
             errors.append(f"{case_id}:custody_binding_mismatch")
         recovery = "not_applicable"
         selected_pages: list[int] = []
-        if expected_route == PDF_INPUT_ROUTE:
+        if settings.kind == "controlled_pdf":
+            if (
+                expected_route != PDF_INPUT_ROUTE
+                or content.get("content_route") != TEXT_ROUTE
+                or (root / "document_route.yml").exists()
+            ):
+                errors.append(f"{case_id}:controlled_pdf_acquisition_mismatch")
+            else:
+                direct_pdf_routes += 1
+        elif expected_route == PDF_INPUT_ROUTE:
             route = read_yaml(root / "document_route.yml", {}) or {}
             identity = (
                 route.get("identity_payload") if isinstance(route, Mapping) else None
@@ -1774,6 +1901,11 @@ def _route_errors(
             {
                 "case_id": case_id,
                 "expected_route": expected_route,
+                **(
+                    {"acquisition_route": TEXT_ROUTE}
+                    if settings.kind == "controlled_pdf"
+                    else {}
+                ),
                 "selected_pages": selected_pages,
                 "recovery": recovery,
             }
@@ -2537,13 +2669,25 @@ def run_gate(
     if live_guard is not None and (
         map_runner is run_map or settings.kind != "four_pdf"
     ):
-        call_kwargs.update(
-            reader=CodexReader(
+        source_reader: CodexReader = (
+            _ControlledPdfReader(
                 SOURCE_MODEL,
                 allow_cloud=True,
                 reasoning_effort=REASONING_EFFORT,
                 attempt_guard=live_guard,
-            ),
+                controlled_workspace=workspace,
+                controlled_case=cases[0],
+            )
+            if settings.kind == "controlled_pdf"
+            else CodexReader(
+                SOURCE_MODEL,
+                allow_cloud=True,
+                reasoning_effort=REASONING_EFFORT,
+                attempt_guard=live_guard,
+            )
+        )
+        call_kwargs.update(
+            reader=source_reader,
             literature_reasoner=CodexReader(
                 RELATIONSHIP_MODEL,
                 allow_cloud=True,
