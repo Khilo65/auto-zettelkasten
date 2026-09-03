@@ -2307,6 +2307,28 @@ def test_private_strategic8_cluster_labels_never_enter_provider_inputs(
     assert errors == []
     assert acceptance["strategic8_evaluated_required_pair_count"] == 6
 
+    roles = report["cluster_map"]["clusters"][0]["source_roles"]
+    roles[0]["role"] = "context"
+    errors, _acceptance = runner._strategic8_oracle_acceptance(
+        tmp_path, cases, report, oracle
+    )
+    assert errors == []  # Two connected cores, with grounded contextual neighbors.
+
+    roles[2]["role"] = "context"
+    errors, _acceptance = runner._strategic8_oracle_acceptance(
+        tmp_path, cases, report, oracle
+    )
+    assert "strategic8_final_cluster_roles_incorrect" in errors
+
+    roles[0]["role"] = roles[2]["role"] = "core"
+    roles[1]["role"] = "context"
+    errors, _acceptance = runner._strategic8_oracle_acceptance(
+        tmp_path, cases, report, oracle
+    )
+    assert "strategic8_core_not_connected_by_accepted_edges" in errors
+
+    roles[0]["role"] = "context"
+    roles[1]["role"] = "core"
     registry["current_pair_decisions"].pop()
     write_yaml(
         tmp_path / "02_source_memory" / "indexes" / "typed_links.yml", registry

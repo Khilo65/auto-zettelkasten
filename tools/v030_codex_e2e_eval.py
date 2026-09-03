@@ -961,10 +961,17 @@ def _strategic8_oracle_acceptance(
                 if isinstance(row, Mapping) and row.get("source_id")
             }
         )
-        if any(roles.get(source_id) != "core" for source_id in core) or roles.get(
-            context
-        ) != "context":
+        actual_core = {
+            source_id for source_id in core if roles.get(source_id) == "core"
+        }
+        if (
+            set(roles) != expected_members
+            or len(actual_core) < 2
+            or any(roles.get(source_id) not in {"core", "context"} for source_id in core)
+            or roles.get(context) != "context"
+        ):
             errors.append("strategic8_final_cluster_roles_incorrect")
+        core = actual_core
     if any(
         controls
         & {str(value) for value in row.get("source_ids", []) or []}
@@ -994,6 +1001,8 @@ def _strategic8_oracle_acceptance(
         errors.append("strategic8_required_pairs_not_all_evaluated")
 
     def connected(nodes: set[str]) -> bool:
+        if len(nodes) < 2:
+            return False
         reached = {next(iter(nodes))}
         while True:
             expanded = reached | {
@@ -1007,12 +1016,18 @@ def _strategic8_oracle_acceptance(
 
     if not connected(core):
         errors.append("strategic8_core_not_connected_by_accepted_edges")
-    if not any(
-        tuple(sorted((context, source_id))) in accepted_pairs for source_id in core
+    if any(
+        not any(
+            tuple(sorted((context_source, source_id))) in accepted_pairs
+            for source_id in core
+        )
+        for context_source in expected_members - core
     ):
         errors.append("strategic8_contextual_relationship_missing")
     return sorted(set(errors)), {
         "strategic8_semantic_oracle_sha256": str(oracle["sha256"]),
+        "strategic8_role_policy": "at_least_two_connected_cores_v1",
+        "strategic8_actual_core_count": len(core),
         "strategic8_required_pair_count": len(required_pairs),
         "strategic8_evaluated_required_pair_count": len(
             required_pairs & evaluated_pairs
