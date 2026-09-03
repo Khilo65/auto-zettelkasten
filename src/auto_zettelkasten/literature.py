@@ -1360,7 +1360,7 @@ def _provider_worker_count(request: Any, ready_jobs: int) -> int:
     if configured in {None, "auto"}:
         provider = str(_as_mapping(request).get("provider") or "").casefold()
         if provider == "codex":
-            return max(1, min(ready_jobs or 1, 16))
+            return max(1, min(ready_jobs or 1, 4))
         return max(
             1,
             ready_jobs if provider != "ollama" else min(ready_jobs or 1, 4),

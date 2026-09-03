@@ -737,8 +737,8 @@ class MapRequest:
                 raise ValueError("Codex reasoning_effort must be medium, high, max, or None")
             if self.max_provider_spend_usd is not None:
                 raise ValueError("Codex subscription use does not support dollar spend caps")
-            if isinstance(self.provider_concurrency, int) and self.provider_concurrency > 32:
-                raise ValueError("Codex provider_concurrency must be between 1 and 32")
+            if isinstance(self.provider_concurrency, int) and self.provider_concurrency > 8:
+                raise ValueError("Codex provider_concurrency must be between 1 and 8")
         elif self.literature_model is not None or self.reasoning_effort is not None:
             raise ValueError(
                 "literature_model and reasoning_effort are supported only by Codex"
@@ -5508,8 +5508,8 @@ class LiteratureMapRequest:
                 raise ValueError("Codex reasoning_effort must be medium, high, max, or None")
             if self.max_provider_spend_usd is not None:
                 raise ValueError("Codex subscription use does not support dollar spend caps")
-            if isinstance(self.provider_concurrency, int) and self.provider_concurrency > 32:
-                raise ValueError("Codex provider_concurrency must be between 1 and 32")
+            if isinstance(self.provider_concurrency, int) and self.provider_concurrency > 8:
+                raise ValueError("Codex provider_concurrency must be between 1 and 8")
         elif self.reasoning_effort is not None:
             raise ValueError("reasoning_effort is supported only by Codex")
         if self.provider_concurrency != "auto" and (

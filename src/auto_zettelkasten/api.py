@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from . import ARTIFACT_SCHEMA_VERSION, ENGINE_VERSION
+from .codex_attempt_guard import codex_subscription_run_lock
 from .files import (
     now_iso,
     read_yaml,
@@ -946,17 +947,18 @@ def run_map(
     run_id: str | None = None,
     resume: bool = False,
 ) -> RunReport:
-    return run_pipeline(
-        request,
-        client=client,
-        reader=reader,
-        vision=vision,
-        controller=controller,
-        literature_reasoner=literature_reasoner,
-        external_discovery=external_discovery,
-        run_id=run_id,
-        resume=resume,
-    )
+    with codex_subscription_run_lock(request.provider):
+        return run_pipeline(
+            request,
+            client=client,
+            reader=reader,
+            vision=vision,
+            controller=controller,
+            literature_reasoner=literature_reasoner,
+            external_discovery=external_discovery,
+            run_id=run_id,
+            resume=resume,
+        )
 
 
 def sync_zotero(
@@ -2427,8 +2429,8 @@ def build_map(
             raise ValueError(
                 "Codex literature model must be gpt-5.6-terra or gpt-5.6-sol"
             )
-        if isinstance(provider_concurrency, int) and provider_concurrency > 32:
-            raise ValueError("Codex provider_concurrency must be between 1 and 32")
+        if isinstance(provider_concurrency, int) and provider_concurrency > 8:
+            raise ValueError("Codex provider_concurrency must be between 1 and 8")
     elif reasoning_effort is not None:
         raise ValueError("reasoning_effort is supported only by Codex")
     configured_navigation = config.get("navigation", {}) if isinstance(config.get("navigation", {}), Mapping) else {}
@@ -2576,20 +2578,21 @@ def build_map(
     )
     progress.set_stage("preflight")
     try:
-        result = rebuild_map(
-            root,
-            source_set=selected_source_set,
-            note_rows=note_rows,
-            terminal_rows=[],
-            items=[],
-            run_id=run_id,
-            question=question,
-            request=map_request,
-            reasoner=reasoner,
-            external_discovery=external_discovery,
-            progress=progress,
-            resume=resume,
-        )
+        with codex_subscription_run_lock(provider):
+            result = rebuild_map(
+                root,
+                source_set=selected_source_set,
+                note_rows=note_rows,
+                terminal_rows=[],
+                items=[],
+                run_id=run_id,
+                question=question,
+                request=map_request,
+                reasoner=reasoner,
+                external_discovery=external_discovery,
+                progress=progress,
+                resume=resume,
+            )
     except Exception:
         progress.finish("partial")
         raise
@@ -2827,12 +2830,13 @@ def run_literature_map(
         if not resolved_source_set:
             raise ValueError("source_set is required when profiles are supplied")
         migrate_workspace(request.workspace)
-        return run_profile_literature_map(
-            request,
-            profiles=profiles,
-            source_set=resolved_source_set,
-            reasoner=reasoner,
-        )
+        with codex_subscription_run_lock(request.provider):
+            return run_profile_literature_map(
+                request,
+                profiles=profiles,
+                source_set=resolved_source_set,
+                reasoner=reasoner,
+            )
     manifest = build_map(
         request.workspace,
         run_id=request.run_id or None,

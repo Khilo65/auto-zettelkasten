@@ -7,6 +7,7 @@ import os
 import re
 import stat
 import subprocess
+import tempfile
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -31,6 +32,10 @@ PAUSE_REASONS = frozenset({"quota", "timeout", "interruption"})
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 _LEDGER_LIMIT = 8_000_000
+_CODEX_SUBSCRIPTION_RUN_LOCK_PATH = (
+    Path(tempfile.gettempdir())
+    / f"auto-zettelkasten-codex-subscription-{os.getuid()}.lock"
+)
 
 
 class CodexAttemptGuardError(RuntimeError):
@@ -72,6 +77,61 @@ def _sha256(path: Path) -> str:
 
 def _inside(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
+
+
+@contextmanager
+def codex_subscription_run_lock(provider: str) -> Iterator[None]:
+    """Allow one local Auto-Zettelkasten Codex run per user."""
+
+    if provider.casefold() != "codex":
+        yield
+        return
+    # ponytail: one host-local run lock; add account-wide coordination only if
+    # cross-host Auto-Zettelkasten concurrency becomes a measured requirement.
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            _CODEX_SUBSCRIPTION_RUN_LOCK_PATH,
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+        ):
+            raise CodexAttemptStateError("Codex subscription run lock is unsafe")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise CodexAttemptStateError(
+                "another Auto-Zettelkasten Codex subscription run is already active"
+            ) from exc
+    except CodexAttemptStateError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise CodexAttemptStateError(
+            "Codex subscription run lock is unavailable"
+        ) from exc
+
+    try:
+        yield
+    finally:
+        try:
+            if descriptor >= 0:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
 
 
 def _git_root(path: Path) -> Path | None:

@@ -283,9 +283,9 @@ def test_shared_guard_starts_after_preflight_and_wraps_fixed_job(
     assert events[0] == "preflight"
     assert events[1][0] == "start"
     assert events[1][1]["stage"] == "luna_source_calibration"
-    assert events[1][1]["source_attempt_limit"] == 70
+    assert events[1][1]["source_attempt_limit"] == 14
     assert events[1][1]["relationship_attempt_limit"] == 0
-    assert events[1][1]["total_attempt_limit"] == 70
+    assert events[1][1]["total_attempt_limit"] == 14
     assert events[1][1]["resume_reason"] is None
     assert reader.attempt_guard is guard
     assert guard.jobs == ["c1:s001"]
@@ -361,7 +361,7 @@ def test_interruption_writes_pause_and_preserves_original_error(
     assert report["stop_reason"] == "interruption"
 
 
-def test_source_calibration_uses_exact_70_attempt_ceiling(
+def test_source_calibration_uses_exact_14_attempt_ceiling(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -387,10 +387,10 @@ def test_source_calibration_uses_exact_70_attempt_ceiling(
     )
 
     assert report["status"] == "passed"
-    assert report["attempt_count"] == 70
+    assert report["attempt_count"] == 14
     assert report["retry_count"] == 0
-    assert [row["concurrency"] for row in report["levels"]] == [1, 2, 4, 8, 16, 32]
-    assert reader.calls == 70
+    assert [row["concurrency"] for row in report["levels"]] == [1, 2, 4]
+    assert reader.calls == 14
     assert reader.preflight_calls == 1
     assert factory_calls == [
         {
@@ -402,8 +402,8 @@ def test_source_calibration_uses_exact_70_attempt_ceiling(
     ]
     ledger = manifest.parent / ".v030-attempts/test-source.jsonl"
     rows = [json.loads(line) for line in ledger.read_text().splitlines()]
-    assert sum(row["record"] == "reserved" for row in rows) == 70
-    assert sum(row["record"] == "completed" for row in rows) == 70
+    assert sum(row["record"] == "reserved" for row in rows) == 14
+    assert sum(row["record"] == "completed" for row in rows) == 14
     assert output.stat().st_mode & 0o777 == 0o600
     assert ledger.stat().st_mode & 0o777 == 0o600
     assert output.parent.stat().st_mode & 0o777 == 0o700
@@ -702,9 +702,9 @@ def test_relationship_stage_uses_terra_medium_public_contract(
     assert factory_kwargs["reasoning_effort"] == "medium"
     assert starts[0]["stage"] == "terra_relationship_calibration"
     assert starts[0]["source_attempt_limit"] == 0
-    assert starts[0]["relationship_attempt_limit"] == 38
-    assert starts[0]["total_attempt_limit"] == 38
-    assert report["maximum_attempts"] == 38
+    assert starts[0]["relationship_attempt_limit"] == 14
+    assert starts[0]["total_attempt_limit"] == 14
+    assert report["maximum_attempts"] == 14
     assert report["attempt_count"] == 1
     assert len(calls) == 1
     assert calls[0][1].literature_policy.cluster_generation_enabled is False

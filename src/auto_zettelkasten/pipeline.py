@@ -226,7 +226,7 @@ def _source_worker_count(
     ):
         configured = _AUTO_DEEPSEEK_SOURCE_WORKER_LIMIT
     elif str(getattr(reader, "name", "")).casefold() == "codex":
-        configured = 8
+        configured = 4
     else:
         configured = _AUTO_CLOUD_SOURCE_WORKER_LIMIT
     return max(1, min(pending_count or 1, configured))

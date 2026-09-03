@@ -43,6 +43,9 @@ from v030_codex_campaign_guard import (  # noqa: E402
     PAUSE_REASONS,
     CodexCampaignGuard,
 )
+from auto_zettelkasten.codex_attempt_guard import (  # noqa: E402
+    codex_subscription_run_lock,
+)
 from auto_zettelkasten.files import (  # noqa: E402
     now_iso,
     read_yaml,
@@ -71,15 +74,15 @@ STAGES: Mapping[str, Mapping[str, Any]] = {
         "contract_id": "source_bundle",
         "model": "gpt-5.6-luna",
         "reasoning_effort": "medium",
-        "levels": (1, 2, 4, 8, 16, 32),
-        "maximum_attempts": 70,
+        "levels": (1, 2, 4),
+        "maximum_attempts": 14,
     },
     "relationship": {
         "contract_id": "relationship_adjudication",
         "model": "gpt-5.6-terra",
         "reasoning_effort": "medium",
-        "levels": (1, 2, 4, 8, 16),
-        "maximum_attempts": 38,
+        "levels": (1, 2, 4),
+        "maximum_attempts": 14,
     },
 }
 BASELINE_ATTEMPTS = 8
@@ -102,7 +105,7 @@ def _controls(stage: str) -> dict[str, Any]:
     return {
         "initial_calls": BASELINE_ATTEMPTS,
         "maximum_attempts": config["maximum_attempts"],
-        "cumulative_calibration_ceiling": 108,
+        "cumulative_calibration_ceiling": 28,
         "retry_limit": 0,
         "levels": list(config["levels"]),
         "call_deadline_seconds": CALL_DEADLINE_SECONDS,
@@ -717,6 +720,7 @@ def _run_level(
     )
 
 
+@codex_subscription_run_lock("codex")
 def run_calibration(
     *,
     manifest_path: Path,

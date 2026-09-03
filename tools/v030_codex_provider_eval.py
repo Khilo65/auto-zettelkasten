@@ -34,6 +34,9 @@ def _verify_runtime_import_root() -> None:
 
 _verify_runtime_import_root()
 
+from auto_zettelkasten.codex_attempt_guard import (  # noqa: E402
+    codex_subscription_run_lock,
+)
 from auto_zettelkasten.files import (  # noqa: E402
     now_iso,
     read_yaml,
@@ -565,6 +568,7 @@ def _error_reason(error: BaseException) -> str | None:
     return None
 
 
+@codex_subscription_run_lock("codex")
 def run_evaluation(
     *,
     manifest_path: Path,

@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 from pypdf import PdfWriter
 
+import auto_zettelkasten.codex_attempt_guard as attempt_guard_module
 from auto_zettelkasten.api import (
     _provider_check,
     build_map,
@@ -151,30 +152,52 @@ def test_codex_request_roles_and_existing_provider_serialization(tmp_path: Path)
         provider="codex",
         model="gpt-5.6-luna",
         literature_model="gpt-5.6-terra",
-        provider_concurrency=32,
+        provider_concurrency=8,
     )
-    with pytest.raises(ValueError, match="between 1 and 32"):
+    with pytest.raises(ValueError, match="between 1 and 8"):
         MapRequest(
             tmp_path,
             provider="codex",
             model="gpt-5.6-luna",
             literature_model="gpt-5.6-terra",
-            provider_concurrency=33,
+            provider_concurrency=9,
         )
     LiteratureMapRequest(
         tmp_path,
         provider="codex",
         model="gpt-5.6-terra",
         reasoning_effort="high",
-        provider_concurrency=32,
+        provider_concurrency=8,
     )
-    with pytest.raises(ValueError, match="between 1 and 32"):
+    with pytest.raises(ValueError, match="between 1 and 8"):
         LiteratureMapRequest(
             tmp_path,
             provider="codex",
             model="gpt-5.6-terra",
-            provider_concurrency=33,
+            provider_concurrency=9,
         )
+
+
+def test_codex_subscription_run_lock_is_exclusive_and_safe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lock_path = tmp_path / "codex.lock"
+    monkeypatch.setattr(
+        attempt_guard_module, "_CODEX_SUBSCRIPTION_RUN_LOCK_PATH", lock_path
+    )
+
+    with attempt_guard_module.codex_subscription_run_lock("codex"):
+        with pytest.raises(CodexAttemptStateError, match="already active"):
+            with attempt_guard_module.codex_subscription_run_lock("codex"):
+                pass
+    with attempt_guard_module.codex_subscription_run_lock("codex"):
+        pass
+
+    lock_path.unlink()
+    lock_path.symlink_to(tmp_path / "target")
+    with pytest.raises(CodexAttemptStateError, match="unavailable"):
+        with attempt_guard_module.codex_subscription_run_lock("codex"):
+            pass
 
 
 def test_codex_contract_capabilities_and_typed_retry_policy() -> None:
@@ -488,7 +511,7 @@ def test_provider_response_reuse_requires_same_codex_execution_identity() -> Non
     )
 
 
-def test_codex_auto_concurrency_uses_calibrated_role_limits(
+def test_codex_auto_concurrency_uses_safe_shared_limit(
     tmp_path: Path,
 ) -> None:
     request = MapRequest(
@@ -499,7 +522,7 @@ def test_codex_auto_concurrency_uses_calibrated_role_limits(
     )
     reader = CodexReader("gpt-5.6-luna")
     assert request.provider_concurrency == "auto"
-    assert _source_worker_count(reader, request, 20) == 8
+    assert _source_worker_count(reader, request, 20) == 4
     assert _provider_worker_count(
         LiteratureMapRequest(
             tmp_path,
@@ -508,7 +531,7 @@ def test_codex_auto_concurrency_uses_calibrated_role_limits(
             provider_concurrency="auto",
         ),
         20,
-    ) == 16
+    ) == 4
 
 
 @pytest.mark.parametrize("cli_profile", ["0.145.0", "0.152.1"])

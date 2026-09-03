@@ -358,9 +358,12 @@ before a new call to verify the CLI version, ChatGPT login, requested model,
 context, effort, and pinned feature manifest. Doctor makes no model call and
 does not estimate remaining subscription quota.
 
-The calibrated Codex profile uses 16 concurrent source calls and 16 concurrent
-literature calls when concurrency is `auto`. An explicit Codex concurrency must
-be between 1 and 32. A quota, timeout, or
+The Codex profile uses four concurrent provider calls for source and literature
+work when concurrency is `auto`. An explicit Codex concurrency must be between
+1 and 8; values above four are intended only for an otherwise idle subscription.
+Overlapping Codex-backed Auto-Zettelkasten runs by the same local user fail
+before launch. This does not coordinate active ChatGPT or Codex work elsewhere.
+A quota, timeout, or
 interruption produces a resumable partial run. Repeat the same command (or use
 `auto-zettelkasten resume --workspace WORKSPACE --run-id RUN_ID`) after quota
 is available; completed calls

@@ -9,7 +9,8 @@
   `--no-clusters`, and estimates make disabled cluster/gap work explicit zeroes.
 - Codex CLI 0.145.0 uses separate Luna source and Terra relationship roles,
   fail-closed tools and credentials, resumable quota/timeout/interruption
-  handling, and a 1–32 explicit concurrency boundary.
+  handling, a four-call automatic concurrency limit, a 1–8 explicit boundary,
+  and a fail-fast lock against overlapping local Auto-Zettelkasten Codex runs.
 - `ocr=auto` can send at most 16 deterministic, bounded PNG page images only to
   the Codex source-bundle contract after custody, capability, and token checks.
   Direct PDF input remains unsupported.
