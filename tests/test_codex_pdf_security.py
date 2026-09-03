@@ -39,6 +39,8 @@ def test_codex_0152_feature_snapshot_and_tool_disables_are_profile_specific() ->
     assert "features.unbounded_connection_retries=false" in (
         _codex_tool_feature_arguments("0.152.1")
     )
+    assert "features.unified_exec=false" not in _codex_tool_feature_arguments("0.152.1")
+    assert "features.unified_exec=false" in _codex_tool_feature_arguments("0.145.0")
     assert "features.view_image=false" not in _codex_tool_feature_arguments("0.145.0")
     assert "features.sleep_tool=false" not in _codex_tool_feature_arguments("0.145.0")
 

@@ -1170,12 +1170,8 @@ _CODEX_TOOL_FEATURES = frozenset(
 )
 
 _CODEX_0152_DISABLED_FEATURES = frozenset(
-    (
-        *_CODEX_TOOL_FEATURES,
-        "sleep_tool",
-        "unbounded_connection_retries",
-        "view_image",
-    )
+    (_CODEX_TOOL_FEATURES - {"unified_exec"})
+    | {"sleep_tool", "unbounded_connection_retries", "view_image"}
 )
 
 _CODEX_TOOL_FEATURE_ARGUMENTS = tuple(
