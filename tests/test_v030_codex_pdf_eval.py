@@ -933,6 +933,39 @@ def test_hash_and_execute_refusals_precede_map_calls(
     assert not called
 
 
+def test_revalidation_allows_only_the_gate_evaluator_to_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = "a" * 40
+    head = "b" * 40
+    monkeypatch.setattr(runner, "_repository_state", lambda: (head, False))
+
+    def git_run(command: tuple[str, ...], **_kwargs: Any) -> Any:
+        if command[1:3] == ("merge-base", "--is-ancestor"):
+            return runner.subprocess.CompletedProcess(command, 0, "", "")
+        return runner.subprocess.CompletedProcess(
+            command,
+            0,
+            "tools/v030_codex_pdf_eval.py\n"
+            "tests/test_v030_codex_pdf_eval.py\n",
+            "",
+        )
+
+    monkeypatch.setattr(runner.subprocess, "run", git_run)
+    assert runner._verify_revalidation_repository(base) == head
+
+    def production_change(command: tuple[str, ...], **_kwargs: Any) -> Any:
+        if command[1:3] == ("merge-base", "--is-ancestor"):
+            return runner.subprocess.CompletedProcess(command, 0, "", "")
+        return runner.subprocess.CompletedProcess(
+            command, 0, "src/auto_zettelkasten/pipeline.py\n", ""
+        )
+
+    monkeypatch.setattr(runner.subprocess, "run", production_change)
+    with pytest.raises(ValueError, match="evaluation-only changes"):
+        runner._verify_revalidation_repository(base)
+
+
 def test_prepare_rejects_uninitialized_workspace(tmp_path: Path) -> None:
     manifest = _manifest(tmp_path / "private")
     (manifest.parent / "11_state" / "workspace_manifest.yml").unlink()
@@ -1482,6 +1515,59 @@ def test_expected_answer_matching_accepts_one_span_paraphrases() -> None:
     assert runner._answer_matches(text, spans, "part of fault recovery")
     assert runner._answer_matches(text, spans, "weaker than checksum validation")
     assert not runner._answer_matches(text, spans, "critical checksum validation")
+
+    performance = runner._normalized_text(
+        "Berkshire's compounded annual gains for 1965-2024 were 19.9%."
+    )
+    assert runner._answer_matches(
+        performance,
+        [performance],
+        "Berkshire compounded annual gain 1965-2024 19.9",
+    )
+
+
+def test_single_source_gate_has_vacuously_complete_relationship_coverage(
+    tmp_path: Path,
+) -> None:
+    index_root = tmp_path / "02_source_memory" / "indexes"
+    index_root.mkdir(parents=True)
+    registry = {
+        "relations": [],
+        "links": [],
+        "pair_decisions": [],
+        "current_pair_decisions": [],
+    }
+    primary_path = index_root / "typed_links.yml"
+    write_yaml(primary_path, registry)
+    write_yaml(index_root / "typed_note_links.yml", registry)
+    errors, requires_adjudication = runner._relationship_errors(
+        tmp_path, {"source-zotero-only"}
+    )
+    assert errors == []
+    assert requires_adjudication is False
+
+    primary_path.unlink()
+    errors, _ = runner._relationship_errors(tmp_path, {"source-zotero-only"})
+    assert errors == ["typed_relationship_registry_missing"]
+    write_yaml(primary_path, registry)
+
+    nonempty_registry = {**registry, "parked": [{"reason": "pending review"}]}
+    write_yaml(primary_path, nonempty_registry)
+    write_yaml(index_root / "typed_note_links.yml", nonempty_registry)
+    errors, _ = runner._relationship_errors(tmp_path, {"source-zotero-only"})
+    assert "relationship_completeness_accounting_failed" in errors
+    write_yaml(primary_path, registry)
+    write_yaml(index_root / "typed_note_links.yml", registry)
+
+    errors, _ = runner._relationship_errors(
+        tmp_path, {"source-zotero-first", "source-zotero-second"}
+    )
+    assert "relationship_completeness_accounting_failed" in errors
+
+    state_path = index_root / "relationship_selection_state.yml"
+    write_yaml(state_path, {})
+    errors, _ = runner._relationship_errors(tmp_path, {"source-zotero-only"})
+    assert "relationship_completeness_accounting_failed" in errors
 
 
 def test_private_locator_matching_accepts_numbered_ranges_without_prefix_collisions(

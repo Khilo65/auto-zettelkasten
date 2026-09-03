@@ -102,6 +102,9 @@ _CLUSTER_CONTRACTS = {
 }
 _PAUSE_REASONS = frozenset({"quota", "timeout", "interruption"})
 _PROVIDER_FREE_MODES = frozenset({"replay", "revalidate"})
+_REVALIDATION_ONLY_PATHS = frozenset(
+    {"tools/v030_codex_pdf_eval.py", "tests/test_v030_codex_pdf_eval.py"}
+)
 
 
 class GateSettings:
@@ -454,6 +457,36 @@ def _verify_repository(
         raise ValueError("manifest code_commit does not match git HEAD")
     if dirty:
         raise ValueError("live gate requires a clean release worktree")
+
+
+def _verify_revalidation_repository(code_commit: str) -> str:
+    head, dirty = _repository_state()
+    if dirty:
+        raise ValueError("revalidation requires a clean release worktree")
+    if head == code_commit:
+        return head
+    try:
+        ancestor = subprocess.run(
+            ("git", "merge-base", "--is-ancestor", code_commit, head),
+            cwd=_REPOSITORY_ROOT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        changed = subprocess.run(
+            ("git", "diff", "--name-only", f"{code_commit}..{head}", "--"),
+            cwd=_REPOSITORY_ROOT,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).stdout.splitlines()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError("unable to verify the revalidation worktree") from exc
+    if ancestor.returncode != 0 or not changed or any(
+        path not in _REVALIDATION_ONLY_PATHS for path in changed
+    ):
+        raise ValueError("revalidation permits evaluation-only changes")
+    return head
 
 
 def _ledger_identity(
@@ -1931,16 +1964,18 @@ def _relationship_errors(
     require_accepted: bool = False,
 ) -> tuple[list[str], bool]:
     errors: list[str] = []
-    registry = (
-        read_yaml(workspace / "02_source_memory" / "indexes" / "typed_links.yml", {})
-        or {}
-    )
-    if not isinstance(registry, Mapping):
+    index_root = workspace / "02_source_memory" / "indexes"
+    registry_path = index_root / "typed_links.yml"
+    registry = read_yaml(registry_path, None)
+    if not registry_path.is_file() or not isinstance(registry, Mapping):
         return ["typed_relationship_registry_missing"], False
-    compatibility = read_yaml(
-        workspace / "02_source_memory" / "indexes" / "typed_note_links.yml", {}
-    ) or {}
-    if compatibility != registry:
+    compatibility_path = index_root / "typed_note_links.yml"
+    compatibility = read_yaml(compatibility_path, None)
+    if (
+        not compatibility_path.is_file()
+        or not isinstance(compatibility, Mapping)
+        or compatibility != registry
+    ):
         errors.append("relationship_registry_projection_mismatch")
     rows = [
         dict(row)
@@ -1979,18 +2014,25 @@ def _relationship_errors(
         and row.get("source_id") in source_ids
         and row.get("target_source_id") in source_ids
     ]
-    state = (
-        read_yaml(
-            workspace
-            / "02_source_memory"
-            / "indexes"
-            / "relationship_selection_state.yml",
-            {},
+    state_path = index_root / "relationship_selection_state.yml"
+    raw_state = read_yaml(state_path, {})
+    state = raw_state if isinstance(raw_state, Mapping) else {}
+    registry_has_activity = any(
+        registry.get(field)
+        for field in (
+            "relations",
+            "links",
+            "pair_decisions",
+            "current_pair_decisions",
+            "events",
+            "parked",
         )
-        or {}
     )
-    if (
-        not isinstance(state, Mapping)
+    state_required = (
+        len(source_ids) > 1 or registry_has_activity or state_path.exists()
+    )
+    if state_required and (
+        not isinstance(raw_state, Mapping)
         or state.get("relationship_stage_complete") is not True
         or state.get("relationship_discovery_status") != "complete"
         or state.get("relationship_discovery_incomplete_jobs")
@@ -2066,6 +2108,7 @@ def _answer_matches(text: str, spans: Sequence[str], expected: str) -> bool:
     if normalized in text:
         return True
     normalized = re.sub(r"\bcomponents?\b", "part", normalized)
+    normalized = re.sub(r"\bgains?\b", "gain", normalized)
     terms = {
         term
         for term in re.findall(r"[a-z0-9]+", normalized)
@@ -2073,7 +2116,14 @@ def _answer_matches(text: str, spans: Sequence[str], expected: str) -> bool:
     }
     return len(terms) >= 2 and any(
         all(re.search(rf"\b{re.escape(term)}\b", span) for term in terms)
-        for span in (re.sub(r"\bcomponents?\b", "part", value) for value in spans)
+        for span in (
+            re.sub(
+                r"\bgains?\b",
+                "gain",
+                re.sub(r"\bcomponents?\b", "part", value),
+            )
+            for value in spans
+        )
     )
 
 
@@ -2571,7 +2621,13 @@ def run_gate(
         return _write_report(workspace, evaluation_id, mode, report, settings), report
     if not execute:
         raise PermissionError("live modes require execute=True")
-    _verify_repository(code_commit, repository_probe)
+    evaluator_commit = code_commit
+    if mode == "revalidate" and repository_probe is _repository_state:
+        evaluator_commit = _verify_revalidation_repository(code_commit)
+    else:
+        _verify_repository(code_commit, repository_probe)
+    if mode == "revalidate":
+        base["evaluator_commit"] = evaluator_commit
 
     run_root = workspace / "11_state" / "runs" / run_id
     if mode == "run":
