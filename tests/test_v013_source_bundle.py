@@ -1126,7 +1126,7 @@ def test_ordinary_bundle_source_uses_one_call_and_no_profile_or_fidelity_call(
     ]
     assert profile["coverage"]["status"] == "partial"
     note = read_note(tmp_path / report.items[0]["note_path"])
-    assert note["frontmatter"]["source_bundle_prompt_version"] == "18"
+    assert note["frontmatter"]["source_bundle_prompt_version"] == "19"
 
 
 def test_atomic_note_projects_only_accepted_high_salience_quantitative_evidence(
@@ -1139,6 +1139,7 @@ def test_atomic_note_projects_only_accepted_high_salience_quantitative_evidence(
             result["content"] += (
                 " In 2024, the reported outcome fell by 4 percentage points."
                 " The source reports 42 treated cases and compares 17 controls."
+                " The district's rank declined by 3 places to 21st."
             )
             return result
 
@@ -1185,6 +1186,20 @@ def test_atomic_note_projects_only_accepted_high_salience_quantitative_evidence(
             payload["evidence_anchors"].extend(
                 [valid, tied_duplicate, lower_salience, invalid]
             )
+            for claim, estimate in (
+                ("The district's rank declined by 3 places.", "3 places"),
+                ("The district's resulting rank is 21st.", "21st"),
+                ("The district's rank declined by 3 places to 21st.", "3 places"),
+            ):
+                split_rank = deepcopy(valid)
+                split_rank.update(
+                    claim=claim,
+                    quantitative_result={
+                        "estimate": estimate,
+                        "provenance": "source_reported",
+                    },
+                )
+                payload["evidence_anchors"].append(split_rank)
             return payload
 
     item = {
@@ -1215,6 +1230,20 @@ def test_atomic_note_projects_only_accepted_high_salience_quantitative_evidence(
     assert note["body"].count(projection) == 1
     assert "The source reports 17 controls." not in note["body"]
     assert "42 cases among 17 controls" not in note["body"]
+    assert "The district's rank declined by 3 places." in note["body"]
+    assert "The district's resulting rank is 21st." in note["body"]
+    assert "rank declined by 3 places to 21st" not in note["body"]
+    profile = read_yaml(
+        next((tmp_path / "02_source_memory" / "profiles").glob("*.yml"))
+    )["profile"]
+    rank_claims = {
+        anchor["claim"] for anchor in profile["evidence_anchors"]
+        if "district" in anchor["claim"]
+    }
+    assert rank_claims == {
+        "The district's rank declined by 3 places.",
+        "The district's resulting rank is 21st.",
+    }
     bundle = read_yaml(
         next((tmp_path / "02_source_memory" / "bundles").glob("*.yml"))
     )["bundle"]

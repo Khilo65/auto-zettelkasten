@@ -83,10 +83,10 @@ def test_atomic_prompt_v14_is_source_adaptive_and_statistics_aware() -> None:
     assert "silently reread" in prompt
 
 
-def test_source_bundle_prompt_v18_preserves_formatting_and_attribution_scope() -> None:
+def test_source_bundle_prompt_v19_preserves_formatting_and_attribution_scope() -> None:
     prompt = _source_bundle_system_prompt()
 
-    assert "source bundle prompt v18" in prompt
+    assert "source bundle prompt v19" in prompt
     assert "apply a footnote, only when the alignment or marker is explicit" in prompt
     assert "A footnote qualifies only the values bearing its explicit marker" in prompt
     assert "page metadata is not a statistic's observation date" in prompt
@@ -102,6 +102,27 @@ def test_source_bundle_prompt_v18_preserves_formatting_and_attribution_scope() -
     assert "selected journalistic examples are not a survey" in prompt
     assert "Each literature-position row represents exactly one distinct work" in prompt
     assert "operative dates, deadlines, effective dates, and signing dates" in prompt
+
+
+def test_source_bundle_preserves_coverage_lineage_and_prose_scope() -> None:
+    system = _source_bundle_system_prompt()
+    prompt = _source_bundle_prompt("A fictional source.", {}, None)
+
+    assert "canonical dataset title and explicitly stated edition" in system
+    assert "hosting site or presentation format" in system
+    assert "located anchors for central mechanisms and author interpretations" in system
+    assert "resulting rank and its rank change" in prompt
+    assert "Apply the same footnote scope to every analysis section" in prompt
+    assert "explicitly marked footnote's temporal scope in period" in prompt
+    assert "never erase a required marked-footnote scope" in prompt
+
+
+def test_cluster_synthesis_requires_clause_support_not_just_source_ownership() -> None:
+    prompt = _cluster_synthesis_system_prompt()
+
+    assert "Each cited anchor must support the attached finding" in prompt
+    assert "Omit or narrow an unsupported clause" in prompt
+    assert "same-source anchor about a different finding" in prompt
 
 
 def test_source_bundle_prompt_keeps_numeric_values_out_of_statistic_labels() -> None:
@@ -154,7 +175,7 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     assert {
         "atomic_prompt_v14": digest(_system_prompt()),
         "chunk_prompt_v14": digest(_chunk_system_prompt()),
-        "source_bundle_prompt_v18": digest(_source_bundle_system_prompt()),
+        "source_bundle_prompt_v19": digest(_source_bundle_system_prompt()),
         "codex_source_bundle_schema": bundle_identity["schema_hash"],
         "codex_source_bundle_contract": digest(bundle_identity),
         "codex_chunk_evidence_schema": chunk_identity["schema_hash"],
@@ -162,7 +183,7 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     } == {
         "atomic_prompt_v14": "8db9f2990d175816cb0100b92d84734ae7c2f930aade66825ed0412b22da3705",
         "chunk_prompt_v14": "3c2eabca75c5ad487a35a5096664e0ec6999d04b738927a60fce2e11cfb15cd5",
-        "source_bundle_prompt_v18": "60cc6c560a57ecd1da1b66ae41c24879e847ee09462a32052aedde8c021e306e",
+        "source_bundle_prompt_v19": "100adc0235f93ed8130c8b5fa9b5d743238d73895fb07bca8c2cabd2389c8331",
         "codex_source_bundle_schema": "ffd00229ee34f87c2bcc9a32f4b620102be6a907975397126103d5aff032ec3a",
         "codex_source_bundle_contract": "153d29b42447de280facb4a132bef9808c30676909bcee900b39353ef6451a59",
         "codex_chunk_evidence_schema": "2df4a0fe634405df5e891283a59bfc7bee18995b5e970a51c5569b5c4eafed8e",
@@ -215,7 +236,7 @@ def test_partial_source_prompt_prohibits_complete_document_inference() -> None:
 def test_cluster_prompt_preserves_inference_and_case_evidence() -> None:
     prompt = _cluster_synthesis_system_prompt()
 
-    assert "cluster synthesis prompt v36" in prompt
+    assert "cluster synthesis prompt v37" in prompt
     assert "Read every supplied atomic_note_markdown" in prompt
     assert "Every retained member" in prompt
     assert "specific study finding" in prompt

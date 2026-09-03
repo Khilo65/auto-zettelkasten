@@ -2525,6 +2525,62 @@ def test_named_dataset_reconciles_brand_finance_publications_stably() -> None:
     assert cluster["qualification_status"] == "evidence_concentrated_cluster"
 
 
+def test_canonical_dataset_identity_ignores_source_host_and_presentation() -> None:
+    dataset = "Harbor Civic Confidence Survey 2024"
+    profiles = [
+        _dataset_profile("report", dataset),
+        _dataset_profile("dashboard", dataset),
+    ]
+    profiles[0].update(
+        title="Harbor Institute: annual confidence report",
+        url="https://research.example/report",
+        method_or_knowledge_basis="Survey report with cross-national interpretation.",
+    )
+    profiles[1].update(
+        title="Civic Explorer: national results",
+        url="https://results.example/dashboard",
+        method_or_knowledge_basis="Interactive country-results table.",
+    )
+
+    forward = normalize_evidence_profiles(profiles)
+    assert forward == normalize_evidence_profiles(list(reversed(profiles)))
+    assert len({row["evidence_base_group_id"] for row in forward}) == 1
+    assert all(
+        claim["independence_status"] == "overlapping_evidence_base"
+        for row in forward
+        for claim in row["claims"]
+    )
+    records = literature.build_independence_records(forward)
+    assert len(records["evidence_base_groups"]) == 1
+    group = records["evidence_base_groups"][0]
+    assert group["source_ids"] == ["dashboard", "report"]
+    assert group["relationship"] == "overlapping_evidence_base"
+    assert records["independence_assessments"][0]["effective_evidence_base_count"] == 1
+
+
+def test_canonical_dataset_identity_preserves_editions_and_sample_qualifiers() -> None:
+    dataset = "Harbor Civic Confidence Survey"
+    for left_dataset, right_dataset in (
+        (f"{dataset} 2023", f"{dataset} 2024"),
+        (f"{dataset} 2024; edition 1", f"{dataset} 2024; edition 2"),
+        (f"{dataset} 2024; sample coastal", f"{dataset} 2024; sample inland"),
+    ):
+        profiles = [
+            _dataset_profile("left", left_dataset),
+            _dataset_profile("right", right_dataset),
+        ]
+        for profile in profiles:
+            profile.update(
+                title="Civic Explorer: survey results",
+                url="https://results.example/dashboard",
+            )
+        normalized = normalize_evidence_profiles(profiles)
+        assert len({row["evidence_base_group_id"] for row in normalized}) == 2, (
+            left_dataset,
+            right_dataset,
+        )
+
+
 def test_named_dataset_fallback_rejects_ambiguous_or_distinct_editions() -> None:
     negative_pairs = (
         (

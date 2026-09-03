@@ -49,7 +49,7 @@ def _profile(source_id: str) -> dict[str, object]:
 def test_source_bundle_prompt_uses_one_shot_statistical_interpretation() -> None:
     prompt = _source_bundle_system_prompt()
 
-    assert "source bundle prompt v18" in prompt
+    assert "source bundle prompt v19" in prompt
     assert "key_concepts_and_definitions" in prompt
     assert "source_structure_and_organization" in prompt
     assert "omit the field entirely" in prompt
