@@ -73,7 +73,7 @@ CONTRACTS = (
     "cluster_proposal",
     "gap_adjudication",
 )
-SOURCE_CONTRACTS = {"source_bundle", "chunk_evidence"}
+SOURCE_CONTRACTS = {"source_bundle", "chunk_evidence", "evidence_profile"}
 CONTRACT_METHODS = {
     "source_bundle": "read_source_bundle",
     "evidence_profile": "profile_source",
@@ -94,6 +94,7 @@ _EVALUATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}")
 _ISOLATION_SUBTYPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 CALL_DEADLINE_SECONDS = 600.0
 STAGE_DEADLINE_SECONDS = 7_260.0
+CODEX_CLI_PROFILE = "0.152.1"
 CONTROLS = {
     "initial_calls": 12,
     "maximum_attempts": 12,
@@ -287,7 +288,10 @@ def _validate_completion(
     effort: str,
 ) -> None:
     expected = {
-        **codex_contract_identity(contract_id, model, effort),
+        **codex_contract_identity(
+            contract_id, model, effort, CODEX_CLI_PROFILE
+        ),
+        "codex_cli_version": CODEX_CLI_PROFILE,
         "finish_reason": "turn.completed",
     }
     for key, value in expected.items():
@@ -509,7 +513,7 @@ def _validated_cases(
             else ("gpt-5.6-terra", "medium")
         )
         if row.get("contract_identity") != codex_contract_identity(
-            contract_id, model, effort
+            contract_id, model, effort, CODEX_CLI_PROFILE
         ):
             raise ValueError(f"{case_id} contract identity mismatch")
         cases[contract_id] = (row, payload)

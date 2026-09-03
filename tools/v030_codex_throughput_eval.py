@@ -87,6 +87,7 @@ MINIMUM_GAIN_PERCENT = 15.0
 CALL_DEADLINE_SECONDS = 600.0
 BASELINE_DEADLINE_SECONDS = 4_860.0
 WAVE_DEADLINE_SECONDS = 660.0
+CODEX_CLI_PROFILE = "0.152.1"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _GIT_COMMIT = re.compile(r"[0-9a-f]{40,64}")
 _EVALUATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}")
@@ -197,6 +198,7 @@ def _validated_manifest(
         str(config["contract_id"]),
         str(config["model"]),
         str(config["reasoning_effort"]),
+        CODEX_CLI_PROFILE,
     ):
         raise ValueError("manifest contract identity mismatch")
     evaluation_id = str(manifest.get("evaluation_id") or "").strip()
@@ -361,7 +363,10 @@ def _validate_completion(
     effort: str,
 ) -> None:
     expected = {
-        **codex_contract_identity(contract_id, model, effort),
+        **codex_contract_identity(
+            contract_id, model, effort, CODEX_CLI_PROFILE
+        ),
+        "codex_cli_version": CODEX_CLI_PROFILE,
         "finish_reason": "turn.completed",
     }
     for key, value in expected.items():
@@ -375,7 +380,10 @@ def _safe_completion(value: Any) -> dict[str, Any]:
     completion = dict(value) if isinstance(value, Mapping) else {}
     identity_keys = set(
         codex_contract_identity(
-            "source_bundle", "gpt-5.6-luna", "medium"
+            "source_bundle",
+            "gpt-5.6-luna",
+            "medium",
+            CODEX_CLI_PROFILE,
         )
     ) | {"finish_reason", "codex_cli_version", "max_output_tokens"}
     return {

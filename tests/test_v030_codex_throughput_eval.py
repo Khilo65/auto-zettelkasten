@@ -59,6 +59,7 @@ def _manifest(root: Path, *, stage: str = "source") -> Path:
                 contract_id,
                 runner.STAGES[stage]["model"],
                 runner.STAGES[stage]["reasoning_effort"],
+                runner.CODEX_CLI_PROFILE,
             ),
             "payload": payload_path.name,
             "payload_sha256": sha256_file(payload_path),
@@ -107,8 +108,12 @@ class FakeAttemptGuard:
 def _completion() -> dict[str, object]:
     return {
         **runner.codex_contract_identity(
-            "source_bundle", "gpt-5.6-luna", "medium"
+            "source_bundle",
+            "gpt-5.6-luna",
+            "medium",
+            runner.CODEX_CLI_PROFILE,
         ),
+        "codex_cli_version": runner.CODEX_CLI_PROFILE,
         "finish_reason": "turn.completed",
         "usage": {"input_tokens": 10, "output_tokens": 5},
     }
@@ -170,6 +175,38 @@ def test_completion_requires_exact_numeric_usage(usage: object) -> None:
     with pytest.raises(ValueError, match="usage is missing"):
         runner._validate_completion(
             completion,
+            contract_id="source_bundle",
+            model="gpt-5.6-luna",
+            effort="medium",
+        )
+
+
+def test_completion_requires_pinned_codex_cli_profile() -> None:
+    completion = {
+        **runner.codex_contract_identity(
+            "source_bundle", "gpt-5.6-luna", "medium", "0.152.1"
+        ),
+        "codex_cli_version": "0.152.1",
+        "finish_reason": "turn.completed",
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+    }
+    runner._validate_completion(
+        completion,
+        contract_id="source_bundle",
+        model="gpt-5.6-luna",
+        effort="medium",
+    )
+    legacy = {
+        **runner.codex_contract_identity(
+            "source_bundle", "gpt-5.6-luna", "medium", "0.145.0"
+        ),
+        "codex_cli_version": "0.145.0",
+        "finish_reason": "turn.completed",
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+    }
+    with pytest.raises(ValueError, match="cli_profile mismatch"):
+        runner._validate_completion(
+            legacy,
             contract_id="source_bundle",
             model="gpt-5.6-luna",
             effort="medium",
