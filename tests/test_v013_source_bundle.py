@@ -1129,6 +1129,114 @@ def test_ordinary_bundle_source_uses_one_call_and_no_profile_or_fidelity_call(
     assert note["frontmatter"]["source_bundle_prompt_version"] == "18"
 
 
+def test_atomic_note_projects_only_accepted_high_salience_quantitative_evidence(
+    tmp_path,
+) -> None:
+    class QuantitativeZotero(FakeZotero):
+        def fulltext(self, item_key):
+            result = super().fulltext(item_key)
+            assert result is not None
+            result["content"] += (
+                " In 2024, the reported outcome fell by 4 percentage points."
+                " The source reports 42 treated cases and compares 17 controls."
+            )
+            return result
+
+    class QuantitativeBundleReader(BundleReader):
+        def read_source_bundle(self, text, metadata, question=None):
+            payload = super().read_source_bundle(text, metadata, question)
+            valid = deepcopy(payload["evidence_anchors"][0])
+            valid.update(
+                evidence_anchor_id="",
+                claim="In 2024, the reported outcome fell.",
+                salience_priority=10,
+                quantitative_result={
+                    "statistic": "case count",
+                    "estimate": "4",
+                    "unit": "percentage points",
+                    "provenance": "source_reported",
+                },
+            )
+            valid.pop("revision_hash", None)
+            tied_duplicate = deepcopy(valid)
+            tied_duplicate.update(
+                evidence_anchor_id="",
+                locator="p. 13",
+                locators=["p. 13"],
+            )
+            lower_salience = deepcopy(valid)
+            lower_salience.update(
+                evidence_anchor_id="",
+                claim="The source reports 17 controls.",
+                salience_priority=9,
+                quantitative_result={
+                    "statistic": "control count",
+                    "estimate": "17",
+                    "unit": "controls",
+                    "provenance": "source_reported",
+                },
+            )
+            invalid = deepcopy(valid)
+            invalid.update(
+                evidence_anchor_id="",
+                claim="The source reports 42 cases among 17 controls.",
+                salience_priority=11,
+            )
+            payload["evidence_anchors"].extend(
+                [valid, tied_duplicate, lower_salience, invalid]
+            )
+            return payload
+
+    item = {
+        "key": "ITEMA",
+        "data": {
+            "key": "ITEMA",
+            "itemType": "journalArticle",
+            "title": "Institutions and Reform",
+            "date": "2024",
+            "creators": [{"creatorType": "author", "lastName": "One"}],
+        },
+    }
+
+    reader = QuantitativeBundleReader()
+    client = QuantitativeZotero([item])
+    report = run_map(
+        MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1),
+        client=client,
+        reader=reader,
+        run_id="quantitative-note-projection",
+    )
+
+    note_path = tmp_path / report.items[0]["note_path"]
+    note = read_note(note_path)
+    projection = (
+        "In 2024, the reported outcome fell. Estimate: 4; Unit: percentage points."
+    )
+    assert note["body"].count(projection) == 1
+    assert "The source reports 17 controls." not in note["body"]
+    assert "42 cases among 17 controls" not in note["body"]
+    bundle = read_yaml(
+        next((tmp_path / "02_source_memory" / "bundles").glob("*.yml"))
+    )["bundle"]
+    assert sum(
+        row["claim"] == "In 2024, the reported outcome fell."
+        for row in bundle["evidence_anchors"]
+    ) == 2
+    assert bundle["analysis_sections"]["evidence_and_data"].count(projection) == 1
+    before = (note["sha256"], note_path.stat().st_mtime_ns)
+
+    replay = resume_map(
+        tmp_path,
+        "quantitative-note-projection",
+        client=client,
+        reader=reader,
+    )
+
+    assert replay.source_provider_call_count == report.source_provider_call_count == 1
+    assert reader.calls == 1
+    assert (read_note(note_path)["sha256"], note_path.stat().st_mtime_ns) == before
+
+
 def test_source_calls_share_the_cumulative_profile_budget_and_replay_is_free(
     tmp_path,
 ) -> None:

@@ -15418,7 +15418,63 @@ def _prepare_item(
         else _ensure_analysis_contract(source_result)
     )
     if bundle is not None:
-        base["source_analysis_bundle"] = bundle.to_dict()
+        quantitative = [
+            anchor
+            for anchor in bundle.evidence_anchors
+            if anchor.quantitative_result is not None
+            and anchor.quantitative_result.estimate.strip()
+            and anchor.claim.strip()
+        ]
+        if quantitative:
+            highest_salience = max(anchor.salience_priority for anchor in quantitative)
+            analysis_text = "\n".join(str(value) for value in analysis.values()).casefold()
+            projections: list[str] = []
+            for anchor in quantitative:
+                if anchor.salience_priority != highest_salience:
+                    continue
+                projection = anchor.claim.strip()
+                represented = projection.casefold()
+                details: list[str] = []
+                for label, value in (
+                    ("Estimate", anchor.quantitative_result.estimate.strip()),
+                    ("Unit", anchor.quantitative_result.unit.strip()),
+                    ("Scale", anchor.quantitative_result.scale.strip()),
+                ):
+                    normalized_value = " ".join(value.casefold().split())
+                    normalized_represented = " ".join(represented.split())
+                    if label == "Estimate":
+                        value_tokens = _claimed_quantity_tokens(value)
+                        value_is_represented = bool(value_tokens) and value_tokens.issubset(
+                            _claimed_quantity_tokens(represented)
+                        )
+                    else:
+                        pattern = re.escape(normalized_value)
+                        if normalized_value[:1].isalnum():
+                            pattern = rf"(?<!\w){pattern}"
+                        if normalized_value[-1:].isalnum():
+                            pattern = rf"{pattern}(?!\w)"
+                        value_is_represented = bool(normalized_value) and bool(
+                            re.search(pattern, normalized_represented)
+                        )
+                    if value and not value_is_represented:
+                        details.append(f"{label}: {value}")
+                        represented += f" {value.casefold()}"
+                if details:
+                    projection = f"{projection} {'; '.join(details)}."
+                normalized = projection.casefold()
+                if normalized not in analysis_text and normalized not in {
+                    value.casefold() for value in projections
+                }:
+                    projections.append(projection)
+            if projections:
+                existing = str(analysis.get("evidence_and_data") or "").rstrip()
+                projected = "\n".join(f"- {claim}" for claim in projections)
+                analysis["evidence_and_data"] = (
+                    f"{existing}\n\n{projected}" if existing else projected
+                )
+        bundle_payload = bundle.to_dict()
+        bundle_payload["analysis_sections"] = dict(analysis)
+        base["source_analysis_bundle"] = bundle_payload
     base["attempts"].append(
         _attempt(
             base,
