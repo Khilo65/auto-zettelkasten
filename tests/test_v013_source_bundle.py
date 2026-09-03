@@ -1126,7 +1126,7 @@ def test_ordinary_bundle_source_uses_one_call_and_no_profile_or_fidelity_call(
     ]
     assert profile["coverage"]["status"] == "partial"
     note = read_note(tmp_path / report.items[0]["note_path"])
-    assert note["frontmatter"]["source_bundle_prompt_version"] == "19"
+    assert note["frontmatter"]["source_bundle_prompt_version"] == "20"
 
 
 def test_atomic_note_projects_only_accepted_high_salience_quantitative_evidence(
@@ -4685,6 +4685,20 @@ def test_quantitative_provenance_accepts_bounded_year_column_table() -> None:
         "zotero_item_key": "A1",
         "text": "\n\n".join(cells),
     }
+
+    single_result = {
+        "statistic": "Score",
+        "outcome_definition": "Global Soft Power Index score",
+        "estimate": "48.7",
+        "period": "2024",
+        "provenance": "source_reported",
+    }
+    payload["evidence_anchors"][0]["quantitative_result"] = single_result
+    assert _source_bundle_from_result(payload, row, "full_document") is not None
+    for period in ("", "2023"):
+        single_result["period"] = period
+        with pytest.raises(SourceBundleQuantitativeProvenanceError):
+            _source_bundle_from_result(payload, row, "full_document")
 
     result = {
         "estimate": "Score 48.7; rank 32",

@@ -235,7 +235,7 @@ DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
-SOURCE_BUNDLE_PROMPT_VERSION = "19"
+SOURCE_BUNDLE_PROMPT_VERSION = "20"
 SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v2"
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
@@ -5359,11 +5359,12 @@ def _source_bundle_prompt(
         "Name the marked measure; do not generalize its caveat to the whole chart, list, or source. If the "
         "24-row limit would be exceeded, omit a lower-salience result instead of combining "
         "observations. Do not use a semicolon to pack separate numeric observations into any "
-        "field. Before emitting a row, keep a numeric optional field only when the same source "
+        "field. Before emitting a row, keep a numeric optional field other than period only when the same source "
         "sentence explicitly binds the same number and noun or measure to that exact estimate; "
         "otherwise set that optional string to \"\". Do not copy study-level sample or coverage "
         "into a different result. Set period to \"\" by default. Use period only when the same "
-        "sentence or explicitly marked table row states every date or year with the estimate. "
+        "sentence or explicitly marked table row or column header states every date or year with the estimate. "
+        "Preserve the selected table year in period when an unambiguous row-column alignment binds it to the value. "
         "Also retain an explicitly marked footnote's temporal scope in period, in its own words, without inferred dates; "
         "a document title, report edition, publication date, page metadata, or global study "
         "timeframe does not qualify. Every numeric value in the anchor claim must belong to and "
@@ -5371,7 +5372,8 @@ def _source_bundle_prompt(
         "extra value otherwise. "
         "For system_derived values, "
         "every input must be explicit in that passage. If only period fails a check, set period "
-        "to \"\" unless it is explicitly footnote-bound; never erase a required marked-footnote scope to pass validation. "
+        "to \"\" unless it is explicitly table-year- or footnote-bound; never erase a required table-year scope, and "
+        "never erase a required marked-footnote scope to pass validation. "
         "Set quantitative_result to null only when estimate fails, and remove that "
         "unsupported number from the anchor claim, plain-English meaning, and analysis prose; "
         "retain only supported nonnumeric meaning. Never replace an unsupported numeric value "

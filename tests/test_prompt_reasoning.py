@@ -83,10 +83,10 @@ def test_atomic_prompt_v14_is_source_adaptive_and_statistics_aware() -> None:
     assert "silently reread" in prompt
 
 
-def test_source_bundle_prompt_v19_preserves_formatting_and_attribution_scope() -> None:
+def test_source_bundle_prompt_v20_preserves_formatting_and_attribution_scope() -> None:
     prompt = _source_bundle_system_prompt()
 
-    assert "source bundle prompt v19" in prompt
+    assert "source bundle prompt v20" in prompt
     assert "apply a footnote, only when the alignment or marker is explicit" in prompt
     assert "A footnote qualifies only the values bearing its explicit marker" in prompt
     assert "page metadata is not a statistic's observation date" in prompt
@@ -115,6 +115,10 @@ def test_source_bundle_preserves_coverage_lineage_and_prose_scope() -> None:
     assert "Apply the same footnote scope to every analysis section" in prompt
     assert "explicitly marked footnote's temporal scope in period" in prompt
     assert "never erase a required marked-footnote scope" in prompt
+    assert "numeric optional field other than period" in prompt
+    assert "table row or column header" in prompt
+    assert "Preserve the selected table year in period" in prompt
+    assert "never erase a required table-year scope" in prompt
 
 
 def test_cluster_synthesis_requires_clause_support_not_just_source_ownership() -> None:
@@ -175,7 +179,7 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     assert {
         "atomic_prompt_v14": digest(_system_prompt()),
         "chunk_prompt_v14": digest(_chunk_system_prompt()),
-        "source_bundle_prompt_v19": digest(_source_bundle_system_prompt()),
+        "source_bundle_prompt_v20": digest(_source_bundle_system_prompt()),
         "codex_source_bundle_schema": bundle_identity["schema_hash"],
         "codex_source_bundle_contract": digest(bundle_identity),
         "codex_chunk_evidence_schema": chunk_identity["schema_hash"],
@@ -183,7 +187,7 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     } == {
         "atomic_prompt_v14": "8db9f2990d175816cb0100b92d84734ae7c2f930aade66825ed0412b22da3705",
         "chunk_prompt_v14": "3c2eabca75c5ad487a35a5096664e0ec6999d04b738927a60fce2e11cfb15cd5",
-        "source_bundle_prompt_v19": "100adc0235f93ed8130c8b5fa9b5d743238d73895fb07bca8c2cabd2389c8331",
+        "source_bundle_prompt_v20": "4fca01ae2d5966cf3167466c9175d9ed97dda60ef70d4616268a73f50cb29b1b",
         "codex_source_bundle_schema": "ffd00229ee34f87c2bcc9a32f4b620102be6a907975397126103d5aff032ec3a",
         "codex_source_bundle_contract": "153d29b42447de280facb4a132bef9808c30676909bcee900b39353ef6451a59",
         "codex_chunk_evidence_schema": "2df4a0fe634405df5e891283a59bfc7bee18995b5e970a51c5569b5c4eafed8e",
