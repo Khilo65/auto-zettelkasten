@@ -16204,7 +16204,28 @@ def _source_line_quantity_tokens(
 ) -> set[str]:
     if _source_line_is_page_date_metadata(source_lines, index):
         return set()
-    return _quantity_tokens(_without_calendar_dates(source_lines[index]))
+    line = _without_calendar_dates(source_lines[index])
+    tokens = _quantity_tokens(line)
+    words = re.findall(r"[A-Za-z]+", line)
+    gaps = list(re.finditer(r"(?<=\d)[ \t]+(?=\d)", line))
+    # ponytail: recover one proven pypdf glyph gap; widen only with a failing fixture.
+    if (
+        sum(
+            len(word) == 1 and word.islower() and word not in {"a", "i"}
+            for word in words
+        )
+        >= 3
+        and sum(len(word) >= 3 for word in words) >= 4
+        and len(gaps) == 1
+        and gaps[0].group() == " "
+    ):
+        gap = gaps[0]
+        before, after = line[: gap.start()], line[gap.end() :]
+        if re.search(r"[$£€]\s*\d{1,3}$", before) or re.match(
+            r"\d,\d{3}(?!\d)", after
+        ):
+            tokens.update(_quantity_tokens(before + after))
+    return tokens
 
 
 def _source_year_values(value: str) -> set[str]:

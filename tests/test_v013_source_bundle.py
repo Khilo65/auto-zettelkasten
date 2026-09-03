@@ -1977,6 +1977,80 @@ def test_quantitative_provenance_accepts_split_footnote_and_local_body_date() ->
 
 
 @pytest.mark.parametrize(
+    ("source_text", "claim", "estimate"),
+    [
+        (
+            "Th e p ro gram allocated $ 48 7 m illio n fo r lo cal grants.",
+            "The program allocated $487 million for local grants.",
+            "$487 million",
+        ),
+        (
+            "Th e p ro gram supported 57 0,000 h ouseholds ac ross regions.",
+            "The program supported 570,000 households across regions.",
+            "570,000",
+        ),
+    ],
+)
+def test_quantitative_provenance_accepts_split_pdf_digit_glyphs(
+    source_text: str, claim: str, estimate: str
+) -> None:
+    payload = _bundle_payload()
+    payload["evidence_anchors"][0]["claim"] = claim
+    payload["evidence_anchors"][0]["quantitative_result"] = {
+        "estimate": estimate,
+        "provenance": "source_reported",
+    }
+
+    assert (
+        _source_bundle_from_result(
+            payload,
+            {
+                "source_id": "source-zotero-A1",
+                "zotero_item_key": "A1",
+                "text": source_text,
+            },
+            "full_document",
+        )
+        is not None
+    )
+
+
+@pytest.mark.parametrize(
+    "source_text",
+    [
+        "Table row 26 0",
+        "Model A B C D outcome estimate dollars 26 0",
+        "Model A B C D outcome estimate dollars $26 0",
+        "Table: 26  0",
+        "The values were 26 0 in adjacent columns.",
+    ],
+)
+def test_quantitative_provenance_does_not_join_separate_plain_numbers(
+    source_text: str,
+) -> None:
+    payload = _bundle_payload()
+    payload["evidence_anchors"][0]["claim"] = "The total was 260 cases."
+    payload["evidence_anchors"][0]["quantitative_result"] = {
+        "estimate": "260",
+        "provenance": "source_reported",
+    }
+
+    with pytest.raises(
+        SourceBundleQuantitativeProvenanceError,
+        match="reported_estimate_not_found_in_source",
+    ):
+        _source_bundle_from_result(
+            payload,
+            {
+                "source_id": "source-zotero-A1",
+                "zotero_item_key": "A1",
+                "text": source_text,
+            },
+            "full_document",
+        )
+
+
+@pytest.mark.parametrize(
     "period", ["", "Entire war", "First 60 days", "First six weeks"]
 )
 def test_quantitative_provenance_requires_marked_footnote_scope(period) -> None:
