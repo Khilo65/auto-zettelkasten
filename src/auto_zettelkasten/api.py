@@ -65,6 +65,7 @@ from .ports import (
     ZoteroClient,
 )
 from .readers import (
+    CODEX_CLI_PROFILES,
     CLUSTER_SYNTHESIS_MAX_OUTPUT_TOKENS,
     DEEPSEEK_V4_FLASH_PRICING,
     DEFAULT_PROMPT_RESERVE_TOKENS,
@@ -1810,6 +1811,7 @@ def _build_map_semantic_fingerprint(
     policy: LiteratureMappingPolicy,
     navigation: NavigationPolicy,
     comparison_collection_keys: Sequence[str] = (),
+    codex_cli_profile: str = "0.145.0",
 ) -> str:
     """Hash only upstream semantic inputs to a global map build."""
 
@@ -1927,7 +1929,9 @@ def _build_map_semantic_fingerprint(
     }
     if provider == "codex" and policy.synthesis_enabled:
         payload["provider_execution_identity"] = codex_suite_identity(
-            model, reasoning_effort or "medium"
+            model,
+            reasoning_effort or "medium",
+            cli_profile=codex_cli_profile,
         )
     return sha256_text(
         json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
@@ -1988,6 +1992,7 @@ def _build_map_receipt_identity(
     navigation: NavigationPolicy,
     comparison_collection_keys: Sequence[str],
     source_set: Mapping[str, Any] | Path | str | None,
+    codex_cli_profile: str = "0.145.0",
 ) -> str:
     if isinstance(source_set, Mapping):
         source_set_identity: Any = dict(source_set)
@@ -2011,7 +2016,9 @@ def _build_map_receipt_identity(
             }
     if provider == "codex" and policy.synthesis_enabled:
         payload["provider_execution_identity"] = codex_suite_identity(
-            model, reasoning_effort or "medium"
+            model,
+            reasoning_effort or "medium",
+            cli_profile=codex_cli_profile,
         )
     return sha256_text(
         json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
@@ -2440,25 +2447,35 @@ def build_map(
         raise ValueError("standalone Auto-Zettelkasten does not accept an external discovery provider")
     run_id = run_id or _latest_run_id(root) or f"build-{now_iso().replace(':', '').replace('+00:00', 'Z')}"
     validate_opaque_id(run_id, field="run_id")
-    receipt_identity = _build_map_receipt_identity(
-        provider=provider,
-        model=model,
-        reasoning_effort=reasoning_effort,
-        question=question,
-        policy=policy,
-        navigation=navigation,
-        comparison_collection_keys=comparison_collection_keys,
-        source_set=source_set,
-    )
-    if not retry_terminal_failures:
-        reusable_receipt = _reusable_build_map_receipt(
-            root,
-            run_id,
-            receipt_identity,
-            workspace_wide_selection=not bool(source_set),
+    receipt_identities = [
+        _build_map_receipt_identity(
+            provider=provider,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            question=question,
+            policy=policy,
+            navigation=navigation,
+            comparison_collection_keys=comparison_collection_keys,
+            source_set=source_set,
+            codex_cli_profile=cli_profile,
         )
-        if reusable_receipt is not None:
-            return reusable_receipt
+        for cli_profile in (
+            tuple(CODEX_CLI_PROFILES)
+            if provider == "codex" and policy.synthesis_enabled
+            else ("0.145.0",)
+        )
+    ]
+    receipt_identity = receipt_identities[0]
+    if not retry_terminal_failures:
+        for candidate_identity in receipt_identities:
+            reusable_receipt = _reusable_build_map_receipt(
+                root,
+                run_id,
+                candidate_identity,
+                workspace_wide_selection=not bool(source_set),
+            )
+            if reusable_receipt is not None:
+                return reusable_receipt
     note_rows = all_workspace_note_rows(root)
     selected_source_set = _resolve_source_set(root, source_set)
     explicit_source_set = bool(selected_source_set)
@@ -2480,18 +2497,6 @@ def build_map(
                 if row.get("note_id")
             ),
         }
-    semantic_fingerprint = _build_map_semantic_fingerprint(
-        root,
-        note_rows=note_rows,
-        source_set=selected_source_set,
-        provider=provider,
-        model=model,
-        reasoning_effort=reasoning_effort,
-        question=question,
-        policy=policy,
-        navigation=navigation,
-        comparison_collection_keys=comparison_collection_keys,
-    )
     if reasoner is None and policy.synthesis_enabled and allow_cloud:
         provider_kwargs = {"allow_cloud": allow_cloud}
         if provider == "codex":
@@ -2588,6 +2593,40 @@ def build_map(
     except Exception:
         progress.finish("partial")
         raise
+    codex_cli_profile = "0.145.0"
+    if provider == "codex" and policy.synthesis_enabled and reasoner is not None:
+        preflight = getattr(reasoner, "_preflight", None)
+        version = (
+            str(preflight.get("version") or "")
+            if isinstance(preflight, Mapping)
+            else ""
+        )
+        if version in CODEX_CLI_PROFILES:
+            codex_cli_profile = version
+    receipt_identity = _build_map_receipt_identity(
+        provider=provider,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        question=question,
+        policy=policy,
+        navigation=navigation,
+        comparison_collection_keys=comparison_collection_keys,
+        source_set=source_set,
+        codex_cli_profile=codex_cli_profile,
+    )
+    semantic_fingerprint = _build_map_semantic_fingerprint(
+        root,
+        note_rows=note_rows,
+        source_set=selected_source_set,
+        provider=provider,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        question=question,
+        policy=policy,
+        navigation=navigation,
+        comparison_collection_keys=comparison_collection_keys,
+        codex_cli_profile=codex_cli_profile,
+    )
     analytical_source_ids = _analytical_profile_source_ids(
         result.get("profiles", []) or []
     )

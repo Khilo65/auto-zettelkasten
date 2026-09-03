@@ -1619,15 +1619,87 @@ class _CheckpointedReasonerCalls:
                 else ""
             ),
         }
-        if str(getattr(self.reasoner, "name", "")).casefold() == "codex":
-            from .readers import codex_stage_identity
+        is_codex = str(getattr(self.reasoner, "name", "")).casefold() == "codex"
+        dependencies_by_fingerprint: dict[str, dict[str, Any]] = {}
+        if is_codex:
+            from .readers import CODEX_CLI_PROFILES, codex_stage_identity
 
-            dependency["provider_execution_identity"] = codex_stage_identity(
-                stage,
-                str(getattr(self.reasoner, "model", "")),
-                self.reasoning_effort,
-            )
-        fingerprint = _stable_hash(dependency)
+            for cli_profile in CODEX_CLI_PROFILES:
+                candidate = {
+                    **dependency,
+                    "provider_execution_identity": codex_stage_identity(
+                        stage,
+                        str(getattr(self.reasoner, "model", "")),
+                        self.reasoning_effort,
+                        cli_profile=cli_profile,
+                    ),
+                }
+                dependencies_by_fingerprint[_stable_hash(candidate)] = candidate
+        else:
+            dependencies_by_fingerprint[_stable_hash(dependency)] = dependency
+        fingerprint, dependency = next(iter(dependencies_by_fingerprint.items()))
+        # A checkpoint is reusable only when the complete provenance contract
+        # still matches. In particular, v0.5 dimension matrices and document-
+        # level cluster prompts must never be upgraded into proposition-backed
+        # outputs without a fresh synthesis call.
+        compatible_fingerprints = set(dependencies_by_fingerprint)
+        path = (
+            self.root
+            / safe_filename(stage)
+            / f"{safe_filename(key, fallback='packet')}.yml"
+        )
+        failure_path = (
+            self.root
+            / "failures"
+            / safe_filename(stage)
+            / f"{safe_filename(key, fallback='packet')}.yml"
+        )
+        history_root = (
+            self.root
+            / "history"
+            / safe_filename(stage)
+            / safe_filename(key, fallback="packet")
+        )
+        existing = read_yaml(path, {}) or {}
+        matching_checkpoint: Mapping[str, Any] | None = None
+        if (
+            isinstance(existing, Mapping)
+            and existing.get("fingerprint") in compatible_fingerprints
+            and isinstance(existing.get("response"), Mapping)
+        ):
+            matching_checkpoint = existing
+        if matching_checkpoint is None:
+            for compatible_fingerprint in sorted(compatible_fingerprints):
+                global_checkpoint = read_yaml(
+                    self.semantic_root
+                    / safe_filename(stage)
+                    / f"{compatible_fingerprint}.yml",
+                    {},
+                ) or {}
+                if (
+                    isinstance(global_checkpoint, Mapping)
+                    and global_checkpoint.get("fingerprint")
+                    == compatible_fingerprint
+                    and isinstance(global_checkpoint.get("response"), Mapping)
+                ):
+                    matching_checkpoint = global_checkpoint
+                    break
+        if matching_checkpoint is None:
+            for compatible_fingerprint in sorted(compatible_fingerprints):
+                historical = (
+                    read_yaml(history_root / f"{compatible_fingerprint}.yml", {}) or {}
+                )
+                if (
+                    isinstance(historical, Mapping)
+                    and historical.get("fingerprint") == compatible_fingerprint
+                    and isinstance(historical.get("response"), Mapping)
+                ):
+                    matching_checkpoint = historical
+                    break
+        if matching_checkpoint is not None:
+            matched_fingerprint = str(matching_checkpoint.get("fingerprint") or "")
+            dependency = dependencies_by_fingerprint[matched_fingerprint]
+            fingerprint = matched_fingerprint
         dependency_component_hashes = {
             str(component): _stable_hash(value)
             for component, value in dependency.items()
@@ -1656,60 +1728,9 @@ class _CheckpointedReasonerCalls:
                 item_hashes[identifier] = _stable_hash(value)
             if item_hashes:
                 dependency_context_item_hashes[str(component)] = item_hashes
-        # A checkpoint is reusable only when the complete provenance contract
-        # still matches. In particular, v0.5 dimension matrices and document-
-        # level cluster prompts must never be upgraded into proposition-backed
-        # outputs without a fresh synthesis call.
-        compatible_fingerprints = {fingerprint}
-        path = (
-            self.root
-            / safe_filename(stage)
-            / f"{safe_filename(key, fallback='packet')}.yml"
-        )
-        failure_path = (
-            self.root
-            / "failures"
-            / safe_filename(stage)
-            / f"{safe_filename(key, fallback='packet')}.yml"
-        )
-        history_root = (
-            self.root
-            / "history"
-            / safe_filename(stage)
-            / safe_filename(key, fallback="packet")
-        )
         semantic_path = (
-            self.semantic_root
-            / safe_filename(stage)
-            / f"{fingerprint}.yml"
+            self.semantic_root / safe_filename(stage) / f"{fingerprint}.yml"
         )
-        existing = read_yaml(path, {}) or {}
-        matching_checkpoint: Mapping[str, Any] | None = None
-        if (
-            isinstance(existing, Mapping)
-            and existing.get("fingerprint") in compatible_fingerprints
-        ):
-            matching_checkpoint = existing
-        if matching_checkpoint is None:
-            global_checkpoint = read_yaml(semantic_path, {}) or {}
-            if (
-                isinstance(global_checkpoint, Mapping)
-                and global_checkpoint.get("fingerprint") == fingerprint
-                and isinstance(global_checkpoint.get("response"), Mapping)
-            ):
-                matching_checkpoint = global_checkpoint
-        if matching_checkpoint is None:
-            for compatible_fingerprint in sorted(compatible_fingerprints):
-                historical = (
-                    read_yaml(history_root / f"{compatible_fingerprint}.yml", {}) or {}
-                )
-                if (
-                    isinstance(historical, Mapping)
-                    and historical.get("fingerprint") == compatible_fingerprint
-                    and isinstance(historical.get("response"), Mapping)
-                ):
-                    matching_checkpoint = historical
-                    break
         if matching_checkpoint is not None and isinstance(
             matching_checkpoint.get("response"), Mapping
         ):
@@ -1752,6 +1773,27 @@ class _CheckpointedReasonerCalls:
                 self._mark_synthesized_cluster(key)
             self._progress(stage, path, active=False)
             return dict(matching_checkpoint["response"])
+        if is_codex:
+            from .readers import codex_execution_profile, codex_stage_identity
+
+            actual_profile = codex_execution_profile(self.reasoner)
+            dependency = {
+                **dependency,
+                "provider_execution_identity": codex_stage_identity(
+                    stage,
+                    str(getattr(self.reasoner, "model", "")),
+                    self.reasoning_effort,
+                    cli_profile=actual_profile,
+                ),
+            }
+            fingerprint = _stable_hash(dependency)
+            dependency_component_hashes = {
+                str(component): _stable_hash(value)
+                for component, value in dependency.items()
+            }
+            semantic_path = (
+                self.semantic_root / safe_filename(stage) / f"{fingerprint}.yml"
+            )
         # A deterministic admission/validation repair must not repeat a paid
         # provider call when the provider-visible prompt and inputs are
         # unchanged. Revalidate the preserved response under the current local

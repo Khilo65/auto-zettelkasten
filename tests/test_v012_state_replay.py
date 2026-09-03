@@ -450,6 +450,7 @@ def test_relationship_adjudication_uses_exact_codex_fit(
         allow_cloud=True,
         reasoning_effort="medium",
     )
+    reader._preflight = {"version": "0.152.1"}
     provider_calls = 0
 
     def adjudicate(

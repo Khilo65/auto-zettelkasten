@@ -87,6 +87,53 @@ def test_schema_two_receipt_returns_before_note_parsing_or_provider_creation(
     assert result.metadata == {"cluster_count": 0}
 
 
+def test_codex_0152_receipt_replays_before_provider_creation_or_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    initialize_workspace(tmp_path)
+    _seed_replay_receipt(tmp_path)
+    policy = LiteratureMappingPolicy(cluster_generation_enabled=False)
+    receipt = (
+        tmp_path
+        / "11_state"
+        / "runs"
+        / "receipt-replay"
+        / "semantic_build_receipt.yml"
+    )
+    payload = api_module.read_yaml(receipt, {})
+    payload["identity"] = api_module._build_map_receipt_identity(
+        provider="codex",
+        model="gpt-5.6-terra",
+        reasoning_effort="medium",
+        question=None,
+        policy=policy,
+        navigation=NavigationPolicy(),
+        comparison_collection_keys=(),
+        source_set=None,
+        codex_cli_profile="0.152.1",
+    )
+    write_yaml(receipt, payload)
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("Codex receipt replay must not construct a provider")
+
+    monkeypatch.setattr(api_module, "all_workspace_note_rows", unexpected)
+    monkeypatch.setattr(api_module, "provider_from_name", unexpected)
+
+    result = build_map(
+        tmp_path,
+        run_id="receipt-replay",
+        provider="codex",
+        model="gpt-5.6-terra",
+        reasoning_effort="medium",
+        allow_cloud=True,
+        literature_policy=policy,
+        resume=True,
+    )
+
+    assert result.status == "built"
+
+
 def test_receipt_tolerates_mtime_only_changes_but_not_output_content_changes(
     tmp_path: Path,
 ) -> None:

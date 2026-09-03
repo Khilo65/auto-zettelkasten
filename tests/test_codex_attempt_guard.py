@@ -21,7 +21,7 @@ from auto_zettelkasten.codex_attempt_guard import (
     initialize_codex_attempt_ledger,
     reserve_codex_attempt,
 )
-from auto_zettelkasten.readers import CodexReader
+from auto_zettelkasten.readers import CodexReader, ProviderTransportError
 from conftest import fake_codex_preflight
 
 
@@ -322,7 +322,9 @@ def test_reader_reserves_immediately_before_popen_and_keeps_orphan(
     monkeypatch.setattr(
         "auto_zettelkasten.readers.subprocess.Popen", fail_after_reservation
     )
-    with guard.job("contract:001"), pytest.raises(OSError, match="synthetic"):
+    with guard.job("contract:001"), pytest.raises(
+        ProviderTransportError, match="Codex CLI process could not start"
+    ):
         reader.read_source_bundle("A complete source.", {"title": "Fixture"})
     with guard.job("contract:001"), pytest.raises(
         CodexAttemptStateError, match="already reserved"
@@ -357,7 +359,9 @@ def test_default_request_identity_blocks_retry_but_allows_distinct_recovery(
 
     with monkeypatch.context() as patch:
         patch.setattr("auto_zettelkasten.readers.subprocess.Popen", fail_spawn)
-        with pytest.raises(OSError, match="synthetic"):
+        with pytest.raises(
+            ProviderTransportError, match="Codex CLI process could not start"
+        ):
             reader.read_source_bundle(
                 "A complete source.",
                 {"title": "Fixture"},
@@ -384,7 +388,9 @@ def test_default_request_identity_blocks_retry_but_allows_distinct_recovery(
                 {"title": "Fixture"},
                 attachment_paths=(image,),
             )
-        with pytest.raises(OSError, match="synthetic"):
+        with pytest.raises(
+            ProviderTransportError, match="Codex CLI process could not start"
+        ):
             resumed_reader.read_source_bundle(
                 "Recovered local text.", {"title": "Fixture"}
             )

@@ -7,6 +7,8 @@ import hashlib
 import http.client
 import json
 import os
+import platform
+import queue
 import re
 import shutil
 import signal
@@ -271,6 +273,9 @@ _OUTPUT_CONTRACT: ContextVar[str | None] = ContextVar(
 )
 _SOURCE_BUNDLE_ATTACHMENTS: ContextVar[tuple[Path, ...]] = ContextVar(
     "auto_zettelkasten_source_bundle_attachments", default=()
+)
+_SOURCE_BUNDLE_EXPECTED_PDF_SHA256: ContextVar[str] = ContextVar(
+    "auto_zettelkasten_source_bundle_expected_pdf_sha256", default=""
 )
 
 _CODEX_STRING = {"type": "string"}
@@ -1077,6 +1082,51 @@ workspace_dependencies|stable|true
 workspace_owner_usage_nudge|removed|false
 """
 
+# Exact rust-v0.152.1 additions and changes over the frozen 0.145.0 snapshot.
+# Repeated keys intentionally override their 0.145.0 values below.
+_CODEX_0152_FEATURES = _CODEX_0145_FEATURES + """\
+transcript_v2|under development|false
+view_image|stable|true
+sleep_tool|stable|true
+powershell_shell_version|under development|false
+shell_snapshot_v2|under development|false
+cwd_relative_turn_diffs|under development|false
+content_item_kinds|stable|true
+executed_tool_call_metadata|under development|false
+code_mode_buffered_exec|removed|false
+code_mode_prewarm|under development|false
+code_mode_interrupt|under development|false
+apply_patch_preserve_line_endings|under development|false
+write_stdin_approval|under development|false
+unbounded_connection_retries|stable|true
+local_thread_store_shared_compression|under development|false
+background_paginated_rollout_migration|under development|false
+psp|under development|false
+mcp_2026_07_28|under development|false
+deferred_tool_world_state|under development|false
+recommended_plugins|stable|false
+skip_host_skill_discovery|under development|false
+in_app_chat|stable|true
+in_app_dictation|stable|true
+in_app_local_automation|stable|true
+in_app_updates|stable|true
+omit_app_server_notification_media|under development|false
+image_resize_notice|under development|false
+unified_image_budget|under development|false
+item_ids|removed|true
+send_async_message|removed|false
+guardian_reuse_parent_compaction|under development|false
+guardian_enhanced_node_repl_transcripts|under development|false
+guardian_node_repl_transcript_images|under development|false
+guardianv2|under development|false
+guardian_ext|under development|false
+bedrock_setup_wizard|under development|false
+step_model_switching|under development|false
+compaction_image_budget|stable|true
+retain_client_developer_messages|under development|false
+unified_exec_zsh_fork|removed|true
+"""
+
 _CODEX_TOOL_FEATURES = frozenset(
     {
         "apps",
@@ -1119,11 +1169,29 @@ _CODEX_TOOL_FEATURES = frozenset(
     }
 )
 
+_CODEX_0152_DISABLED_FEATURES = frozenset(
+    (
+        *_CODEX_TOOL_FEATURES,
+        "sleep_tool",
+        "unbounded_connection_retries",
+        "view_image",
+    )
+)
+
 _CODEX_TOOL_FEATURE_ARGUMENTS = tuple(
     argument
     for feature in sorted(_CODEX_TOOL_FEATURES)
     for argument in ("-c", f"features.{feature}=false")
 )
+
+
+def _codex_tool_feature_arguments(cli_profile: str) -> tuple[str, ...]:
+    return tuple(
+        argument
+        for feature in sorted(CODEX_CLI_PROFILES[cli_profile]["tool_features"])
+        for argument in ("-c", f"features.{feature}=false")
+    )
+
 
 _CODEX_SKILL_ARGUMENTS = (
     "-c",
@@ -1131,6 +1199,16 @@ _CODEX_SKILL_ARGUMENTS = (
     "-c",
     "skills.include_instructions=false",
 )
+_CODEX_NO_RETRY_ARGUMENTS = (
+    "-c",
+    "model_providers.openai.request_max_retries=0",
+    "-c",
+    "model_providers.openai.stream_max_retries=0",
+)
+
+
+def _codex_retry_arguments(cli_profile: str) -> tuple[str, ...]:
+    return _CODEX_NO_RETRY_ARGUMENTS if cli_profile == "0.152.1" else ()
 
 _CODEX_TOOL_ITEM_TYPES = frozenset(
     {
@@ -1212,37 +1290,99 @@ CODEX_CLI_PROFILES: Mapping[str, Mapping[str, Any]] = {
             "max_images": 16,
             "direct_pdf": "unsupported",
         },
-    }
+    },
+    "0.152.1": {
+        "models": {
+            model: {
+                "context_window": 272_000,
+                "max_context_window": 872_000,
+                "effective_context_window_percent": 95,
+                "tool_mode": "code_mode_only",
+                "reasoning_efforts": ("medium", "high", "max"),
+            }
+            for model in ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol")
+        },
+        "features": {
+            line.split("|", 1)[0]: {
+                "maturity": line.split("|")[1],
+                "default": line.rsplit("|", 1)[1] == "true",
+            }
+            for line in _CODEX_0152_FEATURES.splitlines()
+            if line
+        },
+        "tool_features": _CODEX_0152_DISABLED_FEATURES,
+        "event_types": frozenset(
+            {
+                "thread.started",
+                "turn.started",
+                "turn.failed",
+                "item.started",
+                "item.updated",
+                "item.completed",
+                "turn.completed",
+                "error",
+            }
+        ),
+        "source_bundle_attachments": {
+            "argument": "--image",
+            "media_types": ("image/png", "application/pdf"),
+            "max_images": 16,
+            "direct_pdf": "input_file-v1",
+        },
+    },
+}
+
+_CODEX_SUPPORTED_MODELS = frozenset(
+    model
+    for profile in CODEX_CLI_PROFILES.values()
+    for model in profile["models"]
+)
+_CODEX_PDF_HELPER_TAG = "rust-v0.152.1"
+_CODEX_PDF_HELPER_COMMIT = "5adb68a49933ae446bf11935662c83dba55a0804"
+_CODEX_PDF_PROTOCOL_REVISION = "input_file-v1"
+_CODEX_PDF_MAX_BYTES = 50_000_000
+# Packaging replaces this empty set with the reviewed patch/binary hash pair.
+# A companion manifest can describe a build, but it cannot grant itself trust.
+_CODEX_PDF_HELPER_TRUST: Mapping[str, frozenset[tuple[str, str]]] = {
+    "macos-arm64": frozenset()
 }
 
 
-def codex_contract_identity(contract_id: str, model: str, effort: str) -> dict[str, Any]:
+def codex_contract_identity(
+    contract_id: str,
+    model: str,
+    effort: str,
+    cli_profile: str = "0.145.0",
+) -> dict[str, Any]:
     if contract_id not in CODEX_OUTPUT_CONTRACTS:
         raise ProviderError(f"unsupported Codex output contract: {contract_id}")
     schema = _codex_json_schema(contract_id)
-    feature_profile = CODEX_CLI_PROFILES["0.145.0"]
+    if cli_profile not in CODEX_CLI_PROFILES:
+        raise ProviderError(f"unsupported Codex CLI profile: {cli_profile}")
+    feature_profile = CODEX_CLI_PROFILES[cli_profile]
+    feature_manifest = {
+        "event_types": sorted(feature_profile["event_types"]),
+        "features": feature_profile["features"],
+        "skill_arguments": _CODEX_SKILL_ARGUMENTS,
+        "tool_features": sorted(feature_profile["tool_features"]),
+        "tool_item_types": sorted(_CODEX_TOOL_ITEM_TYPES),
+    }
+    retry_arguments = _codex_retry_arguments(cli_profile)
+    if retry_arguments:
+        feature_manifest["retry_arguments"] = retry_arguments
     return {
         "provider": "codex",
         "model": model,
         "reasoning_effort": effort,
         "adapter_protocol": "codex-cli-jsonl-v1",
-        "cli_profile": "0.145.0",
+        "cli_profile": cli_profile,
         "contract_id": contract_id,
         "schema_hash": hashlib.sha256(
             json.dumps(schema, sort_keys=True).encode("utf-8")
         ).hexdigest(),
         "output_reservation": CODEX_CONTRACT_RESERVATIONS[contract_id],
         "feature_manifest_hash": hashlib.sha256(
-            json.dumps(
-                {
-                    "event_types": sorted(feature_profile["event_types"]),
-                    "features": feature_profile["features"],
-                    "skill_arguments": _CODEX_SKILL_ARGUMENTS,
-                    "tool_features": sorted(feature_profile["tool_features"]),
-                    "tool_item_types": sorted(_CODEX_TOOL_ITEM_TYPES),
-                },
-                sort_keys=True,
-            ).encode("utf-8")
+            json.dumps(feature_manifest, sort_keys=True).encode("utf-8")
         ).hexdigest(),
         "transport_instructions_hash": hashlib.sha256(
             _CODEX_TRANSPORT_INSTRUCTIONS.encode("utf-8")
@@ -1250,16 +1390,22 @@ def codex_contract_identity(contract_id: str, model: str, effort: str) -> dict[s
     }
 
 
-def codex_source_bundle_attachment_identity() -> dict[str, Any]:
-    profile = CODEX_CLI_PROFILES["0.145.0"]["source_bundle_attachments"]
-    return {
+def codex_source_bundle_attachment_identity(
+    cli_profile: str = "0.145.0",
+    helper_manifest_identity: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    profile = CODEX_CLI_PROFILES[cli_profile]["source_bundle_attachments"]
+    identity = {
         "adapter_protocol": "codex-cli-jsonl-v1",
-        "cli_profile": "0.145.0",
+        "cli_profile": cli_profile,
         "argument": profile["argument"],
         "media_types": list(profile["media_types"]),
         "max_images": profile["max_images"],
         "direct_pdf": profile["direct_pdf"],
     }
+    if helper_manifest_identity:
+        identity["helper_manifest"] = dict(helper_manifest_identity)
+    return identity
 
 
 def _codex_contract_note(contract_id: str) -> str:
@@ -1369,7 +1515,13 @@ def codex_contract_for_stage(stage: str) -> str:
     return contract
 
 
-def codex_stage_identity(stage: str, model: str, effort: str) -> dict[str, Any]:
+def codex_stage_identity(
+    stage: str,
+    model: str,
+    effort: str,
+    *,
+    cli_profile: str = "0.145.0",
+) -> dict[str, Any]:
     own = codex_contract_for_stage(stage)
     dependencies = {
         "relationship_candidate_selection": (
@@ -1395,17 +1547,46 @@ def codex_stage_identity(stage: str, model: str, effort: str) -> dict[str, Any]:
         }
 
     return {
-        contract_id: codex_contract_identity(contract_id, model, effort)
+        contract_id: codex_contract_identity(
+            contract_id, model, effort, cli_profile
+        )
         for contract_id in (*sorted(ancestors(own)), own)
     }
 
 
-def codex_suite_identity(model: str, effort: str) -> dict[str, Any]:
+def codex_suite_identity(
+    model: str,
+    effort: str,
+    *,
+    cli_profile: str = "0.145.0",
+) -> dict[str, Any]:
     return {
-        contract_id: codex_contract_identity(contract_id, model, effort)
+        contract_id: codex_contract_identity(
+            contract_id, model, effort, cli_profile
+        )
         for contract_id in CODEX_OUTPUT_CONTRACTS
         if contract_id not in {"source_bundle", "chunk_evidence", "evidence_profile"}
     }
+
+
+def codex_execution_profile(reader: Any) -> str:
+    """Return the verified CLI profile only when a new Codex call is required."""
+
+    cached = getattr(reader, "_preflight", None)
+    if isinstance(cached, Mapping):
+        version = str(cached.get("version") or "")
+        if version in CODEX_CLI_PROFILES:
+            return version
+    ensure_preflight = getattr(reader, "_ensure_codex_preflight", None)
+    if callable(ensure_preflight):
+        ensure_preflight()
+        cached = getattr(reader, "_preflight", None)
+        if isinstance(cached, Mapping):
+            version = str(cached.get("version") or "")
+            if version in CODEX_CLI_PROFILES:
+                return version
+        raise ProviderIsolationFailure("Codex preflight did not bind a CLI profile")
+    return "0.145.0"
 
 
 def _codex_json_schema(contract_id: str) -> dict[str, Any]:
@@ -1715,11 +1896,17 @@ class _CapabilityAwareReader:
         system_prompt = _source_bundle_system_prompt()
         user_prompt = _source_bundle_prompt(text, metadata, question)
         if attachments:
-            user_prompt = (
-                "The attached page images are the inspected source content in page order. "
+            attachment_instruction = (
+                "The attached PDF is the original inspected source document. "
+                "Read it directly; an empty extracted-text block does not mean the source "
+                "is empty or unavailable.\n\n"
+                if len(attachments) == 1
+                and attachments[0].suffix.casefold() == ".pdf"
+                else "The attached page images are the inspected source content in page order. "
                 "Read them directly; an empty extracted-text block does not mean the source "
-                "is empty or unavailable.\n\n" + user_prompt
+                "is empty or unavailable.\n\n"
             )
+            user_prompt = attachment_instruction + user_prompt
         output_tokens = self._reserved_output_tokens("source_bundle", min(
             int(self.capabilities["supported_output_tokens"]),
             SOURCE_BUNDLE_MAX_OUTPUT_TOKENS,
@@ -1728,6 +1915,17 @@ class _CapabilityAwareReader:
             system_prompt, user_prompt, output_tokens, label="source analysis bundle"
         )
         attachment_token = _SOURCE_BUNDLE_ATTACHMENTS.set(attachments)
+        source_context = metadata.get("_source_context")
+        expected_pdf_hash = (
+            str(source_context.get("custody_sha256") or "")
+            if len(attachments) == 1
+            and attachments[0].suffix.casefold() == ".pdf"
+            and isinstance(source_context, Mapping)
+            else ""
+        )
+        expected_pdf_hash_token = _SOURCE_BUNDLE_EXPECTED_PDF_SHA256.set(
+            expected_pdf_hash
+        )
         try:
             raw = self._generate_with_reasoning(
                 system_prompt,
@@ -1738,6 +1936,7 @@ class _CapabilityAwareReader:
                 output_contract="source_bundle",
             )
         finally:
+            _SOURCE_BUNDLE_EXPECTED_PDF_SHA256.reset(expected_pdf_hash_token)
             _SOURCE_BUNDLE_ATTACHMENTS.reset(attachment_token)
         try:
             bundle = _parse_source_bundle_response(
@@ -3000,6 +3199,18 @@ def _redact_codex_diagnostic(
     private_paths: Sequence[Path | str] = (),
 ) -> str:
     redacted = str(value)
+    redacted = re.sub(
+        r"(?i)data:application/pdf;base64,(?:[A-Za-z0-9+/=]|\s)+",
+        "data:application/pdf;base64,[REDACTED]",
+        redacted,
+    )
+    redacted = re.sub(
+        r"(?<![A-Za-z0-9+/])(?:[A-Za-z0-9+/]{4}){8,}"
+        r"(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?"
+        r"(?![A-Za-z0-9+/=])",
+        "[REDACTED_BASE64]",
+        redacted,
+    )
     if credential_root:
         root = str(Path(credential_root).expanduser().resolve(strict=False))
         if root and root != Path(root).anchor:
@@ -3060,6 +3271,7 @@ def _codex_environment(
         "LANG",
         "LC_ALL",
         "CODEX_HOME",
+        "AUTO_ZETTELKASTEN_CODEX",
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
     }
@@ -3072,10 +3284,92 @@ def _codex_environment(
 
 def _codex_executable(environment: Mapping[str, str] | None = None) -> Path:
     environment = environment or _codex_environment()
-    executable = shutil.which("codex", path=environment.get("PATH"))
+    override = str(environment.get("AUTO_ZETTELKASTEN_CODEX") or "").strip()
+    if override:
+        executable = (
+            override
+            if Path(override).expanduser().is_absolute()
+            else shutil.which(override, path=environment.get("PATH"))
+        )
+        if not executable:
+            raise ProviderError("AUTO_ZETTELKASTEN_CODEX is not executable")
+    else:
+        executable = shutil.which(
+            "auto-zettelkasten-codex", path=environment.get("PATH")
+        ) or shutil.which("codex", path=environment.get("PATH"))
     if not executable:
         raise ProviderError("Codex CLI is not installed")
-    return Path(executable).resolve()
+    try:
+        path = Path(executable).expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise ProviderError("Codex CLI is not executable") from exc
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise ProviderError("Codex CLI is not executable")
+    return path
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1_048_576), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _codex_payload_sentinels(value: bytes, width: int = 64) -> tuple[bytes, ...]:
+    if not value:
+        return ()
+    width = min(width, len(value))
+    offsets = (0, (len(value) - width) // 2, len(value) - width)
+    return tuple(dict.fromkeys(value[offset : offset + width] for offset in offsets))
+
+
+def _codex_pdf_helper_manifest(executable: Path) -> dict[str, Any] | None:
+    manifest_path = executable.with_name(executable.name + ".manifest.json")
+    try:
+        stat_result = manifest_path.lstat()
+        if not stat.S_ISREG(stat_result.st_mode) or stat_result.st_size > 65_536:
+            return None
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(manifest, Mapping):
+        return None
+    expected = {
+        "manifest_version": 1,
+        "upstream_tag": _CODEX_PDF_HELPER_TAG,
+        "upstream_commit": _CODEX_PDF_HELPER_COMMIT,
+        "platform": "macos-arm64",
+        "license": "Apache-2.0",
+        "notice": "NOTICE",
+        "input_file_protocol_revision": _CODEX_PDF_PROTOCOL_REVISION,
+    }
+    if any(manifest.get(key) != value for key, value in expected.items()):
+        return None
+    patch_hash = str(manifest.get("patch_sha256") or "")
+    binary_hash = str(manifest.get("binary_sha256") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", patch_hash) or not re.fullmatch(
+        r"[0-9a-f]{64}", binary_hash
+    ):
+        return None
+    if (patch_hash, binary_hash) not in _CODEX_PDF_HELPER_TRUST.get(
+        str(expected["platform"]), frozenset()
+    ):
+        return None
+    if platform.system() != "Darwin" or platform.machine() != "arm64":
+        return None
+    try:
+        if _sha256_file(executable) != binary_hash:
+            return None
+        manifest_hash = _sha256_file(manifest_path)
+    except OSError:
+        return None
+    return {
+        **expected,
+        "patch_sha256": patch_hash,
+        "binary_sha256": binary_hash,
+        "manifest_sha256": manifest_hash,
+    }
 
 
 def _parse_codex_features(value: str) -> dict[str, dict[str, Any]]:
@@ -3119,10 +3413,7 @@ def codex_preflight_status(
     """Validate the pinned ChatGPT-authenticated CLI without making a model call."""
 
     requested_models = tuple(dict.fromkeys((model, *additional_models)))
-    if any(
-        requested not in CODEX_CLI_PROFILES["0.145.0"]["models"]
-        for requested in requested_models
-    ):
+    if any(requested not in _CODEX_SUPPORTED_MODELS for requested in requested_models):
         raise ProviderError(f"unsupported Codex model: {requested_models}")
     if reasoning_effort not in {"medium", "high", "max"}:
         raise ProviderError("Codex reasoning_effort must be medium, high, or max")
@@ -3163,6 +3454,10 @@ def codex_preflight_status(
             f"{_redact_codex_diagnostic(version or version_output, credential_root)}"
         )
     profile = CODEX_CLI_PROFILES[version]
+    if any(requested not in profile["models"] for requested in requested_models):
+        raise ProviderError(
+            f"unsupported Codex model for CLI {version}: {requested_models}"
+        )
     catalog = _codex_model_catalog(environment)
     for requested in requested_models:
         installed_model = catalog.get(requested)
@@ -3202,7 +3497,7 @@ def codex_preflight_status(
         feature_environment["CODEX_HOME"] = clean_codex_home
         features = _parse_codex_features(
             check(
-                *_CODEX_TOOL_FEATURE_ARGUMENTS,
+                *_codex_tool_feature_arguments(version),
                 "features", "list",
                 check_environment=feature_environment,
             )
@@ -3210,7 +3505,9 @@ def codex_preflight_status(
     expected_features = {
         name: {
             **values,
-            "default": False if name in _CODEX_TOOL_FEATURES else values["default"],
+            "default": False
+            if name in profile["tool_features"]
+            else values["default"],
         }
         for name, values in profile["features"].items()
     }
@@ -3232,12 +3529,22 @@ def codex_preflight_status(
     login = check("login", "status")
     if "logged in using chatgpt" not in login.casefold():
         raise ProviderError("Codex CLI must be logged in using ChatGPT")
+    helper_manifest = _codex_pdf_helper_manifest(executable)
+    helper_manifest_valid = helper_manifest is not None
     return {
         "status": "configured",
         "provider": "codex",
         "cloud": True,
         "executable": str(executable),
         "version": version,
+        "helper_version": version if helper_manifest_valid else "",
+        "helper_manifest_valid": helper_manifest_valid,
+        "pdf_input_file_capability": bool(
+            helper_manifest_valid
+            and version == "0.152.1"
+            and profile["source_bundle_attachments"]["direct_pdf"]
+            == _CODEX_PDF_PROTOCOL_REVISION
+        ),
         "auth_method": "chatgpt",
         "auth_status": "authenticated",
         "model": model,
@@ -3253,6 +3560,7 @@ def codex_preflight_status(
         "quota": "unknown",
         "_environment": dict(environment),
         "_credential_root": str(credential_root),
+        "_helper_manifest_identity": dict(helper_manifest or {}),
     }
 
 
@@ -3262,14 +3570,24 @@ def _terminate_codex_process(process: subprocess.Popen[bytes]) -> None:
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except OSError:
-        process.terminate()
+        try:
+            process.terminate()
+        except OSError:
+            return
     try:
         process.wait(timeout=2)
     except subprocess.TimeoutExpired:
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except OSError:
-            process.kill()
+            try:
+                process.kill()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
 
 def _codex_failure(
@@ -3317,6 +3635,11 @@ def _codex_failure(
             "image inputs are not supported",
             "does not support image input",
             "unsupported image input",
+            "unsupported input_file",
+            "input_file is not supported",
+            "does not support file input",
+            "unsupported file input",
+            "unsupported attachment",
         )
     ):
         return ProviderUnsupportedAttachment(diagnostic)
@@ -3394,6 +3717,39 @@ def _validated_codex_image_attachments(
     return tuple(paths), tuple(hashes)
 
 
+def _validated_codex_pdf_attachment(
+    values: Sequence[Path],
+    credential_root: Path | str | None,
+    expected_sha256: str = "",
+) -> tuple[Path, bytes, str]:
+    if len(values) != 1:
+        raise ProviderIsolationFailure("Codex PDF transport requires exactly one PDF")
+    value = values[0]
+    if not value.is_absolute() or value.is_symlink():
+        raise ProviderIsolationFailure("Codex PDF attachment is not a regular file")
+    try:
+        path = value.resolve(strict=True)
+        data = path.read_bytes()
+    except OSError as exc:
+        raise ProviderIsolationFailure("Codex PDF attachment is not readable") from exc
+    if not path.is_file() or path.suffix.casefold() != ".pdf":
+        raise ProviderIsolationFailure("Codex PDF attachment must be a PDF file")
+    if not data or len(data) >= _CODEX_PDF_MAX_BYTES:
+        raise ProviderIsolationFailure("Codex PDF attachment size is invalid")
+    if b"%PDF-" not in data[:1_024]:
+        raise ProviderIsolationFailure("Codex PDF attachment header is invalid")
+    if credential_root and _paths_overlap(
+        path, Path(str(credential_root)).expanduser().resolve(strict=False)
+    ):
+        raise ProviderIsolationFailure(
+            "Codex PDF attachment overlaps the credential root"
+        )
+    digest = hashlib.sha256(data).hexdigest()
+    if expected_sha256 and digest != expected_sha256:
+        raise ProviderIsolationFailure("Codex PDF attachment custody hash mismatch")
+    return path, data, digest
+
+
 @dataclass(slots=True)
 class CodexReader(_CapabilityAwareReader):
     model: str
@@ -3426,7 +3782,7 @@ class CodexReader(_CapabilityAwareReader):
     )
 
     def __post_init__(self) -> None:
-        if self.model not in CODEX_CLI_PROFILES["0.145.0"]["models"]:
+        if self.model not in _CODEX_SUPPORTED_MODELS:
             raise ValueError(f"unsupported Codex model: {self.model}")
         if self.reasoning_effort not in {None, "medium", "high", "max"}:
             raise ValueError("reasoning_effort must be medium, high, max, or None")
@@ -3448,6 +3804,756 @@ class CodexReader(_CapabilityAwareReader):
                 )
             )
 
+    def pdf_input_file_status(self) -> dict[str, Any]:
+        """Return the cached, provider-free companion capability status."""
+
+        self._ensure_codex_preflight()
+        return {
+            key: self._preflight.get(key)
+            for key in (
+                "version",
+                "helper_version",
+                "helper_manifest_valid",
+                "pdf_input_file_capability",
+                "_helper_manifest_identity",
+            )
+        }
+
+    def _generate_pdf_text(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        output_tokens: int,
+        deadline_seconds: float,
+        attachment_values: Sequence[Path],
+    ) -> _ProviderText:
+        contract_id = _OUTPUT_CONTRACT.get()
+        if contract_id != "source_bundle":
+            raise ProviderIsolationFailure(
+                "Codex PDF attachments are limited to source bundles"
+            )
+        self._ensure_codex_preflight()
+        assert self._preflight is not None
+        if not self._preflight.get("pdf_input_file_capability"):
+            raise ProviderUnsupportedAttachment(
+                "Codex companion does not support verified PDF input_file transport"
+            )
+        environment = dict(
+            self._preflight.get("_environment")
+            or _codex_environment(self.credential_forbidden_roots)
+        )
+        credential_root = self._preflight.get("_credential_root")
+        if not credential_root:
+            raise ProviderIsolationFailure(
+                "Codex preflight did not provide a credential root"
+            )
+        pdf_path, pdf_data, pdf_hash = _validated_codex_pdf_attachment(
+            attachment_values,
+            credential_root,
+            _SOURCE_BUNDLE_EXPECTED_PDF_SHA256.get(),
+        )
+        version = str(self._preflight.get("version") or "")
+        cached_helper_identity = self._preflight.get("_helper_manifest_identity")
+        if not isinstance(cached_helper_identity, Mapping):
+            raise ProviderIsolationFailure("Codex companion manifest is unavailable")
+        executable = Path(str(self._preflight["executable"]))
+        helper_identity = _codex_pdf_helper_manifest(executable)
+        if helper_identity is None or helper_identity != dict(cached_helper_identity):
+            raise ProviderIsolationFailure(
+                "Codex companion identity changed after preflight"
+            )
+        effort = _REASONING_EFFORT.get() or "medium"
+        identity = {
+            **codex_contract_identity(contract_id, self.model, effort, version),
+            "attachment_transport": {
+                **codex_source_bundle_attachment_identity(
+                    version, helper_identity
+                ),
+                "adapter_protocol": "codex-app-server-jsonrpc-v2",
+            },
+            "attachment_count": 1,
+            "attachment_hashes": [pdf_hash],
+        }
+        prompt = _codex_wire_prompt(system_prompt, user_prompt, contract_id)
+        request_job_id = "request:" + hashlib.sha256(
+            json.dumps(
+                {
+                    "execution_identity": identity,
+                    "wire_prompt_sha256": hashlib.sha256(
+                        prompt.encode("utf-8")
+                    ).hexdigest(),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        byte_limit = _stream_response_byte_limit(output_tokens)
+        encoded_pdf = base64.b64encode(pdf_data).decode("ascii")
+        payload_sentinels = (
+            *_codex_payload_sentinels(encoded_pdf.encode("ascii")),
+            *_codex_payload_sentinels(pdf_data, width=32),
+        )
+        stdout_bytes = bytearray()
+        stderr_bytes = bytearray()
+        stream_failure: list[ProviderError] = []
+        message_queue: queue.Queue[bytes | None] = queue.Queue()
+        agent_text = ""
+        usage: dict[str, Any] = {}
+        terminal: dict[str, Any] | None = None
+        thread_id = ""
+        turn_id = ""
+        observed_thread_ids: set[str] = set()
+        observed_turn_ids: set[str] = set()
+
+        with tempfile.TemporaryDirectory(
+            prefix="auto-zettelkasten-codex-pdf-"
+        ) as value:
+            call_root = Path(value)
+            if _paths_overlap(
+                Path(str(credential_root)).resolve(strict=False),
+                call_root.resolve(strict=False),
+            ):
+                raise ProviderIsolationFailure(
+                    "Codex credential root overlaps the temporary call directory"
+                )
+            call_root.chmod(0o700)
+            environment = _isolated_codex_environment(
+                environment,
+                credential_root,
+                call_root,
+                deadline_seconds,
+            )
+            environment.pop("AUTO_ZETTELKASTEN_CODEX", None)
+            child_auth_path = Path(environment["CODEX_HOME"]) / "auth.json"
+            child_auth_hash = hashlib.sha256(child_auth_path.read_bytes()).digest()
+            call_dir = call_root / "work"
+            call_dir.mkdir(mode=0o700)
+            command = [
+                str(executable),
+                "app-server",
+                "--strict-config",
+                "-c",
+                'forced_login_method="chatgpt"',
+                "-c",
+                "project_doc_max_bytes=0",
+                "-c",
+                'approval_policy="never"',
+                "-c",
+                "tools.web_search=false",
+                "-c",
+                f'model_reasoning_effort="{effort}"',
+                "-c",
+                "agents.enabled=false",
+                *_CODEX_SKILL_ARGUMENTS,
+                *_codex_retry_arguments(version),
+                *_codex_tool_feature_arguments(version),
+            ]
+            if _codex_pdf_helper_manifest(executable) != helper_identity:
+                raise ProviderIsolationFailure(
+                    "Codex companion identity changed before process launch"
+                )
+            reserve_codex_attempt(
+                self.attempt_guard,
+                contract_id=contract_id,
+                job_id=request_job_id,
+            )
+            try:
+                process = subprocess.Popen(
+                    command,
+                    cwd=call_dir,
+                    env=environment,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                )
+            except OSError as exc:
+                raise ProviderTransportError(
+                    "Codex app-server process could not start",
+                    transport_kind="codex_app_server",
+                    cause=exc,
+                ) from exc
+            with _ACTIVE_RESPONSE_LOCK:
+                _ACTIVE_RESPONSES[id(process)] = process
+
+            def read_stdout() -> None:
+                assert process.stdout is not None
+                try:
+                    for line in iter(process.stdout.readline, b""):
+                        stdout_bytes.extend(line)
+                        if len(stdout_bytes) > byte_limit:
+                            stream_failure.append(
+                                ProviderError(
+                                    "Codex app-server response exceeded the byte ceiling"
+                                )
+                            )
+                            _terminate_codex_process(process)
+                            break
+                        message_queue.put(line)
+                except OSError as exc:
+                    stream_failure.append(
+                        ProviderTransportError(
+                            "Codex app-server stdout failed",
+                            transport_kind="codex_app_server",
+                            cause=exc,
+                        )
+                    )
+                finally:
+                    message_queue.put(None)
+
+            def read_stderr() -> None:
+                assert process.stderr is not None
+                try:
+                    while chunk := process.stderr.read(65_536):
+                        stderr_bytes.extend(chunk)
+                        if len(stderr_bytes) > byte_limit:
+                            stream_failure.append(
+                                ProviderError(
+                                    "Codex app-server stderr exceeded the byte ceiling"
+                                )
+                            )
+                            _terminate_codex_process(process)
+                            return
+                except OSError as exc:
+                    stream_failure.append(
+                        ProviderTransportError(
+                            "Codex app-server stderr failed",
+                            transport_kind="codex_app_server",
+                            cause=exc,
+                        )
+                    )
+
+            stdout_thread = threading.Thread(target=read_stdout, daemon=True)
+            stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+            started_threads: list[threading.Thread] = []
+            writer_threads: list[threading.Thread] = []
+            deadline = time.monotonic() + deadline_seconds
+
+            def send(message: Mapping[str, Any]) -> None:
+                assert process.stdin is not None
+                payload = (
+                    json.dumps(message, separators=(",", ":")).encode("utf-8")
+                    + b"\n"
+                )
+                write_done = threading.Event()
+                write_failure: list[BaseException] = []
+
+                def write_payload() -> None:
+                    try:
+                        process.stdin.write(payload)
+                        process.stdin.flush()
+                    except BaseException as exc:
+                        write_failure.append(exc)
+                    finally:
+                        write_done.set()
+
+                writer = threading.Thread(target=write_payload, daemon=True)
+                writer_threads.append(writer)
+                writer.start()
+                while not write_done.wait(
+                    min(0.1, max(0.01, deadline - time.monotonic()))
+                ):
+                    if bool(
+                        getattr(process, "_auto_zettelkasten_interrupted", False)
+                    ):
+                        _terminate_codex_process(process)
+                        writer.join(timeout=2)
+                        raise ProviderInterrupted(
+                            "Codex app-server request interrupted"
+                        )
+                    if time.monotonic() >= deadline:
+                        _terminate_codex_process(process)
+                        writer.join(timeout=2)
+                        raise ProviderTimeout("Codex app-server request timed out")
+                    if process.poll() is not None:
+                        writer.join(timeout=2)
+                        raise _codex_failure(
+                            f"Codex app-server exited {process.returncode}",
+                            credential_root,
+                            (pdf_path,),
+                        )
+                writer.join()
+                writer_threads.remove(writer)
+                if write_failure:
+                    if bool(
+                        getattr(process, "_auto_zettelkasten_interrupted", False)
+                    ):
+                        raise ProviderInterrupted(
+                            "Codex app-server request interrupted"
+                        ) from write_failure[0]
+                    raise ProviderTransportError(
+                        "Codex app-server transport failed",
+                        transport_kind="codex_app_server",
+                        cause=write_failure[0],
+                    ) from write_failure[0]
+
+            allowed_methods = {
+                "account/rateLimits/updated",
+                "item/agentMessage/delta",
+                "item/completed",
+                "item/reasoning/summaryPartAdded",
+                "item/reasoning/summaryTextDelta",
+                "item/reasoning/textDelta",
+                "item/started",
+                "remoteControl/status/changed",
+                "thread/started",
+                "thread/status/changed",
+                "thread/tokenUsage/updated",
+                "turn/completed",
+                "turn/started",
+            }
+
+            turn_methods = {
+                "item/agentMessage/delta",
+                "item/completed",
+                "item/reasoning/summaryPartAdded",
+                "item/reasoning/summaryTextDelta",
+                "item/reasoning/textDelta",
+                "item/started",
+                "thread/tokenUsage/updated",
+                "turn/completed",
+                "turn/started",
+            }
+
+            def process_message(line: bytes) -> dict[str, Any]:
+                nonlocal agent_text, terminal, usage
+                if terminal is not None:
+                    raise ProviderIsolationFailure(
+                        "Codex app-server emitted output after turn completion"
+                    )
+                if b"data:application/pdf;base64," in line or any(
+                    sentinel in line for sentinel in payload_sentinels
+                ):
+                    raise ProviderIsolationFailure(
+                        "Codex app-server leaked raw PDF input"
+                    )
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ProviderIsolationFailure(
+                        "Codex app-server emitted invalid JSON"
+                    ) from exc
+                if not isinstance(message, Mapping):
+                    raise ProviderIsolationFailure(
+                        "Codex app-server emitted a malformed message"
+                    )
+                method = str(message.get("method") or "")
+                if message.get("id") is not None and method:
+                    raise ProviderIsolationFailure(
+                        "Codex app-server issued an unexpected server request"
+                    )
+                if not method:
+                    if type(message.get("id")) is not int:
+                        raise ProviderIsolationFailure(
+                            "Codex app-server emitted a malformed response"
+                        )
+                    return dict(message)
+                if method == "model/rerouted":
+                    raise ProviderIsolationFailure(
+                        "Codex app-server rerouted the requested model"
+                    )
+                if method == "error":
+                    raise _codex_failure(
+                        str(message.get("params") or "app-server error"),
+                        credential_root,
+                        (pdf_path,),
+                    )
+                if method not in allowed_methods:
+                    raise ProviderIsolationFailure(
+                        "Codex app-server emitted an unexpected event: "
+                        + _redact_codex_diagnostic(method, credential_root)
+                    )
+                params = message.get("params")
+                if not isinstance(params, Mapping):
+                    raise ProviderIsolationFailure(
+                        "Codex app-server emitted malformed event parameters"
+                    )
+                event_thread_id = ""
+                event_turn_id = ""
+                if method == "thread/started":
+                    event_thread = params.get("thread")
+                    if (
+                        not isinstance(event_thread, Mapping)
+                        or event_thread.get("ephemeral") is not True
+                    ):
+                        raise ProviderIsolationFailure(
+                            "Codex app-server emitted a malformed thread event"
+                        )
+                    event_thread_id = str(event_thread.get("id") or "")
+                elif method in turn_methods or method == "thread/status/changed":
+                    event_thread_id = str(params.get("threadId") or "")
+                if method in turn_methods:
+                    if method.startswith("turn/"):
+                        event_turn = params.get("turn")
+                        if not isinstance(event_turn, Mapping):
+                            raise ProviderIsolationFailure(
+                                "Codex app-server emitted a malformed turn event"
+                            )
+                        event_turn_id = str(event_turn.get("id") or "")
+                    else:
+                        event_turn_id = str(params.get("turnId") or "")
+                if event_thread_id:
+                    observed_thread_ids.add(event_thread_id)
+                    if thread_id and event_thread_id != thread_id:
+                        raise ProviderIsolationFailure(
+                            "Codex app-server event belongs to another thread"
+                        )
+                elif method in turn_methods or method in {
+                    "thread/started",
+                    "thread/status/changed",
+                }:
+                    raise ProviderIsolationFailure(
+                        "Codex app-server event is missing its thread binding"
+                    )
+                if event_turn_id:
+                    observed_turn_ids.add(event_turn_id)
+                    if turn_id and event_turn_id != turn_id:
+                        raise ProviderIsolationFailure(
+                            "Codex app-server event belongs to another turn"
+                        )
+                elif method in turn_methods:
+                    raise ProviderIsolationFailure(
+                        "Codex app-server event is missing its turn binding"
+                    )
+                if method in {"item/started", "item/completed"}:
+                    item = params.get("item")
+                    if not isinstance(item, Mapping) or not str(item.get("id") or ""):
+                        raise ProviderIsolationFailure(
+                            "Codex app-server emitted a malformed item"
+                        )
+                    item_type = str(item.get("type") or "")
+                    if item_type not in {
+                        "agentMessage",
+                        "reasoning",
+                        "userMessage",
+                    }:
+                        raise ProviderIsolationFailure(
+                            "Codex app-server attempted a tool or unknown item: "
+                            + _redact_codex_diagnostic(
+                                item_type or "unknown", credential_root
+                            )
+                        )
+                    if method == "item/completed" and item_type == "agentMessage":
+                        text_value = item.get("text")
+                        if not isinstance(text_value, str):
+                            raise ProviderIsolationFailure(
+                                "Codex app-server emitted a malformed agent message"
+                            )
+                        agent_text = text_value
+                elif method == "thread/tokenUsage/updated":
+                    token_usage = params.get("tokenUsage")
+                    if isinstance(token_usage, Mapping) and isinstance(
+                        token_usage.get("total"), Mapping
+                    ):
+                        usage = dict(token_usage["total"])
+                elif method == "turn/completed":
+                    event_turn = params["turn"]
+                    status = str(event_turn.get("status") or "")
+                    if status != "completed" or event_turn.get("error") is not None:
+                        if status == "interrupted":
+                            raise ProviderInterrupted(
+                                "Codex app-server turn was interrupted"
+                            )
+                        if status not in {"completed", "failed"}:
+                            raise ProviderIsolationFailure(
+                                "Codex app-server emitted an unknown terminal state"
+                            )
+                        raise _codex_failure(
+                            str(
+                                event_turn.get("error")
+                                or status
+                                or "unknown turn failure"
+                            ),
+                            credential_root,
+                            (pdf_path,),
+                        )
+                    terminal = dict(message)
+                return dict(message)
+
+            def receive_until(
+                predicate: Callable[[Mapping[str, Any]], bool],
+                *,
+                expected_response_id: int | None = None,
+            ) -> dict[str, Any]:
+                while time.monotonic() < deadline:
+                    if stream_failure:
+                        raise stream_failure[0]
+                    try:
+                        line = message_queue.get(
+                            timeout=min(0.25, max(0.01, deadline - time.monotonic()))
+                        )
+                    except queue.Empty:
+                        if process.poll() is not None:
+                            break
+                        continue
+                    if line is None:
+                        break
+                    message = process_message(line)
+                    if message.get("id") is not None and (
+                        expected_response_id is None
+                        or message.get("id") != expected_response_id
+                    ):
+                        raise ProviderIsolationFailure(
+                            "Codex app-server emitted an unexpected response"
+                        )
+                    if predicate(message):
+                        return message
+                if bool(getattr(process, "_auto_zettelkasten_interrupted", False)):
+                    raise ProviderInterrupted("Codex app-server request interrupted")
+                if process.poll() is not None:
+                    raise _codex_failure(
+                        f"Codex app-server exited {process.returncode}",
+                        credential_root,
+                        (pdf_path,),
+                    )
+                raise ProviderTimeout("Codex app-server request timed out")
+
+            def response(request_id: int, label: str) -> dict[str, Any]:
+                message = receive_until(
+                    lambda value: value.get("id") == request_id,
+                    expected_response_id=request_id,
+                )
+                has_result = "result" in message
+                has_error = message.get("error") is not None
+                if has_result == has_error:
+                    raise ProviderIsolationFailure(
+                        f"Codex app-server {label} returned a malformed response"
+                    )
+                if has_error:
+                    raise _codex_failure(
+                        f"Codex app-server {label} failed: {message['error']}",
+                        credential_root,
+                        (pdf_path,),
+                    )
+                if not isinstance(message.get("result"), Mapping):
+                    raise ProviderIsolationFailure(
+                        f"Codex app-server {label} returned a malformed result"
+                    )
+                return message
+
+            def close_input_and_drain() -> None:
+                if process.stdin is not None and not process.stdin.closed:
+                    process.stdin.close()
+                drain_deadline = min(deadline, time.monotonic() + 2)
+                while time.monotonic() < drain_deadline:
+                    if stream_failure:
+                        raise stream_failure[0]
+                    try:
+                        line = message_queue.get(timeout=0.05)
+                    except queue.Empty:
+                        if process.poll() is not None:
+                            return
+                        continue
+                    if line is None:
+                        return
+                    process_message(line)
+
+            request_failure: ProviderError | None = None
+            request_failure_cause: BaseException | None = None
+            try:
+                for worker in (stdout_thread, stderr_thread):
+                    worker.start()
+                    started_threads.append(worker)
+                send(
+                    {
+                        "method": "initialize",
+                        "id": 1,
+                        "params": {
+                            "clientInfo": {
+                                "name": "auto_zettelkasten",
+                                "title": "Auto-Zettelkasten",
+                                "version": "0.30.0",
+                            }
+                        },
+                    }
+                )
+                response(1, "initialize")
+                send({"method": "initialized", "params": {}})
+                send(
+                    {
+                        "method": "thread/start",
+                        "id": 2,
+                        "params": {
+                            "model": self.model,
+                            "cwd": str(call_dir),
+                            "approvalPolicy": "never",
+                            "sandbox": "read-only",
+                            "ephemeral": True,
+                            "baseInstructions": _CODEX_TRANSPORT_INSTRUCTIONS,
+                            "serviceName": "auto_zettelkasten",
+                        },
+                    }
+                )
+                thread_message = response(2, "thread/start")
+                thread_result = thread_message["result"]
+                thread = thread_result.get("thread")
+                if (
+                    not isinstance(thread, Mapping)
+                    or thread.get("ephemeral") is not True
+                    or not str(thread.get("id") or "")
+                ):
+                    raise ProviderIsolationFailure(
+                        "Codex app-server did not create an ephemeral thread"
+                    )
+                thread_id = str(thread["id"])
+                if (
+                    thread_result.get("model") != self.model
+                    or thread_result.get("modelProvider") != "openai"
+                    or thread.get("modelProvider") != "openai"
+                ):
+                    raise ProviderIsolationFailure(
+                        "Codex app-server changed the requested model or provider"
+                    )
+                if observed_thread_ids and observed_thread_ids != {thread_id}:
+                    raise ProviderIsolationFailure(
+                        "Codex app-server event belongs to another thread"
+                    )
+                send(
+                    {
+                        "method": "thread/inject_items",
+                        "id": 3,
+                        "params": {
+                            "threadId": thread_id,
+                            "items": [
+                                {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "input_file",
+                                            "filename": pdf_path.name,
+                                            "file_data": (
+                                                "data:application/pdf;base64," + encoded_pdf
+                                            ),
+                                            "detail": "auto",
+                                        },
+                                        {
+                                            "type": "input_text",
+                                            "text": prompt,
+                                        },
+                                    ],
+                                }
+                            ],
+                        },
+                    }
+                )
+                response(3, "thread/inject_items")
+                send(
+                    {
+                        "method": "turn/start",
+                        "id": 4,
+                        "params": {
+                            "threadId": thread_id,
+                            "input": [],
+                            "model": self.model,
+                            "effort": effort,
+                            "approvalPolicy": "never",
+                            "sandboxPolicy": {
+                                "type": "readOnly",
+                                "networkAccess": False,
+                            },
+                            "outputSchema": _codex_json_schema(contract_id),
+                        },
+                    }
+                )
+                turn_message = response(4, "turn/start")
+                turn = turn_message["result"].get("turn")
+                if not isinstance(turn, Mapping) or not str(turn.get("id") or ""):
+                    raise ProviderIsolationFailure(
+                        "Codex app-server returned a malformed turn"
+                    )
+                turn_id = str(turn["id"])
+                if observed_turn_ids and observed_turn_ids != {turn_id}:
+                    raise ProviderIsolationFailure(
+                        "Codex app-server event belongs to another turn"
+                    )
+                if terminal is None:
+                    receive_until(lambda value: value.get("method") == "turn/completed")
+                close_input_and_drain()
+            except subprocess.TimeoutExpired as exc:
+                request_failure = ProviderTimeout("Codex app-server request timed out")
+                request_failure_cause = exc
+            except (KeyboardInterrupt, InterruptedError) as exc:
+                request_failure = ProviderInterrupted(
+                    "Codex app-server request interrupted"
+                )
+                request_failure_cause = exc
+            except ProviderError as exc:
+                request_failure = exc
+            except (BrokenPipeError, OSError) as exc:
+                request_failure = ProviderTransportError(
+                    "Codex app-server transport failed",
+                    transport_kind="codex_app_server",
+                    cause=exc,
+                )
+                request_failure_cause = exc
+            except RuntimeError as exc:
+                request_failure = ProviderTransportError(
+                    "Codex app-server worker could not start",
+                    transport_kind="codex_app_server",
+                    cause=exc,
+                )
+                request_failure_cause = exc
+            finally:
+                _terminate_codex_process(process)
+                for stream in (process.stdin, process.stdout, process.stderr):
+                    if stream is not None and not stream.closed:
+                        try:
+                            stream.close()
+                        except OSError:
+                            pass
+                for worker in (*started_threads, *writer_threads):
+                    worker.join(timeout=2)
+                with _ACTIVE_RESPONSE_LOCK:
+                    _ACTIVE_RESPONSES.pop(id(process), None)
+            try:
+                child_auth_unchanged = hashlib.sha256(
+                    child_auth_path.read_bytes()
+                ).digest() == child_auth_hash
+            except OSError:
+                child_auth_unchanged = False
+            if not child_auth_unchanged:
+                raise ProviderIsolationFailure(
+                    "Codex changed isolated authentication state"
+                )
+            diagnostic_bytes = bytes(stdout_bytes) + bytes(stderr_bytes)
+            if b"data:application/pdf;base64," in diagnostic_bytes or any(
+                sentinel in diagnostic_bytes for sentinel in payload_sentinels
+            ):
+                raise ProviderIsolationFailure("Codex app-server leaked raw PDF input")
+            if request_failure is not None:
+                if (
+                    isinstance(request_failure, ProviderQuotaExhausted)
+                    and self.quota_stop_event is not None
+                ):
+                    self.quota_stop_event.set()
+                raise request_failure from request_failure_cause
+            if stream_failure:
+                failure = stream_failure[0]
+                if (
+                    isinstance(failure, ProviderQuotaExhausted)
+                    and self.quota_stop_event is not None
+                ):
+                    self.quota_stop_event.set()
+                raise failure
+
+        completion = {
+            **identity,
+            "provider": "codex",
+            "model": self.model,
+            "codex_cli_version": version,
+            "finish_reason": "turn.completed",
+            "max_output_tokens": output_tokens,
+            "usage": usage,
+        }
+        _LITERATURE_COMPLETION.set(completion)
+        content = agent_text.strip()
+        if not content:
+            exc = ProviderEmptyResponse("codex returned an empty response")
+            _preserve_provider_failure(exc, _ProviderText(content, completion))
+            raise exc
+        return _ProviderText(content, completion)
+
     def _generate_text(
         self,
         system_prompt: str,
@@ -3462,9 +4568,20 @@ class CodexReader(_CapabilityAwareReader):
             )
         if self.quota_stop_event is not None and self.quota_stop_event.is_set():
             raise ProviderQuotaExhausted("Codex quota is paused for this run")
+        attachment_values = _SOURCE_BUNDLE_ATTACHMENTS.get()
+        if any(value.suffix.casefold() == ".pdf" for value in attachment_values):
+            return self._generate_pdf_text(
+                system_prompt,
+                user_prompt,
+                output_tokens,
+                deadline_seconds,
+                attachment_values,
+            )
         self._ensure_codex_preflight()
+        assert self._preflight is not None
         effort = _REASONING_EFFORT.get() or "medium"
-        identity = codex_contract_identity(contract_id, self.model, effort)
+        version = str(self._preflight.get("version") or "0.145.0")
+        identity = codex_contract_identity(contract_id, self.model, effort, version)
         environment = dict(
             self._preflight.get("_environment")
             or _codex_environment(self.credential_forbidden_roots)
@@ -3475,7 +4592,7 @@ class CodexReader(_CapabilityAwareReader):
                 "Codex preflight did not provide a credential root"
             )
         attachments, attachment_hashes = _validated_codex_image_attachments(
-            _SOURCE_BUNDLE_ATTACHMENTS.get(), credential_root
+            attachment_values, credential_root
         )
         if attachments:
             if contract_id != "source_bundle":
@@ -3484,7 +4601,9 @@ class CodexReader(_CapabilityAwareReader):
                 )
             identity = {
                 **identity,
-                "attachment_transport": codex_source_bundle_attachment_identity(),
+                "attachment_transport": codex_source_bundle_attachment_identity(
+                    version
+                ),
                 "attachment_count": len(attachments),
                 "attachment_hashes": list(attachment_hashes),
             }
@@ -3575,21 +4694,29 @@ class CodexReader(_CapabilityAwareReader):
                 "agents.enabled=false",
             ])
             command.extend(_CODEX_SKILL_ARGUMENTS)
-            command.extend(_CODEX_TOOL_FEATURE_ARGUMENTS)
+            command.extend(_codex_retry_arguments(version))
+            command.extend(_codex_tool_feature_arguments(version))
             reserve_codex_attempt(
                 self.attempt_guard,
                 contract_id=contract_id,
                 job_id=request_job_id,
             )
-            process = subprocess.Popen(
-                command,
-                cwd=call_dir,
-                env=environment,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
-            )
+            try:
+                process = subprocess.Popen(
+                    command,
+                    cwd=call_dir,
+                    env=environment,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                )
+            except OSError as exc:
+                raise ProviderTransportError(
+                    "Codex CLI process could not start",
+                    transport_kind="codex_cli",
+                    cause=exc,
+                ) from exc
             with _ACTIVE_RESPONSE_LOCK:
                 _ACTIVE_RESPONSES[id(process)] = process
 
@@ -3612,7 +4739,7 @@ class CodexReader(_CapabilityAwareReader):
                         _terminate_codex_process(process)
                         return
                     event_type = str(event.get("type") or "")
-                    if event_type not in CODEX_CLI_PROFILES["0.145.0"]["event_types"]:
+                    if event_type not in CODEX_CLI_PROFILES[version]["event_types"]:
                         stream_failure.append(
                             ProviderIsolationFailure(
                                 "Codex emitted unexpected event: "
@@ -3783,7 +4910,7 @@ class CodexReader(_CapabilityAwareReader):
             **identity,
             "provider": "codex",
             "model": self.model,
-            "codex_cli_version": "0.145.0",
+            "codex_cli_version": version,
             "finish_reason": "turn.completed",
             "max_output_tokens": output_tokens,
             "usage": dict(completed[-1].get("usage") or {}),

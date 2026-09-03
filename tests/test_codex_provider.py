@@ -61,13 +61,13 @@ from auto_zettelkasten.readers import (
     ProviderTransportError,
     ProviderUnsupportedAttachment,
     _SOURCE_BUNDLE_ATTACHMENTS,
-    _CODEX_TOOL_FEATURE_ARGUMENTS,
     _CODEX_TRANSPORT_INSTRUCTIONS,
     _codex_executable,
     _codex_error_item_category,
     _codex_failure,
     _codex_json_schema,
     _codex_pdf_helper_manifest,
+    _codex_tool_feature_arguments,
     _redact_codex_diagnostic,
     cancel_active_provider_responses,
     codex_contract_for_stage,
@@ -498,8 +498,9 @@ def test_codex_auto_concurrency_defaults_to_sixteen(
     ) == 16
 
 
+@pytest.mark.parametrize("cli_profile", ["0.145.0", "0.152.1"])
 def test_codex_preflight_uses_one_sanitized_executable_environment(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cli_profile: str
 ) -> None:
     executable = tmp_path / "codex"
     executable.write_text("", encoding="utf-8")
@@ -518,7 +519,7 @@ def test_codex_preflight_uses_one_sanitized_executable_environment(
                     for effort in values["reasoning_efforts"]
                 ],
             }
-            for model, values in CODEX_CLI_PROFILES["0.145.0"]["models"].items()
+            for model, values in CODEX_CLI_PROFILES[cli_profile]["models"].items()
         },
     )
     monkeypatch.setenv("DEEPSEEK_API_KEY", "must-not-leak")
@@ -536,10 +537,10 @@ def test_codex_preflight_uses_one_sanitized_executable_environment(
         name: {
             **value,
             "default": False
-            if name in CODEX_CLI_PROFILES["0.145.0"]["tool_features"]
+            if name in CODEX_CLI_PROFILES[cli_profile]["tool_features"]
             else value["default"],
         }
-        for name, value in CODEX_CLI_PROFILES["0.145.0"]["features"].items()
+        for name, value in CODEX_CLI_PROFILES[cli_profile]["features"].items()
     }
     feature_output = "\n".join(
         f"{name}  {value['maturity']}  {str(value['default']).lower()}"
@@ -550,7 +551,7 @@ def test_codex_preflight_uses_one_sanitized_executable_environment(
         environment = dict(kwargs["env"])  # type: ignore[arg-type]
         calls.append((args, environment))
         if args[-1] == "--version":
-            output = "codex-cli 0.145.0"
+            output = f"codex-cli {cli_profile}"
         elif args[-2:] == ["features", "list"]:
             output = feature_output
         else:
@@ -573,7 +574,7 @@ def test_codex_preflight_uses_one_sanitized_executable_environment(
     base_codex_home = base_environment.pop("CODEX_HOME", None)
     assert feature_environment == base_environment
     assert calls[1][1]["CODEX_HOME"] != base_codex_home
-    assert calls[1][0][1:-2] == list(_CODEX_TOOL_FEATURE_ARGUMENTS)
+    assert calls[1][0][1:-2] == list(_codex_tool_feature_arguments(cli_profile))
     assert all(args[0] == str(executable) for args, _ in calls)
     assert all("DEEPSEEK_API_KEY" not in environment for _, environment in calls)
     assert all(
@@ -588,7 +589,7 @@ def test_codex_preflight_uses_one_sanitized_executable_environment(
         "auto_zettelkasten.readers._codex_model_catalog",
         lambda _environment=None: {
             "gpt-5.6-luna": {
-                **CODEX_CLI_PROFILES["0.145.0"]["models"]["gpt-5.6-luna"],
+                **CODEX_CLI_PROFILES[cli_profile]["models"]["gpt-5.6-luna"],
                 "supported_reasoning_levels": [{"effort": "high"}],
             }
         },
@@ -1074,7 +1075,18 @@ for line in sys.stdin:
     if method == "initialize":
         print(json.dumps({"id": request_id, "result": {}}), flush=True)
     elif method == "thread/start":
-        print(json.dumps({"id": request_id, "result": {"thread": {"id": "thread-1", "ephemeral": True}}}), flush=True)
+        provider = "other" if mode == "wrong_provider" else "openai"
+        print(json.dumps({"id": request_id, "result": {
+            "model": "gpt-5.6-luna",
+            "modelProvider": provider,
+            "thread": {
+                "id": "thread-1",
+                "ephemeral": True,
+                "modelProvider": provider,
+            },
+        }}), flush=True)
+        if mode == "no_read":
+            time.sleep(10)
     elif method == "thread/inject_items":
         file_data = message["params"]["items"][0]["content"][0]["file_data"]
         if mode == "reject":
@@ -1087,7 +1099,11 @@ for line in sys.stdin:
             continue
         print(json.dumps({"id": request_id, "result": {"turn": {"id": "turn-1"}}}), flush=True)
         if mode == "tool":
-            print(json.dumps({"method": "item/completed", "params": {"item": {"type": "commandExecution"}}}), flush=True)
+            print(json.dumps({"method": "item/completed", "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {"id": "item-1", "type": "commandExecution"},
+            }}), flush=True)
             continue
         if mode == "reroute":
             print(json.dumps({"method": "model/rerouted", "params": {"fromModel": "gpt-5.6-luna", "toModel": "other"}}), flush=True)
@@ -1100,9 +1116,24 @@ for line in sys.stdin:
             continue
         if __MUTATE_AUTH__:
             (Path(os.environ["CODEX_HOME"]) / "auth.json").write_text("mutated")
-        print(json.dumps({"method": "item/completed", "params": {"item": {"type": "agentMessage", "text": __PAYLOAD__}}}), flush=True)
+        event_thread = "thread-other" if mode == "wrong_thread" else "thread-1"
+        event_turn = "turn-other" if mode == "wrong_turn" else "turn-1"
+        print(json.dumps({"method": "item/completed", "params": {
+            "threadId": event_thread,
+            "turnId": event_turn,
+            "item": {"id": "item-1", "type": "agentMessage", "text": __PAYLOAD__},
+        }}), flush=True)
         status = "mystery" if mode == "unknown_terminal" else "completed"
-        print(json.dumps({"method": "turn/completed", "params": {"turn": {"status": status}}}), flush=True)
+        print(json.dumps({"method": "turn/completed", "params": {
+            "threadId": event_thread,
+            "turn": {"id": event_turn, "status": status, "error": None},
+        }}), flush=True)
+        if mode == "post_terminal_tool":
+            print(json.dumps({"method": "item/completed", "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {"id": "item-2", "type": "commandExecution"},
+            }}), flush=True)
 """
     body = (
         body.replace("__PYTHON__", sys.executable)
@@ -1186,6 +1217,8 @@ def test_codex_pdf_app_server_sends_exact_ordered_file_text_and_contract(
     assert result["evidence_anchors"][0]["locator"] == "p. 1"
     captured = json.loads(capture.read_text(encoding="utf-8"))
     assert captured["argv"][1] == "app-server"
+    assert "model_providers.openai.request_max_retries=0" in captured["argv"]
+    assert "model_providers.openai.stream_max_retries=0" in captured["argv"]
     requests = [row for row in captured["messages"] if row.get("id") is not None]
     assert [row["method"] for row in requests] == [
         "initialize",
@@ -1211,11 +1244,12 @@ def test_codex_pdf_app_server_sends_exact_ordered_file_text_and_contract(
         + base64.b64encode(pdf_bytes).decode("ascii"),
         "detail": "auto",
     }
-    assert injected[0]["content"][1] == {
-        "type": "input_text",
-        "text": "This PDF is the source document for the source-bundle request.",
-    }
+    assert injected[0]["content"][1]["type"] == "input_text"
+    assert injected[0]["content"][1]["text"].startswith(
+        "Follow the supplied output schema. Do not use tools."
+    )
     turn = requests[3]["params"]
+    assert turn["input"] == []
     assert turn["model"] == "gpt-5.6-luna"
     assert turn["effort"] == "medium"
     assert turn["approvalPolicy"] == "never"
@@ -1279,6 +1313,10 @@ def test_codex_pdf_reserves_attempt_before_app_server_spawn(
         ("malformed", ProviderIsolationFailure, "invalid JSON"),
         ("unknown_terminal", ProviderIsolationFailure, "terminal"),
         ("raw_leak", ProviderIsolationFailure, "raw (?:document|PDF)"),
+        ("wrong_provider", ProviderIsolationFailure, "model or provider"),
+        ("wrong_thread", ProviderIsolationFailure, "another thread"),
+        ("wrong_turn", ProviderIsolationFailure, "another turn"),
+        ("post_terminal_tool", ProviderIsolationFailure, "after turn completion"),
     ],
 )
 def test_codex_pdf_app_server_fails_closed_on_protocol_violations(
@@ -1374,6 +1412,64 @@ def test_codex_pdf_app_server_timeout_is_typed(
         _SOURCE_BUNDLE_ATTACHMENTS.reset(token)
 
 
+def test_codex_pdf_app_server_write_timeout_is_typed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = tmp_path / "auto-zettelkasten-codex"
+    capture = tmp_path / "capture.json"
+    _fake_codex_app_server(executable, capture, mode="no_read")
+    pdf = tmp_path / "source.pdf"
+    pdf.write_bytes(b"%PDF-1.7\n" + b"x" * 2_000_000 + b"\n%%EOF\n")
+    reader = CodexReader("gpt-5.6-luna", allow_cloud=True)
+    reader._preflight = _fake_pdf_preflight(tmp_path, executable, monkeypatch)
+
+    token = _SOURCE_BUNDLE_ATTACHMENTS.set((pdf,))
+    try:
+        with pytest.raises(ProviderTimeout):
+            reader._generate_with_reasoning(
+                "system",
+                "user",
+                2_048,
+                0.1,
+                reasoning_effort="medium",
+                output_contract="source_bundle",
+            )
+    finally:
+        _SOURCE_BUNDLE_ATTACHMENTS.reset(token)
+
+
+def test_codex_pdf_app_server_worker_start_failure_cleans_up(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = tmp_path / "auto-zettelkasten-codex"
+    capture = tmp_path / "capture.json"
+    _fake_codex_app_server(executable, capture)
+    pdf = tmp_path / "source.pdf"
+    pdf.write_bytes(b"%PDF-1.7\n%%EOF\n")
+    reader = CodexReader("gpt-5.6-luna", allow_cloud=True)
+    reader._preflight = _fake_pdf_preflight(tmp_path, executable, monkeypatch)
+    real_start = threading.Thread.start
+    starts = 0
+
+    def fail_second_start(worker: threading.Thread) -> None:
+        nonlocal starts
+        starts += 1
+        if starts == 2:
+            raise RuntimeError("synthetic worker failure")
+        real_start(worker)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_second_start)
+    with pytest.raises(ProviderTransportError, match="worker could not start"):
+        reader.read_source_bundle(
+            "",
+            {"_source_context": {"source_id": "source-zotero-A1"}},
+            attachment_paths=[pdf],
+        )
+    assert cancel_active_provider_responses() == 0
+
+
 def test_codex_pdf_app_server_external_cancellation_is_typed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1422,6 +1518,7 @@ def test_codex_transport_is_sanitized_schema_bound_and_tool_fail_closed(
     reader._preflight = fake_codex_preflight(
         tmp_path, executable, {"PATH": "preflight-snapshot"}
     )
+    reader._preflight["version"] = "0.152.1"
     credential_root = Path(str(reader._preflight["_credential_root"]))
     (credential_root / "config.toml").write_text("private = true\n", encoding="utf-8")
     system_skills = credential_root / "skills" / ".system"
@@ -1458,9 +1555,11 @@ def test_codex_transport_is_sanitized_schema_bound_and_tool_fail_closed(
     assert "skills.bundled.enabled=false" in captured["argv"]
     assert "skills.include_instructions=false" in captured["argv"]
     assert "features.code_mode_host=false" in captured["argv"]
-    assert captured["argv"][-len(_CODEX_TOOL_FEATURE_ARGUMENTS):] == list(
-        _CODEX_TOOL_FEATURE_ARGUMENTS
+    assert captured["argv"][-len(_codex_tool_feature_arguments("0.152.1")):] == list(
+        _codex_tool_feature_arguments("0.152.1")
     )
+    assert "model_providers.openai.request_max_retries=0" in captured["argv"]
+    assert "model_providers.openai.stream_max_retries=0" in captured["argv"]
     assert "OPENAI_API_KEY" not in captured["env"]
     assert captured["env"]["PATH"] == "preflight-snapshot"
     assert captured["codex_home_entries"] == ["auth.json", "models_cache.json"]

@@ -20,6 +20,7 @@ from . import ARTIFACT_SCHEMA_VERSION, ENGINE_VERSION
 from .controller import LocalController
 from .extraction import (
     ContentAdequacy,
+    ContentAdequacyClass,
     ExtractionCancelled,
     ExtractionResult,
     classify_content_adequacy,
@@ -152,6 +153,7 @@ from .relationships import (
     validate_relationship_decision_rows,
 )
 from .readers import (
+    CODEX_CLI_PROFILES,
     ProviderEmptyResponse,
     ProviderError,
     ProviderInterrupted,
@@ -171,6 +173,7 @@ from .readers import (
     _parse_source_bundle_response,
     cancel_active_provider_responses,
     codex_contract_identity,
+    codex_execution_profile,
     codex_preflight_status,
     codex_source_bundle_attachment_identity,
     codex_source_bundle_image_preflight,
@@ -3207,10 +3210,35 @@ def _source_bundle_dependency_fingerprint(
             "source_bundle_normalization_version": "11",
         }
     if request.provider == "codex":
-        dependency["provider_execution_identity"] = codex_contract_identity(
-            "source_bundle",
-            request.model,
-            request.reasoning_effort or "medium",
+        execution = row.get("provider_execution_identity")
+        source_identity = (
+            execution.get("source_bundle")
+            if isinstance(execution, Mapping)
+            else None
+        )
+        cli_profile = (
+            str(source_identity.get("cli_profile") or "")
+            if isinstance(source_identity, Mapping)
+            else ""
+        )
+        expected = (
+            codex_contract_identity(
+                "source_bundle",
+                request.model,
+                request.reasoning_effort or "medium",
+                cli_profile,
+            )
+            if cli_profile in CODEX_CLI_PROFILES
+            else None
+        )
+        dependency["provider_execution_identity"] = (
+            dict(source_identity)
+            if expected is not None and source_identity == expected
+            else codex_contract_identity(
+                "source_bundle",
+                request.model,
+                request.reasoning_effort or "medium",
+            )
         )
     return stable_hash(dependency)
 
@@ -5300,28 +5328,38 @@ def _plan_literature_families(
         str(row["source_id"]): stable_hash(row) for row in lean_rows
     }
     planning_identity_payload = {
-            "provider": str(getattr(reasoner, "name", "")),
-            "model": str(getattr(reasoner, "model", "")),
-            "prompt_version": LITERATURE_FAMILY_PLAN_PROMPT_VERSION,
-            "policy": _semantic_literature_policy(
-                request.literature_policy.to_dict()
-            ),
-        }
+        "provider": str(getattr(reasoner, "name", "")),
+        "model": str(getattr(reasoner, "model", "")),
+        "prompt_version": LITERATURE_FAMILY_PLAN_PROMPT_VERSION,
+        "policy": _semantic_literature_policy(
+            request.literature_policy.to_dict()
+        ),
+    }
+    planning_identities: dict[str, str] = {}
     if request.provider == "codex":
-        planning_identity_payload["provider_execution_identity"] = (
-            codex_stage_identity(
-                "literature_family_plan",
-                str(
-                    getattr(
-                        reasoner,
-                        "model",
-                        request.model,
-                    )
-                ),
-                request.reasoning_effort or "medium",
+        for cli_profile in CODEX_CLI_PROFILES:
+            planning_identities[cli_profile] = stable_hash(
+                {
+                    **planning_identity_payload,
+                    "provider_execution_identity": codex_stage_identity(
+                        "literature_family_plan",
+                        str(getattr(reasoner, "model", request.model)),
+                        request.reasoning_effort or "medium",
+                        cli_profile=cli_profile,
+                    ),
+                }
             )
-        )
-    planning_identity = stable_hash(planning_identity_payload)
+    else:
+        planning_identities[""] = stable_hash(planning_identity_payload)
+    prior_planning_identity = str(prior_plan.get("planning_identity") or "")
+    planning_identity = next(
+        (
+            identity
+            for identity in planning_identities.values()
+            if identity == prior_planning_identity
+        ),
+        next(iter(planning_identities.values())),
+    )
     planning_job_identity = str(
         prior_plan.get("planning_job_identity")
         or prior_plan.get("planning_identity")
@@ -5409,6 +5447,30 @@ def _plan_literature_families(
             ),
             "plan_path": str(plan_path),
         }
+    if request.provider == "codex":
+        actual_profile = codex_execution_profile(reasoner)
+        planning_identity = planning_identities[actual_profile]
+        planning_job_identity = str(
+            prior_plan.get("planning_job_identity")
+            if prior_planning_identity == planning_identity
+            else planning_identity
+        )
+        incremental_source_ids = sorted(
+            {
+                source_id
+                for source_id, source_hash in lean_source_hashes.items()
+                if str(prior_source_hashes.get(source_id) or "") != source_hash
+            }
+            | (set(prior_source_hashes) - set(lean_source_hashes))
+        )
+        incremental_mode = bool(
+            prior_plan.get("literature_families")
+            and prior_source_hashes
+            and prior_planning_identity == planning_identity
+            and incremental_source_ids
+        )
+        if not incremental_mode:
+            incremental_source_ids = []
     context = {
         "planning_mode": (
             "incremental_patch" if incremental_mode else "initial_global"
@@ -6645,7 +6707,11 @@ def _selected_candidate_rows(
 
 
 def _relationship_discovery_identity(
-    provider: str, model: str, reasoning_effort: str | None = None
+    provider: str,
+    model: str,
+    reasoning_effort: str | None = None,
+    *,
+    cli_profile: str = "0.145.0",
 ) -> str:
     payload = {
             "provider": provider,
@@ -6659,6 +6725,7 @@ def _relationship_discovery_identity(
             "relationship_candidate_selection",
             model,
             reasoning_effort or "medium",
+            cli_profile=cli_profile,
         )
     return stable_hash(payload)
 
@@ -6668,6 +6735,8 @@ def _relationship_adjudication_identity(
     model: str,
     decision_contract: str,
     reasoning_effort: str | None = None,
+    *,
+    cli_profile: str = "0.145.0",
 ) -> tuple[str, str]:
     policy_identity = stable_hash(
         {"relationship_semantic_policy": _RELATIONSHIP_SEMANTIC_POLICY_VERSION}
@@ -6687,6 +6756,7 @@ def _relationship_adjudication_identity(
             "relationship_adjudication",
             model,
             reasoning_effort or "medium",
+            cli_profile=cli_profile,
         )
     return stable_hash(payload), policy_identity
 
@@ -7080,18 +7150,6 @@ def _run_relationship_reasoning(
     }
     relationship_provider = str(getattr(reasoner, "name", ""))
     relationship_model = str(getattr(reasoner, "model", ""))
-    discovery_identity = _relationship_discovery_identity(
-        relationship_provider, relationship_model, request.reasoning_effort
-    )
-    adjudication_identity, relationship_policy_identity = (
-        _relationship_adjudication_identity(
-            relationship_provider,
-            relationship_model,
-            decision_contract,
-            request.reasoning_effort,
-        )
-    )
-    selection_identity = discovery_identity
     state_path = (
         workspace
         / "02_source_memory"
@@ -7099,6 +7157,61 @@ def _run_relationship_reasoning(
         / "relationship_selection_state.yml"
     )
     prior_state = read_yaml(state_path, {}) or {}
+    identity_profiles = (
+        tuple(CODEX_CLI_PROFILES)
+        if relationship_provider == "codex"
+        else ("0.145.0",)
+    )
+    discovery_identities = {
+        cli_profile: _relationship_discovery_identity(
+            relationship_provider,
+            relationship_model,
+            request.reasoning_effort,
+            cli_profile=cli_profile,
+        )
+        for cli_profile in identity_profiles
+    }
+    adjudication_identities = {
+        cli_profile: _relationship_adjudication_identity(
+            relationship_provider,
+            relationship_model,
+            decision_contract,
+            request.reasoning_effort,
+            cli_profile=cli_profile,
+        )[0]
+        for cli_profile in identity_profiles
+    }
+    prior_discovery_identity = str(
+        prior_state.get("discovery_identity")
+        or prior_state.get("selection_identity")
+        or ""
+    )
+    prior_adjudication_identity = str(
+        prior_state.get("adjudication_identity") or ""
+    )
+    discovery_identity = next(
+        (
+            identity
+            for identity in discovery_identities.values()
+            if identity == prior_discovery_identity
+        ),
+        next(iter(discovery_identities.values())),
+    )
+    adjudication_identity = next(
+        (
+            identity
+            for identity in adjudication_identities.values()
+            if identity == prior_adjudication_identity
+        ),
+        next(iter(adjudication_identities.values())),
+    )
+    _, relationship_policy_identity = _relationship_adjudication_identity(
+        relationship_provider,
+        relationship_model,
+        decision_contract,
+        request.reasoning_effort,
+    )
+    selection_identity = discovery_identity
     prior_hashes = dict(prior_state.get("profile_hashes", {}) or {})
     prior_memory_hashes = dict(
         prior_state.get("relationship_memory_hashes", {}) or {}
@@ -7170,6 +7283,20 @@ def _run_relationship_reasoning(
     retry_terminal_failures = bool(
         getattr(request, "retry_terminal_failures", False)
     )
+    if (
+        relationship_provider == "codex"
+        and (
+            discovery_changed
+            or adjudication_changed
+            or retry_terminal_failures
+        )
+    ):
+        actual_profile = codex_execution_profile(reasoner)
+        if discovery_changed:
+            discovery_identity = discovery_identities[actual_profile]
+            selection_identity = discovery_identity
+        adjudication_identity = adjudication_identities[actual_profile]
+        adjudication_changed = prior_adjudication_identity != adjudication_identity
     reuse_selected_pool = bool(
         not discovery_changed
         and prior_selected_candidates is not None
@@ -14696,6 +14823,7 @@ def _acquire_and_freeze_item(
             base,
             request,
             vision,
+            reader=reader,
             cancel_event=cancel_event,
         )
         if content:
@@ -14790,6 +14918,7 @@ def _prepare_item(
                 base,
                 request,
                 vision,
+                reader=reader,
                 cancel_event=cancel_event,
             )
             if content:
@@ -14806,6 +14935,7 @@ def _prepare_item(
                     base,
                     request,
                     vision,
+                    reader=reader,
                     cancel_event=cancel_event,
                 )
                 if content:
@@ -14831,6 +14961,14 @@ def _prepare_item(
         and isinstance(document_route.get("recovery"), Mapping)
         else ""
     )
+    document_route_kind = (
+        str((document_route.get("identity_payload") or {}).get("route") or "")
+        if isinstance(document_route, Mapping)
+        and isinstance(document_route.get("identity_payload"), Mapping)
+        else ""
+    )
+    if not document_route_kind:
+        document_route_kind = str(content.get("content_route") or "")
     if recovery_state == "selected":
         content = _recover_pdf_image_route(
             content,
@@ -14841,6 +14979,30 @@ def _prepare_item(
             acquisition_gate=acquisition_gate,
             cancel_event=cancel_event,
         )
+        if document_route_kind == "codex_pdf_input_file":
+            base.update(content)
+            base.update(
+                terminal_status="parked_for_review",
+                reason="pdf_local_recovery_requires_fresh_run",
+            )
+            base["attempts"].append(
+                _attempt(
+                    base,
+                    "pdf_local_recovery",
+                    "succeeded",
+                    "pdf_local_recovery_requires_fresh_run",
+                )
+            )
+            return base
+    elif recovery_state == "completed" and bool(
+        (document_route.get("recovery") or {}).get("requires_fresh_run")
+    ):
+        base.update(content)
+        base.update(
+            terminal_status="parked_for_review",
+            reason="pdf_local_recovery_requires_fresh_run",
+        )
+        return base
     elif recovery_state == "failed":
         base.update(
             terminal_status="parked_for_review",
@@ -15041,7 +15203,24 @@ def _prepare_item(
                 ProviderUnsupportedAttachment,
                 ProviderInvalidSourceBundle,
             ) as exc:
-                if not isinstance(content.get("document_route"), Mapping):
+                route = content.get("document_route")
+                identity_payload = (
+                    route.get("identity_payload")
+                    if isinstance(route, Mapping)
+                    else None
+                )
+                route_kind = (
+                    str(identity_payload.get("route") or "")
+                    if isinstance(identity_payload, Mapping)
+                    else str(content.get("content_route") or "")
+                )
+                if route_kind not in {
+                    "codex_pdf_input_file",
+                    "codex_pdf_page_images",
+                }:
+                    raise
+                raw_pdf_route = route_kind == "codex_pdf_input_file"
+                if raw_pdf_route and request.extraction_policy.pdf_fallback != "ocr":
                     raise
                 content = _recover_pdf_image_route(
                     content,
@@ -15053,9 +15232,21 @@ def _prepare_item(
                     cancel_event=cancel_event,
                 )
                 base.update(content)
-                source_scope = str(
-                    content.get("source_scope") or "full_document"
-                )
+                if raw_pdf_route:
+                    base.update(
+                        terminal_status="parked_for_review",
+                        reason="pdf_local_recovery_requires_fresh_run",
+                    )
+                    base["attempts"].append(
+                        _attempt(
+                            base,
+                            "pdf_local_recovery",
+                            "succeeded",
+                            "pdf_local_recovery_requires_fresh_run",
+                        )
+                    )
+                    return base
+                source_scope = str(content.get("source_scope") or "full_document")
                 fingerprint = _fingerprint(
                     key,
                     content_hash,
@@ -15073,9 +15264,7 @@ def _prepare_item(
                 base["fingerprint"] = fingerprint
                 if limited := _limited_scope_result(base, content, item):
                     return limited
-                extraction_metrics = dict(
-                    content.get("coverage_metrics", {}) or {}
-                )
+                extraction_metrics = dict(content.get("coverage_metrics", {}) or {})
                 reader_metadata = _source_reader_metadata(
                     item, str(base["source_id"]), key, content
                 )
@@ -15093,6 +15282,15 @@ def _prepare_item(
                 )
                 reader_route += "_after_pdf_local_recovery"
                 reader_reason += ":after_pdf_local_recovery"
+        if request.provider == "codex":
+            execution_identity = _source_checkpoint_execution_identity(
+                checkpoint_root,
+                model=effective_model,
+                effort=request.reasoning_effort or "medium",
+                hierarchical=reader_route.startswith("codex_hierarchical"),
+            )
+            if execution_identity is not None:
+                base["provider_execution_identity"] = execution_identity
     except DocumentPartialError as exc:
         base.update(
             terminal_status="partial",
@@ -17688,7 +17886,10 @@ def _system_derived_estimate_supported(
 def _validate_quantitative_provenance(
     payload: Mapping[str, Any], row: Mapping[str, Any]
 ) -> None:
-    if str(row.get("content_route") or "") == "codex_pdf_page_images":
+    if str(row.get("content_route") or "") in {
+        "codex_pdf_page_images",
+        "codex_pdf_input_file",
+    }:
         return
     text = str(row.get("text") or "")
     if not text:
@@ -18487,6 +18688,127 @@ def _load_frozen_content(checkpoint_root: Path) -> dict[str, Any] | None:
     return content
 
 
+def _pdf_local_recovery_cache_paths(
+    workspace: Path, custody_hash: str
+) -> tuple[Path, Path]:
+    root = workspace / "11_state" / "pdf_local_recovery" / custody_hash
+    return root / "source.txt", root / "manifest.yml"
+
+
+def _write_pdf_local_recovery_cache(
+    workspace: Path,
+    content: Mapping[str, Any],
+    request: MapRequest,
+) -> None:
+    text = str(content.get("text") or "")
+    custody_hash = str(content.get("content_hash") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", custody_hash) or not text.strip():
+        raise ProviderIsolationFailure("PDF recovery cache binding is invalid")
+    source_path, manifest_path = _pdf_local_recovery_cache_paths(
+        workspace, custody_hash
+    )
+    atomic_write_text(source_path, text)
+    write_yaml(
+        manifest_path,
+        {
+            "cache_version": "1",
+            "custody_sha256": custody_hash,
+            "extraction_version": request.extraction_version,
+            "ocr_languages": list(request.extraction_policy.languages),
+            "text_sha256": sha256_text(text),
+            "content_route": str(content.get("content_route") or ""),
+            "media_type": str(content.get("media_type") or "application/pdf"),
+            "source_adequacy": dict(content.get("source_coverage", {}) or {}),
+        },
+    )
+
+
+def _load_pdf_local_recovery_cache(
+    custody_path: Path,
+    custody_hash: str,
+    request: MapRequest,
+) -> ExtractionResult | None:
+    try:
+        resolved_custody = custody_path.resolve(strict=True)
+    except OSError as exc:
+        raise ProviderIsolationFailure("PDF recovery custody is unavailable") from exc
+    custody_root = next(
+        (
+            parent
+            for parent in resolved_custody.parents
+            if parent.name == "files" and parent.parent.name == "01_custody"
+        ),
+        None,
+    )
+    if custody_root is None or not resolved_custody.is_relative_to(custody_root):
+        return None
+    workspace = custody_root.parent.parent
+    source_path, manifest_path = _pdf_local_recovery_cache_paths(
+        workspace, custody_hash
+    )
+    if not source_path.exists() and not manifest_path.exists():
+        return None
+    if not source_path.is_file() or not manifest_path.is_file():
+        raise ProviderIsolationFailure("PDF recovery cache is incomplete")
+    manifest = read_yaml(manifest_path, {})
+    if not isinstance(manifest, Mapping):
+        raise ProviderIsolationFailure("PDF recovery cache manifest is invalid")
+    expected_binding = {
+        "cache_version": "1",
+        "custody_sha256": custody_hash,
+        "extraction_version": request.extraction_version,
+        "ocr_languages": list(request.extraction_policy.languages),
+    }
+    if any(manifest.get(key) != value for key, value in expected_binding.items()):
+        return None
+    text = source_path.read_text(encoding="utf-8")
+    if not text.strip() or manifest.get("text_sha256") != sha256_text(text):
+        raise ProviderIsolationFailure("PDF recovery cache text is invalid")
+    route = str(manifest.get("content_route") or "")
+    media_type = str(manifest.get("media_type") or "")
+    raw_adequacy = manifest.get("source_adequacy")
+    if (
+        not route.endswith("_after_codex_pdf_recovery")
+        or media_type != "application/pdf"
+        or not isinstance(raw_adequacy, Mapping)
+    ):
+        raise ProviderIsolationFailure("PDF recovery cache metadata is invalid")
+    try:
+        adequacy = ContentAdequacy(
+            ContentAdequacyClass(str(raw_adequacy["classification"])),
+            str(raw_adequacy["source_scope"]),  # type: ignore[arg-type]
+            str(raw_adequacy["coverage_gate"]),  # type: ignore[arg-type]
+            str(raw_adequacy["reason"]),
+            str(raw_adequacy.get("abstract") or ""),
+            tuple(
+                str(value)
+                for value in raw_adequacy.get("paywall_markers", []) or []
+            ),
+            tuple(
+                str(value)
+                for value in raw_adequacy.get("access_markers", []) or []
+            ),
+            dict(raw_adequacy.get("metrics", {}) or {}),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ProviderIsolationFailure("PDF recovery cache adequacy is invalid") from exc
+    if adequacy.source_scope not in {
+        "full_document",
+        "partial_document",
+        "abstract_only",
+        "metadata_only",
+    } or adequacy.coverage_gate not in {"passed", "limited", "failed"}:
+        raise ProviderIsolationFailure("PDF recovery cache adequacy is invalid")
+    return ExtractionResult(
+        status="succeeded",
+        text=text,
+        route=route,
+        media_type=media_type,
+        page_count=int((adequacy.metrics or {}).get("page_count", 0) or 0),
+        adequacy=adequacy,
+    )
+
+
 def _recover_pdf_image_route(
     content: Mapping[str, Any],
     request: MapRequest,
@@ -18501,6 +18823,13 @@ def _recover_pdf_image_route(
     if not isinstance(route_value, Mapping):
         raise ProviderInvalidSourceBundle("PDF image recovery route is missing")
     route = dict(route_value)
+    identity_payload = route.get("identity_payload")
+    route_kind = (
+        str(identity_payload.get("route") or "")
+        if isinstance(identity_payload, Mapping)
+        else str(content.get("content_route") or "")
+    )
+    raw_pdf_route = route_kind == "codex_pdf_input_file"
     route_path = checkpoint_root / "document_route.yml"
     if route_path.exists():
         persisted_route = read_yaml(route_path, {})
@@ -18527,7 +18856,9 @@ def _recover_pdf_image_route(
     if (
         recovery.get("state") == "completed"
         and str(content.get("content_route") or "").endswith(
-            "_after_codex_image_recovery"
+            "_after_codex_pdf_recovery"
+            if raw_pdf_route
+            else "_after_codex_image_recovery"
         )
     ):
         return dict(content)
@@ -18584,7 +18915,11 @@ def _recover_pdf_image_route(
     recovered = {
         **dict(content),
         "text": extracted.text,
-        "content_route": f"{extracted.route}_after_codex_image_recovery",
+        "content_route": (
+            f"{extracted.route}_after_codex_pdf_recovery"
+            if raw_pdf_route
+            else f"{extracted.route}_after_codex_image_recovery"
+        ),
         "media_type": extracted.media_type,
         "source_scope": adequacy.source_scope,
         "source_coverage": adequacy.to_dict(),
@@ -18607,8 +18942,11 @@ def _recover_pdf_image_route(
         "state": "completed",
         "content_route": recovered["content_route"],
         "text_hash": sha256_text(extracted.text),
+        "requires_fresh_run": raw_pdf_route,
     }
     recovered["document_route"] = route
+    if raw_pdf_route:
+        _write_pdf_local_recovery_cache(workspace, recovered, request)
     _write_frozen_content(checkpoint_root, recovered)
     return recovered
 
@@ -18711,6 +19049,7 @@ def _source_reader_metadata(
                 item_data(item).get("parentItem") and zotero_key or ""
             ),
             "source_file": str(content.get("source_file") or ""),
+            "custody_sha256": str(content.get("content_hash") or ""),
             "route": str(content.get("content_route") or ""),
             "media_type": str(content.get("media_type") or ""),
             "source_scope": str(content.get("source_scope") or "full_document"),
@@ -18741,6 +19080,7 @@ def _acquire_content(
     request: MapRequest,
     vision: VisionProvider | None,
     *,
+    reader: ReaderProvider | None = None,
     cancel_event: threading.Event | None = None,
 ) -> dict[str, Any] | None:
     key = item_key(item)
@@ -18892,6 +19232,7 @@ def _acquire_content(
                     request,
                     actual_primary_pdf=local_primary_pdf,
                     cancelled=cancelled,
+                    reader=reader,
                 )
             else:
                 extracted = extract_path(
@@ -18982,6 +19323,7 @@ def _acquire_content(
                 request,
                 actual_primary_pdf=downloaded_primary_pdf,
                 cancelled=cancelled,
+                reader=reader,
             )
         else:
             extracted = extract_bytes(
@@ -19153,11 +19495,6 @@ _GENERIC_ATTACHMENT_LABEL_RE = re.compile(
     r"^(?:pdf|full\s*text|attachment|download(?:_file)?(?:\.pdf)?)$",
     flags=re.IGNORECASE,
 )
-_COLLAPSED_PERCENT_SERIES_RE = re.compile(
-    r"(?<![\d.])(?:\d+(?:\.\d+)?%\s*){4,}"
-)
-
-
 def _apply_bibliographic_scope(
     candidate: Mapping[str, Any],
     parent: Mapping[str, Any],
@@ -19266,6 +19603,41 @@ def _apply_bibliographic_scope(
     return row
 
 
+def _codex_pdf_input_file_preflight(
+    extracted_text: str,
+    metadata: Mapping[str, Any],
+    question: str | None,
+    page_dimensions: Sequence[tuple[int, int]],
+) -> dict[str, Any]:
+    prompt_only = codex_source_bundle_image_preflight(
+        "", metadata, question, page_dimensions
+    )
+    with_extracted_text = codex_source_bundle_image_preflight(
+        extracted_text, metadata, question, ()
+    )
+    prompt_tokens = int(prompt_only["document_input_tokens"])
+    extracted_text_tokens = max(
+        0,
+        int(with_extracted_text["document_input_tokens"]) - prompt_tokens,
+    )
+    vision_tokens = int(prompt_only["image_tokens"])
+    document_input = prompt_tokens + extracted_text_tokens + vision_tokens
+    uncertainty = max(16_384, (document_input + 3) // 4)
+    combined = document_input + 32_768 + 32_768 + uncertainty
+    return {
+        "prompt_text_tokens": prompt_tokens,
+        "pdf_extracted_text_tokens": extracted_text_tokens,
+        "image_tokens": vision_tokens,
+        "document_input_tokens": document_input,
+        "reasoning_reservation_tokens": 32_768,
+        "output_reservation_tokens": 32_768,
+        "uncertainty_tokens": uncertainty,
+        "combined_tokens": combined,
+        "ceiling_tokens": 200_000,
+        "admitted": combined <= 200_000,
+    }
+
+
 def _custodied_pdf_candidate(
     document: bytes,
     custody_path: Path,
@@ -19276,6 +19648,7 @@ def _custodied_pdf_candidate(
     *,
     actual_primary_pdf: bool,
     cancelled: Callable[[], bool] | None,
+    reader: ReaderProvider | None = None,
 ) -> tuple[dict[str, Any] | None, ExtractionResult]:
     probe = probe_pdf_bytes(document, cancelled=cancelled)
     document_hash = sha256_bytes(document)
@@ -19284,61 +19657,7 @@ def _custodied_pdf_candidate(
         and request.provider == "codex"
         and request.allow_cloud
     )
-    selected_pages = (
-        tuple(
-            page.page_number
-            for page in probe.pages
-            if _COLLAPSED_PERCENT_SERIES_RE.search(page.embedded_text)
-        )
-        if probe.adequacy is not None and probe.adequacy.is_full_publication
-        else probe.render_candidate_pages
-    )
-    route_allowed = (
-        codex_auto
-        and probe.status != "failed"
-        and probe.adequacy is not None
-        and 0 < len(selected_pages) <= 16
-        and all(
-            page.width > 0 and page.height > 0
-            for page in probe.pages
-            if page.page_number in selected_pages
-        )
-    )
-    document_route: dict[str, Any] | None = None
-    if route_allowed:
-        metrics = dict(probe.adequacy.metrics or {})
-        metrics.update(
-            {
-                "page_count": probe.page_count,
-                "embedded_text_page_count": sum(
-                    1 for page in probe.pages if not page.suspicious
-                ),
-                "ocr_page_count": 0,
-                "unresolved_pages": [],
-                "recovered_pages": list(range(1, probe.page_count + 1)),
-                "recovered_page_ratio": 1.0,
-                "ordinal_to_printed_page": {
-                    str(page.page_number): page.printed_page
-                    for page in probe.pages
-                },
-            }
-        )
-        adequacy = ContentAdequacy(
-            classification=probe.adequacy.classification,
-            source_scope="full_document",
-            coverage_gate="passed",
-            reason="codex_pdf_page_images",
-            metrics=metrics,
-        )
-        extracted = ExtractionResult(
-            status="succeeded",
-            text=probe.embedded_text,
-            route="codex_pdf_page_images",
-            media_type="application/pdf",
-            page_count=probe.page_count,
-            adequacy=adequacy,
-        )
-    elif (
+    if (
         codex_auto
         and probe.adequacy is not None
         and probe.adequacy.is_full_publication
@@ -19351,7 +19670,34 @@ def _custodied_pdf_candidate(
             page_count=probe.page_count,
             adequacy=probe.adequacy,
         )
-    else:
+        return (
+            _custodied_pdf_candidate_from_extraction(
+                extracted,
+                document_hash,
+                custody_path,
+                attachment,
+                source_item,
+                actual_primary_pdf,
+            ),
+            extracted,
+        )
+    if codex_auto and request.extraction_policy.pdf_fallback == "ocr":
+        cached_recovery = _load_pdf_local_recovery_cache(
+            custody_path, document_hash, request
+        )
+        if cached_recovery is not None:
+            return (
+                _custodied_pdf_candidate_from_extraction(
+                    cached_recovery,
+                    document_hash,
+                    custody_path,
+                    attachment,
+                    source_item,
+                    actual_primary_pdf,
+                ),
+                cached_recovery,
+            )
+    if not codex_auto:
         extracted = extract_pdf_from_probe(
             document,
             probe,
@@ -19359,8 +19705,221 @@ def _custodied_pdf_candidate(
             ocr_languages=request.extraction_policy.languages,
             cancelled=cancelled,
         )
-    if extracted.status != "succeeded":
-        return None, extracted
+        return (
+            _custodied_pdf_candidate_from_extraction(
+                extracted,
+                document_hash,
+                custody_path,
+                attachment,
+                source_item,
+                actual_primary_pdf,
+            )
+            if extracted.status == "succeeded"
+            else None,
+            extracted,
+        )
+    def unsupported(reason: str) -> tuple[None, ExtractionResult]:
+        return None, ExtractionResult(
+            status="failed",
+            text=probe.embedded_text,
+            route="codex_pdf_unsupported",
+            reason=reason,
+            media_type="application/pdf",
+            page_count=probe.page_count,
+            adequacy=probe.adequacy,
+        )
+
+    native_reason = "pdf_input_file_unavailable"
+    helper_status: Mapping[str, Any] = {}
+    if probe.status == "failed" or probe.adequacy is None or probe.page_count <= 0:
+        native_reason = "pdf_structural_probe_failed"
+    elif len(document) >= 50_000_000:
+        native_reason = "pdf_file_size_limit_exceeded"
+    elif len(probe.pages) != probe.page_count or any(
+        page.width <= 0 or page.height <= 0 for page in probe.pages
+    ):
+        native_reason = "unknown_pdf_geometry"
+    else:
+        status_loader = getattr(reader, "pdf_input_file_status", None)
+        if callable(status_loader):
+            status_value = status_loader()
+            if isinstance(status_value, Mapping):
+                helper_status = status_value
+        if helper_status.get("pdf_input_file_capability") is True:
+            route_metrics = dict(probe.adequacy.metrics or {})
+            route_metrics.update(
+                {
+                    "page_count": probe.page_count,
+                    "embedded_text_page_count": sum(
+                        1 for page in probe.pages if not page.suspicious
+                    ),
+                    "ocr_page_count": 0,
+                    "unresolved_pages": [],
+                    "recovered_pages": list(range(1, probe.page_count + 1)),
+                    "recovered_page_ratio": 1.0,
+                    "ordinal_to_printed_page": {
+                        str(page.page_number): page.printed_page
+                        for page in probe.pages
+                    },
+                }
+            )
+            adequacy = ContentAdequacy(
+                classification=probe.adequacy.classification,
+                source_scope="full_document",
+                coverage_gate="passed",
+                reason="codex_pdf_input_file",
+                metrics=route_metrics,
+            )
+            extracted = ExtractionResult(
+                status="succeeded",
+                text=probe.embedded_text,
+                route="codex_pdf_input_file",
+                reason="codex_pdf_input_file",
+                media_type="application/pdf",
+                page_count=probe.page_count,
+                adequacy=adequacy,
+            )
+            candidate = _custodied_pdf_candidate_from_extraction(
+                extracted,
+                document_hash,
+                custody_path,
+                attachment,
+                source_item,
+                actual_primary_pdf,
+            )
+            reader_metadata = _source_reader_metadata(
+                source_item,
+                str(base.get("source_id") or ""),
+                item_key(source_item),
+                candidate,
+            )
+            projected_preflight = _codex_pdf_input_file_preflight(
+                extracted.text,
+                reader_metadata,
+                request.question,
+                [(page.width, page.height) for page in probe.pages],
+            )
+            if projected_preflight["admitted"]:
+                probe_evidence = {
+                    "status": probe.status,
+                    "reason": probe.reason,
+                    "custody_byte_count": probe.custody_byte_count,
+                    "page_count": probe.page_count,
+                    "suspicious_pages": list(probe.suspicious_pages),
+                    "render_candidate_pages": list(probe.render_candidate_pages),
+                    "pages": [
+                        {
+                            key: value
+                            for key, value in page.to_dict().items()
+                            if key != "embedded_text"
+                        }
+                        for page in probe.pages
+                    ],
+                }
+                helper_identity = helper_status.get("_helper_manifest_identity")
+                identity_payload = {
+                    "route_version": "1",
+                    "route": "codex_pdf_input_file",
+                    "custody_file": str(custody_path.resolve()),
+                    "custody_sha256": document_hash,
+                    "custody_byte_count": len(document),
+                    "file_policy": {
+                        "media_type": "application/pdf",
+                        "maximum_bytes_exclusive": 50_000_000,
+                        "detail": "auto",
+                    },
+                    "model_profile": {
+                        "model": request.model,
+                        "reasoning_effort": request.reasoning_effort or "medium",
+                        "cli_version": str(helper_status.get("version") or ""),
+                    },
+                    "fallback_policy": request.extraction_policy.pdf_fallback,
+                    "attachment_capability": codex_source_bundle_attachment_identity(
+                        str(helper_status.get("version") or "0.145.0"),
+                        helper_identity
+                        if isinstance(helper_identity, Mapping)
+                        else None,
+                    ),
+                    "probe_evidence": probe_evidence,
+                    "projected_preflight": projected_preflight,
+                }
+                candidate["document_route"] = {
+                    "identity_payload": identity_payload,
+                    "identity": stable_hash(identity_payload),
+                    "recovery": {"state": "not_selected"},
+                }
+                candidate["text"] = ""
+                return candidate, extracted
+            native_reason = "pdf_token_ceiling_exceeded"
+
+    fallback = request.extraction_policy.pdf_fallback
+    if fallback == "ocr":
+        extracted = extract_pdf_from_probe(
+            document,
+            probe,
+            ocr_mode="auto",
+            ocr_languages=request.extraction_policy.languages,
+            cancelled=cancelled,
+        )
+        return (
+            _custodied_pdf_candidate_from_extraction(
+                extracted,
+                document_hash,
+                custody_path,
+                attachment,
+                source_item,
+                actual_primary_pdf,
+            )
+            if extracted.status == "succeeded"
+            else None,
+            extracted,
+        )
+    if fallback != "images":
+        return unsupported(native_reason)
+
+    selected_pages = list(probe.render_candidate_pages)
+    if (
+        probe.adequacy is None
+        or not selected_pages
+        or len(selected_pages) > 16
+        or any(
+            page.width <= 0 or page.height <= 0
+            for page in probe.pages
+            if page.page_number in selected_pages
+        )
+    ):
+        return unsupported("pdf_image_fallback_unavailable")
+    metrics = dict(probe.adequacy.metrics or {})
+    metrics.update(
+        {
+            "page_count": probe.page_count,
+            "embedded_text_page_count": sum(
+                1 for page in probe.pages if not page.suspicious
+            ),
+            "ocr_page_count": 0,
+            "unresolved_pages": [],
+            "recovered_pages": list(range(1, probe.page_count + 1)),
+            "recovered_page_ratio": 1.0,
+            "ordinal_to_printed_page": {
+                str(page.page_number): page.printed_page for page in probe.pages
+            },
+        }
+    )
+    adequacy = ContentAdequacy(
+        classification=probe.adequacy.classification,
+        source_scope="full_document",
+        coverage_gate="passed",
+        reason="codex_pdf_page_images",
+        metrics=metrics,
+    )
+    extracted = ExtractionResult(
+        status="succeeded",
+        text=probe.embedded_text,
+        route="codex_pdf_page_images",
+        media_type="application/pdf",
+        page_count=probe.page_count,
+        adequacy=adequacy,
+    )
     candidate = _custodied_pdf_candidate_from_extraction(
         extracted,
         document_hash,
@@ -19369,82 +19928,66 @@ def _custodied_pdf_candidate(
         source_item,
         actual_primary_pdf,
     )
-    if extracted.route == "codex_pdf_page_images":
-        reader_metadata = _source_reader_metadata(
-            source_item,
-            str(base.get("source_id") or ""),
-            item_key(source_item),
-            candidate,
-        )
-        selected_pages = list(selected_pages)
-        selected_dimensions = [
-            (page.width, page.height)
+    reader_metadata = _source_reader_metadata(
+        source_item,
+        str(base.get("source_id") or ""),
+        item_key(source_item),
+        candidate,
+    )
+    selected_dimensions = [
+        (page.width, page.height)
+        for page in probe.pages
+        if page.page_number in selected_pages
+    ]
+    projected_preflight = codex_source_bundle_image_preflight(
+        extracted.text,
+        reader_metadata,
+        request.question,
+        selected_dimensions,
+    )
+    if not projected_preflight["admitted"]:
+        return unsupported("pdf_image_token_ceiling_exceeded")
+    probe_evidence = {
+        "status": probe.status,
+        "reason": probe.reason,
+        "custody_byte_count": probe.custody_byte_count,
+        "page_count": probe.page_count,
+        "suspicious_pages": list(probe.suspicious_pages),
+        "render_candidate_pages": selected_pages,
+        "pages": [
+            {
+                key: value
+                for key, value in page.to_dict().items()
+                if key != "embedded_text"
+            }
             for page in probe.pages
-            if page.page_number in selected_pages
-        ]
-        projected_preflight = codex_source_bundle_image_preflight(
-            extracted.text,
-            reader_metadata,
-            request.question,
-            selected_dimensions,
-        )
-        if not projected_preflight["admitted"]:
-            extracted = extract_pdf_from_probe(
-                document,
-                probe,
-                ocr_mode="auto",
-                ocr_languages=request.extraction_policy.languages,
-                cancelled=cancelled,
-            )
-            if extracted.status != "succeeded":
-                return None, extracted
-            return _custodied_pdf_candidate_from_extraction(
-                extracted,
-                document_hash,
-                custody_path,
-                attachment,
-                source_item,
-                actual_primary_pdf,
-            ), extracted
-        probe_evidence = {
-            "status": probe.status,
-            "reason": probe.reason,
-            "custody_byte_count": probe.custody_byte_count,
-            "page_count": probe.page_count,
-            "suspicious_pages": list(probe.suspicious_pages),
-            "render_candidate_pages": selected_pages,
-            "pages": [
-                {
-                    key: value
-                    for key, value in page.to_dict().items()
-                    if key != "embedded_text"
-                }
-                for page in probe.pages
-            ],
-        }
-        identity_payload = {
-            "route_version": "1",
-            "route": "codex_pdf_page_images",
-            "custody_file": str(custody_path.resolve()),
-            "custody_sha256": document_hash,
-            "selected_pages": selected_pages,
-            "render_policy": {
-                "format": "png",
-                "maximum_side": 2_048,
-                "maximum_pages": 16,
-                "enlargement": False,
-            },
-            "attachment_capability": codex_source_bundle_attachment_identity(),
-            "probe_evidence": probe_evidence,
-            "projected_preflight": projected_preflight,
-        }
-        document_route = {
-            "identity_payload": identity_payload,
-            "identity": stable_hash(identity_payload),
-            "rendered_images": [],
-            "recovery": {"state": "not_selected"},
-        }
-        candidate["document_route"] = document_route
+        ],
+    }
+    cli_version = str(helper_status.get("version") or "0.145.0")
+    identity_payload = {
+        "route_version": "1",
+        "route": "codex_pdf_page_images",
+        "custody_file": str(custody_path.resolve()),
+        "custody_sha256": document_hash,
+        "selected_pages": selected_pages,
+        "render_policy": {
+            "format": "png",
+            "maximum_side": 2_048,
+            "maximum_pages": 16,
+            "enlargement": False,
+        },
+        "attachment_capability": codex_source_bundle_attachment_identity(
+            cli_version if cli_version in CODEX_CLI_PROFILES else "0.145.0"
+        ),
+        "probe_evidence": probe_evidence,
+        "projected_preflight": projected_preflight,
+    }
+    candidate["document_route"] = {
+        "identity_payload": identity_payload,
+        "identity": stable_hash(identity_payload),
+        "rendered_images": [],
+        "recovery": {"state": "not_selected"},
+    }
     return candidate, extracted
 
 
@@ -20366,13 +20909,20 @@ def _write_run_report(run_dir: Path, report: RunReport) -> None:
     write_yaml(run_dir / "run_report.yml", payload)
 
 
-def _source_replay_request_hash(request: MapRequest) -> str:
+def _source_replay_request_hash(
+    request: MapRequest, *, omit_default_pdf_fallback: bool = False
+) -> str:
     payload = request.to_dict()
     payload.pop("workspace", None)
     payload.pop("parallel", None)
     payload.pop("provider_concurrency", None)
     payload.pop("max_provider_spend_usd", None)
     payload.pop("literature_model", None)
+    if omit_default_pdf_fallback:
+        extraction = dict(payload.get("extraction_policy", {}) or {})
+        if extraction.get("pdf_fallback") == "none":
+            extraction.pop("pdf_fallback", None)
+        payload["extraction_policy"] = extraction
     processing = dict(payload.get("processing", {}) or {})
     for key in (
         "connect_timeout_seconds",
@@ -20472,7 +21022,12 @@ def source_replay_receipt_matches(
         or str(receipt.get("artifact_schema_version") or "")
         != ARTIFACT_SCHEMA_VERSION
         or str(receipt.get("request_hash") or "")
-        != _source_replay_request_hash(request)
+        not in {
+            _source_replay_request_hash(request),
+            _source_replay_request_hash(
+                request, omit_default_pdf_fallback=True
+            ),
+        }
     ):
         return False
     expected = {
@@ -20712,9 +21267,10 @@ def _document_route_identity(document_route: Mapping[str, Any]) -> str:
     if (
         not isinstance(identity_payload, Mapping)
         or identity != stable_hash(identity_payload)
-        or identity_payload.get("route") != "codex_pdf_page_images"
+        or identity_payload.get("route")
+        not in {"codex_pdf_page_images", "codex_pdf_input_file"}
     ):
-        raise ProviderIsolationFailure("PDF image route identity is invalid")
+        raise ProviderIsolationFailure("PDF route identity is invalid")
     return identity
 
 
@@ -20730,21 +21286,21 @@ def _validate_document_route_binding(
     route_hash = str(identity_payload.get("custody_sha256") or "")
     raw_path = Path(str(identity_payload.get("custody_file") or ""))
     if not expected_custody_hash or route_hash != expected_custody_hash:
-        raise ProviderIsolationFailure("PDF image custody binding is invalid")
+        raise ProviderIsolationFailure("PDF custody binding is invalid")
     if not raw_path.is_absolute() or raw_path.is_symlink():
-        raise ProviderIsolationFailure("PDF image custody path is invalid")
+        raise ProviderIsolationFailure("PDF custody path is invalid")
     try:
         custody_file = raw_path.resolve(strict=True)
         expected_file = expected_custody_file.resolve(strict=True)
         allowed_root = custody_root.resolve(strict=True)
     except OSError as exc:
-        raise ProviderIsolationFailure("PDF image custody path is unavailable") from exc
+        raise ProviderIsolationFailure("PDF custody path is unavailable") from exc
     if (
         custody_file != expected_file
         or not custody_file.is_file()
         or not custody_file.is_relative_to(allowed_root)
     ):
-        raise ProviderIsolationFailure("PDF image custody path is outside custody")
+        raise ProviderIsolationFailure("PDF custody path is outside custody")
     return custody_file
 
 
@@ -20761,6 +21317,12 @@ def _render_document_route_attachments(
     expected_custody_file: Path,
     custody_root: Path,
 ) -> tuple[Path, ...]:
+    identity_payload = document_route.get("identity_payload")
+    if (
+        not isinstance(identity_payload, Mapping)
+        or identity_payload.get("route") != "codex_pdf_page_images"
+    ):
+        raise ProviderIsolationFailure("PDF image renderer received the wrong route")
     custody_file = _validate_document_route_binding(
         document_route,
         expected_custody_hash=expected_custody_hash,
@@ -20859,6 +21421,52 @@ def _new_run_id() -> str:
     return f"az-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-{secrets.token_hex(3)}"
 
 
+def _source_checkpoint_execution_identity(
+    checkpoint_root: Path,
+    *,
+    model: str,
+    effort: str,
+    hierarchical: bool,
+) -> dict[str, Any] | None:
+    candidates = [
+        checkpoint_root / ("synthesis.yml" if hierarchical else "direct.yml")
+    ]
+    candidates.append(
+        checkpoint_root / ("direct.yml" if hierarchical else "synthesis.yml")
+    )
+    chunks = checkpoint_root / "chunks"
+    if chunks.is_dir():
+        candidates.extend(sorted(chunks.glob("*.yml")))
+    for path in candidates:
+        checkpoint = read_yaml(path, {}) or {}
+        identity = (
+            checkpoint.get("identity") if isinstance(checkpoint, Mapping) else None
+        )
+        execution = (
+            identity.get("provider_execution_identity")
+            if isinstance(identity, Mapping)
+            else None
+        )
+        if not isinstance(execution, Mapping):
+            continue
+        validated: dict[str, Any] = {}
+        for contract_id in ("chunk_evidence", "source_bundle"):
+            contract = execution.get(contract_id)
+            cli_profile = (
+                str(contract.get("cli_profile") or "")
+                if isinstance(contract, Mapping)
+                else ""
+            )
+            if cli_profile not in CODEX_CLI_PROFILES or contract != (
+                codex_contract_identity(contract_id, model, effort, cli_profile)
+            ):
+                break
+            validated[contract_id] = dict(contract)
+        if len(validated) == 2:
+            return validated
+    return None
+
+
 def _read_document(
     reader: ReaderProvider,
     text: str,
@@ -20909,10 +21517,11 @@ def _read_document(
         "chunk_output_tokens": source_chunk_output_tokens,
         "synthesis_output_tokens": policy.synthesis_output_tokens,
     }
-    image_route = document_route is not None
-    if image_route:
+    attachment_route = document_route is not None
+    route_kind = ""
+    if attachment_route:
         if expected_custody_file is None or custody_root is None:
-            raise ProviderIsolationFailure("PDF image custody binding is missing")
+            raise ProviderIsolationFailure("PDF custody binding is missing")
         _validate_document_route_binding(
             document_route,
             expected_custody_hash=expected_custody_hash,
@@ -20922,15 +21531,59 @@ def _read_document(
         common_identity["document_route_identity"] = _document_route_identity(
             document_route
         )
-    if str(getattr(reader, "name", "")).casefold() == "codex":
-        effort = request.reasoning_effort if request else None
-        common_identity["provider_execution_identity"] = {
-            contract_id: codex_contract_identity(
-                contract_id,
-                str(getattr(reader, "model", "")),
-                effort or "medium",
+        route_kind = str(document_route["identity_payload"].get("route") or "")
+    is_codex = str(getattr(reader, "name", "")).casefold() == "codex"
+    effort = (request.reasoning_effort if request else None) or "medium"
+    resolved_codex_profile: str | None = None
+    if is_codex and route_kind == "codex_pdf_input_file":
+        assert document_route is not None
+        identity_payload = document_route.get("identity_payload", {})
+        model_profile = (
+            identity_payload.get("model_profile", {})
+            if isinstance(identity_payload, Mapping)
+            else {}
+        )
+        resolved_codex_profile = str(
+            model_profile.get("cli_version")
+            if isinstance(model_profile, Mapping)
+            else ""
+        )
+        if resolved_codex_profile != "0.152.1":
+            raise ProviderIsolationFailure(
+                "raw PDF route requires the pinned Codex 0.152.1 profile"
             )
-            for contract_id in ("chunk_evidence", "source_bundle")
+
+    def common_identity_for(cli_profile: str | None) -> dict[str, Any]:
+        identity = dict(common_identity)
+        if cli_profile is not None:
+            identity["provider_execution_identity"] = {
+                contract_id: codex_contract_identity(
+                    contract_id,
+                    str(getattr(reader, "model", "")),
+                    effort,
+                    cli_profile,
+                )
+                for contract_id in ("chunk_evidence", "source_bundle")
+            }
+        return identity
+
+    def candidate_identities(**values: Any) -> list[dict[str, Any]]:
+        profiles: tuple[str | None, ...]
+        if not is_codex:
+            profiles = (None,)
+        elif resolved_codex_profile is not None:
+            profiles = (resolved_codex_profile,)
+        else:
+            profiles = tuple(CODEX_CLI_PROFILES)
+        return [{**common_identity_for(profile), **values} for profile in profiles]
+
+    def identity_for_call(**values: Any) -> dict[str, Any]:
+        nonlocal resolved_codex_profile
+        if is_codex and resolved_codex_profile is None:
+            resolved_codex_profile = codex_execution_profile(reader)
+        return {
+            **common_identity_for(resolved_codex_profile if is_codex else None),
+            **values,
         }
     provider_key = str(
         (
@@ -20966,7 +21619,7 @@ def _read_document(
 
     bundle_reader = getattr(reader, "read_source_bundle", None)
     bundle_fit = getattr(reader, "should_read_source_bundle_directly", None)
-    direct_admitted = image_route or (
+    direct_admitted = attachment_route or (
         len(text) <= direct_limit
         and (
             not callable(bundle_reader)
@@ -20979,21 +21632,22 @@ def _read_document(
         direct_checkpoint = (
             read_yaml(direct_path, {}) or {} if checkpoint_enabled else {}
         )
-        direct_identity = {
-            **common_identity,
-            "mode": "direct",
-            "direct_limit": direct_limit,
-        }
-        if not retry_semantic_checkpoint and direct_checkpoint.get(
-            "identity"
-        ) == direct_identity and isinstance(
-            direct_checkpoint.get("analysis"), Mapping
+        direct_candidates = candidate_identities(
+            mode="direct", direct_limit=direct_limit
+        )
+        if (
+            not retry_semantic_checkpoint
+            and direct_checkpoint.get("identity") in direct_candidates
+            and isinstance(direct_checkpoint.get("analysis"), Mapping)
         ):
             return (
                 _ensure_source_result_contract(dict(direct_checkpoint["analysis"])),
                 f"{reader.name}_text",
                 "reused_direct_source_checkpoint",
             )
+        direct_identity = identity_for_call(
+            mode="direct", direct_limit=direct_limit
+        )
         attachments: tuple[Path, ...] = ()
         temporary_images: tempfile.TemporaryDirectory[str] | None = None
 
@@ -21015,7 +21669,7 @@ def _read_document(
                 except (TypeError, ValueError) as exc:
                     if attachments:
                         raise ProviderInvalidSourceBundle(
-                            "Codex discarded an invalid image-backed source bundle"
+                            "Codex discarded an invalid attachment-backed source bundle"
                         ) from exc
                     raise
                 return result
@@ -21024,32 +21678,45 @@ def _read_document(
             )
 
         try:
-            if image_route:
+            if attachment_route:
                 if not checkpoint_enabled:
                     raise ProviderIsolationFailure(
-                        "PDF image routes require a checkpoint directory"
+                        "PDF routes require a checkpoint directory"
                     )
                 if not callable(bundle_reader):
                     raise ProviderUnsupportedAttachment(
                         "reader does not support source-bundle attachments"
                     )
-                temporary_images = tempfile.TemporaryDirectory(
-                    prefix="auto-zettelkasten-pdf-images-"
-                )
-                attachments = _render_document_route_attachments(
-                    document_route,
-                    text=text,
-                    metadata=metadata,
-                    question=question,
-                    checkpoint_root=checkpoint_root,
-                    output_dir=Path(temporary_images.name),
-                    cancelled=(
-                        cancel_event.is_set if cancel_event is not None else None
-                    ),
-                    expected_custody_hash=expected_custody_hash,
-                    expected_custody_file=expected_custody_file,
-                    custody_root=custody_root,
-                )
+                if route_kind == "codex_pdf_page_images":
+                    temporary_images = tempfile.TemporaryDirectory(
+                        prefix="auto-zettelkasten-pdf-images-"
+                    )
+                    attachments = _render_document_route_attachments(
+                        document_route,
+                        text=text,
+                        metadata=metadata,
+                        question=question,
+                        checkpoint_root=checkpoint_root,
+                        output_dir=Path(temporary_images.name),
+                        cancelled=(
+                            cancel_event.is_set if cancel_event is not None else None
+                        ),
+                        expected_custody_hash=expected_custody_hash,
+                        expected_custody_file=expected_custody_file,
+                        custody_root=custody_root,
+                    )
+                elif route_kind == "codex_pdf_input_file":
+                    custody_file = _validate_document_route_binding(
+                        document_route,
+                        expected_custody_hash=expected_custody_hash,
+                        expected_custody_file=expected_custody_file,
+                        custody_root=custody_root,
+                    )
+                    if sha256_file(custody_file) != expected_custody_hash:
+                        raise ProviderIsolationFailure("PDF custody hash mismatch")
+                    attachments = (custody_file,)
+                else:
+                    raise ProviderIsolationFailure("PDF route is unsupported")
             if provider_budget is not None:
                 analysis = _provider_call_with_transport_retry(
                     provider_budget,
@@ -21080,7 +21747,7 @@ def _read_document(
                 "full_document_source_read",
             )
         except Exception as exc:
-            if image_route:
+            if attachment_route:
                 raise
             message = str(exc).casefold()
             if not any(
@@ -21103,12 +21770,12 @@ def _read_document(
     chunks = _split_document(
         text, chunk_char_limit=chunk_limit, max_chunks=policy.max_total_chunks
     )
-    checkpoint_identity = {
-        **common_identity,
+    hierarchical_values = {
         "mode": "hierarchical",
         "chunk_char_limit": chunk_limit,
         "total_chunks": len(chunks),
     }
+    checkpoint_candidates = candidate_identities(**hierarchical_values)
     analyses: list[Mapping[str, Any]] = []
     for index, chunk in enumerate(chunks):
         checkpoint_path = (
@@ -21117,11 +21784,12 @@ def _read_document(
             / f"{index + 1:04d}-{sha256_text(chunk)[:12]}.yml"
         )
         checkpoint = read_yaml(checkpoint_path, {}) or {} if checkpoint_enabled else {}
-        if checkpoint.get("identity") == checkpoint_identity and isinstance(
+        if checkpoint.get("identity") in checkpoint_candidates and isinstance(
             checkpoint.get("analysis"), Mapping
         ):
             analysis = dict(checkpoint["analysis"])
         else:
+            checkpoint_identity = identity_for_call(**hierarchical_values)
             if (
                 policy.max_calls_per_document_run > 0
                 and calls >= policy.max_calls_per_document_run
@@ -21224,15 +21892,16 @@ def _read_document(
             )
     synthesis_path = checkpoint_root / "synthesis.yml"
     synthesis = read_yaml(synthesis_path, {}) or {} if checkpoint_enabled else {}
-    if not retry_semantic_checkpoint and synthesis.get(
-        "identity"
-    ) == checkpoint_identity and isinstance(
-        synthesis.get("analysis"), Mapping
+    if (
+        not retry_semantic_checkpoint
+        and synthesis.get("identity") in checkpoint_candidates
+        and isinstance(synthesis.get("analysis"), Mapping)
     ):
         merged = _ensure_source_result_contract(dict(synthesis["analysis"]))
     elif hasattr(reader, "synthesize_document_bundle") or hasattr(
         reader, "synthesize_document"
     ):
+        checkpoint_identity = identity_for_call(**hierarchical_values)
         if (
             policy.max_calls_per_document_run > 0
             and calls >= policy.max_calls_per_document_run
