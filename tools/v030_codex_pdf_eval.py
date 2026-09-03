@@ -1468,7 +1468,12 @@ def _image_token_estimate(dimensions: Sequence[tuple[int, int]]) -> int:
     )
 
 
-def _preflight_valid(value: Any, *, expected_image_tokens: int | None = None) -> bool:
+def _preflight_valid(
+    value: Any,
+    *,
+    expected_image_tokens: int | None = None,
+    image_tokens_in_document_input: bool = False,
+) -> bool:
     if not isinstance(value, Mapping):
         return False
     integer_fields = (
@@ -1493,11 +1498,30 @@ def _preflight_valid(value: Any, *, expected_image_tokens: int | None = None) ->
     combined = int(value["combined_tokens"])
     if expected_image_tokens is not None and image_tokens != expected_image_tokens:
         return False
+    if image_tokens_in_document_input:
+        for key in ("prompt_text_tokens", "pdf_extracted_text_tokens"):
+            if (
+                isinstance(value.get(key), bool)
+                or not isinstance(value.get(key), int)
+                or int(value[key]) < 0
+            ):
+                return False
+        if document_tokens != (
+            int(value["prompt_text_tokens"])
+            + int(value["pdf_extracted_text_tokens"])
+            + image_tokens
+        ):
+            return False
     return (
         int(value["reasoning_reservation_tokens"]) == 32_768
         and int(value["output_reservation_tokens"]) == 32_768
         and uncertainty == max(16_384, (document_tokens + 3) // 4)
-        and combined == document_tokens + image_tokens + 32_768 + 32_768 + uncertainty
+        and combined
+        == document_tokens
+        + (0 if image_tokens_in_document_input else image_tokens)
+        + 32_768
+        + 32_768
+        + uncertainty
         and int(value["ceiling_tokens"]) == 200_000
         and value.get("admitted") is True
         and combined <= 200_000
@@ -1828,6 +1852,7 @@ def _route_errors(
                 expected_image_tokens=(
                     _image_token_estimate(probe_dimensions) if probe_valid else None
                 ),
+                image_tokens_in_document_input=True,
             ):
                 errors.append(f"{case_id}:pdf_input_preflight_not_admitted")
             recovery_row = route.get("recovery") if isinstance(route, Mapping) else None

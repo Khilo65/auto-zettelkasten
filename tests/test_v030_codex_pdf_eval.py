@@ -526,22 +526,35 @@ def test_four_pdf_replay_snapshot_covers_every_existing_workspace_artifact(
     assert runner.FOUR_PDF_GATE.attempt_ledger_name in snapshot
 
 
-def _preflight(dimensions: list[tuple[int, int]]) -> dict[str, Any]:
-    document_tokens = 100
+def _preflight(
+    dimensions: list[tuple[int, int]], *, direct_pdf: bool = False
+) -> dict[str, Any]:
+    prompt_tokens = 100
     image_tokens = runner._image_token_estimate(dimensions)
+    document_tokens = prompt_tokens + (image_tokens if direct_pdf else 0)
     uncertainty = 16_384
-    return {
+    payload = {
         "document_input_tokens": document_tokens,
         "image_tokens": image_tokens,
         "reasoning_reservation_tokens": 32_768,
         "output_reservation_tokens": 32_768,
         "uncertainty_tokens": uncertainty,
         "combined_tokens": (
-            document_tokens + image_tokens + 32_768 + 32_768 + uncertainty
+            document_tokens
+            + (0 if direct_pdf else image_tokens)
+            + 32_768
+            + 32_768
+            + uncertainty
         ),
         "ceiling_tokens": 200_000,
         "admitted": True,
     }
+    if direct_pdf:
+        payload.update(
+            prompt_text_tokens=prompt_tokens,
+            pdf_extracted_text_tokens=0,
+        )
+    return payload
 
 
 def _write_accepted_run(
@@ -649,7 +662,7 @@ def _write_accepted_run(
                         }
                     ],
                 },
-                "projected_preflight": _preflight(dimensions),
+                "projected_preflight": _preflight(dimensions, direct_pdf=True),
             }
             write_yaml(
                 item_root / "document_route.yml",
@@ -1278,6 +1291,14 @@ def test_acceptance_binds_direct_pdf_route_and_transport_evidence(
     write_yaml(route_path, route)
     route_errors, _ = runner._acceptance(workspace, run_id, cases, report)
     assert "case-2:route_identity_mismatch" in route_errors
+
+    route_path.write_bytes(route_bytes)
+    route = read_yaml(route_path)
+    route["identity_payload"]["projected_preflight"]["prompt_text_tokens"] += 1
+    route["identity"] = runner.stable_hash(route["identity_payload"])
+    write_yaml(route_path, route)
+    preflight_errors, _ = runner._acceptance(workspace, run_id, cases, report)
+    assert "case-2:pdf_input_preflight_not_admitted" in preflight_errors
 
     route_path.write_bytes(route_bytes)
     usage_path = (
