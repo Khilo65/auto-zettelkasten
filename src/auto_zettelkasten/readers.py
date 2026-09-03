@@ -1337,14 +1337,14 @@ _CODEX_PDF_HELPER_TAG = "rust-v0.152.1"
 _CODEX_PDF_HELPER_COMMIT = "5adb68a49933ae446bf11935662c83dba55a0804"
 _CODEX_PDF_PROTOCOL_REVISION = "input_file-v1"
 _CODEX_PDF_MAX_BYTES = 50_000_000
-# Packaging replaces this empty set with the reviewed patch/binary hash pair.
-# A companion manifest can describe a build, but it cannot grant itself trust.
+# Release packaging pins the reviewed patch/binary hash pair. A companion
+# manifest can describe a build, but it cannot grant itself trust.
 _CODEX_PDF_HELPER_TRUST: Mapping[str, frozenset[tuple[str, str]]] = {
     "macos-arm64": frozenset(
         {
             (
                 "9a3b9c919c94fb51726f0d14ae85c3e0de8906f226cdc0e6f02fe279e2758c3b",
-                "5239c4a1648e1d63b03e941096d78e2b013f50a9078bca5586cd403512899b18",
+                "438690df109d2f51c7c6f6dbaf4c7fb5877c05d0ad297c30b72d142e6bea4ec9",
             )
         }
     )
