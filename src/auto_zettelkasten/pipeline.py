@@ -15514,10 +15514,12 @@ def _source_bundle_from_result(
             if isinstance(payload.get("evidence_anchors"), list)
             else []
         )
-        for diagnostic in diagnostics:
+        rehydrated_diagnostics: set[int] = set()
+        for diagnostic_index, diagnostic in enumerate(diagnostics):
             if (
                 not isinstance(diagnostic, Mapping)
                 or diagnostic.get("component") != "evidence_anchors"
+                or diagnostic.get("rehydrate") is False
                 or not isinstance(diagnostic.get("raw"), Mapping)
             ):
                 continue
@@ -15535,6 +15537,14 @@ def _source_bundle_from_result(
             except (TypeError, ValueError):
                 continue
             anchors.append(recovered)
+            rehydrated_diagnostics.add(diagnostic_index)
+        if rehydrated_diagnostics:
+            payload["component_diagnostics"] = [
+                {**dict(diagnostic), "rehydrate": False}
+                if index in rehydrated_diagnostics
+                else diagnostic
+                for index, diagnostic in enumerate(diagnostics)
+            ]
         payload["evidence_anchors"] = anchors
 
     payload = _normalize_source_bundle_payload(payload)
@@ -15616,7 +15626,47 @@ def _source_bundle_from_result(
             for value in recommendations
         ]
     if validate_quantitative_provenance:
-        _validate_quantitative_provenance(payload, row)
+        try:
+            _validate_quantitative_provenance(payload, row)
+        except SourceBundleQuantitativeProvenanceError:
+            anchors = payload.get("evidence_anchors", [])
+            if not isinstance(anchors, list) or len(anchors) < 2:
+                raise
+            accepted: list[Any] = []
+            rejected: list[dict[str, Any]] = []
+            # ponytail: at most 24 anchors; share scans only if recovery becomes hot.
+            for index, anchor in enumerate(anchors):
+                try:
+                    _validate_quantitative_provenance(
+                        {"evidence_anchors": [anchor]}, row
+                    )
+                except SourceBundleQuantitativeProvenanceError as exc:
+                    rejected.append(
+                        {
+                            "component": "evidence_anchors",
+                            "row_index": index,
+                            "reason": f"{type(exc).__name__}:{exc}",
+                            "severity": "rejected",
+                            "rehydrate": False,
+                            "raw": dict(anchor),
+                        }
+                    )
+                else:
+                    accepted.append(anchor)
+            if not rejected or not any(
+                isinstance(anchor, Mapping) for anchor in accepted
+            ):
+                raise
+            payload["evidence_anchors"] = accepted
+            payload["component_diagnostics"] = [
+                *(
+                    payload.get("component_diagnostics", [])
+                    if isinstance(payload.get("component_diagnostics"), list)
+                    else []
+                ),
+                *rejected,
+            ]
+            _validate_quantitative_provenance(payload, row)
     return SourceAnalysisBundle.from_dict(payload)
 
 

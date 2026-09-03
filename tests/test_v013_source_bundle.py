@@ -4911,6 +4911,122 @@ def test_quantitative_provenance_rejects_unmodeled_anchor_quantity() -> None:
     assert _source_bundle_from_result(payload, row, "full_document") is not None
 
 
+def test_quantitative_provenance_isolates_bad_rows_in_rich_bundle() -> None:
+    payload = _bundle_payload()
+    valid = deepcopy(payload["evidence_anchors"][0])
+    valid["evidence_anchor_id"] = ""
+    valid.pop("revision_hash", None)
+    unmodeled = deepcopy(valid)
+    unmodeled.update(
+        evidence_anchor_id="anchor-unmodeled",
+        claim="The source reports 42 cases among 17 controls.",
+        quantitative_result={
+            "estimate": "42 cases",
+            "provenance": "source_reported",
+        },
+    )
+    remote_period = deepcopy(valid)
+    remote_period.update(
+        evidence_anchor_id="anchor-remote-period",
+        claim="The source reports 43,824 deaths.",
+        quantitative_result={
+            "estimate": "43,824",
+            "period": "October 29, 2024",
+            "provenance": "source_reported",
+        },
+    )
+    unmodeled["quantitative_result"]["estimate"] = 42
+    payload["evidence_anchors"] = [valid, remote_period]
+    payload["component_diagnostics"] = [
+        {
+            "component": "evidence_anchors",
+            "row_index": 0,
+            "reason": "ValueError:quantitative result.estimate must be string",
+            "raw": unmodeled,
+        }
+    ]
+    row = {
+        "source_id": "source-zotero-A1",
+        "zotero_item_key": "A1",
+        "text": (
+            "The source reports 42 cases among 17 controls.\n"
+            "Deaths reported: 43,824.\n"
+            "Figures as of October 29, 2024 report 43,061 deaths."
+        ),
+    }
+
+    bundle = _source_bundle_from_result(payload, row, "full_document")
+
+    assert bundle is not None
+    assert [anchor.claim for anchor in bundle.evidence_anchors] == [
+        valid["claim"]
+    ]
+    rejected = [
+        diagnostic
+        for diagnostic in bundle.component_diagnostics
+        if diagnostic.get("component") == "evidence_anchors"
+        and diagnostic.get("severity") == "rejected"
+    ]
+    assert {diagnostic["reason"] for diagnostic in rejected} == {
+        "SourceBundleQuantitativeProvenanceError:"
+        "quantitative_anchor_contains_unmodeled_quantity",
+        "SourceBundleQuantitativeProvenanceError:"
+        "period_date_not_local_to_reported_estimate",
+    }
+    assert all(
+        diagnostic["rehydrate"] is False
+        and isinstance(diagnostic["raw"], dict)
+        for diagnostic in rejected
+    )
+    assert all(
+        diagnostic.get("rehydrate") is False
+        for diagnostic in bundle.component_diagnostics
+        if diagnostic.get("component") == "evidence_anchors"
+    )
+
+    replayed = _source_bundle_from_result(bundle.to_dict(), row, "full_document")
+
+    assert replayed is not None
+    assert [anchor.claim for anchor in replayed.evidence_anchors] == [
+        valid["claim"]
+    ]
+    assert replayed.component_diagnostics == bundle.component_diagnostics
+
+
+def test_quantitative_provenance_keeps_all_invalid_bundle_fail_closed() -> None:
+    payload = _bundle_payload()
+    first = payload["evidence_anchors"][0]
+    first["claim"] = "The source reports 42 cases among 17 controls."
+    first["quantitative_result"] = {
+        "estimate": "42 cases",
+        "provenance": "source_reported",
+    }
+    second = deepcopy(first)
+    second.update(
+        evidence_anchor_id="anchor-second-invalid",
+        claim="The source reports 12 cases among 9 controls.",
+        quantitative_result={
+            "estimate": "12 cases",
+            "provenance": "source_reported",
+        },
+    )
+    payload["evidence_anchors"] = [first, second]
+
+    with pytest.raises(SourceBundleQuantitativeProvenanceError):
+        _source_bundle_from_result(
+            payload,
+            {
+                "source_id": "source-zotero-A1",
+                "zotero_item_key": "A1",
+                "text": (
+                    "The source reports 42 cases among 17 controls and "
+                    "12 cases among 9 controls."
+                ),
+            },
+            "full_document",
+        )
+
+
 @pytest.mark.parametrize(
     ("estimate", "text"),
     [
