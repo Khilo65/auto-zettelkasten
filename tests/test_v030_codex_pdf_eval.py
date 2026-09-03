@@ -273,6 +273,24 @@ def test_controlled_pdf_gate_is_one_direct_pdf_attempt(tmp_path: Path) -> None:
     assert cases[0]["expected_route"] == runner.PDF_INPUT_ROUTE
 
 
+def test_private_gate_binds_explicit_pdf_fallback(tmp_path: Path) -> None:
+    manifest_path = _manifest(tmp_path / "private")
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["pdf_fallback"] = "ocr"
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    manifest, _cases, workspace = runner._validated_manifest(
+        manifest_path, sha256_file(manifest_path)
+    )
+
+    assert runner._request(manifest, workspace).extraction_policy.pdf_fallback == "ocr"
+
+    payload["pdf_fallback"] = "automatic"
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="manifest pdf_fallback"):
+        runner._validated_manifest(manifest_path, sha256_file(manifest_path))
+
+
 def test_legacy_cli_and_image_route_evidence_remain_accepted(tmp_path: Path) -> None:
     legacy = _usage_row(
         1,

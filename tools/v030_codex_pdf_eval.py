@@ -837,6 +837,9 @@ def _validated_manifest(
     question = manifest.get("question")
     if question is not None and not isinstance(question, str):
         raise ValueError("manifest question must be a string or null")
+    pdf_fallback = manifest.get("pdf_fallback", "none")
+    if pdf_fallback not in {"none", "images", "ocr"}:
+        raise ValueError("manifest pdf_fallback must be none, images, or ocr")
     rows = manifest.get("cases")
     if not isinstance(rows, list) or len(rows) != settings.case_count:
         raise ValueError(
@@ -1070,7 +1073,9 @@ def _request(
         parallel=settings.case_count,
         provider_concurrency="auto",
         retry_terminal_failures=False,
-        extraction_policy=ExtractionPolicy(ocr="auto", pdf_fallback="none"),
+        extraction_policy=ExtractionPolicy(
+            ocr="auto", pdf_fallback=str(manifest.get("pdf_fallback", "none"))
+        ),
         processing=ProcessingPolicy(
             max_calls_per_document_run=settings.document_attempt_limit,
             request_deadline_seconds=600.0,
