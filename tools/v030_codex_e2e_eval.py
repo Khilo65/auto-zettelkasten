@@ -8,6 +8,7 @@ import json
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
+from itertools import combinations
 from pathlib import Path
 from typing import Any
 
@@ -95,6 +96,15 @@ _ROUTE_ORACLE_ROW_FIELDS = {
     "custody_sha256",
     "content_route",
     "selected_pages",
+}
+_STRATEGIC8_ORACLE_FIELDS = {
+    "schema_version",
+    "kind",
+    "source_custody_manifest_sha256",
+    "source_template_manifest_sha256",
+    "core_parent_keys",
+    "context_parent_key",
+    "control_parent_keys",
 }
 
 def _safe_relative_file(root: Path, value: Any, *, label: str) -> Path:
@@ -213,10 +223,16 @@ def _assert_raw_fresh_workspace(
     )
 
 
-def _private_json(path: Path, expected_sha256: str, *, label: str) -> dict[str, Any]:
+def _private_json(
+    path: Path,
+    expected_sha256: str,
+    *,
+    label: str,
+    filename: str = "PRIVATE_CUSTODY_MANIFEST.json",
+) -> dict[str, Any]:
     resolved = base._private(path, label=label)
-    if resolved.name != "PRIVATE_CUSTODY_MANIFEST.json" or not resolved.is_file():
-        raise ValueError(f"{label} must be PRIVATE_CUSTODY_MANIFEST.json")
+    if resolved.name != filename or not resolved.is_file():
+        raise ValueError(f"{label} must be {filename}")
     if not base._SHA256.fullmatch(expected_sha256) or base.sha256_file(resolved) != expected_sha256:
         raise ValueError(f"{label} SHA-256 mismatch")
     try:
@@ -548,7 +564,7 @@ def _custody_origin_root(path: Path, manifest: Mapping[str, Any]) -> Path:
 def _validate_strategic_custody(
     manifest_path: Path,
     manifest_sha256: str,
-    manifest: Mapping[str, Any],
+    manifest: dict[str, Any],
     settings: base.GateSettings,
     *,
     compute_pdf_routes: bool = False,
@@ -634,6 +650,14 @@ def _validate_strategic_custody(
                 )
             ):
                 raise ValueError("strategic8 source differs from strategic40 custody")
+        manifest["_strategic8_semantic_oracle"] = _validated_strategic8_oracle(
+            manifest,
+            workspace,
+            protected_roots,
+            sources,
+            custody_sha256,
+            template_sha256,
+        )
 
     _, cases, live_workspace = base._validated_manifest(
         manifest_path, manifest_sha256, settings
@@ -772,6 +796,175 @@ def _validate_strategic_custody(
             ):
                 raise ValueError("live Zotero full text differs from source custody")
     return route_oracle
+
+
+def _validated_strategic8_oracle(
+    manifest: Mapping[str, Any],
+    workspace: Path,
+    protected_roots: Sequence[Path],
+    sources: Sequence[Mapping[str, Any]],
+    custody_sha256: str,
+    template_sha256: str,
+) -> dict[str, Any]:
+    value = manifest.get("strategic8_semantic_oracle")
+    if not isinstance(value, str) or not Path(value).is_absolute():
+        raise ValueError("strategic8 semantic oracle must be an absolute path")
+    path = base._private(Path(value), label="strategic8 semantic oracle")
+    if not path.is_file() or any(
+        base._inside(path, root) for root in (workspace, *protected_roots)
+    ):
+        raise ValueError(
+            "strategic8 semantic oracle must be outside live and custody workspaces"
+        )
+    expected_sha256 = str(manifest.get("strategic8_semantic_oracle_sha256") or "")
+    if not base._SHA256.fullmatch(expected_sha256) or base.sha256_file(path) != expected_sha256:
+        raise ValueError("strategic8 semantic oracle SHA-256 mismatch")
+    oracle = _private_json(
+        path,
+        expected_sha256,
+        label="strategic8 semantic oracle",
+        filename="PRIVATE_SEMANTIC_ORACLE.json",
+    )
+    if (
+        set(oracle) != _STRATEGIC8_ORACLE_FIELDS
+        or oracle.get("schema_version") != "1"
+        or oracle.get("kind") != "v030_strategic8_semantic_oracle"
+        or oracle.get("source_custody_manifest_sha256") != custody_sha256
+        or oracle.get("source_template_manifest_sha256") != template_sha256
+    ):
+        raise ValueError("strategic8 semantic oracle identity is invalid")
+
+    def keys(name: str, count: int) -> list[str]:
+        values = oracle.get(name)
+        if (
+            not isinstance(values, list)
+            or len(values) != count
+            or any(not isinstance(item, str) or not item.strip() for item in values)
+        ):
+            raise ValueError(f"strategic8 semantic oracle {name} is invalid")
+        normalized = [item.casefold() for item in values]
+        if len(set(normalized)) != count:
+            raise ValueError(f"strategic8 semantic oracle {name} is invalid")
+        return normalized
+
+    core = keys("core_parent_keys", 3)
+    controls = keys("control_parent_keys", 4)
+    context = str(oracle.get("context_parent_key") or "").strip().casefold()
+    known = {str(row.get("parent_key") or "").casefold() for row in sources}
+    if (
+        not context
+        or len({*core, context, *controls}) != 8
+        or {*core, context, *controls} != known
+    ):
+        raise ValueError("strategic8 semantic oracle source partition is invalid")
+    return {
+        "sha256": expected_sha256,
+        "core_parent_keys": core,
+        "context_parent_key": context,
+        "control_parent_keys": controls,
+    }
+
+
+def _strategic8_oracle_acceptance(
+    workspace: Path,
+    cases: Sequence[Mapping[str, Any]],
+    report: Mapping[str, Any],
+    oracle: Mapping[str, Any],
+) -> tuple[list[str], dict[str, Any]]:
+    errors: list[str] = []
+    source_by_parent = {
+        str(row["parent"]["key"]).casefold(): base.source_id_for_item(row["parent"])
+        for row in cases
+    }
+    core = {source_by_parent[str(key)] for key in oracle["core_parent_keys"]}
+    context = source_by_parent[str(oracle["context_parent_key"])]
+    controls = {source_by_parent[str(key)] for key in oracle["control_parent_keys"]}
+    expected_members = core | {context}
+    clusters = (
+        report.get("cluster_map", {}).get("clusters", [])
+        if isinstance(report.get("cluster_map"), Mapping)
+        else []
+    )
+    exact_clusters = [
+        row
+        for row in clusters
+        if isinstance(row, Mapping)
+        and {str(value) for value in row.get("source_ids", []) or []}
+        == expected_members
+    ]
+    if len(exact_clusters) != 1:
+        errors.append("strategic8_expected_cluster_missing_or_duplicated")
+    else:
+        supplied_roles = exact_clusters[0].get("source_roles", [])
+        roles = (
+            {str(key): str(value).casefold() for key, value in supplied_roles.items()}
+            if isinstance(supplied_roles, Mapping)
+            else {
+                str(row.get("source_id") or ""): str(
+                    row.get("role") or row.get("proposed_role") or ""
+                ).casefold()
+                for row in supplied_roles or []
+                if isinstance(row, Mapping) and row.get("source_id")
+            }
+        )
+        if any(roles.get(source_id) != "core" for source_id in core) or roles.get(
+            context
+        ) != "context":
+            errors.append("strategic8_final_cluster_roles_incorrect")
+    if any(
+        controls
+        & {str(value) for value in row.get("source_ids", []) or []}
+        for row in exact_clusters
+    ):
+        errors.append("strategic8_control_in_expected_cluster")
+
+    registry = base.read_yaml(
+        workspace / "02_source_memory" / "indexes" / "typed_links.yml", {}
+    ) or {}
+    accepted_pairs = {
+        pair
+        for row in registry.get("relations", []) or []
+        if isinstance(row, Mapping)
+        and row.get("active", True)
+        and str(row.get("decision_status") or row.get("status") or "")
+        == "accepted"
+        and (pair := _pair(row)) is not None
+    }
+    evaluated_pairs = {
+        pair
+        for row in registry.get("current_pair_decisions", []) or []
+        if isinstance(row, Mapping) and (pair := _pair(row)) is not None
+    }
+    required_pairs = set(combinations(sorted(expected_members), 2))
+    if not required_pairs.issubset(evaluated_pairs):
+        errors.append("strategic8_required_pairs_not_all_evaluated")
+
+    def connected(nodes: set[str]) -> bool:
+        reached = {next(iter(nodes))}
+        while True:
+            expanded = reached | {
+                right if left in reached else left
+                for left, right in accepted_pairs
+                if left in nodes and right in nodes and (left in reached or right in reached)
+            }
+            if expanded == reached:
+                return reached == nodes
+            reached = expanded
+
+    if not connected(core):
+        errors.append("strategic8_core_not_connected_by_accepted_edges")
+    if not any(
+        tuple(sorted((context, source_id))) in accepted_pairs for source_id in core
+    ):
+        errors.append("strategic8_contextual_relationship_missing")
+    return sorted(set(errors)), {
+        "strategic8_semantic_oracle_sha256": str(oracle["sha256"]),
+        "strategic8_required_pair_count": len(required_pairs),
+        "strategic8_evaluated_required_pair_count": len(
+            required_pairs & evaluated_pairs
+        ),
+        "strategic8_expected_member_count": len(expected_members),
+    }
 
 
 def freeze_routes(
@@ -1875,6 +2068,19 @@ def run_gate(
             repository_probe=repository_probe,
             attempt_guard_factory=guard_factory,
         )
+    strategic8_oracle = manifest.get("_strategic8_semantic_oracle")
+
+    def strategic8_acceptance(
+        workspace: Path,
+        _run_id: str,
+        cases: Sequence[Mapping[str, Any]],
+        report: Mapping[str, Any],
+    ) -> tuple[list[str], dict[str, Any]]:
+        assert isinstance(strategic8_oracle, Mapping)
+        return _strategic8_oracle_acceptance(
+            workspace, cases, report, strategic8_oracle
+        )
+
     path, report = base.run_gate(
         mode=mode,
         manifest_path=manifest_path,
@@ -1886,6 +2092,11 @@ def run_gate(
         repository_probe=repository_probe,
         attempt_guard_factory=guard_factory,
         settings=settings,
+        acceptance_hook=(
+            strategic8_acceptance
+            if isinstance(strategic8_oracle, Mapping)
+            else None
+        ),
     )
     if mode == "prepare" and provider_free_pdf_routes:
         report = {**report, "provider_free_pdf_routes": provider_free_pdf_routes}

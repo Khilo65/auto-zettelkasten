@@ -39,9 +39,9 @@ def _verify_runtime_import_root() -> None:
 
 _verify_runtime_import_root()
 
-from auto_zettelkasten.codex_attempt_guard import (  # noqa: E402
+from v030_codex_campaign_guard import (  # noqa: E402
     PAUSE_REASONS,
-    CodexAttemptGuard,
+    CodexCampaignGuard,
 )
 from auto_zettelkasten.files import (  # noqa: E402
     now_iso,
@@ -512,7 +512,7 @@ def _run_level(
     payload_sha256: str,
     ledger_path: Path,
     maximum_attempts: int,
-    attempt_guard: CodexAttemptGuard | None,
+    attempt_guard: CodexCampaignGuard | None,
     reader: Any,
     dispatch: Callable[[Any], Mapping[str, Any]],
     abort_event: threading.Event,
@@ -865,10 +865,9 @@ def run_calibration(
     if callable(preflight):
         preflight()
 
-    attempt_guard: CodexAttemptGuard | None = None
-    carried_stage_attempt_count = 0
+    attempt_guard: CodexCampaignGuard | None = None
     if authorization_path is not None and authorization_sha256 is not None:
-        attempt_guard = CodexAttemptGuard.start(
+        attempt_guard = CodexCampaignGuard.start(
             authorization_path,
             authorization_sha256,
             repository_root=_REPOSITORY_ROOT,
@@ -879,13 +878,19 @@ def run_calibration(
             ),
             manifest_path=manifest_path,
             manifest_sha256=manifest_sha256,
+            evaluation_id=str(manifest["evaluation_id"]),
+            run_id=str(manifest["evaluation_id"]),
+            source_attempt_limit=(
+                int(config["maximum_attempts"]) if stage == "source" else 0
+            ),
+            relationship_attempt_limit=(
+                int(config["maximum_attempts"]) if stage == "relationship" else 0
+            ),
+            total_attempt_limit=int(config["maximum_attempts"]),
             resume_reason=resume_reason,
         )
-        carried_stage_attempt_count = attempt_guard.carried_stage_attempt_count
         setattr(reader, "attempt_guard", attempt_guard)
-    stage_attempt_allowance = (
-        int(config["maximum_attempts"]) - carried_stage_attempt_count
-    )
+    stage_attempt_allowance = int(config["maximum_attempts"])
 
     try:
         prior_rate: float | None = None
@@ -999,7 +1004,6 @@ def run_calibration(
             "minimum_gain_percent": MINIMUM_GAIN_PERCENT,
             "maximum_attempts": config["maximum_attempts"],
             "attempt_count": reservation_count,
-            "carried_stage_attempt_count": carried_stage_attempt_count,
             "remaining_attempts": stage_attempt_allowance - reservation_count,
             "retry_count": 0,
             "resume_count": resume_count,

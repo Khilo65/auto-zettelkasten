@@ -422,6 +422,140 @@ def _completed_review(packet_path: Path, packet: dict) -> dict:
     }
 
 
+def _strategic8_workspace(root: Path) -> tuple[Path, Path]:
+    workspace = _workspace(
+        root, source_count=8, accepted_count=3, negative_count=3, cluster_count=1
+    )
+    cases = []
+    for index in range(8):
+        source_id = f"source-{index:03d}"
+        note_id = f"note-{index:03d}"
+        note_path = workspace / "02_source_memory" / "notes" / f"{note_id}.md"
+        note_path.write_text(
+            "---\n"
+            f"source_id: {source_id}\n"
+            f"note_id: {note_id}\n"
+            "---\n\n"
+            f"# Source-grounded note {index}\n",
+            encoding="utf-8",
+        )
+        source_path = workspace / "01_custody" / "files" / f"source-{index:03d}.html"
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_text(
+            f"<html><body>Frozen source evidence {index}</body></html>",
+            encoding="utf-8",
+        )
+        cases.append(
+            {
+                "case_id": f"p{index}",
+                "source_id": source_id,
+                "primary_stratum_id": f"stratum-{index:02d}",
+                "zotero_parent": {
+                    "key": f"P{index}",
+                    "data": {"key": f"P{index}", "title": f"Source {index}"},
+                },
+                "file": str(source_path.relative_to(workspace)),
+                "sha256": sha256_file(source_path),
+            }
+        )
+    manifest_path = workspace / "PRIVATE_MANIFEST.json"
+    manifest_path.write_text(
+        json.dumps({"schema_version": "1", "cases": cases}, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return workspace, manifest_path
+
+
+def _completed_strategic8_review(packet_path: Path, packet: dict) -> dict:
+    packet_sha256 = sha256_file(packet_path)
+    judgments = []
+    for task_id in ("strategic8-reviewer-a", "strategic8-reviewer-b"):
+        for row in packet["rows"]:
+            judgment = {
+                "review_id": row["review_id"],
+                "artifact_sha256": row["artifact_sha256"],
+                "row_sha256": row["row_sha256"],
+                "packet_sha256": packet_sha256,
+                "reviewer_task_id": task_id,
+                "model": "gpt-5.6-sol",
+                "reasoning_effort": "high",
+            }
+            for field in row["required_judgments"]:
+                judgment[field] = field not in {"material_error", "severe_overmerge"}
+            judgment["judgment_sha256"] = audit_tool._digest(judgment)
+            judgments.append(judgment)
+    return {
+        "review_schema_version": "2",
+        "evidence_status": "autonomous_provisional",
+        "never_production_input": True,
+        "packet_sha256": packet_sha256,
+        "judgments": judgments,
+    }
+
+
+def test_strategic8_packet_requires_two_independent_full_reviewers(
+    tmp_path: Path,
+) -> None:
+    workspace, manifest_path = _strategic8_workspace(tmp_path)
+    private = tmp_path / "private-strategic8-review"
+    packet_path = private / "packet.yml"
+    packet = audit_tool.prepare(
+        workspace,
+        "strategic8",
+        packet_path,
+        source_manifest_path=manifest_path,
+    )
+    assert packet["selection_counts"] == {
+        "notes": 8,
+        "relationships": 3,
+        "memberships": 8,
+        "clusters": 1,
+        "rejected_or_unclustered": 3,
+        "syntheses": 1,
+        "total": 24,
+    }
+    assert all(
+        source["source_artifact"]["sha256"]
+        for source in packet["source_context"]
+    )
+
+    review_path = private / "review.yml"
+    report_path = private / "report.yml"
+    review = _completed_strategic8_review(packet_path, packet)
+    write_yaml(review_path, review)
+    report = audit_tool.score(workspace, packet_path, review_path, report_path)
+    assert report["status"] == "passed"
+    assert report["metrics"]["judgment_count"] == 48
+    assert len(report["reviewers"]) == 2
+
+    missing_path = private / "missing-reviewer.yml"
+    write_yaml(
+        missing_path,
+        {**review, "judgments": review["judgments"][: len(packet["rows"])]},
+    )
+    with pytest.raises(ValueError, match="two independent full reviewer tasks"):
+        audit_tool.score(
+            workspace, packet_path, missing_path, private / "missing-report.yml"
+        )
+
+    disagreement_path = private / "disagreement.yml"
+    disagreement = _completed_strategic8_review(packet_path, packet)
+    disagreement["judgments"][-1]["pass"] = False
+    disagreement["judgments"][-1].pop("judgment_sha256")
+    disagreement["judgments"][-1]["judgment_sha256"] = audit_tool._digest(
+        disagreement["judgments"][-1]
+    )
+    write_yaml(disagreement_path, disagreement)
+    failed = audit_tool.score(
+        workspace,
+        packet_path,
+        disagreement_path,
+        private / "disagreement-report.yml",
+    )
+    assert failed["status"] == "failed"
+    assert failed["checks"]["no_reviewer_disagreements"] is False
+
+
 def test_release_quality_packet_is_deterministic_private_and_stale_safe(
     tmp_path: Path,
 ) -> None:
@@ -458,6 +592,8 @@ def test_release_quality_packet_is_deterministic_private_and_stale_safe(
     )
 
     assert first == second == read_yaml(first_path)
+    assert stat.S_IMODE(first_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(first_bindings.stat().st_mode) == 0o600
     assert first["evidence_status"] == "autonomous_provisional"
     assert first["never_production_input"] is True
     assert first["provider_calls"] == 0
@@ -527,6 +663,7 @@ def test_release_quality_packet_is_deterministic_private_and_stale_safe(
         bindings_path=first_bindings,
     )
     assert report["status"] == "passed"
+    assert stat.S_IMODE(report_path.stat().st_mode) == 0o600
     assert report["metrics"]["material_error_count"] == 0
     assert report["metrics"]["relationship_correctness"]["wilson_95_lower"] >= 0.80
     assert report["metrics"]["membership_correctness"]["wilson_95_lower"] >= 0.80
@@ -586,6 +723,48 @@ def test_release_quality_packet_is_deterministic_private_and_stale_safe(
             first_path,
             stale_review_path,
             private / "stale-report.yml",
+            bindings_path=first_bindings,
+        )
+
+    wrong_model_path = private / "wrong-model.yml"
+    wrong_model = _completed_review(first_path, first)
+    wrong_model["judgments"][0]["model"] = "gpt-5.6-terra"
+    wrong_model["judgments"][0].pop("judgment_sha256")
+    wrong_model["judgments"][0]["judgment_sha256"] = audit_tool._digest(
+        wrong_model["judgments"][0]
+    )
+    write_yaml(wrong_model_path, wrong_model)
+    with pytest.raises(ValueError, match="must use gpt-5.6-sol"):
+        audit_tool.score(
+            workspace,
+            first_path,
+            wrong_model_path,
+            private / "wrong-model-report.yml",
+            bindings_path=first_bindings,
+        )
+
+    shared_note_path = private / "shared-note-reviewer.yml"
+    shared_note = _completed_review(first_path, first)
+    note_judgment = next(
+        judgment
+        for judgment in shared_note["judgments"]
+        if judgment["review_id"] == note_rows[0]["review_id"]
+    )
+    other_judgment = next(
+        judgment
+        for judgment in shared_note["judgments"]
+        if judgment["review_id"] != note_judgment["review_id"]
+    )
+    other_judgment["reviewer_task_id"] = note_judgment["reviewer_task_id"]
+    other_judgment.pop("judgment_sha256")
+    other_judgment["judgment_sha256"] = audit_tool._digest(other_judgment)
+    write_yaml(shared_note_path, shared_note)
+    with pytest.raises(ValueError, match="note requires its own reviewer task"):
+        audit_tool.score(
+            workspace,
+            first_path,
+            shared_note_path,
+            private / "shared-note-report.yml",
             bindings_path=first_bindings,
         )
 
@@ -698,6 +877,21 @@ def test_stratified_500_packet_enforces_deterministic_review_caps(
     assert report["status"] == "passed"
     assert report["checks"]["relationship_wilson_lower_at_least_0_80"] is True
     assert report["checks"]["membership_wilson_lower_at_least_0_80"] is True
+
+    oversized_path = tmp_path / "private" / "oversized-review.yml"
+    oversized = _completed_review(packet_path, packet)
+    for judgment in oversized["judgments"][:21]:
+        judgment["reviewer_task_id"] = "task-oversized"
+        judgment.pop("judgment_sha256")
+        judgment["judgment_sha256"] = audit_tool._digest(judgment)
+    write_yaml(oversized_path, oversized)
+    with pytest.raises(ValueError, match="at most 20 rows"):
+        audit_tool.score(
+            workspace,
+            packet_path,
+            oversized_path,
+            tmp_path / "private" / "oversized-report.yml",
+        )
 
 
 def test_exhaustive_packet_accepts_custody_manifest_at_workspace_root(
@@ -848,6 +1042,7 @@ def test_package_audit_accepts_clean_sdist_built_wheel_and_artifact(
     )
 
     assert report == read_yaml(report_path)
+    assert stat.S_IMODE(report_path.stat().st_mode) == 0o600
     assert report["status"] == "passed"
     assert report["provider_calls"] == 0
     assert report["distribution"] == "auto-zettelkasten"

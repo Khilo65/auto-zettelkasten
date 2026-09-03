@@ -8,6 +8,7 @@ import sys
 from copy import deepcopy
 from collections.abc import Mapping
 from contextlib import contextmanager
+from itertools import combinations
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -347,6 +348,24 @@ def _strategic_manifests(root: Path) -> tuple[Path, Path, Path, Path]:
         + "\n",
         encoding="utf-8",
     )
+    semantic_oracle = root / "strategic8-oracle" / "PRIVATE_SEMANTIC_ORACLE.json"
+    semantic_oracle.parent.mkdir()
+    semantic_oracle.write_text(
+        json.dumps(
+            {
+                "schema_version": "1",
+                "kind": "v030_strategic8_semantic_oracle",
+                "source_custody_manifest_sha256": sha256_file(manifest8_path),
+                "source_template_manifest_sha256": template_sha256,
+                "core_parent_keys": strategic_keys[:3],
+                "context_parent_key": strategic_keys[3],
+                "control_parent_keys": strategic_keys[4:],
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     def live_manifest(name: str, custody_path: Path, sources: list[dict[str, Any]]) -> Path:
         live = root / f"{name}-live"
@@ -410,9 +429,7 @@ def _strategic_manifests(root: Path) -> tuple[Path, Path, Path, Path]:
         count = len(sources)
         controls = runner._STRATEGIC_CONTROLS[count]
         path = live / "PRIVATE_MANIFEST.json"
-        path.write_text(
-            json.dumps(
-                {
+        payload = {
                     "schema_version": "1",
                     "code_commit": CODE_COMMIT,
                     "evaluation_id": f"synthetic-{name}",
@@ -430,10 +447,14 @@ def _strategic_manifests(root: Path) -> tuple[Path, Path, Path, Path]:
                     },
                     "cases": cases,
                     "collections": [],
-                },
-                sort_keys=True,
-                indent=2,
+                }
+        if count == 8:
+            payload.update(
+                strategic8_semantic_oracle=str(semantic_oracle),
+                strategic8_semantic_oracle_sha256=sha256_file(semantic_oracle),
             )
+        path.write_text(
+            json.dumps(payload, sort_keys=True, indent=2)
             + "\n",
             encoding="utf-8",
         )
@@ -813,17 +834,19 @@ def _write_run(workspace: Path, request: Any, client: Any, run_id: str) -> dict[
         "decision_status": "accepted",
         "active": True,
     }
-    write_yaml(
-        workspace / "02_source_memory" / "indexes" / "typed_links.yml",
-        {
-            "relations": [relation],
-            "links": [relation],
-            "pair_decisions": [],
-            "current_pair_decisions": [
-                {"source_ids": source_ids[:2], "status": "accepted"}
-            ],
-        },
-    )
+    registry = {
+        "relations": [relation],
+        "links": [relation],
+        "pair_decisions": [],
+        "current_pair_decisions": [
+            {"source_ids": source_ids[:2], "status": "accepted"}
+        ],
+    }
+    for name in ("typed_links.yml", "typed_note_links.yml"):
+        write_yaml(
+            workspace / "02_source_memory" / "indexes" / name,
+            registry,
+        )
     write_yaml(
         workspace
         / "02_source_memory"
@@ -966,20 +989,30 @@ def _write_graph_run(workspace: Path, kwargs: Mapping[str, Any]) -> None:
             "active": True,
         },
     ]
-    write_yaml(
-        workspace / "02_source_memory" / "indexes" / "typed_links.yml",
-        {
-            "relations": relations,
-            "links": relations,
-            "pair_decisions": [],
-            "current_pair_decisions": [
-                {
-                    "source_ids": source_ids[3:5],
-                    "status": "no_relationship",
-                }
-            ],
-        },
-    )
+    registry = {
+        "relations": relations,
+        "links": relations,
+        "pair_decisions": [],
+        "current_pair_decisions": [
+            {
+                "source_ids": source_ids[:2],
+                "status": "accepted",
+            },
+            {
+                "source_ids": [source_ids[0], source_ids[2]],
+                "status": "accepted",
+            },
+            {
+                "source_ids": source_ids[3:5],
+                "status": "no_relationship",
+            }
+        ],
+    }
+    for name in ("typed_links.yml", "typed_note_links.yml"):
+        write_yaml(
+            workspace / "02_source_memory" / "indexes" / name,
+            registry,
+        )
     write_yaml(
         workspace
         / "02_source_memory"
@@ -1281,15 +1314,17 @@ def test_raw_e2e_binds_exact_html_route_and_requires_a_relationship(
     )
     assert route_errors == ["html:route_mismatch"]
 
-    write_yaml(
-        workspace / "02_source_memory" / "indexes" / "typed_links.yml",
-        {
-            "relations": [],
-            "links": [],
-            "pair_decisions": [],
-            "current_pair_decisions": [],
-        },
-    )
+    empty_registry = {
+        "relations": [],
+        "links": [],
+        "pair_decisions": [],
+        "current_pair_decisions": [],
+    }
+    for name in ("typed_links.yml", "typed_note_links.yml"):
+        write_yaml(
+            workspace / "02_source_memory" / "indexes" / name,
+            empty_registry,
+        )
     write_yaml(
         workspace
         / "02_source_memory"
@@ -1511,6 +1546,19 @@ def test_strategic_route_oracle_is_strict_and_hash_bound(
     manifest["pdf_route_oracle_sha256"] = sha256_file(oracle_path)
     live8.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match="oracle identity is invalid"):
+        runner._manifest_settings(live8, sha256_file(live8))
+
+
+def test_strategic8_semantic_oracle_is_hash_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    live8, _live40, custody8, custody40 = _strategic_manifests(tmp_path)
+    _bind_synthetic_strategic_fixture(monkeypatch, custody8, custody40)
+    manifest = json.loads(live8.read_text(encoding="utf-8"))
+    manifest["strategic8_semantic_oracle_sha256"] = "0" * 64
+    live8.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="semantic oracle SHA-256 mismatch"):
         runner._manifest_settings(live8, sha256_file(live8))
 
 
@@ -2047,7 +2095,9 @@ def test_runner_rejects_auto_zettelkasten_from_another_checkout(
         )
 
 
-def test_private_strategic8_cluster_labels_never_enter_provider_inputs() -> None:
+def test_private_strategic8_cluster_labels_never_enter_provider_inputs(
+    tmp_path: Path,
+) -> None:
     cases = []
     for index in range(8):
         parent = {
@@ -2072,3 +2122,64 @@ def test_private_strategic8_cluster_labels_never_enter_provider_inputs() -> None
     assert runner.base._private_cluster_expectation_errors(cases, report) == [
         "private_related_cluster_or_control_separation_failed"
     ]
+
+    expected = source_ids[:4]
+    accepted = [
+        (source_ids[0], source_ids[1]),
+        (source_ids[1], source_ids[2]),
+        (source_ids[2], source_ids[3]),
+    ]
+    registry = {
+        "relations": [
+            {
+                "source_id": left,
+                "target_source_id": right,
+                "decision_status": "accepted",
+                "active": True,
+            }
+            for left, right in accepted
+        ],
+        "current_pair_decisions": [
+            {
+                "source_ids": [left, right],
+                "status": "accepted" if (left, right) in accepted else "no_relationship",
+            }
+            for left, right in combinations(expected, 2)
+        ],
+    }
+    for name in ("typed_links.yml", "typed_note_links.yml"):
+        write_yaml(tmp_path / "02_source_memory" / "indexes" / name, registry)
+    report = {
+        "cluster_map": {
+            "clusters": [
+                {
+                    "source_ids": expected,
+                    "source_roles": [
+                        {"source_id": source_id, "role": "core"}
+                        for source_id in source_ids[:3]
+                    ]
+                    + [{"source_id": source_ids[3], "role": "context"}],
+                }
+            ]
+        }
+    }
+    oracle = {
+        "sha256": "1" * 64,
+        "core_parent_keys": [f"p{index}" for index in range(3)],
+        "context_parent_key": "p3",
+        "control_parent_keys": [f"p{index}" for index in range(4, 8)],
+    }
+    errors, acceptance = runner._strategic8_oracle_acceptance(
+        tmp_path, cases, report, oracle
+    )
+    assert errors == []
+    assert acceptance["strategic8_evaluated_required_pair_count"] == 6
+
+    registry["current_pair_decisions"].pop()
+    write_yaml(
+        tmp_path / "02_source_memory" / "indexes" / "typed_links.yml", registry
+    )
+    errors, _acceptance = runner._strategic8_oracle_acceptance(
+        tmp_path, cases, report, oracle
+    )
+    assert errors == ["strategic8_required_pairs_not_all_evaluated"]

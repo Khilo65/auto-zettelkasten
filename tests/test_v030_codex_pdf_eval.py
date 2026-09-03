@@ -244,6 +244,35 @@ def test_four_pdf_manifest_requires_the_direct_pdf_route_oracle(
         runner._validated_manifest(manifest, sha256_file(manifest))
 
 
+def test_controlled_pdf_gate_is_one_direct_pdf_attempt(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path / "private")
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["cases"] = [payload["cases"][1]]
+    payload["cases"][0]["expected"]["content_route"] = runner.PDF_INPUT_ROUTE
+    payload["gate"] = runner.CONTROLLED_PDF_GATE.manifest_binding()
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    validated, cases, _workspace = runner._validated_manifest(
+        manifest,
+        sha256_file(manifest),
+        runner.CONTROLLED_PDF_GATE,
+    )
+
+    assert validated["gate"] == {
+        "schema_version": "1",
+        "kind": "controlled_pdf",
+        "stage": "controlled_real_pdf_smoke",
+        "case_count": 1,
+        "source_attempt_limit": 1,
+        "relationship_attempt_limit": 0,
+        "total_attempt_limit": 1,
+        "document_attempt_limit": 1,
+        "stage_deadline_seconds": 8_460,
+        "cluster_generation_enabled": False,
+    }
+    assert cases[0]["expected_route"] == runner.PDF_INPUT_ROUTE
+
+
 def test_legacy_cli_and_image_route_evidence_remain_accepted(tmp_path: Path) -> None:
     legacy = _usage_row(
         1,
@@ -549,17 +578,19 @@ def _write_accepted_run(
         "decision_status": "accepted",
         "active": True,
     }
-    write_yaml(
-        workspace / "02_source_memory" / "indexes" / "typed_links.yml",
-        {
-            "relations": [relation],
-            "links": [relation],
-            "pair_decisions": [],
-            "current_pair_decisions": [
-                {"source_ids": source_ids[:2], "status": "accepted"}
-            ],
-        },
-    )
+    registry = {
+        "relations": [relation],
+        "links": [relation],
+        "pair_decisions": [],
+        "current_pair_decisions": [
+            {"source_ids": source_ids[:2], "status": "accepted"}
+        ],
+    }
+    for name in ("typed_links.yml", "typed_note_links.yml"):
+        write_yaml(
+            workspace / "02_source_memory" / "indexes" / name,
+            registry,
+        )
     write_yaml(
         workspace / "02_source_memory" / "indexes" / "relationship_selection_state.yml",
         {
@@ -1052,15 +1083,17 @@ def test_acceptance_allows_complete_empty_relationship_discovery(
     client = runner.ManifestZoteroClient(cases)
     run_id = str(manifest["run_id"])
     report = _write_accepted_run(workspace, request, client, run_id)
-    write_yaml(
-        workspace / "02_source_memory" / "indexes" / "typed_links.yml",
-        {
-            "relations": [],
-            "links": [],
-            "pair_decisions": [],
-            "current_pair_decisions": [],
-        },
-    )
+    empty_registry = {
+        "relations": [],
+        "links": [],
+        "pair_decisions": [],
+        "current_pair_decisions": [],
+    }
+    for name in ("typed_links.yml", "typed_note_links.yml"):
+        write_yaml(
+            workspace / "02_source_memory" / "indexes" / name,
+            empty_registry,
+        )
     usage_path = (
         workspace
         / "11_state"

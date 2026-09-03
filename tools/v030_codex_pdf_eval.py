@@ -150,7 +150,7 @@ class GateSettings:
         values = locals()
         for name in self.__slots__:
             setattr(self, name, values[name])
-        if kind not in {"four_pdf", "raw_e2e", "graph_e2e"} or not _SAFE_ID.fullmatch(self.stage):
+        if kind not in {"four_pdf", "controlled_pdf", "raw_e2e", "graph_e2e"} or not _SAFE_ID.fullmatch(self.stage):
             raise ValueError("gate kind or stage is invalid")
         for name in (
             "case_count",
@@ -161,7 +161,7 @@ class GateSettings:
             "stage_deadline_seconds",
         ):
             value = getattr(self, name)
-            minimum = 0 if name == "source_attempt_limit" and kind == "graph_e2e" else 1
+            minimum = 0 if name in {"source_attempt_limit", "relationship_attempt_limit"} else 1
             if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
                 raise ValueError(f"gate {name} must be a positive integer")
         if self.total_attempt_limit != (
@@ -206,6 +206,21 @@ class GateSettings:
 FOUR_PDF_GATE = GateSettings(
     require_direct_image_route=False,
     require_direct_pdf_route=True,
+)
+CONTROLLED_PDF_GATE = GateSettings(
+    kind="controlled_pdf",
+    stage="controlled_real_pdf_smoke",
+    case_count=1,
+    source_attempt_limit=1,
+    relationship_attempt_limit=0,
+    total_attempt_limit=1,
+    document_attempt_limit=1,
+    clusters_enabled=False,
+    require_direct_image_route=False,
+    require_direct_pdf_route=True,
+    report_directory="codex-controlled-pdf",
+    attempt_ledger_name=".v030-codex-controlled-pdf-attempt-ledger.json",
+    attempt_lock_name=".v030-codex-controlled-pdf-attempt-ledger.lock",
 )
 
 
@@ -1778,6 +1793,11 @@ def _relationship_errors(
     )
     if not isinstance(registry, Mapping):
         return ["typed_relationship_registry_missing"], False
+    compatibility = read_yaml(
+        workspace / "02_source_memory" / "indexes" / "typed_note_links.yml", {}
+    ) or {}
+    if compatibility != registry:
+        errors.append("relationship_registry_projection_mismatch")
     rows = [
         dict(row)
         for field in ("relations", "links", "pair_decisions")
@@ -1804,20 +1824,17 @@ def _relationship_errors(
         if not endpoints.issubset(source_ids):
             errors.append("relationship_endpoint_outside_gate")
             break
-    accepted = next(
-        (
-            row
-            for row in registry.get("relations", []) or []
-            if isinstance(row, Mapping)
-            and str(row.get("source_kind") or "source") == "source"
-            and str(row.get("target_kind") or "source") == "source"
-            and row.get("active", True)
-            and str(row.get("decision_status") or "") == "accepted"
-            and row.get("source_id") in source_ids
-            and row.get("target_source_id") in source_ids
-        ),
-        None,
-    )
+    accepted = [
+        dict(row)
+        for row in registry.get("relations", []) or []
+        if isinstance(row, Mapping)
+        and str(row.get("source_kind") or "source") == "source"
+        and str(row.get("target_kind") or "source") == "source"
+        and row.get("active", True)
+        and str(row.get("decision_status") or "") == "accepted"
+        and row.get("source_id") in source_ids
+        and row.get("target_source_id") in source_ids
+    ]
     state = (
         read_yaml(
             workspace
@@ -1835,12 +1852,42 @@ def _relationship_errors(
         or state.get("relationship_discovery_incomplete_jobs")
     ):
         errors.append("relationship_completeness_accounting_failed")
+    selected_pairs = {
+        tuple(sorted(str(value) for value in row.get("pair", []) or []))
+        for row in state.get("selected_candidates", []) or []
+        if isinstance(row, Mapping)
+        and len(row.get("pair", []) or []) == 2
+    }
+    current_pairs = {
+        tuple(sorted(str(value) for value in row.get("source_ids", []) or []))
+        for row in registry.get("current_pair_decisions", []) or []
+        if isinstance(row, Mapping)
+        and len(row.get("source_ids", []) or []) == 2
+        and row.get("active", True)
+    }
+    accepted_relation_pairs = {
+        tuple(sorted((str(row["source_id"]), str(row["target_source_id"]))))
+        for row in accepted
+    }
+    accepted_decision_pairs = {
+        tuple(sorted(str(value) for value in row.get("source_ids", []) or []))
+        for row in registry.get("current_pair_decisions", []) or []
+        if isinstance(row, Mapping)
+        and len(row.get("source_ids", []) or []) == 2
+        and row.get("active", True)
+        and str(row.get("status") or row.get("decision_status") or "")
+        == "accepted"
+    }
+    if accepted_relation_pairs != accepted_decision_pairs:
+        errors.append("relationship_registry_projection_mismatch")
+    if selected_pairs != current_pairs and selected_pairs:
+        errors.append("selected_relationship_pair_coverage_incomplete")
     requires_adjudication = bool(
         rows
         or registry.get("current_pair_decisions")
         or (state.get("selected_candidates") if isinstance(state, Mapping) else [])
     )
-    if accepted is None:
+    if not accepted:
         if require_accepted:
             errors.append("accepted_relationship_missing")
         return errors, requires_adjudication
@@ -1852,9 +1899,6 @@ def _relationship_errors(
             source_id = str(frontmatter["source_id"])
             notes[source_id] = frontmatter
             note_ids[source_id] = str(frontmatter.get("note_id") or "")
-    left = str(accepted["source_id"])
-    right = str(accepted["target_source_id"])
-
     def projected(source_id: str, target_id: str) -> bool:
         target_note_id = note_ids.get(target_id, "")
         if not target_note_id:
@@ -1864,7 +1908,11 @@ def _relationship_errors(
             for row in notes.get(source_id, {}).get("related_notes", []) or []
         )
 
-    if not projected(left, right) or not projected(right, left):
+    if any(
+        not projected(str(row["source_id"]), str(row["target_source_id"]))
+        or not projected(str(row["target_source_id"]), str(row["source_id"]))
+        for row in accepted
+    ):
         errors.append("accepted_relationship_not_reciprocally_projected")
     return errors, True
 
@@ -2224,8 +2272,12 @@ def _acceptance(
         completion = row.get("provider_completion")
         if isinstance(completion, Mapping):
             relationship_contracts.add(str(completion.get("contract_id") or ""))
-    required_relationship_contracts = {"relationship_candidate_selection"}
-    if requires_relationship_adjudication:
+    required_relationship_contracts = (
+        {"relationship_candidate_selection"}
+        if settings.relationship_attempt_limit
+        else set()
+    )
+    if requires_relationship_adjudication and settings.relationship_attempt_limit:
         required_relationship_contracts.add("relationship_adjudication")
     if not required_relationship_contracts.issubset(relationship_contracts):
         errors.append("required_relationship_contracts_missing")
@@ -2319,6 +2371,11 @@ def run_gate(
     repository_probe: Callable[[], tuple[str, bool]] = _repository_state,
     attempt_guard_factory: Callable[..., Any] = CodexCampaignGuard.start,
     settings: GateSettings = FOUR_PDF_GATE,
+    acceptance_hook: Callable[
+        [Path, str, Sequence[Mapping[str, Any]], Mapping[str, Any]],
+        tuple[Sequence[str], Mapping[str, Any]],
+    ]
+    | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     """Prepare, execute, resume, or exactly replay the private four-PDF gate."""
 
@@ -2352,6 +2409,19 @@ def run_gate(
         "cluster_generation_enabled": settings.clusters_enabled,
         "case_count": len(cases),
     }
+
+    def evaluate(run_report: Mapping[str, Any]) -> tuple[list[str], dict[str, Any]]:
+        errors, acceptance = _acceptance(
+            workspace, run_id, cases, run_report, settings
+        )
+        if acceptance_hook is not None:
+            hook_errors, hook_acceptance = acceptance_hook(
+                workspace, run_id, cases, run_report
+            )
+            errors = sorted({*errors, *(str(value) for value in hook_errors)})
+            acceptance = {**acceptance, **dict(hook_acceptance)}
+        return errors, acceptance
+
     if mode == "prepare":
         report = {**base, "status": "prepared", "created_at": now_iso()}
         return _write_report(workspace, evaluation_id, mode, report, settings), report
@@ -2449,9 +2519,7 @@ def run_gate(
         prior = read_yaml(run_root / "run_report.yml", {}) or {}
         if not isinstance(prior, Mapping):
             raise ValueError("completed run report is missing")
-        prior_errors, before_acceptance = _acceptance(
-            workspace, run_id, cases, prior, settings
-        )
+        prior_errors, before_acceptance = evaluate(prior)
         if mode == "replay" and prior_errors:
             raise ValueError("replay requires a previously accepted gate")
         before = _gate_snapshot(workspace)
@@ -2611,9 +2679,7 @@ def run_gate(
 
     try:
         run_report = _report_dict(value)
-        errors, acceptance = _acceptance(
-            workspace, run_id, cases, run_report, settings
-        )
+        errors, acceptance = evaluate(run_report)
         source, relationship = _attempts(workspace, run_id)
     except Exception as exc:
         try:
@@ -2736,6 +2802,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--manifest-sha256", required=True)
     parser.add_argument(
+        "--controlled-pdf",
+        action="store_true",
+        help="Run the one-PDF, one-attempt direct subscription smoke gate.",
+    )
+    parser.add_argument(
         "--authorization",
         type=Path,
         help="Private stage-scoped Codex-attempt authorization (run/resume only).",
@@ -2755,6 +2826,7 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    settings = CONTROLLED_PDF_GATE if args.controlled_pdf else FOUR_PDF_GATE
     path, report = run_gate(
         mode=args.mode,
         manifest_path=args.manifest,
@@ -2762,6 +2834,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         authorization_path=args.authorization,
         authorization_sha256=args.authorization_sha256,
         execute=args.execute,
+        settings=settings,
     )
     print(json.dumps({"report": str(path), **report}, sort_keys=True, default=str))
     return 0 if report["status"] in {"prepared", "passed"} else 2

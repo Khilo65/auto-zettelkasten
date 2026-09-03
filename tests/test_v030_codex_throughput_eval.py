@@ -90,13 +90,10 @@ class FakeAttemptGuard:
     def __init__(
         self,
         events: list[object] | None = None,
-        *,
-        carried_stage_attempt_count: int = 0,
     ) -> None:
         self.events = events if events is not None else []
         self.jobs: list[str] = []
         self.finishes: list[tuple[str, str]] = []
-        self.carried_stage_attempt_count = carried_stage_attempt_count
 
     @contextmanager
     def job(self, job_id: str):
@@ -232,7 +229,7 @@ def test_shared_guard_starts_after_preflight_and_wraps_fixed_job(
         events.append(("start", kwargs))
         return guard
 
-    monkeypatch.setattr(runner.CodexAttemptGuard, "start", classmethod(start))
+    monkeypatch.setattr(runner.CodexCampaignGuard, "start", classmethod(start))
     monkeypatch.setattr(runner, "reset_provider_completion", lambda: None)
     _output, report = runner.run_calibration(
         manifest_path=manifest,
@@ -249,6 +246,9 @@ def test_shared_guard_starts_after_preflight_and_wraps_fixed_job(
     assert events[0] == "preflight"
     assert events[1][0] == "start"
     assert events[1][1]["stage"] == "luna_source_calibration"
+    assert events[1][1]["source_attempt_limit"] == 70
+    assert events[1][1]["relationship_attempt_limit"] == 0
+    assert events[1][1]["total_attempt_limit"] == 70
     assert events[1][1]["resume_reason"] is None
     assert reader.attempt_guard is guard
     assert guard.jobs == ["c1:s001"]
@@ -296,7 +296,7 @@ def test_interruption_writes_pause_and_preserves_original_error(
 
     guard.finish = finish_then_fail  # type: ignore[method-assign]
     monkeypatch.setattr(
-        runner.CodexAttemptGuard,
+        runner.CodexCampaignGuard,
         "start",
         classmethod(lambda _cls, *_args, **_kwargs: guard),
     )
@@ -377,78 +377,6 @@ def test_source_calibration_uses_exact_70_attempt_ceiling(
     assert report["levels"][0]["completion_order"] == list(range(1, 9))
     assert report["levels"][0]["child_cpu_seconds"] >= 0
     assert report["levels"][0]["child_max_rss_bytes"] >= 0
-
-
-def test_carried_attempts_stop_before_an_oversized_wave(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(runner, "MINIMUM_GAIN_PERCENT", -1.0)
-    manifest = _manifest(tmp_path / "private")
-    reader = FakeSourceReader()
-    guard = FakeAttemptGuard(carried_stage_attempt_count=3)
-    monkeypatch.setattr(
-        runner.CodexAttemptGuard,
-        "start",
-        classmethod(lambda _cls, *_args, **_kwargs: guard),
-    )
-    monkeypatch.setattr(runner, "reset_provider_completion", lambda: None)
-    monkeypatch.setattr(runner, "current_provider_completion", _completion)
-
-    _output, report = runner.run_calibration(
-        manifest_path=manifest,
-        manifest_sha256=sha256_file(manifest),
-        authorization_path=tmp_path / "authorization.json",
-        authorization_sha256="a" * 64,
-        output_path=tmp_path / "output/report.yml",
-        execute=True,
-        reader_factory=lambda **_kwargs: reader,
-        canceller=lambda: 0,
-        require_clean=False,
-    )
-
-    assert report["status"] == "passed"
-    assert report["stop_reason"] == "insufficient_attempt_allowance"
-    assert [row["concurrency"] for row in report["levels"]] == [1, 2, 4, 8, 16]
-    assert report["attempt_count"] == reader.calls == 38
-    assert report["carried_stage_attempt_count"] == 3
-    assert report["remaining_attempts"] == 29
-    assert guard.finishes == [("passed", "")]
-
-
-def test_carried_attempts_that_cannot_fit_the_baseline_fail_without_calls(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    manifest = _manifest(tmp_path / "private")
-    reader = FakeSourceReader()
-    guard = FakeAttemptGuard(carried_stage_attempt_count=70)
-    monkeypatch.setattr(
-        runner.CodexAttemptGuard,
-        "start",
-        classmethod(lambda _cls, *_args, **_kwargs: guard),
-    )
-
-    output, report = runner.run_calibration(
-        manifest_path=manifest,
-        manifest_sha256=sha256_file(manifest),
-        authorization_path=tmp_path / "authorization.json",
-        authorization_sha256="a" * 64,
-        output_path=tmp_path / "output/report.yml",
-        execute=True,
-        reader_factory=lambda **_kwargs: reader,
-        canceller=lambda: 0,
-        require_clean=False,
-    )
-
-    assert report["status"] == "failed"
-    assert report["stop_reason"] == "insufficient_attempt_allowance"
-    assert report["levels"] == []
-    assert report["attempt_count"] == reader.calls == 0
-    assert report["remaining_attempts"] == 0
-    assert guard.finishes == [("failed", "terminal")]
-    ledger = manifest.parent / report["attempt_ledger"]
-    assert output.is_file() and ledger.is_file() and ledger.read_bytes() == b""
 
 
 def test_failure_aborts_without_retry_and_consumed_ledger_blocks_rerun(
@@ -606,7 +534,7 @@ def test_quota_resume_submits_only_unreserved_jobs(
         starts.append(kwargs)
         return guards[len(starts) - 1]
 
-    monkeypatch.setattr(runner.CodexAttemptGuard, "start", classmethod(start))
+    monkeypatch.setattr(runner.CodexCampaignGuard, "start", classmethod(start))
     monkeypatch.setattr(runner, "reset_provider_completion", lambda: None)
 
     _output, paused = runner.run_calibration(
@@ -712,7 +640,7 @@ def test_relationship_stage_uses_terra_medium_public_contract(
         return FakeRelationshipReader()
 
     monkeypatch.setattr(
-        runner.CodexAttemptGuard,
+        runner.CodexCampaignGuard,
         "start",
         classmethod(
             lambda _cls, *_args, **kwargs: (
@@ -736,6 +664,9 @@ def test_relationship_stage_uses_terra_medium_public_contract(
     assert factory_kwargs["model"] == "gpt-5.6-terra"
     assert factory_kwargs["reasoning_effort"] == "medium"
     assert starts[0]["stage"] == "terra_relationship_calibration"
+    assert starts[0]["source_attempt_limit"] == 0
+    assert starts[0]["relationship_attempt_limit"] == 38
+    assert starts[0]["total_attempt_limit"] == 38
     assert report["maximum_attempts"] == 38
     assert report["attempt_count"] == 1
     assert len(calls) == 1

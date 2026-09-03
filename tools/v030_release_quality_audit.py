@@ -29,7 +29,7 @@ from auto_zettelkasten.notes import read_note, source_id_for_item
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _SEED = "v030-autonomous-provisional-release-audit-v1"
-_MODES = {"exhaustive40": 40, "stratified500": 500}
+_MODES = {"strategic8": 8, "exhaustive40": 40, "stratified500": 500}
 _RELATION_LIMIT = 200
 _MEMBERSHIP_LIMIT = 200
 _DECISION_LIMIT = 100
@@ -95,6 +95,8 @@ _PRIVATE_LITERAL_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 _REVIEWER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}")
 _REVIEWER_MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _REASONING_EFFORTS = {"low", "medium", "high", "xhigh", "max", "ultra"}
+_REQUIRED_REVIEWER_MODEL = "gpt-5.6-sol"
+_REQUIRED_REASONING_EFFORT = "high"
 
 
 class _ArchiveAuditError(ValueError):
@@ -128,6 +130,11 @@ def _private_yaml_path(path: Path, workspace: Path, *, label: str) -> Path:
     ):
         raise ValueError(f"{label} must be outside the workspace and Git")
     return resolved
+
+
+def _write_private_yaml(path: Path, payload: Any) -> None:
+    write_yaml(path, payload)
+    path.chmod(stat.S_IRUSR | stat.S_IWUSR)
 
 
 def _private_input(path: Path, *, label: str) -> Path:
@@ -415,7 +422,7 @@ def _load_sources(
     mode: str,
     manifest_path: Path | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, str], list[dict[str, str]]]:
-    if manifest_path is None and mode == "exhaustive40":
+    if manifest_path is None and mode in {"strategic8", "exhaustive40"}:
         candidate = workspace / "PRIVATE_MANIFEST.json"
         manifest_path = candidate if candidate.is_file() else None
     if manifest_path is not None:
@@ -455,17 +462,49 @@ def _load_sources(
         if set(notes) != set(strata):
             raise ValueError("Strategic40 notes must account for every manifest source")
         contexts = []
+        artifacts = [_artifact(path, workspace, sha256_file(path))]
         for source_id in sorted(strata):
             note_path, frontmatter = notes[source_id]
             text, note_sha256 = _stable_text(note_path, label=f"note for {source_id}")
-            contexts.append({
+            context = {
                 "source_id": source_id,
                 "note_id": str(frontmatter.get("note_id") or note_path.stem),
                 "primary_stratum_id": strata[source_id],
                 "note_artifact": _artifact(note_path, workspace, note_sha256),
                 "note_text": text,
-            })
-        return contexts, strata, [_artifact(path, workspace, sha256_file(path))]
+            }
+            if mode == "strategic8":
+                case = next(
+                    row
+                    for row in cases
+                    if str(
+                        row.get("source_id")
+                        or source_id_for_item(
+                            _mapping(
+                                row.get("zotero_parent", {}),
+                                label="Strategic8 Zotero parent",
+                            )
+                        )
+                    )
+                    == source_id
+                )
+                source_path = _workspace_file(
+                    workspace,
+                    str(case.get("file") or ""),
+                    label=f"raw source for {source_id}",
+                )
+                source_sha256 = sha256_file(source_path)
+                if source_sha256 != str(case.get("sha256") or ""):
+                    raise ValueError("Strategic8 raw source SHA-256 mismatch")
+                context["source_artifact"] = _artifact(
+                    source_path, workspace, source_sha256
+                )
+                context["source_metadata"] = _mapping(
+                    case.get("zotero_parent", {}), label="Strategic8 Zotero parent"
+                )
+                artifacts.append(context["source_artifact"])
+            contexts.append(context)
+        return contexts, strata, artifacts
 
     manifest_path = workspace / "11_state" / "harness_bakeoff_manifest.yml"
     manifest, manifest_sha256 = _stable_yaml(
@@ -1569,7 +1608,7 @@ def package_audit(
         "findings": findings,
     }
     report = _redact_private_literals(report, private_literals)
-    write_yaml(report_path, report)
+    _write_private_yaml(report_path, report)
     return report
 
 
@@ -1590,8 +1629,15 @@ def prepare(
     if not workspace.is_dir():
         raise ValueError("workspace does not exist")
     packet_path = _private_yaml_path(packet_path, workspace, label="review packet")
+    if (
+        mode == "strategic8"
+        and source_manifest_path is None
+        and not (workspace / "PRIVATE_MANIFEST.json").is_file()
+    ):
+        raise ValueError("strategic8 requires its private source manifest")
     sources, strata, artifacts = _load_sources(workspace, mode, source_manifest_path)
     exhaustive = mode == "exhaustive40"
+    full_graph = mode != "stratified500"
     note_bindings: list[dict[str, Any]] = []
     baseline_manifest_artifact: dict[str, str] | None = None
     custody_manifest_artifact: dict[str, str] | None = None
@@ -1704,7 +1750,7 @@ def prepare(
         )
         for row in accepted
     ]
-    if not exhaustive and len(relation_rows) > _RELATION_LIMIT:
+    if not full_graph and len(relation_rows) > _RELATION_LIMIT:
         cross = [
             row
             for row in relation_rows
@@ -1723,7 +1769,7 @@ def prepare(
         relation_rows = _stable_rows([*cross, *fill])
 
     selected_clusters = _select_clusters(
-        clusters, syntheses, strata, exhaustive=exhaustive
+        clusters, syntheses, strata, exhaustive=full_graph
     )
     membership_rows: list[dict[str, Any]] = []
     cluster_rows: list[dict[str, Any]] = []
@@ -1787,7 +1833,7 @@ def prepare(
         )
     if not membership_rows or not synthesis_rows:
         raise ValueError("review requires cluster memberships and syntheses")
-    if not exhaustive and len(membership_rows) > _MEMBERSHIP_LIMIT:
+    if not full_graph and len(membership_rows) > _MEMBERSHIP_LIMIT:
         first_by_cluster: dict[str, dict[str, Any]] = {}
         for row in _stable_rows(membership_rows):
             cluster_id = str(row["payload"]["cluster"].get("cluster_id") or "")
@@ -1839,7 +1885,7 @@ def prepare(
     )
     if not decisions:
         raise ValueError("review requires rejected or unclustered decisions")
-    if not exhaustive:
+    if not full_graph:
         decisions = _balanced_limit(
             decisions,
             _DECISION_LIMIT,
@@ -1856,6 +1902,32 @@ def prepare(
             )
             note_rows.append(row)
             note_bindings.append(binding)
+    elif mode == "strategic8":
+        note_rows = [
+            _review_row(
+                "note",
+                source["note_artifact"],
+                {
+                    "source_id": source["source_id"],
+                    "note_id": source["note_id"],
+                    "note_text": source["note_text"],
+                    "source_artifact": source["source_artifact"],
+                    "source_metadata": source["source_metadata"],
+                },
+                (
+                    "pass",
+                    "material_error",
+                    "identity_correct",
+                    "custody_link_correct",
+                    "status_correct",
+                    "locators_supported",
+                    "unsupported_claims_absent",
+                    "false_quotations_absent",
+                    "source_grounded",
+                ),
+            )
+            for source in sources
+        ]
 
     rows = sorted(
         [
@@ -1881,6 +1953,7 @@ def prepare(
         "source_count": len(sources),
         "selection_seed": _SEED,
         "selection_policy": {
+            "strategic8": "all notes, relationships, memberships, decisions, and syntheses; two independent full reviewers",
             "exhaustive40": "all notes, relationships, memberships, decisions, and syntheses",
             "stratified500": {
                 "relationships": "all cross-stratum, then deterministic strata balance; maximum 200",
@@ -1904,7 +1977,7 @@ def prepare(
         "rows": rows,
     }
     packet["packet_identity"] = _digest(packet)
-    write_yaml(packet_path, packet)
+    _write_private_yaml(packet_path, packet)
     if exhaustive:
         assert (
             bindings_path is not None
@@ -1927,7 +2000,7 @@ def prepare(
             "bindings": sorted(note_bindings, key=lambda row: str(row["review_id"])),
         }
         bindings["binding_identity"] = _digest(bindings)
-        write_yaml(bindings_path, bindings)
+        _write_private_yaml(bindings_path, bindings)
     return packet
 
 
@@ -2090,6 +2163,105 @@ def _rate(values: Sequence[bool]) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
+def _score_strategic8(
+    packet: Mapping[str, Any],
+    rows: Sequence[Mapping[str, Any]],
+    judgments: Sequence[Mapping[str, Any]],
+    packet_path: Path,
+    review_path: Path,
+    report_path: Path,
+) -> dict[str, Any]:
+    packet_sha256 = sha256_file(packet_path)
+    row_by_id = {str(row["review_id"]): row for row in rows}
+    by_task: dict[str, dict[str, Mapping[str, Any]]] = defaultdict(dict)
+    for judgment in judgments:
+        review_id = str(judgment.get("review_id") or "")
+        task_id = str(judgment.get("reviewer_task_id") or "")
+        row = row_by_id.get(review_id)
+        payload = dict(judgment)
+        judgment_sha256 = str(payload.pop("judgment_sha256", ""))
+        if (
+            row is None
+            or not _REVIEWER_ID.fullmatch(task_id)
+            or judgment.get("model") != _REQUIRED_REVIEWER_MODEL
+            or judgment.get("reasoning_effort") != _REQUIRED_REASONING_EFFORT
+            or judgment.get("artifact_sha256") != row["artifact_sha256"]
+            or judgment.get("row_sha256") != row["row_sha256"]
+            or judgment.get("packet_sha256") != packet_sha256
+            or judgment_sha256 != _digest(payload)
+            or review_id in by_task[task_id]
+        ):
+            raise ValueError("Strategic8 review judgment is invalid or stale")
+        for field in row.get("required_judgments", []) or []:
+            if type(judgment.get(str(field))) is not bool:
+                raise ValueError(f"review judgment {field} must be boolean")
+        by_task[task_id][review_id] = judgment
+    if len(by_task) != 2 or any(set(values) != set(row_by_id) for values in by_task.values()):
+        raise ValueError("Strategic8 requires two independent full reviewer tasks")
+
+    task_ids = sorted(by_task)
+    negative_fields = {"material_error", "severe_overmerge"}
+    disagreements: list[str] = []
+    failed_rows: list[str] = []
+    material_errors = 0
+    for review_id, row in row_by_id.items():
+        pair = [by_task[task_id][review_id] for task_id in task_ids]
+        required = [str(field) for field in row.get("required_judgments", []) or []]
+        if any(pair[0][field] != pair[1][field] for field in required):
+            disagreements.append(review_id)
+        if any(bool(judgment.get("material_error")) for judgment in pair):
+            material_errors += 1
+        if any(
+            bool(judgment[field]) != (field not in negative_fields)
+            for judgment in pair
+            for field in required
+        ):
+            failed_rows.append(review_id)
+
+    checks = {
+        "two_independent_full_reviewers": True,
+        "no_reviewer_disagreements": not disagreements,
+        "no_material_errors": material_errors == 0,
+        "all_review_rows_pass": not failed_rows,
+    }
+    report = {
+        "score_schema_version": "1",
+        "status": "passed" if all(checks.values()) else "failed",
+        "evidence_status": "autonomous_provisional",
+        "never_production_input": True,
+        "provider_calls": 0,
+        "mode": packet["mode"],
+        "packet_sha256": packet_sha256,
+        "review_sha256": sha256_file(review_path),
+        "reviewers": [
+            {
+                "reviewer_task_id": task_id,
+                "model": _REQUIRED_REVIEWER_MODEL,
+                "reasoning_effort": _REQUIRED_REASONING_EFFORT,
+            }
+            for task_id in task_ids
+        ],
+        "judgment_sha256": {
+            f"{task_id}:{review_id}": str(
+                by_task[task_id][review_id]["judgment_sha256"]
+            )
+            for task_id in task_ids
+            for review_id in sorted(row_by_id)
+        },
+        "metrics": {
+            "reviewed_row_count": len(rows),
+            "judgment_count": len(judgments),
+            "material_error_count": material_errors,
+            "disagreement_review_ids": sorted(disagreements),
+            "failed_review_ids": sorted(failed_rows),
+            "reviewed_by_kind": dict(sorted(Counter(str(row["kind"]) for row in rows).items())),
+        },
+        "checks": checks,
+    }
+    _write_private_yaml(report_path, report)
+    return report
+
+
 def score(
     workspace: Path,
     packet_path: Path,
@@ -2138,6 +2310,12 @@ def score(
         _mapping(row, label="review judgment")
         for row in review.get("judgments", []) or []
     ]
+    if packet.get("mode") == "strategic8":
+        if bindings_path is not None:
+            raise ValueError("strategic8 scoring does not use note bindings")
+        return _score_strategic8(
+            packet, rows, judgments, packet_path, review_path, report_path
+        )
     by_id = {str(row.get("review_id") or ""): row for row in judgments}
     if len(by_id) != len(judgments) or set(by_id) != {
         str(row["review_id"]) for row in rows
@@ -2160,6 +2338,21 @@ def score(
         for field in row.get("required_judgments", []) or []:
             if type(judgment.get(str(field))) is not bool:
                 raise ValueError(f"review judgment {field} must be boolean")
+    if any(
+        judgment.get("model") != _REQUIRED_REVIEWER_MODEL
+        or judgment.get("reasoning_effort") != _REQUIRED_REASONING_EFFORT
+        for judgment in judgments
+    ):
+        raise ValueError("reviewers must use gpt-5.6-sol with high reasoning")
+    reviewer_counts = Counter(str(row["reviewer_task_id"]) for row in judgments)
+    if any(count > 20 for count in reviewer_counts.values()):
+        raise ValueError("reviewer task batches may contain at most 20 rows")
+    if packet.get("mode") == "exhaustive40" and any(
+        reviewer_counts[str(by_id[str(row["review_id"])]["reviewer_task_id"])] != 1
+        for row in rows
+        if row.get("kind") == "note"
+    ):
+        raise ValueError("each exhaustive40 note requires its own reviewer task")
 
     def values(kind: str, field: str) -> list[bool]:
         return [
@@ -2379,7 +2572,7 @@ def score(
         "metrics": metrics,
         "checks": checks,
     }
-    write_yaml(report_path, report)
+    _write_private_yaml(report_path, report)
     return report
 
 
