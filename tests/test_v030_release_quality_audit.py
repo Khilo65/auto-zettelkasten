@@ -841,35 +841,57 @@ def test_release_quality_packet_is_deterministic_private_and_stale_safe(
         )
 
 
-def test_stratified_500_packet_enforces_deterministic_review_caps(
+def test_stratified_500_packet_preserves_mandatory_rows_above_review_caps(
     tmp_path: Path,
 ) -> None:
     workspace = _workspace(
         tmp_path,
         source_count=500,
-        accepted_count=220,
+        accepted_count=500,
         negative_count=120,
         cluster_count=20,
     )
+    typed_path = workspace / "02_source_memory" / "indexes" / "typed_links.yml"
+    typed = read_yaml(typed_path)
+    for index, decision in enumerate(typed["pair_decisions"][:220]):
+        decision["right_source_id"] = f"source-{(index + 1) % 500:03d}"
+    write_yaml(typed_path, typed)
     packet_path = tmp_path / "private" / "packet.yml"
     packet = audit_tool.prepare(workspace, "stratified500", packet_path)
 
     assert packet["source_count"] == 500
     assert packet["selection_counts"] == {
         "notes": 0,
-        "relationships": 200,
-        "memberships": 200,
+        "relationships": 420,
+        "memberships": 500,
         "clusters": 20,
         "rejected_or_unclustered": 100,
         "syntheses": 20,
-        "total": 540,
+        "total": 1060,
     }
+    assert packet["sampling_counts"] == {
+        "relationships": {"mandatory": 220, "sampled": 200},
+        "memberships": {"mandatory": 500, "sampled": 0},
+        "clusters": {"mandatory": 20, "sampled": 0},
+        "syntheses": {"mandatory": 20, "sampled": 0},
+        "rejected_or_unclustered": {"mandatory": 0, "sampled": 100},
+        "membership_coverage_additions": 0,
+    }
+    second_path = tmp_path / "private" / "packet-again.yml"
+    assert audit_tool.prepare(workspace, "stratified500", second_path) == packet
+    assert second_path.read_bytes() == packet_path.read_bytes()
+    relation_ids = {
+        row["payload"]["relationship"]["pair_job_id"]
+        for row in packet["rows"]
+        if row["kind"] == "relationship"
+    }
+    assert {f"accepted-{index}" for index in range(220)} <= relation_ids
     membership_strata = {
         row["payload"]["member_source_id"].split("-")[-1]
         for row in packet["rows"]
         if row["kind"] == "membership"
     }
-    assert len(membership_strata) == 200
+    assert len(membership_strata) == 500
     review_path = tmp_path / "private" / "review.yml"
     report_path = tmp_path / "private" / "report.yml"
     write_yaml(review_path, _completed_review(packet_path, packet))
@@ -892,6 +914,69 @@ def test_stratified_500_packet_enforces_deterministic_review_caps(
             oversized_path,
             tmp_path / "private" / "oversized-report.yml",
         )
+
+    old_policy = dict(packet)
+    old_policy["selection_policy_revision"] = "capped-v1"
+    old_policy.pop("packet_identity")
+    old_policy["packet_identity"] = audit_tool._digest(old_policy)
+    with pytest.raises(ValueError, match="sampling policy is stale"):
+        audit_tool._verify_packet(workspace, old_policy)
+    changed_selection = dict(packet)
+    changed_selection["selection_identity"] = "0" * 64
+    changed_selection.pop("packet_identity")
+    changed_selection["packet_identity"] = audit_tool._digest(changed_selection)
+    with pytest.raises(ValueError, match="selection identity is invalid"):
+        audit_tool._verify_packet(workspace, changed_selection)
+
+
+def test_stratified_500_sampling_preserves_every_selected_cluster_membership(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path, source_count=500)
+    cluster_path = workspace / "03_literature_synthesis" / "cluster_registry.yml"
+    synthesis_path = workspace / "03_literature_synthesis" / "cluster_syntheses.yml"
+    original = read_yaml(cluster_path)["clusters"][0]
+    source_ids = ["source-000", "source-020"]
+    clusters = [
+        {
+            **original,
+            "cluster_id": f"cluster-{index:04d}",
+            "source_ids": source_ids,
+            "source_roles": {source_id: "core" for source_id in source_ids},
+        }
+        for index in range(801)
+    ]
+    write_yaml(cluster_path, {"clusters": clusters, "unclustered_sources": []})
+    syntheses = {
+        cluster["cluster_id"]: {"status": "reasoned", "synthesis": "Grounded claim."}
+        for cluster in clusters
+    }
+    write_yaml(synthesis_path, {"syntheses": syntheses})
+    packet_path = tmp_path / "private" / "packet.yml"
+    packet = audit_tool.prepare(workspace, "stratified500", packet_path)
+    assert packet["sampling_counts"]["clusters"] == {"mandatory": 0, "sampled": 201}
+    assert packet["selection_counts"]["syntheses"] == 201
+    selected = {
+        row["payload"]["cluster"]["cluster_id"]
+        for row in packet["rows"]
+        if row["kind"] == "cluster"
+    }
+    memberships = [row for row in packet["rows"] if row["kind"] == "membership"]
+    assert {
+        row["payload"]["cluster"]["cluster_id"] for row in memberships
+    } == selected
+    assert len(memberships) == (
+        200 + packet["sampling_counts"]["membership_coverage_additions"]
+    )
+    assert len(memberships) >= 201
+    selected_again, mandatory = audit_tool._select_clusters(
+        list(reversed(clusters)),
+        syntheses,
+        {source_id: "same-stratum" for source_id in source_ids},
+        exhaustive=False,
+    )
+    assert not mandatory
+    assert {cluster["cluster_id"] for cluster in selected_again} == selected
 
 
 def test_exhaustive_packet_accepts_custody_manifest_at_workspace_root(

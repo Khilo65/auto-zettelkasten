@@ -29,6 +29,7 @@ from auto_zettelkasten.notes import read_note, source_id_for_item
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _SEED = "v030-autonomous-provisional-release-audit-v1"
+_STRATIFIED_POLICY_REVISION = "mandatory-first-v2"
 _MODES = {"strategic8": 8, "exhaustive40": 40, "stratified500": 500}
 _RELATION_LIMIT = 200
 _MEMBERSHIP_LIMIT = 200
@@ -839,10 +840,10 @@ def _select_clusters(
     strata: Mapping[str, str],
     *,
     exhaustive: bool,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], set[str]]:
     clusters = _stable_rows(clusters)
     if exhaustive:
-        return clusters
+        return clusters, {str(cluster.get("cluster_id") or "") for cluster in clusters}
     mandatory: list[dict[str, Any]] = []
     remaining: list[dict[str, Any]] = []
     for cluster in clusters:
@@ -867,7 +868,9 @@ def _select_clusters(
             remaining.append(cluster)
     sample_size = math.ceil(len(remaining) * 0.25)
     sampled = sorted(remaining, key=lambda row: _digest([_SEED, row]))[:sample_size]
-    return _stable_rows([*mandatory, *sampled])
+    return _stable_rows([*mandatory, *sampled]), {
+        str(cluster.get("cluster_id") or "") for cluster in mandatory
+    }
 
 
 def _archive_path_is_safe(value: str) -> bool:
@@ -1750,25 +1753,21 @@ def prepare(
         )
         for row in accepted
     ]
-    if not full_graph and len(relation_rows) > _RELATION_LIMIT:
+    if not full_graph:
         cross = [
             row
             for row in relation_rows
             if len(set(_row_group(row, strata).split("|"))) > 1
         ]
-        if len(cross) > _RELATION_LIMIT:
-            raise ValueError(
-                "cross-stratum relationships exceed the 200-row audit limit"
-            )
         cross_ids = {row["review_id"] for row in cross}
         fill = _balanced_limit(
             [row for row in relation_rows if row["review_id"] not in cross_ids],
-            _RELATION_LIMIT - len(cross),
+            _RELATION_LIMIT,
             group_for=lambda row: _row_group(row, strata),
         )
         relation_rows = _stable_rows([*cross, *fill])
 
-    selected_clusters = _select_clusters(
+    selected_clusters, mandatory_clusters = _select_clusters(
         clusters, syntheses, strata, exhaustive=full_graph
     )
     membership_rows: list[dict[str, Any]] = []
@@ -1780,6 +1779,8 @@ def prepare(
             raise ValueError("every audited cluster must have a synthesis")
         roles = _source_roles(cluster.get("source_roles", {}))
         source_ids = [str(value) for value in cluster.get("source_ids", []) or []]
+        if not source_ids:
+            raise ValueError("every audited cluster must have members")
         for source_id in source_ids:
             if source_id not in known_sources:
                 raise ValueError("cluster member is outside the frozen source manifest")
@@ -1833,22 +1834,29 @@ def prepare(
         )
     if not membership_rows or not synthesis_rows:
         raise ValueError("review requires cluster memberships and syntheses")
-    if not full_graph and len(membership_rows) > _MEMBERSHIP_LIMIT:
+    if not full_graph:
+        mandatory_memberships = []
+        remaining_memberships = []
         first_by_cluster: dict[str, dict[str, Any]] = {}
         for row in _stable_rows(membership_rows):
             cluster_id = str(row["payload"]["cluster"].get("cluster_id") or "")
-            first_by_cluster.setdefault(cluster_id, row)
-        if len(first_by_cluster) > _MEMBERSHIP_LIMIT:
-            raise ValueError("audited clusters exceed the 200-row membership limit")
-        mandatory_ids = {row["review_id"] for row in first_by_cluster.values()}
+            if cluster_id in mandatory_clusters:
+                mandatory_memberships.append(row)
+            else:
+                remaining_memberships.append(row)
+                first_by_cluster.setdefault(cluster_id, row)
         fill = _balanced_limit(
-            [row for row in membership_rows if row["review_id"] not in mandatory_ids],
-            _MEMBERSHIP_LIMIT - len(mandatory_ids),
+            remaining_memberships,
+            _MEMBERSHIP_LIMIT,
             group_for=lambda row: strata.get(
                 str(row["payload"].get("member_source_id") or ""), "unknown"
             ),
         )
-        membership_rows = _stable_rows([*first_by_cluster.values(), *fill])
+        covered = {str(row["payload"]["cluster"]["cluster_id"]) for row in fill}
+        coverage = [
+            row for cluster_id, row in first_by_cluster.items() if cluster_id not in covered
+        ]
+        membership_rows = _stable_rows([*mandatory_memberships, *fill, *coverage])
 
     decisions: list[dict[str, Any]] = [
         _review_row(
@@ -1956,9 +1964,9 @@ def prepare(
             "strategic8": "all notes, relationships, memberships, decisions, and syntheses; two independent full reviewers",
             "exhaustive40": "all notes, relationships, memberships, decisions, and syntheses",
             "stratified500": {
-                "relationships": "all cross-stratum, then deterministic strata balance; maximum 200",
+                "relationships": "all cross-stratum, plus up to 200 remaining rows with deterministic strata balance",
                 "clusters": "all cross-stratum, 10+ member, or ambiguous clusters, plus 25% of the remainder",
-                "memberships": "at least one per audited cluster, then deterministic strata balance; maximum 200",
+                "memberships": "all memberships of mandatory clusters, plus up to 200 from sampled clusters with deterministic strata balance; add coverage for any sampled cluster still unrepresented",
                 "decisions": "deterministic strata balance; maximum 100",
             },
         },
@@ -1976,6 +1984,29 @@ def prepare(
         },
         "rows": rows,
     }
+    if not full_graph:
+        cluster_counts = {
+            "mandatory": len(mandatory_clusters),
+            "sampled": len(selected_clusters) - len(mandatory_clusters),
+        }
+        packet["selection_policy_revision"] = _STRATIFIED_POLICY_REVISION
+        packet["sampling_counts"] = {
+            "relationships": {
+                "mandatory": len(cross),
+                "sampled": len(relation_rows) - len(cross),
+            },
+            "memberships": {
+                "mandatory": len(mandatory_memberships),
+                "sampled": len(membership_rows) - len(mandatory_memberships),
+            },
+            "clusters": cluster_counts,
+            "syntheses": dict(cluster_counts),
+            "rejected_or_unclustered": {"mandatory": 0, "sampled": len(decisions)},
+            "membership_coverage_additions": len(coverage),
+        }
+        packet["selection_identity"] = _digest(
+            [_STRATIFIED_POLICY_REVISION, _SEED, packet["sampling_counts"], rows]
+        )
     packet["packet_identity"] = _digest(packet)
     _write_private_yaml(packet_path, packet)
     if exhaustive:
@@ -2018,6 +2049,21 @@ def _verify_packet(workspace: Path, packet: Mapping[str, Any]) -> list[dict[str,
     identity = str(without_identity.pop("packet_identity", ""))
     if identity != _digest(without_identity):
         raise ValueError("review packet identity hash is invalid")
+    if packet["mode"] == "stratified500":
+        if (
+            packet.get("selection_policy_revision") != _STRATIFIED_POLICY_REVISION
+            or packet.get("selection_seed") != _SEED
+        ):
+            raise ValueError("review packet sampling policy is stale")
+        if packet.get("selection_identity") != _digest(
+            [
+                _STRATIFIED_POLICY_REVISION,
+                _SEED,
+                packet.get("sampling_counts"),
+                packet.get("rows"),
+            ]
+        ):
+            raise ValueError("review packet selection identity is invalid")
 
     artifact_hashes: dict[tuple[str, str], str] = {}
     for raw in packet.get("artifacts", []) or []:
