@@ -561,6 +561,8 @@ def test_completed_raw_pdf_checkpoint_bypasses_helper_and_persists_no_pdf_bytes(
 
     assert seen == [(custody,)]
     assert first[0] == second[0]
+    assert first[1] == "codex_attachment"
+    assert second[1] == "codex_attachment"
     assert second[2] == "reused_direct_source_checkpoint"
     persisted = b"\n".join(
         path.read_bytes() for path in checkpoint.rglob("*") if path.is_file()

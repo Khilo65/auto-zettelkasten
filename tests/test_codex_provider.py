@@ -76,6 +76,7 @@ from auto_zettelkasten.readers import (
     codex_contract_identity,
     codex_preflight_status,
     codex_stage_identity,
+    current_provider_completion,
 )
 from conftest import SECTION_KEYS, FakeZotero, fake_codex_preflight
 
@@ -1171,6 +1172,17 @@ for line in sys.stdin:
             (Path(os.environ["CODEX_HOME"]) / "auth.json").write_text("mutated")
         event_thread = "thread-other" if mode == "wrong_thread" else "thread-1"
         event_turn = "turn-other" if mode == "wrong_turn" else "turn-1"
+        print(json.dumps({"method": "thread/tokenUsage/updated", "params": {
+            "threadId": event_thread,
+            "turnId": event_turn,
+            "tokenUsage": {"total": {
+                "inputTokens": 12,
+                "cachedInputTokens": 3,
+                "cacheWriteInputTokens": 2,
+                "outputTokens": 7,
+                "reasoningOutputTokens": 1,
+            }},
+        }}), flush=True)
         print(json.dumps({"method": "item/completed", "params": {
             "threadId": event_thread,
             "turnId": event_turn,
@@ -1314,6 +1326,13 @@ def test_codex_pdf_app_server_sends_exact_ordered_file_text_and_contract(
         "networkAccess": False,
     }
     assert turn["outputSchema"]["additionalProperties"] is False
+    assert current_provider_completion()["usage"] == {
+        "input_tokens": 12,
+        "cached_input_tokens": 3,
+        "cache_write_input_tokens": 2,
+        "output_tokens": 7,
+        "reasoning_output_tokens": 1,
+    }
 
 
 def test_codex_pdf_app_server_accepts_only_the_expected_code_mode_warning(

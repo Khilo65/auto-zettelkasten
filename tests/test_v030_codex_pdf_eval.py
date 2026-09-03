@@ -283,6 +283,16 @@ def test_controlled_pdf_gate_is_one_direct_pdf_attempt(tmp_path: Path) -> None:
             runner.CONTROLLED_PDF_GATE,
         )
 
+    payload["cases"][0]["expected"]["content_route"] = runner.PDF_INPUT_ROUTE
+    payload["question"] = ""
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="manifest question is required"):
+        runner._validated_manifest(
+            manifest,
+            sha256_file(manifest),
+            runner.CONTROLLED_PDF_GATE,
+        )
+
 
 def test_controlled_pdf_reader_sends_verified_custody_pdf_with_empty_text(
     tmp_path: Path,
@@ -331,7 +341,9 @@ def test_controlled_pdf_reader_sends_verified_custody_pdf_with_empty_text(
         reasoning_effort=runner.REASONING_EFFORT,
         controlled_workspace=workspace,
         controlled_case=case,
+        controlled_question="frozen manifest question",
     )
+    assert reader.source_question == "frozen manifest question"
     copied_custody_path = case["path"].with_name("A2.pdf")
     copied_custody_path.write_bytes(case["path"].read_bytes())
     metadata = {
@@ -350,13 +362,13 @@ def test_controlled_pdf_reader_sends_verified_custody_pdf_with_empty_text(
     assert reader.should_read_source_bundle_directly(
         "adequate embedded text", metadata
     )
-    assert reader.read_source_bundle(
-        "adequate embedded text", metadata, "question"
-    ) == {"accepted": True}
+    assert reader.read_source_bundle("adequate embedded text", metadata) == {
+        "accepted": True
+    }
     assert events == [
         "preflight",
         "preflight",
-        ("", metadata, "question", (copied_custody_path,)),
+        ("", metadata, "frozen manifest question", (copied_custody_path,)),
     ]
 
     outside = workspace / "outside.pdf"

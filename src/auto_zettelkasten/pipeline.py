@@ -15373,7 +15373,14 @@ def _prepare_item(
         base["reason"] = f"reader_failed:{type(exc).__name__}"
         return base
     try:
-        bundle = _source_bundle_from_result(source_result, base, source_scope)
+        bundle = _source_bundle_from_result(
+            source_result,
+            base,
+            source_scope,
+            validate_quantitative_provenance=not reader_route.endswith(
+                "_attachment"
+            ),
+        )
     except ValueError as exc:
         quantitative_provenance = isinstance(
             exc, SourceBundleQuantitativeProvenanceError
@@ -21484,6 +21491,9 @@ def _read_document(
     expected_custody_file: Path | None = None,
     custody_root: Path | None = None,
 ) -> tuple[Mapping[str, Any], str, str]:
+    source_question = getattr(reader, "source_question", None)
+    if isinstance(source_question, str) and source_question.strip():
+        question = source_question
     policy = request.processing if request is not None else ProcessingPolicy()
     context_tokens = int(getattr(reader, "context_window_tokens", 0) or 0)
     if context_tokens:
@@ -21642,7 +21652,12 @@ def _read_document(
         ):
             return (
                 _ensure_source_result_contract(dict(direct_checkpoint["analysis"])),
-                f"{reader.name}_text",
+                (
+                    f"{reader.name}_attachment"
+                    if attachment_route
+                    or direct_checkpoint.get("attachment_backed") is True
+                    else f"{reader.name}_text"
+                ),
                 "reused_direct_source_checkpoint",
             )
         direct_identity = identity_for_call(
@@ -21732,18 +21747,43 @@ def _read_document(
                 before_direct_attempt()
                 record_source_attempt()
                 analysis = direct_operation()
+            completion = current_provider_completion()
+            context = (
+                metadata.get("_source_context")
+                if isinstance(metadata.get("_source_context"), Mapping)
+                else {}
+            )
+            custody_sha256 = str(context.get("custody_sha256") or "")
+            transport = completion.get("attachment_transport")
+            attachment_backed = attachment_route or (
+                is_codex
+                and re.fullmatch(r"[0-9a-f]{64}", custody_sha256) is not None
+                and completion.get("contract_id") == "source_bundle"
+                and type(completion.get("attachment_count")) is int
+                and completion.get("attachment_count") == 1
+                and completion.get("attachment_hashes") == [custody_sha256]
+                and isinstance(transport, Mapping)
+                and transport.get("adapter_protocol")
+                == "codex-app-server-jsonrpc-v2"
+                and transport.get("direct_pdf") == "input_file-v1"
+            )
             if checkpoint_enabled:
                 write_yaml(
                     direct_path,
                     {
                         "identity": direct_identity,
+                        "attachment_backed": attachment_backed,
                         "analysis": analysis,
                         "updated_at": now_iso(),
                     },
                 )
             return (
                 _ensure_source_result_contract(analysis),
-                f"{reader.name}_text",
+                (
+                    f"{reader.name}_attachment"
+                    if attachment_backed
+                    else f"{reader.name}_text"
+                ),
                 "full_document_source_read",
             )
         except Exception as exc:

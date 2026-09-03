@@ -249,6 +249,7 @@ class _ControlledPdfReader(CodexReader):
         "_controlled_size",
         "_controlled_source_id",
         "_controlled_zotero_key",
+        "source_question",
     )
 
     def __init__(
@@ -257,6 +258,7 @@ class _ControlledPdfReader(CodexReader):
         *,
         controlled_workspace: Path,
         controlled_case: Mapping[str, Any],
+        controlled_question: str,
         **kwargs: Any,
     ) -> None:
         super().__init__(model, **kwargs)
@@ -268,6 +270,7 @@ class _ControlledPdfReader(CodexReader):
         self._controlled_size = self._controlled_path.stat().st_size
         self._controlled_source_id = source_id_for_item(controlled_case["parent"])
         self._controlled_zotero_key = str(controlled_case["parent"]["key"])
+        self.source_question = controlled_question
         if not _inside(self._controlled_path, self._controlled_custody_root):
             raise ProviderIsolationFailure(
                 "controlled PDF is outside the verified custody directory"
@@ -326,10 +329,12 @@ class _ControlledPdfReader(CodexReader):
         metadata: Mapping[str, Any],
         question: str | None = None,
     ) -> bool:
-        del text
+        del text, question
         self._controlled_attachment(metadata)
         self._require_pdf_capability()
-        return super().should_read_source_bundle_directly("", metadata, question)
+        return super().should_read_source_bundle_directly(
+            "", metadata, self.source_question
+        )
 
     def read_source_bundle(
         self,
@@ -339,7 +344,7 @@ class _ControlledPdfReader(CodexReader):
         *,
         attachment_paths: Sequence[Path | str] = (),
     ) -> Mapping[str, Any]:
-        del text
+        del text, question
         if attachment_paths:
             raise ProviderIsolationFailure(
                 "controlled PDF gate received an unexpected attachment"
@@ -347,7 +352,7 @@ class _ControlledPdfReader(CodexReader):
         path = self._controlled_attachment(metadata)
         self._require_pdf_capability()
         return super().read_source_bundle(
-            "", metadata, question, attachment_paths=(path,)
+            "", metadata, self.source_question, attachment_paths=(path,)
         )
 
 
@@ -950,6 +955,8 @@ def _validated_manifest(
     question = manifest.get("question")
     if question is not None and not isinstance(question, str):
         raise ValueError("manifest question must be a string or null")
+    if settings.kind == "controlled_pdf" and not str(question or "").strip():
+        raise ValueError("controlled PDF manifest question is required")
     pdf_fallback = manifest.get("pdf_fallback", "none")
     if pdf_fallback not in {"none", "images", "ocr"}:
         raise ValueError("manifest pdf_fallback must be none, images, or ocr")
@@ -2677,6 +2684,7 @@ def run_gate(
                 attempt_guard=live_guard,
                 controlled_workspace=workspace,
                 controlled_case=cases[0],
+                controlled_question=str(manifest["question"]),
             )
             if settings.kind == "controlled_pdf"
             else CodexReader(
@@ -2705,12 +2713,15 @@ def run_gate(
     try:
         with attempt_context:
             if mode in _PROVIDER_FREE_MODES:
+                replay_source_reader = _ReplayCodexReader(
+                    SOURCE_MODEL,
+                    allow_cloud=True,
+                    reasoning_effort=REASONING_EFFORT,
+                )
+                if settings.kind == "controlled_pdf":
+                    replay_source_reader.source_question = str(manifest["question"])
                 call_kwargs.update(
-                    reader=_ReplayCodexReader(
-                        SOURCE_MODEL,
-                        allow_cloud=True,
-                        reasoning_effort=REASONING_EFFORT,
-                    ),
+                    reader=replay_source_reader,
                     literature_reasoner=_ReplayCodexReader(
                         RELATIONSHIP_MODEL,
                         allow_cloud=True,

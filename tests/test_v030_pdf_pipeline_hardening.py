@@ -13,7 +13,7 @@ from auto_zettelkasten.extraction import (
     PDFPageEvidence,
     PDFStructuralProbe,
 )
-from auto_zettelkasten.files import read_yaml, sha256_file, write_yaml
+from auto_zettelkasten.files import read_yaml, sha256_file, sha256_text, write_yaml
 from auto_zettelkasten.literature import _CheckpointedReasonerCalls
 from auto_zettelkasten.models import (
     ExtractionPolicy,
@@ -65,6 +65,82 @@ def _bundle() -> dict:
         "missing_source_recommendations": [],
         "self_review": {"passed": True},
     }
+
+
+def test_hidden_pdf_attachment_is_hash_bound_and_checkpointed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from auto_zettelkasten import pipeline
+
+    custody_hash = "a" * 64
+    completion = {
+        "contract_id": "source_bundle",
+        "attachment_count": 1,
+        "attachment_hashes": [custody_hash],
+        "attachment_transport": {
+            "adapter_protocol": "codex-app-server-jsonrpc-v2",
+            "direct_pdf": "input_file-v1",
+        },
+    }
+    monkeypatch.setattr(pipeline, "current_provider_completion", lambda: completion)
+    seen: list[str | None] = []
+
+    class Reader:
+        name = "codex"
+        model = "gpt-5.6-luna"
+        context_window_tokens = 272_000
+        source_question = "frozen question"
+        _preflight = {"version": "0.152.1"}
+
+        def read_source_bundle(self, _text, _metadata, question=None):
+            seen.append(question)
+            return _bundle()
+
+    metadata = {
+        "_source_context": {
+            "source_id": "source-zotero-A1",
+            "zotero_key": "A1",
+            "custody_sha256": custody_hash,
+        }
+    }
+    checkpoint = tmp_path / "checkpoint"
+    first = _read_document(
+        Reader(),
+        "adequate text",
+        metadata,
+        None,
+        request=_request(tmp_path),
+        checkpoint_root=checkpoint,
+    )
+
+    class ReplayReader(Reader):
+        def read_source_bundle(self, *_args, **_kwargs):
+            pytest.fail("attachment-backed checkpoint called the provider")
+
+    second = _read_document(
+        ReplayReader(),
+        "adequate text",
+        metadata,
+        None,
+        request=_request(tmp_path),
+        checkpoint_root=checkpoint,
+    )
+    assert seen == ["frozen question"]
+    assert first[1] == second[1] == "codex_attachment"
+    direct = read_yaml(checkpoint / "direct.yml")
+    assert direct["attachment_backed"] is True
+    assert direct["identity"]["question_hash"] == sha256_text("frozen question")
+
+    completion["attachment_hashes"] = ["b" * 64]
+    mismatched = _read_document(
+        Reader(),
+        "different adequate text",
+        metadata,
+        None,
+        request=_request(tmp_path),
+        checkpoint_root=tmp_path / "mismatched",
+    )
+    assert mismatched[1] == "codex_text"
 
 
 def _probe(document: bytes) -> PDFStructuralProbe:

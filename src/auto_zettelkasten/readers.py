@@ -4280,7 +4280,24 @@ class CodexReader(_CapabilityAwareReader):
                     if isinstance(token_usage, Mapping) and isinstance(
                         token_usage.get("total"), Mapping
                     ):
-                        usage = dict(token_usage["total"])
+                        total = token_usage["total"]
+                        usage = {
+                            target: value
+                            for source, target in (
+                                ("inputTokens", "input_tokens"),
+                                ("cachedInputTokens", "cached_input_tokens"),
+                                (
+                                    "cacheWriteInputTokens",
+                                    "cache_write_input_tokens",
+                                ),
+                                ("outputTokens", "output_tokens"),
+                                (
+                                    "reasoningOutputTokens",
+                                    "reasoning_output_tokens",
+                                ),
+                            )
+                            if type(value := total.get(source)) is int and value >= 0
+                        }
                 elif method == "turn/completed":
                     event_turn = params["turn"]
                     status = str(event_turn.get("status") or "")
