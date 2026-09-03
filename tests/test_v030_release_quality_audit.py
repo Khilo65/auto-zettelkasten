@@ -469,7 +469,7 @@ def _strategic8_workspace(root: Path) -> tuple[Path, Path]:
 def _completed_strategic8_review(packet_path: Path, packet: dict) -> dict:
     packet_sha256 = sha256_file(packet_path)
     judgments = []
-    for task_id in ("strategic8-reviewer-a", "strategic8-reviewer-b"):
+    for task_id in ("/root/strategic8-reviewer-a", "strategic8-reviewer-b"):
         for row in packet["rows"]:
             judgment = {
                 "review_id": row["review_id"],

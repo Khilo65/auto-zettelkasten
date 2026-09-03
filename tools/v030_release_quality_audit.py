@@ -93,7 +93,7 @@ _HISTORICAL_TEST_SENTINELS = {
     ),
 }
 _PRIVATE_LITERAL_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
-_REVIEWER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}")
+_REVIEWER_ID = re.compile(r"/?[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}")
 _REVIEWER_MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _REASONING_EFFORTS = {"low", "medium", "high", "xhigh", "max", "ultra"}
 _REQUIRED_REVIEWER_MODEL = "gpt-5.6-sol"
