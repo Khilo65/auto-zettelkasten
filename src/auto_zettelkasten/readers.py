@@ -235,7 +235,7 @@ DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
-SOURCE_BUNDLE_PROMPT_VERSION = "24"
+SOURCE_BUNDLE_PROMPT_VERSION = "25"
 SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v2"
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
@@ -5412,6 +5412,10 @@ def _source_bundle_prompt(
         "against the supplied source in this same call. Critiques, superlatives, contrasts, and locators are factual claims too. "
         "Before alleging a discrepancy, match population, period, measure, and category, and reconcile explicit totals and subtotals. "
         "Before claiming strongest or weakest, check all comparable displayed values; selected examples are not an exhaustive ranking. "
+        "Even relative strengths and weaknesses must name their comparison set: a weak cross-entity rank does not imply a low within-entity score. "
+        "Do not interchange score and rank. In every prose comparison, preserve who is measured and what or whom they are rating. "
+        "Split a summary list when its examples concern different targets or outcomes. "
+        "Check prose comparisons against the evidence anchors and supplied passages, not just a neighboring sentence. "
         "Do not manufacture disagreement between aligned speakers. Use explicit text anchors rather than unverified opening/closing locations. "
         "Each literature-position row must describe one distinct work, not a publisher's pooled reporting. Leave unknown years and titles empty; "
         "never borrow them from a neighboring citation, the cited event, or the current source's date. "
