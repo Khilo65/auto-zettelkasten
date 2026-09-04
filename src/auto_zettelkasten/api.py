@@ -51,6 +51,7 @@ from .pipeline import (
     _analytical_profile_source_ids,
     _apply_reader_policy,
     _cluster_preservation_snapshot,
+    _relationship_discovery_identity,
     all_workspace_note_rows,
     rebuild_map,
     run_pipeline,
@@ -1929,6 +1930,10 @@ def _build_map_semantic_fingerprint(
             {str(value) for value in comparison_collection_keys if str(value)}
         ),
     }
+    if policy.synthesis_enabled and policy.cluster_generation_enabled is not False:
+        payload["relationship_discovery_identity"] = _relationship_discovery_identity(
+            provider, model, reasoning_effort, cli_profile=codex_cli_profile,
+        )
     if provider == "codex" and policy.synthesis_enabled:
         payload["provider_execution_identity"] = codex_suite_identity(
             model,
@@ -2016,6 +2021,10 @@ def _build_map_receipt_identity(
                 "comparison_collection_keys": sorted(comparison_collection_keys),
                 "source_set": source_set_identity,
             }
+    if policy.synthesis_enabled and policy.cluster_generation_enabled is not False:
+        payload["relationship_discovery_identity"] = _relationship_discovery_identity(
+            provider, model, reasoning_effort, cli_profile=codex_cli_profile,
+        )
     if provider == "codex" and policy.synthesis_enabled:
         payload["provider_execution_identity"] = codex_suite_identity(
             model,

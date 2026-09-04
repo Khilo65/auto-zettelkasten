@@ -204,7 +204,7 @@ _RELATIONSHIP_BATCH_MAX_JOBS = 8
 _LEGACY_RELATIONSHIP_BATCH_MAX_JOBS = 8
 _RELATIONSHIP_DISCOVERY_PAGE_SIZE = 64
 _RELATIONSHIP_SELECTION_STATE_SCHEMA_VERSION = "4"
-_RELATIONSHIP_DISCOVERY_POLICY_VERSION = "neighbor-family-coverage-v300"
+_RELATIONSHIP_DISCOVERY_POLICY_VERSION = "quota-independent-family-coverage-v300"
 _RELATIONSHIP_SEMANTIC_POLICY_VERSION = "source-owned-bases-v26"
 _LITERATURE_MEMORY_LOCK = threading.Lock()
 _AUTO_CLOUD_SOURCE_WORKER_LIMIT = 32
@@ -9658,6 +9658,7 @@ def _run_relationship_reasoning(
         broad_job_ids = {
             str(job.get("bridge_job_id") or "") for job in broad_jobs
         }
+        prior_candidate_pairs = discovered_pairs()
         for job in shared_jobs:
             job_id = str(job["bridge_job_id"])
             accounting = discovery_job_accounting[job_id]
@@ -9668,6 +9669,19 @@ def _run_relationship_reasoning(
                 int(accounting.get("coverage_floor", 0) or 0),
                 int(accounting.get("planner_target_candidates", 0) or 0),
             )
+            if job_id not in broad_job_ids and job.get("family_pair_expansion_required"):
+                # A fulfilled cross-side quota has not examined same-side pairs.
+                # Reuse the single page-bounded wave, excluding work already found.
+                unseen_pairs = (
+                    {
+                        pair
+                        for side in ("left_source_ids", "right_source_ids")
+                        for pair in combinations(job[side], 2)
+                    }
+                    - set(prior_candidate_pairs)
+                    - resolved_pairs
+                )
+                desired_count = max(desired_count, current_count + len(unseen_pairs))
             packet_status = str(accounting.get("packet_status") or "")
             recoverable_transport_failure = bool(
                 packet_status == "failed"
@@ -9717,7 +9731,6 @@ def _run_relationship_reasoning(
                 }
             )
 
-        prior_candidate_pairs = discovered_pairs()
         breadth_tasks = [
             *completion_tasks(
                 "breadth_completion",

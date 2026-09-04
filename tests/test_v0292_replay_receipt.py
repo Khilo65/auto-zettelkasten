@@ -6,9 +6,39 @@ from pathlib import Path
 import pytest
 
 import auto_zettelkasten.api as api_module
+import auto_zettelkasten.pipeline as pipeline_module
 from auto_zettelkasten.api import build_map, initialize_workspace
 from auto_zettelkasten.files import write_yaml
 from auto_zettelkasten.models import LiteratureMappingPolicy, NavigationPolicy
+
+
+@pytest.mark.parametrize("clusters", [None, True, False])
+def test_graph_build_identities_bind_family_discovery_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clusters: bool | None,
+) -> None:
+    kwargs = {
+        "provider": "ollama", "model": "fake-1", "question": None,
+        "policy": LiteratureMappingPolicy(cluster_generation_enabled=clusters),
+        "navigation": NavigationPolicy(), "source_set": {},
+        "comparison_collection_keys": (),
+    }
+
+    def identities():
+        return (
+            api_module._build_map_receipt_identity(**kwargs),
+            api_module._build_map_semantic_fingerprint(
+                tmp_path, note_rows=[], **kwargs,
+            ),
+        )
+
+    before = identities()
+    monkeypatch.setattr(
+        pipeline_module, "_RELATIONSHIP_DISCOVERY_POLICY_VERSION", "changed-policy",
+    )
+    after = identities()
+    assert [left != right for left, right in zip(before, after)] == [
+        clusters is not False,
+    ] * 2
 
 
 def _receipt_identity() -> str:

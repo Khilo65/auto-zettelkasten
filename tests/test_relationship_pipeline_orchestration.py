@@ -771,8 +771,9 @@ def test_shared_plan_keeps_family_discovery_in_separate_packets(
     assert discovery_calls[1][2]["prior_candidate_pairs"] == []
 
 
+@pytest.mark.parametrize("quota", [1, 2, 6])
 def test_complementary_family_breadth_covers_pairs_inside_planner_sides(
-    tmp_path: Path,
+    tmp_path: Path, quota: int,
 ) -> None:
     profiles = [_profile(source_id) for source_id in "ABCD"]
     discovery_passes: list[str] = []
@@ -828,7 +829,7 @@ def test_complementary_family_breadth_covers_pairs_inside_planner_sides(
                     "family": "Named family",
                     "left_source_ids": ["A", "B"],
                     "right_source_ids": ["C", "D"],
-                    "candidate_quota": 6,
+                    "candidate_quota": quota,
                 }
             ],
         },
@@ -841,7 +842,7 @@ def test_complementary_family_breadth_covers_pairs_inside_planner_sides(
         for row in result["relationship_discovery_jobs"]
         if row["bridge_job_id"] == "family-job"
     )
-    assert accounting["planner_target_candidates"] == 6
+    assert accounting["planner_target_candidates"] == quota
     assert accounting["valid_unique_candidates"] == 6
     assert accounting["breadth_added_unique_candidates"] == 2
     assert accounting["planner_target_met"] is True
