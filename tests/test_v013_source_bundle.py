@@ -1220,7 +1220,7 @@ def test_ordinary_bundle_source_uses_one_call_and_no_profile_or_fidelity_call(
     ]
     assert profile["coverage"]["status"] == "partial"
     note = read_note(tmp_path / report.items[0]["note_path"])
-    assert note["frontmatter"]["source_bundle_prompt_version"] == "23"
+    assert note["frontmatter"]["source_bundle_prompt_version"] == "24"
 
 
 def test_atomic_note_projects_accepted_quantitative_evidence_without_salience_loss(
@@ -5181,6 +5181,99 @@ def test_quantitative_provenance_accepts_counted_population_modifier() -> None:
 
     result["population"] = "43 surveyed facilities"
     with pytest.raises(SourceBundleQuantitativeProvenanceError):
+        _source_bundle_from_result(payload, row, "full_document")
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "is one of the most densely populated areas",
+        "was one of the least densely populated areas",
+        "is described as one of the most densely populated areas",
+    ],
+)
+def test_quantitative_provenance_preserves_separate_qualitative_superlatives(
+    description: str,
+) -> None:
+    payload = _bundle_payload()
+    anchor = payload["evidence_anchors"][0]
+    anchor["claim"] = "The district has 800 residents."
+    anchor["quantitative_result"] = {
+        "estimate": "800",
+        "provenance": "source_reported",
+    }
+    qualitative = deepcopy(anchor)
+    qualitative.update(
+        evidence_anchor_id="anchor-qualitative",
+        claim=f"The district {description}.",
+        quantitative_result=None,
+    )
+    payload["evidence_anchors"].append(qualitative)
+    row = {
+        "source_id": "source-zotero-A1",
+        "zotero_item_key": "A1",
+        "text": f"The district has 800 residents and {description}.",
+    }
+
+    bundle = _source_bundle_from_result(payload, row, "full_document")
+
+    assert bundle is not None
+    entries = {entry.claim: entry for entry in bundle.evidence_anchors}
+    assert set(entries) == {anchor["claim"], qualitative["claim"]}
+    assert entries[qualitative["claim"]].quantitative_result is None
+
+
+@pytest.mark.parametrize(
+    ("claim", "estimate"),
+    [
+        ("One of five patients improved.", "1 of 5"),
+        ("One of the most exposed patients improved.", "1"),
+    ],
+)
+def test_quantitative_provenance_keeps_genuine_one_counts(
+    claim: str, estimate: str,
+) -> None:
+    payload = _bundle_payload()
+    anchor = payload["evidence_anchors"][0]
+    anchor["claim"] = claim
+    anchor["quantitative_result"] = {
+        "estimate": "0",
+        "provenance": "source_reported",
+    }
+    row = {
+        "source_id": "source-zotero-A1",
+        "zotero_item_key": "A1",
+        "text": claim,
+    }
+
+    with pytest.raises(
+        SourceBundleQuantitativeProvenanceError,
+        match="quantitative_anchor_contains_unmodeled_quantity",
+    ):
+        _source_bundle_from_result(payload, row, "full_document")
+    anchor["quantitative_result"]["estimate"] = estimate
+    assert _source_bundle_from_result(payload, row, "full_document") is not None
+
+
+@pytest.mark.parametrize(
+    "claim",
+    [
+        "There was one of the most severely affected patients in each of 800 clinics.",
+        "The trial enrolled 800 patients; each dose was described as one of the most potent tablets per day.",
+    ],
+)
+def test_quantitative_provenance_rejects_omitted_predicate_counts(claim: str) -> None:
+    payload = _bundle_payload()
+    payload["evidence_anchors"][0].update(
+        claim=claim,
+        quantitative_result={"estimate": "800", "provenance": "source_reported"},
+    )
+    row = {"source_id": "source-zotero-A1", "zotero_item_key": "A1", "text": claim}
+
+    with pytest.raises(
+        SourceBundleQuantitativeProvenanceError,
+        match="quantitative_anchor_contains_unmodeled_quantity",
+    ):
         _source_bundle_from_result(payload, row, "full_document")
 
 

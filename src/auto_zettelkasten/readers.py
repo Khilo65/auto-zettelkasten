@@ -235,7 +235,7 @@ DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
-SOURCE_BUNDLE_PROMPT_VERSION = "23"
+SOURCE_BUNDLE_PROMPT_VERSION = "24"
 SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v2"
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
@@ -5376,11 +5376,15 @@ def _source_bundle_prompt(
         "them together or they describe the same entity. Overall rank, sub-index score, and "
         "sub-index rank are separate observations; so are a resulting rank and its rank change. "
         "Keep each claim to its single modeled observation, preserving consequential results as separate anchors. "
+        "Keep qualitative classifications such as 'one of the most ...' in a separate nonquantitative evidence anchor or source-grounded analysis prose, "
+        "not in a quantitative anchor's claim. Do not encode that phrase as numeric 1; retain genuine one-person, one-item, or per-unit counts numerically. "
         "Sample size and geographic coverage are not "
         "components of one estimate. A prose sentence or list is not a joint statistic; combine "
         "values only when the source explicitly names one measure that requires every component. "
         "Never copy a footnote period or qualifier to an unmarked sibling value. "
-        "Apply the same footnote scope to every analysis section, including limitations and summaries, and to the compact profile. "
+        "In every analysis section and compact_profile, a footnote still qualifies only its explicitly marked measure. "
+        "Illustration, not source evidence: 'measure A; measure B*. *Measured during period P by organization Q' "
+        "means only B inherits period P and organization Q; A inherits neither from that footnote. "
         "Name the marked measure; do not generalize its caveat to the whole chart, list, or source. If the "
         "24-row limit would be exceeded, omit a lower-salience result instead of combining "
         "observations. Do not use a semicolon to pack separate numeric observations into any "
