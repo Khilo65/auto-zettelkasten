@@ -83,10 +83,10 @@ def test_v8_salvages_valid_connections_and_keeps_anchors_optional() -> None:
     assert accepted["connection_id"].startswith("relationship-connection-")
 
 
-def test_v24_is_compact_domain_neutral_source_owned_and_complete() -> None:
+def test_v25_is_compact_domain_neutral_source_owned_and_complete() -> None:
     prompt = _relationship_adjudication_system_prompt()
 
-    assert "relationship prompt v24" in prompt
+    assert "relationship prompt v25" in prompt
     assert "source_a_basis describes only the supplied left_source_id" in prompt
     assert "source_b_basis only the supplied right_source_id" in prompt
     assert "whole work versus chapter, excerpt, or component" in prompt
@@ -103,7 +103,7 @@ def test_v24_is_compact_domain_neutral_source_owned_and_complete() -> None:
     assert "ACTOR [relation type] REFERENCE" in prompt
     assert "every ID appears exactly once" in prompt
     assert "use no_relationship rather than omitting a pair" in prompt
-    assert len(prompt) <= 4_000
+    assert len(prompt) <= 4_500
     assert not any(
         name in prompt.casefold()
         for name in ("svensson", "mediation", "civil war", "peacekeeping")
@@ -113,8 +113,24 @@ def test_v24_is_compact_domain_neutral_source_owned_and_complete() -> None:
 def test_contextual_comparison_does_not_require_a_causal_bridge() -> None:
     prompt = _relationship_adjudication_system_prompt()
 
-    assert "contextual comparison is your bounded inference" in prompt
-    assert "not a causal or process bridge either note must prove" in prompt
+    assert "state the boundary and system inference" in prompt
+    assert "does not alone invalidate a contextual comparison" in prompt
+
+
+def test_contextual_comparison_uses_contributions_not_cross_source_proof() -> None:
+    prompt = _relationship_adjudication_system_prompt()
+
+    assert "source-specific contributions to one concrete problem, practice, or mechanism" in prompt
+    assert "Neither source must compare the works or link the other's events" in prompt
+    assert "Missing causal identification or systematic comparison limits the claim" in prompt
+    assert "a source lacks a substantive contribution to that comparison" in prompt
+
+
+def test_relationship_bases_keep_analytical_cautions_owned_by_the_note() -> None:
+    prompt = _relationship_adjudication_system_prompt()
+
+    assert "Distinguish source assertions from analytical cautions in the notes" in prompt
+    assert "attribute those cautions to the note or system, not the source" in prompt
 
 
 def test_adjudication_checks_narrower_connections_before_rejecting_a_pair() -> None:

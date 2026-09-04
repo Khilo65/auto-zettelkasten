@@ -83,10 +83,10 @@ def test_atomic_prompt_v14_is_source_adaptive_and_statistics_aware() -> None:
     assert "silently reread" in prompt
 
 
-def test_source_bundle_prompt_v26_preserves_formatting_and_attribution_scope() -> None:
+def test_source_bundle_prompt_v27_preserves_formatting_and_attribution_scope() -> None:
     prompt = _source_bundle_system_prompt()
 
-    assert "source bundle prompt v26" in prompt
+    assert "source bundle prompt v27" in prompt
     assert "apply a footnote, only when the alignment or marker is explicit" in prompt
     assert "A footnote qualifies only the values bearing its explicit marker" in prompt
     assert "page metadata is not a statistic's observation date" in prompt
@@ -261,6 +261,16 @@ def test_source_bundle_emits_evidence_before_analysis() -> None:
     assert "carry their attribution and scope into the later analysis_sections" in prompt
 
 
+def test_source_bundle_keeps_criticism_attributed_to_its_reporting_work() -> None:
+    final = _source_bundle_prompt(
+        "A Delta Press report is criticized in a separate commentary.", {}, None,
+    ).split("FINAL WHOLE-SOURCE CHECK:")[1]
+
+    assert "Do not credit a discussed work or its publisher with third-party commentary" in final
+    assert "Keep that commentary as a separate work" in final
+    assert "author and title empty when not supplied" in final
+
+
 def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     def digest(value: str | dict[str, Any]) -> str:
         text = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
@@ -275,7 +285,10 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     assert {
         "atomic_prompt_v14": digest(_system_prompt()),
         "chunk_prompt_v14": digest(_chunk_system_prompt()),
-        "source_bundle_prompt_v26": digest(_source_bundle_system_prompt()),
+        "source_bundle_prompt_v27": digest(_source_bundle_system_prompt()),
+        "source_bundle_user_prompt_v27": digest(
+            _source_bundle_prompt("A fictional source.", {}, None)
+        ),
         "codex_source_bundle_schema": bundle_identity["schema_hash"],
         "codex_source_bundle_contract": digest(bundle_identity),
         "codex_chunk_evidence_schema": chunk_identity["schema_hash"],
@@ -283,7 +296,8 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     } == {
         "atomic_prompt_v14": "8db9f2990d175816cb0100b92d84734ae7c2f930aade66825ed0412b22da3705",
         "chunk_prompt_v14": "3c2eabca75c5ad487a35a5096664e0ec6999d04b738927a60fce2e11cfb15cd5",
-        "source_bundle_prompt_v26": "c2ee449b0610adb1445d3ca2da6fa2ab0f4a383d7094b8a275c65834cc3f5a7b",
+        "source_bundle_prompt_v27": "2958ea0bdc070a12972476ff267676b7c74a696fe693fce126d05f7a82a9c72d",
+        "source_bundle_user_prompt_v27": "08fea06d10e5fc9f6db714686394463f2afc5116bd711ad6de66562dd80f58c9",
         "codex_source_bundle_schema": "1b9491a9f2d7bf9c4c8c62a5838180c2e8b171700211e2fe63cd77514d7192c2",
         "codex_source_bundle_contract": "e6e7dc65d7953e5fe777faf1dcb43cebf933c4d9e73ca890264e98a7cd08e023",
         "codex_chunk_evidence_schema": "2df4a0fe634405df5e891283a59bfc7bee18995b5e970a51c5569b5c4eafed8e",
@@ -357,6 +371,37 @@ def test_gap_prompt_rejects_invented_resolution_details() -> None:
 
     assert "gap prompt v12" in prompt
     assert "Do not invent named cases, datasets, instruments" in prompt
+
+
+def test_legacy_relationship_request_supplies_connection_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    bodies: list[dict[str, Any]] = []
+
+    def post_json(endpoint, body, **kwargs):
+        del endpoint, kwargs
+        bodies.append(body)
+        return _completion({"decisions": []})
+
+    monkeypatch.setattr("auto_zettelkasten.readers._post_json", post_json)
+    DeepSeekReader(allow_cloud=True).adjudicate_relationships(
+        [],
+        LiteratureMapRequest(
+            workspace=".", provider="deepseek", model="deepseek-v4-flash",
+            allow_cloud=True,
+        ),
+    )
+
+    assert len(bodies) == 1
+    assert bodies[0]["response_format"] == {"type": "json_object"}
+    prompt = " ".join(message["content"] for message in bodies[0]["messages"])
+    for field in (
+        "comparison_proposition", "primary_relation_type", "secondary_relation_types",
+        "actor_source_id", "reference_source_id", "source_a_basis", "source_b_basis",
+        "reason", "boundary_or_qualification", "confidence",
+    ):
+        assert field in prompt
 
 
 def test_deepseek_atomic_and_cluster_calls_use_requested_thinking_effort(

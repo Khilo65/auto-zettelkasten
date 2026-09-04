@@ -235,7 +235,7 @@ DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
-SOURCE_BUNDLE_PROMPT_VERSION = "26"
+SOURCE_BUNDLE_PROMPT_VERSION = "27"
 SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v2"
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
@@ -5423,6 +5423,8 @@ def _source_bundle_prompt(
         "Do not manufacture disagreement between aligned speakers. Use explicit text anchors rather than unverified opening/closing locations. "
         "Each literature-position row must describe one distinct work, not a publisher's pooled reporting. Leave unknown years and titles empty; "
         "never borrow them from a neighboring citation, the cited event, or the current source's date. "
+        "Do not credit a discussed work or its publisher with third-party commentary about it. "
+        "Keep that commentary as a separate work, with author and title empty when not supplied. "
         "Apply each footnote only to its marked measure in every field, including limitations. "
         "Check field roles: a temporal window belongs in period, not sample or uncertainty. "
         "Do not copy a marked footnote's scope to unmarked siblings; retain independently source-stated observation periods. "
@@ -5599,7 +5601,7 @@ def _relationship_candidate_system_prompt() -> str:
 
 def _relationship_adjudication_system_prompt() -> str:
     return (
-        "Auto-Zettelkasten relationship prompt v24, contract relationship-decision-v8. Read both "
+        "Auto-Zettelkasten relationship prompt v25, contract relationship-decision-v8. Read both "
         "complete atomic notes. Return JSON decisions keyed by every supplied pair_job_id, no extras: "
         "either {decision:no_relationship, reason, confidence} or "
         "{decision:relationship, connections:[...]}. Use one connection, or two for distinct propositions, containing comparison_proposition, "
@@ -5607,6 +5609,8 @@ def _relationship_adjudication_system_prompt() -> str:
         "reference_source_id, source_a_basis, source_b_basis, reason, "
         "boundary_or_qualification, confidence. source_a_basis describes only the supplied "
         "left_source_id note and source_b_basis only the supplied right_source_id note. "
+        "Distinguish source assertions from analytical cautions in the notes; "
+        "attribute those cautions to the note or system, not the source unless explicitly attributed. "
         "Notes are summaries: silence is not evidence of source absence. Unless a note explicitly establishes absence, "
         "say 'not supplied in the note', not 'the source does not report it'. Apply this to reasons and qualifications. "
         "Preserve visible scope (whole work versus chapter, excerpt, or component), "
@@ -5615,17 +5619,21 @@ def _relationship_adjudication_system_prompt() -> str:
         "complete notes' contributions. The candidate comparison is a hypothesis, not the scope of either work. Before no_relationship, "
         "check a narrower contextual connection, shared reported result plus interpretation, or attributed process connection. "
         "Then choose the tier before the subtype. Direct: the same sufficiently specific proposition, or one endpoint "
-        "explicitly establishes an intellectual bridge. Use contextual_connection for useful comparison across constructs, outcomes, "
-        "levels, stages, or evidence types; state the boundary and system inference. For a bounded measurement problem with "
+        "explicitly establishes an intellectual bridge. Use contextual_connection to compare "
+        "source-specific contributions to one concrete problem, practice, or mechanism across constructs, outcomes, "
+        "levels, stages, or evidence types; state the boundary and system inference. "
+        "Neither source must compare the works or link the other's events. For a bounded measurement problem with "
         "different operationalizations, instruments, samples, or periods, use methodological_fault_line when method changes what "
         "can be supported, otherwise contextual_connection. Do not reject solely because measures differ or neither source validates the other. "
         "A shared causal outcome or comparable scores are not required for a bounded measurement comparison. Missing methodological "
         "detail limits that comparison; it does not erase the supplied measurement object. "
         "Use no_relationship only when no bounded connection survives and overlap is merely topical, lexical, or generic. Its reason must "
-        "represent both complete notes and explain why the strongest narrower alternative fails. Do not claim causal proof or independent "
+        "represent both complete notes and explain why the strongest narrower alternative fails: "
+        "a source lacks a substantive contribution to that comparison. Do not claim causal proof or independent "
         "corroboration from dependent reports. "
         "Unproven causality does not erase an explicit author argument; preserve it in rejections. "
-        "The contextual comparison is your bounded inference, not a causal or process bridge either note must prove. "
+        "Missing causal identification or systematic comparison limits the claim; "
+        "it does not alone invalidate a contextual comparison. "
         "Use the narrowest subtype. Never infer support or direction from citation, chronology, shared data, method, vocabulary, or pair order alone. "
         "supports means the actor supplies evidence or argument for the reference proposition; "
         "undermines means the actor supplies materially incompatible evidence or argument; "
