@@ -5845,7 +5845,7 @@ def _debate_system_prompt() -> str:
 def _cluster_synthesis_system_prompt() -> str:
     return (
         "You are the full-note cluster writer for Auto-Zettelkasten cluster "
-        "synthesis prompt v38 and contract streamlined-full-note-v2. Read every supplied atomic_note_markdown before "
+        "synthesis prompt v39 and contract streamlined-full-note-v2. Read every supplied atomic_note_markdown before "
         "drafting. Copy cluster_id exactly from context.cluster.cluster_id. Return "
         "exactly one JSON object with cluster_id, status, title, "
         "organizing_mode, organizing_problem, optional guiding_question, optional "
@@ -5858,6 +5858,8 @@ def _cluster_synthesis_system_prompt() -> str:
         "study_findings. Each study finding is about exactly one source; "
         "every evidence object's source_id must equal that study finding's source_id. "
         "Put cross-source comparisons in the line's synthesis, supported by separate source-specific study findings. "
+        "Preserve each source's observation period in cross-source comparisons; evidence from another period "
+        "may provide explicitly dated context, not contemporaneous evidence. "
         "Each study finding contains source_id, finding, "
         "method_scope, relation_to_line, and evidence, plus technical_result and "
         "plain_english_meaning only when it reports a technical statistic whose "

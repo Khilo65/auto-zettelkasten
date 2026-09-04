@@ -73,6 +73,7 @@ _DESCRIPTION_META_NAMES = ("description", "og:description", "twitter:description
 _HTML_VOID_ELEMENTS = frozenset(
     "area base br col embed hr img input link meta param source track wbr".split()
 )
+_HTML_TABLE_ELEMENTS = frozenset("table caption thead tbody tfoot tr th td".split())
 # ponytail: global PDFium lock; use a renderer process if PDF-heavy throughput becomes limiting.
 _PDFIUM_RENDER_LOCK = threading.Lock()
 
@@ -259,8 +260,9 @@ class PDFPageImage:
 
 
 class _HTMLTextExtractor(HTMLParser):
-    def __init__(self) -> None:
+    def __init__(self, *, preserve_tables: bool = False) -> None:
         super().__init__()
+        self.preserve_tables = preserve_tables
         self.parts: list[str] = []
         self.article_parts: list[str] = []
         self.abstract_parts: list[str] = []
@@ -291,6 +293,14 @@ class _HTMLTextExtractor(HTMLParser):
             self._finish_selected_option()
         if tag in {"script", "style", "noscript"}:
             self.hidden_depth += 1
+        if self.preserve_tables and not self.hidden_depth and tag in _HTML_TABLE_ELEMENTS:
+            # Keep source grouping without expanding spans or guessing header/value alignment.
+            spans = "".join(
+                f' {key}="{attributes[key]}"'
+                for key in ("rowspan", "colspan")
+                if tag in {"th", "td"} and re.fullmatch(r"[0-9]{1,5}", attributes.get(key, ""))
+            )
+            self.parts.append(f"<{tag}{spans}>")
         if tag == "meta":
             name = (attributes.get("name") or attributes.get("property") or "").casefold().strip()
             content = attributes.get("content", "").strip()
@@ -330,6 +340,8 @@ class _HTMLTextExtractor(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
+        if self.preserve_tables and not self.hidden_depth and tag in _HTML_TABLE_ELEMENTS:
+            self.parts.append(f"</{tag}>")
         if self._heading_hidden_tags and tag not in _HTML_VOID_ELEMENTS:
             if tag == self._heading_hidden_tags[-1]:
                 self._heading_hidden_tags.pop()
@@ -838,7 +850,7 @@ def extract_bytes(
         )
     if media_type in {"text/html", "application/xhtml+xml"} or suffix in {".html", ".htm"}:
         decoded = _decode_text(data)
-        parser = _parse_html(decoded)
+        parser = _parse_html(decoded, preserve_tables=True)
         text = _clean_text(html.unescape(" ".join(parser.parts)))
         return _text_result(
             text,
@@ -1952,8 +1964,8 @@ def _decode_text(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-def _parse_html(raw_html: str) -> _HTMLTextExtractor:
-    parser = _HTMLTextExtractor()
+def _parse_html(raw_html: str, *, preserve_tables: bool = False) -> _HTMLTextExtractor:
+    parser = _HTMLTextExtractor(preserve_tables=preserve_tables)
     parser.feed(raw_html)
     parser.close()
     return parser

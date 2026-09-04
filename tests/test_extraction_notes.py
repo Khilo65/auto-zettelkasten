@@ -96,6 +96,41 @@ def test_html_preserves_bounded_visible_native_heading_labels() -> None:
     ]
 
 
+def test_html_keeps_grouped_table_headers_cells_and_empty_positions() -> None:
+    raw = (
+        '<table><caption>Survey scores</caption><thead><tr>'
+        '<th rowspan="2">Region</th><th colspan="3">2022</th>'
+        '<th colspan="3">2021</th></tr><tr>'
+        '<th>Score</th><th>Change</th><th>Rank</th>'
+        '<th>Score</th><th>Change</th><th>Rank</th></tr></thead>'
+        '<tbody><tr><th>North</th><td><b>61</b></td><td>+4</td><td>7</td>'
+        '<td>57</td><td></td><td>9</td></tr></tbody></table>'
+    )
+    result = extract_bytes(raw.encode(), media_type="text/html")
+    assert ' '.join(result.text.split()) == (
+        '<table> <caption> Survey scores </caption> <thead> <tr> '
+        '<th rowspan="2"> Region </th> <th colspan="3"> 2022 </th> '
+        '<th colspan="3"> 2021 </th> </tr> <tr> '
+        '<th> Score </th> <th> Change </th> <th> Rank </th> '
+        '<th> Score </th> <th> Change </th> <th> Rank </th> </tr> </thead> '
+        '<tbody> <tr> <th> North </th> <td> 61 </td> <td> +4 </td> <td> 7 </td> '
+        '<td> 57 </td> <td> </td> <td> 9 </td> </tr> </tbody> </table>'
+    )
+    # Markup must not inflate the source-coverage measurements.
+    assert result.coverage_metrics["word_count"] == 17
+
+
+def test_html_table_markup_drops_active_attributes_and_invalid_spans() -> None:
+    raw = (
+        '<noscript><table><tr><td>hidden</td></tr></table></noscript>'
+        '<table onclick="secret()"><tr><td colspan=\'2" onclick=secret\' '
+        'rowspan="-1"><a href="https://example.org/private">Cell</a></td>'
+        '<td colspan="99999999999999999999999999">Other</td></tr></table>'
+    )
+    result = extract_bytes(raw.encode(), media_type="text/html")
+    assert result.text == '<table> <tr> <td> Cell </td> <td> Other </td> </tr> </table>'
+
+
 def test_readable_pdf_extracts_text() -> None:
     result = extract_bytes(
         _minimal_pdf("Readable synthetic PDF content " * 55),
