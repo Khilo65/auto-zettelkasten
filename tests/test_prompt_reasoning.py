@@ -83,10 +83,10 @@ def test_atomic_prompt_v14_is_source_adaptive_and_statistics_aware() -> None:
     assert "silently reread" in prompt
 
 
-def test_source_bundle_prompt_v21_preserves_formatting_and_attribution_scope() -> None:
+def test_source_bundle_prompt_v22_preserves_formatting_and_attribution_scope() -> None:
     prompt = _source_bundle_system_prompt()
 
-    assert "source bundle prompt v21" in prompt
+    assert "source bundle prompt v22" in prompt
     assert "apply a footnote, only when the alignment or marker is explicit" in prompt
     assert "A footnote qualifies only the values bearing its explicit marker" in prompt
     assert "page metadata is not a statistic's observation date" in prompt
@@ -198,6 +198,15 @@ def test_source_bundle_final_review_covers_prose_citations_and_locators() -> Non
     assert "three to eight" not in _source_bundle_system_prompt()
 
 
+def test_source_bundle_critique_distinguishes_totals_from_component_scopes() -> None:
+    prompt = _source_bundle_system_prompt()
+
+    assert "A total and a geographic or demographic subset are not competing estimates" in prompt
+    assert "including subtotals omitted from your evidence anchors" in prompt
+    assert "same population, period, measure, and category" in prompt
+    assert "Do not invent a source-quality criticism" in prompt
+
+
 def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     def digest(value: str | dict[str, Any]) -> str:
         text = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
@@ -212,7 +221,7 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     assert {
         "atomic_prompt_v14": digest(_system_prompt()),
         "chunk_prompt_v14": digest(_chunk_system_prompt()),
-        "source_bundle_prompt_v21": digest(_source_bundle_system_prompt()),
+        "source_bundle_prompt_v22": digest(_source_bundle_system_prompt()),
         "codex_source_bundle_schema": bundle_identity["schema_hash"],
         "codex_source_bundle_contract": digest(bundle_identity),
         "codex_chunk_evidence_schema": chunk_identity["schema_hash"],
@@ -220,7 +229,7 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     } == {
         "atomic_prompt_v14": "8db9f2990d175816cb0100b92d84734ae7c2f930aade66825ed0412b22da3705",
         "chunk_prompt_v14": "3c2eabca75c5ad487a35a5096664e0ec6999d04b738927a60fce2e11cfb15cd5",
-        "source_bundle_prompt_v21": "edadc465c2b8acb21921839017661b5a3db1f779c260f4eccc1ad729c3e66423",
+        "source_bundle_prompt_v22": "4891a274f7f7982c5382ad3df252ab8b476fd89be4aa8f145f5a39c739f419e0",
         "codex_source_bundle_schema": "ffd00229ee34f87c2bcc9a32f4b620102be6a907975397126103d5aff032ec3a",
         "codex_source_bundle_contract": "153d29b42447de280facb4a132bef9808c30676909bcee900b39353ef6451a59",
         "codex_chunk_evidence_schema": "2df4a0fe634405df5e891283a59bfc7bee18995b5e970a51c5569b5c4eafed8e",

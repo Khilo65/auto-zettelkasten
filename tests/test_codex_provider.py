@@ -33,6 +33,7 @@ from auto_zettelkasten.models import (
     LiteratureMapRequest,
     LiteratureMappingPolicy,
     MapRequest,
+    ProcessingPolicy,
 )
 from auto_zettelkasten.literature import (
     _PROVIDER_INPUT_DEPENDENCY_COMPONENTS,
@@ -42,6 +43,8 @@ from auto_zettelkasten.literature import (
 )
 from auto_zettelkasten.pipeline import (
     _ProfileProviderBudget,
+    _apply_reader_policy,
+    _read_document,
     _profile_dependency_policy,
     _provider_call_with_transport_retry,
     _source_worker_count,
@@ -49,6 +52,7 @@ from auto_zettelkasten.pipeline import (
     run_pipeline,
 )
 from auto_zettelkasten.readers import (
+    CHUNK_EVIDENCE_KEYS,
     CODEX_CLI_PROFILES,
     CODEX_CONTRACT_RESERVATIONS,
     CODEX_OUTPUT_CONTRACTS,
@@ -1110,6 +1114,117 @@ def _valid_source_bundle_payload() -> dict[str, object]:
             "date": "",
         },
     }
+
+
+@pytest.mark.parametrize(
+    ("text", "legacy_checkpoint"),
+    [("A" * 909_689, False), ("字" * 450_000, False), ("A" * 909_689, True)],
+    ids=["ascii", "multibyte", "completed-legacy-split"],
+)
+def test_codex_hierarchical_chunks_fit_exact_envelopes_without_losing_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, text: str, legacy_checkpoint: bool,
+) -> None:
+    reader = CodexReader("gpt-5.6-luna", allow_cloud=True, reasoning_effort="medium")
+    reader._preflight = {"version": "0.152.1"}
+    request = MapRequest(tmp_path, processing=ProcessingPolicy())
+    metadata = {"_source_context": {"source_id": "source-zotero-a1", "zotero_key": "A1"}}
+    _apply_reader_policy(reader, request.processing)
+    chunks = []
+    contracts = []
+    summarize = reader.summarize_chunk
+
+    def record_chunk(text, *args, **kwargs):
+        chunks.append(text)
+        return summarize(text, *args, **kwargs)
+
+    def generate(system, user, output_tokens, deadline):
+        assert legacy_checkpoint or reader._prompt_fits(system, user, output_tokens)
+        contract = _OUTPUT_CONTRACT.get()
+        contracts.append(contract)
+        payload = (
+            {key: "Source-grounded chunk evidence." for key in CHUNK_EVIDENCE_KEYS}
+            if contract == "chunk_evidence"
+            else _valid_source_bundle_payload()
+        )
+        return json.dumps(payload)
+
+    monkeypatch.setattr(reader, "summarize_chunk", record_chunk)
+    monkeypatch.setattr(reader, "_generate_text", generate)
+    monkeypatch.setattr(
+        reader, "_ensure_codex_preflight",
+        lambda: pytest.fail("no helper preflight is allowed in this test"),
+    )
+    if legacy_checkpoint:
+        # Model an already completed pre-fit-check checkpoint, never a live request.
+        monkeypatch.setattr(reader, "chunk_evidence_fits", lambda *args, **kwargs: True)
+        monkeypatch.setattr(reader, "_ensure_prompt_fits", lambda *args, **kwargs: None)
+    with deny_codex_attempts():
+        result, route, reason = _read_document(
+            reader, text, metadata, None, request=request,
+            checkpoint_root=tmp_path / "checkpoints",
+        )
+
+    assert route == "codex_hierarchical_text"
+    assert reason == f"hierarchical_source_read:{len(chunks)}"
+    assert len(chunks) > 1
+    assert "".join(chunk.split("\n", 1)[1] for chunk in chunks) == text
+    assert contracts == ["chunk_evidence"] * len(chunks) + ["source_bundle"]
+    before = {
+        str(p): (p.read_bytes(), p.stat().st_mtime_ns)
+        for p in tmp_path.rglob("*") if p.is_file()
+    }
+    monkeypatch.setattr(reader, "_generate_text", lambda *args, **kwargs: pytest.fail("replay launched a call"))
+    if legacy_checkpoint:
+        monkeypatch.setattr(reader, "chunk_evidence_fits", lambda *args, **kwargs: pytest.fail("completed checkpoint was replanned"))
+    with deny_codex_attempts():
+        assert _read_document(
+            reader, text, metadata, None, request=request,
+            checkpoint_root=tmp_path / "checkpoints",
+        ) == (result, route, reason)
+    assert before == {
+        str(p): (p.read_bytes(), p.stat().st_mtime_ns)
+        for p in tmp_path.rglob("*") if p.is_file()
+    }
+
+
+@pytest.mark.parametrize("framed_boundary", [False, True], ids=["oversized", "framed-boundary"])
+def test_codex_chunk_envelope_that_cannot_fit_fails_before_any_provider_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, framed_boundary: bool,
+) -> None:
+    import auto_zettelkasten.pipeline as pipeline_module
+
+    reader = CodexReader("gpt-5.6-luna", allow_cloud=True, reasoning_effort="medium")
+    reader._preflight = {"version": "0.152.1"}
+    if framed_boundary:
+        reader.context_window_tokens = 12_000
+    request = MapRequest(tmp_path, processing=ProcessingPolicy())
+    _apply_reader_policy(reader, request.processing)
+    monkeypatch.setattr(reader, "_generate_text", lambda *args, **kwargs: pytest.fail("provider called for an impossible envelope"))
+    monkeypatch.setattr(reader, "_ensure_codex_preflight", lambda: pytest.fail("preflight called for an impossible envelope"))
+    split_document = pipeline_module._split_document
+    splits = 0
+
+    def bounded_split(*args, **kwargs):
+        nonlocal splits
+        splits += 1
+        assert splits <= 2, "impossible framed envelope repeatedly split the document"
+        return split_document(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline_module, "_split_document", bounded_split)
+    question = "Q" * 3_992 if framed_boundary else "Question " * 75_000
+    text = "A" * (10_000 if framed_boundary else 500_000)
+    if framed_boundary:
+        assert reader.chunk_evidence_fits(
+            "", {}, question, chunk_id="chunk-0001", locator="document chunk 1/1",
+            max_output_tokens=request.processing.chunk_output_tokens,
+        )
+
+    with deny_codex_attempts(), pytest.raises(ProviderError, match="chunk envelope exceeds"):
+        _read_document(
+            reader, text, {}, question,
+            request=request, checkpoint_root=tmp_path / "checkpoints",
+        )
+    assert not list(tmp_path.rglob("*.yml"))
 
 
 def _fake_codex_app_server(

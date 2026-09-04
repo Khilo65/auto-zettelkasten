@@ -794,6 +794,34 @@ def test_remediation_ledgers_record_creator_and_scope_discrepancies(
     } == {"source_scope", "evidence_eligibility"}
 
 
+@pytest.mark.parametrize("observed_date", ["2025-03-04", "March 5, 2025"])
+def test_bibliographic_date_discrepancy_is_advisory_and_preserves_zotero(
+    tmp_path, observed_date,
+) -> None:
+    payload = _bundle_payload()
+    payload["observed_bibliographic_identity"] = {"date": observed_date}
+    row = {
+        "zotero_item_key": "DATE1",
+        "item": {"key": "DATE1", "data": {"date": "2025-03-05"}},
+    }
+    original = deepcopy(row)
+    metadata_rows = {}
+
+    _commit_remediation_ledgers(
+        tmp_path, row, SourceAnalysisBundle.from_dict(payload),
+        metadata_rows=metadata_rows, classification_rows={}, write=False,
+    )
+
+    issue = next(iter(metadata_rows.values()))
+    assert issue["issue_types"] == ["bibliographic_date_review_required"]
+    assert issue["confidence"] == "review_required"
+    assert issue["current_metadata"]["date"] == "2025-03-05"
+    assert issue["recommended_correction"]["date"]["observed"] == observed_date
+    assert "Zotero remains canonical" in issue["ambiguity"]
+    assert row == original
+    assert not list(tmp_path.iterdir())
+
+
 def test_pathways_for_peace_book_metadata_recommends_institutional_report_review(
     tmp_path,
 ) -> None:
@@ -1192,7 +1220,7 @@ def test_ordinary_bundle_source_uses_one_call_and_no_profile_or_fidelity_call(
     ]
     assert profile["coverage"]["status"] == "partial"
     note = read_note(tmp_path / report.items[0]["note_path"])
-    assert note["frontmatter"]["source_bundle_prompt_version"] == "21"
+    assert note["frontmatter"]["source_bundle_prompt_version"] == "22"
 
 
 def test_atomic_note_projects_accepted_quantitative_evidence_without_salience_loss(

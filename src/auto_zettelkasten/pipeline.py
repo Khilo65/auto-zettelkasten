@@ -4361,6 +4361,8 @@ def _commit_remediation_ledgers(
             issue_types.append("probable_creator_role_mismatch")
         if "title" in differences:
             issue_types.append("probable_title_mismatch")
+        if "date" in differences:
+            issue_types.append("bibliographic_date_review_required")
         path = (
             workspace
             / "01_custody"
@@ -21993,15 +21995,49 @@ def _read_document(
         finally:
             if temporary_images is not None:
                 temporary_images.cleanup()
-    chunks = _split_document(
-        text, chunk_char_limit=chunk_limit, max_chunks=policy.max_total_chunks
-    )
-    hierarchical_values = {
-        "mode": "hierarchical",
-        "chunk_char_limit": chunk_limit,
-        "total_chunks": len(chunks),
-    }
-    checkpoint_candidates = candidate_identities(**hierarchical_values)
+    synthesis_path = checkpoint_root / "synthesis.yml"
+    synthesis = read_yaml(synthesis_path, {}) or {} if checkpoint_enabled else {}
+    chunk_fit = getattr(reader, "chunk_evidence_fits", None)
+    while True:
+        chunks = _split_document(
+            text, chunk_char_limit=chunk_limit, max_chunks=policy.max_total_chunks
+        )
+        hierarchical_values = {
+            "mode": "hierarchical",
+            "chunk_char_limit": chunk_limit,
+            "total_chunks": len(chunks),
+        }
+        checkpoint_candidates = candidate_identities(**hierarchical_values)
+        if (
+            not retry_semantic_checkpoint
+            and synthesis.get("identity") in checkpoint_candidates
+            and isinstance(synthesis.get("analysis"), Mapping)
+        ):
+            return (
+                _ensure_source_result_contract(dict(synthesis["analysis"])),
+                f"{reader.name}_hierarchical_text",
+                f"hierarchical_source_read:{len(chunks)}",
+            )
+        if not callable(chunk_fit):
+            break
+        for index, chunk in enumerate(chunks):
+            fit_kwargs = {
+                "chunk_id": f"chunk-{index + 1:04d}",
+                "locator": _chunk_locator(chunk, index, len(chunks)),
+                "max_output_tokens": source_chunk_output_tokens,
+            }
+            if not chunk_fit(chunk, metadata, question, **fit_kwargs):
+                header, _, body = chunk.partition("\n")
+                minimum_chunk = f"{header}\n{body[:1]}"
+                if chunk_limit <= 1 or not chunk_fit(
+                    minimum_chunk, metadata, question, **fit_kwargs
+                ):
+                    raise ProviderError("source chunk envelope exceeds the context budget")
+                # ponytail: preserve paragraph splitting; shrink only rejected packets.
+                chunk_limit = max(1, chunk_limit * 9 // 10)
+                break
+        else:
+            break
     analyses: list[Mapping[str, Any]] = []
     for index, chunk in enumerate(chunks):
         checkpoint_path = (
@@ -22116,15 +22152,7 @@ def _read_document(
                 completed_chunks=len(analyses),
                 total_chunks=len(chunks),
             )
-    synthesis_path = checkpoint_root / "synthesis.yml"
-    synthesis = read_yaml(synthesis_path, {}) or {} if checkpoint_enabled else {}
-    if (
-        not retry_semantic_checkpoint
-        and synthesis.get("identity") in checkpoint_candidates
-        and isinstance(synthesis.get("analysis"), Mapping)
-    ):
-        merged = _ensure_source_result_contract(dict(synthesis["analysis"]))
-    elif hasattr(reader, "synthesize_document_bundle") or hasattr(
+    if hasattr(reader, "synthesize_document_bundle") or hasattr(
         reader, "synthesize_document"
     ):
         checkpoint_identity = identity_for_call(**hierarchical_values)

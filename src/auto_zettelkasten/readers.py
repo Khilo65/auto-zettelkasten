@@ -235,7 +235,7 @@ DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
-SOURCE_BUNDLE_PROMPT_VERSION = "21"
+SOURCE_BUNDLE_PROMPT_VERSION = "22"
 SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v2"
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
@@ -1843,6 +1843,26 @@ class _CapabilityAwareReader:
         return self._prompt_fits(
             _source_bundle_system_prompt(),
             _source_bundle_prompt(text, metadata, question),
+            output_tokens,
+        )
+
+    def chunk_evidence_fits(
+        self,
+        text: str,
+        metadata: Mapping[str, Any],
+        question: str | None = None,
+        *,
+        chunk_id: str = "",
+        locator: str = "",
+        max_output_tokens: int | None = None,
+    ) -> bool:
+        output_tokens = self._reserved_output_tokens(
+            "chunk_evidence",
+            self._bounded_output_tokens(max_output_tokens, default=self._chunk_token_cap),
+        )
+        return self._prompt_fits(
+            _chunk_system_prompt(),
+            _chunk_prompt(text, metadata, question, chunk_id, locator),
             output_tokens,
         )
 
@@ -5258,6 +5278,11 @@ def _source_bundle_system_prompt() -> str:
         "important source-reported number on its original scale with its estimand, comparison, reference group, denominator, "
         "baseline, uncertainty, and observed range. Keep modeled and observed quantities distinct. A simple derivation is "
         "allowed only when all inputs are explicit; retain the source statistic and label the derivation system_derived. "
+        "A total and a geographic or demographic subset are not competing estimates. Before alleging a discrepancy, "
+        "check the same population, period, measure, and category and reconcile the source's explicit components, "
+        "including subtotals omitted from your evidence anchors. Describe different scopes separately; retain a discrepancy "
+        "claim only if a contradiction remains between comparable quantities. Do not invent a source-quality criticism "
+        "to fill a limitations section. "
         "Put a derived number only in estimate. Every numeric statistic, estimand type, outcome definition, unit, scale, "
         "baseline, reference or comparison group, denominator, sample, uncertainty, population, and model value must be "
         "stated explicitly in the source; otherwise leave that field empty or say it is not reported without a number. "
