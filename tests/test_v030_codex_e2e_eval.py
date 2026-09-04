@@ -2398,7 +2398,10 @@ def test_strategic8_two_core_revalidation_preserves_failed_run(
     assert receipt["attempt_reservation_state"] == "failed_preserved"
     assert receipt["exact_zero_call_replay"] is True
     assert receipt["strategic8_actual_core_count"] == 2
-    assert receipt["strategic8_role_policy"] == "two_or_three_connected_cores_supported_roles_v3"
+    assert (
+        receipt["strategic8_role_policy"]
+        == "probabilistic_cluster_family_connected_cores_v4"
+    )
     after = runner.base._gate_snapshot(workspace)
     assert after.pop(str(receipt_path.relative_to(workspace)))
     assert before == after
@@ -2484,6 +2487,30 @@ def test_private_strategic8_cluster_labels_never_enter_provider_inputs(
     assert errors == []
     assert acceptance["strategic8_evaluated_required_pair_count"] == 6
 
+    exact_cluster = report["cluster_map"]["clusters"][0]
+    report["cluster_map"]["clusters"] = [
+        {
+            "source_ids": source_ids[:3],
+            "source_roles": [
+                {"source_id": source_id, "role": "core"}
+                for source_id in source_ids[:3]
+            ],
+        },
+        {
+            "source_ids": source_ids[1:4],
+            "source_roles": [
+                {"source_id": source_id, "role": "core"}
+                for source_id in source_ids[1:4]
+            ],
+        },
+    ]
+    errors, acceptance = runner._strategic8_oracle_acceptance(
+        tmp_path, cases, report, oracle
+    )
+    assert errors == []  # Valid overlapping subquestions need not collapse to one cluster.
+    assert acceptance["strategic8_expected_group_cluster_count"] == 2
+    report["cluster_map"]["clusters"] = [exact_cluster]
+
     roles = report["cluster_map"]["clusters"][0]["source_roles"]
     roles[0]["role"] = "context"
     errors, _acceptance = runner._strategic8_oracle_acceptance(
@@ -2501,7 +2528,10 @@ def test_private_strategic8_cluster_labels_never_enter_provider_inputs(
     errors, _acceptance = runner._strategic8_oracle_acceptance(
         tmp_path, cases, report, oracle
     )
-    assert errors == ["strategic8_contextual_relationship_missing"]
+    assert errors == [
+        "strategic8_contextual_relationship_missing",
+        "strategic8_core_not_connected_by_accepted_edges",
+    ]
     registry["relations"].append(removed)
     write_yaml(tmp_path / "02_source_memory" / "indexes" / "typed_links.yml", registry)
     roles[3]["role"] = "unsupported"
@@ -2517,10 +2547,11 @@ def test_private_strategic8_cluster_labels_never_enter_provider_inputs(
     assert errors == []  # Historical fixture labels do not fix production roles.
     assert acceptance["strategic8_actual_core_count"] == 3
     roles[0]["role"] = "core"
-    errors, _acceptance = runner._strategic8_oracle_acceptance(
+    errors, acceptance = runner._strategic8_oracle_acceptance(
         tmp_path, cases, report, oracle
     )
-    assert "strategic8_final_cluster_roles_incorrect" in errors
+    assert errors == []  # Every member may be central when the evidence supports it.
+    assert acceptance["strategic8_actual_core_count"] == 4
     roles[0]["role"] = roles[3]["role"] = "context"
 
     roles[2]["role"] = "context"

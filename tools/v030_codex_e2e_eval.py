@@ -948,23 +948,39 @@ def _strategic8_oracle_acceptance(
     context = source_by_parent[str(oracle["context_parent_key"])]
     controls = {source_by_parent[str(key)] for key in oracle["control_parent_keys"]}
     expected_members.add(context)
-    core: set[str] = set()
     clusters = (
         report.get("cluster_map", {}).get("clusters", [])
         if isinstance(report.get("cluster_map"), Mapping)
         else []
     )
-    exact_clusters = [
-        row
+    cluster_rows = [
+        (row, {str(value) for value in row.get("source_ids", []) or []})
         for row in clusters
         if isinstance(row, Mapping)
-        and {str(value) for value in row.get("source_ids", []) or []}
-        == expected_members
     ]
-    if len(exact_clusters) != 1:
+    expected_group_clusters = [
+        (row, members)
+        for row, members in cluster_rows
+        if len(members) >= 2 and members <= expected_members
+    ]
+    covered_members = set().union(
+        *(members for _row, members in expected_group_clusters)
+    )
+    membership_sets = [frozenset(members) for _row, members in expected_group_clusters]
+    if (
+        covered_members != expected_members
+        or len(set(membership_sets)) != len(membership_sets)
+    ):
         errors.append("strategic8_expected_cluster_missing_or_duplicated")
-    else:
-        supplied_roles = exact_clusters[0].get("source_roles", [])
+    if any(
+        members & expected_members and members & controls
+        for _row, members in cluster_rows
+    ):
+        errors.append("strategic8_control_in_expected_cluster")
+
+    cluster_roles: list[tuple[set[str], set[str], bool]] = []
+    for row, members in expected_group_clusters:
+        supplied_roles = row.get("source_roles", [])
         roles = (
             {str(key): str(value).casefold() for key, value in supplied_roles.items()}
             if isinstance(supplied_roles, Mapping)
@@ -976,19 +992,15 @@ def _strategic8_oracle_acceptance(
                 if isinstance(row, Mapping) and row.get("source_id")
             }
         )
-        core = {source_id for source_id in expected_members if roles.get(source_id) == "core"}
-        if (
-            set(roles) != expected_members
-            or len(core) not in {2, 3}
+        core = {source_id for source_id in members if roles.get(source_id) == "core"}
+        roles_valid = not (
+            set(roles) != members
+            or len(core) < 2
             or any(role not in {"core", "context", "bridge"} for role in roles.values())
-        ):
+        )
+        if not roles_valid:
             errors.append("strategic8_final_cluster_roles_incorrect")
-    if any(
-        controls
-        & {str(value) for value in row.get("source_ids", []) or []}
-        for row in exact_clusters
-    ):
-        errors.append("strategic8_control_in_expected_cluster")
+        cluster_roles.append((members, core, roles_valid))
 
     registry = base.read_yaml(
         workspace / "02_source_memory" / "indexes" / "typed_links.yml", {}
@@ -1025,20 +1037,31 @@ def _strategic8_oracle_acceptance(
                 return reached == nodes
             reached = expanded
 
-    if len(exact_clusters) == 1 and not connected(core):
+    if covered_members == expected_members and not connected(expected_members):
         errors.append("strategic8_core_not_connected_by_accepted_edges")
-    if len(exact_clusters) == 1 and any(
-        not any(
-            tuple(sorted((context_source, source_id))) in accepted_pairs
-            for source_id in core
-        )
-        for context_source in expected_members - core
-    ):
-        errors.append("strategic8_contextual_relationship_missing")
+    for members, core, roles_valid in cluster_roles:
+        if not roles_valid:
+            continue
+        if not connected(core):
+            errors.append("strategic8_core_not_connected_by_accepted_edges")
+        if any(
+            not any(
+                tuple(sorted((context_source, source_id))) in accepted_pairs
+                for source_id in core
+            )
+            for context_source in members - core
+        ):
+            errors.append("strategic8_contextual_relationship_missing")
+    core_counts = [len(core) for _members, core, valid in cluster_roles if valid]
     return sorted(set(errors)), {
         "strategic8_semantic_oracle_sha256": str(oracle["sha256"]),
-        "strategic8_role_policy": "two_or_three_connected_cores_supported_roles_v3",
-        "strategic8_actual_core_count": len(core) if len(exact_clusters) == 1 else None,
+        "strategic8_role_policy": "probabilistic_cluster_family_connected_cores_v4",
+        "strategic8_actual_core_count": (
+            core_counts[0] if len(core_counts) == 1 else None
+        ),
+        "strategic8_expected_group_cluster_count": len(expected_group_clusters),
+        "strategic8_expected_group_core_counts": core_counts,
+        "strategic8_expected_member_coverage_count": len(covered_members),
         "strategic8_required_pair_count": len(required_pairs),
         "strategic8_evaluated_required_pair_count": len(
             required_pairs & evaluated_pairs
