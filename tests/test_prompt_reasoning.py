@@ -83,10 +83,10 @@ def test_atomic_prompt_v14_is_source_adaptive_and_statistics_aware() -> None:
     assert "silently reread" in prompt
 
 
-def test_source_bundle_prompt_v25_preserves_formatting_and_attribution_scope() -> None:
+def test_source_bundle_prompt_v26_preserves_formatting_and_attribution_scope() -> None:
     prompt = _source_bundle_system_prompt()
 
-    assert "source bundle prompt v25" in prompt
+    assert "source bundle prompt v26" in prompt
     assert "apply a footnote, only when the alignment or marker is explicit" in prompt
     assert "A footnote qualifies only the values bearing its explicit marker" in prompt
     assert "page metadata is not a statistic's observation date" in prompt
@@ -254,6 +254,13 @@ def test_source_bundle_keeps_rated_target_in_grouped_prose() -> None:
     assert "Check prose comparisons against the evidence anchors and supplied passages" in final
 
 
+def test_source_bundle_emits_evidence_before_analysis() -> None:
+    prompt = _source_bundle_system_prompt()
+
+    assert "Emit evidence_anchors first" in prompt
+    assert "carry their attribution and scope into the later analysis_sections" in prompt
+
+
 def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     def digest(value: str | dict[str, Any]) -> str:
         text = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
@@ -268,7 +275,7 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     assert {
         "atomic_prompt_v14": digest(_system_prompt()),
         "chunk_prompt_v14": digest(_chunk_system_prompt()),
-        "source_bundle_prompt_v25": digest(_source_bundle_system_prompt()),
+        "source_bundle_prompt_v26": digest(_source_bundle_system_prompt()),
         "codex_source_bundle_schema": bundle_identity["schema_hash"],
         "codex_source_bundle_contract": digest(bundle_identity),
         "codex_chunk_evidence_schema": chunk_identity["schema_hash"],
@@ -276,9 +283,9 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     } == {
         "atomic_prompt_v14": "8db9f2990d175816cb0100b92d84734ae7c2f930aade66825ed0412b22da3705",
         "chunk_prompt_v14": "3c2eabca75c5ad487a35a5096664e0ec6999d04b738927a60fce2e11cfb15cd5",
-        "source_bundle_prompt_v25": "a0eb19807dad7234381adb6447a1ce15ee29137a221d3f2a9fe1d07a87f2a956",
-        "codex_source_bundle_schema": "ffd00229ee34f87c2bcc9a32f4b620102be6a907975397126103d5aff032ec3a",
-        "codex_source_bundle_contract": "153d29b42447de280facb4a132bef9808c30676909bcee900b39353ef6451a59",
+        "source_bundle_prompt_v26": "c2ee449b0610adb1445d3ca2da6fa2ab0f4a383d7094b8a275c65834cc3f5a7b",
+        "codex_source_bundle_schema": "1b9491a9f2d7bf9c4c8c62a5838180c2e8b171700211e2fe63cd77514d7192c2",
+        "codex_source_bundle_contract": "e6e7dc65d7953e5fe777faf1dcb43cebf933c4d9e73ca890264e98a7cd08e023",
         "codex_chunk_evidence_schema": "2df4a0fe634405df5e891283a59bfc7bee18995b5e970a51c5569b5c4eafed8e",
         "codex_chunk_evidence_contract": "122375b5eb8daeadd5a6461903004ec177e2b5547822d0258c7420c28852b332",
     }

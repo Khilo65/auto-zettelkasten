@@ -225,9 +225,9 @@ def test_codex_contract_capabilities_and_typed_retry_policy() -> None:
         "gap_adjudication": 12_288,
     }
     assert CODEX_OUTPUT_CONTRACTS["source_bundle"]["required"] == [
+        "evidence_anchors",
         "analysis_sections",
         "compact_profile",
-        "evidence_anchors",
         "literature_positions",
         "observed_bibliographic_identity",
     ]
@@ -1058,8 +1058,9 @@ import json, os, sys, time
 from pathlib import Path
 instruction_config = next(value for value in sys.argv if value.startswith("model_instructions_file="))
 instruction_path = Path(json.loads(instruction_config.split("=", 1)[1]))
+schema_path = Path(sys.argv[sys.argv.index("--output-schema") + 1])
 codex_home = Path(os.environ["CODEX_HOME"])
-Path({str(capture_path)!r}).write_text(json.dumps({{"argv": sys.argv, "env": dict(os.environ), "cwd": os.getcwd(), "cwd_entries": sorted(os.listdir()), "codex_home": str(codex_home), "codex_home_entries": sorted(path.name for path in codex_home.iterdir()), "codex_home_modes": {{path.name: path.stat().st_mode & 0o777 for path in codex_home.iterdir()}}, "model_instructions_path": str(instruction_path), "model_instructions": instruction_path.read_text(), "model_instructions_mode": instruction_path.stat().st_mode & 0o777}}))
+Path({str(capture_path)!r}).write_text(json.dumps({{"argv": sys.argv, "env": dict(os.environ), "cwd": os.getcwd(), "cwd_entries": sorted(os.listdir()), "codex_home": str(codex_home), "codex_home_entries": sorted(path.name for path in codex_home.iterdir()), "codex_home_modes": {{path.name: path.stat().st_mode & 0o777 for path in codex_home.iterdir()}}, "model_instructions_path": str(instruction_path), "model_instructions": instruction_path.read_text(), "model_instructions_mode": instruction_path.stat().st_mode & 0o777, "output_schema": schema_path.read_text()}}))
 if {mutate_codex_home!r}:
     (codex_home / "models_cache.json").write_text("child mutation")
 if {mutate_codex_auth!r}:
@@ -1464,6 +1465,7 @@ def test_codex_pdf_app_server_sends_exact_ordered_file_text_and_contract(
         "networkAccess": False,
     }
     assert turn["outputSchema"]["additionalProperties"] is False
+    assert next(iter(turn["outputSchema"]["properties"])) == "evidence_anchors"
     assert current_provider_completion()["usage"] == {
         "input_tokens": 12,
         "cached_input_tokens": 3,
@@ -1748,8 +1750,9 @@ def test_codex_pdf_app_server_external_cancellation_is_typed(
             future.result()
 
 
+@pytest.mark.parametrize("contract_id", sorted(CODEX_OUTPUT_CONTRACTS))
 def test_codex_transport_is_sanitized_schema_bound_and_tool_fail_closed(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, contract_id: str,
 ) -> None:
     executable = tmp_path / "codex"
     capture = tmp_path / "capture.json"
@@ -1787,10 +1790,18 @@ def test_codex_transport_is_sanitized_schema_bound_and_tool_fail_closed(
         2_048,
         5,
         reasoning_effort="high",
-        output_contract="chunk_evidence",
+        output_contract=contract_id,
     )
     assert json.loads(value)["summary"] == "ok"
     captured = json.loads(capture.read_text(encoding="utf-8"))
+    assert captured["output_schema"] == json.dumps(
+        _codex_json_schema(contract_id), sort_keys=contract_id != "source_bundle"
+    )
+    assert hashlib.sha256(captured["output_schema"].encode()).hexdigest() == (
+        codex_contract_identity(contract_id, reader.model, "high", "0.152.1")["schema_hash"]
+    )
+    if contract_id == "source_bundle":
+        assert next(iter(json.loads(captured["output_schema"])["properties"])) == "evidence_anchors"
     assert "--output-schema" in captured["argv"]
     assert 'forced_login_method="chatgpt"' in captured["argv"]
     assert "skills.bundled.enabled=false" in captured["argv"]
@@ -1829,6 +1840,19 @@ def test_codex_transport_is_sanitized_schema_bound_and_tool_fail_closed(
         captured["argv"][captured["argv"].index("--output-schema") + 1]
     )
     assert schema_path.parent != Path(captured["cwd"])
+
+
+@pytest.mark.parametrize("contract_id", sorted(CODEX_OUTPUT_CONTRACTS))
+def test_codex_only_source_bundle_identity_tracks_property_order(
+    monkeypatch: pytest.MonkeyPatch, contract_id: str,
+) -> None:
+    before = codex_contract_identity(contract_id, "gpt-5.6-luna", "medium")
+    contract = dict(CODEX_OUTPUT_CONTRACTS[contract_id])
+    contract["properties"] = dict(reversed(list(contract["properties"].items())))
+    monkeypatch.setitem(CODEX_OUTPUT_CONTRACTS, contract_id, contract)
+    after = codex_contract_identity(contract_id, "gpt-5.6-luna", "medium")
+
+    assert (before != after) is (contract_id == "source_bundle")
 
 
 def test_codex_early_stdin_close_is_typed_transport_failure(tmp_path: Path) -> None:

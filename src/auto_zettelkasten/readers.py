@@ -235,7 +235,7 @@ DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
-SOURCE_BUNDLE_PROMPT_VERSION = "25"
+SOURCE_BUNDLE_PROMPT_VERSION = "26"
 SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v2"
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
@@ -362,28 +362,6 @@ _CODEX_SOURCE_ROLE = _codex_object(
 CODEX_OUTPUT_CONTRACTS: Mapping[str, Mapping[str, Any]] = {
     "source_bundle": _codex_object(
         {
-            "analysis_sections": _codex_object(
-                {key: _CODEX_STRING for key in SECTION_KEYS}
-            ),
-            "compact_profile": _codex_object(
-                {
-                    "thesis": _CODEX_STRING,
-                    "method_or_knowledge_basis": _CODEX_STRING,
-                    "source_genre": _CODEX_STRING,
-                    "inferential_design": _CODEX_STRING,
-                    **{
-                        key: _CODEX_STRINGS
-                        for key in (
-                            "mechanisms",
-                            "outcomes",
-                            "cases",
-                            "populations",
-                            "periods",
-                            "datasets",
-                        )
-                    },
-                }
-            ),
             "evidence_anchors": _codex_array(
                 _codex_object(
                     {
@@ -409,6 +387,28 @@ CODEX_OUTPUT_CONTRACTS: Mapping[str, Mapping[str, Any]] = {
                         },
                     }
                 )
+            ),
+            "analysis_sections": _codex_object(
+                {key: _CODEX_STRING for key in SECTION_KEYS}
+            ),
+            "compact_profile": _codex_object(
+                {
+                    "thesis": _CODEX_STRING,
+                    "method_or_knowledge_basis": _CODEX_STRING,
+                    "source_genre": _CODEX_STRING,
+                    "inferential_design": _CODEX_STRING,
+                    **{
+                        key: _CODEX_STRINGS
+                        for key in (
+                            "mechanisms",
+                            "outcomes",
+                            "cases",
+                            "populations",
+                            "periods",
+                            "datasets",
+                        )
+                    },
+                }
             ),
             "literature_positions": _codex_array(
                 _codex_object(
@@ -1389,7 +1389,7 @@ def codex_contract_identity(
         "cli_profile": cli_profile,
         "contract_id": contract_id,
         "schema_hash": hashlib.sha256(
-            json.dumps(schema, sort_keys=True).encode("utf-8")
+            json.dumps(schema, sort_keys=contract_id != "source_bundle").encode("utf-8")
         ).hexdigest(),
         "output_reservation": CODEX_CONTRACT_RESERVATIONS[contract_id],
         "feature_manifest_hash": hashlib.sha256(
@@ -4726,7 +4726,9 @@ class CodexReader(_CapabilityAwareReader):
             call_dir.mkdir(mode=0o700)
             schema_path = call_root / "output-schema.json"
             schema_path.write_text(
-                json.dumps(_codex_json_schema(contract_id), sort_keys=True),
+                json.dumps(
+                    _codex_json_schema(contract_id), sort_keys=contract_id != "source_bundle"
+                ),
                 encoding="utf-8",
             )
             instructions_path = call_root / "model-instructions.txt"
@@ -5295,8 +5297,10 @@ def _source_bundle_system_prompt() -> str:
         "all required inputs. A p-value is not an effect size or the probability that a hypothesis is true. Locators are "
         "approximate navigation aids and must not be invented. "
         f"Return exactly one JSON object for {SOURCE_BUNDLE_ENVELOPE_CONTRACT} with only these top-level fields: "
-        "analysis_sections, compact_profile, evidence_anchors, literature_positions, and "
+        "evidence_anchors, analysis_sections, compact_profile, literature_positions, and "
         "observed_bibliographic_identity. "
+        "Emit evidence_anchors first; carry their attribution and scope into the later analysis_sections "
+        "and compact_profile. Recheck prose against the supplied source, not only the selected anchors. "
         f"analysis_sections is an object with readable Markdown strings for these required keys: {keys}. It may also contain "
         "key_concepts_and_definitions and source_structure_and_organization only under their rules above. "
         "For required fields only, use a short 'Not applicable to this source form' string when necessary. compact_profile is an object containing "
