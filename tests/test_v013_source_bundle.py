@@ -1192,7 +1192,7 @@ def test_ordinary_bundle_source_uses_one_call_and_no_profile_or_fidelity_call(
     ]
     assert profile["coverage"]["status"] == "partial"
     note = read_note(tmp_path / report.items[0]["note_path"])
-    assert note["frontmatter"]["source_bundle_prompt_version"] == "20"
+    assert note["frontmatter"]["source_bundle_prompt_version"] == "21"
 
 
 def test_atomic_note_projects_only_accepted_high_salience_quantitative_evidence(

@@ -133,7 +133,8 @@ def test_semantic_prompts_allow_neutral_nonmembership_and_bounded_relations() ->
     assert "topical, lexical, or generic" in relationships
     assert "extends requires explicit building on" in relationships
     assert "shared data" in relationships
-    assert "Do not infer intellectual direction or support" in relationships
+    assert "Never infer support or direction" in relationships
+    assert "vocabulary, or pair order alone" in relationships
     assert "self-review once" in relationships
 
 

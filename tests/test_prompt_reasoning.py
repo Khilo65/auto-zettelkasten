@@ -83,10 +83,10 @@ def test_atomic_prompt_v14_is_source_adaptive_and_statistics_aware() -> None:
     assert "silently reread" in prompt
 
 
-def test_source_bundle_prompt_v20_preserves_formatting_and_attribution_scope() -> None:
+def test_source_bundle_prompt_v21_preserves_formatting_and_attribution_scope() -> None:
     prompt = _source_bundle_system_prompt()
 
-    assert "source bundle prompt v20" in prompt
+    assert "source bundle prompt v21" in prompt
     assert "apply a footnote, only when the alignment or marker is explicit" in prompt
     assert "A footnote qualifies only the values bearing its explicit marker" in prompt
     assert "page metadata is not a statistic's observation date" in prompt
@@ -168,6 +168,36 @@ def test_source_bundle_prompt_requires_a_final_quantitative_copy_gate() -> None:
     )
 
 
+def test_source_bundle_final_review_covers_prose_citations_and_locators() -> None:
+    source = (
+        "Regional total: 90; North: 60; South: 30. "
+        "Scores: access 8, trust 7, reach 6. "
+        "Rates: 2 deliveries*; 3 visits. *First week only. "
+        "Opening: Ada criticizes restrictions. Closing: Ben defends access. "
+        "Journal Q published a 2001 study and a separate undated commentary."
+    )
+    prompt = _source_bundle_prompt(source, {}, None)
+    final = prompt.split("FINAL WHOLE-SOURCE CHECK:")[1]
+
+    assert prompt.index(source) < prompt.index("FINAL QUANTITATIVE COPY GATE")
+    assert prompt.index("FINAL QUANTITATIVE COPY GATE") < prompt.index(final)
+    for requirement in (
+        "all analysis sections, compact_profile, evidence_anchors, and literature_positions",
+        "Critiques, superlatives, contrasts, and locators are factual claims too",
+        "population, period, measure, and category",
+        "totals and subtotals",
+        "all comparable displayed values",
+        "aligned speakers",
+        "explicit text anchors",
+        "one distinct work",
+        "unknown years and titles empty",
+        "marked measure in every field",
+        "same call",
+    ):
+        assert requirement in final
+    assert "three to eight" not in _source_bundle_system_prompt()
+
+
 def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     def digest(value: str | dict[str, Any]) -> str:
         text = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
@@ -182,7 +212,7 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     assert {
         "atomic_prompt_v14": digest(_system_prompt()),
         "chunk_prompt_v14": digest(_chunk_system_prompt()),
-        "source_bundle_prompt_v20": digest(_source_bundle_system_prompt()),
+        "source_bundle_prompt_v21": digest(_source_bundle_system_prompt()),
         "codex_source_bundle_schema": bundle_identity["schema_hash"],
         "codex_source_bundle_contract": digest(bundle_identity),
         "codex_chunk_evidence_schema": chunk_identity["schema_hash"],
@@ -190,7 +220,7 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     } == {
         "atomic_prompt_v14": "8db9f2990d175816cb0100b92d84734ae7c2f930aade66825ed0412b22da3705",
         "chunk_prompt_v14": "3c2eabca75c5ad487a35a5096664e0ec6999d04b738927a60fce2e11cfb15cd5",
-        "source_bundle_prompt_v20": "4fca01ae2d5966cf3167466c9175d9ed97dda60ef70d4616268a73f50cb29b1b",
+        "source_bundle_prompt_v21": "edadc465c2b8acb21921839017661b5a3db1f779c260f4eccc1ad729c3e66423",
         "codex_source_bundle_schema": "ffd00229ee34f87c2bcc9a32f4b620102be6a907975397126103d5aff032ec3a",
         "codex_source_bundle_contract": "153d29b42447de280facb4a132bef9808c30676909bcee900b39353ef6451a59",
         "codex_chunk_evidence_schema": "2df4a0fe634405df5e891283a59bfc7bee18995b5e970a51c5569b5c4eafed8e",

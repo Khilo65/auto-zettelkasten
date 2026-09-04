@@ -83,15 +83,16 @@ def test_v8_salvages_valid_connections_and_keeps_anchors_optional() -> None:
     assert accepted["connection_id"].startswith("relationship-connection-")
 
 
-def test_v21_is_compact_domain_neutral_source_owned_and_complete() -> None:
+def test_v22_is_compact_domain_neutral_source_owned_and_complete() -> None:
     prompt = _relationship_adjudication_system_prompt()
 
-    assert "relationship prompt v21" in prompt
+    assert "relationship prompt v22" in prompt
     assert "source_a_basis describes only the supplied left_source_id" in prompt
     assert "source_b_basis only the supplied right_source_id" in prompt
     assert "whole work versus chapter, excerpt, or component" in prompt
     assert "choose the tier before the subtype" in prompt
     assert "same sufficiently specific proposition" in prompt
+    assert "vocabulary, or pair order alone" in prompt
     assert "explicitly establishes an intellectual bridge" in prompt
     assert "supports means the actor supplies evidence or argument" in prompt
     assert "undermines means the actor supplies materially incompatible" in prompt
@@ -124,6 +125,14 @@ def test_adjudication_checks_narrower_connections_before_rejecting_a_pair() -> N
         "preserve it in rejections",
     ):
         assert requirement in prompt
+    assert prompt.index("complete notes' contributions") < prompt.index(
+        "choose the tier before the subtype"
+    )
+    assert "no bounded connection survives" in prompt
+    assert "reason must represent both complete notes" in prompt
+    assert "why the strongest narrower alternative fails" in prompt
+    assert "for rejections, verify whole-note scope" in prompt
+    assert "not merely direct equivalence" in prompt
 
 
 def test_v8_accepts_prose_wrapped_singleton_and_relation_shorthand() -> None:
