@@ -436,6 +436,19 @@ def test_map_excerpts_stop_at_complete_sentences_and_deduplicate_threads() -> No
     )
 
 
+def test_map_excerpt_preserves_numeric_punctuation_at_display_boundaries() -> None:
+    clause = (
+        "The survey summarizes respondents' views on institutions and services "
+        "across selected regions"
+    )
+    prefix = clause + ", with recorded values of "
+    for value in ("280,000", "2,800,000", "12:30"):
+        sentence = prefix + value + " and further observations beyond the display budget."
+        assert _map_verdict_excerpt(sentence) == sentence
+        for cutoff in range(len(prefix) + 1, len(prefix + value) + 5):
+            assert _map_verdict_excerpt(sentence, character_limit=cutoff) == clause + "."
+
+
 def test_cluster_answer_replaces_dangling_thread_fragments_with_named_findings() -> None:
     cluster = {
         "label": "Mediator bias and bargaining dynamics",

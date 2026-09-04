@@ -83,10 +83,10 @@ def test_v8_salvages_valid_connections_and_keeps_anchors_optional() -> None:
     assert accepted["connection_id"].startswith("relationship-connection-")
 
 
-def test_v22_is_compact_domain_neutral_source_owned_and_complete() -> None:
+def test_v23_is_compact_domain_neutral_source_owned_and_complete() -> None:
     prompt = _relationship_adjudication_system_prompt()
 
-    assert "relationship prompt v22" in prompt
+    assert "relationship prompt v23" in prompt
     assert "source_a_basis describes only the supplied left_source_id" in prompt
     assert "source_b_basis only the supplied right_source_id" in prompt
     assert "whole work versus chapter, excerpt, or component" in prompt
@@ -103,7 +103,7 @@ def test_v22_is_compact_domain_neutral_source_owned_and_complete() -> None:
     assert "ACTOR [relation type] REFERENCE" in prompt
     assert "every ID appears exactly once" in prompt
     assert "use no_relationship rather than omitting a pair" in prompt
-    assert len(prompt) <= 3_500
+    assert len(prompt) <= 4_000
     assert not any(
         name in prompt.casefold()
         for name in ("svensson", "mediation", "civil war", "peacekeeping")
@@ -133,6 +133,21 @@ def test_adjudication_checks_narrower_connections_before_rejecting_a_pair() -> N
     assert "why the strongest narrower alternative fails" in prompt
     assert "for rejections, verify whole-note scope" in prompt
     assert "not merely direct equivalence" in prompt
+
+
+def test_adjudication_scopes_absence_claims_to_supplied_summary_evidence() -> None:
+    prompt = " ".join(_relationship_adjudication_system_prompt().casefold().split())
+
+    for requirement in (
+        "notes are summaries: silence is not evidence of source absence",
+        "unless a note explicitly establishes absence",
+        "not supplied in the note",
+        "apply this to reasons and qualifications",
+        "a shared causal outcome or comparable scores are not required",
+        "missing methodological detail limits that comparison",
+        "does not erase the supplied measurement object",
+    ):
+        assert requirement in prompt
 
 
 def test_v8_accepts_prose_wrapped_singleton_and_relation_shorthand() -> None:

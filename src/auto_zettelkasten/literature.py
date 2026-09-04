@@ -26536,7 +26536,14 @@ def _map_verdict_excerpt(
         if selected:
             break
         shortened = sentence[:character_limit]
-        boundary = max(shortened.rfind(";"), shortened.rfind(","), shortened.rfind(":"))
+        boundary = max(
+            (
+                match.start()
+                for match in re.finditer(r"(?<!\d)[;,:]|[;,:](?!\d)", sentence)
+                if match.start() < character_limit
+            ),
+            default=-1,
+        )
         if boundary >= max(80, character_limit // 2):
             shortened = shortened[:boundary]
         else:
