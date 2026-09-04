@@ -1813,6 +1813,30 @@ def test_expected_answer_matching_accepts_one_span_paraphrases() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("body", "matches"),
+    [
+        ("The relay reset is insufficient on its own.", True),
+        ("The relay reset is not sufficient on its own.", True),
+        ("The relay reset is sufficient on its own.", False),
+        ("The relay reset is not insufficient on its own.", False),
+        ("The relay reset is never insufficient on its own.", False),
+        ("The relay reset is not entirely insufficient on its own.", False),
+        ("The relay reset isn't insufficient on its own.", False),
+        ("The relay reset is insufficient.", False),
+        ("The relay reset is insufficient\non its own.", False),
+    ],
+)
+def test_expected_answer_insufficiency_preserves_phrase_and_polarity(
+    body: str, matches: bool,
+) -> None:
+    spans = [runner._normalized_text(line) for line in body.splitlines()]
+
+    assert runner._answer_matches(
+        runner._normalized_text(body), spans, "not sufficient on its own"
+    ) is matches
+
+
 def test_single_source_gate_has_vacuously_complete_relationship_coverage(
     tmp_path: Path,
 ) -> None:

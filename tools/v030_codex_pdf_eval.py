@@ -2309,6 +2309,15 @@ def _answer_matches(text: str, spans: Sequence[str], expected: str) -> bool:
     normalized = _normalized_text(expected)
     if normalized in text:
         return True
+    if "not sufficient" in normalized:
+        # ponytail: lexical smoke check; qualified claims still need semantic review.
+        for span in spans:
+            prefix = span.partition("insufficient")[0]
+            if re.search(r"\b(?:no|not|never|without)\b|n['’]t\b", prefix):
+                continue
+            equivalent = re.sub(r"\binsufficient\b", "not sufficient", span)
+            if normalized in equivalent:
+                return True
     normalized = re.sub(r"\bcomponents?\b", "part", normalized)
     normalized = re.sub(r"\bgains?\b", "gain", normalized)
     terms = {
