@@ -518,6 +518,7 @@ def test_strategic8_packet_requires_two_independent_full_reviewers(
         source["source_artifact"]["sha256"]
         for source in packet["source_context"]
     )
+    assert all("metadata_diagnostics" not in source for source in packet["source_context"])
 
     review_path = private / "review.yml"
     report_path = private / "report.yml"
@@ -556,6 +557,68 @@ def test_strategic8_packet_requires_two_independent_full_reviewers(
     assert failed["checks"]["no_reviewer_disagreements"] is False
 
 
+def test_strategic8_metadata_diagnostics_match_imported_keys_and_are_hash_bound(
+    tmp_path: Path,
+) -> None:
+    workspace, manifest_path = _strategic8_workspace(tmp_path)
+    manifest = json.loads(manifest_path.read_text())
+    manifest["cases"][0]["zotero_parent"]["data"]["key"] = "IGNORED-NESTED-KEY"
+    manifest["cases"][0]["zotero_parent"]["data"]["date"] = "2025"
+    del manifest["cases"][1]["zotero_parent"]["key"]
+    manifest_path.write_text(json.dumps(manifest))
+    issue_path = workspace / "01_custody" / "zotero" / "zotero_metadata_issues.yml"
+    date_issue = {
+        "issue_id": "date-review", "zotero_item_key": "P0",
+        "current_metadata": {"date": "2025"},
+        "recommended_correction": {"date": {"current": "2025", "observed": "2024"}},
+        "evidence": {"date": "2024"}, "status": "open",
+        "ambiguity": "Document-body identity is diagnostic; Zotero remains canonical.",
+    }
+    duplicate_issue = {
+        "issue_id": "duplicate-review", "zotero_item_keys": ["P0", "P1"],
+        "issue_types": ["duplicate_zotero_work"], "status": "open",
+    }
+    write_yaml(issue_path, {
+        "zotero_metadata_issue_schema_version": "1",
+        "issues": [date_issue, duplicate_issue, *(
+            {"issue_id": key, "zotero_item_key": key}
+            for key in ("source-000", "IGNORED-NESTED-KEY", "OUTSIDE-SAMPLE")
+        )],
+    })
+    packet_path = tmp_path / "private-review" / "packet.yml"
+    packet = audit_tool.prepare(workspace, "strategic8", packet_path)
+    notes = {
+        row["payload"]["source_id"]: row["payload"]
+        for row in packet["rows"] if row["kind"] == "note"
+    }
+    evidence = notes["source-000"]["metadata_diagnostics"]
+    assert notes["source-000"]["source_metadata"]["data"]["date"] == "2025"
+    assert json.loads(manifest_path.read_text()) == manifest
+    assert evidence["issues"] == [date_issue, duplicate_issue]
+    assert notes["source-001"]["metadata_diagnostics"]["issues"] == [duplicate_issue]
+    assert all("metadata_diagnostics" not in notes[f"source-{index:03d}"] for index in range(2, 8))
+    assert evidence["artifact"] == {
+        "path": "01_custody/zotero/zotero_metadata_issues.yml",
+        "path_scope": "workspace", "sha256": sha256_file(issue_path),
+    }
+    assert packet["artifacts"].count(evidence["artifact"]) == 1
+    audit_tool._verify_packet(workspace, packet)
+    issue_path.write_text(issue_path.read_text().replace("observed: '2024'", "observed: '2023'"))
+    assert sha256_file(issue_path) != evidence["artifact"]["sha256"]
+    with pytest.raises(ValueError, match="stale review artifact"):
+        audit_tool._verify_packet(workspace, packet)
+
+
+@pytest.mark.parametrize("issues", ["not a list", ["not a mapping"], [{"zotero_item_keys": "P0"}]])
+def test_strategic8_rejects_malformed_metadata_diagnostics(tmp_path: Path, issues: object) -> None:
+    workspace, _ = _strategic8_workspace(tmp_path)
+    write_yaml(workspace / "01_custody" / "zotero" / "zotero_metadata_issues.yml", {
+        "issues": issues,
+    })
+    with pytest.raises(ValueError, match="metadata diagnostic"):
+        audit_tool.prepare(workspace, "strategic8", tmp_path / "private-review" / "packet.yml")
+
+
 def test_release_quality_packet_is_deterministic_private_and_stale_safe(
     tmp_path: Path,
 ) -> None:
@@ -563,6 +626,9 @@ def test_release_quality_packet_is_deterministic_private_and_stale_safe(
     baseline, baseline_manifest, custody_manifest = _exhaustive_inputs(
         tmp_path, workspace
     )
+    write_yaml(workspace / "01_custody" / "zotero" / "zotero_metadata_issues.yml", {
+        "current_only_diagnostic": "not part of blinded A/B evidence",
+    })
     private = tmp_path / "private-review"
     first_path = private / "packet-one.yml"
     second_path = private / "packet-two.yml"
@@ -607,6 +673,7 @@ def test_release_quality_packet_is_deterministic_private_and_stale_safe(
         "total": 122,
     }
     assert all(row["artifact_sha256"] and row["row_sha256"] for row in first["rows"])
+    assert not any("zotero_metadata_issues" in row["path"] for row in first["artifacts"])
     assert any(
         artifact["path"] == "03_literature_synthesis/manifest.yml"
         for artifact in first["artifacts"]

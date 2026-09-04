@@ -24,7 +24,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from auto_zettelkasten.files import read_yaml, sha256_file, write_yaml
-from auto_zettelkasten.notes import read_note, source_id_for_item
+from auto_zettelkasten.notes import item_key, read_note, source_id_for_item
 
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -465,6 +465,25 @@ def _load_sources(
             raise ValueError("Strategic40 notes must account for every manifest source")
         contexts = []
         artifacts = [_artifact(path, workspace, sha256_file(path))]
+        metadata_issues: list[dict[str, Any]] = []
+        metadata_artifact: dict[str, str] | None = None
+        metadata_path = workspace / "01_custody" / "zotero" / "zotero_metadata_issues.yml"
+        if mode == "strategic8" and metadata_path.exists():
+            metadata_path = _workspace_file(workspace, str(metadata_path), label="metadata diagnostics")
+            metadata, metadata_sha256 = _stable_yaml(metadata_path, label="metadata diagnostics")
+            issue_rows = metadata.get("issues", [])
+            if not isinstance(issue_rows, list):
+                raise ValueError("metadata diagnostic issues must be a list")
+            metadata_issues = [_mapping(row, label="metadata diagnostic issue") for row in issue_rows]
+            for issue in metadata_issues:
+                keys = issue.get("zotero_item_keys", [])
+                if (
+                    not isinstance(issue.get("zotero_item_key", ""), str)
+                    or not isinstance(keys, list)
+                    or any(not isinstance(key, str) for key in keys)
+                ):
+                    raise ValueError("metadata diagnostic Zotero keys are invalid")
+            metadata_artifact = _artifact(metadata_path, workspace, metadata_sha256)
         for source_id in sorted(strata):
             note_path, frontmatter = notes[source_id]
             text, note_sha256 = _stable_text(note_path, label=f"note for {source_id}")
@@ -504,6 +523,20 @@ def _load_sources(
                 context["source_metadata"] = _mapping(
                     case.get("zotero_parent", {}), label="Strategic8 Zotero parent"
                 )
+                imported_key = item_key(context["source_metadata"])
+                relevant_issues = [
+                    issue for issue in metadata_issues
+                    if imported_key and (
+                        issue.get("zotero_item_key") == imported_key
+                        or imported_key in issue.get("zotero_item_keys", [])
+                    )
+                ]
+                if relevant_issues:
+                    assert metadata_artifact is not None
+                    context["metadata_diagnostics"] = {
+                        "artifact": metadata_artifact, "issues": relevant_issues,
+                    }
+                    artifacts.append(metadata_artifact)
                 artifacts.append(context["source_artifact"])
             contexts.append(context)
         return contexts, strata, artifacts
@@ -1933,6 +1966,10 @@ def prepare(
                     "note_text": source["note_text"],
                     "source_artifact": source["source_artifact"],
                     "source_metadata": source["source_metadata"],
+                    **(
+                        {"metadata_diagnostics": source["metadata_diagnostics"]}
+                        if "metadata_diagnostics" in source else {}
+                    ),
                 },
                 (
                     "pass",
