@@ -83,10 +83,10 @@ def test_v8_salvages_valid_connections_and_keeps_anchors_optional() -> None:
     assert accepted["connection_id"].startswith("relationship-connection-")
 
 
-def test_v26_is_compact_domain_neutral_source_owned_and_complete() -> None:
+def test_v27_is_compact_domain_neutral_source_owned_and_complete() -> None:
     prompt = _relationship_adjudication_system_prompt()
 
-    assert "relationship prompt v26" in prompt
+    assert "relationship prompt v27" in prompt
     assert "source_a_basis describes only the supplied left_source_id" in prompt
     assert "source_b_basis only the supplied right_source_id" in prompt
     assert "whole work versus chapter, excerpt, or component" in prompt
@@ -115,6 +115,8 @@ def test_contextual_comparison_does_not_require_a_causal_bridge() -> None:
 
     assert "state the boundary and system inference" in prompt
     assert "does not alone invalidate a contextual comparison" in prompt
+    assert "successive institutional stage" in prompt
+    assert "prove a cross-stage causal chain" in prompt
 
 
 def test_measurement_fault_line_includes_simple_indicator_vs_composite_index() -> None:
@@ -128,7 +130,7 @@ def test_contextual_comparison_uses_contributions_not_cross_source_proof() -> No
     prompt = _relationship_adjudication_system_prompt()
 
     assert "source-specific contributions to one concrete problem, practice, or mechanism" in prompt
-    assert "Neither source must compare the works or link the other's events" in prompt
+    assert "Neither source must compare the works, link the events" in prompt
     assert "Missing causal identification or systematic comparison limits the claim" in prompt
     assert "a source lacks a substantive contribution to that comparison" in prompt
 
