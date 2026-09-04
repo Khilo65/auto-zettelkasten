@@ -1,5 +1,8 @@
 from pathlib import Path
+from copy import deepcopy
 from itertools import combinations as stdlib_combinations
+
+import pytest
 
 import auto_zettelkasten.literature as literature_module
 import auto_zettelkasten.navigation as navigation_module
@@ -124,6 +127,64 @@ def test_custom_reasoner_without_reconciliation_capability_is_not_called() -> No
 
     assert result == plan
     assert warnings == []
+
+
+@pytest.mark.parametrize(
+    "groups,merged_members",
+    [
+        ([["one"], ["one", "two", "three"]], []),
+        ([["one", "two"], ["two", "three"]], []),
+        ([["one", "two"], ["three"]], ["one", "two"]),
+    ],
+)
+def test_family_reconciliation_supersedes_only_exclusively_grouped_cards(
+    groups, merged_members
+) -> None:
+    class Reasoner:
+        capabilities = {"supports_family_card_reconciliation": True}
+
+    plan = {
+        "literature_families": [
+            {"family_id": "one", "source_ids": ["A", "B"]},
+            {"family_id": "two", "source_ids": ["B", "C"]},
+            {"family_id": "three", "source_ids": ["C", "D"]},
+        ],
+        "source_dispositions": [
+            {"source_id": "A", "family_ids": ["one"]},
+            {"source_id": "B", "family_ids": ["one", "two"]},
+            {"source_id": "C", "family_ids": ["two", "three"]},
+            {"source_id": "D", "family_ids": ["three"]},
+        ],
+    }
+    original = deepcopy(plan)
+    for ordered_groups in (groups, list(reversed(groups))):
+        result, warnings = _reconcile_overlapping_family_cards(
+            plan,
+            request=None,  # type: ignore[arg-type]
+            reasoner=Reasoner(),  # type: ignore[arg-type]
+            reasoner_calls=lambda *_args: {
+                "literature_families": [
+                    {"source_ids": group} for group in ordered_groups
+                ]
+            },  # type: ignore[arg-type]
+        )
+        assert warnings == []
+        assert plan == original
+        families = {row["family_id"]: row for row in result["literature_families"]}
+        assert set(families) & {"one", "two", "three"} == (
+            {"one", "two", "three"} - set(merged_members)
+        )
+        assert [
+            row["supersedes_family_ids"]
+            for row in families.values()
+            if "supersedes_family_ids" in row
+        ] == ([merged_members] if merged_members else [])
+        for disposition in result["source_dispositions"]:
+            assert set(disposition["family_ids"]) == {
+                family_id
+                for family_id, family in families.items()
+                if disposition["source_id"] in family["source_ids"]
+            }
 
 
 def test_v029_cleanup_waits_for_durable_replacement_receipt(tmp_path: Path) -> None:

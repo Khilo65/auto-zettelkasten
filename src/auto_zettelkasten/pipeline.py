@@ -6050,6 +6050,7 @@ def _reconcile_overlapping_family_cards(
         except Exception as exc:
             warnings.append(type(exc).__name__ + ":" + stable_hash(component)[:16])
             continue
+        groups = []
         for raw in response.get("literature_families", []) or []:
             if not isinstance(raw, Mapping):
                 continue
@@ -6060,7 +6061,15 @@ def _reconcile_overlapping_family_cards(
                     if str(value) in component
                 }
             )
-            if len(merged_ids) < 2:
+            groups.append((raw, merged_ids))
+        membership_counts = Counter(
+            family_id for _, group in groups for family_id in group
+        )
+        for raw, merged_ids in groups:
+            # Overlap or a retained singleton is not permission to erase a family.
+            if len(merged_ids) < 2 or any(
+                membership_counts[family_id] > 1 for family_id in merged_ids
+            ):
                 continue
             merged_sources = sorted(
                 {
