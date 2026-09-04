@@ -2337,7 +2337,9 @@ def _locator_matches(text: str, expected: str) -> bool:
         return False
     unit, value = numbered.group(1), int(numbered.group(2))
     unit_pattern = (
-        r"(?:pages?\s+|p{1,2}\.\s*)" if unit == "page" else r"clauses?\s+"
+        r"(?:pages?\s+|p{1,2}\.\s*)"
+        if unit == "page"
+        else r"(?:clauses?|numbered commitments?)\s+"
     )
     if re.search(rf"\b{unit_pattern}{value}\b", text):
         return True
