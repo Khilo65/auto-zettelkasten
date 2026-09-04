@@ -5431,6 +5431,11 @@ def normalize_evidence_profiles(profiles: Sequence[Any]) -> list[dict[str, Any]]
                 "search_tokens": sorted(_tokens(search_values)),
             }
         )
+        if observed_date := str(
+            raw.get("observed_document_date_diagnostic")
+            or context.get("observed_document_date_diagnostic") or ""
+        ).strip():
+            normalized[-1]["observed_document_date_diagnostic"] = observed_date
     _reconcile_evidence_base_groups(normalized)
     return sorted(normalized, key=lambda row: (row["source_id"], row["note_id"]))
 
@@ -18681,6 +18686,8 @@ def _cluster_synthesis_profile_projection(
     compact = _coverage_profile_projection(profile)
     compact.pop("claims", None)
     compact["evidence_anchors"] = selected
+    if profile.get("observed_document_date_diagnostic"):
+        compact["observed_document_date_diagnostic"] = profile["observed_document_date_diagnostic"]
     if include_legacy_claims:
         compact["claims"] = [
             {

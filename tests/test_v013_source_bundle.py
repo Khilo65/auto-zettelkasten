@@ -15,6 +15,11 @@ from auto_zettelkasten.models import (
 )
 from auto_zettelkasten.api import resume_map, run_map
 from auto_zettelkasten.files import read_yaml, write_yaml
+from auto_zettelkasten.extraction import extract_bytes
+from auto_zettelkasten.literature import (
+    _cluster_synthesis_profile_projection,
+    normalize_evidence_profiles,
+)
 from auto_zettelkasten.notes import read_note
 from auto_zettelkasten.pipeline import (
     SourceBundleQuantitativeProvenanceError,
@@ -918,7 +923,8 @@ def test_pipeline_does_not_reinsert_rejected_optional_rows() -> None:
     )
 
 
-def test_native_html_heading_reaches_cluster_admission_without_weak_locator_promotion() -> None:
+@pytest.mark.parametrize("quoted_span", [False, True])
+def test_native_html_heading_reaches_cluster_admission_without_weak_locator_promotion(quoted_span) -> None:
     from auto_zettelkasten.extraction import extract_bytes
     from auto_zettelkasten.literature import (
         _anchor_is_synthesis_eligible,
@@ -945,11 +951,15 @@ def test_native_html_heading_reaches_cluster_admission_without_weak_locator_prom
     )
     payload = _bundle_payload()
     anchor = payload["evidence_anchors"][0]
-    anchor.update(locator=heading, locators=[heading])
+    locator = 'Quote "Monitoring changes implementation."' if quoted_span else heading
+    expected = locator if quoted_span else f'Heading "{heading}"'
+    anchor.update(locator=locator, locators=[locator])
+    if quoted_span:
+        anchor["support_envelope"] = {"empirical_role": "descriptive", "support_status": "supported"}
     bundle = _source_bundle_from_result(payload, row, "full_document")
     assert bundle is not None
-    assert bundle.evidence_anchors[0].locator == f'Heading "{heading}"'
-    assert bundle.evidence_anchors[0].locators == [f'Heading "{heading}"']
+    assert bundle.evidence_anchors[0].locator == expected
+    assert bundle.evidence_anchors[0].locators == [expected]
     assert bundle.evidence_anchors[0].support_envelope.argument_role == "none"
     replayed = _source_bundle_from_result(bundle.to_dict(), row, "full_document")
     assert replayed is not None and replayed.semantic_dict() == bundle.semantic_dict()
@@ -964,9 +974,10 @@ def test_native_html_heading_reaches_cluster_admission_without_weak_locator_prom
         "evidence_anchors": [{
             **source_profile["evidence_anchors"][0], "source_id": "source-b",
             "evidence_anchor_id": "anchor-b", "locator": "p. 2", "locators": ["p. 2"],
+            "source_locators": [],
         }],
     }])
-    assert _anchor_is_synthesis_eligible(profiles[0]["claims"][0])
+    assert all(_anchor_is_synthesis_eligible(profile["claims"][0]) for profile in profiles)
     proposal = {"clusters": [{
         "cluster_id": "native-heading", "shared_question": "How does monitoring work?",
         "members": [{"source_id": profile["source_id"], "role": "core",
@@ -975,10 +986,35 @@ def test_native_html_heading_reaches_cluster_admission_without_weak_locator_prom
     }]}
     admitted, _parked, _neighbors, _unclustered = _global_plan_proposals(proposal, profiles)
     assert admitted[0]["source_roles"] == {row["source_id"]: "core", "source-b": "core"}
-    for locator in ("Ambiguous source heading", "Unverified source heading", "Detailed Findings", "Methods"):
+    for locator in ("Ambiguous source heading", "Unverified source heading", "Detailed Findings", "Methods", "Opening paragraph"):
         anchor.update(locator=locator, locators=[locator])
         unchanged = _source_bundle_from_result(payload, row, "full_document")
         assert unchanged is not None and unchanged.evidence_anchors[0].locator == locator
+    if quoted_span:
+        anchor.update(locator=expected, locators=[expected])
+        for text in ("Unrelated source text.", row["text"] * 2):
+            with pytest.raises(ValueError, match="quote_locator_not_unique_in_source"):
+                _source_bundle_from_result(payload, {**row, "text": text}, "full_document")
+        for span, text in (("a" * 12, "a" * 13), ("b" * 121, "b" * 121)):
+            anchor.update(locator=f'Quote "{span}"', locators=[f'Quote "{span}"'])
+            with pytest.raises(ValueError, match="quote_locator_not_unique_in_source"):
+                _source_bundle_from_result(payload, {**row, "text": text}, "full_document")
+        legacy_quote = _source_bundle_from_result(
+            payload, row, "full_document", validate_quantitative_provenance=False,
+        )
+        assert legacy_quote is not None and not legacy_quote.evidence_anchors[0].source_locators
+        for route in ("codex_pdf_page_images", "codex_pdf_input_file"):
+            with pytest.raises(ValueError, match="quote_locator_not_unique_in_source"):
+                _source_bundle_from_result(
+                    payload, {**row, "content_route": route}, "full_document",
+                    validate_quantitative_provenance=False,
+                )
+        anchor.update(locator=expected, locators=[expected])
+        opaque = _source_bundle_from_result(
+            payload, {**row, "content_route": "codex_pdf_input_file", "text": ""},
+            "full_document", validate_quantitative_provenance=False,
+        )
+        assert opaque is not None and opaque.evidence_anchors[0].source_locators
     anchor.update(locator=heading, locators=[heading])
     legacy = _source_bundle_from_result(payload, {**row, "coverage_metrics": {}}, "full_document")
     assert legacy is not None and legacy.evidence_anchors[0].locator == heading
@@ -1220,7 +1256,43 @@ def test_ordinary_bundle_source_uses_one_call_and_no_profile_or_fidelity_call(
     ]
     assert profile["coverage"]["status"] == "partial"
     note = read_note(tmp_path / report.items[0]["note_path"])
-    assert note["frontmatter"]["source_bundle_prompt_version"] == "27"
+    assert note["frontmatter"]["source_bundle_prompt_version"] == "28"
+
+
+@pytest.mark.parametrize("observed_date", ["", "Published 2019; updated 2024"])
+def test_observed_document_date_reaches_writer_without_replacing_canonical_date(
+    tmp_path, observed_date,
+) -> None:
+    class DatedReader(BundleReader):
+        def read_source_bundle(self, *args, **kwargs):
+            payload = super().read_source_bundle(*args, **kwargs)
+            payload["observed_bibliographic_identity"]["date"] = observed_date
+            return payload
+
+    report = run_map(
+        MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1),
+        client=FakeZotero([{"key": "ITEMA", "data": {
+            "key": "ITEMA", "itemType": "journalArticle", "title": "A dated source", "date": "2019",
+        }}]),
+        reader=DatedReader(), run_id="observed-date",
+    )
+    profile = read_yaml(next((tmp_path / "02_source_memory/profiles").glob("*.yml")))["profile"]
+    normalized = normalize_evidence_profiles([profile])[0]
+    projected = _cluster_synthesis_profile_projection(
+        normalized, {}, {"body": (tmp_path / report.items[0]["note_path"]).read_text(), "date": "2019"},
+    )
+    for value in (profile["context"], normalized, projected):
+        if observed_date:
+            assert value["observed_document_date_diagnostic"] == observed_date
+        else:
+            assert "observed_document_date_diagnostic" not in value
+    assert projected["year"] == "2019"
+    assert normalized["year"] == "2019"
+    assert all(
+        not anchor.get("quantitative_result")
+        or anchor["quantitative_result"].get("period") != observed_date
+        for anchor in profile["evidence_anchors"]
+    )
 
 
 def test_atomic_note_projects_accepted_quantitative_evidence_without_salience_loss(
@@ -1642,6 +1714,10 @@ def test_legacy_source_contract_pairs_are_reused_fail_closed(
     write_yaml(metadata_path, metadata)
     bundle_path = next((tmp_path / "02_source_memory" / "bundles").glob("*.yml"))
     bundle = read_yaml(bundle_path)
+    bundle["bundle"]["evidence_anchors"][0].update(
+        locator='Quote "Previously accepted source wording"',
+        locators=['Quote "Previously accepted source wording"'],
+    )
     bundle["bundle"]["evidence_anchors"][0]["quantitative_result"] = {
         "estimate": "43,824",
         "period": "October 29, 2024",
@@ -4761,6 +4837,30 @@ def test_quantitative_provenance_does_not_treat_quantity_as_period_year() -> Non
             },
             "full_document",
         )
+
+
+def test_extracted_html_table_retains_year_and_quantity_validation() -> None:
+    raw = (
+        '<p>Show all years</p><p>Expand All</p>\n<table><thead><tr>\n'
+        + '\n'.join(f'<th colspan="9876">{year}</th>' for year in (2023, 2022, 2021))
+        + '\n</tr><tr><th>Pillar</th>\n'
+        + '\n'.join('<th>Score</th>\n<th>Rank</th>' for _ in range(3))
+        + '\n</tr></thead><tbody><tr><th>Composite</th>\n'
+        + '\n'.join(f'<td>{value}</td>' for value in ('61', '+4', '7', '-2', '57', '+2', '9', '-1', '55', '10'))
+        + '</tr></tbody></table>'
+    )
+    text = extract_bytes(raw.encode(), media_type="text/html").text
+    assert '<table>' in text
+    payload = _bundle_payload()
+    result = {"estimate": "Score 61; rank 7", "period": "2023", "provenance": "source_reported"}
+    payload["evidence_anchors"][0]["quantitative_result"] = result
+    row = {"source_id": "source-zotero-A1", "zotero_item_key": "A1", "text": text, "media_type": "text/html"}
+    assert _source_bundle_from_result(payload, row, "full_document") is not None
+    for estimate, period in (("Score 61; rank 7", "2022"), ("Score 7; rank 61", "2023"), ("9876 cases", "")):
+        result.update(estimate=estimate, period=period)
+        with pytest.raises(SourceBundleQuantitativeProvenanceError):
+            _source_bundle_from_result(payload, row, "full_document")
+    assert row["text"] == text
 
 
 def test_quantitative_provenance_accepts_bounded_year_column_table() -> None:

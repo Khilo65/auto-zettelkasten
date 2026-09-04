@@ -235,7 +235,7 @@ DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
-SOURCE_BUNDLE_PROMPT_VERSION = "27"
+SOURCE_BUNDLE_PROMPT_VERSION = "28"
 SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v2"
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
@@ -5311,7 +5311,9 @@ def _source_bundle_system_prompt() -> str:
         "Include located anchors for central mechanisms and author interpretations as well as quantitative results; "
         "do not fill the budget with secondary numbers while omitting the argument's decisive evidence. Each "
         "row uses claim, locator, planning_roles, salience_priority, evidence_role, support_boundary, plain_english_meaning, "
-        "uncertainty, and optional quantitative_result. evidence_role should be a short controlled description such as "
+        'uncertainty, and optional quantitative_result. For locator use a supplied page or numbered paragraph, Heading "exact heading", '
+        'or Quote "exact unique source words" (12–120 characters) when no supplied page or heading exists. '
+        "Descriptive paragraph labels are not locators. evidence_role should be a short controlled description such as "
         "causal, associational, descriptive, mechanism_evidence, conceptual, methodological, normative, or "
         "practitioner_guidance. quantitative_result may use statistic, estimand_type, outcome_definition, estimate, unit, "
         "scale, baseline, reference_group, comparison_group, denominator, sample, uncertainty, population, period, model, "

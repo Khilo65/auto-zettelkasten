@@ -128,6 +128,8 @@ from .profiles import (
     PROFILE_PROMPT_VERSION,
     ProfileContractError,
     ProfileParseError,
+    _QUOTE_SPAN_LOCATOR,
+    _source_locator_payloads,
     augment_profile_from_committed_note,
     build_evidence_profile,
     load_profile_checkpoint,
@@ -3107,6 +3109,8 @@ def _commit_source_bundle(
         "source_analysis_bundle_dependency_fingerprint": dependency_fingerprint,
         "profile_generation_route": "source_analysis_bundle",
     }
+    if observed_date := str(bundle.observed_bibliographic_identity.get("date") or "").strip():
+        profile.context["observed_document_date_diagnostic"] = observed_date
     eligibility = str(
         bundle.scope_assessment.get("evidence_eligibility")
         or row.get("evidence_eligibility")
@@ -15771,6 +15775,7 @@ def _source_bundle_from_result(
         for label in heading_labels
         if label and heading_counts[label.casefold()] == 1
     }
+    opaque_pdf_route = row.get("content_route") in {"codex_pdf_page_images", "codex_pdf_input_file"}
     anchors = payload.get("evidence_anchors", [])
     if isinstance(anchors, list):
         normalized_anchors = []
@@ -15780,6 +15785,22 @@ def _source_bundle_from_result(
                 normalized_anchors.append(value)
                 continue
             locator = str(value.get("locator") or "")
+            if (validate_quantitative_provenance or opaque_pdf_route) and locator.casefold().startswith("quote "):
+                quoted = _QUOTE_SPAN_LOCATOR.fullmatch(locator[6:].strip())
+                span = " ".join(quoted.group("quote").split()) if quoted else ""
+                source_text = " ".join(str(row.get("text") or "").split())
+                if not quoted or len(quoted.group("quote")) > 120 or (
+                    not opaque_pdf_route
+                    and (source_text.find(span) < 0 or source_text.find(span) != source_text.rfind(span))
+                ):
+                    raise ValueError("quote_locator_not_unique_in_source")
+                value = {
+                    **value,
+                    "source_locators": _source_locator_payloads(
+                        locator, source_id=expected_source_id,
+                        evidence_anchor_id=str(value.get("evidence_anchor_id") or ""),
+                    ),
+                }
             heading = unique_headings.get(
                 re.sub(r"\s+", " ", locator).strip().casefold()
             )
@@ -18208,6 +18229,12 @@ def _validate_quantitative_provenance(
                     else "reported_estimate_not_found_in_source"
                 )
         return
+    # Validate visible quantities, not the structural markup retained for the model.
+    # Preserve line positions for existing year-column and locality checks.
+    text = re.sub(
+        r'</?(?:table|caption|thead|tbody|tfoot|tr|th|td)'
+        r'(?: (?:rowspan|colspan)="[0-9]{1,5}")*>', '', text,
+    )
     footnote_groups = _footnote_quantity_groups(text)
     source_lines = text.splitlines()
     source_dates = _source_dates(text)
