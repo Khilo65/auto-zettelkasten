@@ -1881,24 +1881,27 @@ def test_single_source_gate_has_vacuously_complete_relationship_coverage(
     assert "relationship_completeness_accounting_failed" in errors
 
 
-def test_private_locator_matching_recognizes_numbered_commitment_references() -> None:
-    for locator in ("Numbered commitments 6–8", "Numbered commitment 7"):
+def test_private_locator_matching_recognizes_numbered_operative_references() -> None:
+    for locator in (
+        "Numbered commitments 6–8", "Numbered commitment 7",
+        "Operative provisions 6–8", "Provision 7",
+    ):
         text = runner._normalized_text(locator + ": operative clauses on the left side.")
         assert runner._locator_matches(text, "clause 7")
         assert not runner._locator_matches(text, "clause 9")
-    assert not runner._locator_matches(
-        runner._normalized_text("Numbered commitment 70"), "clause 7"
-    )
+    for locator in ("Numbered commitment 70", "Provisions 70–72", "Budget 7"):
+        assert not runner._locator_matches(runner._normalized_text(locator), "clause 7")
 
 
+@pytest.mark.parametrize("label", ["numbered clauses", "operative provisions"])
 def test_private_locator_matching_accepts_numbered_ranges_without_prefix_collisions(
-    tmp_path: Path,
+    tmp_path: Path, label: str,
 ) -> None:
     source_id = "source-zotero-synth001"
     note_path = tmp_path / "synthetic-report.md"
     note_path.write_text(
         "Instrument calibration completed.\n\n"
-        "## Locators\n\nSupplied page image: numbered clauses 1–3.\n\n"
+        f"## Locators\n\nSupplied page image: {label} 1–3.\n\n"
         "The system resumes nominal operation.\n",
         encoding="utf-8",
     )
