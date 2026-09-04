@@ -2321,8 +2321,10 @@ def test_runner_rejects_auto_zettelkasten_from_another_checkout(
         )
 
 
+@pytest.mark.parametrize("non_core_role", ["context", "bridge"])
 def test_strategic8_two_core_revalidation_preserves_failed_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    non_core_role: str,
 ) -> None:
     path, _path40, custody8, custody40 = _strategic_manifests(tmp_path / "private")
     _bind_synthetic_strategic_fixture(monkeypatch, custody8, custody40)
@@ -2341,7 +2343,7 @@ def test_strategic8_two_core_revalidation_preserves_failed_run(
         "cluster_map": {"clusters": [{
             "source_ids": members,
             "source_roles": {
-                source: "core" if source in cores[:2] else "context"
+                source: "core" if source in cores[:2] else non_core_role
                 for source in members
             },
         }]},
@@ -2396,7 +2398,7 @@ def test_strategic8_two_core_revalidation_preserves_failed_run(
     assert receipt["attempt_reservation_state"] == "failed_preserved"
     assert receipt["exact_zero_call_replay"] is True
     assert receipt["strategic8_actual_core_count"] == 2
-    assert receipt["strategic8_role_policy"] == "two_or_three_connected_cores_label_independent_v2"
+    assert receipt["strategic8_role_policy"] == "two_or_three_connected_cores_supported_roles_v3"
     after = runner.base._gate_snapshot(workspace)
     assert after.pop(str(receipt_path.relative_to(workspace)))
     assert before == after
@@ -2488,6 +2490,25 @@ def test_private_strategic8_cluster_labels_never_enter_provider_inputs(
         tmp_path, cases, report, oracle
     )
     assert errors == []  # Two connected cores, with grounded contextual neighbors.
+
+    roles[3]["role"] = "bridge"
+    errors, _acceptance = runner._strategic8_oracle_acceptance(
+        tmp_path, cases, report, oracle
+    )
+    assert errors == []  # Supported non-core roles still require accepted core links.
+    removed = registry["relations"].pop()
+    write_yaml(tmp_path / "02_source_memory" / "indexes" / "typed_links.yml", registry)
+    errors, _acceptance = runner._strategic8_oracle_acceptance(
+        tmp_path, cases, report, oracle
+    )
+    assert errors == ["strategic8_contextual_relationship_missing"]
+    registry["relations"].append(removed)
+    write_yaml(tmp_path / "02_source_memory" / "indexes" / "typed_links.yml", registry)
+    roles[3]["role"] = "unsupported"
+    errors, _acceptance = runner._strategic8_oracle_acceptance(
+        tmp_path, cases, report, oracle
+    )
+    assert "strategic8_final_cluster_roles_incorrect" in errors
 
     roles[3]["role"] = "core"
     errors, acceptance = runner._strategic8_oracle_acceptance(

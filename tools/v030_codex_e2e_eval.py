@@ -980,7 +980,7 @@ def _strategic8_oracle_acceptance(
         if (
             set(roles) != expected_members
             or len(core) not in {2, 3}
-            or any(role not in {"core", "context"} for role in roles.values())
+            or any(role not in {"core", "context", "bridge"} for role in roles.values())
         ):
             errors.append("strategic8_final_cluster_roles_incorrect")
     if any(
@@ -1037,7 +1037,7 @@ def _strategic8_oracle_acceptance(
         errors.append("strategic8_contextual_relationship_missing")
     return sorted(set(errors)), {
         "strategic8_semantic_oracle_sha256": str(oracle["sha256"]),
-        "strategic8_role_policy": "two_or_three_connected_cores_label_independent_v2",
+        "strategic8_role_policy": "two_or_three_connected_cores_supported_roles_v3",
         "strategic8_actual_core_count": len(core) if len(exact_clusters) == 1 else None,
         "strategic8_required_pair_count": len(required_pairs),
         "strategic8_evaluated_required_pair_count": len(
