@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import marshal
+import py_compile
 import sys
+import zipfile
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -292,6 +296,252 @@ def test_controlled_pdf_gate_is_one_direct_pdf_attempt(tmp_path: Path) -> None:
             sha256_file(manifest),
             runner.CONTROLLED_PDF_GATE,
         )
+
+
+def _installed_runtime(
+    root: Path, monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, dict[str, Any], Path]:
+    manifest = _manifest(root / "workspace")
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["cases"] = [payload["cases"][1]]
+    payload["gate"] = runner.CONTROLLED_PDF_GATE.manifest_binding()
+    site = root / "venv" / "lib" / "site-packages"
+    dist = "auto_zettelkasten-0.30.0.dist-info"
+    files = {
+        "auto_zettelkasten/__init__.py": b'ENGINE_VERSION = "0.30.0"\n',
+        f"{dist}/METADATA": b"Name: auto-zettelkasten\nVersion: 0.30.0\n",
+        f"{dist}/WHEEL": b"Wheel-Version: 1.0\n",
+        f"{dist}/entry_points.txt": b"[console_scripts]\n",
+        f"{dist}/licenses/LICENSE": b"Synthetic license\n",
+        f"{dist}/RECORD": b"",
+    }
+    wheel = root / "auto_zettelkasten-0.30.0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for name, data in files.items():
+            archive.writestr(name, data)
+            path = site / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+    (site / dist / "INSTALLER").write_bytes(b"pip\n")
+    (site / dist / "REQUESTED").write_bytes(b"")
+    (site / dist / "RECORD").write_bytes(b"installer-specific record\n")
+    wheel_binding = {"path": str(wheel), "sha256": sha256_file(wheel)}
+    audit = root / "PACKAGE_AUDIT.yml"
+    write_yaml(audit, {
+        "package_audit_schema_version": "1", "status": "passed",
+        "repository_dirty": False, "repository_head": CODE_COMMIT,
+        "provider_calls": 0,
+        "distribution": "auto-zettelkasten", "version": "0.30.0",
+        "findings": [], "wheel": wheel_binding,
+    })
+    payload["installed_runtime"] = {
+        "schema_version": "1", "wheel": wheel_binding,
+        "package_audit": {"path": str(audit), "sha256": sha256_file(audit)},
+    }
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    module = SimpleNamespace(
+        __file__=str(site / "auto_zettelkasten" / "__init__.py"),
+        __version__="0.30.0", ENGINE_VERSION="0.30.0",
+    )
+    module.__spec__ = SimpleNamespace(origin=module.__file__)
+    monkeypatch.setattr(runner, "auto_zettelkasten", module)
+    monkeypatch.setattr(runner, "sys", SimpleNamespace(
+        modules={"auto_zettelkasten": module},
+    ))
+    monkeypatch.setattr(runner.sysconfig, "get_path", lambda key: str(site))
+    return manifest, payload, site
+
+
+def test_installed_runtime_verifies_wheel_and_preserves_default_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _manifest_path, payload, site = _installed_runtime(tmp_path, monkeypatch)
+    source = site / "auto_zettelkasten" / "__init__.py"
+    py_compile.compile(str(source), doraise=True)
+    direct_url_path = site / "auto_zettelkasten-0.30.0.dist-info" / "direct_url.json"
+    direct_url_path.write_text(json.dumps({
+        "url": Path(payload["installed_runtime"]["wheel"]["path"]).as_uri(),
+        "archive_info": {"hashes": {"sha256": payload["installed_runtime"]["wheel"]["sha256"]}},
+    }))
+
+    identity = runner._verify_runtime_import_root(payload, runner.CONTROLLED_PDF_GATE)
+    assert identity == {
+        "schema_version": "1", "version": "0.30.0",
+        "wheel_sha256": payload["installed_runtime"]["wheel"]["sha256"],
+        "package_audit_sha256": payload["installed_runtime"]["package_audit"]["sha256"],
+        "package_file_count": 1,
+    }
+    with pytest.raises(RuntimeError, match="repository's src directory"):
+        runner._verify_runtime_import_root()
+
+
+@pytest.mark.parametrize("defect", [
+    "wheel_hash", "audit_hash", "audit_failed", "audit_dirty", "audit_commit",
+    "audit_version", "audit_wheel", "runtime_version", "altered", "missing",
+    "extra", "symlink", "directory_symlink", "wheel_symlink", "orphan_bytecode",
+    "tampered_bytecode", "metadata", "installer_extra", "wrong_origin", "wrong_site", "wrong_gate",
+    "binding_schema", "unreadable_audit", "direct_url", "direct_url_shape",
+])
+def test_installed_runtime_rejects_defects_before_attempt_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str,
+) -> None:
+    manifest, payload, site = _installed_runtime(tmp_path, monkeypatch)
+    binding = payload["installed_runtime"]
+    source = site / "auto_zettelkasten" / "__init__.py"
+    dist = site / "auto_zettelkasten-0.30.0.dist-info"
+    settings = runner.CONTROLLED_PDF_GATE
+    if defect in {"wheel_hash", "audit_hash"}:
+        binding["wheel" if defect == "wheel_hash" else "package_audit"]["sha256"] = "0" * 64
+    elif defect.startswith("audit_"):
+        path = Path(binding["package_audit"]["path"])
+        audit = read_yaml(path)
+        key, value = {
+            "audit_failed": ("status", "failed"),
+            "audit_dirty": ("repository_dirty", True),
+            "audit_commit": ("repository_head", "b" * 40),
+            "audit_version": ("version", "0.29.11"),
+            "audit_wheel": ("wheel", {"path": str(tmp_path / "other.whl"), "sha256": "0" * 64}),
+        }[defect]
+        audit[key] = value
+        write_yaml(path, audit)
+        binding["package_audit"]["sha256"] = sha256_file(path)
+    elif defect == "runtime_version":
+        runner.auto_zettelkasten.ENGINE_VERSION = "0.29.11"
+    elif defect == "binding_schema":
+        binding["unrecognized"] = True
+    elif defect == "unreadable_audit":
+        path = Path(binding["package_audit"]["path"])
+        path.write_text("private_fixture_material: [\n")
+        binding["package_audit"]["sha256"] = sha256_file(path)
+    elif defect in {"direct_url", "direct_url_shape"}:
+        (dist / "direct_url.json").write_text(json.dumps({
+            "url": Path(binding["wheel"]["path"]).as_uri(),
+            "archive_info": {"hashes": {"sha256": "0" * 64}} if defect == "direct_url" else ["hash"],
+        }))
+    elif defect == "altered":
+        source.write_bytes(b"modified runtime")
+    elif defect == "missing":
+        source.unlink()
+    elif defect == "extra":
+        source.with_name("unexpected.py").write_bytes(b"extra runtime")
+    elif defect == "symlink":
+        target = tmp_path / "copied.py"
+        target.write_bytes(source.read_bytes())
+        source.unlink()
+        source.symlink_to(target)
+    elif defect == "directory_symlink":
+        target = tmp_path / "copied-package"
+        source.parent.rename(target)
+        source.parent.symlink_to(target, target_is_directory=True)
+    elif defect == "wheel_symlink":
+        path = Path(binding["wheel"]["path"])
+        target = path.with_name("copied.whl")
+        path.rename(target)
+        path.symlink_to(target)
+    elif defect == "orphan_bytecode":
+        path = source.parent / "__pycache__" / "orphan.cpython-313.pyc"
+        path.parent.mkdir()
+        path.write_bytes(b"orphan bytecode")
+    elif defect == "tampered_bytecode":
+        cache = Path(importlib.util.cache_from_source(str(source)))
+        cache.parent.mkdir()
+        cache.write_bytes(importlib.util.MAGIC_NUMBER + bytes(12) + marshal.dumps(
+            compile("unexpected = True\n", str(source), "exec"),
+        ))
+    elif defect == "metadata":
+        (dist / "METADATA").write_bytes(b"Version: 0.29.11\n")
+    elif defect == "installer_extra":
+        (dist / "unexpected.pth").write_bytes(b"unexpected")
+    elif defect == "wrong_origin":
+        runner.sys.modules["auto_zettelkasten.shadow"] = SimpleNamespace(
+            __file__=str(tmp_path / "shadow.py"),
+            __spec__=SimpleNamespace(origin=str(tmp_path / "shadow.py")),
+        )
+    elif defect == "wrong_site":
+        monkeypatch.setattr(runner.sysconfig, "get_path", lambda key: str(tmp_path / "elsewhere"))
+    elif defect == "wrong_gate":
+        settings = runner.GateSettings(**{
+            name: "another_controlled_gate" if name == "stage" else getattr(settings, name)
+            for name in settings.__slots__
+        })
+        payload["gate"] = settings.manifest_binding()
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    events: list[str] = []
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> None:
+        events.append("called")
+        raise AssertionError("runtime must be checked before reservation or map")
+
+    with pytest.raises((ValueError, RuntimeError), match="installed runtime"):
+        runner.run_gate(
+            mode="run", manifest_path=manifest, manifest_sha256=sha256_file(manifest),
+            authorization_path=tmp_path / "unused-auth.json", authorization_sha256="1" * 64,
+            execute=True, settings=settings, repository_probe=_clean_repo,
+            attempt_guard_factory=forbidden, map_runner=forbidden,
+        )
+    assert events == []
+    assert not (manifest.parent / settings.attempt_ledger_name).exists()
+
+
+def test_installed_controlled_pdf_run_and_replay_recheck_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, payload, site = _installed_runtime(tmp_path, monkeypatch)
+    authorization, authorization_sha256 = _authorization(tmp_path)
+    settings = runner.CONTROLLED_PDF_GATE
+    workspace = manifest.parent
+    run_id = payload["run_id"]
+    run_root = workspace / "11_state" / "runs" / run_id
+    events: list[tuple[Any, ...]] = []
+    acceptance = {"source_attempt_count": 1, "relationship_attempt_count": 0, "total_attempt_count": 1}
+    monkeypatch.setattr(runner, "_acceptance", lambda *args: ([], acceptance))
+    monkeypatch.setattr(runner, "_attempts", lambda *args: (
+        {"count": int((run_root / "inventory.json").is_file()), "rows": []},
+        {"count": 0, "rows": []},
+    ))
+
+    def factory(*_args: Any, **kwargs: Any) -> _FakeAttemptGuard:
+        assert kwargs["total_attempt_limit"] == 1
+        assert kwargs["source_attempt_limit"] == 1
+        assert kwargs["relationship_attempt_limit"] == 0
+        events.append(("start",))
+        return _FakeAttemptGuard(events)
+
+    def fake_map(request: Any, *, resume: bool, reader: Any, **_kwargs: Any) -> Any:
+        assert Path(request.workspace) == workspace
+        events.append(("map", resume))
+        if resume:
+            assert isinstance(reader, runner._ReplayCodexReader)
+            assert isinstance(reader.attempt_guard, CodexAttemptDeny)
+            return read_yaml(run_root / "run_report.yml")
+        assert isinstance(reader, runner._ControlledPdfReader)
+        run_root.mkdir(parents=True)
+        (run_root / "inventory.json").write_text("[]\n")
+        report = {"status": "completed", **acceptance}
+        write_yaml(run_root / "run_report.yml", report)
+        return report
+
+    kwargs = dict(
+        manifest_path=manifest, manifest_sha256=sha256_file(manifest),
+        execute=True, settings=settings, repository_probe=_clean_repo, map_runner=fake_map,
+    )
+    _, first = runner.run_gate(
+        mode="run", authorization_path=authorization,
+        authorization_sha256=authorization_sha256, attempt_guard_factory=factory, **kwargs,
+    )
+    assert first["status"] == "passed"
+    _, replay = runner.run_gate(mode="replay", **kwargs)
+    assert replay["status"] == "passed"
+    assert replay["exact_zero_call_replay"] is True
+    assert replay["semantic_changed_paths"] == []
+    assert first["installed_runtime"] == replay["installed_runtime"]
+    assert events == [("start",), ("activate",), ("map", False), ("finish", "passed", ""), ("map", True)]
+    before = runner._gate_snapshot(workspace)
+    (site / "auto_zettelkasten" / "__init__.py").write_bytes(b"changed after run")
+    with pytest.raises(ValueError, match="installed runtime"):
+        runner.run_gate(mode="replay", **kwargs)
+    assert len(events) == 5
+    assert runner._gate_snapshot(workspace) == before
 
 
 def test_controlled_pdf_reader_sends_verified_custody_pdf_with_empty_text(

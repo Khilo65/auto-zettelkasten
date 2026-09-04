@@ -6,17 +6,22 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import importlib.util
 import json
+import marshal
 import os
 import re
 import signal
 import subprocess
+import sys
+import sysconfig
 import threading
 import time
 from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
+from email.parser import BytesParser
 from pathlib import Path
 from typing import Any
 
@@ -370,7 +375,174 @@ def _mapping(value: Any, *, label: str) -> dict[str, Any]:
     return dict(value)
 
 
-def _verify_runtime_import_root() -> None:
+def _verify_runtime_import_root(
+    manifest: Mapping[str, Any] | None = None, settings: GateSettings = FOUR_PDF_GATE,
+) -> dict[str, Any] | None:
+    if manifest is not None and "installed_runtime" in manifest:
+        from v030_release_quality_audit import _MAX_ARCHIVE_BYTES, _archive_files
+
+        if settings != CONTROLLED_PDF_GATE:
+            raise ValueError("installed runtime is supported only by the controlled PDF gate")
+        binding = _mapping(manifest["installed_runtime"], label="installed runtime")
+        if set(binding) != {"schema_version", "wheel", "package_audit"} or binding["schema_version"] != "1":
+            raise ValueError("installed runtime binding schema is invalid")
+        paths: dict[str, Path] = {}
+        for key in ("wheel", "package_audit"):
+            item = _mapping(binding[key], label=f"installed runtime {key}")
+            if (
+                set(item) != {"path", "sha256"}
+                or not isinstance(item["path"], str)
+                or not isinstance(item["sha256"], str)
+                or not _SHA256.fullmatch(item["sha256"])
+            ):
+                raise ValueError("installed runtime artifact binding is invalid")
+            path = Path(item["path"]).expanduser()
+            if (
+                not path.is_absolute()
+                or any(part.is_symlink() for part in (path, *path.parents))
+                or not path.is_file()
+            ):
+                raise ValueError("installed runtime artifacts must be absolute regular files without symlinks")
+            path = _private(path, label=f"installed runtime {key}")
+            if sha256_file(path) != item["sha256"]:
+                raise ValueError("installed runtime artifact SHA-256 mismatch")
+            paths[key] = path
+        try:
+            audit = _mapping(read_yaml(paths["package_audit"]), label="installed runtime package audit")
+        except Exception:
+            raise ValueError("installed runtime package audit is unreadable") from None
+        if (
+            audit.get("package_audit_schema_version") != "1"
+            or audit.get("status") != "passed"
+            or audit.get("repository_dirty") is not False
+            or audit.get("provider_calls") != 0
+            or audit.get("repository_head") != manifest["code_commit"]
+            or audit.get("distribution") != "auto-zettelkasten"
+            or audit.get("version") != "0.30.0"
+            or audit.get("findings") != []
+            or audit.get("wheel") != binding["wheel"]
+        ):
+            raise ValueError("installed runtime requires a clean passed exact-commit package audit")
+        wheel = paths["wheel"]
+        if wheel.name != "auto_zettelkasten-0.30.0-py3-none-any.whl":
+            raise ValueError("installed runtime wheel identity is invalid")
+        files = _archive_files(wheel, wheel=True)
+        package = "auto_zettelkasten"
+        dist = "auto_zettelkasten-0.30.0.dist-info"
+        metadata = BytesParser().parsebytes(files.get(f"{dist}/METADATA", b""))
+        if (
+            set(Path(name).parts[0] for name in files) != {package, dist}
+            or f"{package}/__init__.py" not in files
+            or metadata.get("Name") != "auto-zettelkasten"
+            or metadata.get("Version") != "0.30.0"
+            or auto_zettelkasten.ENGINE_VERSION != "0.30.0"
+            or auto_zettelkasten.__version__ != "0.30.0"
+        ):
+            raise ValueError("installed runtime package or version is invalid")
+        site_path = Path(sysconfig.get_path("purelib"))
+        site = _private(site_path, label="installed runtime site-packages")
+        module_file = getattr(auto_zettelkasten, "__file__", None)
+        if (
+            site_path.is_symlink()
+            or not module_file
+            or Path(module_file).resolve() != site / package / "__init__.py"
+            or set(site.glob("auto_zettelkasten-*.dist-info")) != {site / dist}
+        ):
+            raise ValueError("installed runtime is not the active interpreter's inspected installation")
+        allowed_directories = {
+            str(parent) for name in files for parent in Path(name).parents
+            if str(parent) != "."
+        }
+        caches = {
+            Path(importlib.util.cache_from_source(str(site / name), optimization=level)).relative_to(site).as_posix()
+            for name in files if name.startswith(f"{package}/") and name.endswith(".py")
+            for level in ("", "1", "2")
+        }
+        allowed_directories.update(str(Path(name).parent) for name in caches)
+        bookkeeping = {f"{dist}/{name}" for name in ("INSTALLER", "REQUESTED", "direct_url.json")}
+        found: set[str] = set()
+        for root in (site / package, site / dist):
+            if root.is_symlink() or not root.is_dir():
+                raise ValueError("installed runtime package directory is missing or a symlink")
+            for path in root.rglob("*"):
+                name = path.relative_to(site).as_posix()
+                if path.is_symlink() or not (path.is_file() or path.is_dir()):
+                    raise ValueError("installed runtime contains a symlink or non-regular file")
+                if path.is_dir():
+                    if name not in allowed_directories:
+                        raise ValueError("installed runtime contains an unexpected directory")
+                    continue
+                if name in files:
+                    found.add(name)
+                    if name != f"{dist}/RECORD" and (
+                        path.stat().st_size != len(files[name]) or path.read_bytes() != files[name]
+                    ):
+                        raise ValueError("installed runtime file differs from inspected wheel")
+                elif name not in caches | bookkeeping:
+                    raise ValueError("installed runtime contains an unexpected file")
+                elif name in caches:
+                    source = Path(importlib.util.source_from_cache(str(path)))
+                    level = 1 if name.endswith(".opt-1.pyc") else 2 if name.endswith(".opt-2.pyc") else 0
+                    expected_code = compile(
+                        files[source.relative_to(site).as_posix()], str(source), "exec",
+                        dont_inherit=True, optimize=level,
+                    )
+                    try:
+                        if path.stat().st_size > _MAX_ARCHIVE_BYTES:
+                            raise ValueError("bytecode exceeds inspection ceiling")
+                        data = path.read_bytes()
+                        code = marshal.loads(data[16:])
+                        valid = (
+                            data[:4] == importlib.util.MAGIC_NUMBER
+                            and code == expected_code
+                            and code.co_filename == expected_code.co_filename
+                        )
+                    except (EOFError, TypeError, ValueError):
+                        valid = False
+                    if not valid:
+                        raise ValueError("installed runtime bytecode differs from inspected source")
+                elif name == f"{dist}/INSTALLER" and path.read_bytes() not in {b"pip\n", b"uv\n"}:
+                    raise ValueError("installed runtime installer record is invalid")
+                elif name == f"{dist}/REQUESTED" and path.read_bytes():
+                    raise ValueError("installed runtime requested record is invalid")
+                elif name == f"{dist}/direct_url.json":
+                    try:
+                        direct = json.loads(path.read_text(encoding="utf-8"))
+                        archive = direct["archive_info"]
+                        valid = (
+                            isinstance(direct, Mapping)
+                            and isinstance(archive, Mapping)
+                            and set(direct) == {"url", "archive_info"}
+                            and direct["url"] == wheel.as_uri()
+                            and bool(archive)
+                            and set(archive) <= {"hash", "hashes"}
+                            and archive.get("hash", f"sha256={binding['wheel']['sha256']}") == f"sha256={binding['wheel']['sha256']}"
+                            and archive.get("hashes", {"sha256": binding["wheel"]["sha256"]}) == {"sha256": binding["wheel"]["sha256"]}
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        valid = False
+                    if not valid:
+                        raise ValueError("installed runtime direct URL record does not match the wheel")
+        if found != set(files):
+            raise ValueError("installed runtime is missing an inspected wheel file")
+        for name, module in tuple(sys.modules.items()):
+            if name != package and not name.startswith(f"{package}."):
+                continue
+            origin = getattr(module, "__file__", None)
+            spec_origin = getattr(getattr(module, "__spec__", None), "origin", None)
+            candidates = {name.replace(".", "/") + ending for ending in (".py", "/__init__.py")} & files.keys()
+            if (
+                not origin or not spec_origin
+                or Path(origin).resolve() not in {site / candidate for candidate in candidates}
+                or Path(spec_origin).resolve() != Path(origin).resolve()
+            ):
+                raise ValueError("installed runtime has a package module loaded from another origin")
+        return {
+            "schema_version": "1", "version": "0.30.0",
+            "wheel_sha256": binding["wheel"]["sha256"],
+            "package_audit_sha256": binding["package_audit"]["sha256"],
+            "package_file_count": sum(name.startswith(f"{package}/") for name in files),
+        }
     expected = (_REPOSITORY_ROOT / "src" / "auto_zettelkasten").resolve()
     module_file = getattr(auto_zettelkasten, "__file__", None)
     actual = Path(module_file).resolve().parent if module_file else None
@@ -2603,12 +2775,12 @@ def run_gate(
 ) -> tuple[Path, dict[str, Any]]:
     """Prepare, execute, resume, or exactly replay the private four-PDF gate."""
 
-    _verify_runtime_import_root()
     if mode not in {"prepare", "run", "resume", "replay", "revalidate"}:
         raise ValueError("mode must be prepare, run, resume, replay, or revalidate")
     manifest, cases, workspace = _validated_manifest(
         manifest_path, manifest_sha256, settings
     )
+    installed_runtime = _verify_runtime_import_root(manifest, settings)
     assert_compatible(workspace)
     request = _request(manifest, workspace, settings)
     evaluation_id = str(manifest["evaluation_id"])
@@ -2633,6 +2805,8 @@ def run_gate(
         "cluster_generation_enabled": settings.clusters_enabled,
         "case_count": len(cases),
     }
+    if installed_runtime is not None:
+        base["installed_runtime"] = installed_runtime
 
     def evaluate(run_report: Mapping[str, Any]) -> tuple[list[str], dict[str, Any]]:
         errors, acceptance = _acceptance(
