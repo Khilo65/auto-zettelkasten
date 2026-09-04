@@ -557,6 +557,112 @@ def test_strategic8_packet_requires_two_independent_full_reviewers(
     assert failed["checks"]["no_reviewer_disagreements"] is False
 
 
+@pytest.mark.parametrize("mode", ["strategic8", "exhaustive40", "stratified500"])
+def test_empty_decision_review_is_optional_only_for_full_small_sample_audits(
+    tmp_path: Path, mode: str,
+) -> None:
+    workspace = (
+        _strategic8_workspace(tmp_path)[0]
+        if mode == "strategic8"
+        else _workspace(tmp_path, source_count=40 if mode == "exhaustive40" else 500)
+    )
+    typed_path = workspace / "02_source_memory" / "indexes" / "typed_links.yml"
+    typed = read_yaml(typed_path)
+    typed["pair_decisions"] = [
+        row for row in typed["pair_decisions"]
+        if row["decision_status"] == "accepted" or not row["active"]
+    ]
+    write_yaml(typed_path, typed)
+    private = tmp_path / "private-review"
+    packet_path = private / "packet.yml"
+    kwargs = {}
+    if mode == "exhaustive40":
+        baseline, manifest, custody = _exhaustive_inputs(tmp_path, workspace)
+        kwargs = {
+            "baseline_workspace": baseline,
+            "baseline_manifest_path": manifest,
+            "custody_manifest_path": custody,
+            "bindings_path": private / "bindings.yml",
+        }
+    protected = {
+        path: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in workspace.rglob("*") if path.is_file()
+    }
+    if mode == "stratified500":
+        with pytest.raises(ValueError, match="requires rejected or unclustered decisions"):
+            audit_tool.prepare(workspace, mode, packet_path)
+    else:
+        packet = audit_tool.prepare(workspace, mode, packet_path, **kwargs)
+        assert packet["selection_counts"]["rejected_or_unclustered"] == 0
+        review = (
+            _completed_strategic8_review(packet_path, packet)
+            if mode == "strategic8"
+            else _completed_review(packet_path, packet)
+        )
+        review_path = private / "review.yml"
+        write_yaml(review_path, review)
+        report = audit_tool.score(
+            workspace, packet_path, review_path, private / "report.yml",
+            bindings_path=kwargs.get("bindings_path"),
+        )
+        assert report["status"] == "passed"
+        if mode == "exhaustive40":
+            assert report["metrics"]["rejected_unclustered_reviewed"] == 0
+            assert report["metrics"]["rejected_unclustered_accuracy"] is None
+            assert "rejected_unclustered_accuracy_at_least_0_90" not in report["checks"]
+        judgment = review["judgments"][0]
+        judgment["material_error"] = True
+        judgment.pop("judgment_sha256")
+        judgment["judgment_sha256"] = audit_tool._digest(judgment)
+        write_yaml(review_path, review)
+        failed = audit_tool.score(
+            workspace, packet_path, review_path, private / "failed.yml",
+            bindings_path=kwargs.get("bindings_path"),
+        )
+        assert failed["status"] == "failed"
+        assert failed["metrics"]["material_error_count"] == 1
+    assert protected == {
+        path: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in workspace.rglob("*") if path.is_file()
+    }
+
+
+@pytest.mark.parametrize("mode", ["exhaustive40", "stratified500"])
+def test_nonempty_decision_reviews_still_require_ninety_percent_accuracy(
+    tmp_path: Path, mode: str,
+) -> None:
+    workspace = _workspace(tmp_path, source_count=40 if mode == "exhaustive40" else 500)
+    private = tmp_path / "private-review"
+    packet_path = private / "packet.yml"
+    kwargs = {}
+    if mode == "exhaustive40":
+        baseline, manifest, custody = _exhaustive_inputs(tmp_path, workspace)
+        kwargs = {
+            "baseline_workspace": baseline,
+            "baseline_manifest_path": manifest,
+            "custody_manifest_path": custody,
+            "bindings_path": private / "bindings.yml",
+        }
+    packet = audit_tool.prepare(workspace, mode, packet_path, **kwargs)
+    review = _completed_review(packet_path, packet)
+    decisions = [row for row in review["judgments"]
+                 if row["review_id"].startswith("rejected_or_unclustered-")]
+    assert len(decisions) == 20
+    for row in decisions[:3]:
+        row["decision_correct"] = False
+        row.pop("judgment_sha256")
+        row["judgment_sha256"] = audit_tool._digest(row)
+    review_path = private / "review.yml"
+    write_yaml(review_path, review)
+    report = audit_tool.score(
+        workspace, packet_path, review_path, private / "report.yml",
+        bindings_path=kwargs.get("bindings_path"),
+    )
+    assert report["status"] == "failed"
+    assert report["metrics"]["rejected_unclustered_accuracy"] == 0.85
+    assert report["checks"]["rejected_unclustered_accuracy_at_least_0_90"] is False
+
+
 def test_strategic8_metadata_diagnostics_match_imported_keys_and_are_hash_bound(
     tmp_path: Path,
 ) -> None:

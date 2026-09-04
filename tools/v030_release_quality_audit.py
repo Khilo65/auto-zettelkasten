@@ -1936,7 +1936,7 @@ def prepare(
         )
         for row in cluster_registry.get("rejected_proposals", []) or []
     )
-    if not decisions:
+    if not decisions and not full_graph:
         raise ValueError("review requires rejected or unclustered decisions")
     if not full_graph:
         decisions = _balanced_limit(
@@ -2538,7 +2538,8 @@ def score(
         },
         "type_direction_accuracy": _rate(type_direction),
         "role_accuracy": _rate(roles),
-        "rejected_unclustered_accuracy": _rate(decisions),
+        "rejected_unclustered_reviewed": len(decisions),
+        "rejected_unclustered_accuracy": _rate(decisions) if decisions else None,
         "cluster_coherence_accuracy": _rate(cluster_coherence),
         "severe_overmerge_count": sum(severe_overmerges),
         "source_grounded_rate": _rate(source_grounded),
@@ -2564,16 +2565,14 @@ def score(
         "type_direction_accuracy_at_least_0_90": metrics["type_direction_accuracy"]
         >= 0.90,
         "role_accuracy_at_least_0_90": metrics["role_accuracy"] >= 0.90,
-        "rejected_unclustered_accuracy_at_least_0_90": metrics[
-            "rejected_unclustered_accuracy"
-        ]
-        >= 0.90,
         "cluster_coherence_at_least_0_90": metrics["cluster_coherence_accuracy"]
         >= 0.90,
         "no_severe_overmerges": metrics["severe_overmerge_count"] == 0,
         "source_grounded_rate_at_least_0_90": metrics["source_grounded_rate"] >= 0.90,
         "all_audited_syntheses_supported": bool(supported) and all(supported),
     }
+    if decisions or packet["mode"] == "stratified500":
+        checks["rejected_unclustered_accuracy_at_least_0_90"] = _rate(decisions) >= 0.90
     if packet["mode"] == "exhaustive40":
         checks.update(
             {
