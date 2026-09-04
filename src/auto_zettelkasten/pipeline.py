@@ -12935,7 +12935,7 @@ def rebuild_map(
         existing_clusters,
         collection_snapshot=collection_snapshot,
         identity_projection=identity_projection,
-        write_cluster_outputs=clusters_enabled,
+        write_cluster_outputs=False,
     )
     catalogue_payload = read_yaml(Path(str(catalogue["catalogue_path"])), {}) or {}
     collection_rows = [

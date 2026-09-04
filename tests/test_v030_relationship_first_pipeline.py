@@ -27,6 +27,7 @@ from auto_zettelkasten.pipeline import (
     _workspace_graph_inputs,
 )
 from auto_zettelkasten.profiles import deterministic_profile, profile_to_dict
+from auto_zettelkasten.readers import ProviderTimeout
 from auto_zettelkasten.relationships import persist_relationship_registry
 from auto_zettelkasten.workspace import initialize
 
@@ -601,6 +602,39 @@ def test_clusters_off_receipt_replay_rejects_changed_protected_state(
         )
 
     assert reasoner.adjudication_calls == calls
+
+
+def test_fresh_map_family_timeout_preserves_absent_cluster_outputs(
+    tmp_path: Path,
+    sample_items: list[dict[str, Any]],
+    monkeypatch,
+) -> None:
+    reasoner = _RelationshipReasoner()
+
+    def timed_out(*args: Any, **kwargs: Any) -> None:
+        raise ProviderTimeout("synthetic family planning timeout")
+
+    monkeypatch.setattr(pipeline_module, "_plan_literature_families", timed_out)
+    result = run_map(
+        MapRequest(
+            tmp_path,
+            provider="ollama",
+            model="fake-1",
+            literature_policy=LiteratureMappingPolicy(cluster_generation_enabled=True),
+        ),
+        client=FakeZotero(sample_items),
+        reader=FakeReader(),
+        literature_reasoner=reasoner,
+        run_id="fresh-family-timeout",
+    )
+
+    assert result.status == "partial"
+    assert result.literature_packet["retry_on_resume"] is True
+    assert result.cluster_map["preservation"]["status"] == "verified"
+    assert reasoner.candidate_calls == reasoner.cluster_calls == 0
+    index_root = tmp_path / "02_source_memory" / "indexes"
+    assert not (index_root / "cluster_catalogue.yml").exists()
+    assert not (index_root / "CLUSTERS.md").exists()
 
 
 def test_clusters_off_partial_relationship_stage_preserves_protected_state(
