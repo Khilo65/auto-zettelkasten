@@ -70,6 +70,9 @@ ACCESS_MARKERS = (
 _ARTICLE_SECTION_MARKERS = ("introduction", "methods", "methodology", "results", "discussion", "conclusion")
 _ABSTRACT_META_NAMES = ("citation_abstract", "dc.description", "dcterms.abstract", "prism.abstract")
 _DESCRIPTION_META_NAMES = ("description", "og:description", "twitter:description")
+_HTML_VOID_ELEMENTS = frozenset(
+    "area base br col embed hr img input link meta param source track wbr".split()
+)
 # ponytail: global PDFium lock; use a renderer process if PDF-heavy throughput becomes limiting.
 _PDFIUM_RENDER_LOCK = threading.Lock()
 
@@ -270,11 +273,20 @@ class _HTMLTextExtractor(HTMLParser):
         self.article_paragraph_count = 0
         self.heading_count = 0
         self.article_heading_count = 0
+        self.heading_spans: list[dict[str, str]] | None = []
+        self._heading_tag = ""
+        self._heading_parts: list[str] = []
+        self._heading_hidden_tags: list[str] = []
         self.selected_option_parts: list[str] | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
         attributes = {str(key).casefold(): str(value or "") for key, value in attrs}
+        if (
+            self._heading_hidden_tags or "hidden" in attributes
+            or attributes.get("aria-hidden", "").strip().casefold() == "true"
+        ) and tag not in _HTML_VOID_ELEMENTS:
+            self._heading_hidden_tags.append(tag)
         if tag == "option":
             self._finish_selected_option()
         if tag in {"script", "style", "noscript"}:
@@ -299,6 +311,13 @@ class _HTMLTextExtractor(HTMLParser):
             self.heading_count += 1
             if self.article_depth:
                 self.article_heading_count += 1
+            if self._heading_tag:
+                self.heading_spans = None
+            if not self.hidden_depth and not self._heading_hidden_tags:
+                self._heading_tag = tag
+                self._heading_parts = []
+        if tag == "br" and self._heading_tag and not self.hidden_depth and not self._heading_hidden_tags:
+            self._heading_parts.append(" ")
         identity = f"{attributes.get('id', '')} {attributes.get('class', '')}".casefold()
         if "abstract" in identity:
             self._abstract_containers.append(tag)
@@ -311,6 +330,26 @@ class _HTMLTextExtractor(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
+        if self._heading_hidden_tags and tag not in _HTML_VOID_ELEMENTS:
+            if tag == self._heading_hidden_tags[-1]:
+                self._heading_hidden_tags.pop()
+            else:
+                self.heading_spans = None
+        if (
+            tag in {"h1", "h2", "h3", "h4", "h5", "h6"}
+            and self._heading_tag and tag != self._heading_tag
+        ):
+            self.heading_spans = None
+        if tag == self._heading_tag and not self.hidden_depth and not self._heading_hidden_tags:
+            label = " ".join("".join(self._heading_parts).split())
+            if self.heading_spans is not None and 0 < len(label) <= 180:
+                if len(self.heading_spans) < 512:
+                    self.heading_spans.append({"label": label})
+                else:
+                    # A truncated list cannot establish that a heading is unique.
+                    self.heading_spans = None
+            self._heading_tag = ""
+            self._heading_parts = []
         if tag in {"option", "select"}:
             self._finish_selected_option()
         if tag in {"script", "style", "noscript"} and self.hidden_depth:
@@ -323,6 +362,8 @@ class _HTMLTextExtractor(HTMLParser):
     def handle_data(self, data: str) -> None:
         if not self.hidden_depth:
             self.parts.append(data)
+            if self._heading_tag and not self._heading_hidden_tags:
+                self._heading_parts.append(data)
             if self.selected_option_parts is not None:
                 self.selected_option_parts.append(data)
             if self.article_depth:
@@ -332,6 +373,8 @@ class _HTMLTextExtractor(HTMLParser):
 
     def close(self) -> None:
         super().close()
+        if self._heading_tag or self._heading_hidden_tags:
+            self.heading_spans = None
         self._finish_selected_option()
 
     def _finish_selected_option(self) -> None:
@@ -630,6 +673,7 @@ def classify_html_content(
             "article_paragraph_count": parser.article_paragraph_count,
             "heading_count": parser.heading_count,
             "article_heading_count": parser.article_heading_count,
+            "heading_spans": parser.heading_spans or [],
             "visible_block_count": visible_block_count,
             "article_section_count": section_count,
             "has_article_container": parser.has_article_container,

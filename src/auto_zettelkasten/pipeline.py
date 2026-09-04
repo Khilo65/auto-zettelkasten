@@ -66,6 +66,7 @@ from .literature import (
     _provider_worker_count,
     _reasoner_packet_chars,
     _semantic_literature_policy,
+    _source_locator,
     _synthesis_failure_class,
     _synthesis_retry_on_resume,
     build_navigation_projection,
@@ -15623,6 +15624,21 @@ def _source_bundle_from_result(
     scope["source_scope"] = source_scope
     scope["evidence_eligibility"] = authoritative_eligibility
     payload["scope_assessment"] = scope
+    heading_labels = (
+        [
+            re.sub(r"\s+", " ", span["label"]).strip()
+            for span in (row.get("coverage_metrics") or {}).get("heading_spans", [])
+            if isinstance(span, Mapping) and isinstance(span.get("label"), str)
+        ]
+        if row.get("media_type") in {"text/html", "application/xhtml+xml"}
+        else []
+    )
+    heading_counts = Counter(label.casefold() for label in heading_labels)
+    unique_headings = {
+        label.casefold(): label
+        for label in heading_labels
+        if label and heading_counts[label.casefold()] == 1
+    }
     anchors = payload.get("evidence_anchors", [])
     if isinstance(anchors, list):
         normalized_anchors = []
@@ -15631,6 +15647,22 @@ def _source_bundle_from_result(
             if not isinstance(value, Mapping):
                 normalized_anchors.append(value)
                 continue
+            locator = str(value.get("locator") or "")
+            heading = unique_headings.get(
+                re.sub(r"\s+", " ", locator).strip().casefold()
+            )
+            if heading and _source_locator(locator)["kind"] == "untyped_text":
+                canonical_locator = f'Heading "{heading}"'
+                value = {
+                    **value,
+                    "locator": canonical_locator,
+                    "locators": [
+                        canonical_locator
+                        if re.sub(r"\s+", " ", str(item)).strip().casefold() == heading.casefold()
+                        else item
+                        for item in value.get("locators", []) or []
+                    ],
+                }
             anchor = _normalized_bundle_evidence_anchor(
                 value,
                 expected_source_id=expected_source_id,
@@ -18661,7 +18693,7 @@ def _normalized_support_envelope(
             else "conceptual"
             if any(token in argument for token in ("concept", "theor", "claim", "thesis"))
             else "interpretive"
-            if argument
+            if argument and argument != "none"
             else "none"
         ),
         "coverage": (

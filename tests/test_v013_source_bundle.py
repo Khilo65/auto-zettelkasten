@@ -890,6 +890,72 @@ def test_pipeline_does_not_reinsert_rejected_optional_rows() -> None:
     )
 
 
+def test_native_html_heading_reaches_cluster_admission_without_weak_locator_promotion() -> None:
+    from auto_zettelkasten.extraction import extract_bytes
+    from auto_zettelkasten.literature import (
+        _anchor_is_synthesis_eligible,
+        _global_plan_proposals,
+        normalize_evidence_profiles,
+    )
+    from auto_zettelkasten.pipeline import _source_read_metadata_hash, _source_reader_metadata
+
+    heading = "Specific monitoring mechanisms"
+    raw = (
+        f'<h4>{heading}</h4><p>Monitoring changes implementation.</p>'
+        '<h4>Ambiguous source heading</h4><h4>Ambiguous source heading</h4>'
+        '<h4>Detailed Findings</h4><h4>Methods</h4>'
+    )
+    extracted = extract_bytes(raw.encode(), media_type="text/html", filename="source.html")
+    row = {
+        "source_id": "source-zotero-A1", "zotero_item_key": "A1",
+        "media_type": "text/html", "text": extracted.text,
+        "coverage_metrics": extracted.coverage_metrics,
+    }
+    metadata = _source_reader_metadata({}, row["source_id"], "A1", row)
+    assert _source_read_metadata_hash(metadata) != _source_read_metadata_hash(
+        _source_reader_metadata({}, row["source_id"], "A1", {**row, "coverage_metrics": {}})
+    )
+    payload = _bundle_payload()
+    anchor = payload["evidence_anchors"][0]
+    anchor.update(locator=heading, locators=[heading])
+    bundle = _source_bundle_from_result(payload, row, "full_document")
+    assert bundle is not None
+    assert bundle.evidence_anchors[0].locator == f'Heading "{heading}"'
+    assert bundle.evidence_anchors[0].locators == [f'Heading "{heading}"']
+    assert bundle.evidence_anchors[0].support_envelope.argument_role == "none"
+    replayed = _source_bundle_from_result(bundle.to_dict(), row, "full_document")
+    assert replayed is not None and replayed.semantic_dict() == bundle.semantic_dict()
+    source_profile = {
+        "source_id": row["source_id"], "note_id": "note-a",
+        "note_status": "analytical_atomic_note",
+        "evidence_eligibility": "substantive_bounded",
+        "evidence_anchors": [value.to_dict() for value in bundle.evidence_anchors],
+    }
+    profiles = normalize_evidence_profiles([source_profile, {
+        **source_profile, "source_id": "source-b", "note_id": "note-b",
+        "evidence_anchors": [{
+            **source_profile["evidence_anchors"][0], "source_id": "source-b",
+            "evidence_anchor_id": "anchor-b", "locator": "p. 2", "locators": ["p. 2"],
+        }],
+    }])
+    assert _anchor_is_synthesis_eligible(profiles[0]["claims"][0])
+    proposal = {"clusters": [{
+        "cluster_id": "native-heading", "shared_question": "How does monitoring work?",
+        "members": [{"source_id": profile["source_id"], "role": "core",
+                     "evidence_anchor_ids": [profile["claims"][0]["evidence_anchor_id"]]}
+                    for profile in profiles],
+    }]}
+    admitted, _parked, _neighbors, _unclustered = _global_plan_proposals(proposal, profiles)
+    assert admitted[0]["source_roles"] == {row["source_id"]: "core", "source-b": "core"}
+    for locator in ("Ambiguous source heading", "Unverified source heading", "Detailed Findings", "Methods"):
+        anchor.update(locator=locator, locators=[locator])
+        unchanged = _source_bundle_from_result(payload, row, "full_document")
+        assert unchanged is not None and unchanged.evidence_anchors[0].locator == locator
+    anchor.update(locator=heading, locators=[heading])
+    legacy = _source_bundle_from_result(payload, {**row, "coverage_metrics": {}}, "full_document")
+    assert legacy is not None and legacy.evidence_anchors[0].locator == heading
+
+
 def test_pipeline_rehydrates_safe_same_source_evidence_diagnostics_idempotently() -> None:
     payload = _bundle_payload()
     payload["evidence_anchors"] = []

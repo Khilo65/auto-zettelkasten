@@ -46,6 +46,40 @@ def test_blank_pdf_is_classified_for_vision_or_review_parking() -> None:
     assert result.reason in {"empty_or_scanned_pdf", "pdf_error:PdfStreamError"}
 
 
+def test_html_preserves_bounded_visible_native_heading_labels() -> None:
+    raw = (
+        '<h4>Specific <em>source</em> &amp; evidence</h4>'
+        '<noscript><h2>Hidden source heading</h2></noscript>'
+        '<h5>Repeated source heading</h5><h5>Repeated source heading</h5>'
+        f'<h6>{"x" * 181}</h6>'
+    )
+    result = extract_bytes(raw.encode(), media_type="text/html", filename="source.html")
+    assert result.coverage_metrics["heading_spans"] == [
+        {"label": "Specific source & evidence"},
+        {"label": "Repeated source heading"},
+        {"label": "Repeated source heading"},
+    ]
+    bounded = classify_html_content('<h4>Specific source heading</h4>' * 513)
+    assert bounded.metrics["heading_spans"] == []  # Truncation cannot establish uniqueness.
+    for malformed in (
+        '<h4>Repeated<h5>Nested</h5></h4><h4>Repeated</h4>',
+        '<h4>Repeated</h3><h4>Repeated</h4>',
+        '<h4>Repeated</h4><h4>Repeated',
+    ):
+        assert classify_html_content(malformed).metrics["heading_spans"] == []
+    visible = classify_html_content(
+        '<h4 hidden>Hidden title</h4>'
+        '<div hidden><div><input/><br/><h4>Hidden title</h4></div></div>'
+        '<input hidden><h4>Specific<br>source mechanisms</h4>'
+        '<h4>Native<span hidden> hidden</span> heading</h4>'
+        '<h4>Specific<noscript><br></noscript>source mechanisms</h4>'
+    )
+    assert visible.metrics["heading_spans"] == [
+        {"label": "Specific source mechanisms"}, {"label": "Native heading"},
+        {"label": "Specificsource mechanisms"},
+    ]
+
+
 def test_readable_pdf_extracts_text() -> None:
     result = extract_bytes(
         _minimal_pdf("Readable synthetic PDF content " * 55),
