@@ -15793,6 +15793,10 @@ def _source_bundle_from_result(
                         {"evidence_anchors": [anchor]}, row
                     )
                 except SourceBundleQuantitativeProvenanceError as exc:
+                    if str(exc) == "footnote_scope_combines_marked_and_unmarked_quantities":
+                        # The same scope may survive in prose; dropping only its
+                        # numeric anchor cannot establish that the note is safe.
+                        raise
                     rejected.append(
                         {
                             "component": "evidence_anchors",

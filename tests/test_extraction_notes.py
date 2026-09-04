@@ -46,6 +46,22 @@ def test_blank_pdf_is_classified_for_vision_or_review_parking() -> None:
     assert result.reason in {"empty_or_scanned_pdf", "pdf_error:PdfStreamError"}
 
 
+@pytest.mark.parametrize("level", range(1, 7))
+def test_html_keeps_every_heading_level_separate_from_adjacent_paragraphs(level) -> None:
+    raw = (
+        "<article><p>Background sentence.</p>"
+        f"<h{level}>Measurement design</h{level}>"
+        "<p>Researchers surveyed 640 people.</p>"
+        f"<h{level}>Results</h{level}>"
+        "<p>The score increased.</p></article>"
+    )
+    result = extract_bytes(raw.encode(), media_type="text/html", filename="source.html")
+    assert [line.strip() for line in result.text.splitlines() if line.strip()] == [
+        "Background sentence.", "Measurement design",
+        "Researchers surveyed 640 people.", "Results", "The score increased.",
+    ]
+
+
 def test_html_preserves_bounded_visible_native_heading_labels() -> None:
     raw = (
         '<h4>Specific <em>source</em> &amp; evidence</h4>'

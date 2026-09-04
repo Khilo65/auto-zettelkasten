@@ -5241,6 +5241,54 @@ def test_quantitative_provenance_isolates_bad_rows_in_rich_bundle() -> None:
     assert replayed.component_diagnostics == bundle.component_diagnostics
 
 
+def test_quantitative_provenance_does_not_salvage_uncertain_footnote_prose() -> None:
+    payload = _bundle_payload()
+    supported = deepcopy(payload["evidence_anchors"][0])
+    supported.update(
+        claim="The source reports 47 shipments per hour in the first three days.",
+        quantitative_result={
+            "estimate": "47", "period": "first three days",
+            "provenance": "source_reported",
+        },
+    )
+    unsupported = deepcopy(supported)
+    unsupported.update(
+        evidence_anchor_id="anchor-unmarked",
+        claim="The source reports 19 arrivals per hour in the first three days.",
+        quantitative_result={
+            "estimate": "19", "period": "first three days",
+            "provenance": "source_reported",
+        },
+    )
+    row = {
+        "source_id": "source-zotero-A1", "zotero_item_key": "A1",
+        "text": (
+            "Hourly rates:\n19 arrivals.\n47 shipments*.\n"
+            "*Based on the first three days."
+        ),
+    }
+    payload["evidence_anchors"] = [supported, unsupported]
+    for caveat in (
+        "All hourly rates describe the first three days.",
+        "All rates, including 47 shipments, describe the first three days.",
+        "The shipment rate covers the first three days.",
+    ):
+        payload["analysis_sections"]["limitations"] = caveat
+        with pytest.raises(
+            SourceBundleQuantitativeProvenanceError,
+            match="footnote_scope_combines_marked_and_unmarked_quantities",
+        ):
+            _source_bundle_from_result(payload, row, "full_document")
+    # Supported prose is not guessed away: with valid anchors the bundle is intact.
+    payload["evidence_anchors"] = [supported]
+    accepted = _source_bundle_from_result(payload, row, "full_document")
+    assert accepted is not None
+    assert all(
+        accepted.analysis_sections[key] == value
+        for key, value in payload["analysis_sections"].items()
+    )
+
+
 def test_quantitative_provenance_keeps_all_invalid_bundle_fail_closed() -> None:
     payload = _bundle_payload()
     first = payload["evidence_anchors"][0]

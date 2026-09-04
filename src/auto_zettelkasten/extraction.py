@@ -321,7 +321,7 @@ class _HTMLTextExtractor(HTMLParser):
         identity = f"{attributes.get('id', '')} {attributes.get('class', '')}".casefold()
         if "abstract" in identity:
             self._abstract_containers.append(tag)
-        if tag in {"p", "br", "div", "section", "article", "main", "li", "h1", "h2", "h3"}:
+        if tag in {"p", "br", "div", "section", "article", "main", "li", "h1", "h2", "h3", "h4", "h5", "h6"}:
             self.parts.append("\n")
             if self.article_depth:
                 self.article_parts.append("\n")
