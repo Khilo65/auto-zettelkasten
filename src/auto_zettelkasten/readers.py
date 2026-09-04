@@ -5595,13 +5595,13 @@ def _relationship_candidate_system_prompt() -> str:
 
 def _relationship_adjudication_system_prompt() -> str:
     return (
-        "Auto-Zettelkasten relationship prompt v23, contract relationship-decision-v8. Read both "
+        "Auto-Zettelkasten relationship prompt v24, contract relationship-decision-v8. Read both "
         "complete atomic notes. Return JSON decisions keyed by every supplied pair_job_id, no extras: "
         "either {decision:no_relationship, reason, confidence} or "
         "{decision:relationship, connections:[...]}. Use one connection, or two for distinct propositions, containing comparison_proposition, "
         "primary_relation_type, secondary_relation_types, actor_source_id, "
         "reference_source_id, source_a_basis, source_b_basis, reason, "
-        "boundary_or_qualification, confidence. First, source_a_basis describes only the supplied "
+        "boundary_or_qualification, confidence. source_a_basis describes only the supplied "
         "left_source_id note and source_b_basis only the supplied right_source_id note. "
         "Notes are summaries: silence is not evidence of source absence. Unless a note explicitly establishes absence, "
         "say 'not supplied in the note', not 'the source does not report it'. Apply this to reasons and qualifications. "
@@ -5621,7 +5621,8 @@ def _relationship_adjudication_system_prompt() -> str:
         "represent both complete notes and explain why the strongest narrower alternative fails. Do not claim causal proof or independent "
         "corroboration from dependent reports. "
         "Unproven causality does not erase an explicit author argument; preserve it in rejections. "
-        "Choose the narrowest defensible subtype. Never infer support or direction from citation, chronology, shared data, method, vocabulary, or pair order alone. "
+        "The contextual comparison is your bounded inference, not a causal or process bridge either note must prove. "
+        "Use the narrowest subtype. Never infer support or direction from citation, chronology, shared data, method, vocabulary, or pair order alone. "
         "supports means the actor supplies evidence or argument for the reference proposition; "
         "undermines means the actor supplies materially incompatible evidence or argument; "
         "qualifies means the actor establishes a condition, exception, or boundary; extends "
@@ -5634,7 +5635,7 @@ def _relationship_adjudication_system_prompt() -> str:
         "and contextual_connection are symmetric and may use nulls; all directional types "
         "require exact supplied endpoints as actor/reference. Check every ID appears exactly once; "
         "use no_relationship rather than omitting a pair. "
-        "Then self-review once: for connections, read 'ACTOR [relation type] REFERENCE' and verify bases, boundaries and source ownership. "
+        "Self-review once: for connections, read 'ACTOR [relation type] REFERENCE' and verify bases, boundaries and source ownership. "
         "For rejections, verify whole-note scope and that the reason rules out contextual usefulness, not merely direct equivalence. "
         "No display labels, Markdown, invented IDs, locators, provenance or timestamps."
     )

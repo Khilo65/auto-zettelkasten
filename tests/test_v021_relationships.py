@@ -83,10 +83,10 @@ def test_v8_salvages_valid_connections_and_keeps_anchors_optional() -> None:
     assert accepted["connection_id"].startswith("relationship-connection-")
 
 
-def test_v23_is_compact_domain_neutral_source_owned_and_complete() -> None:
+def test_v24_is_compact_domain_neutral_source_owned_and_complete() -> None:
     prompt = _relationship_adjudication_system_prompt()
 
-    assert "relationship prompt v23" in prompt
+    assert "relationship prompt v24" in prompt
     assert "source_a_basis describes only the supplied left_source_id" in prompt
     assert "source_b_basis only the supplied right_source_id" in prompt
     assert "whole work versus chapter, excerpt, or component" in prompt
@@ -108,6 +108,13 @@ def test_v23_is_compact_domain_neutral_source_owned_and_complete() -> None:
         name in prompt.casefold()
         for name in ("svensson", "mediation", "civil war", "peacekeeping")
     )
+
+
+def test_contextual_comparison_does_not_require_a_causal_bridge() -> None:
+    prompt = _relationship_adjudication_system_prompt()
+
+    assert "contextual comparison is your bounded inference" in prompt
+    assert "not a causal or process bridge either note must prove" in prompt
 
 
 def test_adjudication_checks_narrower_connections_before_rejecting_a_pair() -> None:

@@ -135,7 +135,7 @@ def test_semantic_prompts_allow_neutral_nonmembership_and_bounded_relations() ->
     assert "shared data" in relationships
     assert "Never infer support or direction" in relationships
     assert "vocabulary, or pair order alone" in relationships
-    assert "self-review once" in relationships
+    assert "self-review once" in relationships.casefold()
 
 
 def test_mapped_literature_position_projects_explicit_citation(tmp_path: Path) -> None:
