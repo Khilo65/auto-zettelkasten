@@ -28,13 +28,13 @@ from auto_zettelkasten.relationships import (
 
 def test_v29_4_relationship_packet_and_family_plan_limits() -> None:
     prompt = _relationship_adjudication_system_prompt()
-    assert RELATIONSHIP_PROMPT_VERSION == "25"
+    assert RELATIONSHIP_PROMPT_VERSION == "26"
     assert RELATIONSHIP_DISCOVERY_PROMPT_VERSION == "20"
-    assert "relationship prompt v25" in prompt
+    assert "relationship prompt v26" in prompt
     assert "choose the tier before the subtype" in prompt
     assert "Use contextual_connection" in prompt
     assert "different operationalizations, instruments, samples, or periods" in prompt
-    assert "neither source validates the other" in prompt
+    assert "Neither source must validate the other" in prompt
     assert "every ID appears exactly once" in prompt
     assert _RELATIONSHIP_BATCH_MAX_JOBS == 8
     assert LITERATURE_FAMILY_PLAN_MAX_OUTPUT_TOKENS == 128_000

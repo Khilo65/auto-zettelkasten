@@ -5603,7 +5603,7 @@ def _relationship_candidate_system_prompt() -> str:
 
 def _relationship_adjudication_system_prompt() -> str:
     return (
-        "Auto-Zettelkasten relationship prompt v25, contract relationship-decision-v8. Read both "
+        "Auto-Zettelkasten relationship prompt v26, contract relationship-decision-v8. Read both "
         "complete atomic notes. Return JSON decisions keyed by every supplied pair_job_id, no extras: "
         "either {decision:no_relationship, reason, confidence} or "
         "{decision:relationship, connections:[...]}. Use one connection, or two for distinct propositions, containing comparison_proposition, "
@@ -5624,9 +5624,10 @@ def _relationship_adjudication_system_prompt() -> str:
         "explicitly establishes an intellectual bridge. Use contextual_connection to compare "
         "source-specific contributions to one concrete problem, practice, or mechanism across constructs, outcomes, "
         "levels, stages, or evidence types; state the boundary and system inference. "
-        "Neither source must compare the works or link the other's events. For a bounded measurement problem with "
-        "different operationalizations, instruments, samples, or periods, use methodological_fault_line when method changes what "
-        "can be supported, otherwise contextual_connection. Do not reject solely because measures differ or neither source validates the other. "
+        "Neither source must compare the works or link the other's events. For a bounded measurement problem, a simple indicator "
+        "versus a composite index—or different operationalizations, instruments, samples, or periods—is a methodological_fault_line "
+        "when method changes what can be supported; otherwise use contextual_connection. Treat different measures of the same bounded "
+        "phenomenon as a connection, not a rejection. Neither source must validate the other. "
         "A shared causal outcome or comparable scores are not required for a bounded measurement comparison. Missing methodological "
         "detail limits that comparison; it does not erase the supplied measurement object. "
         "Use no_relationship only when no bounded connection survives and overlap is merely topical, lexical, or generic. Its reason must "
