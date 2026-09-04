@@ -8,6 +8,7 @@ import sys
 from copy import deepcopy
 from collections.abc import Mapping
 from contextlib import contextmanager
+from dataclasses import replace
 from itertools import combinations
 from pathlib import Path
 from types import SimpleNamespace
@@ -1578,6 +1579,10 @@ def test_strategic_manifests_bind_exact_private_custody_and_derivation(
 
     assert settings8.case_count == 8
     assert settings40.case_count == 40
+    assert (settings8.source_attempt_limit, settings8.relationship_attempt_limit,
+            settings8.total_attempt_limit, settings8.document_attempt_limit) == (8, 12, 20, 4)
+    assert (settings40.source_attempt_limit, settings40.relationship_attempt_limit,
+            settings40.total_attempt_limit, settings40.document_attempt_limit) == (56, 24, 80, 8)
     assert manifest8["source_template_manifest_sha256"] == (
         runner._STRATEGIC_TEMPLATE_MANIFEST_SHA256
     )
@@ -1656,6 +1661,95 @@ def test_strategic_manifests_bind_exact_private_custody_and_derivation(
     inventory = runner.base.ManifestZoteroClient(cases).inventory("library")
     assert [str(row["key"]).casefold() for row in inventory] == case_ids
     assert "cluster_expectation" not in json.dumps(inventory)
+
+
+def test_route_identity_excludes_only_document_attempt_budget(tmp_path: Path) -> None:
+    request = runner.base._request({}, tmp_path, runner.base.GateSettings(document_attempt_limit=4))
+    identity = runner._pdf_route_request_identity(request)
+    assert "max_calls_per_document_run" not in identity["processing"]
+    assert identity == runner._pdf_route_request_identity(replace(
+        request, processing=replace(request.processing, max_calls_per_document_run=8),
+    ))
+
+
+def test_legacy_shared_route_oracle_and_strategic40_controls_remain_readable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    live8, live40, custody8, custody40 = _strategic_manifests(tmp_path)
+    _bind_synthetic_strategic_fixture(monkeypatch, custody8, custody40)
+    oracle_path = Path(json.loads(live40.read_text())["pdf_route_oracle"])
+    oracle = json.loads(oracle_path.read_text())
+    oracle["request_identity"]["processing"]["max_calls_per_document_run"] = 4
+    oracle_path.write_text(json.dumps(oracle))
+    for path in (live8, live40):
+        manifest = json.loads(path.read_text())
+        manifest["pdf_route_oracle_sha256"] = sha256_file(oracle_path)
+        path.write_text(json.dumps(manifest))
+        runner._manifest_settings(path, sha256_file(path))
+    manifest["gate"].update(source_attempt_limit=40, relationship_attempt_limit=40, document_attempt_limit=4)
+    live40.write_text(json.dumps(manifest))
+    _, settings = runner._manifest_settings(live40, sha256_file(live40))
+    assert (settings.source_attempt_limit, settings.relationship_attempt_limit,
+            settings.document_attempt_limit) == (40, 40, 4)
+    with pytest.raises(ValueError, match="fresh strategic40"):
+        runner.run_gate(mode="run", manifest_path=live40, manifest_sha256=sha256_file(live40))
+
+
+def test_route_oracle_rejects_every_other_request_identity_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    live8, _, custody8, custody40 = _strategic_manifests(tmp_path)
+    _bind_synthetic_strategic_fixture(monkeypatch, custody8, custody40)
+    manifest = json.loads(live8.read_text())
+    oracle_path = Path(manifest["pdf_route_oracle"])
+    original = json.loads(oracle_path.read_text())
+    fields = [
+        (key, nested) for key, value in original["request_identity"].items()
+        for nested in (value.keys() if isinstance(value, dict) else (None,))
+    ]
+    for key, nested in fields:
+        if (key, nested) == ("processing", "max_calls_per_document_run"):
+            continue
+        oracle = deepcopy(original)
+        target = oracle["request_identity"] if nested is None else oracle["request_identity"][key]
+        target[key if nested is None else nested] = "changed routing identity"
+        oracle_path.write_text(json.dumps(oracle))
+        manifest["pdf_route_oracle_sha256"] = sha256_file(oracle_path)
+        live8.write_text(json.dumps(manifest))
+        with pytest.raises(ValueError, match="oracle identity is invalid"):
+            runner._manifest_settings(live8, sha256_file(live8))
+
+
+@pytest.mark.parametrize("changed", ["role", "document"])
+def test_campaign_keeps_role_and_document_budgets_hash_locked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed: str,
+) -> None:
+    import v030_codex_campaign_guard as campaign
+
+    path = _manifest(tmp_path / "private")
+    manifest, settings = runner._manifest_settings(path, sha256_file(path))
+    monkeypatch.setattr(campaign, "_clean_commit", lambda _: CODE_COMMIT)
+    auth = campaign.initialize_codex_campaign(
+        path, tmp_path / "authorization.json", tmp_path / "attempts.jsonl",
+        repository_root=tmp_path / "repository", authorization_id="synthetic-authorization",
+        evaluation_id=manifest["evaluation_id"], run_id=manifest["run_id"], stage=settings.stage,
+        source_attempt_limit=5, relationship_attempt_limit=4,
+    )
+    before = Path(auth["ledger"]).read_bytes()
+    if changed == "document":
+        manifest["gate"]["document_attempt_limit"] = 8
+        path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="authorization"):
+        campaign.CodexCampaignGuard.start(
+            Path(auth["authorization"]), auth["authorization_sha256"],
+            repository_root=tmp_path / "repository", stage=settings.stage,
+            manifest_path=path, manifest_sha256=sha256_file(path),
+            evaluation_id=manifest["evaluation_id"], run_id=manifest["run_id"],
+            source_attempt_limit=4 if changed == "role" else 5,
+            relationship_attempt_limit=5 if changed == "role" else 4,
+            total_attempt_limit=9,
+        )
+    assert Path(auth["ledger"]).read_bytes() == before
 
 
 def test_strategic_route_oracle_is_strict_and_hash_bound(

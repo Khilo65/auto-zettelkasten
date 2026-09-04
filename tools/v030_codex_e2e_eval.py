@@ -81,10 +81,10 @@ _STRATEGIC_CONTROLS = {
     },
     40: {
         "stage": "strategic40",
-        "source_attempt_limit": 40,
-        "relationship_attempt_limit": 40,
+        "source_attempt_limit": 56,
+        "relationship_attempt_limit": 24,
         "total_attempt_limit": 80,
-        "document_attempt_limit": 4,
+        "document_attempt_limit": 8,
         "stage_deadline_seconds": 14_400,
         "cluster_generation_enabled": True,
     },
@@ -339,25 +339,32 @@ def _provider_free_pdf_route(
 
 
 def _pdf_route_request_identity(request: Any) -> dict[str, Any]:
-    payload = base._mapping(request.to_dict(), label="PDF route request")
-    return {
-        key: payload[key]
-        for key in (
-            "question",
-            "provider",
-            "model",
-            "reasoning_effort",
-            "allow_cloud",
-            "extraction_version",
-            "prompt_version",
-            "extraction_policy",
-            "processing",
-        )
-    } | {
-        "attachment_capability": base.codex_source_bundle_attachment_identity(
-            base.DIRECT_PDF_CLI_VERSION
-        )
-    }
+    if isinstance(request, Mapping):
+        identity = dict(request)
+    else:
+        payload = base._mapping(request.to_dict(), label="PDF route request")
+        identity = {
+            key: payload[key]
+            for key in (
+                "question",
+                "provider",
+                "model",
+                "reasoning_effort",
+                "allow_cloud",
+                "extraction_version",
+                "prompt_version",
+                "extraction_policy",
+                "processing",
+            )
+        } | {
+            "attachment_capability": base.codex_source_bundle_attachment_identity(
+                base.DIRECT_PDF_CLI_VERSION
+            )
+        }
+    processing = base._mapping(identity.get("processing"), label="PDF route processing")
+    # Attempt ceilings remain manifest/authorization-bound, not PDF routing inputs.
+    processing.pop("max_calls_per_document_run", None)
+    return {**identity, "processing": processing}
 
 
 def _validated_route_oracle(
@@ -401,7 +408,9 @@ def _validated_route_oracle(
         }
         or oracle.get("source_template_manifest_sha256")
         != _STRATEGIC_TEMPLATE_MANIFEST_SHA256
-        or oracle.get("request_identity") != _pdf_route_request_identity(request)
+        or _pdf_route_request_identity(base._mapping(
+            oracle.get("request_identity"), label="PDF route request identity"
+        )) != _pdf_route_request_identity(request)
     ):
         raise ValueError("PDF route oracle identity is invalid")
     rows = [
@@ -627,7 +636,12 @@ def _validate_strategic_custody(
         raise ValueError("strategic question must remain neutral and canonical")
     if manifest.get("collections") != []:
         raise ValueError("strategic canaries require an empty collection snapshot")
-    if any(manifest.get("gate", {}).get(key) != value for key, value in expected.items()):
+    controls = {key: manifest.get("gate", {}).get(key) for key in expected}
+    legacy40 = {
+        **expected, "source_attempt_limit": 40, "relationship_attempt_limit": 40,
+        "document_attempt_limit": 4,
+    }
+    if controls != expected and not (settings.case_count == 40 and controls == legacy40):
         raise ValueError(f"strategic{settings.case_count} gate controls are invalid")
     custody_value = manifest.get("source_custody_manifest")
     if not isinstance(custody_value, str) or not Path(custody_value).is_absolute():
@@ -2113,6 +2127,11 @@ def run_gate(
     ):
         raise ValueError("live raw E2E supports only frozen strategic8/40 gates")
     if settings.kind == "raw_e2e" and mode == "run":
+        if settings.case_count == 40 and any(
+            manifest["gate"][key] != value
+            for key, value in _STRATEGIC_CONTROLS[40].items()
+        ):
+            raise ValueError("fresh strategic40 requires the current immutable gate controls")
         workspace = base._private(
             Path(str(manifest.get("workspace") or "")), label="workspace"
         )
