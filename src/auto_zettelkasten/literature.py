@@ -1442,6 +1442,7 @@ class _CheckpointedReasonerCalls:
         )
         self.semantic_root = workspace / "11_state" / "semantic_jobs"
         self.usage_path = self.root / "provider_usage.yml"
+        self.terminal_transport_path = self.root / "terminal_transport_failure.yml"
         self.stage_callback = stage_callback
         self.started = time.monotonic()
         self.provider_calls = 0
@@ -1486,6 +1487,11 @@ class _CheckpointedReasonerCalls:
         self._synthesized_cluster_ids: set[str] = set()
         self._state_lock = threading.RLock()
         self.quota_stop_event = getattr(reasoner, "quota_stop_event", None)
+        self._terminal_transport_failure = read_yaml(
+            self.terminal_transport_path, {}
+        ) or {}
+        if self._terminal_transport_failure and self.quota_stop_event is not None:
+            self.quota_stop_event.set()
 
     def __call__(
         self,
@@ -1498,6 +1504,10 @@ class _CheckpointedReasonerCalls:
         method = getattr(self.reasoner, method_name, None)
         if not callable(method):
             return {}
+        if self._terminal_transport_failure:
+            raise LiteratureSynthesisPartialError(
+                "literature_synthesis_terminal_codex_transport_failure"
+            )
         if (
             self.deadline_seconds is not None
             and time.monotonic() - self.started >= self.deadline_seconds
@@ -2003,6 +2013,26 @@ class _CheckpointedReasonerCalls:
                 or bool(prior_failure.get("deterministic_preflight"))
             )
         ):
+            if (
+                is_codex
+                and prior_failure.get("failure_class") == "transport"
+            ):
+                self._terminal_transport_failure = {
+                    "status": "terminal",
+                    "failure_class": "transport",
+                    "terminal": True,
+                    "retry_on_resume": False,
+                    "stage": stage,
+                    "key": key,
+                    "fingerprint": fingerprint,
+                    "updated_at": now_iso(),
+                }
+                write_yaml(
+                    self.terminal_transport_path,
+                    self._terminal_transport_failure,
+                )
+                if self.quota_stop_event is not None:
+                    self.quota_stop_event.set()
             raise LiteratureSynthesisPartialError(
                 f"literature_synthesis_terminal_failure:{stage}:{key}"
             )
@@ -2045,6 +2075,10 @@ class _CheckpointedReasonerCalls:
         # A reservation without a completion event means the prior process was
         # interrupted. It remains charged, but is retryable on resume.
         with self._state_lock:
+            if self._terminal_transport_failure:
+                raise LiteratureSynthesisPartialError(
+                    "literature_synthesis_terminal_codex_transport_failure"
+                )
             if self.quota_stop_event is not None and self.quota_stop_event.is_set():
                 from .readers import ProviderQuotaExhausted
 
@@ -2313,12 +2347,32 @@ class _CheckpointedReasonerCalls:
                 return recovered_response
             self._record_failure()
             failure_class = _synthesis_failure_class(exc)
-            if failure_class == "quota" and self.quota_stop_event is not None:
+            codex_transport_failure = is_codex and failure_class == "transport"
+            if codex_transport_failure:
+                with self._state_lock:
+                    if not self._terminal_transport_failure:
+                        self._terminal_transport_failure = {
+                            "status": "terminal",
+                            "failure_class": "transport",
+                            "terminal": True,
+                            "retry_on_resume": False,
+                            "stage": stage,
+                            "key": key,
+                            "fingerprint": fingerprint,
+                            "updated_at": now_iso(),
+                        }
+                        write_yaml(
+                            self.terminal_transport_path,
+                            self._terminal_transport_failure,
+                        )
+            if (
+                failure_class == "quota" or codex_transport_failure
+            ) and self.quota_stop_event is not None:
                 self.quota_stop_event.set()
             deferred_empty_retry = str(
                 getattr(exc, "empty_retry_deferred", "") or ""
             )
-            terminal = not deferred_empty_retry and (
+            terminal = codex_transport_failure or not deferred_empty_retry and (
                 failure_class
                 not in {
                     "transport",
@@ -2382,6 +2436,8 @@ class _CheckpointedReasonerCalls:
                 ),
                 raw_response=raw_response,
             )
+            if codex_transport_failure:
+                raise
             if terminal and failure_class in {
                 "transport",
                 "provider_empty_response",
@@ -2660,6 +2716,13 @@ def _synthesis_failure_class(exc: BaseException) -> str:
     ):
         return "transport"
     return "contract"
+
+
+def _codex_transport_failure(reasoner: Any, exc: BaseException) -> bool:
+    return (
+        str(getattr(reasoner, "name", "")).casefold() == "codex"
+        and _synthesis_failure_class(exc) == "transport"
+    )
 
 
 def _synthesis_retry_on_resume(exc: BaseException) -> bool:
@@ -20592,6 +20655,8 @@ def build_literature_report(
                     try:
                         local_by_index[index] = future.result()
                     except BaseException as exc:
+                        if _codex_transport_failure(reasoner, exc):
+                            raise
                         if _synthesis_failure_class(exc) in {
                             "quota",
                             "timeout",
@@ -20803,6 +20868,8 @@ def build_literature_report(
                         try:
                             bridge_by_index[index] = future.result()
                         except Exception as exc:
+                            if _codex_transport_failure(reasoner, exc):
+                                raise
                             if _synthesis_failure_class(exc) in {
                                 "quota",
                                 "timeout",
@@ -22408,7 +22475,9 @@ def build_literature_report(
                 request=request,
                 context=partition_context,
             )
-        except Exception:
+        except Exception as exc:
+            if _codex_transport_failure(reasoner, exc):
+                raise
             cluster["cluster_synthesis_preflight_error"] = (
                 "cluster_partition_planning_failed"
             )
@@ -22711,6 +22780,8 @@ def build_literature_report(
                 try:
                     concurrent_results[cluster_id] = future.result()
                 except BaseException as exc:
+                    if _codex_transport_failure(reasoner, exc):
+                        raise
                     if _synthesis_failure_class(exc) in {
                         "quota",
                         "timeout",
@@ -22743,6 +22814,8 @@ def build_literature_report(
             try:
                 concurrent_results[cluster_id] = run_cluster_job(cluster)
             except BaseException as exc:
+                if _codex_transport_failure(reasoner, exc):
+                    raise
                 concurrent_results[cluster_id] = exc
         _notify_stage(
             stage_callback,

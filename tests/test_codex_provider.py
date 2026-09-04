@@ -16,6 +16,7 @@ import pytest
 from pypdf import PdfWriter
 
 import auto_zettelkasten.codex_attempt_guard as attempt_guard_module
+import auto_zettelkasten.literature as literature_module
 from auto_zettelkasten.api import (
     _provider_check,
     build_map,
@@ -36,6 +37,8 @@ from auto_zettelkasten.models import (
     ProcessingPolicy,
 )
 from auto_zettelkasten.literature import (
+    LiteratureSynthesisPartialError,
+    _CheckpointedReasonerCalls,
     _PROVIDER_INPUT_DEPENDENCY_COMPONENTS,
     _bounded_provider_futures,
     _provider_worker_count,
@@ -342,6 +345,34 @@ def test_codex_cancelled_source_call_is_interruption(tmp_path: Path) -> None:
     assert budget.cumulative_calls == 0
 
 
+def test_codex_transport_failure_is_raised_without_retry(tmp_path: Path) -> None:
+    budget = _ProfileProviderBudget(
+        tmp_path / "provider_usage.yml", 1, provider="codex", model="gpt-5.6-luna"
+    )
+    calls = 0
+
+    def operation() -> None:
+        nonlocal calls
+        calls += 1
+        raise ProviderTransportError(
+            "stream disconnected before completion",
+            transport_kind="codex_cli",
+        )
+
+    with pytest.raises(ProviderTransportError, match="stream disconnected"):
+        _provider_call_with_transport_retry(
+            budget,
+            "source_bundle_direct",
+            "A",
+            "fingerprint",
+            operation,
+        )
+
+    assert calls == 1
+    assert budget.cumulative_calls == 1
+    assert budget.attempts[0]["failure_class"] == "transport"
+
+
 @pytest.mark.parametrize(
     "failure_type",
     [ProviderQuotaExhausted, ProviderTimeout, ProviderInterrupted],
@@ -427,6 +458,289 @@ def test_codex_source_pause_resumes_from_frozen_content_without_terminal_checkpo
     assert resumed.status == "completed"
     assert resumed.validated_note_count == 1
     assert reader.calls == 2
+
+
+def test_codex_source_transport_failure_stops_queue_and_is_terminal(
+    tmp_path: Path,
+    sample_items: list[dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TransportFailureReader:
+        name = "codex"
+        model = "gpt-5.6-luna"
+        is_cloud = True
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def read_source(self, text, metadata, question=None):
+            del text, metadata, question
+            self.calls += 1
+            raise ProviderTransportError(
+                "unexpected 404", transport_kind="codex_cli"
+            )
+
+    request = MapRequest(
+        tmp_path,
+        provider="codex",
+        model="gpt-5.6-luna",
+        allow_cloud=True,
+        parallel=1,
+        provider_concurrency=1,
+        literature_policy=LiteratureMappingPolicy(synthesis_enabled=False),
+    )
+    reader = TransportFailureReader()
+    monkeypatch.setattr(
+        "auto_zettelkasten.pipeline.rebuild_map",
+        lambda *_args, **_kwargs: pytest.fail(
+            "graph stage must not start after terminal source transport"
+        ),
+    )
+
+    report = run_pipeline(
+        request,
+        client=FakeZotero(sample_items[:2]),
+        reader=reader,
+        run_id="terminal-source-transport",
+    )
+
+    assert report.status == "partial"
+    assert report.pending_count == 1
+    assert reader.calls == 1
+    failure = read_yaml(
+        tmp_path
+        / "11_state"
+        / "runs"
+        / "terminal-source-transport"
+        / "items"
+        / "ITEMA"
+        / "source_failure.yml"
+    )
+    assert failure["failure_class"] == "transport"
+    assert failure["retry_on_resume"] is False
+    assert failure["status"] == "parked_for_review"
+
+    resumed = run_pipeline(
+        request,
+        client=FakeZotero(sample_items[:2]),
+        reader=reader,
+        run_id="terminal-source-transport",
+        resume=True,
+    )
+    assert resumed.status == "partial"
+    assert reader.calls == 1
+
+    (
+        tmp_path
+        / "11_state"
+        / "runs"
+        / "terminal-source-transport"
+        / "items"
+        / "ITEMA"
+        / "prepared_result.yml"
+    ).unlink()
+    crash_resumed = run_pipeline(
+        request,
+        client=FakeZotero(sample_items[:2]),
+        reader=reader,
+        run_id="terminal-source-transport",
+        resume=True,
+    )
+    assert crash_resumed.status == "partial"
+    assert reader.calls == 1
+
+    single_root = tmp_path / "single"
+    single_reader = TransportFailureReader()
+    single = run_pipeline(
+        MapRequest(
+            single_root,
+            provider="codex",
+            model="gpt-5.6-luna",
+            allow_cloud=True,
+            parallel=1,
+            provider_concurrency=1,
+            literature_policy=LiteratureMappingPolicy(synthesis_enabled=False),
+        ),
+        client=FakeZotero(sample_items[:1]),
+        reader=single_reader,
+        run_id="single-terminal-source-transport",
+    )
+    assert single.status == "partial"
+    assert single_reader.calls == 1
+
+
+def test_codex_literature_transport_failure_stops_replenishment_and_is_terminal(
+    tmp_path: Path,
+) -> None:
+    class TransportFailureReasoner:
+        name = "codex"
+        model = "gpt-5.6-terra"
+        _preflight = {"version": "0.152.1"}
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.quota_stop_event = threading.Event()
+
+        def select_relationship_candidates(self, profiles, request, *, context=None):
+            del profiles, request, context
+            self.calls += 1
+            raise ProviderTransportError(
+                "unexpected 404", transport_kind="codex_cli"
+            )
+
+    reasoner = TransportFailureReasoner()
+    request = LiteratureMapRequest(
+        workspace=tmp_path,
+        provider="codex",
+        model="gpt-5.6-terra",
+        allow_cloud=True,
+    )
+    calls = _CheckpointedReasonerCalls(tmp_path, "terminal-graph", reasoner, request)
+    submitted: list[int] = []
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        for future, _job in _bounded_provider_futures(
+            executor,
+            [0, 1, 2, 3, 4],
+            lambda pool, job: (
+                submitted.append(job)
+                or pool.submit(
+                    calls,
+                    "relationship_candidate_selection",
+                    f"job-{job}",
+                    "select_relationship_candidates",
+                    [],
+                    {},
+                )
+            ),
+            workers=4,
+            stop_event=reasoner.quota_stop_event,
+        ):
+            with pytest.raises(
+                (
+                    LiteratureSynthesisPartialError,
+                    ProviderQuotaExhausted,
+                    ProviderTransportError,
+                )
+            ):
+                future.result()
+
+    assert submitted == [0, 1, 2, 3]
+    assert 1 <= reasoner.calls <= 4
+    failure = read_yaml(
+        tmp_path
+        / "11_state"
+        / "runs"
+        / "terminal-graph"
+        / "literature"
+        / "synthesis"
+        / "terminal_transport_failure.yml"
+    )
+    assert failure["failure_class"] == "transport"
+    assert failure["terminal"] is True
+    assert failure["retry_on_resume"] is False
+
+    resumed_reasoner = TransportFailureReasoner()
+    resumed_calls = _CheckpointedReasonerCalls(
+        tmp_path, "terminal-graph", resumed_reasoner, request
+    )
+    resumed_submitted: list[int] = []
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        for future, _job in _bounded_provider_futures(
+            executor,
+            [0, 5],
+            lambda pool, job: (
+                resumed_submitted.append(job)
+                or pool.submit(
+                    resumed_calls,
+                    "relationship_candidate_selection",
+                    f"job-{job}",
+                    "select_relationship_candidates",
+                    [],
+                    {},
+                )
+            ),
+            workers=4,
+            stop_event=resumed_reasoner.quota_stop_event,
+        ):
+            future.result()
+
+    assert resumed_submitted == []
+    assert resumed_reasoner.calls == 0
+
+
+def test_codex_terminal_transport_wins_over_concurrent_quota_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TransportFailureReasoner:
+        name = "codex"
+        model = "gpt-5.6-terra"
+        _preflight = {"version": "0.152.1"}
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.quota_stop_event = threading.Event()
+
+        def select_relationship_candidates(self, profiles, request, *, context=None):
+            del profiles, request, context
+            self.calls += 1
+            raise ProviderTransportError(
+                "unexpected 404", transport_kind="codex_cli"
+            )
+
+    delayed = threading.Event()
+    release = threading.Event()
+    original_packet_chars = literature_module._reasoner_packet_chars
+
+    def pause_after_terminal_check(profiles, context):
+        if context.get("delay_before_reservation"):
+            delayed.set()
+            assert release.wait(timeout=5)
+        return original_packet_chars(profiles, context)
+
+    monkeypatch.setattr(
+        literature_module, "_reasoner_packet_chars", pause_after_terminal_check
+    )
+    reasoner = TransportFailureReasoner()
+    calls = _CheckpointedReasonerCalls(
+        tmp_path,
+        "concurrent-terminal-transport",
+        reasoner,
+        LiteratureMapRequest(
+            workspace=tmp_path,
+            provider="codex",
+            model="gpt-5.6-terra",
+            allow_cloud=True,
+        ),
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        sibling = executor.submit(
+            calls,
+            "relationship_candidate_selection",
+            "delayed",
+            "select_relationship_candidates",
+            [],
+            {"delay_before_reservation": True},
+        )
+        assert delayed.wait(timeout=5)
+        with pytest.raises(ProviderTransportError):
+            calls(
+                "relationship_candidate_selection",
+                "failure",
+                "select_relationship_candidates",
+                [],
+                {},
+            )
+        release.set()
+        with pytest.raises(
+            LiteratureSynthesisPartialError,
+            match="terminal_codex_transport_failure",
+        ):
+            sibling.result()
+
+    assert reasoner.calls == 1
 
 
 def test_codex_contract_schemas_are_strict_recursively() -> None:

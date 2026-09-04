@@ -1058,6 +1058,45 @@ def test_native_html_heading_reaches_cluster_admission_without_weak_locator_prom
     assert legacy is not None and legacy.evidence_anchors[0].locator == heading
 
 
+def test_invalid_quote_locator_is_quarantined_without_discarding_bundle() -> None:
+    span = "This lead sentence reports the source's central evidence."
+    payload = _bundle_payload()
+    payload["evidence_anchors"][0].update(
+        locator=f'Quote "{span}"',
+        locators=[f'Quote "{span}"'],
+    )
+    payload["evidence_anchors"].append(
+        {
+            **payload["evidence_anchors"][0],
+            "evidence_anchor_id": "anchor-valid",
+            "claim": "A separate supported claim remains usable.",
+            "locator": "p. 2",
+            "locators": ["p. 2"],
+        }
+    )
+    abstract = f"{span} The abstract then adds context."
+    row = {
+        "source_id": "source-zotero-A1",
+        "zotero_item_key": "A1",
+        "media_type": "text/html",
+        "text": f"Abstract: {abstract}\nArticle: {span} The body then adds detail.",
+        "abstract_text": abstract,
+        "coverage_metrics": {},
+    }
+
+    bundle = _source_bundle_from_result(payload, row, "full_document")
+
+    assert bundle is not None
+    assert [anchor.claim for anchor in bundle.evidence_anchors] == [
+        "A separate supported claim remains usable."
+    ]
+    assert bundle.component_diagnostics[-1]["row_index"] == 0
+    assert bundle.component_diagnostics[-1]["reason"] == (
+        "ValueError:quote_locator_not_unique_in_source"
+    )
+    assert bundle.component_diagnostics[-1]["rehydrate"] is False
+
+
 def test_pipeline_rehydrates_safe_same_source_evidence_diagnostics_idempotently() -> None:
     payload = _bundle_payload()
     payload["evidence_anchors"] = []

@@ -60,6 +60,7 @@ from .literature import (
     LITERATURE_FAMILY_PLAN_PROMPT_VERSION,
     _CheckpointedReasonerCalls,
     _bounded_provider_futures,
+    _codex_transport_failure,
     _load_map_cluster_registry,
     _persist_typed_source_relation_projection,
     _preserve_last_valid_clusters_on_refresh_failure,
@@ -205,7 +206,7 @@ _RELATIONSHIP_BATCH_MAX_JOBS = 8
 _LEGACY_RELATIONSHIP_BATCH_MAX_JOBS = 8
 _RELATIONSHIP_DISCOVERY_PAGE_SIZE = 64
 _RELATIONSHIP_SELECTION_STATE_SCHEMA_VERSION = "4"
-_RELATIONSHIP_DISCOVERY_POLICY_VERSION = "quota-independent-family-coverage-v300"
+_RELATIONSHIP_DISCOVERY_POLICY_VERSION = "quota-independent-family-coverage-v301"
 _RELATIONSHIP_SEMANTIC_POLICY_VERSION = "source-owned-bases-v26"
 _SOURCE_BUNDLE_QUOTE_LOCATOR = re.compile(
     r'^["\u201c](?P<quote>[^"\u201d]+)["\u201d]'
@@ -1129,6 +1130,7 @@ def _provider_call_with_transport_retry(
             )
             if (
                 attempt_number == 0
+                and budget.provider != "codex"
                 and _transport_retryable(exc)
                 and not (cancelled is not None and cancelled())
             ):
@@ -1995,6 +1997,27 @@ def run_pipeline(
     local_stop = object()
     local_exit_lock = threading.Lock()
     local_exits = 0
+    if request.provider.casefold() == "codex":
+        for _index, pending_item in pending:
+            key = item_key(pending_item)
+            saved = _load_prepared_source_result(
+                _prepared_source_result_path(run_dir, key),
+                request_hash=prepared_request_hash,
+            )
+            failure = read_yaml(
+                run_dir / "items" / safe_filename(key) / "source_failure.yml",
+                {},
+            ) or {}
+            if (
+                saved and saved.get("provider_failure_class") == "transport"
+            ) or (
+                isinstance(failure, Mapping)
+                and failure.get("failure_class") == "transport"
+                and failure.get("retry_on_resume") is False
+            ):
+                source_pause_reason = "provider_transport_failed"
+                source_pause_event.set()
+                break
 
     def record_queue(name: str, value: queue.Queue[Any]) -> None:
         with queue_lock:
@@ -2128,6 +2151,14 @@ def run_pipeline(
                 finally:
                     with concurrency_lock:
                         active_source_jobs -= 1
+                if (
+                    request.provider.casefold() == "codex"
+                    and row.get("provider_failure_class") == "transport"
+                ):
+                    with concurrency_lock:
+                        if not source_pause_reason:
+                            source_pause_reason = "provider_transport_failed"
+                    source_pause_event.set()
                 path = _write_prepared_source_result(
                     run_dir, row, request_hash=prepared_request_hash
                 )
@@ -2380,13 +2411,14 @@ def run_pipeline(
             },
         )
     map_source_set = run_source_set
-    source_work_pending = len(terminal_rows) < len(items) or any(
-        str(row.get("terminal_status") or "") in {
-            "partial",
-            "pending",
-            "paused_transport",
-        }
-        for row in terminal_rows
+    source_work_pending = (
+        source_budget_paused
+        or len(terminal_rows) < len(items)
+        or any(
+            str(row.get("terminal_status") or "")
+            in {"partial", "pending", "paused_transport"}
+            for row in terminal_rows
+        )
     )
     if source_work_pending:
         progress.set_stage("source_barrier_pending")
@@ -5620,6 +5652,8 @@ def _plan_literature_families(
                 try:
                     indexed_plans[index] = future.result()
                 except Exception as exc:
+                    if _codex_transport_failure(reasoner, exc):
+                        raise
                     if _synthesis_failure_class(exc) in {
                         "quota",
                         "timeout",
@@ -5743,6 +5777,8 @@ def _plan_literature_families(
                         try:
                             indexed_completions[index] = future.result()
                         except Exception as exc:
+                            if _codex_transport_failure(reasoner, exc):
+                                raise
                             if _synthesis_failure_class(exc) in {
                                 "quota",
                                 "timeout",
@@ -5778,6 +5814,8 @@ def _plan_literature_families(
                     completion_status = "partial_failure:packet_failure"
                     failed_packet_ids.extend(completion_failures)
             except Exception as exc:
+                if _codex_transport_failure(reasoner, exc):
+                    raise
                 completion_status = f"partial_failure:{type(exc).__name__}"
     validated = _apply_reviewed_family_exclusions(
         validated, reviewed_family_exclusions
@@ -6054,6 +6092,8 @@ def _reconcile_overlapping_family_cards(
                 context,
             )
         except Exception as exc:
+            if _codex_transport_failure(reasoner, exc):
+                raise
             warnings.append(type(exc).__name__ + ":" + stable_hash(component)[:16])
             continue
         groups = []
@@ -7840,6 +7880,8 @@ def _run_relationship_reasoning(
                     },
                 )
             except Exception as exc:
+                if _codex_transport_failure(reasoner, exc):
+                    raise
                 collection_routing = {}
                 failure_class = _synthesis_failure_class(exc)
                 discovery_terminal |= failure_class != "transport"
@@ -7930,6 +7972,8 @@ def _run_relationship_reasoning(
                     routing_context,
                 )
             except Exception as exc:
+                if _codex_transport_failure(reasoner, exc):
+                    raise
                 routing = {}
                 can_discover = False
                 general_capacity = 0
@@ -8081,6 +8125,8 @@ def _run_relationship_reasoning(
                             },
                         )
                     except Exception as exc:
+                        if _codex_transport_failure(reasoner, exc):
+                            raise
                         if not routed_rows:
                             raise
                         failure_class = _synthesis_failure_class(exc)
@@ -8169,6 +8215,8 @@ def _run_relationship_reasoning(
                         )
                     )
             except Exception as exc:
+                if _codex_transport_failure(reasoner, exc):
+                    raise
                 failure_class = _synthesis_failure_class(exc)
                 discovery_terminal |= failure_class != "transport"
                 discovery_parked.append(
@@ -9439,6 +9487,8 @@ def _run_relationship_reasoning(
                             wave_successes[job_id] += 1
                             wave_no_more[job_id] += int(task_no_more)
                     if continuation_error is not None:
+                        if _codex_transport_failure(reasoner, continuation_error):
+                            raise continuation_error
                         failure_class = _synthesis_failure_class(
                             continuation_error
                         )
@@ -9473,6 +9523,8 @@ def _run_relationship_reasoning(
                                 }
                             )
                 except Exception as exc:
+                    if _codex_transport_failure(reasoner, exc):
+                        raise
                     failure_class = _synthesis_failure_class(exc)
                     if failure_class in {"quota", "timeout", "interruption"}:
                         raise
@@ -9603,31 +9655,34 @@ def _run_relationship_reasoning(
                 }
             )
 
+        def discovered_pairs_for_job(job_id: str) -> set[tuple[str, str]]:
+            return {
+                canonical_pair(
+                    str(
+                        row.get("left_source_id")
+                        or row.get("source_id")
+                        or ""
+                    ),
+                    str(
+                        row.get("right_source_id")
+                        or row.get("target_source_id")
+                        or row.get("target_id")
+                        or ""
+                    ),
+                )
+                for rows in candidate_results.values()
+                for _key, response in rows
+                for row in response.get("candidates", []) or []
+                if isinstance(row, Mapping)
+                and str(row.get("discovery_job_id") or "") == job_id
+                and not row.get("_candidate_disposition")
+            }
+
         def recompute_discovery_accounting() -> None:
             for job in shared_jobs:
                 job_id = str(job["bridge_job_id"])
                 accounting = discovery_job_accounting[job_id]
-                pairs = {
-                    canonical_pair(
-                        str(
-                            row.get("left_source_id")
-                            or row.get("source_id")
-                            or ""
-                        ),
-                        str(
-                            row.get("right_source_id")
-                            or row.get("target_source_id")
-                            or row.get("target_id")
-                            or ""
-                        ),
-                    )
-                    for rows in candidate_results.values()
-                    for _key, response in rows
-                    for row in response.get("candidates", []) or []
-                    if isinstance(row, Mapping)
-                    and str(row.get("discovery_job_id") or "") == job_id
-                    and not row.get("_candidate_disposition")
-                }
+                pairs = discovered_pairs_for_job(job_id)
                 left_side = set(job.get("left_source_ids", []) or [])
                 right_side = set(job.get("right_source_ids", []) or [])
                 accounting["valid_unique_candidates"] = len(pairs)
@@ -9692,6 +9747,7 @@ def _run_relationship_reasoning(
             recoverable_transport_failure = bool(
                 packet_status == "failed"
                 and accounting.get("packet_failure_class") == "transport"
+                and str(getattr(reasoner, "name", "")).casefold() != "codex"
             )
             if (
                 (
@@ -9769,6 +9825,60 @@ def _run_relationship_reasoning(
             for job_id, row in discovery_job_accounting.items()
         }
         execute_candidate_tasks(breadth_tasks)
+        for job in shared_jobs:
+            job_id = str(job["bridge_job_id"])
+            accounting = discovery_job_accounting[job_id]
+            family_source_ids = list(job.get("family_source_ids", []) or [])
+            family = family_rows.get(str(job.get("bridge_family") or ""), {})
+            if (
+                not family_source_ids
+                or family.get("candidate_cluster") is not True
+                or job.get("requested_collection_pair")
+                or accounting.get("packet_status") != "completed"
+            ):
+                continue
+            family_pairs = set(combinations(family_source_ids, 2)) - resolved_pairs
+            if (
+                len(family_pairs) > _RELATIONSHIP_DISCOVERY_PAGE_SIZE
+                or int(accounting.get("planner_target_candidates", 0) or 0)
+                != len(family_pairs)
+            ):
+                continue
+            residual_pairs = sorted(
+                family_pairs - discovered_pairs_for_job(job_id)
+            )
+            if not residual_pairs:
+                continue
+            candidate_results["general"].append(
+                (
+                    "deterministic-family-completion-" + stable_hash(job_id)[:16],
+                    {
+                        "candidates": [
+                            {
+                                "left_source_id": pair[0],
+                                "right_source_id": pair[1],
+                                "bridge_job_id": job_id,
+                                "discovery_route": (
+                                    "deterministic_bounded_family_completion"
+                                ),
+                                "discovery_job_id": job_id,
+                                "discovery_family": str(
+                                    job.get("bridge_family") or ""
+                                ),
+                                "discovery_job_quota": len(family_pairs),
+                                "discovery_pass": "deterministic_family_completion",
+                                "rank": index,
+                                "why_compare": str(job.get("why_examine") or ""),
+                            }
+                            for index, pair in enumerate(residual_pairs, start=1)
+                        ]
+                    },
+                )
+            )
+            accounting["deterministic_family_completion_count"] = len(
+                residual_pairs
+            )
+            accounting["breadth_completion_status"] = "deterministic_completion"
         for job_id in unschedulable_completion_job_ids:
             accounting = discovery_job_accounting.get(job_id)
             if accounting is None:
@@ -10630,6 +10740,8 @@ def _run_relationship_reasoning(
                 try:
                     concurrent_batch_results[packet_key] = future.result()
                 except BaseException as exc:
+                    if _codex_transport_failure(reasoner, exc):
+                        raise
                     if _synthesis_failure_class(exc) in {
                         "quota",
                         "timeout",
@@ -13016,6 +13128,9 @@ def rebuild_map(
             note_rows=full_workspace_note_rows,
         )
     except Exception as exc:
+        retry_on_resume = _synthesis_retry_on_resume(
+            exc
+        ) and not _codex_transport_failure(reasoner, exc)
         failure_reason = (
             "literature_family_planning_failure"
             if clusters_enabled and shared_family_plan is None
@@ -13029,16 +13144,14 @@ def rebuild_map(
                     "reason": failure_reason,
                     "error_type": type(exc).__name__,
                     "error": str(exc),
-                    "retry_on_resume": _synthesis_retry_on_resume(exc),
+                    "retry_on_resume": retry_on_resume,
                 }
             ],
             "cluster_candidates": [],
             "selected_profile_hashes": {},
             "reconciled_catalogue_revision": "",
             "relationship_stage_complete": False,
-            "relationship_retry_on_resume": (
-                _synthesis_retry_on_resume(exc)
-            ),
+            "relationship_retry_on_resume": retry_on_resume,
             "planning_failed": failure_reason
             == "literature_family_planning_failure",
         }
@@ -13423,7 +13536,9 @@ def rebuild_map(
             paths = [*paths, acquisition_ledger_path]
     except Exception as exc:
         reason = f"literature_synthesis_partial:{type(exc).__name__}:{exc}"
-        retry_on_resume = _synthesis_retry_on_resume(exc)
+        retry_on_resume = _synthesis_retry_on_resume(
+            exc
+        ) and not _codex_transport_failure(reasoner, exc)
         if profile_partial_reason:
             reason = f"{profile_partial_reason};{reason}"
         preserved_clusters, refresh_paths = (
@@ -15479,7 +15594,13 @@ def _prepare_item(
             if isinstance(exc, ProviderEmptyResponse)
             else "semantic_contract"
         )
-        retry_on_resume = failure_class in {"transport", "quota", "timeout", "interruption"}
+        codex_transport_failure = (
+            request.provider.casefold() == "codex" and failure_class == "transport"
+        )
+        retry_on_resume = (
+            failure_class in {"transport", "quota", "timeout", "interruption"}
+            and not codex_transport_failure
+        )
         failure_status = "paused_transport" if retry_on_resume else "parked_for_review"
         write_yaml(
             checkpoint_root / "source_failure.yml",
@@ -15513,6 +15634,7 @@ def _prepare_item(
         )
         base["terminal_status"] = failure_status
         base["reason"] = f"reader_failed:{type(exc).__name__}"
+        base["provider_failure_class"] = failure_class
         return base
     try:
         bundle = _source_bundle_from_result(
@@ -15782,7 +15904,8 @@ def _source_bundle_from_result(
     if isinstance(anchors, list):
         normalized_anchors = []
         seen_anchors: set[str] = set()
-        for value in anchors:
+        rejected_locator_diagnostics: list[dict[str, Any]] = []
+        for anchor_index, value in enumerate(anchors):
             if not isinstance(value, Mapping):
                 normalized_anchors.append(value)
                 continue
@@ -15827,7 +15950,17 @@ def _source_bundle_from_result(
                     and (source_text.find(span) < 0 or source_text.find(span) != source_text.rfind(span))
                     )
                 ):
-                    raise ValueError("quote_locator_not_unique_in_source")
+                    rejected_locator_diagnostics.append(
+                        {
+                            "component": "evidence_anchors",
+                            "row_index": anchor_index,
+                            "reason": "ValueError:quote_locator_not_unique_in_source",
+                            "severity": "rejected",
+                            "rehydrate": False,
+                            "raw": dict(value),
+                        }
+                    )
+                    continue
                 value = {
                     **value,
                     "source_locators": _source_locator_payloads(
@@ -15860,6 +15993,17 @@ def _source_bundle_from_result(
                 continue
             seen_anchors.add(anchor_key)
             normalized_anchors.append(anchor)
+        if rejected_locator_diagnostics:
+            if not any(isinstance(anchor, Mapping) for anchor in normalized_anchors):
+                raise ValueError("quote_locator_not_unique_in_source")
+            payload["component_diagnostics"] = [
+                *(
+                    payload.get("component_diagnostics", [])
+                    if isinstance(payload.get("component_diagnostics"), list)
+                    else []
+                ),
+                *rejected_locator_diagnostics,
+            ]
         payload["evidence_anchors"] = normalized_anchors
     positions = payload.get("literature_positions", [])
     if isinstance(positions, list):

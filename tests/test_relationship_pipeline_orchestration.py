@@ -18,6 +18,7 @@ from auto_zettelkasten.models import (
     RelationshipPairJob,
 )
 from auto_zettelkasten.profiles import profile_to_dict
+from auto_zettelkasten.readers import ProviderTransportError
 from auto_zettelkasten.relationships import (
     ingest_relationship_decision_batch,
     relationship_decision_key,
@@ -63,6 +64,10 @@ class _V8Reasoner(_Reasoner):
 class _BuiltInDeepSeekReasoner(_Reasoner):
     name = "deepseek"
     profile_generation_route = "built_in_reader"
+
+
+class _CodexReasoner(_Reasoner):
+    name = "codex"
 
 
 class _BridgeRoutedReasoner(_Reasoner):
@@ -846,6 +851,142 @@ def test_complementary_family_breadth_covers_pairs_inside_planner_sides(
     assert accounting["valid_unique_candidates"] == 6
     assert accounting["breadth_added_unique_candidates"] == 2
     assert accounting["planner_target_met"] is True
+
+
+@pytest.mark.parametrize(("page_size", "expected_pairs"), [(64, 6), (5, 5)])
+def test_small_family_no_more_still_adjudicates_every_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    page_size: int,
+    expected_pairs: int,
+) -> None:
+    monkeypatch.setattr(
+        pipeline_module, "_RELATIONSHIP_DISCOVERY_PAGE_SIZE", page_size
+    )
+    profiles = [_profile(source_id) for source_id in "ABCD"]
+    discovery_passes: list[str] = []
+
+    def handler(stage, _profiles, context):
+        if stage.endswith("candidate_selection"):
+            discovery_pass = str(context["discovery_pass"])
+            discovery_passes.append(discovery_pass)
+            job_id = str(context["bridge_jobs"][0]["bridge_job_id"])
+            pairs = (
+                (("A", "B"), ("A", "C"), ("A", "D"))
+                if discovery_pass == "complement"
+                else (("B", "C"), ("B", "D"))
+            )
+            return {
+                "candidates": [
+                    {**_candidate(left, right, rank=index), "bridge_job_id": job_id}
+                    for index, (left, right) in enumerate(pairs, start=1)
+                ],
+                "job_outcomes": [
+                    {"bridge_job_id": job_id, "status": "no_more_candidates"}
+                ],
+            }
+        return {"decisions": [_decision(job) for job in context["pair_jobs"]]}
+
+    plan = {
+        "lean_index_hash": "lean",
+        "literature_families": [
+            {
+                "family_id": "family-one",
+                "source_ids": list("ABCD"),
+                "candidate_cluster": True,
+            }
+        ],
+        "discovery_jobs": [
+            {
+                "job_id": "family-job",
+                "family": "family-one",
+                "left_source_ids": ["A"],
+                "right_source_ids": ["B", "C", "D"],
+                "candidate_quota": 6,
+            }
+        ],
+    }
+    result = _run(
+        tmp_path, profiles, _Calls(handler), shared_family_plan=plan
+    )
+
+    assert discovery_passes == ["complement", "breadth_completion"]
+    assert result["pair_job_count"] == expected_pairs
+    accounting = result["relationship_discovery_jobs"][0]
+    assert accounting["planner_target_candidates"] == 6
+    assert accounting["valid_unique_candidates"] == expected_pairs
+    assert accounting.get("deterministic_family_completion_count", 0) == (
+        1 if page_size == 64 else 0
+    )
+    assert accounting["planner_target_met"] is (page_size == 64)
+    if page_size == 64:
+        _commit_relationship_selection_state(
+            tmp_path,
+            result,
+            catalogue_revision=result["reconciled_catalogue_revision"],
+        )
+        replay_calls = _Calls(
+            lambda *_args: pytest.fail("unexpected replay call")
+        )
+        replay = _run(
+            tmp_path, profiles, replay_calls, shared_family_plan=plan
+        )
+        assert replay_calls.seen == []
+        assert replay["semantic_noop"] is True
+
+        monkeypatch.setattr(
+            pipeline_module,
+            "_RELATIONSHIP_DISCOVERY_POLICY_VERSION",
+            "quota-independent-family-coverage-v302",
+        )
+        upgraded_calls = _Calls(handler)
+        upgraded = _run(
+            tmp_path, profiles, upgraded_calls, shared_family_plan=plan
+        )
+        assert upgraded_calls.seen
+        assert upgraded.get("semantic_noop") is not True
+
+
+def test_codex_discovery_transport_failure_is_not_retried_as_breadth(
+    tmp_path: Path,
+) -> None:
+    def handler(*_args: Any) -> Mapping[str, Any]:
+        raise ProviderTransportError("disconnected", transport_kind="codex_cli")
+
+    calls = _Calls(handler)
+    with pytest.raises(ProviderTransportError, match="disconnected"):
+        _run(
+            tmp_path,
+            [_profile(source_id) for source_id in "ABCD"],
+            calls,
+            reasoner=_CodexReasoner(),
+            request=LiteratureMapRequest(
+                workspace=tmp_path,
+                provider="codex",
+                model="gpt-5.6-terra",
+            ),
+            shared_family_plan={
+                "lean_index_hash": "lean",
+                "literature_families": [
+                    {
+                        "family_id": "family-one",
+                        "source_ids": list("ABCD"),
+                        "candidate_cluster": True,
+                    }
+                ],
+                "discovery_jobs": [
+                    {
+                        "job_id": "family-job",
+                        "family": "family-one",
+                        "left_source_ids": ["A"],
+                        "right_source_ids": ["B", "C", "D"],
+                        "candidate_quota": 6,
+                    }
+                ],
+            },
+        )
+
+    assert len(calls.seen) == 1
 
 
 @pytest.mark.parametrize("family_reference,left_ids,right_ids", [
