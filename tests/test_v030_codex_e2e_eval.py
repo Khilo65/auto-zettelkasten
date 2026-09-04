@@ -2302,7 +2302,7 @@ def test_strategic8_two_core_revalidation_preserves_failed_run(
     assert receipt["attempt_reservation_state"] == "failed_preserved"
     assert receipt["exact_zero_call_replay"] is True
     assert receipt["strategic8_actual_core_count"] == 2
-    assert receipt["strategic8_role_policy"] == "at_least_two_connected_cores_v1"
+    assert receipt["strategic8_role_policy"] == "two_or_three_connected_cores_label_independent_v2"
     after = runner.base._gate_snapshot(workspace)
     assert after.pop(str(receipt_path.relative_to(workspace)))
     assert before == after
@@ -2395,6 +2395,19 @@ def test_private_strategic8_cluster_labels_never_enter_provider_inputs(
     )
     assert errors == []  # Two connected cores, with grounded contextual neighbors.
 
+    roles[3]["role"] = "core"
+    errors, acceptance = runner._strategic8_oracle_acceptance(
+        tmp_path, cases, report, oracle
+    )
+    assert errors == []  # Historical fixture labels do not fix production roles.
+    assert acceptance["strategic8_actual_core_count"] == 3
+    roles[0]["role"] = "core"
+    errors, _acceptance = runner._strategic8_oracle_acceptance(
+        tmp_path, cases, report, oracle
+    )
+    assert "strategic8_final_cluster_roles_incorrect" in errors
+    roles[0]["role"] = roles[3]["role"] = "context"
+
     roles[2]["role"] = "context"
     errors, _acceptance = runner._strategic8_oracle_acceptance(
         tmp_path, cases, report, oracle
@@ -2418,3 +2431,10 @@ def test_private_strategic8_cluster_labels_never_enter_provider_inputs(
         tmp_path, cases, report, oracle
     )
     assert errors == ["strategic8_required_pairs_not_all_evaluated"]
+
+    report["cluster_map"]["clusters"] = []
+    errors, acceptance = runner._strategic8_oracle_acceptance(
+        tmp_path, cases, report, oracle
+    )
+    assert "strategic8_expected_cluster_missing_or_duplicated" in errors
+    assert acceptance["strategic8_actual_core_count"] is None

@@ -930,10 +930,11 @@ def _strategic8_oracle_acceptance(
         str(row["parent"]["key"]).casefold(): base.source_id_for_item(row["parent"])
         for row in cases
     }
-    core = {source_by_parent[str(key)] for key in oracle["core_parent_keys"]}
+    expected_members = {source_by_parent[str(key)] for key in oracle["core_parent_keys"]}
     context = source_by_parent[str(oracle["context_parent_key"])]
     controls = {source_by_parent[str(key)] for key in oracle["control_parent_keys"]}
-    expected_members = core | {context}
+    expected_members.add(context)
+    core: set[str] = set()
     clusters = (
         report.get("cluster_map", {}).get("clusters", [])
         if isinstance(report.get("cluster_map"), Mapping)
@@ -961,17 +962,13 @@ def _strategic8_oracle_acceptance(
                 if isinstance(row, Mapping) and row.get("source_id")
             }
         )
-        actual_core = {
-            source_id for source_id in core if roles.get(source_id) == "core"
-        }
+        core = {source_id for source_id in expected_members if roles.get(source_id) == "core"}
         if (
             set(roles) != expected_members
-            or len(actual_core) < 2
-            or any(roles.get(source_id) not in {"core", "context"} for source_id in core)
-            or roles.get(context) != "context"
+            or len(core) not in {2, 3}
+            or any(role not in {"core", "context"} for role in roles.values())
         ):
             errors.append("strategic8_final_cluster_roles_incorrect")
-        core = actual_core
     if any(
         controls
         & {str(value) for value in row.get("source_ids", []) or []}
@@ -1014,9 +1011,9 @@ def _strategic8_oracle_acceptance(
                 return reached == nodes
             reached = expanded
 
-    if not connected(core):
+    if len(exact_clusters) == 1 and not connected(core):
         errors.append("strategic8_core_not_connected_by_accepted_edges")
-    if any(
+    if len(exact_clusters) == 1 and any(
         not any(
             tuple(sorted((context_source, source_id))) in accepted_pairs
             for source_id in core
@@ -1026,8 +1023,8 @@ def _strategic8_oracle_acceptance(
         errors.append("strategic8_contextual_relationship_missing")
     return sorted(set(errors)), {
         "strategic8_semantic_oracle_sha256": str(oracle["sha256"]),
-        "strategic8_role_policy": "at_least_two_connected_cores_v1",
-        "strategic8_actual_core_count": len(core),
+        "strategic8_role_policy": "two_or_three_connected_cores_label_independent_v2",
+        "strategic8_actual_core_count": len(core) if len(exact_clusters) == 1 else None,
         "strategic8_required_pair_count": len(required_pairs),
         "strategic8_evaluated_required_pair_count": len(
             required_pairs & evaluated_pairs
