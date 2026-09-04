@@ -83,10 +83,10 @@ def test_atomic_prompt_v14_is_source_adaptive_and_statistics_aware() -> None:
     assert "silently reread" in prompt
 
 
-def test_source_bundle_prompt_v22_preserves_formatting_and_attribution_scope() -> None:
+def test_source_bundle_prompt_v23_preserves_formatting_and_attribution_scope() -> None:
     prompt = _source_bundle_system_prompt()
 
-    assert "source bundle prompt v22" in prompt
+    assert "source bundle prompt v23" in prompt
     assert "apply a footnote, only when the alignment or marker is explicit" in prompt
     assert "A footnote qualifies only the values bearing its explicit marker" in prompt
     assert "page metadata is not a statistic's observation date" in prompt
@@ -207,6 +207,17 @@ def test_source_bundle_critique_distinguishes_totals_from_component_scopes() -> 
     assert "Do not invent a source-quality criticism" in prompt
 
 
+def test_source_bundle_checks_repeated_dates_and_temporal_field_roles() -> None:
+    source = "The 2019 report describes expansion from 30 to 40 regions in 2017."
+    final = _source_bundle_prompt(source, {}, None).split("FINAL WHOLE-SOURCE CHECK:")[1]
+
+    assert "Distinguish the date of a design, sample, or instrument change from the report edition" in final
+    assert "Use the source's change date consistently across every section" in final
+    assert "a temporal window belongs in period, not sample or uncertainty" in final
+    assert "retain independently source-stated observation periods" in final
+    assert "leave unmarked sibling observations unscoped" not in final
+
+
 def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     def digest(value: str | dict[str, Any]) -> str:
         text = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
@@ -221,7 +232,7 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     assert {
         "atomic_prompt_v14": digest(_system_prompt()),
         "chunk_prompt_v14": digest(_chunk_system_prompt()),
-        "source_bundle_prompt_v22": digest(_source_bundle_system_prompt()),
+        "source_bundle_prompt_v23": digest(_source_bundle_system_prompt()),
         "codex_source_bundle_schema": bundle_identity["schema_hash"],
         "codex_source_bundle_contract": digest(bundle_identity),
         "codex_chunk_evidence_schema": chunk_identity["schema_hash"],
@@ -229,7 +240,7 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     } == {
         "atomic_prompt_v14": "8db9f2990d175816cb0100b92d84734ae7c2f930aade66825ed0412b22da3705",
         "chunk_prompt_v14": "3c2eabca75c5ad487a35a5096664e0ec6999d04b738927a60fce2e11cfb15cd5",
-        "source_bundle_prompt_v22": "4891a274f7f7982c5382ad3df252ab8b476fd89be4aa8f145f5a39c739f419e0",
+        "source_bundle_prompt_v23": "a91b89db3c7448a0269858c922a43e734c8c757176b3168b9d3e5a34927e1e4f",
         "codex_source_bundle_schema": "ffd00229ee34f87c2bcc9a32f4b620102be6a907975397126103d5aff032ec3a",
         "codex_source_bundle_contract": "153d29b42447de280facb4a132bef9808c30676909bcee900b39353ef6451a59",
         "codex_chunk_evidence_schema": "2df4a0fe634405df5e891283a59bfc7bee18995b5e970a51c5569b5c4eafed8e",

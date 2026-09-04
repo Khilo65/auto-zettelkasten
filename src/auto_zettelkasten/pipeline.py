@@ -18269,6 +18269,18 @@ def _validate_quantitative_provenance(
                 )
             matching_by_period.append(matching_dates)
         period_terms = _footnote_scope_terms(_normalized_quantity_text(period))
+        claimed_footnote_scopes = [period_terms]
+        if footnote_groups:
+            for field, value in result.items():
+                # A duration can describe uncertainty; require a time-window cue.
+                if field != "period" and isinstance(value, str) and (
+                    _named_period_markers(value)
+                    or _footnote_text_scope(value)
+                    or _calendar_dates(value)
+                ):
+                    claimed_footnote_scopes.append(
+                        _footnote_scope_terms(_normalized_quantity_text(value))
+                    )
         period_temporal_scope = _footnote_temporal_scope(period)
         period_text_scope = _footnote_text_scope(period)
         period_markers = _named_period_markers(period)
@@ -18285,8 +18297,10 @@ def _validate_quantitative_provenance(
             ) or (
                 estimate_tokens.intersection(unmarked)
                 and not estimate_tokens.intersection(marked)
-                and period_terms
-                and period_terms.issubset(definition_terms)
+                and any(
+                    scope and scope.issubset(definition_terms)
+                    for scope in claimed_footnote_scopes
+                )
             ) or (
                 estimate_tokens.intersection(marked)
                 and definition_temporal_scope

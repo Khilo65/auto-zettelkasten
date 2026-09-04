@@ -1220,7 +1220,7 @@ def test_ordinary_bundle_source_uses_one_call_and_no_profile_or_fidelity_call(
     ]
     assert profile["coverage"]["status"] == "partial"
     note = read_note(tmp_path / report.items[0]["note_path"])
-    assert note["frontmatter"]["source_bundle_prompt_version"] == "22"
+    assert note["frontmatter"]["source_bundle_prompt_version"] == "23"
 
 
 def test_atomic_note_projects_accepted_quantitative_evidence_without_salience_loss(
@@ -4130,6 +4130,55 @@ def test_quantitative_provenance_rejects_unmarked_footnote_period() -> None:
             match="footnote_scope_combines_marked_and_unmarked_quantities",
         ):
             _source_bundle_from_result(payload, row, "full_document")
+
+
+@pytest.mark.parametrize("field", ["period", "sample", "uncertainty"])
+@pytest.mark.parametrize("scope", ["first three days", "first 3 days"])
+def test_quantitative_provenance_cannot_hide_footnote_scope_in_auxiliary_fields(
+    field: str, scope: str,
+) -> None:
+    payload = _bundle_payload()
+    payload["evidence_anchors"][0].update(
+        claim=f"During the {scope}, the source reports 19 arrivals per hour.",
+        quantitative_result={
+            "estimate": "19", "period": "", field: scope,
+            "provenance": "source_reported",
+        },
+    )
+    row = {
+        "source_id": "source-zotero-A1", "zotero_item_key": "A1",
+        "text": (
+            "Hourly rates:\n19 arrivals.\n47 shipments*.\n"
+            "*Based on the first three days."
+        ),
+    }
+    with pytest.raises(
+        SourceBundleQuantitativeProvenanceError,
+        match="footnote_scope_combines_marked_and_unmarked_quantities",
+    ):
+        _source_bundle_from_result(payload, row, "full_document")
+
+
+@pytest.mark.parametrize("uncertainty", ["", "3 days"])
+def test_quantitative_provenance_does_not_treat_duration_units_as_footnote_scope(
+    uncertainty: str,
+) -> None:
+    payload = _bundle_payload()
+    payload["evidence_anchors"][0].update(
+        claim="The mean duration is 19 days.",
+        quantitative_result={
+            "estimate": "19", "unit": "days", "period": "", "uncertainty": uncertainty,
+            "provenance": "source_reported",
+        },
+    )
+    row = {
+        "source_id": "source-zotero-A1", "zotero_item_key": "A1",
+        "text": (
+            "Mean duration: 19 days (uncertainty 3 days).\n"
+            "47 shipments*.\n*Based on the first three days."
+        ),
+    }
+    assert _source_bundle_from_result(payload, row, "full_document") is not None
 
 
 def test_quantitative_provenance_rejects_duplicate_marked_footnote_token() -> None:

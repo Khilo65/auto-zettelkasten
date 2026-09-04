@@ -235,7 +235,7 @@ DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
-SOURCE_BUNDLE_PROMPT_VERSION = "22"
+SOURCE_BUNDLE_PROMPT_VERSION = "23"
 SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v2"
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
@@ -5412,6 +5412,10 @@ def _source_bundle_prompt(
         "Each literature-position row must describe one distinct work, not a publisher's pooled reporting. Leave unknown years and titles empty; "
         "never borrow them from a neighboring citation, the cited event, or the current source's date. "
         "Apply each footnote only to its marked measure in every field, including limitations. "
+        "Check field roles: a temporal window belongs in period, not sample or uncertainty. "
+        "Do not copy a marked footnote's scope to unmarked siblings; retain independently source-stated observation periods. "
+        "Distinguish the date of a design, sample, or instrument change from the report edition. "
+        "Use the source's change date consistently across every section; reconcile repeated factual statements before returning. "
         "Correct or omit unsupported clauses instead of inventing criticism to fill a section. Return only the requested bundle, not a review."
     )
 
