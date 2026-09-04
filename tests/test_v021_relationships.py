@@ -83,10 +83,10 @@ def test_v8_salvages_valid_connections_and_keeps_anchors_optional() -> None:
     assert accepted["connection_id"].startswith("relationship-connection-")
 
 
-def test_v27_is_compact_domain_neutral_source_owned_and_complete() -> None:
+def test_v28_is_compact_domain_neutral_source_owned_and_complete() -> None:
     prompt = _relationship_adjudication_system_prompt()
 
-    assert "relationship prompt v27" in prompt
+    assert "relationship prompt v28" in prompt
     assert "source_a_basis describes only the supplied left_source_id" in prompt
     assert "source_b_basis only the supplied right_source_id" in prompt
     assert "whole work versus chapter, excerpt, or component" in prompt
@@ -113,10 +113,17 @@ def test_v27_is_compact_domain_neutral_source_owned_and_complete() -> None:
 def test_contextual_comparison_does_not_require_a_causal_bridge() -> None:
     prompt = _relationship_adjudication_system_prompt()
 
-    assert "state the boundary and system inference" in prompt
-    assert "does not alone invalidate a contextual comparison" in prompt
+    assert "State the boundary" in prompt
+    assert "nor invalidates a contextual comparison" in prompt
     assert "successive institutional stage" in prompt
     assert "prove a cross-stage causal chain" in prompt
+
+
+def test_contextual_comparison_connects_argument_to_measured_perception_without_causality() -> None:
+    prompt = _relationship_adjudication_system_prompt()
+
+    assert "an argued communication or legitimation process alongside a measured perception outcome" in prompt
+    assert "measure exposure, establish that the process caused the outcome" in prompt
 
 
 def test_measurement_fault_line_includes_simple_indicator_vs_composite_index() -> None:
@@ -129,9 +136,9 @@ def test_measurement_fault_line_includes_simple_indicator_vs_composite_index() -
 def test_contextual_comparison_uses_contributions_not_cross_source_proof() -> None:
     prompt = _relationship_adjudication_system_prompt()
 
-    assert "source-specific contributions to one concrete problem, practice, or mechanism" in prompt
-    assert "Neither source must compare the works, link the events" in prompt
-    assert "Missing causal identification or systematic comparison limits the claim" in prompt
+    assert "source-specific contributions to one concrete problem, practice, mechanism, or outcome" in prompt
+    assert "Sources need not compare works, link events" in prompt
+    assert "Unproven causality neither erases" in prompt
     assert "a source lacks a substantive contribution to that comparison" in prompt
 
 
@@ -153,8 +160,7 @@ def test_adjudication_checks_narrower_connections_before_rejecting_a_pair() -> N
         "attributed process",
         "causal proof",
         "independent corroboration",
-        "unproven causality does not erase an explicit author argument",
-        "preserve it in rejections",
+        "neither erases an explicit author argument nor invalidates a contextual comparison",
     ):
         assert requirement in prompt
     assert prompt.index("complete notes' contributions") < prompt.index(

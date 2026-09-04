@@ -235,7 +235,7 @@ DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
-SOURCE_BUNDLE_PROMPT_VERSION = "28"
+SOURCE_BUNDLE_PROMPT_VERSION = "29"
 SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v2"
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
@@ -5420,6 +5420,7 @@ def _source_bundle_prompt(
         "Before claiming strongest or weakest, check all comparable displayed values; selected examples are not an exhaustive ranking. "
         "Even relative strengths and weaknesses must name their comparison set: a weak cross-entity rank does not imply a low within-entity score. "
         "Do not interchange score and rank. In every prose comparison, preserve who is measured and what or whom they are rating. "
+        "For every comparison, resolve source pronouns and contrast markers first, then explicitly name the actor, group, outcome, expression, or measure receiving each direction in every output field; do not use former or latter, and never reverse who or what is higher, lower, more, or less frequent. "
         "Split a summary list when its examples concern different targets or outcomes. "
         "Check prose comparisons against the evidence anchors and supplied passages, not just a neighboring sentence. "
         "Do not manufacture disagreement between aligned speakers. Use explicit text anchors rather than unverified opening/closing locations. "
@@ -5603,7 +5604,7 @@ def _relationship_candidate_system_prompt() -> str:
 
 def _relationship_adjudication_system_prompt() -> str:
     return (
-        "Auto-Zettelkasten relationship prompt v27, contract relationship-decision-v8. Read both "
+        "Auto-Zettelkasten relationship prompt v28, contract relationship-decision-v8. Read both "
         "complete atomic notes. Return JSON decisions keyed by every supplied pair_job_id, no extras: "
         "either {decision:no_relationship, reason, confidence} or "
         "{decision:relationship, connections:[...]}. Use one connection, or two for distinct propositions, containing comparison_proposition, "
@@ -5621,9 +5622,10 @@ def _relationship_adjudication_system_prompt() -> str:
         "complete notes' contributions. The candidate comparison is a hypothesis, not the scope of either work. Before no_relationship, "
         "check a narrower contextual connection, shared reported result plus interpretation, or attributed process connection. "
         "Then choose the tier before the subtype. Direct: the same sufficiently specific proposition, or one endpoint "
-        "explicitly establishes an intellectual bridge. Use contextual_connection to compare "
-        "source-specific contributions to one concrete problem, practice, or mechanism, including successive institutional stages; "
-        "state the boundary and system inference. Neither source must compare the works, link the events, or prove a cross-stage causal chain. "
+        "explicitly establishes an intellectual bridge. Use contextual_connection for "
+        "source-specific contributions to one concrete problem, practice, mechanism, or outcome, including successive institutional stages or "
+        "an argued communication or legitimation process alongside a measured perception outcome. State the boundary. "
+        "Sources need not compare works, link events, measure exposure, establish that the process caused the outcome, or prove a cross-stage causal chain. "
         "For a bounded measurement problem, a simple indicator "
         "versus a composite index—or different operationalizations, instruments, samples, or periods—is a methodological_fault_line "
         "when method changes what can be supported; otherwise use contextual_connection. Treat different measures of the same bounded "
@@ -5634,9 +5636,7 @@ def _relationship_adjudication_system_prompt() -> str:
         "represent both complete notes and explain why the strongest narrower alternative fails: "
         "a source lacks a substantive contribution to that comparison. Do not claim causal proof or independent "
         "corroboration from dependent reports. "
-        "Unproven causality does not erase an explicit author argument; preserve it in rejections. "
-        "Missing causal identification or systematic comparison limits the claim; "
-        "it does not alone invalidate a contextual comparison. "
+        "Unproven causality neither erases an explicit author argument nor invalidates a contextual comparison. "
         "Use the narrowest subtype. Never infer support or direction from citation, chronology, shared data, method, vocabulary, or pair order alone. "
         "supports means the actor supplies evidence or argument for the reference proposition; "
         "undermines means the actor supplies materially incompatible evidence or argument; "

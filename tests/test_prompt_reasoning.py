@@ -83,10 +83,10 @@ def test_atomic_prompt_v14_is_source_adaptive_and_statistics_aware() -> None:
     assert "silently reread" in prompt
 
 
-def test_source_bundle_prompt_v28_preserves_formatting_and_attribution_scope() -> None:
+def test_source_bundle_prompt_v29_preserves_formatting_and_attribution_scope() -> None:
     prompt = _source_bundle_system_prompt()
 
-    assert "source bundle prompt v28" in prompt
+    assert "source bundle prompt v29" in prompt
     assert "apply a footnote, only when the alignment or marker is explicit" in prompt
     assert "A footnote qualifies only the values bearing its explicit marker" in prompt
     assert "page metadata is not a statistic's observation date" in prompt
@@ -257,6 +257,19 @@ def test_source_bundle_keeps_rated_target_in_grouped_prose() -> None:
     assert "Check prose comparisons against the evidence anchors and supplied passages" in final
 
 
+def test_source_bundle_preserves_comparative_referents_and_direction() -> None:
+    final = _source_bundle_prompt(
+        "Sanctions affected both groups, but such action was less frequent for group B.",
+        {},
+        None,
+    ).split("FINAL WHOLE-SOURCE CHECK:")[1]
+
+    assert "resolve source pronouns and contrast markers first" in final
+    assert "explicitly name the actor, group, outcome, expression, or measure" in final
+    assert "do not use former or latter" in final
+    assert "never reverse who or what is higher, lower, more, or less frequent" in final
+
+
 def test_source_bundle_emits_evidence_before_analysis() -> None:
     prompt = _source_bundle_system_prompt()
 
@@ -288,8 +301,8 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     assert {
         "atomic_prompt_v14": digest(_system_prompt()),
         "chunk_prompt_v14": digest(_chunk_system_prompt()),
-        "source_bundle_prompt_v28": digest(_source_bundle_system_prompt()),
-        "source_bundle_user_prompt_v28": digest(
+        "source_bundle_prompt_v29": digest(_source_bundle_system_prompt()),
+        "source_bundle_user_prompt_v29": digest(
             _source_bundle_prompt("A fictional source.", {}, None)
         ),
         "codex_source_bundle_schema": bundle_identity["schema_hash"],
@@ -299,8 +312,8 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     } == {
         "atomic_prompt_v14": "8db9f2990d175816cb0100b92d84734ae7c2f930aade66825ed0412b22da3705",
         "chunk_prompt_v14": "3c2eabca75c5ad487a35a5096664e0ec6999d04b738927a60fce2e11cfb15cd5",
-        "source_bundle_prompt_v28": "ede3c297a157aa315d1d0501e3f2776b42769330504e2f80e3a6c53f13fa43e4",
-        "source_bundle_user_prompt_v28": "08fea06d10e5fc9f6db714686394463f2afc5116bd711ad6de66562dd80f58c9",
+        "source_bundle_prompt_v29": "c07091db363cb47c077fcf6709bbd9dcb1b5fdc5fb98decb45250db5b3798f31",
+        "source_bundle_user_prompt_v29": "c530d3874ae68f532dd574390ff15944bd2b2cfe5f2bb5986bad3da62935ad8f",
         "codex_source_bundle_schema": "1b9491a9f2d7bf9c4c8c62a5838180c2e8b171700211e2fe63cd77514d7192c2",
         "codex_source_bundle_contract": "e6e7dc65d7953e5fe777faf1dcb43cebf933c4d9e73ca890264e98a7cd08e023",
         "codex_chunk_evidence_schema": "2df4a0fe634405df5e891283a59bfc7bee18995b5e970a51c5569b5c4eafed8e",
