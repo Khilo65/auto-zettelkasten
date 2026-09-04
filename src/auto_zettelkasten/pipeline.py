@@ -19955,6 +19955,7 @@ def _custodied_pdf_candidate(
                     "ordinal_to_printed_page": {
                         str(page.page_number): page.printed_page
                         for page in probe.pages
+                        if page.printed_page
                     },
                 }
             )
@@ -20096,7 +20097,9 @@ def _custodied_pdf_candidate(
             "recovered_pages": list(range(1, probe.page_count + 1)),
             "recovered_page_ratio": 1.0,
             "ordinal_to_printed_page": {
-                str(page.page_number): page.printed_page for page in probe.pages
+                str(page.page_number): page.printed_page
+                for page in probe.pages
+                if page.printed_page
             },
         }
     )

@@ -983,7 +983,16 @@ def probe_pdf_bytes(
                 **failure,
             )
         try:
-            page_labels = tuple(str(value) for value in reader.page_labels)
+            # pypdf also synthesizes ordinals for malformed label trees.
+            # Matching labels cannot disambiguate printed pagination.
+            page_labels = (
+                tuple(
+                    str(value) if str(value) != str(index) else ""
+                    for index, value in enumerate(reader.page_labels, start=1)
+                )
+                if "/PageLabels" in reader.root_object
+                else ()
+            )
         except (AttributeError, TypeError, ValueError):
             page_labels = ()
     except ExtractionCancelled:
@@ -1035,7 +1044,7 @@ def probe_pdf_bytes(
         suspicious.update(range(page_count))
 
     printed_pages = tuple(
-        page_labels[index] if index < len(page_labels) and page_labels[index] else str(index + 1)
+        page_labels[index] if index < len(page_labels) else ""
         for index in range(page_count)
     )
     embedded_text = _page_marked_text(embedded_pages)
@@ -1796,8 +1805,9 @@ def _positive_int(value: Any) -> int | None:
 def _printed_page_map(page_count: int, value: Any) -> dict[str, str]:
     supplied = value if isinstance(value, Mapping) else {}
     return {
-        str(index): str(supplied.get(str(index)) or supplied.get(index) or index)
+        str(index): str(label)
         for index in range(1, page_count + 1)
+        if (label := supplied.get(str(index)) or supplied.get(index))
     }
 
 
@@ -1831,7 +1841,7 @@ def _document_spans(
             span = {
                 "label": line,
                 "page_ordinal": page,
-                "printed_page": str(printed_page_map.get(str(page)) or page),
+                "printed_page": str(printed_page_map.get(str(page)) or ""),
             }
             object_match = object_heading.match(line)
             if object_match:

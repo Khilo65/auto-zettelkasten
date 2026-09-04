@@ -21,7 +21,7 @@ ANALYSIS_SECTION_KEYS = (
     "locators",
     "source_structure_and_organization",
 )
-ATOMIC_FIDELITY_VERSION = "6"
+ATOMIC_FIDELITY_VERSION = "7"
 
 _CAUSAL_SCAN_KEYS = {
     "thesis",
@@ -536,7 +536,9 @@ def _claim_units(section: str) -> list[str]:
         line = re.sub(r"^\s*(?:[-*+]|\d+[.)])\s*", "", raw_line).strip()
         if not line:
             continue
-        parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", line)
+        parts = re.split(
+            r"(?<=[.!?])(?<!\b[pP]\.)(?<!\b[pP][pP]\.)\s+(?=[A-Z0-9])", line
+        )
         units.extend(part.strip() for part in parts if part.strip())
     return units or ([section.strip()] if section.strip() else [])
 

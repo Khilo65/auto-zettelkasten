@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -438,6 +439,40 @@ def test_explicit_image_fallback_is_used_only_after_raw_pdf_admission_fails(
     assert extracted.route == "codex_pdf_page_images"
     assert candidate
     assert candidate["document_route"]["identity_payload"]["selected_pages"] == [1]
+
+
+@pytest.mark.parametrize(
+    ("fallback", "route"),
+    [("none", "codex_pdf_input_file"), ("images", "codex_pdf_page_images")],
+)
+def test_pdf_routes_keep_unknown_printed_labels_empty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fallback: str, route: str,
+) -> None:
+    from auto_zettelkasten import pipeline
+
+    document = b"pdf"
+    probe = _inadequate_probe(document)
+    probe = replace(
+        probe, pages=(replace(probe.pages[0], printed_page=""),), page_labels=(),
+    )
+    monkeypatch.setattr(pipeline, "probe_pdf_bytes", lambda *_args, **_kwargs: probe)
+    custody = tmp_path / "custody.pdf"
+    custody.write_bytes(document)
+
+    candidate, extracted = _custodied_pdf_candidate(
+        document, custody, {},
+        {"key": "A1", "data": {"key": "A1", "itemType": "journalArticle"}},
+        {"source_id": "source-zotero-A1"},
+        _request(tmp_path, pdf_fallback=fallback),
+        actual_primary_pdf=True,
+        cancelled=None,
+        reader=_pdf_capable_reader() if fallback == "none" else None,
+    )
+
+    assert candidate
+    assert extracted.route == route
+    assert extracted.coverage_metrics["ordinal_to_printed_page"] == {}
+    assert extracted.coverage_metrics["recovered_pages"] == [1]
 
 
 def test_explicit_ocr_fallback_is_used_only_after_raw_pdf_admission_fails(

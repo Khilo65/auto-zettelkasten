@@ -106,6 +106,17 @@ def test_analyzer_resolves_printed_page_labels_to_pdf_ordinals() -> None:
     assert not [row for row in risks if row["kind"] == "nonexistent_page_locator"]
 
 
+@pytest.mark.parametrize("locator", ["p. 999", "pp. 999–1000", "PDF p. 999"])
+def test_analyzer_retains_abbreviated_page_locators_in_claims(locator: str) -> None:
+    risks = analyze_atomic_fidelity(
+        _analysis(detailed_findings=f"The result appears on {locator}."),
+        _pages({1: "The result appears here."}),
+        {"page_count": 1},
+    )
+
+    assert any(row["kind"] == "nonexistent_page_locator" for row in risks)
+
+
 def test_analyzer_normalizes_bracketed_printed_page_labels() -> None:
     analysis = _analysis(locators="Printed page 71.")
     source = _pages({1: "The article begins on printed page 71."})

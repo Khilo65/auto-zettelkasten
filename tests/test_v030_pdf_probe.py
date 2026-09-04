@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import sys
 import threading
 import time
@@ -39,7 +40,7 @@ def test_pdf_probe_collects_no_ocr_page_and_custody_evidence(monkeypatch) -> Non
     assert probe.pages[0].height == 2_048
     assert probe.pages[1].suspicious is True
     assert probe.pages[1].render_candidate is True
-    assert probe.pages[1].printed_page == "2"
+    assert probe.pages[1].printed_page == ""
     assert probe.adequacy is not None
     assert probe.to_dict()["pages"][1]["embedded_text"] == "scan"
 
@@ -72,6 +73,7 @@ def test_pdf_probe_retains_other_pages_after_one_page_text_error(
 
     class FakeReader:
         is_encrypted = False
+        root_object = {"/PageLabels": {}}
         page_labels = ("i", "ii")
 
         def __init__(self, _stream) -> None:  # noqa: ANN001
@@ -97,6 +99,33 @@ def test_pdf_probe_retains_other_pages_after_one_page_text_error(
     assert probe.pages[1].text_quality == "corrupted"
     assert probe.pages[1].error_type == "ValueError"
     assert probe.pages[1].printed_page == "ii"
+
+
+@pytest.mark.parametrize("label", [None, "empty", "empty_nums", 1, 42])
+def test_pdf_probe_does_not_invent_printed_labels(label: int | str | None) -> None:
+    from pypdf import PdfWriter
+    from pypdf.generic import ArrayObject, DictionaryObject, NameObject
+
+    writer = PdfWriter(clone_from=io.BytesIO(_pdf([_prose("Introduction", 220)])))
+    if isinstance(label, int):
+        writer.set_page_label(0, 0, style="/D", start=label)
+    elif label is not None:
+        writer.root_object[NameObject("/PageLabels")] = DictionaryObject(
+            {NameObject("/Nums"): ArrayObject()} if label == "empty_nums" else {}
+        )
+    stream = io.BytesIO()
+    writer.write(stream)
+    data = stream.getvalue()
+
+    probe = extraction.probe_pdf_bytes(data)
+    result = extraction.extract_pdf_from_probe(data, probe, ocr_mode="off")
+    expected = {"1": str(label)} if isinstance(label, int) and label != 1 else {}
+
+    assert result.status == "succeeded"
+    assert probe.pages[0].page_number == 1
+    assert probe.pages[0].printed_page == expected.get("1", "")
+    assert probe.adequacy.metrics["ordinal_to_printed_page"] == expected
+    assert result.coverage_metrics["ordinal_to_printed_page"] == expected
 
 
 def test_extract_pdf_from_probe_reuses_custody_checked_evidence(monkeypatch) -> None:

@@ -55,7 +55,7 @@ def test_substantive_mixed_pdf_with_one_unresolved_page_is_partial(
     assert result.coverage_metrics["unresolved_pages"] == (5,)
     assert result.coverage_metrics["recovered_pages"] == (1, 2, 3, 4)
     assert result.coverage_metrics["recovered_page_ratio"] == 0.8
-    assert result.coverage_metrics["ordinal_to_printed_page"]["1"] == "1"
+    assert result.coverage_metrics["ordinal_to_printed_page"] == {}
 
 
 @pytest.mark.parametrize("recovered_count", [39, 100, 105])
@@ -128,6 +128,20 @@ def test_pdf_classification_records_printed_page_map_and_source_spans() -> None:
     assert adequacy.metrics["heading_spans"][0]["label"] == "Introduction"
     assert adequacy.metrics["table_spans"][0]["page_ordinal"] == 2
     assert adequacy.metrics["figure_spans"][0]["printed_page"] == "2"
+
+
+def test_pdf_classification_keeps_unknown_printed_pages_empty() -> None:
+    adequacy = classify_pdf_text(
+        "--- Page 1 ---\nIntroduction\n" + _prose("opening", 120)
+        + "\n--- Page 2 ---\nTable 1: Outcomes\n" + _prose("results", 120),
+        page_count=2,
+        coverage_metadata={"ordinal_to_printed_page": {"1": "iv"}},
+    )
+
+    assert adequacy.metrics["ordinal_to_printed_page"] == {"1": "iv"}
+    assert adequacy.metrics["heading_spans"][0]["printed_page"] == "iv"
+    assert adequacy.metrics["table_spans"][0]["page_ordinal"] == 2
+    assert adequacy.metrics["table_spans"][0]["printed_page"] == ""
 
 
 def test_reference_only_pdf_is_not_analytical() -> None:
