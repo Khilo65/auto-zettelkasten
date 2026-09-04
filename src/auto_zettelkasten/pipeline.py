@@ -128,7 +128,6 @@ from .profiles import (
     PROFILE_PROMPT_VERSION,
     ProfileContractError,
     ProfileParseError,
-    _QUOTE_SPAN_LOCATOR,
     _source_locator_payloads,
     augment_profile_from_committed_note,
     build_evidence_profile,
@@ -208,6 +207,9 @@ _RELATIONSHIP_DISCOVERY_PAGE_SIZE = 64
 _RELATIONSHIP_SELECTION_STATE_SCHEMA_VERSION = "4"
 _RELATIONSHIP_DISCOVERY_POLICY_VERSION = "quota-independent-family-coverage-v300"
 _RELATIONSHIP_SEMANTIC_POLICY_VERSION = "source-owned-bases-v26"
+_SOURCE_BUNDLE_QUOTE_LOCATOR = re.compile(
+    r'^["\u201c](?P<quote>[^"\u201d]+)["\u201d]'
+)
 _LITERATURE_MEMORY_LOCK = threading.Lock()
 _AUTO_CLOUD_SOURCE_WORKER_LIMIT = 32
 _AUTO_DEEPSEEK_SOURCE_WORKER_LIMIT = 256
@@ -15785,9 +15787,15 @@ def _source_bundle_from_result(
                 normalized_anchors.append(value)
                 continue
             locator = str(value.get("locator") or "")
-            if (validate_quantitative_provenance or opaque_pdf_route) and locator.casefold().startswith("quote "):
-                quote_locator = locator[6:].strip()
-                quoted = _QUOTE_SPAN_LOCATOR.search(quote_locator)
+            quote_like = re.match(r"^\s*quote\s", locator, flags=re.IGNORECASE)
+            if (validate_quantitative_provenance or opaque_pdf_route) and quote_like:
+                canonical_locator = locator.strip()
+                quote_locator = (
+                    canonical_locator[6:].strip()
+                    if canonical_locator.casefold().startswith("quote ")
+                    else ""
+                )
+                quoted = _SOURCE_BUNDLE_QUOTE_LOCATOR.match(quote_locator)
                 span = " ".join(quoted.group("quote").split()) if quoted else ""
                 suffix = quote_locator[quoted.end() :].strip() if quoted else ""
                 page_suffix = suffix[1:-1].strip() if suffix.startswith("(") and suffix.endswith(")") else ""
@@ -15808,6 +15816,10 @@ def _source_bundle_from_result(
                         len(suffix_locators) != 1
                         or suffix_locators[0]["locator_type"] not in {"page", "page_range"}
                         or suffix_locators[0]["value"].casefold() != page_suffix.casefold()
+                        or not isinstance(suffix_locators[0]["page_start"], int)
+                        or not isinstance(suffix_locators[0]["page_end"], int)
+                        or suffix_locators[0]["page_start"] < 1
+                        or suffix_locators[0]["page_end"] < suffix_locators[0]["page_start"]
                     ))
                     or not 12 <= len(span) <= 120
                     or (

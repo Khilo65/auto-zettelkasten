@@ -937,6 +937,7 @@ def test_native_html_heading_reaches_cluster_admission_without_weak_locator_prom
     raw = (
         f'<h4>{heading}</h4><p>Monitoring changes implementation.</p>'
         '<h4>Ambiguous source heading</h4><h4>Ambiguous source heading</h4>'
+        '<h4>Quote-based evidence</h4>'
         '<h4>Detailed Findings</h4><h4>Methods</h4>'
     )
     extracted = extract_bytes(raw.encode(), media_type="text/html", filename="source.html")
@@ -986,6 +987,10 @@ def test_native_html_heading_reaches_cluster_admission_without_weak_locator_prom
     }]}
     admitted, _parked, _neighbors, _unclustered = _global_plan_proposals(proposal, profiles)
     assert admitted[0]["source_roles"] == {row["source_id"]: "core", "source-b": "core"}
+    anchor.update(locator="Quote-based evidence", locators=["Quote-based evidence"])
+    quote_heading = _source_bundle_from_result(payload, row, "full_document")
+    assert quote_heading is not None
+    assert quote_heading.evidence_anchors[0].locator == 'Heading "Quote-based evidence"'
     for locator in ("Ambiguous source heading", "Unverified source heading", "Detailed Findings", "Methods", "Opening paragraph"):
         anchor.update(locator=locator, locators=[locator])
         unchanged = _source_bundle_from_result(payload, row, "full_document")
@@ -999,6 +1004,17 @@ def test_native_html_heading_reaches_cluster_admission_without_weak_locator_prom
             anchor.update(locator=f'Quote "{span}"', locators=[f'Quote "{span}"'])
             with pytest.raises(ValueError, match="quote_locator_not_unique_in_source"):
                 _source_bundle_from_result(payload, {**row, "text": text}, "full_document")
+        for invalid in (
+            ' Quote "Invented quotation never in text" unsupported',
+            'Quote\t"Invented quotation never in text" unsupported',
+        ):
+            anchor.update(locator=invalid, locators=[invalid])
+            with pytest.raises(ValueError, match="quote_locator_not_unique_in_source"):
+                _source_bundle_from_result(payload, row, "full_document")
+        padded = f'Quote "Monitoring{" " * 250}changes implementation."'
+        anchor.update(locator=padded, locators=[padded])
+        normalized = _source_bundle_from_result(payload, row, "full_document")
+        assert normalized is not None and normalized.evidence_anchors[0].source_locators
         legacy_quote = _source_bundle_from_result(
             payload, row, "full_document", validate_quantitative_provenance=False,
         )
@@ -1027,7 +1043,10 @@ def test_native_html_heading_reaches_cluster_admission_without_weak_locator_prom
         assert {value.locator_type for value in opaque.evidence_anchors[0].source_locators} == {
             "page", "quote_span",
         }
-        for invalid in (f'{expected} unsupported', f'{expected} (context p. 92)'):
+        for invalid in (
+            f'{expected} unsupported', f'{expected} (context p. 92)',
+            f'{expected} (p. 0)', f'{expected} (pp. 93-92)',
+        ):
             anchor.update(locator=invalid, locators=[invalid])
             with pytest.raises(ValueError, match="quote_locator_not_unique_in_source"):
                 _source_bundle_from_result(
