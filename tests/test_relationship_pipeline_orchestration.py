@@ -6,6 +6,8 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+import pytest
+
 import auto_zettelkasten.pipeline as pipeline_module
 from auto_zettelkasten.files import read_yaml, write_yaml
 from auto_zettelkasten.models import (
@@ -595,6 +597,105 @@ def test_complementary_family_breadth_covers_pairs_inside_planner_sides(
     assert accounting["valid_unique_candidates"] == 6
     assert accounting["breadth_added_unique_candidates"] == 2
     assert accounting["planner_target_met"] is True
+
+
+@pytest.mark.parametrize("family_reference,left_ids,right_ids", [
+    ("Named family", ["C"], ["D"]),
+    ("Other description", ["C"], ["D"]),
+    (None, [], []),
+    ("Named family", list("ABC"), list("BCD")),
+    ("Named family", list("ABCD"), []),
+])
+def test_shared_discovery_keeps_members_omitted_from_planner_jobs(
+    tmp_path: Path, family_reference: str | None, left_ids: list[str], right_ids: list[str],
+) -> None:
+    profiles = [_profile(source_id) for source_id in "ABCDEF"]
+    catalogue = _catalogue(tmp_path, profiles)
+    plan = {
+        "lean_index_hash": "lean",
+        "literature_families": [
+            {
+                "family_id": "family-one",
+                "label": "Named family",
+                "source_ids": list("ABCD"),
+                "candidate_cluster": True,
+            },
+            {
+                "family_id": "routing-only",
+                "source_ids": list("EF"),
+                "candidate_cluster": False,
+            },
+        ],
+        "discovery_jobs": [
+            {
+                "job_id": "incomplete-job",
+                "family": family_reference,
+                "left_source_ids": left_ids,
+                "right_source_ids": right_ids,
+                "candidate_quota": 6,
+            }
+        ] if family_reference is not None else [],
+    }
+    considered: set[tuple[str, str]] = set()
+
+    def handler(stage, _profiles, context):
+        if not stage.endswith("candidate_selection"):
+            return {"decisions": [_decision(job) for job in context["pair_jobs"]]}
+        excluded = {tuple(pair) for pair in context["excluded_candidate_pairs"]}
+        candidates = []
+        outcomes = []
+        packet_pairs: set[tuple[str, str]] = set()
+        for job in context["bridge_jobs"]:
+            pairs = {
+                tuple(sorted((left, right)))
+                for left in job["left_source_ids"]
+                for right in job["right_source_ids"]
+                if left != right
+            } - excluded
+            considered.update(pairs)
+            assert all(set(pair) <= set("ABCD") or pair == ("E", "F") for pair in pairs)
+            candidates.extend(
+                {**_candidate(*pair), "bridge_job_id": job["bridge_job_id"]}
+                for pair in sorted(pairs - packet_pairs)
+                if pair != ("E", "F")
+            )
+            packet_pairs.update(pairs)
+            outcomes.append({"bridge_job_id": job["bridge_job_id"], "status": "no_more_candidates"})
+        return {"candidates": candidates, "job_outcomes": outcomes}
+
+    result = _run(
+        tmp_path, profiles, _Calls(handler), catalogue=catalogue,
+        shared_family_plan=plan,
+    )
+    assert considered == {
+        ("A", "B"), ("A", "C"), ("A", "D"), ("B", "C"),
+        ("B", "D"), ("C", "D"), ("E", "F"),
+    }
+    assert result["pair_job_count"] == len(result["accepted"]) == 6
+    assert result["relationship_stage_complete"] is True
+    assert plan["literature_families"][1]["candidate_cluster"] is False
+    _commit_relationship_selection_state(
+        tmp_path, result, catalogue_revision=result["reconciled_catalogue_revision"],
+    )
+    before = {
+        path: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in tmp_path.rglob("*") if path.is_file()
+    }
+    replay_calls = _Calls(lambda *_args: pytest.fail("unexpected replay call"))
+    replay = _run(
+        tmp_path, profiles, replay_calls, catalogue=catalogue,
+        shared_family_plan=plan,
+    )
+    _commit_relationship_selection_state(
+        tmp_path, replay, catalogue_revision=replay["reconciled_catalogue_revision"],
+    )
+    assert replay_calls.seen == []
+    assert replay["semantic_noop"] is True
+    assert replay["provider_batch_count"] == 0
+    assert before == {
+        path: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in tmp_path.rglob("*") if path.is_file()
+    }
 
 
 def test_complementary_breadth_runs_after_cross_pairs_are_resolved(

@@ -5681,10 +5681,15 @@ def _cluster_proposal_system_prompt() -> str:
 def _literature_family_plan_system_prompt() -> str:
     return (
         "You are the shared literature-family planner for Auto-Zettelkasten "
-        "cluster plan prompt v10. Read the supplied labeled source-index shard jobs. Return one "
+        "cluster plan prompt v11. Read the supplied labeled source-index shard jobs. Return one "
         "JSON object with literature_families, discovery_jobs, neighboring_families, and "
         "source_dispositions arrays. A family has family_id, label, "
         "organizing_problem, source_ids, proposed_roles, and candidate_cluster. "
+        "candidate_cluster=true proposes a coherent bounded literature with at least two relevant source "
+        "contributions for later evidence-based admission and synthesis; it does not assert final membership, "
+        "independent corroboration, or a shared exact finding. Use candidate_cluster=false only for a "
+        "routing-only grouping that does not warrant that examination. This judgment is independent of whether cluster generation is enabled "
+        "for the current run. Propose candidates here; do not write their syntheses. "
         "Roles are core, supporting, mechanism, boundary, practitioner, or partial. "
         "A discovery job has job_id, family, left_source_ids, right_source_ids, "
         "requested_collection_pair, discovery_goal, and candidate_quota. A "
@@ -5708,8 +5713,8 @@ def _literature_family_plan_system_prompt() -> str:
         "or replacement families and discovery jobs, retain existing family IDs "
         "when their organizing problem still applies, and do not reshuffle "
         "unaffected families. Consider coherent within-collection, mixed-collection, bridge, and neighboring-but-distinct "
-        "families; collection membership is routing provenance, not an intellectual boundary. Do not adjudicate relationships, summarize findings, write "
-        "clusters, invent IDs, or force every source into a family."
+        "families; collection membership is routing provenance, not an intellectual boundary. Do not adjudicate relationships, summarize findings, "
+        "invent IDs, or force every source into a family."
     )
 
 

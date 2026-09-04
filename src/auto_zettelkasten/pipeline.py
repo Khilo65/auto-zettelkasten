@@ -204,7 +204,7 @@ _RELATIONSHIP_BATCH_MAX_JOBS = 8
 _LEGACY_RELATIONSHIP_BATCH_MAX_JOBS = 8
 _RELATIONSHIP_DISCOVERY_PAGE_SIZE = 64
 _RELATIONSHIP_SELECTION_STATE_SCHEMA_VERSION = "4"
-_RELATIONSHIP_DISCOVERY_POLICY_VERSION = "negative-aware-breadth-v298"
+_RELATIONSHIP_DISCOVERY_POLICY_VERSION = "negative-aware-breadth-v299"
 _RELATIONSHIP_SEMANTIC_POLICY_VERSION = "source-owned-bases-v26"
 _LITERATURE_MEMORY_LOCK = threading.Lock()
 _AUTO_CLOUD_SOURCE_WORKER_LIMIT = 32
@@ -7054,7 +7054,6 @@ def _run_relationship_reasoning(
     }
     shared_plan_active = bool(
         shared_family_plan
-        and shared_family_plan.get("discovery_jobs")
         and shared_family_plan.get("literature_families")
     )
     catalogue_revision = stable_hash(
@@ -8360,9 +8359,40 @@ def _run_relationship_reasoning(
             if label := str(family.get("label") or "").strip():
                 family_aliases[label].add(family_id)
         resolved_pairs = set(mandatory_basis) | negative_pairs | visible_pairs
-        for raw_job in shared_family_plan.get("discovery_jobs", []) or []:
-            if not isinstance(raw_job, Mapping):
+        discovery_jobs = [
+            dict(row) for row in shared_family_plan.get("discovery_jobs", []) or []
+            if isinstance(row, Mapping)
+        ]
+        discovery_scopes: list[set[str]] = []
+        for job in discovery_jobs:
+            left = set(job.get("left_source_ids", []) or []) & analytical_source_ids & set(lean_by_source)
+            right = set(job.get("right_source_ids", []) or []) & analytical_source_ids & set(lean_by_source)
+            if left - right and right - left:
+                discovery_scopes.append(left ^ right)
+        # A family assignment must remain discoverable even when the planner
+        # omits members from its jobs or uses an unresolvable family label.
+        for family_id, family in sorted(family_rows.items()):
+            coverage_source_ids = sorted(
+                set(family.get("source_ids", []) or [])
+                & set(lean_by_source) & analytical_source_ids
+            )
+            if len(coverage_source_ids) < 2 or any(
+                set(coverage_source_ids) <= scope for scope in discovery_scopes
+            ):
                 continue
+            job_id = "family-coverage-" + stable_hash(family)[:16]
+            while any(job.get("job_id") == job_id for job in discovery_jobs):
+                job_id += "-coverage"
+            discovery_jobs.append({
+                "job_id": job_id,
+                "family": family_id,
+                "left_source_ids": coverage_source_ids[:1],
+                "right_source_ids": coverage_source_ids[1:],
+                "discovery_goal": str(family.get("organizing_problem") or ""),
+                "candidate_quota": 24,
+            })
+            discovery_scopes.append(set(coverage_source_ids))
+        for raw_job in discovery_jobs:
             job_id = str(
                 raw_job.get("job_id")
                 or "family-job-" + stable_hash(raw_job)[:12]

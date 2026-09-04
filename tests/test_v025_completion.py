@@ -17,6 +17,7 @@ from auto_zettelkasten.pipeline import (
 from auto_zettelkasten.literature import LITERATURE_FAMILY_PLAN_PROMPT_VERSION
 from auto_zettelkasten.readers import (
     LITERATURE_FAMILY_PLAN_MAX_OUTPUT_TOKENS,
+    _literature_family_plan_system_prompt,
     _relationship_adjudication_system_prompt,
 )
 from auto_zettelkasten.relationships import (
@@ -37,7 +38,14 @@ def test_v29_4_relationship_packet_and_family_plan_limits() -> None:
     assert "every ID appears exactly once" in prompt
     assert _RELATIONSHIP_BATCH_MAX_JOBS == 8
     assert LITERATURE_FAMILY_PLAN_MAX_OUTPUT_TOKENS == 128_000
-    assert LITERATURE_FAMILY_PLAN_PROMPT_VERSION == "10"
+    assert LITERATURE_FAMILY_PLAN_PROMPT_VERSION == "11"
+    family_prompt = _literature_family_plan_system_prompt()
+    assert "cluster plan prompt v11" in family_prompt
+    assert "candidate_cluster=true" in family_prompt
+    assert "candidate_cluster=false" in family_prompt
+    assert "routing-only grouping" in family_prompt
+    assert "later evidence-based admission" in family_prompt
+    assert "independent of whether cluster generation is enabled" in family_prompt
 
     rows = list(range(31))
     packets = _pack_relationship_rows(

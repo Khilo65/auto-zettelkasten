@@ -10,6 +10,7 @@ import pytest
 from auto_zettelkasten.files import read_yaml, write_yaml
 from auto_zettelkasten.literature import (
     _CheckpointedReasonerCalls,
+    _shared_family_cluster_plan,
     _streamlined_cluster_markdown,
     _synthesis_stage_budget_group,
     _synthesis_stage_prompt_version,
@@ -94,6 +95,24 @@ def _response(
             }
         ],
     }
+
+
+@pytest.mark.parametrize("candidate_cluster", [True, False])
+def test_shared_family_candidate_flag_preserves_routing_only_exclusion(
+    candidate_cluster: bool,
+) -> None:
+    plan = {"literature_families": [{
+        "family_id": "family",
+        "source_ids": ["A", "B"],
+        "proposed_roles": {"A": "core", "B": "core"},
+        "candidate_cluster": candidate_cluster,
+    }]}
+    result = _shared_family_cluster_plan(
+        plan, [{"source_id": source_id, "analytical": True} for source_id in "AB"],
+    )
+    assert len(result["clusters"]) == int(candidate_cluster)
+    assert result["parked_clusters"] == []
+    assert plan["literature_families"][0]["candidate_cluster"] is candidate_cluster
 
 
 def test_shared_family_plan_bypasses_cluster_planner_and_supplies_receipt() -> None:
@@ -581,7 +600,7 @@ def test_acquisition_reconciliation_is_additive_and_idempotent(tmp_path: Path) -
 
 
 def test_literature_family_stage_has_explicit_checkpoint_mappings() -> None:
-    assert _synthesis_stage_prompt_version("literature_family_plan") == "10"
+    assert _synthesis_stage_prompt_version("literature_family_plan") == "11"
     assert (
         _synthesis_stage_budget_group("literature_family_plan")
         == "literature_family_plan"
