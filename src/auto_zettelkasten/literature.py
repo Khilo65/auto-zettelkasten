@@ -88,7 +88,7 @@ CLUSTER_PLAN_PROMPT_VERSION = "6"
 CLUSTER_PROPOSAL_PROMPT_VERSION = "17"
 CLUSTER_SYNTHESIS_PROMPT_VERSION = "39"
 CLUSTER_PARTITION_POLICY_VERSION = "3"
-CLUSTER_VALIDATION_POLICY_VERSION = "3"
+CLUSTER_VALIDATION_POLICY_VERSION = "4"
 CLUSTER_EMPTY_RETRY_POLICY_VERSION = "1"
 GAP_REASONING_PROMPT_VERSION = "12"
 ANCHOR_ALGORITHM_VERSION = "3"
@@ -99,7 +99,7 @@ GAP_RULE_VERSION = "3"
 
 FAMILY_RELATION_VERSION = "6"
 
-FAMILY_ADMISSION_VERSION = "10"
+FAMILY_ADMISSION_VERSION = "11"
 
 STRICT_ADJUDICATION_VERSION = "3"
 
@@ -7323,6 +7323,13 @@ def _family_relation_connected_components(
         return []
     adjacency: dict[str, set[str]] = {source_id: set() for source_id in core_source_ids}
     for relation in relations:
+        if (
+            _as_mapping(relation.get("comparability")).get(
+                "accepted_relation_type"
+            )
+            == "contextual_connection"
+        ):
+            continue
         members = sorted(
             core_source_ids
             & {str(value) for value in relation.get("source_ids", []) or []}

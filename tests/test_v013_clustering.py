@@ -174,7 +174,7 @@ def test_relationship_first_global_plan_requires_verified_pair_connectivity() ->
         {
             "relation_id": relation_id,
             "source_ids": [left, right],
-            "relation_type": "contextual_connection",
+            "relation_type": "complements",
             "reason": "The pair supports a bounded comparison.",
             "cluster_evidence_eligible": True,
             "evidence": [
@@ -228,6 +228,111 @@ def test_relationship_first_global_plan_requires_verified_pair_connectivity() ->
     )
 
 
+def test_relationship_first_contextual_edge_does_not_create_core_only_cluster() -> None:
+    profiles = normalize_evidence_profiles([_profile("a"), _profile("b")])
+    response = {
+        "clusters": [
+            {
+                "cluster_id": "context-only",
+                "title": "Adjacent questions",
+                "shared_question": "How are these adjacent questions connected?",
+                "coherence_rationale": "The sources supply neighboring context.",
+                "members": [
+                    {
+                        "source_id": source_id,
+                        "role": "core",
+                        "evidence_anchor_ids": [f"{source_id}-anchor-1"],
+                    }
+                    for source_id in ("a", "b")
+                ],
+            }
+        ]
+    }
+    accepted = [
+        {
+            "relation_id": "relationship-a-b",
+            "source_ids": ["a", "b"],
+            "relation_type": "contextual_connection",
+            "reason": "The sources address neighboring stages without a shared finding.",
+            "cluster_evidence_eligible": True,
+            "evidence": [
+                {
+                    "source_id": source_id,
+                    "evidence_anchor_id": f"{source_id}-anchor-2",
+                }
+                for source_id in ("a", "b")
+            ],
+        }
+    ]
+
+    proposals, _, _, _ = _global_plan_proposals(
+        response,
+        profiles,
+        accepted_relationships=accepted,
+    )
+    mapped = map_overlapping_clusters(profiles, proposals=proposals)
+
+    assert mapped["clusters"] == []
+    assert mapped["rejected_proposals"][0]["reason"] == (
+        "no_valid_connected_family_relation"
+    )
+
+
+def test_relationship_first_contextual_edge_retains_non_core_neighbor() -> None:
+    profiles = normalize_evidence_profiles(
+        [_profile(source_id) for source_id in ("a", "b", "c")]
+    )
+    response = {
+        "clusters": [
+            {
+                "cluster_id": "connected-with-context",
+                "title": "Bounded core with adjacent context",
+                "shared_question": "How is the bounded core qualified?",
+                "coherence_rationale": "A and B form the core; C supplies context.",
+                "members": [
+                    {
+                        "source_id": source_id,
+                        "role": "bridge" if source_id == "c" else "core",
+                        "evidence_anchor_ids": [f"{source_id}-anchor-1"],
+                    }
+                    for source_id in ("a", "b", "c")
+                ],
+            }
+        ]
+    }
+    accepted = [
+        {
+            "relation_id": relation_id,
+            "source_ids": [left, right],
+            "relation_type": relation_type,
+            "reason": "Verified bounded connection.",
+            "cluster_evidence_eligible": True,
+            "evidence": [
+                {
+                    "source_id": source_id,
+                    "evidence_anchor_id": f"{source_id}-anchor-2",
+                }
+                for source_id in (left, right)
+            ],
+        }
+        for relation_id, left, right, relation_type in (
+            ("relationship-a-b", "a", "b", "complements"),
+            ("relationship-b-c", "b", "c", "contextual_connection"),
+        )
+    ]
+
+    proposals, _, _, _ = _global_plan_proposals(
+        response,
+        profiles,
+        accepted_relationships=accepted,
+    )
+    mapped = map_overlapping_clusters(profiles, proposals=proposals)
+
+    assert mapped["clusters"][0]["core_source_ids"] == ["a", "b"]
+    assert mapped["clusters"][0]["context_source_ids"] == ["c"]
+    assert mapped["clusters"][0]["relation_ids"] == ["relationship-a-b"]
+
+
 def test_relationship_first_cluster_discards_unconnected_auxiliary_member() -> None:
     profiles = normalize_evidence_profiles(
         [_profile(source_id) for source_id in ("a", "b", "c")]
@@ -257,7 +362,7 @@ def test_relationship_first_cluster_discards_unconnected_auxiliary_member() -> N
             {
                 "relation_id": "relationship-a-b",
                 "source_ids": ["a", "b"],
-                "relation_type": "contextual_connection",
+                "relation_type": "complements",
                 "cluster_evidence_eligible": True,
                 "evidence": [
                     {

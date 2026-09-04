@@ -148,6 +148,47 @@ def test_disconnected_writer_core_roles_fall_back_to_admitted_roles() -> None:
     assert "member_role_connectivity_fallback" in validated["quality_warnings"]
 
 
+def test_contextual_neighbor_cannot_be_promoted_to_writer_core() -> None:
+    profiles = [_profile(source_id) for source_id in ("A", "B", "C")]
+    cluster = {
+        "cluster_id": "cluster-one",
+        "formation_route": "reasoner_debate_family_component",
+        "relationship_first_admission": True,
+        "source_ids": ["A", "B", "C"],
+        "source_roles": [
+            {"source_id": "A", "role": "core"},
+            {"source_id": "B", "role": "core"},
+            {"source_id": "C", "role": "context"},
+        ],
+        "family_relations": [
+            {
+                "relation_type": "shared_research_problem",
+                "source_ids": ["A", "B"],
+                "comparability": {"accepted_relation_type": "complements"},
+            },
+            {
+                "relation_type": "shared_research_problem",
+                "source_ids": ["B", "C"],
+                "comparability": {
+                    "accepted_relation_type": "contextual_connection"
+                },
+            },
+        ],
+    }
+    response = _response(cluster, profiles)
+    response["member_roles"] = {"A": "core", "B": "core", "C": "core"}
+
+    validated = validate_streamlined_cluster_synthesis(response, cluster, profiles)
+
+    assert validated["status"] == "reasoned"
+    assert validated["member_roles"] == {
+        "A": "core",
+        "B": "core",
+        "C": "context",
+    }
+    assert "member_role_connectivity_fallback" in validated["quality_warnings"]
+
+
 def test_missing_or_invalid_writer_roles_fall_back_without_parking() -> None:
     profiles = [_profile(source_id) for source_id in ("A", "B", "C")]
     cluster = {
@@ -281,7 +322,7 @@ def test_relationship_first_writer_cannot_drop_connecting_core() -> None:
                 "relation_id": f"relationship-{left}-{right}",
                 "source_id": left,
                 "target_source_id": right,
-                "relation_type": "contextual_connection",
+                "relation_type": "complements",
                 "provenance": "human_curated",
                 "cluster_evidence_eligible": True,
                 "active": True,
