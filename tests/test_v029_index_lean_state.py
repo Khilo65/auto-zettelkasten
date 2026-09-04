@@ -132,6 +132,7 @@ def test_custom_reasoner_without_reconciliation_capability_is_not_called() -> No
 @pytest.mark.parametrize(
     "groups,merged_members",
     [
+        ([], []),
         ([["one"], ["one", "two", "three"]], []),
         ([["one", "two"], ["two", "three"]], []),
         ([["one", "two"], ["three"]], ["one", "two"]),

@@ -2120,7 +2120,7 @@ class _CapabilityAwareReader:
                 profiles,
                 request,
                 context,
-                instruction="Plan shared, overlapping literature families and bounded discovery jobs.",
+                instruction="Follow planning_mode to plan or reconcile literature families and discovery jobs.",
             ),
             self._reserved_output_tokens(
                 "literature_family_plan", LITERATURE_FAMILY_PLAN_MAX_OUTPUT_TOKENS
@@ -2143,7 +2143,7 @@ class _CapabilityAwareReader:
             "Audit the primary family plan for omitted or underrepresented coherent "
             "families and return additions only."
             if mode == "coverage_completion"
-            else "Plan shared, overlapping literature families and bounded discovery jobs."
+            else "Follow planning_mode to plan or reconcile literature families and discovery jobs."
         )
         return self._literature_json_call(
             _literature_family_plan_system_prompt(),
@@ -5722,7 +5722,7 @@ def _cluster_proposal_system_prompt() -> str:
 def _literature_family_plan_system_prompt() -> str:
     return (
         "You are the shared literature-family planner for Auto-Zettelkasten "
-        "cluster plan prompt v12. Read the supplied labeled source-index shard jobs. Return one "
+        "cluster plan prompt v13. Read the supplied labeled source-index shard jobs. Return one "
         "JSON object with literature_families, discovery_jobs, neighboring_families, and "
         "source_dispositions arrays. A family has family_id, label, "
         "organizing_problem, source_ids, proposed_roles, and candidate_cluster. "
@@ -5752,7 +5752,14 @@ def _literature_family_plan_system_prompt() -> str:
         "non-duplicative candidate targets. Candidate discovery should optimize recall; "
         "the later full-note call decides whether a relationship exists. Citation "
         "and literature-position records are routing signals, not evidence of "
-        "agreement. When planning_mode is coverage_completion, preserve the supplied "
+        "agreement. When planning_mode is family_card_reconciliation, inputs are "
+        "existing family cards, not individual source profiles; each input row's source_id is a family ID. "
+        "Review existing_family_cards and return mutually exclusive merge groups of at least two cards, "
+        "using only supplied family IDs in source_ids. Merge only for the same bounded organizing problem, "
+        "not on shared members alone. Preserve distinct cards by omitting them; all four arrays may be empty "
+        "when no merge is justified. Do not expand groups into original work IDs; local code unions their "
+        "original memberships. Leave discovery_jobs, neighboring_families, and source_dispositions empty. "
+        "When planning_mode is coverage_completion, preserve the supplied "
         "existing family cards and return only omitted or underrepresented coherent "
         "families and jobs; three empty arrays are valid when none are missing. When "
         "planning_mode is incremental_patch, return only affected "

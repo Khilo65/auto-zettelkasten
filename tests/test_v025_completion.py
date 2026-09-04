@@ -38,9 +38,9 @@ def test_v29_4_relationship_packet_and_family_plan_limits() -> None:
     assert "every ID appears exactly once" in prompt
     assert _RELATIONSHIP_BATCH_MAX_JOBS == 8
     assert LITERATURE_FAMILY_PLAN_MAX_OUTPUT_TOKENS == 128_000
-    assert LITERATURE_FAMILY_PLAN_PROMPT_VERSION == "12"
+    assert LITERATURE_FAMILY_PLAN_PROMPT_VERSION == "13"
     family_prompt = _literature_family_plan_system_prompt()
-    assert "cluster plan prompt v12" in family_prompt
+    assert "cluster plan prompt v13" in family_prompt
     assert "candidate_cluster=true" in family_prompt
     assert "candidate_cluster=false" in family_prompt
     assert "routing-only grouping" in family_prompt
@@ -64,6 +64,20 @@ def test_v29_4_relationship_packet_and_family_plan_limits() -> None:
         max_rows=_RELATIONSHIP_BATCH_MAX_JOBS,
     )
     assert [len(packet) for packet in packets] == [8, 8, 8, 7]
+
+
+def test_family_reconciliation_prompt_distinguishes_cards_from_sources() -> None:
+    prompt = _literature_family_plan_system_prompt()
+
+    assert "planning_mode is family_card_reconciliation" in prompt
+    assert "existing family cards, not individual source profiles" in prompt
+    assert "each input row's source_id is a family ID" in prompt
+    assert "only supplied family IDs in source_ids" in prompt
+    assert "same bounded organizing problem" in prompt
+    assert "not on shared members alone" in prompt
+    assert "mutually exclusive merge groups of at least two cards" in prompt
+    assert "all four arrays may be empty when no merge is justified" in prompt
+    assert "Do not expand groups into original work IDs" in prompt
 
 
 def test_cluster_scheduler_uses_all_explicitly_available_calls() -> None:
