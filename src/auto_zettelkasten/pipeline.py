@@ -204,7 +204,7 @@ _RELATIONSHIP_BATCH_MAX_JOBS = 8
 _LEGACY_RELATIONSHIP_BATCH_MAX_JOBS = 8
 _RELATIONSHIP_DISCOVERY_PAGE_SIZE = 64
 _RELATIONSHIP_SELECTION_STATE_SCHEMA_VERSION = "4"
-_RELATIONSHIP_DISCOVERY_POLICY_VERSION = "unclustered-endpoint-coverage-v300"
+_RELATIONSHIP_DISCOVERY_POLICY_VERSION = "neighbor-family-coverage-v300"
 _RELATIONSHIP_SEMANTIC_POLICY_VERSION = "source-owned-bases-v26"
 _LITERATURE_MEMORY_LOCK = threading.Lock()
 _AUTO_CLOUD_SOURCE_WORKER_LIMIT = 32
@@ -7078,6 +7078,9 @@ def _run_relationship_reasoning(
             "discovery_jobs": list(
                 shared_family_plan.get("discovery_jobs", []) or []
             ),
+            "neighboring_families": list(
+                shared_family_plan.get("neighboring_families", []) or []
+            ),
             "requested_collection_keys": list(
                 shared_family_plan.get("requested_collection_keys", []) or []
             ),
@@ -8369,6 +8372,8 @@ def _run_relationship_reasoning(
             family_aliases[family_id].add(family_id)
             if label := str(family.get("label") or "").strip():
                 family_aliases[label].add(family_id)
+            for alias in family.get("supersedes_family_ids", []) or []:
+                family_aliases[str(alias)].add(family_id)
         resolved_pairs = set(mandatory_basis) | negative_pairs | visible_pairs
         discovery_jobs = [
             dict(row) for row in shared_family_plan.get("discovery_jobs", []) or []
@@ -8403,10 +8408,51 @@ def _run_relationship_reasoning(
                 "candidate_quota": 24,
             })
             discovery_scopes.append(set(coverage_source_ids))
+        eligible_ids = analytical_source_ids & set(lean_by_source)
+        canonical_families = {
+            alias: next(iter(ids))
+            for alias, ids in family_aliases.items() if len(ids) == 1
+        }
+        routed_sides = []
+        for job in discovery_jobs:
+            left = set(job.get("left_source_ids", []) or []) & eligible_ids
+            right = set(job.get("right_source_ids", []) or []) & eligible_ids
+            routed_sides.append((left - right, right - left))
+        for neighbor in shared_family_plan.get("neighboring_families", []) or []:
+            if not isinstance(neighbor, Mapping):
+                continue
+            family_ids = sorted({
+                canonical_families.get(str(neighbor.get(key) or ""), "")
+                for key in ("left_family_id", "right_family_id")
+            })
+            if len(family_ids) != 2 or "" in family_ids:
+                continue
+            left = set(family_rows[family_ids[0]].get("source_ids", []) or []) & eligible_ids
+            right = set(family_rows[family_ids[1]].get("source_ids", []) or []) & eligible_ids
+            left, right = left - right, right - left
+            if not left or not right or any(
+                (left <= old_left and right <= old_right)
+                or (left <= old_right and right <= old_left)
+                for old_left, old_right in routed_sides
+            ):
+                continue
+            job_id = "neighbor-coverage-" + stable_hash(family_ids)[:16]
+            while any(job.get("job_id") == job_id for job in discovery_jobs):
+                job_id += "-coverage"
+            discovery_jobs.append({
+                "job_id": job_id,
+                "family": "",
+                "left_source_ids": sorted(left),
+                "right_source_ids": sorted(right),
+                "discovery_goal": str(neighbor.get("reason") or ""),
+                "candidate_quota": 24,
+                "endpoint_coverage_only": True,
+            })
+            routed_sides.append((left, right))
+            discovery_scopes.append(left | right)
         # Non-membership is not a negative relationship decision. Reuse bounded
         # discovery for analytical endpoints omitted from every planned job.
         # ponytail: O(u*n) routing for u uncovered sources; shard if it dominates.
-        eligible_ids = analytical_source_ids & set(lean_by_source)
         covered_ids = set().union(*discovery_scopes)
         for source_id in sorted(eligible_ids - covered_ids):
             other_ids = sorted(eligible_ids - {source_id})

@@ -421,6 +421,161 @@ def test_unclustered_source_coverage_quota_is_shared_across_packets(
     assert sum(job["target_candidate_count"] for job in coverage_jobs) <= 24
 
 
+@pytest.mark.parametrize("clusters_enabled", [False, True])
+@pytest.mark.parametrize("select_neighbors", [False, True])
+def test_neighbor_families_are_compared_and_neighbor_changes_invalidate_replay(
+    tmp_path: Path, clusters_enabled: bool, select_neighbors: bool,
+) -> None:
+    profiles = [_profile(source_id) for source_id in "ABCDEF"]
+    metadata = _profile("M")
+    metadata.context["note_status"] = "metadata_only"
+    profiles.append(metadata)
+    families = [
+        {"family_id": "one", "source_ids": ["A", "B", "M"], "supersedes_family_ids": ["old-one"]},
+        {"family_id": "two", "source_ids": ["C", "D"]},
+        {"family_id": "three", "source_ids": ["E", "F"]},
+    ]
+    plan = {
+        "lean_index_hash": "lean",
+        "literature_families": families,
+        "discovery_jobs": [
+            {"job_id": family["family_id"], "family": family["family_id"],
+             "left_source_ids": family["source_ids"][:1],
+             "right_source_ids": family["source_ids"][1:], "candidate_quota": 3}
+            for family in families
+        ],
+        "neighboring_families": [
+            {"left_family_id": "old-one", "right_family_id": "two", "reason": "Different measures of one construct."},
+            {"left_family_id": "two", "right_family_id": "one", "reason": "The same comparison in reverse."},
+            {"left_family_id": "missing", "right_family_id": "three"},
+        ],
+    }
+    request = LiteratureMapRequest(
+        workspace=tmp_path, provider="test-provider", model="test-model",
+        literature_policy=LiteratureMappingPolicy(cluster_generation_enabled=clusters_enabled),
+    )
+    compared = set()
+    neighbor_jobs = []
+
+    def handler(stage, _profiles, context):
+        if stage == "relationship_adjudication":
+            compared.update(tuple(sorted(job["pair"].values())) for job in context["pair_jobs"])
+            return {"decisions": [_decision(job) for job in context["pair_jobs"]]}
+        candidates = []
+        for job in context["bridge_jobs"]:
+            if job["bridge_job_id"].startswith("neighbor-coverage-"):
+                assert not job["family_source_ids"]
+                neighbor_jobs.append(job)
+                if not select_neighbors:
+                    continue
+            for left in job["left_source_ids"]:
+                for right in job["right_source_ids"]:
+                    assert "M" not in (left, right)
+                    candidates.append({**_candidate(left, right), "bridge_job_id": job["bridge_job_id"]})
+        return {"candidates": candidates, "job_outcomes": [
+            {"bridge_job_id": job["bridge_job_id"], "status": "no_more_candidates"}
+            for job in context["bridge_jobs"]
+        ]}
+
+    original_plan = json.dumps(plan, sort_keys=True)
+    result = _run(tmp_path, profiles, _Calls(handler), shared_family_plan=plan, request=request)
+    assert json.dumps(plan, sort_keys=True) == original_plan
+    assert compared == {("A", "B"), ("C", "D"), ("E", "F")} | (
+        {("A", "C"), ("A", "D"), ("B", "C"), ("B", "D")} if select_neighbors else set()
+    )
+    assert result["relationship_stage_complete"] is True
+    assert len(neighbor_jobs) == 1
+    _commit_relationship_selection_state(tmp_path, result, catalogue_revision=result["reconciled_catalogue_revision"])
+    plan["neighboring_families"].append({"left_family_id": "two", "right_family_id": "three", "reason": "A new bounded comparison."})
+    compared.clear()
+    changed = _run(tmp_path, profiles, _Calls(handler), shared_family_plan=plan, request=request)
+    assert changed["reconciled_catalogue_revision"] != result["reconciled_catalogue_revision"]
+    assert compared == ({("C", "E"), ("C", "F"), ("D", "E"), ("D", "F")} if select_neighbors else set())
+    assert changed["relationship_stage_complete"] is True
+    _commit_relationship_selection_state(tmp_path, changed, catalogue_revision=changed["reconciled_catalogue_revision"])
+    state = Path(changed["state_path"])
+    before = (state.read_bytes(), state.stat().st_mtime_ns)
+    replay = _run(tmp_path, profiles, _Calls(lambda *_args: pytest.fail("unexpected replay call")), shared_family_plan=plan, request=request)
+    assert replay["semantic_noop"] is True
+    assert (state.read_bytes(), state.stat().st_mtime_ns) == before
+
+
+@pytest.mark.parametrize("context_budget", [1_000_000, 15_000])
+def test_neighbor_candidate_quota_stays_bounded_when_packets_split(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, context_budget: int,
+) -> None:
+    left = [f"L{index:02}" for index in range(32)]
+    right = [f"R{index:02}" for index in range(32)]
+    profiles = [_profile(source_id) for source_id in [*left, *right]]
+    monkeypatch.setattr(pipeline_module, "_relationship_context_char_budget", lambda *_args: context_budget)
+    neighbor_jobs = []
+
+    def handler(stage, _profiles, context):
+        assert stage.endswith("candidate_selection")
+        for job in context["bridge_jobs"]:
+            if job["bridge_job_id"].startswith("neighbor-coverage-"):
+                assert set(job["left_source_ids"]) <= set(left)
+                assert set(job["right_source_ids"]) <= set(right)
+                assert not job["family_source_ids"]
+                neighbor_jobs.append(job)
+        return {"candidates": [], "job_outcomes": [
+            {"bridge_job_id": job["bridge_job_id"], "status": "no_more_candidates"}
+            for job in context["bridge_jobs"]
+        ]}
+
+    result = _run(tmp_path, profiles, _Calls(handler), shared_family_plan={
+        "lean_index_hash": "lean",
+        "literature_families": [
+            {"family_id": "left", "source_ids": left},
+            {"family_id": "right", "source_ids": right},
+        ],
+        "discovery_jobs": [
+            {"job_id": name, "family": name, "left_source_ids": ids[:1],
+             "right_source_ids": ids[1:], "candidate_quota": 1}
+            for name, ids in [("left", left), ("right", right)]
+        ],
+        "neighboring_families": [{"left_family_id": "left", "right_family_id": "right"}],
+    })
+    assert result["relationship_stage_complete"] is True, result["parked"]
+    assert result["pair_job_count"] == 0
+    assert neighbor_jobs
+    assert sum(job["target_candidate_count"] for job in neighbor_jobs) <= 24
+    if context_budget == 15_000:
+        assert len(neighbor_jobs) > 1
+
+
+@pytest.mark.parametrize(
+    "left,right,needs_neighbor_job",
+    [("AB", "CD", False), ("CD", "AB", False), ("AC", "BD", True)],
+)
+def test_neighbor_deduplication_compares_sides_not_endpoint_unions(
+    tmp_path: Path, left: str, right: str, needs_neighbor_job: bool,
+) -> None:
+    calls = _Calls(lambda _stage, _profiles, context: {
+        "candidates": [], "job_outcomes": [
+            {"bridge_job_id": job["bridge_job_id"], "status": "no_more_candidates"}
+            for job in context["bridge_jobs"]
+        ],
+    })
+    result = _run(tmp_path, [_profile(source_id) for source_id in "ABCD"], calls, shared_family_plan={
+        "lean_index_hash": "lean",
+        "literature_families": [
+            {"family_id": "one", "source_ids": ["A", "B"]},
+            {"family_id": "two", "source_ids": ["C", "D"]},
+        ],
+        "discovery_jobs": [{
+            "job_id": "existing", "family": "", "left_source_ids": list(left),
+            "right_source_ids": list(right), "candidate_quota": 4,
+            "endpoint_coverage_only": True,
+        }],
+        "neighboring_families": [{"left_family_id": "one", "right_family_id": "two"}],
+    })
+    jobs = [job for _, _, context in calls.seen for job in context["bridge_jobs"]
+            if job["bridge_job_id"].startswith("neighbor-coverage-")]
+    assert bool(jobs) is needs_neighbor_job
+    assert result["relationship_stage_complete"] is True
+
+
 def test_global_discovery_creates_immutable_pair_job(
     tmp_path: Path,
 ) -> None:
