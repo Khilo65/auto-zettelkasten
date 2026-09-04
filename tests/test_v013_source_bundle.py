@@ -1004,11 +1004,13 @@ def test_native_html_heading_reaches_cluster_admission_without_weak_locator_prom
         )
         assert legacy_quote is not None and not legacy_quote.evidence_anchors[0].source_locators
         for route in ("codex_pdf_page_images", "codex_pdf_input_file"):
-            with pytest.raises(ValueError, match="quote_locator_not_unique_in_source"):
-                _source_bundle_from_result(
-                    payload, {**row, "content_route": route}, "full_document",
-                    validate_quantitative_provenance=False,
-                )
+            for span in ("b" * 121, " " * 12, "     a      "):
+                anchor.update(locator=f'Quote "{span}"', locators=[f'Quote "{span}"'])
+                with pytest.raises(ValueError, match="quote_locator_not_unique_in_source"):
+                    _source_bundle_from_result(
+                        payload, {**row, "content_route": route}, "full_document",
+                        validate_quantitative_provenance=False,
+                    )
         anchor.update(locator=expected, locators=[expected])
         opaque = _source_bundle_from_result(
             payload, {**row, "content_route": "codex_pdf_input_file", "text": ""},

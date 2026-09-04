@@ -15789,7 +15789,7 @@ def _source_bundle_from_result(
                 quoted = _QUOTE_SPAN_LOCATOR.fullmatch(locator[6:].strip())
                 span = " ".join(quoted.group("quote").split()) if quoted else ""
                 source_text = " ".join(str(row.get("text") or "").split())
-                if not quoted or len(quoted.group("quote")) > 120 or (
+                if not quoted or len(span) < 12 or len(quoted.group("quote")) > 120 or (
                     not opaque_pdf_route
                     and (source_text.find(span) < 0 or source_text.find(span) != source_text.rfind(span))
                 ):
