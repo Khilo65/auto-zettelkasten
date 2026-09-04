@@ -1017,6 +1017,23 @@ def test_native_html_heading_reaches_cluster_admission_without_weak_locator_prom
             "full_document", validate_quantitative_provenance=False,
         )
         assert opaque is not None and opaque.evidence_anchors[0].source_locators
+        composite = f'{expected} (p. 92)'
+        anchor.update(locator=composite, locators=[composite])
+        opaque = _source_bundle_from_result(
+            payload, {**row, "content_route": "codex_pdf_input_file", "text": ""},
+            "full_document", validate_quantitative_provenance=False,
+        )
+        assert opaque is not None
+        assert {value.locator_type for value in opaque.evidence_anchors[0].source_locators} == {
+            "page", "quote_span",
+        }
+        for invalid in (f'{expected} unsupported', f'{expected} (context p. 92)'):
+            anchor.update(locator=invalid, locators=[invalid])
+            with pytest.raises(ValueError, match="quote_locator_not_unique_in_source"):
+                _source_bundle_from_result(
+                    payload, {**row, "content_route": "codex_pdf_input_file", "text": ""},
+                    "full_document", validate_quantitative_provenance=False,
+                )
     anchor.update(locator=heading, locators=[heading])
     legacy = _source_bundle_from_result(payload, {**row, "coverage_metrics": {}}, "full_document")
     assert legacy is not None and legacy.evidence_anchors[0].locator == heading

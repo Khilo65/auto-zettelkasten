@@ -15786,12 +15786,34 @@ def _source_bundle_from_result(
                 continue
             locator = str(value.get("locator") or "")
             if (validate_quantitative_provenance or opaque_pdf_route) and locator.casefold().startswith("quote "):
-                quoted = _QUOTE_SPAN_LOCATOR.fullmatch(locator[6:].strip())
+                quote_locator = locator[6:].strip()
+                quoted = _QUOTE_SPAN_LOCATOR.search(quote_locator)
                 span = " ".join(quoted.group("quote").split()) if quoted else ""
+                suffix = quote_locator[quoted.end() :].strip() if quoted else ""
+                page_suffix = suffix[1:-1].strip() if suffix.startswith("(") and suffix.endswith(")") else ""
+                suffix_locators = (
+                    _source_locator_payloads(
+                        page_suffix,
+                        source_id=expected_source_id,
+                        evidence_anchor_id=str(value.get("evidence_anchor_id") or ""),
+                    )
+                    if page_suffix
+                    else []
+                )
                 source_text = " ".join(str(row.get("text") or "").split())
-                if not quoted or len(span) < 12 or len(quoted.group("quote")) > 120 or (
+                if (
+                    not quoted
+                    or quoted.start() != 0
+                    or (suffix and (
+                        len(suffix_locators) != 1
+                        or suffix_locators[0]["locator_type"] not in {"page", "page_range"}
+                        or suffix_locators[0]["value"].casefold() != page_suffix.casefold()
+                    ))
+                    or not 12 <= len(span) <= 120
+                    or (
                     not opaque_pdf_route
                     and (source_text.find(span) < 0 or source_text.find(span) != source_text.rfind(span))
+                    )
                 ):
                     raise ValueError("quote_locator_not_unique_in_source")
                 value = {
