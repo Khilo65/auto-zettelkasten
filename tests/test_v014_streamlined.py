@@ -335,6 +335,15 @@ def test_streamlined_cluster_ignores_only_cross_owned_evidence_rows() -> None:
     ]
     assert "study_finding_cross_owned_evidence" in validated["quality_errors"]
 
+    line = response["lines_of_inquiry"][0]
+    line["synthesis"] = "A and B supply contrasting source-specific findings."
+    line["study_findings"] = _streamlined_response(cluster, profiles)[
+        "lines_of_inquiry"
+    ][0]["study_findings"]
+    repaired = validate_streamlined_cluster_synthesis(response, cluster, profiles)
+    assert repaired["status"] == "reasoned"
+    assert repaired["quality_errors"] == []
+
 
 def test_oversized_cluster_is_partitioned_before_writers(tmp_path: Path) -> None:
     profiles = [_profile(source_id) for source_id in ("A", "B", "C", "D")]

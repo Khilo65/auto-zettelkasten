@@ -83,10 +83,10 @@ def test_v8_salvages_valid_connections_and_keeps_anchors_optional() -> None:
     assert accepted["connection_id"].startswith("relationship-connection-")
 
 
-def test_v20_is_compact_domain_neutral_source_owned_and_complete() -> None:
+def test_v21_is_compact_domain_neutral_source_owned_and_complete() -> None:
     prompt = _relationship_adjudication_system_prompt()
 
-    assert "relationship prompt v20" in prompt
+    assert "relationship prompt v21" in prompt
     assert "source_a_basis describes only the supplied left_source_id" in prompt
     assert "source_b_basis only the supplied right_source_id" in prompt
     assert "whole work versus chapter, excerpt, or component" in prompt
@@ -120,6 +120,8 @@ def test_adjudication_checks_narrower_connections_before_rejecting_a_pair() -> N
         "attributed process",
         "causal proof",
         "independent corroboration",
+        "unproven causality does not erase an explicit author argument",
+        "preserve it in rejections",
     ):
         assert requirement in prompt
 

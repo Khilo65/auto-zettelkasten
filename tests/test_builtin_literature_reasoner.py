@@ -1828,7 +1828,7 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
     ]
     assert synthesis["cluster_contract"] == "streamlined-full-note-v2"
     assert synthesis["lines_of_inquiry"][0]["study_findings"][0]["source_id"] == "source-a"
-    assert "cluster synthesis prompt v37" in system_prompts["full-note cluster writer"]
+    assert "cluster synthesis prompt v38" in system_prompts["full-note cluster writer"]
     assert "Read every supplied atomic_note_markdown" in system_prompts[
         "full-note cluster writer"
     ]

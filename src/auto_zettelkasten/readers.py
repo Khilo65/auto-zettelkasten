@@ -5549,7 +5549,7 @@ def _relationship_candidate_system_prompt() -> str:
 
 def _relationship_adjudication_system_prompt() -> str:
     return (
-        "Auto-Zettelkasten relationship prompt v20, contract relationship-decision-v8. Read both "
+        "Auto-Zettelkasten relationship prompt v21, contract relationship-decision-v8. Read both "
         "complete atomic notes. Return a JSON decisions object keyed by every supplied pair_job_id, no extras. Each value is "
         "either {decision:no_relationship, reason, confidence} or "
         "{decision:relationship, connections:[...]}. Return one connection normally "
@@ -5572,6 +5572,7 @@ def _relationship_adjudication_system_prompt() -> str:
         "narrower contextual connection, shared reported result plus interpretation, or attributed process connection. "
         "Rejecting a causal comparison does not reject every link; do not claim causal proof or independent corroboration "
         "from dependent reports. Use no_relationship for merely topical, lexical, or generic overlap. "
+        "Unproven causality does not erase an explicit author argument; preserve it in rejections. "
         "Third, choose the narrowest defensible subtype. Citation, chronology, shared "
         "data, motivation, method, or vocabulary alone do not establish support. "
         "Do not infer intellectual direction or support from pair order or those signals. "
@@ -5769,7 +5770,7 @@ def _debate_system_prompt() -> str:
 def _cluster_synthesis_system_prompt() -> str:
     return (
         "You are the full-note cluster writer for Auto-Zettelkasten cluster "
-        "synthesis prompt v37 and contract streamlined-full-note-v2. Read every supplied atomic_note_markdown before "
+        "synthesis prompt v38 and contract streamlined-full-note-v2. Read every supplied atomic_note_markdown before "
         "drafting. Copy cluster_id exactly from context.cluster.cluster_id. Return "
         "exactly one JSON object with cluster_id, status, title, "
         "organizing_mode, organizing_problem, optional guiding_question, optional "
@@ -5779,7 +5780,10 @@ def _cluster_synthesis_system_prompt() -> str:
         "split_proposals, and optional missing_member_ids. Status is accepted or "
         "rejected; it is the writer decision, not a copied planning or registry "
         "status. Each line of inquiry contains title, synthesis, and "
-        "study_findings. Each study finding contains source_id, finding, "
+        "study_findings. Each study finding is about exactly one source; "
+        "every evidence object's source_id must equal that study finding's source_id. "
+        "Put cross-source comparisons in the line's synthesis, supported by separate source-specific study findings. "
+        "Each study finding contains source_id, finding, "
         "method_scope, relation_to_line, and evidence, plus technical_result and "
         "plain_english_meaning only when it reports a technical statistic whose "
         "meaning is not already intuitive. Do not add a plain-English duplicate of "

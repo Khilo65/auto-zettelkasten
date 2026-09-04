@@ -127,6 +127,9 @@ def test_cluster_synthesis_requires_clause_support_not_just_source_ownership() -
     assert "Each cited anchor must support the attached finding" in prompt
     assert "Omit or narrow an unsupported clause" in prompt
     assert "same-source anchor about a different finding" in prompt
+    assert "Each study finding is about exactly one source" in prompt
+    assert "every evidence object's source_id must equal that study finding's source_id" in prompt
+    assert "Put cross-source comparisons in the line's synthesis" in prompt
 
 
 def test_source_bundle_prompt_keeps_numeric_values_out_of_statistic_labels() -> None:
@@ -240,7 +243,7 @@ def test_partial_source_prompt_prohibits_complete_document_inference() -> None:
 def test_cluster_prompt_preserves_inference_and_case_evidence() -> None:
     prompt = _cluster_synthesis_system_prompt()
 
-    assert "cluster synthesis prompt v37" in prompt
+    assert "cluster synthesis prompt v38" in prompt
     assert "Read every supplied atomic_note_markdown" in prompt
     assert "Every retained member" in prompt
     assert "specific study finding" in prompt
