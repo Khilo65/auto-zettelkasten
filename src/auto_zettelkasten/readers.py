@@ -5706,7 +5706,7 @@ def _cluster_proposal_system_prompt() -> str:
 def _literature_family_plan_system_prompt() -> str:
     return (
         "You are the shared literature-family planner for Auto-Zettelkasten "
-        "cluster plan prompt v11. Read the supplied labeled source-index shard jobs. Return one "
+        "cluster plan prompt v12. Read the supplied labeled source-index shard jobs. Return one "
         "JSON object with literature_families, discovery_jobs, neighboring_families, and "
         "source_dispositions arrays. A family has family_id, label, "
         "organizing_problem, source_ids, proposed_roles, and candidate_cluster. "
@@ -5722,6 +5722,11 @@ def _literature_family_plan_system_prompt() -> str:
         "(assigned, currently_unclustered, or overlap), family_ids, and a concise reason. Account for every source required "
         "by the supplied planning jobs. Use only "
         "supplied source and collection IDs. Families and memberships may overlap. "
+        "Source dispositions are cluster-membership decisions, not relationship rejections. "
+        "A currently unclustered source still needs discovery jobs for plausible comparisons. "
+        "Consider a source's full supplied thesis and method, not only one outcome. "
+        "Direct contributions to a bounded comparison may use different constructs, instruments, "
+        "populations, or periods; explain those differences rather than requiring identical measures. "
         "Inspect the whole inventory and identify specific research problems, "
         "debates, mechanisms, outcomes, sequences, methods, cases, and practice "
         "questions; do not use shared words alone. Plan both within-literature and "

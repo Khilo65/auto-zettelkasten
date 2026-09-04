@@ -328,6 +328,99 @@ def _write_atomic_note(workspace: Path, source_id: str) -> None:
     )
 
 
+@pytest.mark.parametrize("clusters_enabled", [False, True])
+def test_unclustered_source_remains_discoverable_and_replays(
+    tmp_path: Path, clusters_enabled: bool,
+) -> None:
+    profiles = [_profile(source_id) for source_id in "ABCD"]
+    metadata_only = _profile("E")
+    metadata_only.context["note_status"] = "metadata_only"
+    profiles.append(metadata_only)
+    plan = {
+        "lean_index_hash": "lean",
+        "literature_families": [{"family_id": "family", "source_ids": ["A", "B", "C"]}],
+        "discovery_jobs": [{
+            "job_id": "family", "family": "family", "left_source_ids": ["A"],
+            "right_source_ids": ["B", "C"], "candidate_quota": 3,
+        }],
+        "source_dispositions": [{
+            "source_id": "D", "disposition": "currently_unclustered", "family_ids": [],
+        }],
+    }
+    original_plan = json.dumps(plan, sort_keys=True)
+    request = LiteratureMapRequest(
+        workspace=tmp_path, provider="test-provider", model="test-model",
+        literature_policy=LiteratureMappingPolicy(cluster_generation_enabled=clusters_enabled),
+    )
+
+    def handler(stage, _profiles, context):
+        if stage == "relationship_adjudication":
+            return {"decisions": [_decision(job) for job in context["pair_jobs"]]}
+        candidates = []
+        for job in context["bridge_jobs"]:
+            endpoints = set(job["left_source_ids"]) | set(job["right_source_ids"])
+            if "D" in endpoints:
+                assert endpoints == set("ABCD")
+                candidates.append({**_candidate("A", "D"), "bridge_job_id": job["bridge_job_id"]})
+        return {"candidates": candidates, "job_outcomes": [
+            {"bridge_job_id": job["bridge_job_id"], "status": "no_more_candidates"}
+            for job in context["bridge_jobs"]
+        ]}
+
+    calls = _Calls(handler)
+    result = _run(tmp_path, profiles, calls, shared_family_plan=plan, request=request)
+    assert result["pair_job_count"] == 1
+    assert result["relationship_stage_complete"] is True
+    assert json.dumps(plan, sort_keys=True) == original_plan
+    _commit_relationship_selection_state(
+        tmp_path, result, catalogue_revision=result["reconciled_catalogue_revision"],
+    )
+    selection_state = Path(result["state_path"])
+    before = (selection_state.read_bytes(), selection_state.stat().st_mtime_ns)
+    replay_calls = _Calls(lambda *_args: pytest.fail("unexpected replay call"))
+    replay = _run(tmp_path, profiles, replay_calls, shared_family_plan=plan, request=request)
+    assert replay["semantic_noop"] is True
+    assert replay_calls.seen == []
+    assert (selection_state.read_bytes(), selection_state.stat().st_mtime_ns) == before
+
+
+@pytest.mark.parametrize("context_budget", [1_000_000, 15_000])
+def test_unclustered_source_coverage_quota_is_shared_across_packets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, context_budget: int,
+) -> None:
+    peer_ids = [f"A{index:02}" for index in range(64)]
+    profiles = [_profile(source_id) for source_id in [*peer_ids, "Z"]]
+    monkeypatch.setattr(pipeline_module, "_relationship_context_char_budget", lambda *_args: context_budget)
+    coverage_jobs = []
+
+    def handler(stage, _profiles, context):
+        assert stage.endswith("candidate_selection")
+        for job in context["bridge_jobs"]:
+            if "Z" in job["left_source_ids"] or "Z" in job["right_source_ids"]:
+                assert job["left_source_ids"] == ["Z"]
+                assert set(job["right_source_ids"]) <= set(peer_ids)
+                assert not job["family_source_ids"]
+                coverage_jobs.append(job)
+        return {"candidates": [], "job_outcomes": [
+            {"bridge_job_id": job["bridge_job_id"], "status": "no_more_candidates"}
+            for job in context["bridge_jobs"]
+        ]}
+
+    result = _run(tmp_path, profiles, _Calls(handler), shared_family_plan={
+        "lean_index_hash": "lean",
+        "literature_families": [{"family_id": "family", "source_ids": peer_ids}],
+        "discovery_jobs": [{
+            "job_id": "family", "family": "family", "left_source_ids": peer_ids[:1],
+            "right_source_ids": peer_ids[1:], "candidate_quota": 1,
+        }],
+    })
+    assert result["relationship_stage_complete"] is True, result["parked"]
+    assert coverage_jobs
+    if context_budget == 15_000:
+        assert len(coverage_jobs) > 1
+    assert sum(job["target_candidate_count"] for job in coverage_jobs) <= 24
+
+
 def test_global_discovery_creates_immutable_pair_job(
     tmp_path: Path,
 ) -> None:

@@ -204,7 +204,7 @@ _RELATIONSHIP_BATCH_MAX_JOBS = 8
 _LEGACY_RELATIONSHIP_BATCH_MAX_JOBS = 8
 _RELATIONSHIP_DISCOVERY_PAGE_SIZE = 64
 _RELATIONSHIP_SELECTION_STATE_SCHEMA_VERSION = "4"
-_RELATIONSHIP_DISCOVERY_POLICY_VERSION = "negative-aware-breadth-v299"
+_RELATIONSHIP_DISCOVERY_POLICY_VERSION = "unclustered-endpoint-coverage-v300"
 _RELATIONSHIP_SEMANTIC_POLICY_VERSION = "source-owned-bases-v26"
 _LITERATURE_MEMORY_LOCK = threading.Lock()
 _AUTO_CLOUD_SOURCE_WORKER_LIMIT = 32
@@ -7805,7 +7805,7 @@ def _run_relationship_reasoning(
     bridge_capacity = inferred_capacity
     discovery_completed = False
     discovery_terminal = False
-    if can_discover and requires_routing:
+    if can_discover and requires_routing and not shared_plan_active:
         selected_collection_source_ids = set(profile_by_source)
         if collection_cards:
             try:
@@ -8394,6 +8394,31 @@ def _run_relationship_reasoning(
                 "candidate_quota": 24,
             })
             discovery_scopes.append(set(coverage_source_ids))
+        # Non-membership is not a negative relationship decision. Reuse bounded
+        # discovery for analytical endpoints omitted from every planned job.
+        # ponytail: O(u*n) routing for u uncovered sources; shard if it dominates.
+        eligible_ids = analytical_source_ids & set(lean_by_source)
+        covered_ids = set().union(*discovery_scopes)
+        for source_id in sorted(eligible_ids - covered_ids):
+            other_ids = sorted(eligible_ids - {source_id})
+            if not other_ids:
+                continue
+            job_id = "source-coverage-" + stable_hash(source_id)[:16]
+            while any(job.get("job_id") == job_id for job in discovery_jobs):
+                job_id += "-coverage"
+            discovery_jobs.append({
+                "job_id": job_id,
+                "family": "",
+                "left_source_ids": [source_id],
+                "right_source_ids": other_ids,
+                "discovery_goal": (
+                    "Examine plausible relationships for this otherwise unrouted source, "
+                    "including grounded methodological or contextual comparisons. "
+                    "Its current cluster non-membership is not evidence against a relationship."
+                ),
+                "candidate_quota": 24,
+                "endpoint_coverage_only": True,
+            })
         for raw_job in discovery_jobs:
             job_id = str(
                 raw_job.get("job_id")
@@ -8439,7 +8464,10 @@ def _run_relationship_reasoning(
                 if len(matching_family_ids) == 1
                 else family_reference
             )
-            family_source_ids = sorted(set(left_ids) | set(right_ids))
+            family_source_ids = (
+                [] if raw_job.get("endpoint_coverage_only")
+                else sorted(set(left_ids) | set(right_ids))
+            )
             requested_collection_pair = list(
                 raw_job.get("requested_collection_pair", []) or []
             )
@@ -8451,7 +8479,7 @@ def _run_relationship_reasoning(
             } - resolved_pairs
             family_pairs = (
                 set(combinations(family_source_ids, 2)) - resolved_pairs
-                if not requested_collection_pair
+                if family_source_ids and not requested_collection_pair
                 else initial_pairs
             )
             planner_target = min(quota, len(family_pairs))
@@ -8958,6 +8986,11 @@ def _run_relationship_reasoning(
             }
             for job in complement_jobs
         ]
+        for job in accounted_complement_jobs:
+            if not job["family_source_ids"]:
+                job["target_candidate_count"] = min(
+                    job["target_candidate_count"], job["planner_target_candidate_count"]
+                )
         allocated_complement_jobs = [
             job for job in accounted_complement_jobs if job["target_candidate_count"]
         ]
@@ -8991,7 +9024,9 @@ def _run_relationship_reasoning(
             measured_job_sizes[str(job.get("bridge_job_id") or "")] = measured_size
             if measured_size > context_budget:
                 oversized_complement_tasks.extend(
-                    split_shared_job("complement", "general", job)
+                    completion_tasks("complement", "general", [job], [])
+                    if not job["family_source_ids"]
+                    else split_shared_job("complement", "general", job)
                 )
             else:
                 packable_complement_jobs.append(job)
