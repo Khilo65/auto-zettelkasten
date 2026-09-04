@@ -1195,7 +1195,7 @@ def test_ordinary_bundle_source_uses_one_call_and_no_profile_or_fidelity_call(
     assert note["frontmatter"]["source_bundle_prompt_version"] == "21"
 
 
-def test_atomic_note_projects_only_accepted_high_salience_quantitative_evidence(
+def test_atomic_note_projects_accepted_quantitative_evidence_without_salience_loss(
     tmp_path,
 ) -> None:
     class QuantitativeZotero(FakeZotero):
@@ -1294,7 +1294,7 @@ def test_atomic_note_projects_only_accepted_high_salience_quantitative_evidence(
         "In 2024, the reported outcome fell. Estimate: 4; Unit: percentage points."
     )
     assert note["body"].count(projection) == 1
-    assert "The source reports 17 controls." not in note["body"]
+    assert note["body"].count("The source reports 17 controls.") == 1
     assert "42 cases among 17 controls" not in note["body"]
     assert "The district's rank declined by 3 places." in note["body"]
     assert "The district's resulting rank is 21st." in note["body"]
@@ -1318,6 +1318,9 @@ def test_atomic_note_projects_only_accepted_high_salience_quantitative_evidence(
         for row in bundle["evidence_anchors"]
     ) == 2
     assert bundle["analysis_sections"]["evidence_and_data"].count(projection) == 1
+    assert bundle["analysis_sections"]["evidence_and_data"].count(
+        "The source reports 17 controls."
+    ) == 1
     before = (note["sha256"], note_path.stat().st_mtime_ns)
 
     replay = resume_map(

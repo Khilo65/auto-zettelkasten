@@ -15427,12 +15427,9 @@ def _prepare_item(
             and anchor.claim.strip()
         ]
         if quantitative:
-            highest_salience = max(anchor.salience_priority for anchor in quantitative)
             analysis_text = "\n".join(str(value) for value in analysis.values()).casefold()
             projections: list[str] = []
             for anchor in quantitative:
-                if anchor.salience_priority != highest_salience:
-                    continue
                 projection = anchor.claim.strip()
                 represented = projection.casefold()
                 details: list[str] = []
