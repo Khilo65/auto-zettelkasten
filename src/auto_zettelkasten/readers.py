@@ -219,10 +219,12 @@ CHUNK_EVIDENCE_KEYS = (
     "locators",
     "key_concepts_and_definitions",
     "source_structure_and_organization",
+    "source_visible_bibliographic_identity",
 )
 OPTIONAL_CHUNK_EVIDENCE_KEYS = (
     "key_concepts_and_definitions",
     "source_structure_and_organization",
+    "source_visible_bibliographic_identity",
 )
 REQUIRED_CHUNK_EVIDENCE_KEYS = tuple(
     key for key in CHUNK_EVIDENCE_KEYS if key not in OPTIONAL_CHUNK_EVIDENCE_KEYS
@@ -235,7 +237,7 @@ DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
-SOURCE_BUNDLE_PROMPT_VERSION = "30"
+SOURCE_BUNDLE_PROMPT_VERSION = "31"
 SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v2"
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
@@ -5281,7 +5283,9 @@ def _source_bundle_system_prompt() -> str:
         "count. Preserve the exact speaker or author and singular or plural cardinality in every analysis, compact-profile, "
         "and anchor field; do not infer a group's position from actions or quotations about that group, and keep author "
         "interpretations or intent claims attributed. Describe methods only as the source reports them: selected journalistic "
-        "examples are not a survey, systematic sample, or case-study design. Each literature-position row represents exactly "
+        "examples are not a survey, systematic sample, or case-study design. For journalistic sources, distinguish people actually "
+        "interviewed from people or organizations merely contacted, asked for comment, or reported as nonresponsive. "
+        "Each literature-position row represents exactly "
         "one distinct work; never pool works, years, claims, or locators. "
         "Use associational wording for observational evidence unless the design and source justify causality. Attribute "
         "qualitative explanatory claims to the author. Never turn a recommendation into a demonstrated result. Preserve every "
@@ -6622,13 +6626,16 @@ def _chunk_system_prompt() -> str:
         "Include the optional source_structure_and_organization field only when this chunk exposes source-native headings or chapters. "
         "Preserve their titles, order, hierarchy, and available locator in concise Markdown bullets. Do not infer missing structure, "
         "and omit the field when no reliable source-native structure is visible. "
+        "Include the source-visible bibliographic identity field source_visible_bibliographic_identity only for title, creators, date, edition, or identifiers visibly printed in this chunk; distinguish them from supplied metadata. "
         "Statistical context must retain exact estimates and units plus any sample size, denominator, baseline, comparison "
         "group, reference category, uncertainty measure, significance statement, and caveat needed for later plain-English explanation. "
         "If the chunk contains no quantitative result, say so briefly in statistical_context. "
+        "Bind every number to its exact noun, unit, and grammatical role: a duration, year, rank, page, or sample label must never become a count. "
         "Keep page markers, section headings, and explicit text anchors in locators. "
         "`--- Page N ---`, `PDF page N`, and caller-provided page scopes are physical PDF ordinals. "
         "Reserve bare `p. N` or `pp. N-M` for supplied source-native printed labels; use "
         "ordinal_to_printed_page to convert when present, and keep the `PDF` prefix when no printed label is supplied. "
+        "Treat every caller-provided chunk page range as a coverage boundary, not a chapter boundary. "
         "When a field is not reported in this chunk, say so briefly."
     )
 
@@ -6746,6 +6753,7 @@ def _synthesis_prompt(
         f"{_metadata_prompt(metadata, question, include_page_labels=True)}\n\n"
         "Synthesize the following ordered coarse chunk evidence into one source-level analysis. "
         "Resolve repetition, retain disagreements and qualifications, and preserve all useful locators. "
+        "Preserve source-visible identity separately from supplied metadata. Reconcile structure across adjacent chunks, retain the earliest supported section start, and copy PDF/printed locator pairs exactly. "
         "Keep exact technical figures in detailed_findings and use statistical_context to produce the separately labeled "
         "plain_english_interpretation required by the system instructions. "
         "Do not claim that a chunk summary proves anything beyond its supplied evidence.\n\n"

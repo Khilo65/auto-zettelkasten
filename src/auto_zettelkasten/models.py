@@ -106,7 +106,7 @@ def _readable_bundle_text(value: Any) -> str:
             for item in value
             if item not in (None, "", [], {})
         )
-    return str(value)
+    return re.sub(r"\\n(?=\s*[-*+] )", "\n", str(value))
 
 
 def _normalized_bundle_profile(value: Mapping[str, Any]) -> dict[str, Any]:

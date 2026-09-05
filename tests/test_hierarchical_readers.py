@@ -25,6 +25,9 @@ from auto_zettelkasten.readers import (
     _parse_chunk_evidence,
     _post_json,
     _read_openai_stream_response,
+    _chunk_system_prompt,
+    _source_bundle_system_prompt,
+    _synthesis_prompt,
 )
 
 
@@ -103,20 +106,58 @@ def test_additive_fields_are_optional_in_direct_and_chunk_responses() -> None:
         for key in (
             "key_concepts_and_definitions",
             "source_structure_and_organization",
+            "source_visible_bibliographic_identity",
         ):
-            payload.pop(key)
+            payload.pop(key, None)
         assert not {
             "key_concepts_and_definitions",
             "source_structure_and_organization",
+            "source_visible_bibliographic_identity",
         } & parser(payload).keys()
         payload.update(
             key_concepts_and_definitions="",
             source_structure_and_organization="",
+            source_visible_bibliographic_identity="",
         )
         assert not {
             "key_concepts_and_definitions",
             "source_structure_and_organization",
+            "source_visible_bibliographic_identity",
         } & parser(payload).keys()
+
+
+def test_hierarchical_prompts_preserve_identity_quantity_and_locator_roles() -> None:
+    chunk = _chunk_system_prompt()
+    synthesis = _synthesis_prompt(
+        [
+            {
+                **_chunk_memo(),
+                "source_visible_bibliographic_identity": (
+                    "Title: The Making of Israel; date: 1987; "
+                    "edition: FIRST EDITION; ISBN: 0-394-55588-x."
+                ),
+            }
+        ],
+        {"title": "Supplied Zotero title", "date": "1988"},
+        None,
+    )
+
+    assert "source-visible bibliographic identity" in chunk
+    assert "duration, year, rank, page, or sample label" in chunk
+    assert "exact noun, unit, and grammatical role" in chunk
+    assert "coverage boundary, not a chapter boundary" in chunk
+    assert "The Making of Israel" in synthesis
+    assert "source-visible identity" in synthesis
+    assert "earliest supported section start" in synthesis
+    assert "PDF/printed locator pairs exactly" in synthesis
+
+
+def test_journalism_prompt_separates_interviews_from_nonresponses() -> None:
+    prompt = _source_bundle_system_prompt()
+
+    assert "actually interviewed" in prompt
+    assert "merely contacted" in prompt
+    assert "reported as nonresponsive" in prompt
 
 
 def _openai_response(content: dict[str, str], *, fenced: bool = False) -> dict[str, Any]:

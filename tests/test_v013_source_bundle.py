@@ -13,6 +13,7 @@ from auto_zettelkasten.models import (
     MissingSourceRecommendation,
     ProcessingPolicy,
     SourceAnalysisBundle,
+    _readable_bundle_text,
 )
 from auto_zettelkasten.api import resume_map, run_map
 from auto_zettelkasten.files import read_yaml, write_yaml
@@ -44,6 +45,15 @@ from auto_zettelkasten.readers import (
 )
 
 from conftest import FakeZotero
+
+
+def test_readable_bundle_text_decodes_only_escaped_markdown_lists() -> None:
+    assert _readable_bundle_text("Lead\\n- first\\n  - nested") == (
+        "Lead\n- first\n  - nested"
+    )
+    assert _readable_bundle_text(r"Keep literal \n inside code") == (
+        r"Keep literal \n inside code"
+    )
 
 
 def test_resolved_literature_position_projects_cites_and_cited_by(
@@ -1132,6 +1142,30 @@ def test_invalid_quote_locator_is_quarantined_without_discarding_bundle() -> Non
     assert bundle.component_diagnostics[-1]["rehydrate"] is False
 
 
+def test_long_key_concept_quotation_must_exist_in_inspected_text() -> None:
+    payload = _bundle_payload()
+    exact = (
+        "news content passes through institutional filters before reaching audiences"
+    )
+    payload["analysis_sections"]["key_concepts_and_definitions"] = (
+        f'**Model** — “{exact}” (p. 1).'
+    )
+    row = {
+        "source_id": "source-zotero-A1",
+        "zotero_item_key": "A1",
+        "text": f"The authors state that {exact}.",
+    }
+
+    assert _source_bundle_from_result(payload, row, "full_document") is not None
+
+    payload["analysis_sections"]["key_concepts_and_definitions"] = (
+        "**Model** — “an invented analytical definition with no source wording "
+        "behind it at all” (p. 1)."
+    )
+    with pytest.raises(ValueError, match="analysis_quote_not_found_in_source"):
+        _source_bundle_from_result(payload, row, "full_document")
+
+
 def test_unique_quote_locator_restores_source_casing() -> None:
     payload = _bundle_payload()
     payload["evidence_anchors"][0].update(
@@ -1393,7 +1427,7 @@ def test_ordinary_bundle_source_uses_one_call_and_no_profile_or_fidelity_call(
     ]
     assert profile["coverage"]["status"] == "partial"
     note = read_note(tmp_path / report.items[0]["note_path"])
-    assert note["frontmatter"]["source_bundle_prompt_version"] == "30"
+    assert note["frontmatter"]["source_bundle_prompt_version"] == "31"
 
 
 @pytest.mark.parametrize("observed_date", ["", "Published 2019; updated 2024"])

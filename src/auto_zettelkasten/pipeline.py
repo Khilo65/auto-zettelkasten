@@ -212,6 +212,7 @@ _RELATIONSHIP_SEMANTIC_POLICY_VERSION = "source-owned-bases-v26"
 _SOURCE_BUNDLE_QUOTE_LOCATOR = re.compile(
     r'^["\u201c](?P<quote>[^"\u201d]+)["\u201d]'
 )
+_ANALYSIS_QUOTED_SPAN = re.compile(r'“([^”]+)”|"([^"]+)"')
 _LITERATURE_MEMORY_LOCK = threading.Lock()
 _AUTO_CLOUD_SOURCE_WORKER_LIMIT = 32
 _AUTO_DEEPSEEK_SOURCE_WORKER_LIMIT = 256
@@ -15953,6 +15954,22 @@ def _source_bundle_from_result(
         if label and heading_counts[label.casefold()] == 1
     }
     opaque_pdf_route = row.get("content_route") in {"codex_pdf_page_images", "codex_pdf_input_file"}
+    if validate_quantitative_provenance and not opaque_pdf_route:
+        source_words = re.sub(
+            r"[^\w]+", " ", str(row.get("text") or "").casefold()
+        ).strip()
+        concepts = str(
+            (payload.get("analysis_sections") or {}).get(
+                "key_concepts_and_definitions", ""
+            )
+        )
+        for match in _ANALYSIS_QUOTED_SPAN.finditer(concepts):
+            quoted = next(value for value in match.groups() if value is not None)
+            if len(quoted.split()) < 8:
+                continue
+            quote_words = re.sub(r"[^\w]+", " ", quoted.casefold()).strip()
+            if quote_words not in source_words:
+                raise ValueError("analysis_quote_not_found_in_source")
     anchors = payload.get("evidence_anchors", [])
     if isinstance(anchors, list):
         normalized_anchors = []
