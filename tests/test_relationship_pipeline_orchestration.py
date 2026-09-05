@@ -2876,6 +2876,25 @@ def test_candidate_cap_reserves_bridge_slots_and_keeps_model_rank() -> None:
     ]
 
 
+def test_zero_candidate_capacity_defers_every_candidate() -> None:
+    dispositions: list[dict[str, Any]] = []
+
+    selected = _ranked_relationship_candidates(
+        {"candidates": [_candidate("A", "B")]},
+        available_source_ids={"A", "B"},
+        entry_by_source={"A": {}, "B": {}},
+        excluded_pairs=set(),
+        maximum=0,
+        bridge_fraction=0.4,
+        dispositions=dispositions,
+    )
+
+    assert selected == []
+    assert dispositions == [
+        {"pair": ["A", "B"], "disposition": "deferred_capacity"}
+    ]
+
+
 def test_candidate_ranking_is_fair_across_jobs_and_merges_provenance() -> None:
     entries = {
         source_id: {"collections": ["one" if source_id.startswith("A") else "two"]}
@@ -3542,6 +3561,85 @@ def test_relationship_packet_sizing_matches_provider_visible_payload(
     assert observed_batches == expected_batches
     assert result["provider_batch_count"] == len(expected_batches)
     assert result["accounted_pair_job_count"] == 8
+
+
+def test_shared_plan_reserves_cluster_and_gap_calls_before_adjudication(
+    tmp_path: Path,
+) -> None:
+    source_ids = ["A", *[f"S{index:02d}" for index in range(13)]]
+    profiles = [_profile(source_id) for source_id in source_ids]
+    shared_plan = {
+        "lean_index_hash": "lean",
+        "literature_families": [
+            {
+                "family_id": "family",
+                "source_ids": source_ids,
+                "candidate_cluster": True,
+            }
+        ],
+        "discovery_jobs": [
+            {
+                "job_id": "family",
+                "family": "family",
+                "left_source_ids": ["A"],
+                "right_source_ids": source_ids[1:],
+                "candidate_quota": 13,
+            }
+        ],
+    }
+    candidates = [
+        _candidate("A", source_id, rank=index)
+        for index, source_id in enumerate(source_ids[1:], start=1)
+    ]
+    batch_sizes: list[int] = []
+
+    def handler(
+        stage: str,
+        _profiles: Sequence[Any],
+        context: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if stage == "relationship_candidate_selection":
+            return {
+                "candidates": candidates,
+                "job_outcomes": [
+                    {
+                        "bridge_job_id": job["bridge_job_id"],
+                        "status": "no_more_candidates",
+                    }
+                    for job in context["bridge_jobs"]
+                ],
+            }
+        jobs = context["pair_jobs"]
+        batch_sizes.append(len(jobs))
+        return {"decisions": [_decision(job) for job in jobs]}
+
+    calls = _Calls(handler)
+    calls.max_calls = 5
+    calls.cumulative_provider_calls = 0
+    result = _run(
+        tmp_path,
+        profiles,
+        calls,
+        reasoner=_V8Reasoner(),
+        shared_family_plan=shared_plan,
+        request=LiteratureMapRequest(
+            workspace=tmp_path,
+            provider="test-provider",
+            model="test-model",
+            provider_concurrency=1,
+            literature_policy=LiteratureMappingPolicy(
+                cluster_generation_enabled=True
+            ),
+        ),
+    )
+
+    assert batch_sizes == [8]
+    assert result["pair_job_count"] == 8
+    assert sum(
+        row["disposition"] == "deferred_capacity"
+        for row in result["candidate_dispositions"]
+    ) == 5
+    assert calls.cumulative_provider_calls == 3
 
 
 def test_malformed_decision_parks_only_its_pair(

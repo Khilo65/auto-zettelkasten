@@ -9998,6 +9998,33 @@ def _run_relationship_reasoning(
         if discovery_usable
         else "failed"
     )
+    if (
+        remaining_calls is not None
+        and not reuse_selected_pool
+        and shared_plan_active
+        and request.literature_policy.cluster_generation_enabled is not False
+    ):
+        downstream_call_reserve = 1 + sum(
+            isinstance(family, Mapping)
+            and family.get("candidate_cluster") is not False
+            for family in shared_family_plan.get("literature_families", []) or []
+        )
+        remaining_adjudication_calls = max(
+            0,
+            int(reasoner_calls.max_calls or 0)
+            - int(reasoner_calls.cumulative_provider_calls or 0)
+            - downstream_call_reserve,
+        )
+        inferred_capacity = min(
+            possible_pair_count,
+            max(
+                0,
+                remaining_adjudication_calls * batch_max_jobs
+                - len(mandatory_basis),
+            ),
+        )
+        general_capacity = inferred_capacity
+        bridge_capacity = inferred_capacity
 
     merged_candidates: dict[tuple[str, str], dict[str, Any]] = {}
     merged_candidate_pools: dict[tuple[str, str], set[str]] = defaultdict(set)
@@ -11425,7 +11452,7 @@ def _ranked_relationship_candidates(
         selected.extend(leftovers[: max(0, count - len(selected))])
         return selected
 
-    if maximum <= 0:
+    if maximum < 0:
         maximum = len(seen)
     bridge_slots = min(len(bridges), int(maximum * bridge_fraction + 0.999))
     within_slots = min(len(within), maximum - bridge_slots)
