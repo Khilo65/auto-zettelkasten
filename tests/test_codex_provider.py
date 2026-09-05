@@ -245,6 +245,10 @@ def test_codex_contract_capabilities_and_typed_retry_policy() -> None:
     assert isinstance(_codex_failure("HTTP 429"), ProviderTransportError)
     assert isinstance(_codex_failure("503 Service Unavailable"), ProviderTransportError)
     assert isinstance(
+        _codex_failure("Selected model is at capacity. Please try a different model."),
+        ProviderQuotaExhausted,
+    )
+    assert isinstance(
         _codex_failure(
             "image inputs are not supported: /tmp/pytest-500/page.png",
             attachment_paths=("/tmp/pytest-500/page.png",),

@@ -3641,7 +3641,7 @@ def _codex_failure(
     diagnostic = _redact_codex_diagnostic(
         message, credential_root, attachment_paths
     )
-    if any(value in normalized for value in ("quota", "usage limit")):
+    if any(value in normalized for value in ("quota", "usage limit", "at capacity")):
         return ProviderQuotaExhausted(diagnostic)
     if "timed out" in normalized or "timeout" in normalized:
         return ProviderTimeout(diagnostic)
