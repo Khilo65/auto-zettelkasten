@@ -235,7 +235,7 @@ DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
-SOURCE_BUNDLE_PROMPT_VERSION = "29"
+SOURCE_BUNDLE_PROMPT_VERSION = "30"
 SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v2"
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
@@ -5295,7 +5295,9 @@ def _source_bundle_system_prompt() -> str:
         "22.5% lower relative to the 40% baseline. Keep odds, hazards, risks, and probabilities distinct. Do not convert a "
         "logit coefficient or interaction into a percentage without a reported marginal effect, predicted probability, or "
         "all required inputs. A p-value is not an effect size or the probability that a hypothesis is true. Locators are "
-        "approximate navigation aids and must not be invented. "
+        "approximate navigation aids and must not be invented. `--- Page N ---`, `PDF page N`, and caller-provided page scopes "
+        "are physical PDF ordinals. Reserve bare `p. N` or `pp. N-M` for supplied source-native printed labels; use "
+        "ordinal_to_printed_page to convert when present, and keep the `PDF` prefix when no printed label is supplied. "
         f"Return exactly one JSON object for {SOURCE_BUNDLE_ENVELOPE_CONTRACT} with only these top-level fields: "
         "evidence_anchors, analysis_sections, compact_profile, literature_positions, and "
         "observed_bibliographic_identity. "
@@ -6613,11 +6615,19 @@ def _chunk_system_prompt() -> str:
         "group, reference category, uncertainty measure, significance statement, and caveat needed for later plain-English explanation. "
         "If the chunk contains no quantitative result, say so briefly in statistical_context. "
         "Keep page markers, section headings, and explicit text anchors in locators. "
+        "`--- Page N ---`, `PDF page N`, and caller-provided page scopes are physical PDF ordinals. "
+        "Reserve bare `p. N` or `pp. N-M` for supplied source-native printed labels; use "
+        "ordinal_to_printed_page to convert when present, and keep the `PDF` prefix when no printed label is supplied. "
         "When a field is not reported in this chunk, say so briefly."
     )
 
 
-def _metadata_prompt(metadata: Mapping[str, Any], question: str | None) -> str:
+def _metadata_prompt(
+    metadata: Mapping[str, Any],
+    question: str | None,
+    *,
+    include_page_labels: bool = False,
+) -> str:
     safe_metadata = {
         key: metadata.get(key)
         for key in (
@@ -6645,19 +6655,20 @@ def _metadata_prompt(metadata: Mapping[str, Any], question: str | None) -> str:
         None,
     )
     if isinstance(extraction_value, Mapping):
+        extraction_keys = (
+            "source_type",
+            "coverage",
+            "source_scope",
+            "extraction_route",
+            "route",
+            "page_count",
+            "embedded_text_page_count",
+            "ocr_page_count",
+            "unresolved_pages",
+        ) + (("ordinal_to_printed_page",) if include_page_labels else ())
         compact_extraction = {
             key: extraction_value.get(key)
-            for key in (
-                "source_type",
-                "coverage",
-                "source_scope",
-                "extraction_route",
-                "route",
-                "page_count",
-                "embedded_text_page_count",
-                "ocr_page_count",
-                "unresolved_pages",
-            )
+            for key in extraction_keys
             if extraction_value.get(key) not in (None, "", [])
         }
         if compact_extraction:
@@ -6695,7 +6706,7 @@ def _chunk_prompt(
         if metadata.get(key) is not None
     }
     return (
-        f"{_metadata_prompt(metadata, question)}\n"
+        f"{_metadata_prompt(metadata, question, include_page_labels=True)}\n"
         f"Coarse chunk id: {chunk_id or 'unspecified'}\n"
         f"Caller-provided locator: {locator or 'unspecified'}\n"
         f"Caller-provided section/page scope: {json.dumps(scope, ensure_ascii=False)}\n\n"
@@ -6721,7 +6732,7 @@ def _synthesis_prompt(
             raise ValueError(f"chunk_memos item {index} has no usable evidence")
         compact_evidence.append(compact)
     return (
-        f"{_metadata_prompt(metadata, question)}\n\n"
+        f"{_metadata_prompt(metadata, question, include_page_labels=True)}\n\n"
         "Synthesize the following ordered coarse chunk evidence into one source-level analysis. "
         "Resolve repetition, retain disagreements and qualifications, and preserve all useful locators. "
         "Keep exact technical figures in detailed_findings and use statistical_context to produce the separately labeled "

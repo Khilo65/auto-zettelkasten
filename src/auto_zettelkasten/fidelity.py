@@ -159,9 +159,13 @@ def analyze_atomic_fidelity(
     printed_to_ordinals = _printed_to_ordinals(
         metrics.get("ordinal_to_printed_page")
     )
-    inferred = _inferred_printed_to_ordinals(pages)
-    if inferred:
-        printed_to_ordinals = inferred
+    if not printed_to_ordinals or all(
+        label.isdigit() and ordinals == (int(label),)
+        for label, ordinals in printed_to_ordinals.items()
+    ):
+        inferred = _inferred_printed_to_ordinals(pages)
+        if inferred:
+            printed_to_ordinals = inferred
     object_spans = {
         kind: _span_index(metrics.get(f"{kind}_spans"))
         for kind in ("table", "figure", "heading")

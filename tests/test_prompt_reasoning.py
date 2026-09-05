@@ -83,10 +83,10 @@ def test_atomic_prompt_v14_is_source_adaptive_and_statistics_aware() -> None:
     assert "silently reread" in prompt
 
 
-def test_source_bundle_prompt_v29_preserves_formatting_and_attribution_scope() -> None:
+def test_source_bundle_prompt_v30_preserves_formatting_and_attribution_scope() -> None:
     prompt = _source_bundle_system_prompt()
 
-    assert "source bundle prompt v29" in prompt
+    assert "source bundle prompt v30" in prompt
     assert "apply a footnote, only when the alignment or marker is explicit" in prompt
     assert "A footnote qualifies only the values bearing its explicit marker" in prompt
     assert "page metadata is not a statistic's observation date" in prompt
@@ -105,6 +105,8 @@ def test_source_bundle_prompt_v29_preserves_formatting_and_attribution_scope() -
     assert 'Quote "exact unique source words"' in prompt
     assert "12–120 characters" in prompt
     assert "Descriptive paragraph labels are not locators" in prompt
+    assert "physical PDF ordinals" in prompt
+    assert "Reserve bare `p. N`" in prompt
 
 
 def test_source_bundle_preserves_coverage_lineage_and_prose_scope() -> None:
@@ -301,8 +303,8 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     assert {
         "atomic_prompt_v14": digest(_system_prompt()),
         "chunk_prompt_v14": digest(_chunk_system_prompt()),
-        "source_bundle_prompt_v29": digest(_source_bundle_system_prompt()),
-        "source_bundle_user_prompt_v29": digest(
+        "source_bundle_prompt_v30": digest(_source_bundle_system_prompt()),
+        "source_bundle_user_prompt_v30": digest(
             _source_bundle_prompt("A fictional source.", {}, None)
         ),
         "codex_source_bundle_schema": bundle_identity["schema_hash"],
@@ -311,9 +313,9 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
         "codex_chunk_evidence_contract": digest(chunk_identity),
     } == {
         "atomic_prompt_v14": "8db9f2990d175816cb0100b92d84734ae7c2f930aade66825ed0412b22da3705",
-        "chunk_prompt_v14": "3c2eabca75c5ad487a35a5096664e0ec6999d04b738927a60fce2e11cfb15cd5",
-        "source_bundle_prompt_v29": "c07091db363cb47c077fcf6709bbd9dcb1b5fdc5fb98decb45250db5b3798f31",
-        "source_bundle_user_prompt_v29": "c530d3874ae68f532dd574390ff15944bd2b2cfe5f2bb5986bad3da62935ad8f",
+        "chunk_prompt_v14": "f1030158546cbce9c6478f89d9e46b8450cf4f2e7dd4be443289378996cfcd06",
+        "source_bundle_prompt_v30": "585ce08ca8ad30d27ae629578f3df0ac41149ecf1216f02570538dd88b64cc77",
+        "source_bundle_user_prompt_v30": "c530d3874ae68f532dd574390ff15944bd2b2cfe5f2bb5986bad3da62935ad8f",
         "codex_source_bundle_schema": "1b9491a9f2d7bf9c4c8c62a5838180c2e8b171700211e2fe63cd77514d7192c2",
         "codex_source_bundle_contract": "e6e7dc65d7953e5fe777faf1dcb43cebf933c4d9e73ca890264e98a7cd08e023",
         "codex_chunk_evidence_schema": "2df4a0fe634405df5e891283a59bfc7bee18995b5e970a51c5569b5c4eafed8e",

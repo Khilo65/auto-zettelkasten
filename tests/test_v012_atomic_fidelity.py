@@ -181,6 +181,29 @@ def test_analyzer_infers_consistent_printed_page_offset_from_page_footers() -> N
     ]
 
 
+def test_analyzer_keeps_authoritative_nonidentity_page_labels() -> None:
+    source = _pages(
+        {
+            21: "Noisy index entry 234",
+            22: "Noisy index entry 235",
+            23: "Table 2 reports the result.\n236",
+        }
+    )
+    risks = analyze_atomic_fidelity(
+        _analysis(detailed_findings="Table 2 reports the result on p. 13."),
+        source,
+        {
+            "page_count": 23,
+            "ordinal_to_printed_page": {"21": "11", "22": "12", "23": "13"},
+            "table_spans": [
+                {"label": "Table 2", "page_ordinal": 23, "printed_page": "13"}
+            ],
+        },
+    )
+
+    assert not [row for row in risks if row["kind"] == "locator_page_mismatch"]
+
+
 def test_analyzer_preserves_dominant_zero_page_offset() -> None:
     source = _pages(
         {

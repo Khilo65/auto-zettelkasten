@@ -1526,7 +1526,7 @@ def test_codex_chunk_envelope_that_cannot_fit_fails_before_any_provider_call(
         return split_document(*args, **kwargs)
 
     monkeypatch.setattr(pipeline_module, "_split_document", bounded_split)
-    question = "Q" * 3_992 if framed_boundary else "Question " * 75_000
+    question = "Q" * 3_728 if framed_boundary else "Question " * 75_000
     text = "A" * (10_000 if framed_boundary else 500_000)
     if framed_boundary:
         assert reader.chunk_evidence_fits(
