@@ -11657,6 +11657,8 @@ def validate_streamlined_cluster_synthesis(
         warnings.append("unknown_retained_member_ignored")
     if raw_dropped - proposed_ids:
         warnings.append("unknown_dropped_member_ignored")
+    if raw_dropped & retained:
+        warnings.append("retained_member_also_marked_dropped_ignored")
     for field in ("title", "organizing_problem", "bottom_line"):
         if not str(response.get(field) or "").strip():
             errors.append(f"cluster_requires_{field}")
@@ -11842,6 +11844,7 @@ def validate_streamlined_cluster_synthesis(
         for row in response.get("dropped_members", []) or []
         if isinstance(row, Mapping)
         and str(row.get("source_id") or "") in proposed_ids
+        and str(row.get("source_id") or "") not in retained
     ]
     existing_drop_ids = {
         str(row.get("source_id") or "") for row in returned_drops

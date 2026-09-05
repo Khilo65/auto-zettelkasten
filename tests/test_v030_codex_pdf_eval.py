@@ -2048,3 +2048,191 @@ def test_cluster_acceptance_allows_only_terminal_new_cluster_quarantine(
             workspace, {"source-a", "source-b", "source-c"}, report
         )
         assert "cluster_registry_incomplete" in errors
+
+
+def test_cluster_accounting_uses_runtime_eligibility_with_typed_exclusion(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    raw_profiles = [
+        {"source_id": source_id, "note_id": f"note-{source_id}"}
+        for source_id in ("source-a", "source-b")
+    ]
+    raw_profiles.append(
+        {
+            "source_id": "source-c",
+            "note_id": "note-source-c",
+            "context": {"date": "1996"},
+            "evidence_anchors": [
+                {"finding": "Observed results were reported in 2000 and 2001."}
+            ],
+        }
+    )
+    normalized = {
+        row["source_id"]: row
+        for row in runner.normalize_evidence_profiles(raw_profiles)
+    }
+    for profile in raw_profiles:
+        write_yaml(
+            workspace
+            / "02_source_memory"
+            / "profiles"
+            / f"{profile['note_id']}.yml",
+            {"profile": profile},
+        )
+    write_yaml(
+        workspace / "03_literature_synthesis" / "coverage_register.yml",
+        {
+            "source_set_id": "source-set-test",
+            "inventory_count": 3,
+            "counts": {
+                "validated_note": 2,
+                "limited_note": 1,
+                "duplicate_alias": 0,
+                "parked_for_review": 0,
+                "partial": 0,
+                "pending": 0,
+            },
+            "records": [
+                {
+                    "source_id": source_id,
+                    "terminal_state": "validated_note",
+                }
+                for source_id in ("source-a", "source-b")
+            ]
+            + [
+                {
+                    "source_id": "source-c",
+                    "terminal_state": "limited_note",
+                    "exclusion_reason": normalized["source-c"]["exclusion_reason"],
+                }
+            ],
+            "status": "complete",
+        },
+    )
+    write_yaml(
+        workspace / "03_literature_synthesis" / "cluster_registry.yml",
+        {"pending_revisions": []},
+    )
+    report = {
+        "items": [
+            {"source_id": source_id}
+            for source_id in ("source-a", "source-b", "source-c")
+        ],
+        "cluster_count": 1,
+        "synthesized_cluster_count": 1,
+        "cluster_map": {
+            "clusters": [
+                {
+                    "cluster_id": "cluster-active",
+                    "source_ids": ["source-a", "source-b"],
+                }
+            ],
+            "unclustered_sources": [],
+        },
+        "literature_packet": {
+            "status": "complete",
+            "cluster_ids": ["cluster-active"],
+            "parked_cluster_ids": [],
+            "refresh_pending_cluster_ids": [],
+        },
+    }
+
+    errors = runner._cluster_errors(
+        workspace, {"source-a", "source-b", "source-c"}, report
+    )
+
+    assert "cluster_disposition_accounting_failed" not in errors
+    assert "cluster_integrity_exclusion_unexplained" not in errors
+
+    coverage = read_yaml(
+        workspace / "03_literature_synthesis" / "coverage_register.yml"
+    )
+    coverage["records"][-1]["exclusion_reason"] = ""
+    write_yaml(
+        workspace / "03_literature_synthesis" / "coverage_register.yml",
+        coverage,
+    )
+    errors = runner._cluster_errors(
+        workspace, {"source-a", "source-b", "source-c"}, report
+    )
+    assert "cluster_integrity_exclusion_unexplained" in errors
+
+    coverage["records"][-1]["exclusion_reason"] = normalized["source-c"][
+        "exclusion_reason"
+    ]
+    coverage["counts"]["validated_note"] = 3
+    coverage["counts"]["limited_note"] = 0
+    write_yaml(
+        workspace / "03_literature_synthesis" / "coverage_register.yml",
+        coverage,
+    )
+    errors = runner._cluster_errors(
+        workspace, {"source-a", "source-b", "source-c"}, report
+    )
+    assert "cluster_coverage_register_invalid" in errors
+
+    coverage["counts"]["validated_note"] = 2
+    coverage["counts"]["limited_note"] = 1
+    coverage["records"].append(dict(coverage["records"][-1]))
+    coverage["inventory_count"] = 4
+    coverage["counts"]["limited_note"] = 2
+    write_yaml(
+        workspace / "03_literature_synthesis" / "coverage_register.yml",
+        coverage,
+    )
+    errors = runner._cluster_errors(
+        workspace, {"source-a", "source-b", "source-c"}, report
+    )
+    assert "cluster_coverage_register_invalid" in errors
+
+    (
+        workspace / "03_literature_synthesis" / "coverage_register.yml"
+    ).unlink()
+    errors = runner._cluster_errors(
+        workspace, {"source-a", "source-b", "source-c"}, report
+    )
+    assert "cluster_coverage_register_invalid" in errors
+
+
+def test_cluster_acceptance_rejects_retained_and_dropped_member_overlap(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    write_yaml(
+        workspace / "03_literature_synthesis" / "cluster_registry.yml",
+        {"pending_revisions": []},
+    )
+    report = {
+        "cluster_count": 1,
+        "synthesized_cluster_count": 1,
+        "cluster_map": {
+            "clusters": [
+                {
+                    "cluster_id": "cluster-active",
+                    "source_ids": ["source-a", "source-b"],
+                }
+            ],
+            "unclustered_sources": [],
+            "cluster_syntheses": {
+                "cluster-active": {
+                    "retained_member_ids": ["source-a", "source-b"],
+                    "dropped_members": [
+                        {"source_id": "source-b", "reason": "stale"}
+                    ],
+                }
+            },
+        },
+        "literature_packet": {
+            "status": "complete",
+            "cluster_ids": ["cluster-active"],
+            "parked_cluster_ids": [],
+            "refresh_pending_cluster_ids": [],
+        },
+    }
+
+    errors = runner._cluster_errors(
+        workspace, {"source-a", "source-b"}, report
+    )
+
+    assert "cluster_synthesis_membership_contradiction" in errors

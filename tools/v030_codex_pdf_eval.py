@@ -37,11 +37,13 @@ from auto_zettelkasten.files import (
     write_yaml,
 )
 from auto_zettelkasten.models import (
+    CoverageRegister,
     ExtractionPolicy,
     LiteratureMappingPolicy,
     MapRequest,
     ProcessingPolicy,
 )
+from auto_zettelkasten.literature import normalize_evidence_profiles
 from auto_zettelkasten.notes import read_note, source_id_for_item
 from auto_zettelkasten.readers import (
     CodexReader,
@@ -2502,6 +2504,83 @@ def _cluster_errors(
     cluster_map = report.get("cluster_map")
     if not isinstance(cluster_map, Mapping):
         return ["cluster_map_missing"]
+    raw_coverage_register = read_yaml(
+        workspace / "03_literature_synthesis" / "coverage_register.yml", {}
+    ) or {}
+    try:
+        coverage_register = CoverageRegister.from_dict(raw_coverage_register)
+    except (TypeError, ValueError):
+        coverage_register = None
+    if coverage_register is not None and coverage_register.records:
+        coverage_rows = coverage_register.records
+        coverage_by_source = {
+            row.source_id: row
+            for row in coverage_rows
+            if row.source_id
+        }
+        report_source_ids = {
+            str(row.get("source_id") or "")
+            for row in report.get("items", []) or []
+            if isinstance(row, Mapping) and str(row.get("source_id") or "")
+        }
+        raw_profiles = []
+        for path in (workspace / "02_source_memory" / "profiles").glob("*.yml"):
+            payload = read_yaml(path, {}) or {}
+            profile = payload.get("profile") if isinstance(payload, Mapping) else None
+            if isinstance(profile, Mapping):
+                raw_profiles.append(profile)
+        normalized_profiles = normalize_evidence_profiles(raw_profiles)
+        normalized_by_source = {
+            str(row.get("source_id") or ""): row for row in normalized_profiles
+        }
+        runtime_eligible = {
+            source_id
+            for source_id, row in normalized_by_source.items()
+            if row.get("analytical") is True
+        }
+        registered_eligible = {
+            source_id
+            for source_id, row in coverage_by_source.items()
+            if row.terminal_state == "validated_note"
+        }
+        actual_coverage_counts = Counter(
+            row.terminal_state for row in coverage_rows
+        )
+        coverage_valid = (
+            len(coverage_by_source) == len(coverage_rows)
+            and set(coverage_by_source) == report_source_ids
+            and set(normalized_by_source) == report_source_ids
+            and len(normalized_by_source) == len(normalized_profiles)
+            and registered_eligible == runtime_eligible
+            and all(
+                coverage_register.counts.get(state, 0) == count
+                for state, count in actual_coverage_counts.items()
+            )
+            and all(
+                actual_coverage_counts.get(state, 0) == count
+                for state, count in coverage_register.counts.items()
+            )
+        )
+        if not coverage_valid:
+            errors.append("cluster_coverage_register_invalid")
+        if runtime_eligible - source_ids:
+            errors.append("cluster_eligibility_outside_gate")
+        if any(
+            normalized_by_source.get(source_id, {}).get(
+                "bibliographic_identity_status"
+            )
+            != "source_identity_conflict"
+            or coverage_by_source[source_id].terminal_state != "limited_note"
+            or coverage_by_source[source_id].exclusion_reason
+            != normalized_by_source[source_id].get("exclusion_reason")
+            for source_id in source_ids - runtime_eligible
+            if source_id in coverage_by_source and source_id in normalized_by_source
+        ):
+            errors.append("cluster_integrity_exclusion_unexplained")
+        if coverage_valid:
+            source_ids = runtime_eligible & source_ids
+    else:
+        errors.append("cluster_coverage_register_invalid")
     clusters = [
         dict(row)
         for row in cluster_map.get("clusters", []) or []
@@ -2524,6 +2603,22 @@ def _cluster_errors(
         errors.append("cluster_endpoint_outside_gate")
     if member_ids & unclustered_ids or member_ids | unclustered_ids != source_ids:
         errors.append("cluster_disposition_accounting_failed")
+    syntheses = cluster_map.get("cluster_syntheses", {})
+    if isinstance(syntheses, Mapping) and any(
+        {
+            str(value)
+            for value in synthesis.get("retained_member_ids", []) or []
+            if str(value)
+        }
+        & {
+            str(row.get("source_id") or "")
+            for row in synthesis.get("dropped_members", []) or []
+            if isinstance(row, Mapping) and str(row.get("source_id") or "")
+        }
+        for synthesis in syntheses.values()
+        if isinstance(synthesis, Mapping)
+    ):
+        errors.append("cluster_synthesis_membership_contradiction")
     if any(cluster.get("refresh_pending") is True for cluster in clusters):
         errors.append("cluster_refresh_pending")
     registry = read_yaml(

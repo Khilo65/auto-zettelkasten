@@ -30,6 +30,10 @@ from auto_zettelkasten.files import (
     sha256_text,
     write_yaml,
 )
+from auto_zettelkasten.literature import (
+    build_coverage_register,
+    normalize_evidence_profiles,
+)
 from auto_zettelkasten.models import ExtractionPolicy, MapRequest
 from auto_zettelkasten.notes import semantic_note_hash
 from conftest import fake_codex_preflight
@@ -778,6 +782,7 @@ def _write_run(workspace: Path, request: Any, client: Any, run_id: str) -> dict[
     profile_root = workspace / "02_source_memory" / "profiles"
     source_ids = [runner.base.source_id_for_item(item) for item in items]
     report_items = []
+    profiles = []
     for index, source_id in enumerate(source_ids, 1):
         case = client._by_parent[f"P{index}"]
         terminal_status = str(case["expected_terminal_status"])
@@ -820,10 +825,15 @@ def _write_run(workspace: Path, request: Any, client: Any, run_id: str) -> dict[
             "---\n# Synthetic note\n",
             encoding="utf-8",
         )
-        write_yaml(
-            profile_root / f"note-{index}.yml",
-            {"profile": {"source_id": source_id, "note_id": f"note-{index}"}},
-        )
+        profile = {
+            "source_id": source_id,
+            "note_id": f"note-{index}",
+            "note_status": (
+                "analytical" if terminal_status == "validated_note" else "metadata_only"
+            ),
+        }
+        profiles.append(profile)
+        write_yaml(profile_root / f"note-{index}.yml", {"profile": profile})
         report_items.append(
             {
                 "source_id": source_id,
@@ -832,6 +842,14 @@ def _write_run(workspace: Path, request: Any, client: Any, run_id: str) -> dict[
                 "terminal_status": terminal_status,
             }
         )
+
+    write_yaml(
+        workspace / "03_literature_synthesis" / "coverage_register.yml",
+        build_coverage_register(
+            normalize_evidence_profiles(profiles),
+            source_set={"source_set_id": "synthetic-source-set", "rows": report_items},
+        ),
+    )
 
     relation = {
         "relation_id": "synthetic-relation",
@@ -1054,6 +1072,18 @@ def _write_graph_run(workspace: Path, kwargs: Mapping[str, Any]) -> None:
                 }
             }
         },
+    )
+    write_yaml(
+        workspace / "03_literature_synthesis" / "coverage_register.yml",
+        build_coverage_register(
+            normalize_evidence_profiles(
+                [
+                    {"source_id": source_id, "note_id": f"note-{index:03d}"}
+                    for index, source_id in enumerate(source_ids)
+                ]
+            ),
+            source_set={"source_set_id": str(kwargs["source_set"]["source_set_id"])},
+        ),
     )
     run_root = workspace / "11_state" / "runs" / kwargs["run_id"]
     relationship_rows = [

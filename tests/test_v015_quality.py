@@ -99,7 +99,9 @@ def test_streamlined_cluster_preserves_technical_and_plain_english_results() -> 
         "organizing_problem": "What is associated with war duration?",
         "bottom_line": "The studies identify conditional associations.",
         "retained_member_ids": ["A", "B"],
-        "dropped_members": [],
+        "dropped_members": [
+            {"source_id": "A", "reason": "Stale contradictory disposition."}
+        ],
         "differences": [],
         "limits": ["The estimates are observational."],
         "related_clusters": [],
@@ -149,6 +151,10 @@ def test_streamlined_cluster_preserves_technical_and_plain_english_results() -> 
     )
 
     contribution = validated["source_contributions"][0]
+    assert validated["dropped_members"] == []
+    assert "retained_member_also_marked_dropped_ignored" in validated[
+        "quality_warnings"
+    ]
     assert contribution["technical_result"] == "40% versus 31%; p<.05."
     assert contribution["plain_english_meaning"].startswith(
         "That is 9 percentage points lower"
