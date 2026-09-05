@@ -10753,6 +10753,27 @@ def _run_relationship_reasoning(
             <= catalogue_char_budget
         ):
             runnable_packets.append(packet)
+    if (
+        configured_max_calls is not None
+        and shared_plan_active
+        and request.literature_policy.cluster_generation_enabled is not False
+    ):
+        downstream_call_reserve = 1 + sum(
+            isinstance(family, Mapping)
+            and family.get("candidate_cluster") is not False
+            for family in shared_family_plan.get("literature_families", []) or []
+        )
+        available_adjudication_calls = max(
+            0,
+            int(configured_max_calls or 0)
+            - int(reasoner_calls.cumulative_provider_calls or 0)
+            - downstream_call_reserve,
+        )
+        if len(runnable_packets) > available_adjudication_calls:
+            raise RuntimeError(
+                "relationship adjudication packet budget conflicts with "
+                "required cluster/gap call reserve"
+            )
     if runnable_packets:
         relationship_started = time.monotonic()
         workers = _provider_worker_count(request, len(runnable_packets))

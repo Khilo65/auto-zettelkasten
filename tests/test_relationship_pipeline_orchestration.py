@@ -3642,6 +3642,190 @@ def test_shared_plan_reserves_cluster_and_gap_calls_before_adjudication(
     assert calls.cumulative_provider_calls == 3
 
 
+def test_shared_plan_fails_before_mandatory_pairs_consume_cluster_budget(
+    tmp_path: Path,
+) -> None:
+    source_ids = ["A", *[f"S{index:02d}" for index in range(17)]]
+    profiles = [_profile(source_id) for source_id in source_ids]
+    write_yaml(
+        tmp_path / "02_source_memory" / "indexes" / "typed_links.yml",
+        {
+            "relations": [
+                {
+                    "relation_id": f"explicit-{source_id}",
+                    "source_id": "A",
+                    "target_source_id": source_id,
+                    "relation_type": "zotero_related",
+                    "active": True,
+                }
+                for source_id in source_ids[1:]
+            ]
+        },
+    )
+    shared_plan = {
+        "lean_index_hash": "lean",
+        "literature_families": [
+            {
+                "family_id": "family",
+                "source_ids": source_ids,
+                "candidate_cluster": True,
+            }
+        ],
+        "discovery_jobs": [
+            {
+                "job_id": "family",
+                "family": "family",
+                "left_source_ids": ["A"],
+                "right_source_ids": source_ids[1:],
+                "candidate_quota": 17,
+            }
+        ],
+    }
+
+    def handler(
+        stage: str,
+        _profiles: Sequence[Any],
+        context: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if stage == "relationship_candidate_selection":
+            return {
+                "candidates": [],
+                "job_outcomes": [
+                    {
+                        "bridge_job_id": job["bridge_job_id"],
+                        "status": "no_more_candidates",
+                    }
+                    for job in context["bridge_jobs"]
+                ],
+            }
+        raise AssertionError(f"unexpected adjudication call: {stage}")
+
+    calls = _Calls(handler)
+    calls.max_calls = 4
+    calls.cumulative_provider_calls = 0
+    with pytest.raises(
+        RuntimeError,
+        match="relationship adjudication packet budget conflicts",
+    ):
+        _run(
+            tmp_path,
+            profiles,
+            calls,
+            reasoner=_V8Reasoner(),
+            shared_family_plan=shared_plan,
+            request=LiteratureMapRequest(
+                workspace=tmp_path,
+                provider="test-provider",
+                model="test-model",
+                provider_concurrency=1,
+                literature_policy=LiteratureMappingPolicy(
+                    cluster_generation_enabled=True
+                ),
+            ),
+        )
+
+    assert [stage for stage, _profiles, _context in calls.seen] == [
+        "relationship_candidate_selection"
+    ]
+    assert calls.cumulative_provider_calls == 1
+
+
+def test_shared_plan_uses_actual_packet_count_for_cluster_budget(
+    tmp_path: Path,
+) -> None:
+    source_ids = ["A", *[f"S{index:02d}" for index in range(8)]]
+    profiles = [_profile(source_id) for source_id in source_ids]
+    for profile in profiles:
+        profile.evidence_anchors = [
+            EvidenceAnchor(
+                evidence_anchor_id=(
+                    f"large-anchor-{profile.source_id}-{anchor_index}"
+                ),
+                source_id=profile.source_id,
+                claim=f"Claim for {profile.source_id}. " + "evidence " * 180,
+                locator="p. 10",
+                support_envelope={
+                    "support_status": "supported",
+                    "coverage": "full_text",
+                },
+            )
+            for anchor_index in range(3)
+        ]
+    shared_plan = {
+        "lean_index_hash": "lean",
+        "literature_families": [
+            {
+                "family_id": "family",
+                "source_ids": source_ids,
+                "candidate_cluster": True,
+            }
+        ],
+        "discovery_jobs": [
+            {
+                "job_id": "family",
+                "family": "family",
+                "left_source_ids": ["A"],
+                "right_source_ids": source_ids[1:],
+                "candidate_quota": 8,
+            }
+        ],
+    }
+    candidates = [
+        _candidate("A", source_id, rank=index)
+        for index, source_id in enumerate(source_ids[1:], start=1)
+    ]
+
+    def handler(
+        stage: str,
+        _profiles: Sequence[Any],
+        context: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if stage == "relationship_candidate_selection":
+            return {
+                "candidates": candidates,
+                "job_outcomes": [
+                    {
+                        "bridge_job_id": job["bridge_job_id"],
+                        "status": "no_more_candidates",
+                    }
+                    for job in context["bridge_jobs"]
+                ],
+            }
+        raise AssertionError(f"unexpected adjudication call: {stage}")
+
+    calls = _Calls(handler)
+    calls.max_calls = 5
+    calls.cumulative_provider_calls = 0
+    reasoner = _V8Reasoner()
+    reasoner.context_window_tokens = 10_000
+    with pytest.raises(
+        RuntimeError,
+        match="relationship adjudication packet budget conflicts",
+    ):
+        _run(
+            tmp_path,
+            profiles,
+            calls,
+            reasoner=reasoner,
+            shared_family_plan=shared_plan,
+            request=LiteratureMapRequest(
+                workspace=tmp_path,
+                provider="test-provider",
+                model="test-model",
+                provider_concurrency=1,
+                literature_policy=LiteratureMappingPolicy(
+                    cluster_generation_enabled=True
+                ),
+            ),
+        )
+
+    assert [stage for stage, _profiles, _context in calls.seen] == [
+        "relationship_candidate_selection",
+        "relationship_candidate_selection",
+    ]
+    assert calls.cumulative_provider_calls == 2
+
+
 def test_malformed_decision_parks_only_its_pair(
     tmp_path: Path,
 ) -> None:
