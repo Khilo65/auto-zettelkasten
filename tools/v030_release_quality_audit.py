@@ -30,6 +30,18 @@ from auto_zettelkasten.notes import item_key, read_note, source_id_for_item
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _SEED = "v030-autonomous-provisional-release-audit-v1"
 _STRATIFIED_POLICY_REVISION = "mandatory-first-v2"
+_JUDGMENT_POLICY_REVISION = "probabilistic-reasonable-v1"
+_JUDGMENT_POLICY = {
+    "accepted_output": (
+        "Fail materially false, unsupported, or severely overmerged accepted output."
+    ),
+    "negative_or_unclustered": (
+        "Pass a source-grounded conservative omission when another optional relationship "
+        "or cluster boundary is also defensible. Fail only a plainly unreasonable decision, "
+        "lost required coverage, fabricated premise, severe overmerge, or systematic "
+        "relationship or clustering failure."
+    ),
+}
 _MODES = {"strategic8": 8, "exhaustive40": 40, "stratified500": 500}
 _RELATION_LIMIT = 200
 _MEMBERSHIP_LIMIT = 200
@@ -2009,6 +2021,8 @@ def prepare(
         "mode": mode,
         "source_count": len(sources),
         "selection_seed": _SEED,
+        "judgment_policy_revision": _JUDGMENT_POLICY_REVISION,
+        "judgment_policy": _JUDGMENT_POLICY,
         "selection_policy": {
             "strategic8": "all notes, relationships, memberships, decisions, and syntheses; two independent full reviewers",
             "exhaustive40": "all notes, relationships, memberships, decisions, and syntheses",
@@ -2092,6 +2106,8 @@ def _verify_packet(workspace: Path, packet: Mapping[str, Any]) -> list[dict[str,
         or packet.get("provider_calls") != 0
         or packet.get("mode") not in _MODES
         or packet.get("workspace_binding_sha256") != _digest(str(workspace))
+        or packet.get("judgment_policy_revision") != _JUDGMENT_POLICY_REVISION
+        or packet.get("judgment_policy") != _JUDGMENT_POLICY
     ):
         raise ValueError("review packet identity is invalid")
     without_identity = dict(packet)

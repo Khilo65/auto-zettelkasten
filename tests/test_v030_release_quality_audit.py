@@ -514,6 +514,10 @@ def test_strategic8_packet_requires_two_independent_full_reviewers(
         "syntheses": 1,
         "total": 24,
     }
+    assert packet["judgment_policy_revision"] == "probabilistic-reasonable-v1"
+    assert "another optional relationship or cluster boundary is also defensible" in packet[
+        "judgment_policy"
+    ]["negative_or_unclustered"]
     assert all(
         source["source_artifact"]["sha256"]
         for source in packet["source_context"]
@@ -537,6 +541,21 @@ def test_strategic8_packet_requires_two_independent_full_reviewers(
     with pytest.raises(ValueError, match="two independent full reviewer tasks"):
         audit_tool.score(
             workspace, packet_path, missing_path, private / "missing-report.yml"
+        )
+
+    stale_policy_path = private / "stale-policy.yml"
+    stale_policy = dict(packet)
+    stale_policy["judgment_policy_revision"] = "exhaustive-recall-v0"
+    stale_policy_without_identity = dict(stale_policy)
+    stale_policy_without_identity.pop("packet_identity")
+    stale_policy["packet_identity"] = audit_tool._digest(stale_policy_without_identity)
+    write_yaml(stale_policy_path, stale_policy)
+    with pytest.raises(ValueError, match="review packet identity is invalid"):
+        audit_tool.score(
+            workspace,
+            stale_policy_path,
+            review_path,
+            private / "stale-policy-report.yml",
         )
 
     disagreement_path = private / "disagreement.yml"
