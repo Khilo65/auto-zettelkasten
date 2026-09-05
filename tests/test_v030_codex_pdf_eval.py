@@ -2084,12 +2084,12 @@ def test_cluster_accounting_uses_runtime_eligibility_with_typed_exclusion(
         workspace / "03_literature_synthesis" / "coverage_register.yml",
         {
             "source_set_id": "source-set-test",
-            "inventory_count": 3,
+            "inventory_count": 4,
             "counts": {
                 "validated_note": 2,
                 "limited_note": 1,
                 "duplicate_alias": 0,
-                "parked_for_review": 0,
+                "parked_for_review": 1,
                 "partial": 0,
                 "pending": 0,
             },
@@ -2105,9 +2105,14 @@ def test_cluster_accounting_uses_runtime_eligibility_with_typed_exclusion(
                     "source_id": "source-c",
                     "terminal_state": "limited_note",
                     "exclusion_reason": normalized["source-c"]["exclusion_reason"],
-                }
+                },
+                {
+                    "source_id": "source-d",
+                    "terminal_state": "parked_for_review",
+                    "exclusion_reason": "source_parked_for_review",
+                },
             ],
-            "status": "complete",
+            "status": "complete_with_exclusions",
         },
     )
     write_yaml(
@@ -2117,7 +2122,7 @@ def test_cluster_accounting_uses_runtime_eligibility_with_typed_exclusion(
     report = {
         "items": [
             {"source_id": source_id}
-            for source_id in ("source-a", "source-b", "source-c")
+            for source_id in ("source-a", "source-b", "source-c", "source-d")
         ],
         "cluster_count": 1,
         "synthesized_cluster_count": 1,
@@ -2139,7 +2144,7 @@ def test_cluster_accounting_uses_runtime_eligibility_with_typed_exclusion(
     }
 
     errors = runner._cluster_errors(
-        workspace, {"source-a", "source-b", "source-c"}, report
+        workspace, {"source-a", "source-b", "source-c", "source-d"}, report
     )
 
     assert "cluster_disposition_accounting_failed" not in errors
@@ -2148,17 +2153,17 @@ def test_cluster_accounting_uses_runtime_eligibility_with_typed_exclusion(
     coverage = read_yaml(
         workspace / "03_literature_synthesis" / "coverage_register.yml"
     )
-    coverage["records"][-1]["exclusion_reason"] = ""
+    coverage["records"][2]["exclusion_reason"] = ""
     write_yaml(
         workspace / "03_literature_synthesis" / "coverage_register.yml",
         coverage,
     )
     errors = runner._cluster_errors(
-        workspace, {"source-a", "source-b", "source-c"}, report
+        workspace, {"source-a", "source-b", "source-c", "source-d"}, report
     )
     assert "cluster_integrity_exclusion_unexplained" in errors
 
-    coverage["records"][-1]["exclusion_reason"] = normalized["source-c"][
+    coverage["records"][2]["exclusion_reason"] = normalized["source-c"][
         "exclusion_reason"
     ]
     coverage["counts"]["validated_note"] = 3
@@ -2168,21 +2173,21 @@ def test_cluster_accounting_uses_runtime_eligibility_with_typed_exclusion(
         coverage,
     )
     errors = runner._cluster_errors(
-        workspace, {"source-a", "source-b", "source-c"}, report
+        workspace, {"source-a", "source-b", "source-c", "source-d"}, report
     )
     assert "cluster_coverage_register_invalid" in errors
 
     coverage["counts"]["validated_note"] = 2
     coverage["counts"]["limited_note"] = 1
-    coverage["records"].append(dict(coverage["records"][-1]))
-    coverage["inventory_count"] = 4
+    coverage["records"].append(dict(coverage["records"][2]))
+    coverage["inventory_count"] = 5
     coverage["counts"]["limited_note"] = 2
     write_yaml(
         workspace / "03_literature_synthesis" / "coverage_register.yml",
         coverage,
     )
     errors = runner._cluster_errors(
-        workspace, {"source-a", "source-b", "source-c"}, report
+        workspace, {"source-a", "source-b", "source-c", "source-d"}, report
     )
     assert "cluster_coverage_register_invalid" in errors
 
@@ -2190,7 +2195,7 @@ def test_cluster_accounting_uses_runtime_eligibility_with_typed_exclusion(
         workspace / "03_literature_synthesis" / "coverage_register.yml"
     ).unlink()
     errors = runner._cluster_errors(
-        workspace, {"source-a", "source-b", "source-c"}, report
+        workspace, {"source-a", "source-b", "source-c", "source-d"}, report
     )
     assert "cluster_coverage_register_invalid" in errors
 

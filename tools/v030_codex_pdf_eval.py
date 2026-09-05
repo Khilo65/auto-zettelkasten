@@ -2543,13 +2543,25 @@ def _cluster_errors(
             for source_id, row in coverage_by_source.items()
             if row.terminal_state == "validated_note"
         }
+        required_profile_source_ids = {
+            source_id
+            for source_id, row in coverage_by_source.items()
+            if row.terminal_state in {"validated_note", "limited_note"}
+        }
+        allowed_profile_source_ids = {
+            source_id
+            for source_id, row in coverage_by_source.items()
+            if row.terminal_state
+            in {"validated_note", "limited_note", "duplicate_alias"}
+        }
         actual_coverage_counts = Counter(
             row.terminal_state for row in coverage_rows
         )
         coverage_valid = (
             len(coverage_by_source) == len(coverage_rows)
             and set(coverage_by_source) == report_source_ids
-            and set(normalized_by_source) == report_source_ids
+            and required_profile_source_ids <= set(normalized_by_source)
+            and set(normalized_by_source) <= allowed_profile_source_ids
             and len(normalized_by_source) == len(normalized_profiles)
             and registered_eligible == runtime_eligible
             and all(

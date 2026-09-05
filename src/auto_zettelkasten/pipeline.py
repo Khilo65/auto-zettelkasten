@@ -13019,6 +13019,31 @@ def rebuild_map(
             for row in full_workspace_note_rows
         ],
     }
+    global_row_source_ids = {
+        str(row.get("source_id") or "") for row in global_source_set["rows"]
+    }
+    for raw_row in source_set.get("rows", []) or []:
+        if not isinstance(raw_row, Mapping):
+            continue
+        source_id = str(raw_row.get("source_id") or "")
+        if not source_id or source_id in global_row_source_ids:
+            continue
+        global_source_set["rows"].append(
+            {
+                **dict(raw_row),
+                "source_id": source_id,
+                "terminal_status": (
+                    "parked_for_review"
+                    if str(raw_row.get("terminal_status") or "") == "exhausted"
+                    else str(raw_row.get("terminal_status") or "pending")
+                ),
+                "canonical_source_id": str(
+                    raw_row.get("canonical_source_id") or source_id
+                ),
+                "attempted_route": ["not_recorded_legacy"],
+            }
+        )
+        global_row_source_ids.add(source_id)
     canonical_packet_result = _write_profile_packets(
         run_directory(workspace, run_id) / "literature",
         workspace_profiles,

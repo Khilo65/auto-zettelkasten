@@ -2307,6 +2307,12 @@ def test_wrong_source_bundle_is_parked_without_publishing_a_note(tmp_path) -> No
     )
     assert failure["status"] == "parked_for_review"
     assert failure["raw_response"]["bundle_schema_version"] == "1"
+    coverage = read_yaml(
+        tmp_path / "03_literature_synthesis" / "coverage_register.yml"
+    )
+    assert coverage["inventory_count"] == 1
+    assert coverage["counts"]["parked_for_review"] == 1
+    assert coverage["records"][0]["source_id"] == "source-zotero-itema"
 
 
 @pytest.mark.parametrize(
