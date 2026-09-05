@@ -35,7 +35,7 @@ from auto_zettelkasten.notes import (
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _SEED = "v030-autonomous-provisional-release-audit-v1"
 _STRATIFIED_POLICY_REVISION = "mandatory-first-v2"
-_JUDGMENT_POLICY_REVISION = "probabilistic-reasonable-v1"
+_JUDGMENT_POLICY_REVISION = "probabilistic-reasonable-v2"
 _JUDGMENT_POLICY = {
     "accepted_output": (
         "Fail materially false, unsupported, or severely overmerged accepted output."
@@ -45,6 +45,11 @@ _JUDGMENT_POLICY = {
         "or cluster boundary is also defensible. Fail only a plainly unreasonable decision, "
         "lost required coverage, fabricated premise, severe overmerge, or systematic "
         "relationship or clustering failure."
+    ),
+    "canonical_metadata": (
+        "Judge note identity against the frozen Zotero parent. A source-visible "
+        "difference is acceptable only when the hash-bound metadata diagnostic "
+        "records it; fail an uncaptured material attachment or parent conflict."
     ),
 }
 _MODES = {"strategic8": 8, "exhaustive40": 40, "stratified500": 500}
@@ -485,7 +490,7 @@ def _load_sources(
         metadata_issues: list[dict[str, Any]] = []
         metadata_artifact: dict[str, str] | None = None
         metadata_path = workspace / "01_custody" / "zotero" / "zotero_metadata_issues.yml"
-        if mode == "strategic8" and metadata_path.exists():
+        if mode in {"strategic8", "exhaustive40"} and metadata_path.exists():
             metadata_path = _workspace_file(workspace, str(metadata_path), label="metadata diagnostics")
             metadata, metadata_sha256 = _stable_yaml(metadata_path, label="metadata diagnostics")
             issue_rows = metadata.get("issues", [])
@@ -555,6 +560,42 @@ def _load_sources(
                     }
                     artifacts.append(metadata_artifact)
                 artifacts.append(context["source_artifact"])
+            elif metadata_issues:
+                case = next(
+                    row
+                    for row in cases
+                    if str(
+                        row.get("source_id")
+                        or source_id_for_item(
+                            _mapping(
+                                row.get("zotero_parent", {}),
+                                label="Strategic40 Zotero parent",
+                            )
+                        )
+                    )
+                    == source_id
+                )
+                parent = _mapping(
+                    case.get("zotero_parent", {}),
+                    label="Strategic40 Zotero parent",
+                )
+                imported_key = item_key(parent)
+                relevant_issues = [
+                    issue
+                    for issue in metadata_issues
+                    if imported_key
+                    and (
+                        issue.get("zotero_item_key") == imported_key
+                        or imported_key in issue.get("zotero_item_keys", [])
+                    )
+                ]
+                if relevant_issues:
+                    assert metadata_artifact is not None
+                    context["metadata_diagnostics"] = {
+                        "artifact": metadata_artifact,
+                        "issues": relevant_issues,
+                    }
+                    artifacts.append(metadata_artifact)
             contexts.append(context)
         return contexts, strata, artifacts
 
@@ -868,6 +909,11 @@ def _blinded_note_row(
                 "artifact_sha256": custody["artifact"]["sha256"],
                 "custody_case": custody["case"],
                 "status_expectation": custody["status_expectation"],
+                **(
+                    {"metadata_diagnostics": source["metadata_diagnostics"]}
+                    if "metadata_diagnostics" in source
+                    else {}
+                ),
             },
         },
         tuple(

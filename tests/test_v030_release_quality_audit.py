@@ -514,10 +514,11 @@ def test_strategic8_packet_requires_two_independent_full_reviewers(
         "syntheses": 1,
         "total": 24,
     }
-    assert packet["judgment_policy_revision"] == "probabilistic-reasonable-v1"
+    assert packet["judgment_policy_revision"] == "probabilistic-reasonable-v2"
     assert "another optional relationship or cluster boundary is also defensible" in packet[
         "judgment_policy"
     ]["negative_or_unclustered"]
+    assert "frozen Zotero parent" in packet["judgment_policy"]["canonical_metadata"]
     assert all(
         source["source_artifact"]["sha256"]
         for source in packet["source_context"]
@@ -732,6 +733,41 @@ def test_strategic8_metadata_diagnostics_match_imported_keys_and_are_hash_bound(
     assert sha256_file(issue_path) != evidence["artifact"]["sha256"]
     with pytest.raises(ValueError, match="stale review artifact"):
         audit_tool._verify_packet(workspace, packet)
+
+
+def test_blinded_note_row_binds_metadata_diagnostics_to_source_evidence() -> None:
+    diagnostic = {
+        "artifact": {
+            "path": "01_custody/zotero/zotero_metadata_issues.yml",
+            "path_scope": "workspace",
+            "sha256": "1" * 64,
+        },
+        "issues": [{"zotero_item_key": "P0", "status": "open"}],
+    }
+    row, _binding = audit_tool._blinded_note_row(
+        {
+            "source_id": "source-000",
+            "primary_stratum_id": "stratum-00",
+            "note_artifact": {"sha256": "2" * 64},
+            "note_text": "# Current note",
+            "metadata_diagnostics": diagnostic,
+        },
+        {
+            "note_artifact": {"sha256": "3" * 64},
+            "note_text": "# Baseline note",
+        },
+        {
+            "artifact": {
+                "path": "raw/source-000.txt",
+                "path_scope": "external",
+                "sha256": "4" * 64,
+            },
+            "case": {"zotero_parent": {"key": "P0"}},
+            "status_expectation": {"metadata_only": False},
+        },
+    )
+
+    assert row["payload"]["source_evidence"]["metadata_diagnostics"] == diagnostic
 
 
 @pytest.mark.parametrize("issues", ["not a list", ["not a mapping"], [{"zotero_item_keys": "P0"}]])
