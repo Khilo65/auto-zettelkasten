@@ -33,6 +33,7 @@ from auto_zettelkasten.pipeline import (
     _recover_saved_source_bundle,
     _reusable_note,
     _source_bundle_from_result,
+    _source_dates,
 )
 from auto_zettelkasten.relationships import stable_hash
 from auto_zettelkasten.readers import (
@@ -921,6 +922,39 @@ def test_pipeline_does_not_reinsert_rejected_optional_rows() -> None:
     assert bundle.component_diagnostics[0]["raw"]["source_id"] == (
         "source-zotero-wrong"
     )
+
+
+def test_source_bundle_skips_quantitative_scan_without_quantitative_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "auto_zettelkasten.pipeline._source_dates",
+        lambda _text: pytest.fail("quantitative source scan must be skipped"),
+    )
+
+    bundle = _source_bundle_from_result(
+        _bundle_payload(),
+        {
+            "source_id": "source-zotero-A1",
+            "zotero_item_key": "A1",
+            "text": "A long source without quantitative evidence.",
+        },
+        "full_document",
+    )
+
+    assert bundle is not None
+
+
+def test_page_date_metadata_lookback_uses_quantitative_locality_limit() -> None:
+    within_limit = _source_dates(
+        "Updated:\n" + "UTC\n" * 11 + "October 29, 2024"
+    )
+    beyond_limit = _source_dates(
+        "Updated:\n" + "UTC\n" * 12 + "October 29, 2024"
+    )
+
+    assert within_limit[-1][2] is True
+    assert beyond_limit[-1][2] is False
 
 
 @pytest.mark.parametrize("quoted_span", [False, True])

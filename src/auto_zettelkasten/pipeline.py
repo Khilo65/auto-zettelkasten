@@ -16656,7 +16656,11 @@ def _source_line_is_page_date_metadata(
 ) -> bool:
     if _page_date_metadata_line(source_lines[index]):
         return True
-    for start in range(index - 1, -1, -1):
+    for start in range(
+        index - 1,
+        max(-1, index - _QUANTITATIVE_DATE_LOCALITY_LINES - 1),
+        -1,
+    ):
         label = _PAGE_DATE_METADATA_LABEL_RE.match(source_lines[start])
         if label:
             return _page_date_metadata_line(
@@ -18391,6 +18395,13 @@ def _validate_quantitative_provenance(
         "codex_pdf_page_images",
         "codex_pdf_input_file",
     }:
+        return
+    if not any(
+        isinstance(anchor, Mapping)
+        and isinstance(anchor.get("quantitative_result"), Mapping)
+        and anchor.get("quantitative_result")
+        for anchor in payload.get("evidence_anchors", []) or []
+    ):
         return
     text = str(row.get("text") or "")
     if not text:
