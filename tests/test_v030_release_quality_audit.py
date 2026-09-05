@@ -514,11 +514,14 @@ def test_strategic8_packet_requires_two_independent_full_reviewers(
         "syntheses": 1,
         "total": 24,
     }
-    assert packet["judgment_policy_revision"] == "probabilistic-reasonable-v2"
+    assert packet["judgment_policy_revision"] == "probabilistic-reasonable-v3"
     assert "another optional relationship or cluster boundary is also defensible" in packet[
         "judgment_policy"
     ]["negative_or_unclustered"]
     assert "frozen Zotero parent" in packet["judgment_policy"]["canonical_metadata"]
+    assert "same-article display-headline variant" in packet["judgment_policy"][
+        "canonical_metadata"
+    ]
     assert all(
         source["source_artifact"]["sha256"]
         for source in packet["source_context"]

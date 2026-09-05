@@ -35,7 +35,7 @@ from auto_zettelkasten.notes import (
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _SEED = "v030-autonomous-provisional-release-audit-v1"
 _STRATIFIED_POLICY_REVISION = "mandatory-first-v2"
-_JUDGMENT_POLICY_REVISION = "probabilistic-reasonable-v2"
+_JUDGMENT_POLICY_REVISION = "probabilistic-reasonable-v3"
 _JUDGMENT_POLICY = {
     "accepted_output": (
         "Fail materially false, unsupported, or severely overmerged accepted output."
@@ -47,9 +47,12 @@ _JUDGMENT_POLICY = {
         "relationship or clustering failure."
     ),
     "canonical_metadata": (
-        "Judge note identity against the frozen Zotero parent. A source-visible "
-        "difference is acceptable only when the hash-bound metadata diagnostic "
-        "records it; fail an uncaptured material attachment or parent conflict."
+        "Judge note identity against the frozen Zotero parent and custody binding. "
+        "A same-article display-headline variant remains identity-consistent when "
+        "the canonical URL and document metadata match; it need not be a separate "
+        "metadata issue. Other source-visible bibliographic conflicts are acceptable "
+        "only when the hash-bound metadata diagnostic records them. Fail an "
+        "uncaptured material attachment or parent conflict."
     ),
 }
 _MODES = {"strategic8": 8, "exhaustive40": 40, "stratified500": 500}
