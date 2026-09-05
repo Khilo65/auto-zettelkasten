@@ -6,6 +6,7 @@ import threading
 
 import pytest
 
+import auto_zettelkasten.pipeline as pipeline_module
 from auto_zettelkasten.models import (
     EvidenceProfile,
     MapRequest,
@@ -5592,6 +5593,70 @@ def test_quantitative_provenance_isolates_bad_rows_in_rich_bundle() -> None:
         valid["claim"]
     ]
     assert replayed.component_diagnostics == bundle.component_diagnostics
+
+
+def test_quantitative_provenance_reuses_long_source_index_during_salvage(
+    monkeypatch,
+) -> None:
+    payload = _bundle_payload()
+    template = deepcopy(payload["evidence_anchors"][0])
+    template.pop("revision_hash", None)
+    valid_claims = [f"The source reports {100 + index} cases." for index in range(14)]
+    payload["evidence_anchors"] = [
+        {
+            **deepcopy(template),
+            "evidence_anchor_id": f"anchor-{index}",
+            "claim": claim,
+            "quantitative_result": {
+                "estimate": f"{100 + index} cases",
+                "provenance": "source_reported",
+            },
+        }
+        for index, claim in enumerate(valid_claims)
+    ] + [
+        {
+            **deepcopy(template),
+            "evidence_anchor_id": "anchor-invalid",
+            "claim": "The source reports 9,999 cases.",
+            "quantitative_result": {
+                "estimate": "9,999 cases",
+                "provenance": "source_reported",
+            },
+        }
+    ]
+    source_lines = ["Background without quantities."] * 1_000 + valid_claims
+    original = pipeline_module._source_line_quantity_tokens
+    calls = 0
+
+    def counted(lines, index):
+        nonlocal calls
+        calls += 1
+        return original(lines, index)
+
+    monkeypatch.setattr(pipeline_module, "_source_line_quantity_tokens", counted)
+
+    bundle = _source_bundle_from_result(
+        payload,
+        {
+            "source_id": "source-zotero-A1",
+            "zotero_item_key": "A1",
+            "text": "\n".join(source_lines),
+        },
+        "full_document",
+    )
+
+    assert sorted(anchor.claim for anchor in bundle.evidence_anchors) == sorted(
+        valid_claims
+    )
+    assert [
+        diagnostic["reason"]
+        for diagnostic in bundle.component_diagnostics
+        if diagnostic.get("severity") == "rejected"
+    ] == [
+        "SourceBundleQuantitativeProvenanceError:"
+        "reported_estimate_not_found_in_source"
+    ]
+    assert calls <= len(source_lines) + 1
 
 
 def test_quantitative_provenance_does_not_salvage_uncertain_footnote_prose() -> None:

@@ -10,6 +10,7 @@ import threading
 import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from decimal import Decimal
 from itertools import combinations
@@ -16097,19 +16098,36 @@ def _source_bundle_from_result(
             for value in recommendations
         ]
     if validate_quantitative_provenance:
+        quantitative_source_index = (
+            _quantitative_source_index(str(row.get("text") or ""))
+            if not opaque_pdf_route
+            and any(
+                isinstance(anchor, Mapping)
+                and isinstance(anchor.get("quantitative_result"), Mapping)
+                and anchor.get("quantitative_result")
+                for anchor in payload.get("evidence_anchors", []) or []
+            )
+            else None
+        )
         try:
-            _validate_quantitative_provenance(payload, row)
+            _validate_quantitative_provenance(
+                payload,
+                row,
+                source_index=quantitative_source_index,
+            )
         except SourceBundleQuantitativeProvenanceError:
             anchors = payload.get("evidence_anchors", [])
             if not isinstance(anchors, list) or len(anchors) < 2:
                 raise
             accepted: list[Any] = []
             rejected: list[dict[str, Any]] = []
-            # ponytail: at most 24 anchors; share scans only if recovery becomes hot.
+            # Reuse the document index so bounded per-anchor salvage stays linear.
             for index, anchor in enumerate(anchors):
                 try:
                     _validate_quantitative_provenance(
-                        {"evidence_anchors": [anchor]}, row
+                        {"evidence_anchors": [anchor]},
+                        row,
+                        source_index=quantitative_source_index,
                     )
                 except SourceBundleQuantitativeProvenanceError as exc:
                     if str(exc) == "footnote_scope_combines_marked_and_unmarked_quantities":
@@ -16141,7 +16159,11 @@ def _source_bundle_from_result(
                 ),
                 *rejected,
             ]
-            _validate_quantitative_provenance(payload, row)
+            _validate_quantitative_provenance(
+                payload,
+                row,
+                source_index=quantitative_source_index,
+            )
     return SourceAnalysisBundle.from_dict(payload)
 
 
@@ -16990,6 +17012,181 @@ def _year_column_table_lines(
     return {}
 
 
+@dataclass(frozen=True)
+class _QuantitativeSourceIndex:
+    text: str
+    lines: tuple[str, ...]
+    metadata_lines: frozenset[int]
+    source_dates: tuple[tuple[int, tuple[int, int, int | None], bool], ...]
+    quantity_tokens_by_line: tuple[frozenset[str], ...]
+    years_by_line: tuple[frozenset[str], ...]
+    period_markers_by_line: tuple[frozenset[str], ...]
+    source_groups: tuple[
+        tuple[
+            tuple[int, ...],
+            str,
+            frozenset[str],
+            frozenset[tuple[int, int, int | None]],
+        ],
+        ...,
+    ]
+    group_ids_by_token: Mapping[str, frozenset[int]]
+    group_ids_by_date: Mapping[tuple[int, int, int | None], frozenset[int]]
+    source_year_lines: Mapping[str, frozenset[int]]
+    source_period_lines: Mapping[str, frozenset[int]]
+    year_column_table: Mapping[str, Mapping[str, Mapping[str, set[int]]]]
+    year_column_lines: frozenset[int]
+    all_source_inputs: frozenset[str]
+    footnote_groups: tuple[tuple[set[str], set[str], str], ...]
+
+
+def _quantitative_source_index(source_text: str) -> _QuantitativeSourceIndex:
+    text = re.sub(
+        r'</?(?:table|caption|thead|tbody|tfoot|tr|th|td)'
+        r'(?: (?:rowspan|colspan)="[0-9]{1,5}")*>',
+        "",
+        source_text,
+    )
+    lines = tuple(text.splitlines())
+    metadata_lines = frozenset(
+        index
+        for index in range(len(lines))
+        if _source_line_is_page_date_metadata(lines, index)
+    )
+    quantity_tokens_by_line = tuple(
+        frozenset(_source_line_quantity_tokens(lines, index))
+        for index in range(len(lines))
+    )
+    calendar_dates_by_line = tuple(
+        tuple(_calendar_dates(line)) for line in lines
+    )
+    years_by_line = tuple(
+        frozenset() if index in metadata_lines else frozenset(_source_year_values(line))
+        for index, line in enumerate(lines)
+    )
+    period_markers_by_line = tuple(
+        frozenset()
+        if index in metadata_lines
+        else frozenset(_named_period_markers(line))
+        for index, line in enumerate(lines)
+    )
+    source_groups: list[
+        tuple[
+            tuple[int, ...],
+            str,
+            frozenset[str],
+            frozenset[tuple[int, int, int | None]],
+        ]
+    ] = []
+    group_ids_by_token: dict[str, set[int]] = defaultdict(set)
+    group_ids_by_date: dict[tuple[int, int, int | None], set[int]] = defaultdict(set)
+    for index in range(len(lines)):
+        groups = [(index,)]
+        if (
+            index
+            and lines[index - 1].strip()
+            and not lines[index - 1].rstrip().endswith((".", "?", "!"))
+        ):
+            groups.append((index - 1, index))
+        for group in groups:
+            tokens = frozenset(
+                token for line in group for token in quantity_tokens_by_line[line]
+            )
+            dates = frozenset(
+                date
+                for line in group
+                if line not in metadata_lines
+                for date in calendar_dates_by_line[line]
+            )
+            group_id = len(source_groups)
+            source_groups.append((group, "\n".join(lines[line] for line in group), tokens, dates))
+            for token in tokens:
+                group_ids_by_token[token].add(group_id)
+            for date in dates:
+                group_ids_by_date[date].add(group_id)
+    year_column_table = _year_column_table_lines(lines)
+    return _QuantitativeSourceIndex(
+        text=text,
+        lines=lines,
+        metadata_lines=metadata_lines,
+        source_dates=tuple(
+            (index, date, index in metadata_lines)
+            for index, dates in enumerate(calendar_dates_by_line)
+            for date in dates
+        ),
+        quantity_tokens_by_line=quantity_tokens_by_line,
+        years_by_line=years_by_line,
+        period_markers_by_line=period_markers_by_line,
+        source_groups=tuple(source_groups),
+        group_ids_by_token={
+            token: frozenset(group_ids)
+            for token, group_ids in group_ids_by_token.items()
+        },
+        group_ids_by_date={
+            date: frozenset(group_ids)
+            for date, group_ids in group_ids_by_date.items()
+        },
+        source_year_lines={
+            year: frozenset(
+                index
+                for index, years in enumerate(years_by_line)
+                if year in years
+            )
+            for year in {year for years in years_by_line for year in years}
+        },
+        source_period_lines={
+            marker: frozenset(
+                index
+                for index, markers in enumerate(period_markers_by_line)
+                if marker in markers
+            )
+            for marker in {
+                marker for markers in period_markers_by_line for marker in markers
+            }
+        },
+        year_column_table=year_column_table,
+        year_column_lines=frozenset(
+            line
+            for rows in year_column_table.values()
+            for roles in rows.values()
+            for lines_for_role in roles.values()
+            for line in lines_for_role
+        ),
+        all_source_inputs=frozenset(
+            token for tokens in quantity_tokens_by_line for token in tokens
+        ),
+        footnote_groups=tuple(_footnote_quantity_groups(text)),
+    )
+
+
+def _matching_quantitative_source_groups(
+    source_index: _QuantitativeSourceIndex,
+    expected_tokens: set[str],
+    expected_dates: set[tuple[int, int, int | None]],
+) -> tuple[
+    tuple[
+        tuple[int, ...],
+        str,
+        frozenset[str],
+        frozenset[tuple[int, int, int | None]],
+    ],
+    ...,
+]:
+    constraints = [
+        source_index.group_ids_by_token.get(token, frozenset())
+        for token in expected_tokens
+    ] + [
+        source_index.group_ids_by_date.get(date, frozenset())
+        for date in expected_dates
+    ]
+    if not constraints:
+        return source_index.source_groups
+    matching = set(constraints[0])
+    for group_ids in constraints[1:]:
+        matching.intersection_update(group_ids)
+    return tuple(source_index.source_groups[group_id] for group_id in sorted(matching))
+
+
 def _year_column_period_years(
     period: str,
     table: Mapping[str, Mapping[str, Mapping[str, set[int]]]],
@@ -17012,6 +17209,7 @@ def _year_column_value_supported(
     source_lines: Sequence[str],
     *,
     bare_year_quantity: bool = False,
+    source_index: _QuantitativeSourceIndex | None = None,
 ) -> tuple[bool, set[str]]:
     if not table:
         return False, set()
@@ -17022,7 +17220,11 @@ def _year_column_value_supported(
                 role: {
                     token
                     for line in lines
-                    for token in _source_line_quantity_tokens(source_lines, line)
+                    for token in (
+                        source_index.quantity_tokens_by_line[line]
+                        if source_index is not None
+                        else _source_line_quantity_tokens(source_lines, line)
+                    )
                 }
                 for role, lines in roles.items()
             }
@@ -17065,7 +17267,11 @@ def _year_column_value_supported(
         for year in quantity_years:
             unit = _derived_output_unit(value, year)
             if not unit or not any(
-                not _source_line_is_page_date_metadata(source_lines, index)
+                (
+                    index not in source_index.metadata_lines
+                    if source_index is not None
+                    else not _source_line_is_page_date_metadata(source_lines, index)
+                )
                 and any(
                     match.group(1) == year
                     and _unit_key(_following_unit(line, match.end()))
@@ -17109,12 +17315,18 @@ def _year_column_value_supported(
         period_dates = set(_calendar_dates(period))
         period_years = _period_years(period)
         period_markers = _named_period_markers(period)
-        source_dates = _source_dates("\n".join(source_lines))
+        source_dates = (
+            source_index.source_dates
+            if source_index is not None
+            else tuple(_source_dates("\n".join(source_lines)))
+        )
         metadata_lines = {
             line for line, _date, metadata in source_dates if metadata
         }
         source_year_lines = {
-            year: [
+            year: list(source_index.source_year_lines.get(year, ()))
+            if source_index is not None
+            else [
                 index
                 for index, line in enumerate(source_lines)
                 if year in _source_year_values(line)
@@ -17123,7 +17335,9 @@ def _year_column_value_supported(
             for year in period_years
         }
         source_period_lines = {
-            marker: [
+            marker: list(source_index.source_period_lines.get(marker, ()))
+            if source_index is not None
+            else [
                 index
                 for index, line in enumerate(source_lines)
                 if marker in _named_period_markers(line)
@@ -17132,8 +17346,10 @@ def _year_column_value_supported(
             for marker in period_markers
         }
         for index, line in enumerate(source_lines):
-            if index in table_lines or _source_line_is_page_date_metadata(
-                source_lines, index
+            if index in table_lines or (
+                index in source_index.metadata_lines
+                if source_index is not None
+                else _source_line_is_page_date_metadata(source_lines, index)
             ):
                 continue
             if (
@@ -17159,6 +17375,7 @@ def _year_column_value_supported(
                         source_year_lines[year],
                         source_lines,
                         metadata_lines,
+                        year_column_table=table,
                     )
                     for year in period_years
                 )
@@ -17332,12 +17549,22 @@ def _year_column_value_supported(
 
 
 def _same_year_column_table(
-    source_lines: Sequence[str], year_line: int, value_line: int
+    source_lines: Sequence[str],
+    year_line: int,
+    value_line: int,
+    *,
+    year_column_table: Mapping[str, Mapping[str, Mapping[str, set[int]]]] | None = None,
 ) -> bool:
     year = source_lines[year_line].strip()
     return any(
         value_line in lines
-        for roles in _year_column_table_lines(source_lines).get(year, {}).values()
+        for roles in (
+            year_column_table
+            if year_column_table is not None
+            else _year_column_table_lines(source_lines)
+        )
+        .get(year, {})
+        .values()
         for lines in roles.values()
     )
 
@@ -17347,6 +17574,8 @@ def _line_has_local_year(
     matching_lines: Sequence[int],
     source_lines: Sequence[str],
     metadata_lines: set[int],
+    *,
+    year_column_table: Mapping[str, Mapping[str, Mapping[str, set[int]]]] | None = None,
 ) -> bool:
     return any(
         not any(
@@ -17355,7 +17584,12 @@ def _line_has_local_year(
         )
         and (
             abs(year_line - line) <= _QUANTITATIVE_DATE_LOCALITY_LINES
-            or _same_year_column_table(source_lines, year_line, line)
+            or _same_year_column_table(
+                source_lines,
+                year_line,
+                line,
+                year_column_table=year_column_table,
+            )
         )
         for year_line in matching_lines
     )
@@ -17395,7 +17629,7 @@ def _line_date_is_lower_bound(
 def _source_value_is_locally_supported(
     value: str,
     anchor_lines: set[int],
-    source_lines: Sequence[str],
+    source_index: _QuantitativeSourceIndex,
     primary_tokens: set[str],
     *,
     excluded_lines: set[int] | None = None,
@@ -17404,116 +17638,86 @@ def _source_value_is_locally_supported(
     expected_dates = set(_calendar_dates(value))
     if not expected_tokens and not expected_dates:
         return True
-    metadata_lines = {
-        index
-        for index in range(len(source_lines))
-        if _source_line_is_page_date_metadata(source_lines, index)
-    }
+    source_lines = source_index.lines
+    metadata_lines = source_index.metadata_lines
     expected_units = _quantity_token_units(value)
     supported_anchors: set[int] = set()
     joint_support = False
-    for index in range(len(source_lines)):
-        groups = [(index,)]
+    for group, group_text, tokens, dates in _matching_quantitative_source_groups(
+        source_index,
+        expected_tokens,
+        expected_dates,
+    ):
+        if excluded_lines and excluded_lines.intersection(group):
+            continue
         if (
-            index
-            and source_lines[index - 1].strip()
-            and not source_lines[index - 1].rstrip().endswith((".", "?", "!"))
+            expected_tokens.issubset(tokens)
+            and expected_dates.issubset(dates)
+            and all(
+                not units
+                or units.intersection(
+                    _quantity_token_units(group_text).get(token, set())
+                )
+                for token, units in expected_units.items()
+            )
+            and bool(anchor_lines)
         ):
-            groups.append((index - 1, index))
-        for group in groups:
-            if excluded_lines and excluded_lines.intersection(group):
-                continue
-            group_text = "\n".join(source_lines[line] for line in group)
-            tokens = {
-                token
-                for line in group
-                for token in _source_line_quantity_tokens(source_lines, line)
-            }
-            dates = {
-                date
-                for line in group
-                if not _source_line_is_page_date_metadata(source_lines, line)
-                for date in _calendar_dates(source_lines[line])
-            }
-            if (
-                expected_tokens.issubset(tokens)
-                and expected_dates.issubset(dates)
+            segments: list[str] = []
+            for segment in _quantitative_segments(group_text):
+                start = 0
+                for conjunction in re.finditer(r"\band\b", segment, re.IGNORECASE):
+                    if (
+                        _claimed_quantity_tokens(segment[conjunction.end() :])
+                        - expected_tokens
+                        - primary_tokens
+                    ):
+                        segments.append(segment[start : conjunction.start()])
+                        start = conjunction.end()
+                segments.append(segment[start:])
+            matching_segments = [
+                segment
+                for segment in segments
+                if expected_tokens.issubset(_claimed_quantity_tokens(segment))
+                and expected_dates.issubset(set(_calendar_dates(segment)))
                 and all(
                     not units
                     or units.intersection(
-                        _quantity_token_units(group_text).get(token, set())
+                        _quantity_token_units(segment).get(token, set())
                     )
                     for token, units in expected_units.items()
                 )
-                and bool(anchor_lines)
-            ):
-                segments: list[str] = []
-                for segment in _quantitative_segments(group_text):
-                    start = 0
-                    for conjunction in re.finditer(
-                        r"\band\b", segment, re.IGNORECASE
-                    ):
-                        if (
-                            _claimed_quantity_tokens(
-                                segment[conjunction.end() :]
-                            )
-                            - expected_tokens
-                            - primary_tokens
-                        ):
-                            segments.append(segment[start : conjunction.start()])
-                            start = conjunction.end()
-                    segments.append(segment[start:])
-                matching_segments = [
-                    segment
-                    for segment in segments
-                    if expected_tokens.issubset(
-                        _claimed_quantity_tokens(segment)
-                    )
-                    and expected_dates.issubset(set(_calendar_dates(segment)))
-                    and all(
-                        not units
-                        or units.intersection(
-                            _quantity_token_units(segment).get(token, set())
-                        )
-                        for token, units in expected_units.items()
-                    )
-                ]
-                if len(segments) > 1 and not any(
-                    primary_tokens.intersection(
-                        _claimed_quantity_tokens(segment)
-                    )
-                    or not (
-                        _claimed_quantity_tokens(segment)
-                        - expected_tokens
-                        - primary_tokens
-                    )
-                    for segment in matching_segments
-                ):
-                    continue
-                local_anchors = {
-                    anchor_line
-                    for anchor_line in anchor_lines
-                    if any(
-                        abs(anchor_line - line)
-                        <= _QUANTITATIVE_DATE_LOCALITY_LINES
-                        and not any(
-                            min(anchor_line, line) < boundary < max(anchor_line, line)
-                            for boundary in metadata_lines
-                        )
-                        for line in group
-                    )
-                }
-                supported_anchors.update(local_anchors)
-                joint_support = joint_support or bool(
-                    primary_tokens
-                    and local_anchors
-                    and any(
-                        primary_tokens.issubset(
-                            _claimed_quantity_tokens(segment)
-                        )
-                        for segment in matching_segments
-                    )
+            ]
+            if len(segments) > 1 and not any(
+                primary_tokens.intersection(_claimed_quantity_tokens(segment))
+                or not (
+                    _claimed_quantity_tokens(segment)
+                    - expected_tokens
+                    - primary_tokens
                 )
+                for segment in matching_segments
+            ):
+                continue
+            local_anchors = {
+                anchor_line
+                for anchor_line in anchor_lines
+                if any(
+                    abs(anchor_line - line) <= _QUANTITATIVE_DATE_LOCALITY_LINES
+                    and not any(
+                        min(anchor_line, line) < boundary < max(anchor_line, line)
+                        for boundary in metadata_lines
+                    )
+                    for line in group
+                )
+            }
+            supported_anchors.update(local_anchors)
+            joint_support = joint_support or bool(
+                primary_tokens
+                and local_anchors
+                and any(
+                    primary_tokens.issubset(_claimed_quantity_tokens(segment))
+                    for segment in matching_segments
+                )
+            )
     if not supported_anchors:
         return False
     if joint_support:
@@ -17528,7 +17732,7 @@ def _source_value_is_locally_supported(
                     anchor_line + _QUANTITATIVE_DATE_LOCALITY_LINES + 1,
                 ),
             )
-            for token in _source_line_quantity_tokens(source_lines, index)
+            for token in source_index.quantity_tokens_by_line[index]
         }
         if nearby_tokens - primary_tokens:
             return False
@@ -18441,7 +18645,10 @@ def _system_derived_estimate_supported(
 
 
 def _validate_quantitative_provenance(
-    payload: Mapping[str, Any], row: Mapping[str, Any]
+    payload: Mapping[str, Any],
+    row: Mapping[str, Any],
+    *,
+    source_index: _QuantitativeSourceIndex | None = None,
 ) -> None:
     if str(row.get("content_route") or "") in {
         "codex_pdf_page_images",
@@ -18455,8 +18662,8 @@ def _validate_quantitative_provenance(
         for anchor in payload.get("evidence_anchors", []) or []
     ):
         return
-    text = str(row.get("text") or "")
-    if not text:
+    source_text = str(row.get("text") or "")
+    if not source_text:
         for anchor in payload.get("evidence_anchors", []) or []:
             result = (
                 anchor.get("quantitative_result")
@@ -18470,38 +18677,17 @@ def _validate_quantitative_provenance(
                     else "reported_estimate_not_found_in_source"
                 )
         return
-    # Validate visible quantities, not the structural markup retained for the model.
-    # Preserve line positions for existing year-column and locality checks.
-    text = re.sub(
-        r'</?(?:table|caption|thead|tbody|tfoot|tr|th|td)'
-        r'(?: (?:rowspan|colspan)="[0-9]{1,5}")*>', '', text,
-    )
-    footnote_groups = _footnote_quantity_groups(text)
-    source_lines = text.splitlines()
-    source_dates = _source_dates(text)
-    all_source_inputs = {
-        token
-        for index in range(len(source_lines))
-        for token in _source_line_quantity_tokens(source_lines, index)
-    }
-    source_year_lines: dict[str, set[int]] = defaultdict(set)
-    source_period_lines: dict[str, set[int]] = defaultdict(set)
-    for index, line in enumerate(source_lines):
-        if _source_line_is_page_date_metadata(source_lines, index):
-            continue
-        for year in _source_year_values(line):
-            source_year_lines[year].add(index)
-        for marker in _named_period_markers(line):
-            source_period_lines[marker].add(index)
+    source_data = source_index or _quantitative_source_index(source_text)
+    text = source_data.text
+    footnote_groups = source_data.footnote_groups
+    source_lines = source_data.lines
+    source_dates = source_data.source_dates
+    all_source_inputs = source_data.all_source_inputs
+    source_year_lines = source_data.source_year_lines
+    source_period_lines = source_data.source_period_lines
     source_years = set(source_year_lines)
-    year_column_table = _year_column_table_lines(source_lines)
-    year_column_lines = {
-        line
-        for rows in year_column_table.values()
-        for roles in rows.values()
-        for lines in roles.values()
-        for line in lines
-    }
+    year_column_table = source_data.year_column_table
+    year_column_lines = source_data.year_column_lines
     metadata_date_lines = {
         line for line, _date, metadata in source_dates if metadata
     }
@@ -18611,7 +18797,11 @@ def _validate_quantitative_provenance(
         candidates = _claimed_quantity_token_list(estimate)
         provenance = str(result.get("provenance") or "")
         estimate_table_handled, estimate_table_rows = _year_column_value_supported(
-            estimate, period, year_column_table, source_lines
+            estimate,
+            period,
+            year_column_table,
+            source_lines,
+            source_index=source_data,
         )
         if estimate_table_handled and not estimate_table_rows:
             raise SourceBundleQuantitativeProvenanceError(
@@ -18629,34 +18819,17 @@ def _validate_quantitative_provenance(
             )
         anchor_lines: set[int] = set()
         if provenance != "system_derived":
-            source_groups: list[tuple[tuple[int, ...], set[str]]] = []
-            for index in range(len(source_lines)):
-                groups = [(index,)]
-                if (
-                    index
-                    and source_lines[index - 1].strip()
-                    and not source_lines[index - 1].rstrip().endswith(
-                        (".", "?", "!")
-                    )
-                ):
-                    groups.append((index - 1, index))
-                source_groups.extend(
-                    (
-                        group,
-                        {
-                            token
-                            for line in group
-                            for token in _source_line_quantity_tokens(
-                                source_lines, line
-                            )
-                        },
-                    )
-                    for group in groups
-                )
             full_groups = [
                 group
-                for group, tokens in source_groups
-                if estimate_tokens and estimate_tokens.issubset(tokens)
+                for group, _text, _tokens, _dates in (
+                    _matching_quantitative_source_groups(
+                        source_data,
+                        estimate_tokens,
+                        set(),
+                    )
+                    if estimate_tokens
+                    else ()
+                )
             ]
             if full_groups:
                 anchor_lines = {
@@ -18664,7 +18837,7 @@ def _validate_quantitative_provenance(
                     for group in full_groups
                     for line in group
                     if estimate_tokens.intersection(
-                        _source_line_quantity_tokens(source_lines, line)
+                        source_data.quantity_tokens_by_line[line]
                     )
                 }
             claim_token_groups = [
@@ -18676,11 +18849,16 @@ def _validate_quantitative_provenance(
                 for expected_tokens in claim_token_groups:
                     group_lines = {
                         line
-                        for group, tokens in source_groups
-                        if expected_tokens.issubset(tokens)
+                        for group, _text, _tokens, _dates in (
+                            _matching_quantitative_source_groups(
+                                source_data,
+                                expected_tokens,
+                                set(),
+                            )
+                        )
                         for line in group
                         if expected_tokens.intersection(
-                            _source_line_quantity_tokens(source_lines, line)
+                            source_data.quantity_tokens_by_line[line]
                         )
                     }
                     if not group_lines:
@@ -18738,6 +18916,7 @@ def _validate_quantitative_provenance(
                         sorted(source_year_lines[year]),
                         source_lines,
                         metadata_date_lines,
+                        year_column_table=year_column_table,
                     )
                     for year in local_period_years
                 )
@@ -18752,6 +18931,7 @@ def _validate_quantitative_provenance(
                         sorted(source_year_lines[year]),
                         source_lines,
                         metadata_date_lines,
+                        year_column_table=year_column_table,
                     )
                     for year in period_years
                 )
@@ -18812,6 +18992,7 @@ def _validate_quantitative_provenance(
                 year_column_table,
                 source_lines,
                 bare_year_quantity=field in {"denominator", "population", "sample"},
+                source_index=source_data,
             )
             if (
                 not table_handled
@@ -18850,7 +19031,7 @@ def _validate_quantitative_provenance(
             if not _source_value_is_locally_supported(
                 auxiliary_value,
                 anchor_lines,
-                source_lines,
+                source_data,
                 estimate_tokens,
                 excluded_lines=(
                     year_column_lines
@@ -18884,6 +19065,7 @@ def _validate_quantitative_provenance(
                                 sorted(source_year_lines[year]),
                                 source_lines,
                                 metadata_date_lines,
+                                year_column_table=year_column_table,
                             )
                             for year in period_years
                         )
@@ -18907,7 +19089,7 @@ def _validate_quantitative_provenance(
                 local_inputs = {
                     token
                     for index in supported_lines
-                    for token in _source_line_quantity_tokens(source_lines, index)
+                    for token in source_data.quantity_tokens_by_line[index]
                 }
             if provenance == "system_derived":
                 invalid = not _system_derived_estimate_supported(
@@ -18942,6 +19124,7 @@ def _validate_quantitative_provenance(
                     sorted(source_year_lines[year]),
                     source_lines,
                     metadata_date_lines,
+                    year_column_table=year_column_table,
                 )
                 for year in local_period_years
             )
@@ -18963,7 +19146,7 @@ def _validate_quantitative_provenance(
                 index
                 for index in supported_lines
                 if set(candidates).intersection(
-                    _source_line_quantity_tokens(source_lines, index)
+                    source_data.quantity_tokens_by_line[index]
                 )
             }
             supporting_date_lines = {
@@ -18990,7 +19173,7 @@ def _validate_quantitative_provenance(
         local_inputs = {
             token
             for index in supported_lines
-            for token in _source_line_quantity_tokens(source_lines, index)
+            for token in source_data.quantity_tokens_by_line[index]
         }
         if str(result.get("provenance") or "") == "system_derived":
             local_text = "\n".join(
