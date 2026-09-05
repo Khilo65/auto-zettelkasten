@@ -10649,7 +10649,11 @@ def _run_relationship_reasoning(
     job_packets = _pack_relationship_rows(
         unresolved,
         pair_for=lambda job: (job.left_source_id, job.right_source_id),
-        profile_by_source=profile_by_source,
+        profile_by_source=(
+            {}
+            if decision_contract == RELATIONSHIP_DECISION_CONTRACT
+            else profile_by_source
+        ),
         context_for=lambda packet: _relationship_transport_context(
             packet, decision_contract=decision_contract
         ),

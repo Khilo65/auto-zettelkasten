@@ -3479,6 +3479,71 @@ def test_pair_jobs_are_bounded_into_eight_row_transport_batches(
     } == {"completed"}
 
 
+@pytest.mark.parametrize(
+    ("reasoner_class", "expected_batches"),
+    [
+        (_V8Reasoner, [(8, 0)]),
+        (_V6Reasoner, [(5, 6), (3, 4)]),
+    ],
+)
+def test_relationship_packet_sizing_matches_provider_visible_payload(
+    tmp_path: Path,
+    reasoner_class: type[_Reasoner],
+    expected_batches: list[tuple[int, int]],
+) -> None:
+    profiles = [_profile("A"), *[_profile(f"S{index}") for index in range(8)]]
+    for profile in profiles:
+        profile.evidence_anchors = [
+            EvidenceAnchor(
+                evidence_anchor_id=f"anchor-{profile.source_id}",
+                source_id=profile.source_id,
+                claim="x" * 30_000,
+                locator="p. 1",
+                support_envelope={
+                    "support_status": "supported",
+                    "coverage": "full_text",
+                },
+            )
+        ]
+    reasoner = reasoner_class()
+    reasoner.context_window_tokens = 272_000
+    reasoner.prompt_reserve_tokens = 2_048
+    observed_batches: list[tuple[int, int]] = []
+
+    def handler(
+        stage: str,
+        provider_profiles: Sequence[Any],
+        context: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if stage == "relationship_candidate_selection":
+            return {
+                "candidates": [
+                    _candidate("A", f"S{index}", rank=index + 1)
+                    for index in range(8)
+                ]
+            }
+        jobs = context["pair_jobs"]
+        observed_batches.append((len(jobs), len(provider_profiles)))
+        return {"decisions": [_decision(job) for job in jobs]}
+
+    result = _run(
+        tmp_path,
+        profiles,
+        _Calls(handler),
+        reasoner=reasoner,
+        request=LiteratureMapRequest(
+            workspace=tmp_path,
+            provider="test-provider",
+            model="test-model",
+            provider_concurrency=1,
+        ),
+    )
+
+    assert observed_batches == expected_batches
+    assert result["provider_batch_count"] == len(expected_batches)
+    assert result["accounted_pair_job_count"] == 8
+
+
 def test_malformed_decision_parks_only_its_pair(
     tmp_path: Path,
 ) -> None:
