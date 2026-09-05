@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from enum import Enum
 from html.parser import HTMLParser
 from pathlib import Path
@@ -1035,7 +1036,7 @@ def probe_pdf_bytes(
         resource_evidence.append(_pdf_page_resource_evidence(page))
         projected_dimensions.append(_pdf_page_projected_dimensions(page))
         try:
-            embedded_pages.append(_clean_text(page.extract_text() or ""))
+            embedded_pages.append(_pdf_embedded_text(page))
             page_errors.append("")
         except ExtractionCancelled:
             raise
@@ -2007,6 +2008,45 @@ def _nonnegative_int(value: Any) -> int | None:
 def _matched_markers(text: str, markers: tuple[str, ...]) -> tuple[str, ...]:
     found = [marker for marker in markers if marker in text]
     return tuple(marker for marker in found if not any(marker != other and marker in other for other in found))
+
+
+def _pdf_embedded_text(page: Any) -> str:
+    """Restore geometry-backed spaces without replacing plain text or its order."""
+    plain = _clean_text(page.extract_text() or "")
+    # ponytail: cap quadratic alignment at 20K characters per page; dense pages
+    # retain plain extraction until a bounded alignment implementation is needed.
+    if not plain or len(plain) > 20_000:
+        return plain
+    try:
+        layout = _clean_text(page.extract_text(extraction_mode="layout") or "")
+    except ExtractionCancelled:
+        raise
+    except Exception:
+        return plain
+    if not layout or len(layout) > 20_000 or layout == plain:
+        return plain
+    plain_offsets = [i for i, char in enumerate(plain) if not char.isspace()]
+    layout_offsets = [i for i, char in enumerate(layout) if not char.isspace()]
+    plain_chars = "".join(plain[i] for i in plain_offsets)
+    layout_chars = "".join(layout[i] for i in layout_offsets)
+    insertions: set[int] = set()
+    blocks = (
+        [(0, 0, len(plain_chars))]
+        if plain_chars == layout_chars
+        else SequenceMatcher(None, plain_chars, layout_chars, autojunk=False).get_matching_blocks()
+    )
+    for plain_start, layout_start, size in blocks:
+        shared = plain_chars[plain_start:plain_start + size]
+        if size < 32 or plain_chars.count(shared) != 1 or layout_chars.count(shared) != 1:
+            continue
+        for offset in range(1, size):
+            left, right = plain_start + offset, layout_start + offset
+            if (
+                layout_offsets[right] > layout_offsets[right - 1] + 1
+                and plain_offsets[left] == plain_offsets[left - 1] + 1
+            ):
+                insertions.add(plain_offsets[left])
+    return "".join((" " if i in insertions else "") + char for i, char in enumerate(plain))
 
 
 def _clean_text(value: str) -> str:

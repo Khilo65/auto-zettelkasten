@@ -15,6 +15,93 @@ import pytest
 import auto_zettelkasten.extraction as extraction
 
 
+@pytest.mark.parametrize(
+    ("plain", "layout", "expected"),
+    [
+        (
+            "Footer\nThese are publicrating questionswhich describe the observed outcome today.",
+            "These are public rating questions which describe the observed outcome today.\nFooter",
+            "Footer\nThese are public rating questions which describe the observed outcome today.",
+        ),
+        (
+            "The phrase says nowhere within this source text today.",
+            "The phrase says nowhere within this source text today.",
+            "The phrase says nowhere within this source text today.",
+        ),
+        (
+            "An unrelated original statement with different evidence.",
+            "A replacement sentence that must never enter source text.",
+            "An unrelated original statement with different evidence.",
+        ),
+    ],
+)
+def test_pdf_spacing_uses_geometry_without_changing_text_order(
+    plain: str, layout: str, expected: str,
+) -> None:
+    class Page:
+        def extract_text(self, *, extraction_mode="plain"):
+            return layout if extraction_mode == "layout" else plain
+
+    assert extraction._pdf_embedded_text(Page()) == expected
+
+
+def test_pdf_spacing_avoids_quadratic_alignment_for_matching_characters(monkeypatch) -> None:
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("identical characters need no sequence alignment")
+
+    monkeypatch.setattr(extraction, "SequenceMatcher", unexpected)
+
+    class Page:
+        def extract_text(self, *, extraction_mode="plain"):
+            return "a " * 10_000 if extraction_mode == "layout" else "a" * 10_000
+
+    assert extraction._pdf_embedded_text(Page()) == ("a " * 10_000).strip()
+
+
+def test_pdf_spacing_keeps_plain_text_if_layout_extraction_fails() -> None:
+    class Page:
+        def extract_text(self, *, extraction_mode="plain"):
+            if extraction_mode == "layout":
+                raise ValueError("unsupported layout")
+            return "The original text remains available."
+
+    assert extraction._pdf_embedded_text(Page()) == "The original text remains available."
+
+
+@pytest.mark.parametrize("second_x", [300, 308])
+def test_pdf_probe_recovers_spaces_between_positioned_text_runs(second_x: int) -> None:
+    from pypdf import PdfReader, PdfWriter
+    from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=1200, height=400)
+    font = DictionaryObject({
+        NameObject("/Type"): NameObject("/Font"),
+        NameObject("/Subtype"): NameObject("/Type1"),
+        NameObject("/BaseFont"): NameObject("/Helvetica"),
+    })
+    page[NameObject("/Resources")] = DictionaryObject({
+        NameObject("/Font"): DictionaryObject({NameObject("/F1"): font}),
+    })
+    content = DecodedStreamObject()
+    content.set_data(
+        b"q 0.24 0 0 0.24 39 0 cm BT /F1 1 Tf "
+        b"66.66666 0 0 66.66666 0 1000 Tm "
+        b"(The definition describes performance) Tj ET Q\n"
+        + f"q 0.24 0 0 0.24 {second_x} 0 cm BT /F1 1 Tf ".encode()
+        + b"66.66666 0 0 66.66666 0 1000 Tm "
+        b"(rating questions which influence the final outcome) Tj ET Q"
+    )
+    page[NameObject("/Contents")] = writer._add_object(content)
+    stream = io.BytesIO()
+    writer.write(stream)
+    data = stream.getvalue()
+    assert "performancerating" in PdfReader(io.BytesIO(data)).pages[0].extract_text()
+    text = extraction.probe_pdf_bytes(data).embedded_text
+    assert ("performance rating" in text) == (second_x == 308)
+    assert ("performancerating" in text) == (second_x == 300)
+
+
 def test_pdf_probe_collects_no_ocr_page_and_custody_evidence(monkeypatch) -> None:
     def unexpected(*_args, **_kwargs):
         raise AssertionError("the structural probe must not OCR or render")
