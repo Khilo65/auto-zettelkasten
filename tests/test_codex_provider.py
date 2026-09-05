@@ -833,7 +833,7 @@ def test_provider_response_reuse_requires_same_codex_execution_identity() -> Non
     )
 
 
-def test_codex_auto_concurrency_uses_safe_shared_limit(
+def test_codex_auto_concurrency_uses_role_specific_limits(
     tmp_path: Path,
 ) -> None:
     request = MapRequest(
@@ -853,7 +853,7 @@ def test_codex_auto_concurrency_uses_safe_shared_limit(
             provider_concurrency="auto",
         ),
         20,
-    ) == 4
+    ) == 1
 
 
 @pytest.mark.parametrize("cli_profile", ["0.145.0", "0.152.1"])
