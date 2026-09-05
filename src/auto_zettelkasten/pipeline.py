@@ -149,7 +149,7 @@ from .relationships import (
     profile_hash_aliases,
     projected_related_links,
     relationship_decision_key,
-    RELATIONSHIP_DECISION_CONTRACT,
+    RELATIONSHIP_ENVELOPE_CONTRACTS,
     RELATIONSHIP_DECISION_NORMALIZATION_VERSION,
     RELATIONSHIP_DISCOVERY_PROMPT_VERSION,
     RELATIONSHIP_PROMPT_VERSION,
@@ -7023,7 +7023,7 @@ def _run_relationship_reasoning(
     )
     batch_max_jobs = (
         _RELATIONSHIP_BATCH_MAX_JOBS
-        if decision_contract == RELATIONSHIP_DECISION_CONTRACT
+        if decision_contract in RELATIONSHIP_ENVELOPE_CONTRACTS
         else _LEGACY_RELATIONSHIP_BATCH_MAX_JOBS
     )
     note_row_by_source = {
@@ -10679,7 +10679,7 @@ def _run_relationship_reasoning(
         pair_for=lambda job: (job.left_source_id, job.right_source_id),
         profile_by_source=(
             {}
-            if decision_contract == RELATIONSHIP_DECISION_CONTRACT
+            if decision_contract in RELATIONSHIP_ENVELOPE_CONTRACTS
             else profile_by_source
         ),
         context_for=lambda packet: _relationship_transport_context(
@@ -10707,7 +10707,7 @@ def _run_relationship_reasoning(
         )
         packet_profiles = (
             []
-            if decision_contract == RELATIONSHIP_DECISION_CONTRACT
+            if decision_contract in RELATIONSHIP_ENVELOPE_CONTRACTS
             else [profile_by_source[source_id] for source_id in packet_source_ids]
         )
         batch = RelationshipProviderBatch(
@@ -10743,7 +10743,7 @@ def _run_relationship_reasoning(
         )
         packet_profiles = (
             []
-            if decision_contract == RELATIONSHIP_DECISION_CONTRACT
+            if decision_contract in RELATIONSHIP_ENVELOPE_CONTRACTS
             else [profile_by_source[source_id] for source_id in packet_source_ids]
         )
         if (
@@ -10820,7 +10820,7 @@ def _run_relationship_reasoning(
         )
         packet_profiles = (
             []
-            if decision_contract == RELATIONSHIP_DECISION_CONTRACT
+            if decision_contract in RELATIONSHIP_ENVELOPE_CONTRACTS
             else [profile_by_source[source_id] for source_id in packet_source_ids]
         )
         if (
@@ -11673,7 +11673,7 @@ def _relationship_transport_context(
     if decision_contract not in {
         "relationship-decision-v6",
         "relationship-decision-v7",
-        RELATIONSHIP_DECISION_CONTRACT,
+        *RELATIONSHIP_ENVELOPE_CONTRACTS,
     }:
         return {"pair_jobs": [job.to_dict() for job in jobs]}
     source_documents: dict[str, Any] = {}
@@ -11691,7 +11691,7 @@ def _relationship_transport_context(
         selected_evidence = (
             row.pop("selected_evidence", {})
             if decision_contract
-            in {"relationship-decision-v7", RELATIONSHIP_DECISION_CONTRACT}
+            in {"relationship-decision-v7", *RELATIONSHIP_ENVELOPE_CONTRACTS}
             else {}
         )
         for side, source_id in (
@@ -11712,7 +11712,7 @@ def _relationship_transport_context(
                 )
             if (
                 decision_contract
-                in {"relationship-decision-v7", RELATIONSHIP_DECISION_CONTRACT}
+                in {"relationship-decision-v7", *RELATIONSHIP_ENVELOPE_CONTRACTS}
                 and source_id not in source_evidence
             ):
                 source_evidence[source_id] = list(
@@ -11732,7 +11732,7 @@ def _relationship_transport_context(
     }
     if decision_contract in {
         "relationship-decision-v7",
-        RELATIONSHIP_DECISION_CONTRACT,
+        *RELATIONSHIP_ENVELOPE_CONTRACTS,
     }:
         payload["source_evidence"] = {
             key: source_evidence[key] for key in sorted(source_evidence)

@@ -23,6 +23,7 @@ from auto_zettelkasten.readers import (
     _relationship_adjudication_system_prompt,
     _relationship_prompt,
 )
+from auto_zettelkasten.relationships import RELATIONSHIP_DECISION_CONTRACT
 
 
 CONTEXT_WINDOW_TOKENS = 272_000
@@ -31,7 +32,7 @@ PROMPT_RESERVE_TOKENS = 2_048
 OUTPUT_RESERVE_TOKENS = 16_384
 MAX_PAIR_JOBS = 8
 MATERIAL_REDUCTION_TARGET_PERCENT = 25.0
-DECISION_CONTRACT = "relationship-decision-v8"
+DECISION_CONTRACT = RELATIONSHIP_DECISION_CONTRACT
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -137,7 +138,7 @@ def _load_frozen_run(
         if job.pair_job_id != input_path.parent.name:
             raise ValueError("relationship job directory does not match its input")
         if job.output_contract != DECISION_CONTRACT:
-            raise ValueError("audit requires relationship-decision-v8 jobs")
+            raise ValueError(f"audit requires {DECISION_CONTRACT} jobs")
         jobs.append(job)
     if not jobs:
         raise ValueError("no frozen relationship jobs found")

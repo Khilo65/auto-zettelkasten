@@ -29,6 +29,36 @@ def _job() -> RelationshipPairJob:
         left_source_id="A",
         right_source_id="B",
         profiles={"left": _profile("A"), "right": _profile("B")},
+        output_contract="relationship-decision-v8",
+    )
+
+
+def _v9_profile(source_id: str) -> dict[str, object]:
+    return {
+        **_profile(source_id),
+        "evidence_anchors": [
+            {
+                "source_id": source_id,
+                "evidence_anchor_id": f"anchor-{source_id.casefold()}",
+                "claim": f"{source_id} owns this exact claim.",
+                "locator": f"{source_id} locator",
+            }
+        ],
+    }
+
+
+def _v9_job() -> RelationshipPairJob:
+    left = _v9_profile("A")
+    right = _v9_profile("B")
+    return RelationshipPairJob(
+        pair_job_id="job-ab",
+        left_source_id="A",
+        right_source_id="B",
+        profiles={"left": left, "right": right},
+        selected_evidence={
+            "left": list(left["evidence_anchors"]),
+            "right": list(right["evidence_anchors"]),
+        },
         output_contract=RELATIONSHIP_DECISION_CONTRACT,
     )
 
@@ -83,10 +113,92 @@ def test_v8_salvages_valid_connections_and_keeps_anchors_optional() -> None:
     assert accepted["connection_id"].startswith("relationship-connection-")
 
 
-def test_v28_is_compact_domain_neutral_source_owned_and_complete() -> None:
+def test_v9_repartitions_actor_right_anchors_and_uses_owned_claims() -> None:
+    job = _v9_job()
+    profiles = [_v9_profile("A"), _v9_profile("B")]
+    result = ingest_relationship_decision_batch(
+        {
+            "decisions": [
+                {
+                    "pair_job_id": "job-ab",
+                    "decision": "relationship",
+                    "connections": [
+                        {
+                            "comparison_proposition": "B supports A.",
+                            "primary_relation_type": "supports",
+                            "secondary_relation_types": [],
+                            "actor_source_id": "B",
+                            "reference_source_id": "A",
+                            # Reproduce the provider's actor/reference interpretation
+                            # of A/B. Ownership must come from the anchors, not prose.
+                            "source_a_basis": "B's submitted basis.",
+                            "source_b_basis": "A's submitted basis.",
+                            "source_a_anchor_ids": ["anchor-b"],
+                            "source_b_anchor_ids": ["anchor-a"],
+                            "reason": "The bounded evidence supports the direction.",
+                            "boundary_or_qualification": "Only this proposition.",
+                            "confidence": "high",
+                        }
+                    ],
+                }
+            ]
+        },
+        pair_jobs=[job],
+        profiles=profiles,
+    )
+
+    assert result["parked"] == []
+    relation = result["accepted"][0]
+    assert relation["source_id"] == "B"
+    assert relation["target_source_id"] == "A"
+    assert relation["left_endpoint_claim"] == "A owns this exact claim."
+    assert relation["right_endpoint_claim"] == "B owns this exact claim."
+    assert relation["source_evidence"] == {
+        "source_id": "B",
+        "evidence_anchor_id": "anchor-b",
+        "locator": "B locator",
+        "claim": "B owns this exact claim.",
+    }
+    assert relation["target_evidence"] == {
+        "source_id": "A",
+        "evidence_anchor_id": "anchor-a",
+        "locator": "A locator",
+        "claim": "A owns this exact claim.",
+    }
+
+
+def test_v9_parks_relationship_without_owned_endpoint_anchors() -> None:
+    connection = _connection("A shared proposition.")
+    connection.update(
+        {
+            "source_a_anchor_ids": [],
+            "source_b_anchor_ids": ["unknown-anchor"],
+        }
+    )
+    result = ingest_relationship_decision_batch(
+        {
+            "decisions": [
+                {
+                    "pair_job_id": "job-ab",
+                    "decision": "relationship",
+                    "connections": [connection],
+                }
+            ]
+        },
+        pair_jobs=[_v9_job()],
+        profiles=[_v9_profile("A"), _v9_profile("B")],
+    )
+
+    assert result["accepted"] == []
+    assert result["parked"]
+    assert "complete semantic record" in str(result["parked"][0].get("error") or "")
+
+
+def test_v29_is_compact_domain_neutral_source_owned_and_complete() -> None:
     prompt = _relationship_adjudication_system_prompt()
 
-    assert "relationship prompt v28" in prompt
+    assert "relationship prompt v29" in prompt
+    assert "contract relationship-decision-v9" in prompt
     assert "source_a_basis describes only the supplied left_source_id" in prompt
     assert "source_b_basis only the supplied right_source_id" in prompt
     assert "whole work versus chapter, excerpt, or component" in prompt
@@ -101,9 +213,12 @@ def test_v28_is_compact_domain_neutral_source_owned_and_complete() -> None:
     assert "contextual_connection are symmetric" in prompt
     assert "directional types require exact supplied endpoints as actor/reference" in prompt
     assert "ACTOR [relation type] REFERENCE" in prompt
+    assert "exact evidence-anchor IDs owned by that endpoint" in prompt
+    assert "the evidence source normally supports the dependent work" in prompt
+    assert "does not support the evidence source merely by relying on it" in prompt
     assert "every ID appears exactly once" in prompt
     assert "use no_relationship rather than omitting a pair" in prompt
-    assert len(prompt) <= 4_500
+    assert len(prompt) <= 5_000
     assert not any(
         name in prompt.casefold()
         for name in ("svensson", "mediation", "civil war", "peacekeeping")

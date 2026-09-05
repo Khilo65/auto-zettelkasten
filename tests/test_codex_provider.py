@@ -2772,6 +2772,10 @@ elif contract == "bridge_shard_selection":
     payload = {{"shard_pairs": []}}
 elif contract == "relationship_adjudication":
     jobs = user.get("context", {{}}).get("pair_jobs", [])
+    source_evidence = user.get("context", {{}}).get("source_evidence", {{}})
+    def first_anchor(source_id):
+        row = (source_evidence.get(source_id) or [{{}}])[0]
+        return row.get("evidence_anchor_id") or row.get("claim_id") or row.get("finding_id") or ""
     payload = {{"decisions": [{{
         "pair_job_id": job["pair_job_id"],
         "decision": "relationship",
@@ -2783,6 +2787,8 @@ elif contract == "relationship_adjudication":
             "reference_source_id": None,
             "source_a_basis": "The left source describes institutional implementation.",
             "source_b_basis": "The right source describes implementation outcomes.",
+            "source_a_anchor_ids": [first_anchor(job["pair"]["left_source_id"])],
+            "source_b_anchor_ids": [first_anchor(job["pair"]["right_source_id"])],
             "reason": "The sources contribute complementary bounded evidence.",
             "boundary_or_qualification": "Limited to the synthetic fixture scope.",
             "confidence": "high",

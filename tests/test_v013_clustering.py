@@ -18,6 +18,7 @@ from auto_zettelkasten.literature import (
     normalize_evidence_profiles,
 )
 from auto_zettelkasten.readers import _validate_literature_response
+from auto_zettelkasten.relationships import RELATIONSHIP_DECISION_CONTRACT
 
 
 def _profile(source_id: str, *, partial: bool = False) -> dict:
@@ -619,6 +620,48 @@ def test_legacy_review_pending_relationships_do_not_enter_cluster_context() -> N
         row["relation_id"]
         for row in _cluster_relationship_context(relationships, {"a", "b"})
     ] == ["verified"]
+
+
+def test_v9_cluster_context_requires_source_owned_anchor_evidence() -> None:
+    base = {
+        "source_id": "a",
+        "target_source_id": "b",
+        "active": True,
+        "verification_status": "final",
+        "relation_type": "supports",
+        "output_contract": RELATIONSHIP_DECISION_CONTRACT,
+        "cluster_evidence_eligible": True,
+    }
+    relationships = [
+        {
+            **base,
+            "relation_id": "claim-only",
+            "source_evidence": {"source_id": "a", "claim": "A claim"},
+            "target_evidence": {"source_id": "b", "claim": "B claim"},
+        },
+        {
+            **base,
+            "relation_id": "owned-anchors",
+            "source_evidence": {
+                "source_id": "a",
+                "evidence_anchor_id": "a-1",
+                "claim": "A claim",
+            },
+            "target_evidence": {
+                "source_id": "b",
+                "evidence_anchor_id": "b-1",
+                "claim": "B claim",
+            },
+        },
+    ]
+
+    context = _cluster_relationship_context(relationships, {"a", "b"})
+
+    assert [row["relation_id"] for row in context] == ["owned-anchors"]
+    assert [
+        (row["source_id"], row["evidence_anchor_id"])
+        for row in context[0]["evidence"]
+    ] == [("a", "a-1"), ("b", "b-1")]
 
 
 def test_planned_cluster_neighbors_project_reciprocally() -> None:

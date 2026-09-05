@@ -83,6 +83,7 @@ def test_v7_relationship_requires_claim_owned_primary_anchor_per_endpoint() -> N
             "left": [profiles["A"]["evidence_anchors"][0]],
             "right": [profiles["B"]["evidence_anchors"][0]],
         },
+        output_contract="relationship-decision-v8",
     )
     result = validate_relationship_decision_rows(
         {
@@ -113,7 +114,7 @@ def test_v7_relationship_requires_claim_owned_primary_anchor_per_endpoint() -> N
     prompt = _relationship_adjudication_system_prompt()
     assert "source_a_basis" in prompt
     assert "source_b_basis" in prompt
-    assert "source_a_anchor_ids" not in prompt
+    assert "source_a_anchor_ids" in prompt
 
 
 def test_v7_relationship_accepts_unambiguous_plural_anchor_fields() -> None:
@@ -126,6 +127,7 @@ def test_v7_relationship_accepts_unambiguous_plural_anchor_fields() -> None:
             "left": [profiles["A"]["evidence_anchors"][0]],
             "right": [profiles["B"]["evidence_anchors"][0]],
         },
+        output_contract="relationship-decision-v8",
     )
 
     result = validate_relationship_decision_rows(
@@ -169,6 +171,7 @@ def test_v7_contextual_decision_shorthand_is_normalized() -> None:
             "left": [profiles["A"]["evidence_anchors"][0]],
             "right": [profiles["B"]["evidence_anchors"][0]],
         },
+        output_contract="relationship-decision-v8",
     )
 
     result = validate_relationship_decision_rows(
@@ -210,6 +213,7 @@ def test_v7_direct_relation_decision_shorthand_is_normalized() -> None:
             "left": [profiles["A"]["evidence_anchors"][0]],
             "right": [profiles["B"]["evidence_anchors"][0]],
         },
+        output_contract="relationship-decision-v8",
     )
 
     result = validate_relationship_decision_rows(
@@ -558,7 +562,7 @@ def test_v8_directional_relationship_without_endpoints_is_parked() -> None:
 
 
 @pytest.mark.parametrize("relation_type", sorted(SYMMETRIC_RELATION_TYPES))
-def test_v8_all_symmetric_relationships_accept_null_endpoints(
+def test_v9_all_symmetric_relationships_accept_null_endpoints(
     relation_type: str,
 ) -> None:
     job = RelationshipPairJob.from_dict(
@@ -580,6 +584,8 @@ def test_v8_all_symmetric_relationships_accept_null_endpoints(
                             "reference_source_id": None,
                             "source_a_basis": "A establishes its bounded claim.",
                             "source_b_basis": "B establishes its bounded claim.",
+                            "source_a_anchor_ids": ["anchor-a"],
+                            "source_b_anchor_ids": ["anchor-b"],
                             "reason": "The pair supports the stated comparison.",
                         }
                     ],

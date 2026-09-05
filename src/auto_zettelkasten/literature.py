@@ -34,6 +34,7 @@ from .models import (
 )
 from .notes import source_note_semantic_components
 from .relationships import (
+    RELATIONSHIP_DECISION_CONTRACT,
     RELATIONSHIP_DISCOVERY_PROMPT_VERSION,
     RELATIONSHIP_PROMPT_VERSION,
 )
@@ -19919,6 +19920,20 @@ def _cluster_relationship_context(
         right = str(relation.get("target_source_id") or "")
         if not left or not right or not {left, right}.issubset(source_ids):
             continue
+        if str(relation.get("output_contract") or "") == RELATIONSHIP_DECISION_CONTRACT:
+            endpoint_evidence = (
+                relation.get("source_evidence"),
+                relation.get("target_evidence"),
+            )
+            if any(
+                not isinstance(value, Mapping)
+                or str(value.get("source_id") or "") != source_id
+                or not str(value.get("evidence_anchor_id") or "")
+                for value, source_id in zip(
+                    endpoint_evidence, (left, right), strict=True
+                )
+            ):
+                continue
         rows.append(
             {
                 "relation_id": str(relation.get("relation_id") or ""),

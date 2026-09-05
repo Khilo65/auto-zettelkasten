@@ -10,11 +10,14 @@ from .models import RelationshipDecision, RelationshipPairJob
 from .navigation import TYPED_SOURCE_RELATIONS, rank_human_related_links
 
 
-RELATIONSHIP_PROMPT_VERSION = "28"
+RELATIONSHIP_PROMPT_VERSION = "29"
 RELATIONSHIP_DISCOVERY_PROMPT_VERSION = "20"
 RELATIONSHIP_REGISTRY_SCHEMA_VERSION = "7"
-RELATIONSHIP_DECISION_SCHEMA_VERSION = "8"
-RELATIONSHIP_DECISION_CONTRACT = "relationship-decision-v8"
+RELATIONSHIP_DECISION_SCHEMA_VERSION = "9"
+RELATIONSHIP_DECISION_CONTRACT = "relationship-decision-v9"
+RELATIONSHIP_ENVELOPE_CONTRACTS = frozenset(
+    {"relationship-decision-v8", RELATIONSHIP_DECISION_CONTRACT}
+)
 RELATIONSHIP_DECISION_NORMALIZATION_VERSION = "3"
 SUBSTANTIVE_RELATION_TYPES = frozenset(
     {
@@ -332,7 +335,7 @@ def _normalize_provider_decision_row(
     if contract not in {
         "relationship-decision-v6",
         "relationship-decision-v7",
-        RELATIONSHIP_DECISION_CONTRACT,
+        *RELATIONSHIP_ENVELOPE_CONTRACTS,
     }:
         if str(normalized.get("decision") or "") == "relationship":
             labels = RELATIONSHIP_PROJECTION_LABELS.get(
@@ -348,7 +351,7 @@ def _normalize_provider_decision_row(
         "right_source_id": job.right_source_id,
     }
     normalized["output_contract"] = contract
-    if contract == RELATIONSHIP_DECISION_CONTRACT and not normalized.get("reason"):
+    if contract in RELATIONSHIP_ENVELOPE_CONTRACTS and not normalized.get("reason"):
         normalized["reason"] = normalized.pop("rationale", "")
     decision = str(normalized.get("decision") or "")
     if decision in SUBSTANTIVE_RELATION_TYPES:
@@ -373,7 +376,7 @@ def _normalize_provider_decision_row(
     raw_right = normalized.get("right_evidence_anchor_ids", [])
     if contract in {
         "relationship-decision-v7",
-        RELATIONSHIP_DECISION_CONTRACT,
+        *RELATIONSHIP_ENVELOPE_CONTRACTS,
     }:
         for side in ("left", "right"):
             primary = normalized.pop(f"{side}_evidence_anchor_id", "")
@@ -424,13 +427,26 @@ def _normalize_provider_decision_row(
             warnings.append(f"anchor_dropped_unknown:{anchor_id}")
     normalized["left_evidence_anchor_ids"] = left_ids
     normalized["right_evidence_anchor_ids"] = right_ids
+    if contract == RELATIONSHIP_DECISION_CONTRACT and left_ids and right_ids:
+        normalized["left_endpoint_claim"] = str(
+            left_anchors[left_ids[0]].get("claim")
+            or left_anchors[left_ids[0]].get("proposition")
+            or left_anchors[left_ids[0]].get("text")
+            or ""
+        )
+        normalized["right_endpoint_claim"] = str(
+            right_anchors[right_ids[0]].get("claim")
+            or right_anchors[right_ids[0]].get("proposition")
+            or right_anchors[right_ids[0]].get("text")
+            or ""
+        )
     if (
         contract == "relationship-decision-v7"
         and normalized.get("left_endpoint_claim")
         and normalized.get("right_endpoint_claim")
         and (not left_ids or not right_ids)
     ):
-        normalized["output_contract"] = RELATIONSHIP_DECISION_CONTRACT
+        normalized["output_contract"] = "relationship-decision-v8"
         warnings.append("normalized_v7_optional_endpoint_anchors")
     return normalized, warnings
 
@@ -601,7 +617,7 @@ def _v8_connection_rows(
                         "reference_source_id": reference,
                     }
                 )[:16],
-                "output_contract": RELATIONSHIP_DECISION_CONTRACT,
+                "output_contract": job.output_contract,
                 "_contract_warnings": [
                     *(
                         ["normalized_relation_decision_shorthand"]
@@ -711,7 +727,7 @@ def ingest_relationship_decision_batch(
         job_entry = jobs.get(job_id)
         if (
             job_entry is None
-            or job_entry[0].output_contract != RELATIONSHIP_DECISION_CONTRACT
+            or job_entry[0].output_contract not in RELATIONSHIP_ENVELOPE_CONTRACTS
         ):
             expanded_rows.append(value)
             continue
@@ -791,7 +807,7 @@ def ingest_relationship_decision_batch(
         if (
             str(row.get("decision") or "") == "relationship"
             and str(row.get("output_contract") or "")
-            != RELATIONSHIP_DECISION_CONTRACT
+            not in RELATIONSHIP_ENVELOPE_CONTRACTS
             and (
                 not row.get("left_evidence_anchor_ids")
                 or not row.get("right_evidence_anchor_ids")
@@ -1674,7 +1690,7 @@ def persist_relationship_registry(
                 **(
                     dict(row)
                     if str(row.get("output_contract") or "")
-                    == RELATIONSHIP_DECISION_CONTRACT
+                    in RELATIONSHIP_ENVELOPE_CONTRACTS
                     else {}
                 ),
                 "decision_key": decision_key,
@@ -2356,7 +2372,7 @@ def _normalized_v4_decision(
             decision.relation_type,
             (
                 decision.comparison_proposition
-                if decision.output_contract == RELATIONSHIP_DECISION_CONTRACT
+                if decision.output_contract in RELATIONSHIP_ENVELOPE_CONTRACTS
                 else ""
             ),
         ),
@@ -2608,6 +2624,7 @@ def _final_v4_relation(row: Mapping[str, Any]) -> bool:
                     ("relationship-decision-v5", "5"),
                     ("relationship-decision-v6", "6"),
                     ("relationship-decision-v7", "7"),
+                    ("relationship-decision-v8", "8"),
                 }
             )
         )
@@ -2637,6 +2654,7 @@ def _final_v4_decision(
                     ("relationship-decision-v5", "5"),
                     ("relationship-decision-v6", "6"),
                     ("relationship-decision-v7", "7"),
+                    ("relationship-decision-v8", "8"),
                 }
             )
         )
@@ -2659,6 +2677,7 @@ def _publishable_machine_relation(row: Mapping[str, Any]) -> bool:
                 "relationship-decision-v5",
                 "relationship-decision-v6",
                 "relationship-decision-v7",
+                "relationship-decision-v8",
                 RELATIONSHIP_DECISION_CONTRACT,
             }
         )

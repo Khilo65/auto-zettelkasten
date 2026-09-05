@@ -2303,7 +2303,7 @@ class RelationshipPairJob:
     graph_context: dict[str, Any] = field(default_factory=dict)
     candidate_basis: list[dict[str, Any]] = field(default_factory=list)
     prior_pair_memory: dict[str, Any] = field(default_factory=dict)
-    output_contract: str = "relationship-decision-v8"
+    output_contract: str = "relationship-decision-v9"
 
     def __post_init__(self) -> None:
         if (
@@ -2318,6 +2318,7 @@ class RelationshipPairJob:
             "relationship-decision-v6",
             "relationship-decision-v7",
             "relationship-decision-v8",
+            "relationship-decision-v9",
         }:
             raise ValueError("relationship pair job output contract is invalid")
         left, right = sorted((self.left_source_id, self.right_source_id))
@@ -2505,7 +2506,7 @@ class RelationshipDecision:
     boundary_or_qualification: str = ""
     confidence: str = ""
     connection_id: str = ""
-    output_contract: str = "relationship-decision-v8"
+    output_contract: str = "relationship-decision-v9"
 
     def __post_init__(self) -> None:
         if self.decision not in {
@@ -2520,6 +2521,7 @@ class RelationshipDecision:
             "relationship-decision-v6",
             "relationship-decision-v7",
             "relationship-decision-v8",
+            "relationship-decision-v9",
         }:
             raise ValueError("relationship decision output contract is invalid")
         pair = {self.left_source_id, self.right_source_id}
@@ -2585,13 +2587,21 @@ class RelationshipDecision:
                     (
                         self.left_endpoint_claim
                         if self.output_contract
-                        in {"relationship-decision-v7", "relationship-decision-v8"}
+                        in {
+                            "relationship-decision-v7",
+                            "relationship-decision-v8",
+                            "relationship-decision-v9",
+                        }
                         else "legacy"
                     ),
                     (
                         self.right_endpoint_claim
                         if self.output_contract
-                        in {"relationship-decision-v7", "relationship-decision-v8"}
+                        in {
+                            "relationship-decision-v7",
+                            "relationship-decision-v8",
+                            "relationship-decision-v9",
+                        }
                         else "legacy"
                     ),
                     (

@@ -627,6 +627,14 @@ CODEX_OUTPUT_CONTRACTS: Mapping[str, Mapping[str, Any]] = {
                                             },
                                             "source_a_basis": _CODEX_STRING,
                                             "source_b_basis": _CODEX_STRING,
+                                            "source_a_anchor_ids": {
+                                                **_CODEX_STRINGS,
+                                                "minItems": 1,
+                                            },
+                                            "source_b_anchor_ids": {
+                                                **_CODEX_STRINGS,
+                                                "minItems": 1,
+                                            },
                                             "reason": _CODEX_STRING,
                                             "boundary_or_qualification": _CODEX_STRING,
                                             "confidence": {
@@ -1728,7 +1736,7 @@ class _CapabilityAwareReader:
     timeout: float
     connect_timeout: float
     request_deadline: float | None
-    relationship_decision_contract = "relationship-decision-v8"
+    relationship_decision_contract = "relationship-decision-v9"
     reasoning_effort: str | None = None
 
     def _configure_capabilities(self) -> None:
@@ -5606,14 +5614,15 @@ def _relationship_candidate_system_prompt() -> str:
 
 def _relationship_adjudication_system_prompt() -> str:
     return (
-        "Auto-Zettelkasten relationship prompt v28, contract relationship-decision-v8. Read both "
+        "Auto-Zettelkasten relationship prompt v29, contract relationship-decision-v9. Read both "
         "complete atomic notes. Return JSON decisions keyed by every supplied pair_job_id, no extras: "
         "either {decision:no_relationship, reason, confidence} or "
         "{decision:relationship, connections:[...]}. Use one connection, or two for distinct propositions, containing comparison_proposition, "
         "primary_relation_type, secondary_relation_types, actor_source_id, "
-        "reference_source_id, source_a_basis, source_b_basis, reason, "
+        "reference_source_id, source_a_basis, source_b_basis, source_a_anchor_ids, source_b_anchor_ids, reason, "
         "boundary_or_qualification, confidence. source_a_basis describes only the supplied "
         "left_source_id note and source_b_basis only the supplied right_source_id note. "
+        "For each basis, return one or more exact evidence-anchor IDs owned by that endpoint in source_a_anchor_ids and source_b_anchor_ids. "
         "Distinguish source assertions from analytical cautions in the notes; "
         "attribute those cautions to the note or system, not the source unless explicitly attributed. "
         "Notes are summaries: silence is not evidence of source absence. Unless a note explicitly establishes absence, "
@@ -5647,6 +5656,8 @@ def _relationship_adjudication_system_prompt() -> str:
         "reference; rival_explanation offers a competing answer to the same explanandum; and "
         "sequential_relationship means the actor precedes the reference in an explicit "
         "intellectual or process sequence. "
+        "If one work cites or depends on another as evidence for its own claim, the evidence source normally supports the dependent work, not vice versa. "
+        "A dependent or adopting work does not support the evidence source merely by relying on it; use contextual_connection if neither supports the other's proposition. "
         "complements, contrasts, "
         "boundary_contrast, methodological_fault_line, interpretive_or_normative_disagreement, "
         "and contextual_connection are symmetric and may use nulls; all directional types "
