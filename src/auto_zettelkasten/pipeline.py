@@ -15985,6 +15985,16 @@ def _source_bundle_from_result(
                     else []
                 )
                 source_text = " ".join(str(row.get("text") or "").split())
+                quote_pattern = (
+                    re.compile(re.escape(span), flags=re.IGNORECASE)
+                    if span and not opaque_pdf_route
+                    else None
+                )
+                quote_match = quote_pattern.search(source_text) if quote_pattern else None
+                quote_is_unique = bool(
+                    quote_match
+                    and quote_pattern.search(source_text, quote_match.start() + 1) is None
+                )
                 if (
                     not quoted
                     or quoted.start() != 0
@@ -15999,8 +16009,7 @@ def _source_bundle_from_result(
                     ))
                     or not 12 <= len(span) <= 120
                     or (
-                    not opaque_pdf_route
-                    and (source_text.find(span) < 0 or source_text.find(span) != source_text.rfind(span))
+                    not opaque_pdf_route and not quote_is_unique
                     )
                 ):
                     rejected_locator_diagnostics.append(
@@ -16014,10 +16023,21 @@ def _source_bundle_from_result(
                         }
                     )
                     continue
+                if quote_match:
+                    canonical_locator = f'Quote "{quote_match.group()}"' + (
+                        f" {suffix}" if suffix else ""
+                    )
                 value = {
                     **value,
+                    "locator": canonical_locator,
+                    "locators": [
+                        canonical_locator
+                        if str(item).strip() == locator.strip()
+                        else item
+                        for item in value.get("locators", []) or []
+                    ],
                     "source_locators": _source_locator_payloads(
-                        locator, source_id=expected_source_id,
+                        canonical_locator, source_id=expected_source_id,
                         evidence_anchor_id=str(value.get("evidence_anchor_id") or ""),
                     ),
                 }

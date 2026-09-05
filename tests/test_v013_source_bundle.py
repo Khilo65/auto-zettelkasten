@@ -1132,6 +1132,31 @@ def test_invalid_quote_locator_is_quarantined_without_discarding_bundle() -> Non
     assert bundle.component_diagnostics[-1]["rehydrate"] is False
 
 
+def test_unique_quote_locator_restores_source_casing() -> None:
+    payload = _bundle_payload()
+    payload["evidence_anchors"][0].update(
+        locator='Quote "monitoring changes implementation."',
+        locators=['Quote "monitoring changes implementation."'],
+    )
+    row = {
+        "source_id": "source-zotero-A1",
+        "zotero_item_key": "A1",
+        "media_type": "text/html",
+        "text": "Monitoring changes implementation.",
+        "coverage_metrics": {},
+    }
+
+    bundle = _source_bundle_from_result(payload, row, "full_document")
+
+    assert bundle is not None
+    assert bundle.evidence_anchors[0].locator == (
+        'Quote "Monitoring changes implementation."'
+    )
+    assert bundle.evidence_anchors[0].locators == [
+        'Quote "Monitoring changes implementation."'
+    ]
+
+
 def test_pipeline_rehydrates_safe_same_source_evidence_diagnostics_idempotently() -> None:
     payload = _bundle_payload()
     payload["evidence_anchors"] = []
