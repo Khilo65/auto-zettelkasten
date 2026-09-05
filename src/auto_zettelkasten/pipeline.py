@@ -15955,8 +15955,18 @@ def _source_bundle_from_result(
     }
     opaque_pdf_route = row.get("content_route") in {"codex_pdf_page_images", "codex_pdf_input_file"}
     if validate_quantitative_provenance and not opaque_pdf_route:
+        source_text = str(row.get("text") or "")
         source_words = re.sub(
-            r"[^\w]+", " ", str(row.get("text") or "").casefold()
+            r"[^\w]+", " ", source_text.casefold()
+        ).strip()
+        dehyphenated_source_words = re.sub(
+            r"[^\w]+",
+            " ",
+            re.sub(
+                r"(?<=\w)[ \t]*-[ \t]*\r?\n[ \t]*(?=\w)",
+                "",
+                source_text,
+            ).casefold(),
         ).strip()
         concepts = str(
             (payload.get("analysis_sections") or {}).get(
@@ -15968,7 +15978,10 @@ def _source_bundle_from_result(
             if len(quoted.split()) < 8:
                 continue
             quote_words = re.sub(r"[^\w]+", " ", quoted.casefold()).strip()
-            if quote_words not in source_words:
+            if (
+                quote_words not in source_words
+                and quote_words not in dehyphenated_source_words
+            ):
                 raise ValueError("analysis_quote_not_found_in_source")
     anchors = payload.get("evidence_anchors", [])
     if isinstance(anchors, list):

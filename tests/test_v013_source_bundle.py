@@ -1166,6 +1166,24 @@ def test_long_key_concept_quotation_must_exist_in_inspected_text() -> None:
         _source_bundle_from_result(payload, row, "full_document")
 
 
+def test_long_key_concept_quotation_accepts_ocr_line_wrap_hyphenation() -> None:
+    payload = _bundle_payload()
+    exact = "institutional and cultural recollections shape present collective action"
+    payload["analysis_sections"]["key_concepts_and_definitions"] = (
+        f'**Collective memory** — “{exact}” (p. 1).'
+    )
+    row = {
+        "source_id": "source-zotero-A1",
+        "zotero_item_key": "A1",
+        "text": (
+            "institutional and cultural recollections shape present collec- \n"
+            "tive action"
+        ),
+    }
+
+    assert _source_bundle_from_result(payload, row, "full_document") is not None
+
+
 def test_unique_quote_locator_restores_source_casing() -> None:
     payload = _bundle_payload()
     payload["evidence_anchors"][0].update(
