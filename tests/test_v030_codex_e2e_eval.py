@@ -1582,7 +1582,7 @@ def test_strategic_manifests_bind_exact_private_custody_and_derivation(
     assert (settings8.source_attempt_limit, settings8.relationship_attempt_limit,
             settings8.total_attempt_limit, settings8.document_attempt_limit) == (8, 12, 20, 4)
     assert (settings40.source_attempt_limit, settings40.relationship_attempt_limit,
-            settings40.total_attempt_limit, settings40.document_attempt_limit) == (56, 24, 80, 8)
+            settings40.total_attempt_limit, settings40.document_attempt_limit) == (52, 28, 80, 8)
     assert manifest8["source_template_manifest_sha256"] == (
         runner._STRATEGIC_TEMPLATE_MANIFEST_SHA256
     )

@@ -81,8 +81,8 @@ _STRATEGIC_CONTROLS = {
     },
     40: {
         "stage": "strategic40",
-        "source_attempt_limit": 56,
-        "relationship_attempt_limit": 24,
+        "source_attempt_limit": 52,
+        "relationship_attempt_limit": 28,
         "total_attempt_limit": 80,
         "document_attempt_limit": 8,
         "stage_deadline_seconds": 14_400,
