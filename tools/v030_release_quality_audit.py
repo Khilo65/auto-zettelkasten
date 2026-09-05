@@ -24,7 +24,12 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from auto_zettelkasten.files import read_yaml, sha256_file, write_yaml
-from auto_zettelkasten.notes import item_key, read_note, source_id_for_item
+from auto_zettelkasten.notes import (
+    canonical_source_note_text,
+    item_key,
+    read_note,
+    source_id_for_item,
+)
 
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -843,11 +848,11 @@ def _blinded_note_row(
     versions = {
         current_variant: {
             "artifact_sha256": source["note_artifact"]["sha256"],
-            "note_text": source["note_text"],
+            "note_text": canonical_source_note_text(source["note_text"]),
         },
         baseline_variant: {
             "artifact_sha256": baseline["note_artifact"]["sha256"],
-            "note_text": baseline["note_text"],
+            "note_text": canonical_source_note_text(baseline["note_text"]),
         },
     }
     row = _review_row(

@@ -1033,6 +1033,47 @@ def test_release_quality_packet_is_deterministic_private_and_stale_safe(
         )
 
 
+def test_exhaustive_note_review_excludes_generated_graph_projections(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    baseline, baseline_manifest, custody_manifest = _exhaustive_inputs(
+        tmp_path, workspace
+    )
+    current_note = workspace / "02_source_memory" / "notes" / "note-000.md"
+    current_note.write_text(
+        current_note.read_text()
+        + "\n## Graph Links\n\n"
+        + "<!-- auto-zettelkasten:graph:start -->\n"
+        + "- [[Generated neighbor]]\n"
+        + "<!-- auto-zettelkasten:graph:end -->\n"
+    )
+
+    packet = audit_tool.prepare(
+        workspace,
+        "exhaustive40",
+        tmp_path / "private-review" / "packet.yml",
+        baseline_workspace=baseline,
+        baseline_manifest_path=baseline_manifest,
+        custody_manifest_path=custody_manifest,
+        bindings_path=tmp_path / "private-review" / "bindings.yml",
+    )
+
+    note_row = next(
+        row
+        for row in packet["rows"]
+        if row["kind"] == "note" and row["payload"]["source_id"] == "source-000"
+    )
+    variant_texts = [
+        variant["note_text"] for variant in note_row["payload"]["variants"].values()
+    ]
+    assert all("Generated neighbor" not in text for text in variant_texts)
+    assert all("## Graph Links" not in text for text in variant_texts)
+    assert any("Source-grounded analysis" in text for text in variant_texts)
+    assert any("Bounded prior analysis" in text for text in variant_texts)
+    assert any(row["kind"] == "relationship" for row in packet["rows"])
+
+
 def test_stratified_500_packet_preserves_mandatory_rows_above_review_caps(
     tmp_path: Path,
 ) -> None:
