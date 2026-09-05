@@ -361,6 +361,85 @@ def test_relationship_first_writer_cannot_drop_connecting_core() -> None:
     ]
 
 
+def test_relationship_first_writer_receives_admitted_roles() -> None:
+    profiles = [_profile(source_id) for source_id in ("A", "B", "C")]
+    received_roles: dict[str, str] = {}
+    receipt_roles: dict[str, str] = {}
+
+    class Reasoner:
+        name = "local"
+        model = "one"
+
+        def synthesize_cluster(self, projected, request, *, context=None):
+            received_roles.update(context["cluster"]["candidate_roles"])
+            receipt_roles.update(
+                {
+                    row["source_id"]: row["candidate_role"]
+                    for row in context["candidate_input_receipt"]["sources"]
+                }
+            )
+            response = _response(context["cluster"], projected)
+            response["member_roles"] = {"A": "context", "B": "core", "C": "core"}
+            return response
+
+    def relationship(left: str, right: str, relation_type: str) -> dict[str, Any]:
+        return {
+            "relation_id": f"relationship-{left}-{right}",
+            "source_id": left,
+            "target_source_id": right,
+            "relation_type": relation_type,
+            "provenance": "human_curated",
+            "cluster_evidence_eligible": True,
+            "active": True,
+            "source_evidence": {
+                "source_id": left,
+                "evidence_anchor_id": f"anchor-{left}",
+            },
+            "target_evidence": {
+                "source_id": right,
+                "evidence_anchor_id": f"anchor-{right}",
+            },
+        }
+
+    report = build_literature_report(
+        profiles,
+        reasoner=Reasoner(),
+        request=LiteratureMapRequest(Path(".")),
+        source_notes=[
+            {
+                "source_id": source_id,
+                "body": f"# {source_id}\n\n## Thesis\n\nFull note {source_id}.",
+            }
+            for source_id in ("A", "B", "C")
+        ],
+        accepted_relationships=[
+            relationship("A", "B", "contextual_connection"),
+            relationship("B", "C", "complements"),
+        ],
+        shared_literature_plan={
+            "literature_families": [
+                {
+                    "family_id": "family",
+                    "label": "Connected family",
+                    "source_ids": ["A", "B", "C"],
+                    "proposed_roles": {
+                        "A": "core",
+                        "B": "core",
+                        "C": "supporting",
+                    },
+                    "candidate_cluster": True,
+                }
+            ],
+            "discovery_jobs": [],
+            "neighboring_families": [],
+        },
+    )
+
+    assert received_roles == {"A": "context", "B": "core", "C": "core"}
+    assert receipt_roles == received_roles
+    assert report["cluster_registry"]["pending_revisions"] == []
+
+
 def test_cluster_prompt_requires_connected_member_roles_v36() -> None:
     prompt = _cluster_synthesis_system_prompt()
     assert "prompt v39" in prompt

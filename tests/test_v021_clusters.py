@@ -245,6 +245,10 @@ def test_one_malformed_shared_plan_cluster_is_parked_without_partial_map() -> No
     assert report["packet"]["status"] == "complete"
     assert report["cluster_registry"]["clusters"] == []
     assert len(report["packet"]["parked_cluster_ids"]) == 1
+    assert any(
+        row.get("event") == "cluster_parked_by_writer"
+        for row in report["cluster_registry"]["ledger"]
+    )
 
 
 def test_malformed_cluster_with_no_publishable_prior_stays_parked() -> None:

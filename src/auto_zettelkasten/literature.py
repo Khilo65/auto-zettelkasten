@@ -21838,9 +21838,7 @@ def build_literature_report(
         ]
         candidate_roles = {
             str(source_id): str(role)
-            for source_id, role in _as_mapping(
-                cluster.get("candidate_roles")
-            ).items()
+            for source_id, role in _proposal_source_roles(cluster).items()
             if str(source_id) in member_ids
         }
         candidate_input_receipt = {
@@ -23369,6 +23367,7 @@ def build_literature_report(
         and str(row.get("event") or "")
         in {
             "refresh_pending",
+            "cluster_parked_by_writer",
             "cluster_rejected_by_writer",
             "cluster_partition_committed",
             "cluster_partition_pending",
