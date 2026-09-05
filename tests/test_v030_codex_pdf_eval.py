@@ -1969,3 +1969,82 @@ def test_acceptance_rejects_malformed_codex_usage_telemetry(tmp_path: Path) -> N
     errors, _ = runner._acceptance(workspace, run_id, cases, report)
 
     assert "provider_usage_invalid" in errors
+
+
+def test_cluster_acceptance_allows_only_terminal_new_cluster_quarantine(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    registry_path = (
+        workspace / "03_literature_synthesis" / "cluster_registry.yml"
+    )
+    pending_cluster = {
+        "cluster_id": "cluster-parked",
+        "revision_hash": "a" * 64,
+        "source_ids": ["source-a", "source-c"],
+    }
+    pending_synthesis = {
+        "cluster_id": "cluster-parked",
+        "status": "partial",
+        "parked_for_review": True,
+        "quality_errors": ["writer_core_relationship_graph_disconnected"],
+    }
+    terminal_pending = {
+        "cluster_id": "cluster-parked",
+        "pending_revision_hash": "a" * 64,
+        "last_good_revision_hash": "",
+        "refresh_pending_source_ids": ["source-a", "source-c"],
+        "cluster": pending_cluster,
+        "synthesis": pending_synthesis,
+    }
+    write_yaml(registry_path, {"pending_revisions": [terminal_pending]})
+    report = {
+        "cluster_count": 1,
+        "synthesized_cluster_count": 1,
+        "cluster_map": {
+            "clusters": [
+                {"cluster_id": "cluster-active", "source_ids": ["source-a", "source-b"]}
+            ],
+            "unclustered_sources": [{"source_id": "source-c"}],
+        },
+        "literature_packet": {
+            "status": "complete",
+            "cluster_ids": ["cluster-active"],
+            "parked_cluster_ids": ["cluster-parked"],
+            "refresh_pending_cluster_ids": [],
+        },
+    }
+
+    errors = runner._cluster_errors(
+        workspace, {"source-a", "source-b", "source-c"}, report
+    )
+    assert "cluster_registry_incomplete" not in errors
+
+    invalid_pending: list[Any] = [1]
+    for path, value in (
+        (("last_good_revision_hash",), "b" * 64),
+        (("last_good_revision_hash",), False),
+        (("pending_revision_hash",), ""),
+        (("cluster_id",), False),
+        (("retry_on_resume",), True),
+        (("retry_on_resume",), []),
+        (("cluster", "source_ids"), 1),
+        (("cluster", "source_ids"), ["source-outsider"]),
+        (("cluster", "refresh_pending"), True),
+        (("cluster", "refresh_pending"), 0),
+        (("synthesis", "refresh_pending"), True),
+        (("synthesis", "refresh_pending"), ""),
+        (("synthesis", "quality_errors"), "malformed"),
+    ):
+        row = json.loads(json.dumps(terminal_pending))
+        target = row
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = value
+        invalid_pending.append([row])
+    for pending in invalid_pending:
+        write_yaml(registry_path, {"pending_revisions": pending})
+        errors = runner._cluster_errors(
+            workspace, {"source-a", "source-b", "source-c"}, report
+        )
+        assert "cluster_registry_incomplete" in errors

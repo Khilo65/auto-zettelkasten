@@ -2413,6 +2413,86 @@ def _private_expectation_errors(
     return errors, passed
 
 
+def _unique_string_set(value: Any) -> set[str] | None:
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) or not item for item in value
+    ):
+        return None
+    result = set(value)
+    return result if len(result) == len(value) else None
+
+
+def _terminal_cluster_quarantine_valid(
+    pending: Any,
+    packet: Any,
+    active_cluster_ids: set[str],
+    eligible_source_ids: set[str],
+) -> bool:
+    if not isinstance(pending, list):
+        return False
+    if not pending:
+        return True
+    if not isinstance(packet, Mapping):
+        return False
+    parked_ids: set[str] = set()
+
+    def disabled_flag(row: Mapping[str, Any], key: str) -> bool:
+        return key not in row or row[key] is None or row[key] is False
+
+    for row in pending:
+        if not isinstance(row, Mapping):
+            return False
+        cluster = row.get("cluster")
+        synthesis = row.get("synthesis")
+        cluster_id = row.get("cluster_id")
+        source_ids = (
+            _unique_string_set(cluster.get("source_ids"))
+            if isinstance(cluster, Mapping)
+            else None
+        )
+        refresh_ids = _unique_string_set(row.get("refresh_pending_source_ids"))
+        revision = row.get("pending_revision_hash")
+        quality_errors = (
+            synthesis.get("quality_errors")
+            if isinstance(synthesis, Mapping)
+            else None
+        )
+        if not (
+            isinstance(cluster_id, str)
+            and cluster_id
+            and cluster_id not in active_cluster_ids | parked_ids
+            and isinstance(cluster, Mapping)
+            and cluster.get("cluster_id") == cluster_id
+            and source_ids
+            and source_ids <= eligible_source_ids
+            and refresh_ids == source_ids
+            and row.get("last_good_revision_hash") == ""
+            and isinstance(revision, str)
+            and _SHA256.fullmatch(revision)
+            and revision == cluster.get("revision_hash")
+            and disabled_flag(row, "retry_on_resume")
+            and disabled_flag(row, "refresh_pending")
+            and disabled_flag(cluster, "refresh_pending")
+            and isinstance(synthesis, Mapping)
+            and synthesis.get("cluster_id") == cluster_id
+            and synthesis.get("status") == "partial"
+            and synthesis.get("parked_for_review") is True
+            and isinstance(quality_errors, list)
+            and bool(quality_errors)
+            and all(isinstance(error, str) and error for error in quality_errors)
+            and disabled_flag(synthesis, "retry_on_resume")
+            and disabled_flag(synthesis, "refresh_pending")
+        ):
+            return False
+        parked_ids.add(cluster_id)
+    return (
+        packet.get("status") == "complete"
+        and _unique_string_set(packet.get("cluster_ids")) == active_cluster_ids
+        and _unique_string_set(packet.get("parked_cluster_ids")) == parked_ids
+        and _unique_string_set(packet.get("refresh_pending_cluster_ids")) == set()
+    )
+
+
 def _cluster_errors(
     workspace: Path,
     source_ids: set[str],
@@ -2449,7 +2529,17 @@ def _cluster_errors(
     registry = read_yaml(
         workspace / "03_literature_synthesis" / "cluster_registry.yml", {}
     ) or {}
-    if not isinstance(registry, Mapping) or registry.get("pending_revisions"):
+    active_cluster_ids = {
+        str(cluster.get("cluster_id") or "")
+        for cluster in clusters
+        if str(cluster.get("cluster_id") or "")
+    }
+    if not isinstance(registry, Mapping) or not _terminal_cluster_quarantine_valid(
+        registry.get("pending_revisions", []),
+        report.get("literature_packet"),
+        active_cluster_ids,
+        source_ids,
+    ):
         errors.append("cluster_registry_incomplete")
     synthesized = int(
         report.get(
