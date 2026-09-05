@@ -15993,6 +15993,11 @@ def _source_bundle_from_result(
                 source_text,
             ).casefold(),
         ).strip()
+        ocr_source_words = (
+            dehyphenated_source_words
+            if str(row.get("content_route") or "").endswith("_tesseract")
+            else ""
+        )
         concepts = str(
             (payload.get("analysis_sections") or {}).get(
                 "key_concepts_and_definitions", ""
@@ -16006,6 +16011,18 @@ def _source_bundle_from_result(
             if (
                 quote_words not in source_words
                 and quote_words not in dehyphenated_source_words
+                and not (
+                    ocr_source_words
+                    and re.search(
+                        r"(?<!\w)"
+                        + r"\s+".join(
+                            r"\s*".join(map(re.escape, word))
+                            for word in quote_words.split()
+                        )
+                        + r"(?!\w)",
+                        ocr_source_words,
+                    )
+                )
             ):
                 raise ValueError("analysis_quote_not_found_in_source")
     anchors = payload.get("evidence_anchors", [])

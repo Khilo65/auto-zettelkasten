@@ -1184,6 +1184,30 @@ def test_long_key_concept_quotation_accepts_ocr_line_wrap_hyphenation() -> None:
     assert _source_bundle_from_result(payload, row, "full_document") is not None
 
 
+def test_long_key_concept_quotation_accepts_ocr_intra_word_spacing() -> None:
+    payload = _bundle_payload()
+    exact = "an organized effort to spread a particular belief or doctrine"
+    payload["analysis_sections"]["key_concepts_and_definitions"] = (
+        f'**Propaganda** — “{exact}” (p. 20).'
+    )
+    row = {
+        "source_id": "source-zotero-A1",
+        "zotero_item_key": "A1",
+        "content_route": "pypdf_pdfium_tesseract",
+        "text": "an organized effort to spre ad a particular belief or doctrine",
+    }
+
+    assert _source_bundle_from_result(payload, row, "full_document") is not None
+
+    payload["analysis_sections"]["key_concepts_and_definitions"] = (
+        "**Location** — “the phrase says now here within the source text today” "
+        "(p. 20)."
+    )
+    row["text"] = "the phrase says nowhere within the source text today"
+    with pytest.raises(ValueError, match="analysis_quote_not_found_in_source"):
+        _source_bundle_from_result(payload, row, "full_document")
+
+
 def test_unique_quote_locator_restores_source_casing() -> None:
     payload = _bundle_payload()
     payload["evidence_anchors"][0].update(
