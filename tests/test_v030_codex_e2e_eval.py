@@ -2400,7 +2400,7 @@ def test_strategic8_two_core_revalidation_preserves_failed_run(
     assert receipt["strategic8_actual_core_count"] == 2
     assert (
         receipt["strategic8_role_policy"]
-        == "probabilistic_cluster_family_connected_cores_v4"
+        == "probabilistic_cluster_family_grounded_overlap_v5"
     )
     after = runner.base._gate_snapshot(workspace)
     assert after.pop(str(receipt_path.relative_to(workspace)))
@@ -2509,6 +2509,28 @@ def test_private_strategic8_cluster_labels_never_enter_provider_inputs(
     )
     assert errors == []  # Valid overlapping subquestions need not collapse to one cluster.
     assert acceptance["strategic8_expected_group_cluster_count"] == 2
+
+    control_relation = {
+        "source_id": source_ids[4],
+        "target_source_id": source_ids[0],
+        "decision_status": "accepted",
+        "active": True,
+    }
+    registry["relations"].append(control_relation)
+    report["cluster_map"]["clusters"][0]["source_ids"].append(source_ids[4])
+    report["cluster_map"]["clusters"][0]["source_roles"].append(
+        {"source_id": source_ids[4], "role": "context"}
+    )
+    for name in ("typed_links.yml", "typed_note_links.yml"):
+        write_yaml(tmp_path / "02_source_memory" / "indexes" / name, registry)
+    errors, acceptance = runner._strategic8_oracle_acceptance(
+        tmp_path, cases, report, oracle
+    )
+    assert errors == []  # Grounded context may cross a private fixture label.
+    assert acceptance["strategic8_expected_member_coverage_count"] == 4
+    registry["relations"].pop()
+    for name in ("typed_links.yml", "typed_note_links.yml"):
+        write_yaml(tmp_path / "02_source_memory" / "indexes" / name, registry)
     report["cluster_map"]["clusters"] = [exact_cluster]
 
     roles = report["cluster_map"]["clusters"][0]["source_roles"]

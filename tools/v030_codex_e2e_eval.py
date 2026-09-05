@@ -946,7 +946,6 @@ def _strategic8_oracle_acceptance(
     }
     expected_members = {source_by_parent[str(key)] for key in oracle["core_parent_keys"]}
     context = source_by_parent[str(oracle["context_parent_key"])]
-    controls = {source_by_parent[str(key)] for key in oracle["control_parent_keys"]}
     expected_members.add(context)
     clusters = (
         report.get("cluster_map", {}).get("clusters", [])
@@ -961,22 +960,13 @@ def _strategic8_oracle_acceptance(
     expected_group_clusters = [
         (row, members)
         for row, members in cluster_rows
-        if len(members) >= 2 and members <= expected_members
+        if len(members & expected_members) >= 2
     ]
     covered_members = set().union(
-        *(members for _row, members in expected_group_clusters)
+        *(members & expected_members for _row, members in expected_group_clusters)
     )
-    membership_sets = [frozenset(members) for _row, members in expected_group_clusters]
-    if (
-        covered_members != expected_members
-        or len(set(membership_sets)) != len(membership_sets)
-    ):
+    if covered_members != expected_members:
         errors.append("strategic8_expected_cluster_missing_or_duplicated")
-    if any(
-        members & expected_members and members & controls
-        for _row, members in cluster_rows
-    ):
-        errors.append("strategic8_control_in_expected_cluster")
 
     cluster_roles: list[tuple[set[str], set[str], bool]] = []
     for row, members in expected_group_clusters:
@@ -1055,7 +1045,7 @@ def _strategic8_oracle_acceptance(
     core_counts = [len(core) for _members, core, valid in cluster_roles if valid]
     return sorted(set(errors)), {
         "strategic8_semantic_oracle_sha256": str(oracle["sha256"]),
-        "strategic8_role_policy": "probabilistic_cluster_family_connected_cores_v4",
+        "strategic8_role_policy": "probabilistic_cluster_family_grounded_overlap_v5",
         "strategic8_actual_core_count": (
             core_counts[0] if len(core_counts) == 1 else None
         ),
