@@ -5,6 +5,7 @@ from pathlib import Path
 
 from auto_zettelkasten.files import write_yaml
 from auto_zettelkasten.models import RelationshipPairJob
+from auto_zettelkasten.pipeline import _relationship_transport_context
 from auto_zettelkasten.readers import _relationship_adjudication_system_prompt
 from auto_zettelkasten.relationships import (
     RELATIONSHIP_DECISION_CONTRACT,
@@ -78,6 +79,44 @@ def _connection(
         "reason": "The two source-specific bases establish this connection.",
         "confidence": 0.8,
     }
+
+
+def test_relationship_packet_scopes_anchor_choices_to_each_pair() -> None:
+    job_ab = _v9_job()
+    source_c = _v9_profile("C")
+    job_ac = RelationshipPairJob(
+        left_source_id="A", right_source_id="C",
+        profiles={"left": _v9_profile("A"), "right": source_c},
+        selected_evidence={
+            "left": _v9_profile("A")["evidence_anchors"],
+            "right": source_c["evidence_anchors"],
+        },
+        output_contract=RELATIONSHIP_DECISION_CONTRACT,
+    )
+    context = _relationship_transport_context(
+        [job_ab, job_ac], decision_contract=RELATIONSHIP_DECISION_CONTRACT,
+    )
+    assert [row["allowed_evidence_anchor_ids"] for row in context["pair_jobs"]] == [
+        {"source_a": ["anchor-a"], "source_b": ["anchor-b"]},
+        {"source_a": ["anchor-a"], "source_b": ["anchor-c"]},
+    ]
+    connection = {
+        **_connection("Both sources discuss the same reported event.", "contextual_connection"),
+        "source_a_anchor_ids": ["anchor-a"],
+        "source_b_anchor_ids": ["anchor-c"],
+    }
+    def ingest():
+        return ingest_relationship_decision_batch(
+            {"decisions": [{"pair_job_id": job_ab.pair_job_id,
+                            "decision": "relationship", "connections": [connection]}]},
+            pair_jobs=[job_ab], profiles=[_v9_profile(value) for value in "ABC"],
+        )
+
+    assert not ingest()["accepted"]
+    assert ingest()["parked"]
+    connection["source_b_anchor_ids"] = ["anchor-b"]
+    assert len(ingest()["accepted"]) == 1
+    assert not ingest()["parked"]
 
 
 def test_v8_salvages_valid_connections_and_keeps_anchors_optional() -> None:
@@ -194,10 +233,12 @@ def test_v9_parks_relationship_without_owned_endpoint_anchors() -> None:
     assert "complete semantic record" in str(result["parked"][0].get("error") or "")
 
 
-def test_v29_is_compact_domain_neutral_source_owned_and_complete() -> None:
+def test_v30_is_compact_domain_neutral_source_owned_and_complete() -> None:
     prompt = _relationship_adjudication_system_prompt()
 
-    assert "relationship prompt v29" in prompt
+    assert "relationship prompt v30" in prompt
+    assert "allowed_evidence_anchor_ids" in prompt
+    assert "another source's IDs are never interchangeable" in prompt
     assert "contract relationship-decision-v9" in prompt
     assert "source_a_basis describes only the supplied left_source_id" in prompt
     assert "source_b_basis only the supplied right_source_id" in prompt
@@ -218,7 +259,7 @@ def test_v29_is_compact_domain_neutral_source_owned_and_complete() -> None:
     assert "does not support the evidence source merely by relying on it" in prompt
     assert "every ID appears exactly once" in prompt
     assert "use no_relationship rather than omitting a pair" in prompt
-    assert len(prompt) <= 5_000
+    assert len(prompt) <= 5_300
     assert not any(
         name in prompt.casefold()
         for name in ("svensson", "mediation", "civil war", "peacekeeping")

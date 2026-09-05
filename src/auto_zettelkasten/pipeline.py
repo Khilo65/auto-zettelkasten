@@ -150,6 +150,7 @@ from .relationships import (
     projected_related_links,
     relationship_decision_key,
     RELATIONSHIP_ENVELOPE_CONTRACTS,
+    RELATIONSHIP_DECISION_CONTRACT,
     RELATIONSHIP_DECISION_NORMALIZATION_VERSION,
     RELATIONSHIP_DISCOVERY_PROMPT_VERSION,
     RELATIONSHIP_PROMPT_VERSION,
@@ -11695,6 +11696,20 @@ def _relationship_transport_context(
             in {"relationship-decision-v7", *RELATIONSHIP_ENVELOPE_CONTRACTS}
             else {}
         )
+        if decision_contract == RELATIONSHIP_DECISION_CONTRACT:
+            row["allowed_evidence_anchor_ids"] = {
+                label: sorted({
+                    str(anchor["evidence_anchor_id"])
+                    for anchor in (selected_evidence.get(side) or selected_evidence.get(source_id) or [])
+                    if isinstance(anchor, Mapping)
+                    and anchor.get("evidence_anchor_id")
+                    and str(anchor.get("source_id") or source_id) == source_id
+                })
+                for label, side, source_id in (
+                    ("source_a", "left", job.left_source_id),
+                    ("source_b", "right", job.right_source_id),
+                )
+            }
         for side, source_id in (
             ("left", job.left_source_id),
             ("right", job.right_source_id),
