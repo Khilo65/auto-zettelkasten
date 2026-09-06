@@ -5781,7 +5781,7 @@ def _relationship_candidate_system_prompt() -> str:
 
 def _relationship_adjudication_system_prompt() -> str:
     return (
-        "Auto-Zettelkasten relationship prompt v33, contract relationship-decision-v9. Read both "
+        "Auto-Zettelkasten relationship prompt v34, contract relationship-decision-v9. Read both "
         "complete atomic notes. Return JSON decisions keyed by every supplied pair_job_id, no extras: "
         "either {decision:no_relationship, reason, confidence} or "
         "{decision:relationship, connections:[...]}. Use one connection, or two for distinct propositions, containing comparison_proposition, "
@@ -5834,10 +5834,10 @@ def _relationship_adjudication_system_prompt() -> str:
         "complements, contrasts, "
         "boundary_contrast, methodological_fault_line, interpretive_or_normative_disagreement, "
         "and contextual_connection are symmetric and may use nulls; all directional types "
-        "require exact supplied endpoints as actor/reference. Check every ID appears exactly once; "
-        "use no_relationship rather than omitting a pair. "
+        "require exact supplied endpoints as actor/reference. Check every ID appears exactly once. "
         "Self-review once: for connections, read 'ACTOR [relation type] REFERENCE' and verify bases, boundaries and source ownership. "
-        "For rejections, verify whole-note scope and that the reason rules out contextual usefulness, not merely direct equivalence. "
+        "For rejections, verify whole-note scope, not merely direct equivalence. "
+        "If the reason identifies a useful bounded connection, return relationship with its grounded connection instead. "
         "No display labels, Markdown, invented IDs, locators, provenance or timestamps."
     )
 

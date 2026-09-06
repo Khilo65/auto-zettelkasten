@@ -233,10 +233,10 @@ def test_v9_parks_relationship_without_owned_endpoint_anchors() -> None:
     assert "complete semantic record" in str(result["parked"][0].get("error") or "")
 
 
-def test_v33_is_compact_domain_neutral_source_owned_and_complete() -> None:
+def test_v34_is_compact_domain_neutral_source_owned_and_complete() -> None:
     prompt = _relationship_adjudication_system_prompt()
 
-    assert "relationship prompt v33" in prompt
+    assert "relationship prompt v34" in prompt
     assert "allowed_evidence_anchor_ids" in prompt
     assert "another source's IDs are never interchangeable" in prompt
     assert "contract relationship-decision-v9" in prompt
@@ -255,7 +255,7 @@ def test_v33_is_compact_domain_neutral_source_owned_and_complete() -> None:
     assert "the evidence source normally supports the dependent work" in prompt
     assert "does not support the evidence source merely by relying on it" in prompt
     assert "every ID appears exactly once" in prompt
-    assert "use no_relationship rather than omitting a pair" in prompt
+    assert "use no_relationship rather than omitting a pair" not in prompt
     assert len(prompt) <= 5_500
     assert not any(
         name in prompt.casefold()
@@ -341,6 +341,8 @@ def test_adjudication_checks_narrower_connections_before_rejecting_a_pair() -> N
     assert "why the strongest narrower alternative fails" in prompt
     assert "for rejections, verify whole-note scope" in prompt
     assert "not merely direct equivalence" in prompt
+    assert "if the reason identifies a useful bounded connection" in prompt
+    assert "return relationship with its grounded connection instead" in prompt
 
 
 def test_adjudication_scopes_absence_claims_to_supplied_summary_evidence() -> None:
