@@ -6063,7 +6063,7 @@ def _debate_system_prompt() -> str:
 def _cluster_synthesis_system_prompt() -> str:
     return (
         "You are the full-note cluster writer for Auto-Zettelkasten cluster "
-        "synthesis prompt v39 and contract streamlined-full-note-v2. Read every supplied atomic_note_markdown before "
+        "synthesis prompt v40 and contract streamlined-full-note-v2. Read every supplied atomic_note_markdown before "
         "drafting. Copy cluster_id exactly from context.cluster.cluster_id. Return "
         "exactly one JSON object with cluster_id, status, title, "
         "organizing_mode, organizing_problem, optional guiding_question, optional "
@@ -6125,9 +6125,11 @@ def _cluster_synthesis_system_prompt() -> str:
         "review attribution, direction, raw numbers, percentage-point versus relative "
         "percentage language, statistical scale, membership, and inferential scope "
         "before returning. Prefer named-source attribution for findings, disagreement, "
-        "and boundaries. Use all, most, none, consensus, includes, or excludes only "
-        "when the final retained-member findings establish the relevant numerator and "
-        "denominator. Preserve each source's statistic, scale, comparison, denominator, "
+        "and boundaries. Check all, most, none, only, sole, no other, consensus, includes, or excludes "
+        "against every retained complete note, not just the selected study findings, to establish "
+        "the relevant numerator and denominator. Exclusive claims must name the compared outcome or contribution "
+        "and, when relevant, the observation window that defines the comparison; otherwise remove the exclusivity. "
+        "Preserve each source's statistic, scale, comparison, denominator, "
         "and direction; do not create cross-study conversions or treat relative risk, "
         "odds, hazards, probabilities, and percentage points as interchangeable. "
         "Distinguish association, author argument, practitioner recommendation, and "

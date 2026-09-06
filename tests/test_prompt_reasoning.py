@@ -368,7 +368,7 @@ def test_partial_source_prompt_prohibits_complete_document_inference() -> None:
 def test_cluster_prompt_preserves_inference_and_case_evidence() -> None:
     prompt = _cluster_synthesis_system_prompt()
 
-    assert "cluster synthesis prompt v39" in prompt
+    assert "cluster synthesis prompt v40" in prompt
     assert "Read every supplied atomic_note_markdown" in prompt
     assert "Every retained member" in prompt
     assert "specific study finding" in prompt
@@ -388,10 +388,14 @@ def test_cluster_prompt_preserves_observation_windows_without_excluding_context(
     from auto_zettelkasten.literature import _synthesis_stage_prompt_version
 
     prompt = _cluster_synthesis_system_prompt()
-    assert _synthesis_stage_prompt_version("cluster_synthesis") == "39"
+    assert _synthesis_stage_prompt_version("cluster_synthesis") == "40"
     assert "Preserve each source's observation period in cross-source comparisons" in prompt
     assert "explicitly dated context, not contemporaneous evidence" in prompt
     assert "different instruments, samples, or time windows" in prompt
+    assert "every retained complete note, not just the selected study findings" in prompt
+    assert "Exclusive claims must name the compared outcome or contribution" in prompt
+    assert "when relevant, the observation window that defines the comparison" in prompt
+    assert "otherwise remove the exclusivity" in prompt
 
 
 def test_gap_prompt_rejects_invented_resolution_details() -> None:
