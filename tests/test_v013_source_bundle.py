@@ -5663,6 +5663,37 @@ def test_quantitative_provenance_rejects_omitted_predicate_counts(claim: str) ->
         _source_bundle_from_result(payload, row, "full_document")
 
 
+@pytest.mark.parametrize(
+    "context, estimate, error",
+    [
+        ("in the 2018 rank", "62.4", ""),
+        ("in the 2018 ranking", "62.4", ""),
+        ("in the 2018 rankings", "62.4", ""),
+        ("among 2018 people", "62.4", "quantitative_anchor_contains_unmodeled_quantity"),
+        ("and held rank 2018", "62.4", "quantitative_anchor_contains_unmodeled_quantity"),
+        ("in the 2018 rank", "61.2", "reported_estimate_not_found_in_source"),
+    ],
+)
+def test_quantitative_provenance_distinguishes_ranking_year_from_quantity(
+    context: str, estimate: str, error: str,
+) -> None:
+    payload = _bundle_payload()
+    payload["evidence_anchors"][0].update(
+        claim=f"The group scored {estimate} {context}.",
+        quantitative_result={"estimate": estimate, "provenance": "source_reported"},
+    )
+    row = {
+        "source_id": "source-zotero-A1", "zotero_item_key": "A1",
+        "text": f"The group scored 62.4 {context}.",
+    }
+    if error:
+        with pytest.raises(SourceBundleQuantitativeProvenanceError, match=error):
+            _source_bundle_from_result(payload, row, "full_document")
+    else:
+        bundle = _source_bundle_from_result(payload, row, "full_document")
+        assert bundle.evidence_anchors[0].quantitative_result.estimate == estimate
+
+
 def test_quantitative_provenance_rejects_unmodeled_anchor_quantity() -> None:
     payload = _bundle_payload()
     anchor = payload["evidence_anchors"][0]
