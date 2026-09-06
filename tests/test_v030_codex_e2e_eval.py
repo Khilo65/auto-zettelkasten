@@ -2352,9 +2352,10 @@ def test_runner_rejects_auto_zettelkasten_from_another_checkout(
 
 
 @pytest.mark.parametrize("non_core_role", ["context", "bridge"])
+@pytest.mark.parametrize("omit_linked_member", [False, True])
 def test_strategic8_two_core_revalidation_preserves_failed_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-    non_core_role: str,
+    non_core_role: str, omit_linked_member: bool,
 ) -> None:
     path, _path40, custody8, custody40 = _strategic_manifests(tmp_path / "private")
     _bind_synthetic_strategic_fixture(monkeypatch, custody8, custody40)
@@ -2368,13 +2369,14 @@ def test_strategic8_two_core_revalidation_preserves_failed_run(
     }
     cores = [source_by_key[key] for key in oracle["core_parent_keys"]]
     members = [*cores, source_by_key[oracle["context_parent_key"]]]
+    clustered = members[:-1] if omit_linked_member else members
     report = {
         "status": "completed",
         "cluster_map": {"clusters": [{
-            "source_ids": members,
+            "source_ids": clustered,
             "source_roles": {
                 source: "core" if source in cores[:2] else non_core_role
-                for source in members
+                for source in clustered
             },
         }]},
     }
@@ -2428,9 +2430,10 @@ def test_strategic8_two_core_revalidation_preserves_failed_run(
     assert receipt["attempt_reservation_state"] == "failed_preserved"
     assert receipt["exact_zero_call_replay"] is True
     assert receipt["strategic8_actual_core_count"] == 2
+    assert receipt["strategic8_expected_member_coverage_count"] == len(clustered)
     assert (
         receipt["strategic8_role_policy"]
-        == "probabilistic_cluster_family_grounded_overlap_v5"
+        == "probabilistic_cluster_boundaries_connected_notes_v6"
     )
     after = runner.base._gate_snapshot(workspace)
     assert after.pop(str(receipt_path.relative_to(workspace)))
@@ -2518,6 +2521,26 @@ def test_private_strategic8_cluster_labels_never_enter_provider_inputs(
     assert acceptance["strategic8_evaluated_required_pair_count"] == 6
 
     exact_cluster = report["cluster_map"]["clusters"][0]
+    report["cluster_map"]["clusters"] = [{
+        "source_ids": expected[:3],
+        "source_roles": [
+            {"source_id": source_id, "role": "core"}
+            for source_id in expected[:3]
+        ],
+    }]
+    errors, acceptance = runner._strategic8_oracle_acceptance(
+        tmp_path, cases, report, oracle
+    )
+    assert errors == []  # Atomic links need not imply cluster membership.
+    assert acceptance["strategic8_expected_member_coverage_count"] == 3
+    removed = registry["relations"].pop()
+    write_yaml(tmp_path / "02_source_memory" / "indexes" / "typed_links.yml", registry)
+    errors, _acceptance = runner._strategic8_oracle_acceptance(
+        tmp_path, cases, report, oracle
+    )
+    assert errors == ["strategic8_core_not_connected_by_accepted_edges"]
+    registry["relations"].append(removed)
+    write_yaml(tmp_path / "02_source_memory" / "indexes" / "typed_links.yml", registry)
     report["cluster_map"]["clusters"] = [
         {
             "source_ids": source_ids[:3],

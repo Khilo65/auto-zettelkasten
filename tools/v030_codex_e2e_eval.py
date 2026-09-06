@@ -965,7 +965,7 @@ def _strategic8_oracle_acceptance(
     covered_members = set().union(
         *(members & expected_members for _row, members in expected_group_clusters)
     )
-    if covered_members != expected_members:
+    if not expected_group_clusters:
         errors.append("strategic8_expected_cluster_missing_or_duplicated")
 
     cluster_roles: list[tuple[set[str], set[str], bool]] = []
@@ -1027,7 +1027,8 @@ def _strategic8_oracle_acceptance(
                 return reached == nodes
             reached = expanded
 
-    if covered_members == expected_members and not connected(expected_members):
+    # Required atomic-note connectivity is independent of optional cluster boundaries.
+    if not connected(expected_members):
         errors.append("strategic8_core_not_connected_by_accepted_edges")
     for members, core, roles_valid in cluster_roles:
         if not roles_valid:
@@ -1045,7 +1046,7 @@ def _strategic8_oracle_acceptance(
     core_counts = [len(core) for _members, core, valid in cluster_roles if valid]
     return sorted(set(errors)), {
         "strategic8_semantic_oracle_sha256": str(oracle["sha256"]),
-        "strategic8_role_policy": "probabilistic_cluster_family_grounded_overlap_v5",
+        "strategic8_role_policy": "probabilistic_cluster_boundaries_connected_notes_v6",
         "strategic8_actual_core_count": (
             core_counts[0] if len(core_counts) == 1 else None
         ),
