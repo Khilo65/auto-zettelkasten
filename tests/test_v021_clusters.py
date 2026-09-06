@@ -604,7 +604,7 @@ def test_acquisition_reconciliation_is_additive_and_idempotent(tmp_path: Path) -
 
 
 def test_literature_family_stage_has_explicit_checkpoint_mappings() -> None:
-    assert _synthesis_stage_prompt_version("literature_family_plan") == "13"
+    assert _synthesis_stage_prompt_version("literature_family_plan") == "14"
     assert (
         _synthesis_stage_budget_group("literature_family_plan")
         == "literature_family_plan"

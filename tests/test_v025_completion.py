@@ -37,15 +37,15 @@ def test_v29_4_relationship_packet_and_family_plan_limits() -> None:
     assert "every ID appears exactly once" in prompt
     assert _RELATIONSHIP_BATCH_MAX_JOBS == 8
     assert LITERATURE_FAMILY_PLAN_MAX_OUTPUT_TOKENS == 128_000
-    assert LITERATURE_FAMILY_PLAN_PROMPT_VERSION == "13"
+    assert LITERATURE_FAMILY_PLAN_PROMPT_VERSION == "14"
     family_prompt = _literature_family_plan_system_prompt()
-    assert "cluster plan prompt v13" in family_prompt
+    assert "cluster plan prompt v14" in family_prompt
     assert "candidate_cluster=true" in family_prompt
     assert "candidate_cluster=false" in family_prompt
     assert "routing-only grouping" in family_prompt
     assert "later evidence-based admission" in family_prompt
     assert "independent of whether cluster generation is enabled" in family_prompt
-    assert "not relationship rejections" in family_prompt
+    assert "not final memberships or relationship rejections" in family_prompt
     assert "full supplied thesis and method, not only one outcome" in family_prompt
     assert "rather than requiring identical measures" in family_prompt
 
@@ -77,6 +77,16 @@ def test_family_reconciliation_prompt_distinguishes_cards_from_sources() -> None
     assert "mutually exclusive merge groups of at least two cards" in prompt
     assert "all four arrays may be empty when no merge is justified" in prompt
     assert "Do not expand groups into original work IDs" in prompt
+
+
+def test_family_planner_keeps_candidate_placement_distinct_from_final_membership() -> None:
+    prompt = _literature_family_plan_system_prompt()
+
+    assert "Source dispositions are cluster-membership decisions" not in prompt
+    assert "provisional candidate placements" in prompt
+    assert "source_ids is its bounded candidate pool" in prompt
+    assert "full-note review may narrow that pool and revise roles" in prompt
+    assert "plausible contribution to the organizing problem" in prompt
 
 
 def test_cluster_scheduler_uses_all_explicitly_available_calls() -> None:
