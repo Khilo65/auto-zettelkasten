@@ -1184,6 +1184,73 @@ def test_long_key_concept_quotation_accepts_ocr_line_wrap_hyphenation() -> None:
     assert _source_bundle_from_result(payload, row, "full_document") is not None
 
 
+@pytest.mark.parametrize(
+    "header, title, pages, media_type, expected",
+    [
+        ("", "Signal Manual", (1, 2, 3), "application/pdf", True),
+        ("{page}——Signal Manual\n", "Signal Manual", (1, 2, 3), "application/pdf", True),
+        ("{page}——Signal Manual\n", "Another Manual", (1, 2, 3), "application/pdf", False),
+        ("{page}——Signal Manual\n", "Signal Manual", (1, 2), "application/pdf", False),
+        ("{page}——Signal Manual\n", "Signal Manual", (1, 3, 4), "application/pdf", False),
+        ("", "Signal Manual", (1, 3, 4), "application/pdf", False),
+        ("", "Signal Manual", (1, 2, 3), "text/html", False),
+        ("{page}——Signal Manual\nNever ", "Signal Manual", (1, 2, 3), "application/pdf", False),
+        ("{page}——Signal Manual\n", "Signal Manual", (1, 2, 2), "application/pdf", False),
+        ("{page}——Signal Manual\n", "Signal Manual", (2, 1, 3), "application/pdf", False),
+        ("10——Signal Manual\n", "Signal Manual", (1, 2, 3), "application/pdf", False),
+        ("Preface\n{page}——Signal Manual\n", "Signal Manual", (1, 2, 3), "application/pdf", False),
+    ],
+)
+def test_source_quotes_across_pdf_pages(
+    header, title, pages, media_type, expected,
+) -> None:
+    payload = _bundle_payload()
+    span = "Each sensor records a timestamp before sending the signal"
+    payload["analysis_sections"]["key_concepts_and_definitions"] = f'“{span}”'
+    payload["evidence_anchors"][0].update(
+        locator=f'Quote "{span.lower()}"', locators=[f'Quote "{span.lower()}"'],
+    )
+    text = "\n".join(
+        f"--- Page {page} ---\n{header.format(page=page + 10)}{body}"
+        for page, body in zip(pages, (
+            "Each sensor records a timestamp", "before sending the signal", "Appendix",
+        ))
+    )
+    row = {
+        "source_id": "source-zotero-A1", "zotero_item_key": "A1",
+        "item": {"data": {"title": title}}, "media_type": media_type, "text": text,
+    }
+    if expected:
+        bundle = _source_bundle_from_result(deepcopy(payload), row, "full_document")
+        assert bundle.evidence_anchors[0].locator == f'Quote "{span}"'
+        assert row["text"] == text
+        row["text"] += f"\n{span}"
+        with pytest.raises(ValueError, match="quote_locator_not_unique_in_source"):
+            _source_bundle_from_result(deepcopy(payload), row, "full_document")
+    else:
+        with pytest.raises(ValueError, match="analysis_quote_not_found_in_source"):
+            _source_bundle_from_result(deepcopy(payload), row, "full_document")
+        payload["analysis_sections"]["key_concepts_and_definitions"] = "Signal timing"
+        with pytest.raises(ValueError, match="quote_locator_not_unique_in_source"):
+            _source_bundle_from_result(payload, row, "full_document")
+
+
+def test_long_key_concept_quotation_accepts_pdf_page_wrap_hyphenation() -> None:
+    payload = _bundle_payload()
+    payload["analysis_sections"]["key_concepts_and_definitions"] = (
+        '“Every sensor sends a collective signal before the daily reset”'
+    )
+    row = {
+        "source_id": "source-zotero-A1", "zotero_item_key": "A1",
+        "media_type": "application/pdf",
+        "text": (
+            "--- Page 1 ---\nEvery sensor sends a collec-\n\n"
+            "--- Page 2 ---\n\ntive signal before the daily reset"
+        ),
+    }
+    assert _source_bundle_from_result(payload, row, "full_document") is not None
+
+
 def test_long_key_concept_quotation_accepts_ocr_intra_word_spacing() -> None:
     payload = _bundle_payload()
     exact = "an organized effort to spread a particular belief or doctrine"

@@ -3249,7 +3249,7 @@ def _source_bundle_dependency_fingerprint(
             "model": request.model,
             "prompt_version": request.prompt_version,
             "source_bundle_prompt_version": SOURCE_BUNDLE_PROMPT_VERSION,
-            "source_bundle_normalization_version": "11",
+            "source_bundle_normalization_version": "12",
         }
     if request.provider == "codex":
         execution = row.get("provider_execution_identity")
@@ -15856,6 +15856,49 @@ def _prepare_item(
     return base
 
 
+def _source_quote_comparison_text(row: Mapping[str, Any]) -> str:
+    text = str(row.get("text") or "")
+    if row.get("media_type") != "application/pdf":
+        return text
+    parts = re.split(r"(?m)^--- Page ([1-9]\d*) ---[ \t]*(?:\r?\n|$)", text)
+    pages = [int(value) for value in parts[1::2]]
+    if not pages or pages != sorted(set(pages)):
+        return text
+    item = row.get("item")
+    title = (
+        " ".join(str(item_data(item).get("title") or "").split()).casefold()
+        if isinstance(item, Mapping) else ""
+    )
+    bodies = parts[2::2]
+    headers = [
+        re.match(r"\s*(\d+)[ \t]*[-–—]+[ \t]*([^\r\n]+)(?:\r?\n|$)", body)
+        for body in bodies
+    ]
+    offsets = [
+        int(header[1]) - page
+        if header and title and " ".join(header[2].split()).casefold() == title
+        else None
+        for page, header in zip(pages, headers)
+    ]
+    counts = Counter(offsets)
+    output = [parts[0]]
+    previous_page = 0
+    previous_body = ""
+    # ponytail: only repeated numbered title headers; other furniture stays as evidence.
+    for page, body, header, offset in zip(pages, bodies, headers, offsets):
+        if offset is not None and counts[offset] >= 3:
+            body = body[header.end():]
+        if previous_body.strip() and body.strip() and page == previous_page + 1:
+            output[-1] = output[-1].rstrip()
+            output.append("\n")
+            body = body.lstrip()
+        else:
+            output.append(f"\n--- Page {page} ---\n")
+        output.append(body)
+        previous_page, previous_body = page, body
+    return "".join(output)
+
+
 def _source_bundle_from_result(
     result: Mapping[str, Any],
     row: Mapping[str, Any],
@@ -15994,8 +16037,10 @@ def _source_bundle_from_result(
         if label and heading_counts[label.casefold()] == 1
     }
     opaque_pdf_route = row.get("content_route") in {"codex_pdf_page_images", "codex_pdf_input_file"}
+    quote_source_text = _source_quote_comparison_text(row)
+    locator_source_text = " ".join(quote_source_text.split())
     if validate_quantitative_provenance and not opaque_pdf_route:
-        source_text = str(row.get("text") or "")
+        source_text = quote_source_text
         source_words = re.sub(
             r"[^\w]+", " ", source_text.casefold()
         ).strip()
@@ -16071,7 +16116,7 @@ def _source_bundle_from_result(
                     if page_suffix
                     else []
                 )
-                source_text = " ".join(str(row.get("text") or "").split())
+                source_text = locator_source_text
                 quote_pattern = (
                     re.compile(re.escape(span), flags=re.IGNORECASE)
                     if span and not opaque_pdf_route
