@@ -238,7 +238,7 @@ DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
-SOURCE_BUNDLE_PROMPT_VERSION = "31"
+SOURCE_BUNDLE_PROMPT_VERSION = "32"
 SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v2"
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
@@ -5627,7 +5627,10 @@ def _source_bundle_prompt(
         "For every comparison, resolve source pronouns and contrast markers first, then explicitly name the actor, group, outcome, expression, or measure receiving each direction in every output field; do not use former or latter, and never reverse who or what is higher, lower, more, or less frequent. "
         "Split a summary list when its examples concern different targets or outcomes. "
         "Check prose comparisons against the evidence anchors and supplied passages, not just a neighboring sentence. "
-        "Do not manufacture disagreement between aligned speakers. Use explicit text anchors rather than unverified opening/closing locations. "
+        "For every attributed quotation, paraphrase, and definition, resolve its speaker or author from the local reporting clause "
+        "and check that owner in every output field, including key_concepts_and_definitions; do not carry a neighboring speaker "
+        "across a change of attribution. Do not manufacture disagreement between aligned speakers. "
+        "Use explicit text anchors rather than unverified opening/closing locations. "
         "Each literature-position row must describe one distinct work, not a publisher's pooled reporting. Leave unknown years and titles empty; "
         "never borrow them from a neighboring citation, the cited event, or the current source's date. "
         "Do not credit a discussed work or its publisher with third-party commentary about it. "
