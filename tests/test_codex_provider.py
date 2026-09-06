@@ -17,6 +17,7 @@ from pypdf import PdfWriter
 
 import auto_zettelkasten.codex_attempt_guard as attempt_guard_module
 import auto_zettelkasten.literature as literature_module
+import auto_zettelkasten.readers as readers_module
 from auto_zettelkasten.api import (
     _provider_check,
     build_map,
@@ -765,6 +766,101 @@ def test_codex_contract_schemas_are_strict_recursively() -> None:
 
     for contract_id in CODEX_OUTPUT_CONTRACTS:
         visit(_codex_json_schema(contract_id))
+
+
+def test_codex_relationship_schema_requires_every_requested_pair() -> None:
+    pair_ids = tuple(f"relationship-job-{value * 20}" for value in "abc")
+    original = json.dumps(CODEX_OUTPUT_CONTRACTS, sort_keys=True)
+    schema = _codex_json_schema(
+        "relationship_adjudication", pair_job_ids=pair_ids
+    )
+    decisions = schema["properties"]["decisions"]
+    assert decisions["type"] == "object"
+    assert decisions["required"] == list(pair_ids)
+    assert set(decisions["properties"]) == set(pair_ids)
+    assert decisions["additionalProperties"] is False
+    for value in decisions["properties"].values():
+        for alternative in value["anyOf"]:
+            assert "pair_job_id" not in alternative["properties"]
+            assert set(alternative["required"]) == set(alternative["properties"])
+            assert alternative["additionalProperties"] is False
+    assert json.dumps(CODEX_OUTPUT_CONTRACTS, sort_keys=True) == original
+
+
+@pytest.mark.parametrize("failure", ["", "missing", "extra", "duplicate", "array", "malformed", "extra_root"])
+def test_codex_relationship_request_keys_are_strict_and_reset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    pair_ids = ("relationship-job-a", "relationship-job-b")
+    context = {"pair_jobs": [{"pair_job_id": value} for value in pair_ids]}
+    reader = CodexReader("gpt-5.6-terra", allow_cloud=True)
+    decision = {"decision": "no_relationship", "reason": "No bounded connection.", "confidence": "high"}
+
+    def generate(*_args):
+        assert readers_module._RELATIONSHIP_PAIR_JOB_IDS.get() == pair_ids
+        assert "decisions is an object" in readers_module._codex_contract_note("relationship_adjudication")
+        values = dict.fromkeys(pair_ids, decision)
+        if failure == "missing":
+            values.pop(pair_ids[-1])
+        elif failure == "extra":
+            values["relationship-job-foreign"] = decision
+        if failure == "duplicate":
+            row = json.dumps(decision)
+            return '{"decisions":{"relationship-job-a":' + row + ',"relationship-job-a":' + row + ',"relationship-job-b":' + row + '}}'
+        if failure == "malformed":
+            return '{"decisions":'
+        if failure == "extra_root":
+            return json.dumps({"decisions": values, "unexpected": "value"})
+        return json.dumps({"decisions": [] if failure == "array" else values})
+
+    monkeypatch.setattr(reader, "_generate_text", generate)
+    with deny_codex_attempts():
+        if failure:
+            with pytest.raises(ProviderError, match="exact pair keys|duplicate JSON keys|valid JSON"):
+                reader.adjudicate_relationships([], LiteratureMapRequest(tmp_path), context=context)
+        else:
+            result = reader.adjudicate_relationships([], LiteratureMapRequest(tmp_path), context=context)
+            assert [row["pair_job_id"] for row in result["decisions"]] == list(pair_ids)
+    assert readers_module._RELATIONSHIP_PAIR_JOB_IDS.get() == ()
+    assert "decisions is an array" in readers_module._codex_contract_note("relationship_adjudication")
+
+
+def test_codex_relationship_pair_bindings_are_thread_local(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    reader = CodexReader("gpt-5.6-terra", allow_cloud=True)
+    barrier = threading.Barrier(2)
+
+    def generate(*_args):
+        before = readers_module._RELATIONSHIP_PAIR_JOB_IDS.get()
+        barrier.wait(timeout=5)
+        assert readers_module._RELATIONSHIP_PAIR_JOB_IDS.get() == before
+        return json.dumps({"decisions": {before[0]: {"decision": "no_relationship", "reason": "Distinct scope.", "confidence": "high"}}})
+
+    monkeypatch.setattr(reader, "_generate_text", generate)
+    def invoke(pair_id):
+        result = reader.adjudicate_relationships([], LiteratureMapRequest(tmp_path), context={"pair_jobs": [{"pair_job_id": pair_id}]})
+        assert readers_module._RELATIONSHIP_PAIR_JOB_IDS.get() == ()
+        return result["decisions"][0]["pair_job_id"]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        assert list(executor.map(invoke, ["job-a", "job-b"])) == ["job-a", "job-b"]
+
+
+def test_codex_relationship_admission_counts_bound_schema(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    reader = CodexReader("gpt-5.6-terra", allow_cloud=True)
+    request = LiteratureMapRequest(tmp_path)
+    context = {"pair_jobs": [{"pair_job_id": f"job-{index}"} for index in range(8)]}
+    observed = []
+    def fits(*_args, **kwargs):
+        observed.append(kwargs["extra_input_tokens"])
+        return False
+
+    monkeypatch.setattr(reader, "_prompt_fits", fits)
+    monkeypatch.setattr(reader, "_generate_text", lambda *_args: pytest.fail("over-budget request must not launch"))
+    assert reader.relationship_adjudication_fits([], request, context=context) is False
+    with pytest.raises(ProviderError, match="context budget"):
+        reader.adjudicate_relationships([], request, context=context)
+    assert len(observed) == 2 and observed[0] == observed[1] > 3000
+    assert readers_module._RELATIONSHIP_PAIR_JOB_IDS.get() == ()
 
 
 def test_codex_contract_identity_covers_tool_disable_manifest(
@@ -2068,6 +2164,31 @@ def test_codex_pdf_app_server_external_cancellation_is_typed(
             future.result()
 
 
+def test_codex_relationship_completion_binds_emitted_pair_schema(tmp_path: Path) -> None:
+    executable = tmp_path / "codex"
+    capture = tmp_path / "capture.json"
+    _fake_codex(executable, capture)
+    reader = CodexReader("gpt-5.6-terra", allow_cloud=True)
+    reader._preflight = fake_codex_preflight(tmp_path, executable, {})
+    pair_ids = ("job-a", "job-b")
+    token = readers_module._RELATIONSHIP_PAIR_JOB_IDS.set(pair_ids)
+    try:
+        value = reader._generate_with_reasoning(
+            "system", "user", 2_048, 5, reasoning_effort="medium",
+            output_contract="relationship_adjudication",
+        )
+    finally:
+        readers_module._RELATIONSHIP_PAIR_JOB_IDS.reset(token)
+    captured = json.loads(capture.read_text(encoding="utf-8"))
+    assert json.loads(captured["output_schema"]) == _codex_json_schema(
+        "relationship_adjudication", pair_job_ids=pair_ids,
+    )
+    assert value.completion["request_schema_hash"] == hashlib.sha256(
+        captured["output_schema"].encode("utf-8")
+    ).hexdigest()
+    assert value.completion["request_schema_policy"] == "required-pair-keys-v1"
+
+
 @pytest.mark.parametrize("contract_id", sorted(CODEX_OUTPUT_CONTRACTS))
 def test_codex_transport_is_sanitized_schema_bound_and_tool_fail_closed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, contract_id: str,
@@ -2798,6 +2919,11 @@ elif contract == "relationship_adjudication":
             "confidence": "high",
         }}],
     }} for job in jobs]}}
+    if schema["properties"]["decisions"]["type"] == "object":
+        payload["decisions"] = {{
+            row["pair_job_id"]: {{key: value for key, value in row.items() if key != "pair_job_id"}}
+            for row in payload["decisions"]
+        }}
 elif contract == "cluster_synthesis":
     cluster = user.get("context", {{}}).get("cluster", {{}})
     member_ids = sorted(cluster.get("source_ids", []))

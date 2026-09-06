@@ -273,6 +273,9 @@ _REASONING_EFFORT: ContextVar[str | None] = ContextVar(
 _OUTPUT_CONTRACT: ContextVar[str | None] = ContextVar(
     "auto_zettelkasten_output_contract", default=None
 )
+_RELATIONSHIP_PAIR_JOB_IDS: ContextVar[tuple[str, ...]] = ContextVar(
+    "auto_zettelkasten_relationship_pair_job_ids", default=()
+)
 _SOURCE_BUNDLE_ATTACHMENTS: ContextVar[tuple[Path, ...]] = ContextVar(
     "auto_zettelkasten_source_bundle_attachments", default=()
 )
@@ -1398,6 +1401,11 @@ def codex_contract_identity(
         "adapter_protocol": "codex-cli-jsonl-v1",
         "cli_profile": cli_profile,
         "contract_id": contract_id,
+        **(
+            {"request_schema_policy": "required-pair-keys-v1"}
+            if contract_id == "relationship_adjudication"
+            else {}
+        ),
         "schema_hash": hashlib.sha256(
             json.dumps(schema, sort_keys=contract_id != "source_bundle").encode("utf-8")
         ).hexdigest(),
@@ -1430,6 +1438,14 @@ def codex_source_bundle_attachment_identity(
 
 
 def _codex_contract_note(contract_id: str) -> str:
+    if contract_id == "relationship_adjudication" and _RELATIONSHIP_PAIR_JOB_IDS.get():
+        return (
+            "For this request, decisions is an object whose required keys are the exact "
+            "supplied pair_job_ids. Return every key exactly once, with no extra keys. "
+            "Each value is the corresponding decision; do not repeat pair_job_id inside "
+            "the value. A no_relationship value contains decision, reason, confidence; "
+            "a relationship value contains decision and connections."
+        )
     return {
         "source_bundle": (
             "The recursive schema keeps optional semantic strings wire-required. "
@@ -1610,11 +1626,56 @@ def codex_execution_profile(reader: Any) -> str:
     return "0.145.0"
 
 
-def _codex_json_schema(contract_id: str) -> dict[str, Any]:
+def _codex_json_schema(
+    contract_id: str, *, pair_job_ids: tuple[str, ...] = ()
+) -> dict[str, Any]:
     contract = CODEX_OUTPUT_CONTRACTS.get(contract_id)
     if contract is None:
         raise ProviderError(f"unsupported Codex output contract: {contract_id}")
+    if pair_job_ids:
+        if contract_id != "relationship_adjudication":
+            raise ProviderError("pair-bound schemas require relationship adjudication")
+        if (
+            any(not isinstance(value, str) or not value.strip() for value in pair_job_ids)
+            or len(set(pair_job_ids)) != len(pair_job_ids)
+        ):
+            raise ProviderError("Codex relationship pair IDs must be nonempty and unique")
+        alternatives = contract["properties"]["decisions"]["items"]["anyOf"]
+        value_schema = {
+            "anyOf": [
+                _codex_object({
+                    key: value for key, value in alternative["properties"].items()
+                    if key != "pair_job_id"
+                })
+                for alternative in alternatives
+            ]
+        }
+        return _codex_object({
+            "decisions": _codex_object({key: value_schema for key in pair_job_ids})
+        })
     return dict(contract)
+
+
+def _codex_relationship_pair_ids(context: Mapping[str, Any] | None) -> tuple[str, ...]:
+    rows = (context or {}).get("pair_jobs")
+    if not isinstance(rows, list) or not rows:
+        raise ProviderError("Codex relationship adjudication requires explicit pair jobs")
+    ids = tuple(row.get("pair_job_id") if isinstance(row, Mapping) else None for row in rows)
+    if (
+        any(not isinstance(value, str) or not value.strip() for value in ids)
+        or len(set(ids)) != len(ids)
+    ):
+        raise ProviderError("Codex relationship pair IDs must be nonempty and unique")
+    return ids
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ProviderError("Codex relationship response contains duplicate JSON keys")
+        result[key] = value
+    return result
 
 _EVIDENCE_ANCHOR_TEXT_FIELDS = frozenset(
     {
@@ -2236,6 +2297,13 @@ class _CapabilityAwareReader:
                 "relationship_adjudication", RELATIONSHIP_MAX_OUTPUT_TOKENS
             ),
             context_fraction=0.8,
+            extra_input_tokens=(
+                _estimate_tokens(json.dumps(_codex_json_schema(
+                    "relationship_adjudication",
+                    pair_job_ids=_codex_relationship_pair_ids(context),
+                ), sort_keys=True))
+                if self.name == "codex" else 0
+            ),
         )
 
     def adjudicate_relationships(
@@ -2245,28 +2313,43 @@ class _CapabilityAwareReader:
         *,
         context: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
-        """Return one complete v8 decision for every immutable pair job."""
+        """Return one complete decision for every immutable pair job."""
 
         self._authorize_request()
-        raw_response = self._literature_json_call(
-            _relationship_adjudication_system_prompt(),
-            _relationship_prompt(profiles, request, context),
-            label="relationship adjudication",
-            reasoning_effort="max",
-            output_tokens=RELATIONSHIP_MAX_OUTPUT_TOKENS,
-            list_key="decisions",
-            contract_id="relationship_adjudication",
+        pair_ids = (
+            _codex_relationship_pair_ids(context) if self.name == "codex" else ()
         )
+        token = _RELATIONSHIP_PAIR_JOB_IDS.set(pair_ids)
         try:
-            return _validate_relationship_response(
-                raw_response, kind="relationship_adjudication"
+            raw_response = self._literature_json_call(
+                _relationship_adjudication_system_prompt(),
+                _relationship_prompt(profiles, request, context),
+                label="relationship adjudication",
+                reasoning_effort="max",
+                output_tokens=RELATIONSHIP_MAX_OUTPUT_TOKENS,
+                list_key="decisions",
+                contract_id="relationship_adjudication",
             )
-        except ProviderError as exc:
-            exc.raw_response = raw_response
-            completion = current_literature_completion()
-            if completion:
-                exc.provider_completion = dict(completion)
-            raise
+            try:
+                if pair_ids:
+                    decisions = raw_response.get("decisions")
+                    if (
+                        set(raw_response) != {"decisions"}
+                        or not isinstance(decisions, Mapping)
+                        or set(decisions) != set(pair_ids)
+                    ):
+                        raise ProviderError("Codex relationship response must cover exact pair keys")
+                return _validate_relationship_response(
+                    raw_response, kind="relationship_adjudication"
+                )
+            except ProviderError as exc:
+                exc.raw_response = raw_response
+                completion = current_literature_completion()
+                if completion:
+                    exc.provider_completion = dict(completion)
+                raise
+        finally:
+            _RELATIONSHIP_PAIR_JOB_IDS.reset(token)
 
     def verify_relationships(
         self,
@@ -2673,6 +2756,13 @@ class _CapabilityAwareReader:
             output_tokens,
             label=label,
             context_fraction=0.8,
+            extra_input_tokens=(
+                _estimate_tokens(json.dumps(_codex_json_schema(
+                    contract_id, pair_job_ids=_RELATIONSHIP_PAIR_JOB_IDS.get(),
+                ), sort_keys=True))
+                if self.name == "codex" and contract_id == "relationship_adjudication"
+                and _RELATIONSHIP_PAIR_JOB_IDS.get() else 0
+            ),
         )
         raw = self._generate_with_reasoning(
                 system_prompt,
@@ -2683,8 +2773,21 @@ class _CapabilityAwareReader:
                 output_contract=contract_id,
             )
         try:
+            if (
+                self.name == "codex" and contract_id == "relationship_adjudication"
+                and _RELATIONSHIP_PAIR_JOB_IDS.get()
+            ):
+                # The new wire contract is strict JSON, including unique object keys.
+                try:
+                    parsed = json.loads(str(raw), object_pairs_hook=_unique_json_object)
+                except json.JSONDecodeError as exc:
+                    raise ProviderError("Codex relationship response must be valid JSON") from exc
+                if not isinstance(parsed, dict):
+                    raise ProviderError("Codex relationship response must be a JSON object")
+            else:
+                parsed = raw
             response = _parse_json_object(
-                raw,
+                parsed,
                 label=f"{label} response",
                 list_key=list_key,
             )
@@ -2865,10 +2968,11 @@ class _CapabilityAwareReader:
         output_tokens: int,
         *,
         context_fraction: float | None = None,
+        extra_input_tokens: int = 0,
     ) -> bool:
         estimated_input = _estimate_tokens(system_prompt) + _estimate_tokens(
             user_prompt
-        )
+        ) + extra_input_tokens
         reserve = self.prompt_reserve_tokens + output_tokens
         usable = int(
             int(self.context_window_tokens or 0)
@@ -2890,12 +2994,14 @@ class _CapabilityAwareReader:
         *,
         label: str,
         context_fraction: float | None = None,
+        extra_input_tokens: int = 0,
     ) -> None:
         if not self._prompt_fits(
             system_prompt,
             user_prompt,
             output_tokens,
             context_fraction=context_fraction,
+            extra_input_tokens=extra_input_tokens,
         ):
             raise ProviderError(
                 f"{label} exceeds the {self.name} context budget; use coarse hierarchical chunks"
@@ -4669,6 +4775,20 @@ class CodexReader(_CapabilityAwareReader):
         effort = _REASONING_EFFORT.get() or "medium"
         version = str(self._preflight.get("version") or "0.145.0")
         identity = codex_contract_identity(contract_id, self.model, effort, version)
+        pair_ids = (
+            _RELATIONSHIP_PAIR_JOB_IDS.get()
+            if contract_id == "relationship_adjudication" else ()
+        )
+        schema_text = json.dumps(
+            _codex_json_schema(contract_id, pair_job_ids=pair_ids),
+            sort_keys=contract_id != "source_bundle",
+        )
+        if pair_ids:
+            # schema_hash names the canonical template; this binds the exact wire schema.
+            identity = {
+                **identity,
+                "request_schema_hash": hashlib.sha256(schema_text.encode("utf-8")).hexdigest(),
+            }
         environment = dict(
             self._preflight.get("_environment")
             or _codex_environment(self.credential_forbidden_roots)
@@ -4736,9 +4856,7 @@ class CodexReader(_CapabilityAwareReader):
             call_dir.mkdir(mode=0o700)
             schema_path = call_root / "output-schema.json"
             schema_path.write_text(
-                json.dumps(
-                    _codex_json_schema(contract_id), sort_keys=contract_id != "source_bundle"
-                ),
+                schema_text,
                 encoding="utf-8",
             )
             instructions_path = call_root / "model-instructions.txt"

@@ -481,7 +481,7 @@ def test_relationship_adjudication_uses_exact_codex_fit(
         "large-but-valid",
         "adjudicate_relationships",
         [],
-        {"evidence": "x" * 263_000},
+        {"evidence": "x" * 263_000, "pair_jobs": [{"pair_job_id": "job-a"}]},
     )
 
     assert result == {"decisions": []}
