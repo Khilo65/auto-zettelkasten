@@ -1816,15 +1816,15 @@ def test_expected_answer_matching_accepts_one_span_paraphrases() -> None:
 @pytest.mark.parametrize(
     ("body", "matches"),
     [
-        ("The relay reset is insufficient on its own.", True),
-        ("The relay reset is not sufficient on its own.", True),
-        ("The relay reset is sufficient on its own.", False),
-        ("The relay reset is not insufficient on its own.", False),
-        ("The relay reset is never insufficient on its own.", False),
-        ("The relay reset is not entirely insufficient on its own.", False),
-        ("The relay reset isn't insufficient on its own.", False),
+        ("The relay reset is insufficient without assistance.", True),
+        ("The relay reset is not sufficient without assistance.", True),
+        ("The relay reset is sufficient without assistance.", False),
+        ("The relay reset is not insufficient without assistance.", False),
+        ("The relay reset is never insufficient without assistance.", False),
+        ("The relay reset is not entirely insufficient without assistance.", False),
+        ("The relay reset isn't insufficient without assistance.", False),
         ("The relay reset is insufficient.", False),
-        ("The relay reset is insufficient\non its own.", False),
+        ("The relay reset is insufficient\nwithout assistance.", False),
     ],
 )
 def test_expected_answer_insufficiency_preserves_phrase_and_polarity(
@@ -1833,7 +1833,7 @@ def test_expected_answer_insufficiency_preserves_phrase_and_polarity(
     spans = [runner._normalized_text(line) for line in body.splitlines()]
 
     assert runner._answer_matches(
-        runner._normalized_text(body), spans, "not sufficient on its own"
+        runner._normalized_text(body), spans, "not sufficient without assistance"
     ) is matches
 
 
