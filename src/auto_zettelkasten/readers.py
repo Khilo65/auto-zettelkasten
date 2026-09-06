@@ -5781,7 +5781,7 @@ def _relationship_candidate_system_prompt() -> str:
 
 def _relationship_adjudication_system_prompt() -> str:
     return (
-        "Auto-Zettelkasten relationship prompt v32, contract relationship-decision-v9. Read both "
+        "Auto-Zettelkasten relationship prompt v33, contract relationship-decision-v9. Read both "
         "complete atomic notes. Return JSON decisions keyed by every supplied pair_job_id, no extras: "
         "either {decision:no_relationship, reason, confidence} or "
         "{decision:relationship, connections:[...]}. Use one connection, or two for distinct propositions, containing comparison_proposition, "
@@ -5796,6 +5796,8 @@ def _relationship_adjudication_system_prompt() -> str:
         "attribute those cautions to the note or system, not the source unless explicitly attributed. "
         "Notes are summaries: silence is not evidence of source absence. Unless a note explicitly establishes absence, "
         "say 'not supplied in the note', not 'the source does not report it'. Apply this to reasons and qualifications. "
+        "Anchor lists are selected evidence, not exhaustive source summaries. Before alleging absence, "
+        "reread the full note even when no anchor states the fact. "
         "Preserve visible scope (whole work versus chapter, excerpt, or component), "
         "construct and outcome, unit and level of analysis, process stage, method, "
         "evidentiary role and status, and causal strength. Find a bounded joint-reading connection from the "

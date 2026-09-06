@@ -233,10 +233,10 @@ def test_v9_parks_relationship_without_owned_endpoint_anchors() -> None:
     assert "complete semantic record" in str(result["parked"][0].get("error") or "")
 
 
-def test_v32_is_compact_domain_neutral_source_owned_and_complete() -> None:
+def test_v33_is_compact_domain_neutral_source_owned_and_complete() -> None:
     prompt = _relationship_adjudication_system_prompt()
 
-    assert "relationship prompt v32" in prompt
+    assert "relationship prompt v33" in prompt
     assert "allowed_evidence_anchor_ids" in prompt
     assert "another source's IDs are never interchangeable" in prompt
     assert "contract relationship-decision-v9" in prompt
@@ -349,6 +349,8 @@ def test_adjudication_scopes_absence_claims_to_supplied_summary_evidence() -> No
     for requirement in (
         "notes are summaries: silence is not evidence of source absence",
         "unless a note explicitly establishes absence",
+        "anchor lists are selected evidence, not exhaustive source summaries",
+        "reread the full note even when no anchor states the fact",
         "not supplied in the note",
         "apply this to reasons and qualifications",
         "a shared causal outcome or comparable scores are not required",
