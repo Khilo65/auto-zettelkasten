@@ -1406,7 +1406,7 @@ def codex_contract_identity(
         "cli_profile": cli_profile,
         "contract_id": contract_id,
         **(
-            {"request_schema_policy": "required-pair-keys-assessment-first-v3"}
+            {"request_schema_policy": "required-pair-keys-connections-v4"}
             if contract_id == "relationship_adjudication"
             else {}
         ),
@@ -1446,11 +1446,13 @@ def _codex_contract_note(contract_id: str) -> str:
         return (
             "For this request, decisions is an object whose required keys are the exact "
             "supplied pair_job_ids. Return every key exactly once, with no extra keys. "
-            "Each value contains assessment and outcome; do not repeat pair_job_id inside it. "
-            "First assess both notes' concrete contributions and the strongest bounded connection, "
-            "or explain why none survives. Then choose the outcome consistent with that assessment. "
-            "A no_relationship outcome contains decision and confidence; its reason is the assessment. "
-            "A relationship outcome contains decision and connections with the required endpoint evidence."
+            "Each value contains assessment, confidence, and connections; do not repeat pair_job_id "
+            "or emit a decision field. First assess both notes' concrete contributions and the "
+            "strongest bounded connection, or explain why none survives. Return one useful "
+            "grounded connection, or two for distinct propositions, with the required endpoint evidence. Use an empty "
+            "connections list only when no useful bounded connection survives; the assessment then "
+            "explains the rejection. Confidence rates the assessment. A nonempty connections list "
+            "means relationship; each connection carries its own confidence."
         )
     return {
         "source_bundle": (
@@ -1648,25 +1650,18 @@ def _codex_json_schema(
         ):
             raise ProviderError("Codex relationship pair IDs must be nonempty and unique")
         alternatives = contract["properties"]["decisions"]["items"]["anyOf"]
-        outcome_schema = {
-            "anyOf": [
-                _codex_object({
-                    key: value for key, value in alternative["properties"].items()
-                    if key not in {"pair_job_id", "reason"}
-                })
-                for alternative in alternatives
-            ]
-        }
-        # Assessment precedes the branch choice in the sorted wire schema.
+        # A single shape avoids a redundant decision contradicting the connections.
         value_schema = _codex_object({
-            "assessment": _CODEX_STRING, "outcome": outcome_schema,
+            "assessment": _CODEX_STRING,
+            "confidence": alternatives[0]["properties"]["confidence"],
+            "connections": alternatives[1]["properties"]["connections"],
         })
         schemas = {key: deepcopy(value_schema) for key in pair_job_ids}
         if pair_anchor_ids is not None:
             if set(pair_anchor_ids) != set(pair_job_ids):
                 raise ProviderError("Codex relationship anchor pools must cover exact pair keys")
             for key, endpoints in pair_anchor_ids.items():
-                connection = schemas[key]["properties"]["outcome"]["anyOf"][1]["properties"]["connections"]["items"]
+                connection = schemas[key]["properties"]["connections"]["items"]
                 for endpoint, anchors in endpoints.items():
                     connection["properties"][f"{endpoint}_anchor_ids"]["items"] = {
                         "type": "string", "enum": list(anchors),
@@ -2389,22 +2384,27 @@ class _CapabilityAwareReader:
                     for job_id, value in decisions.items():
                         if (
                             not isinstance(value, Mapping)
-                            or set(value) != {"assessment", "outcome"}
+                            or set(value) != {"assessment", "confidence", "connections"}
                             or not isinstance(value["assessment"], str)
                             or not value["assessment"].strip()
                         ):
-                            raise ProviderError("Codex relationship requires an assessment and outcome")
-                        outcome = value["outcome"]
-                        if not isinstance(outcome, Mapping) or outcome.get("decision") not in (
-                            "relationship", "no_relationship",
+                            raise ProviderError("Codex relationship requires assessment, confidence, and connections")
+                        connections = value["connections"]
+                        if not isinstance(connections, list) or any(
+                            not isinstance(connection, Mapping) for connection in connections
                         ):
-                            raise ProviderError("Codex relationship outcome is invalid")
-                        rejected = outcome["decision"] == "no_relationship"
-                        if set(outcome) != {"decision", "confidence" if rejected else "connections"}:
-                            raise ProviderError("Codex relationship outcome has invalid fields")
-                        normalized[job_id] = dict(outcome)
-                        if rejected:
-                            normalized[job_id]["reason"] = value["assessment"]
+                            raise ProviderError("Codex relationship connections must be a list of objects")
+                        if isinstance(value["confidence"], bool) or not isinstance(
+                            value["confidence"], (str, int, float)
+                        ):
+                            raise ProviderError("Codex relationship confidence must be a number or string")
+                        normalized[job_id] = (
+                            {"decision": "relationship", "connections": connections}
+                            if connections else {
+                                "decision": "no_relationship", "reason": value["assessment"],
+                                "confidence": value["confidence"],
+                            }
+                        )
                     raw_response = {"decisions": normalized}
                 return _validate_relationship_response(
                     raw_response, kind="relationship_adjudication"
