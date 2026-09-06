@@ -233,10 +233,10 @@ def test_v9_parks_relationship_without_owned_endpoint_anchors() -> None:
     assert "complete semantic record" in str(result["parked"][0].get("error") or "")
 
 
-def test_v30_is_compact_domain_neutral_source_owned_and_complete() -> None:
+def test_v31_is_compact_domain_neutral_source_owned_and_complete() -> None:
     prompt = _relationship_adjudication_system_prompt()
 
-    assert "relationship prompt v30" in prompt
+    assert "relationship prompt v31" in prompt
     assert "allowed_evidence_anchor_ids" in prompt
     assert "another source's IDs are never interchangeable" in prompt
     assert "contract relationship-decision-v9" in prompt
@@ -259,7 +259,7 @@ def test_v30_is_compact_domain_neutral_source_owned_and_complete() -> None:
     assert "does not support the evidence source merely by relying on it" in prompt
     assert "every ID appears exactly once" in prompt
     assert "use no_relationship rather than omitting a pair" in prompt
-    assert len(prompt) <= 5_300
+    assert len(prompt) <= 5_500
     assert not any(
         name in prompt.casefold()
         for name in ("svensson", "mediation", "civil war", "peacekeeping")
@@ -287,6 +287,16 @@ def test_measurement_fault_line_includes_simple_indicator_vs_composite_index() -
 
     assert "a simple indicator versus a composite index" in prompt
     assert "different measures of the same bounded phenomenon as a connection, not a rejection" in prompt
+
+
+def test_method_comparison_does_not_require_matching_case_results() -> None:
+    prompt = " ".join(_relationship_adjudication_system_prompt().split())
+
+    assert "one work is a general framework and the other a case result" in prompt
+    assert "Missing same-case results blocks corroboration, not methodological or contextual comparison" in prompt
+    assert "constructs, populations and timing" in prompt
+    assert "Across disciplines or methods, seek unconventional but source-grounded connections" in prompt
+    assert "overlap is merely topical, lexical, or generic" in prompt
 
 
 def test_contextual_comparison_uses_contributions_not_cross_source_proof() -> None:
