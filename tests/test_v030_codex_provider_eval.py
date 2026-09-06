@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import importlib.util
 import sys
 from contextlib import contextmanager
@@ -54,6 +55,8 @@ def _write_manifest(root: Path) -> Path:
                     "context": {"profile_prompt_version": "6"},
                 }
                 if contract_id == "evidence_profile"
+                else {"profiles": [], "request": {}, "context": {"pair_jobs": [{"pair_job_id": "job-smoke"}]}}
+                if contract_id == "relationship_adjudication"
                 else {"profiles": [], "request": {}, "context": {}}
             ),
         }
@@ -175,6 +178,10 @@ def _usage(monkeypatch: pytest.MonkeyPatch, calls: list[str]) -> None:
             **runner.codex_contract_identity(
                 contract_id, model, "medium", runner.CODEX_CLI_PROFILE
             ),
+            **({"request_schema_hash": runner.sha256_text(json.dumps(
+                runner._codex_json_schema(contract_id, pair_job_ids=("job-smoke",)),
+                sort_keys=True,
+            ))} if contract_id == "relationship_adjudication" else {}),
             "codex_cli_version": runner.CODEX_CLI_PROFILE,
             "finish_reason": "turn.completed",
             "usage": {"input_tokens": 10, "output_tokens": 5},
@@ -288,6 +295,25 @@ def test_completion_requires_pinned_codex_cli_profile() -> None:
             contract_id="source_bundle",
             model="gpt-5.6-luna",
             effort="medium",
+        )
+
+
+@pytest.mark.parametrize("schema_hash", [None, "0" * 64])
+def test_completion_rejects_unbound_relationship_schema(schema_hash: str | None) -> None:
+    completion = {
+        **runner.codex_contract_identity(
+            "relationship_adjudication", "gpt-5.6-terra", "medium", runner.CODEX_CLI_PROFILE
+        ),
+        "codex_cli_version": runner.CODEX_CLI_PROFILE,
+        "finish_reason": "turn.completed",
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+    }
+    if schema_hash is not None:
+        completion["request_schema_hash"] = schema_hash
+    with pytest.raises(ValueError, match="request_schema_hash mismatch"):
+        runner._validate_completion(
+            completion, contract_id="relationship_adjudication",
+            model="gpt-5.6-terra", effort="medium", pair_job_ids=("job-smoke",),
         )
 
 

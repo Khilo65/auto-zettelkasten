@@ -54,6 +54,8 @@ from auto_zettelkasten.readers import (  # noqa: E402
     ProviderTimeout,
     ProviderTransportError,
     _CODEX_ERROR_ITEM_CATEGORIES,
+    _codex_json_schema,
+    _codex_relationship_pair_ids,
     _redact_codex_diagnostic,
     codex_contract_identity,
     current_provider_completion,
@@ -272,6 +274,8 @@ def _safe_completion(value: Any) -> dict[str, Any]:
         "codex_cli_version",
         "contract_id",
         "schema_hash",
+        "request_schema_policy",
+        "request_schema_hash",
         "output_reservation",
         "feature_manifest_hash",
         "finish_reason",
@@ -289,6 +293,7 @@ def _validate_completion(
     contract_id: str,
     model: str,
     effort: str,
+    pair_job_ids: tuple[str, ...] = (),
 ) -> None:
     expected = {
         **codex_contract_identity(
@@ -300,6 +305,12 @@ def _validate_completion(
     for key, value in expected.items():
         if completion.get(key) != value:
             raise ValueError(f"provider completion {key} mismatch")
+    if pair_job_ids:
+        expected_hash = sha256_text(json.dumps(
+            _codex_json_schema(contract_id, pair_job_ids=pair_job_ids), sort_keys=True
+        ))
+        if completion.get("request_schema_hash") != expected_hash:
+            raise ValueError("provider completion request_schema_hash mismatch")
     if not _safe_completion(completion)["usage"]:
         raise ValueError("provider completion usage is missing")
 
@@ -784,6 +795,10 @@ def run_evaluation(
                         contract_id=contract_id,
                         model=model,
                         effort=effort,
+                        pair_job_ids=(
+                            _codex_relationship_pair_ids(payload["arguments"].get("context"))
+                            if contract_id == "relationship_adjudication" else ()
+                        ),
                     )
                     usage = _safe_completion(completion)["usage"]
                     result_sha256 = sha256_text(
