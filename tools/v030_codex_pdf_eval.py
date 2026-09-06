@@ -2764,7 +2764,8 @@ def _acceptance(
     }
     if settings.clusters_enabled:
         errors.extend(_cluster_errors(workspace, eligible_source_ids, report))
-        errors.extend(_private_cluster_expectation_errors(cases, report))
+        if settings.require_private_expectations:
+            errors.extend(_private_cluster_expectation_errors(cases, report))
     else:
         if (
             not isinstance(cluster_map, Mapping)

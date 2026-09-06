@@ -2369,22 +2369,54 @@ def test_strategic8_two_core_revalidation_preserves_failed_run(
     }
     cores = [source_by_key[key] for key in oracle["core_parent_keys"]]
     members = [*cores, source_by_key[oracle["context_parent_key"]]]
-    clustered = members[:-1] if omit_linked_member else members
+    control = source_by_key[oracle["control_parent_keys"][0]]
+    clustered = [*(members[:-1] if omit_linked_member else members), control]
     report = {
         "status": "completed",
+        "inventory_count": 8,
+        "validated_note_count": 8,
+        "profile_count": 8,
+        "profile_valid_count": 8,
+        "source_provider_call_count": 8,
+        "literature_provider_call_count": 8,
+        "synthesis_call_count": 8,
+        "provider_call_count": 16,
+        "cluster_count": 1,
+        "synthesized_cluster_count": 1,
+        "items": [],
         "cluster_map": {"clusters": [{
             "source_ids": clustered,
             "source_roles": {
                 source: "core" if source in cores[:2] else non_core_role
                 for source in clustered
             },
-        }]},
+        }], "unclustered_sources": [
+            {"source_id": source} for source in source_by_key.values()
+            if source not in clustered
+        ]},
     }
+    profiles = []
+    for source in source_by_key.values():
+        note_path = workspace / "02_source_memory" / "notes" / f"{source}.md"
+        note_path.write_text("# Synthetic note\n", encoding="utf-8")
+        report["items"].append({
+            "source_id": source, "note_id": source,
+            "note_path": str(note_path.relative_to(workspace)),
+            "terminal_status": "validated_note",
+        })
+        profile = {"source_id": source, "note_id": source, "note_status": "analytical"}
+        profiles.append(profile)
+        write_yaml(workspace / "02_source_memory" / "profiles" / f"{source}.yml",
+                   {"profile": profile})
+    write_yaml(workspace / "03_literature_synthesis" / "coverage_register.yml",
+               build_coverage_register(normalize_evidence_profiles(profiles), source_set={
+                   "source_set_id": "synthetic-source-set", "rows": report["items"],
+               }))
     write_yaml(workspace / "02_source_memory" / "indexes" / "typed_links.yml", {
         "relations": [
             {"source_id": cores[0], "target_source_id": source,
              "decision_status": "accepted", "active": True}
-            for source in members[1:]
+            for source in [*members[1:], control]
         ],
         "current_pair_decisions": [
             {"source_ids": list(pair)} for pair in combinations(members, 2)
@@ -2394,13 +2426,29 @@ def test_strategic8_two_core_revalidation_preserves_failed_run(
     run_root = workspace / "11_state" / "runs" / run_id
     write_yaml(run_root / "run_report.yml", report)
     (run_root / "inventory.json").write_text("[]", encoding="utf-8")
-    counts = {"source_attempt_count": 8, "relationship_attempt_count": 8,
-              "total_attempt_count": 16}
-    # Other acceptance dimensions have their own full-path tests.
-    monkeypatch.setattr(runner.base, "_acceptance", lambda *args: ([], counts))
+    # Keep the real base acceptance and cluster checks in the public path.
+    monkeypatch.setattr(runner.base, "_route_errors", lambda *args: ([], []))
+    monkeypatch.setattr(runner.base, "_relationship_errors", lambda *args, **kwargs: ([], True))
     monkeypatch.setattr(runner.base, "_attempts", lambda *args: (
-        {"count": 8, "rows": []}, {"count": 8, "rows": []},
+        {"count": 8, "reported_count": 8, "reservation_count": 8, "rows": []},
+        {"count": 8, "reported_count": 8, "rows": [
+            _attempt(1, "relationship_candidate_selection", source=False),
+            _attempt(2, "relationship_adjudication", source=False),
+        ]},
     ))
+    assert runner.base._private_cluster_expectation_errors(cases, report) == [
+        "private_related_cluster_or_control_separation_failed"
+    ]
+    errors, _ = runner.base._acceptance(workspace, run_id, cases, report, settings)
+    assert errors == []
+    strict_settings = deepcopy(settings)
+    strict_settings.require_private_expectations = True
+    errors, _ = runner.base._acceptance(workspace, run_id, cases, report, strict_settings)
+    assert "private_related_cluster_or_control_separation_failed" in errors
+    report["cluster_map"]["unclustered_sources"].append({"source_id": control})
+    errors, _ = runner.base._acceptance(workspace, run_id, cases, report, settings)
+    assert errors == ["cluster_disposition_accounting_failed"]
+    report["cluster_map"]["unclustered_sources"].pop()
     identity = runner.base._ledger_identity(manifest, digest, settings)
     runner.base._begin_attempt_reservation(
         workspace, identity, mode="run", source_count=0, relationship_count=0,
@@ -2430,7 +2478,7 @@ def test_strategic8_two_core_revalidation_preserves_failed_run(
     assert receipt["attempt_reservation_state"] == "failed_preserved"
     assert receipt["exact_zero_call_replay"] is True
     assert receipt["strategic8_actual_core_count"] == 2
-    assert receipt["strategic8_expected_member_coverage_count"] == len(clustered)
+    assert receipt["strategic8_expected_member_coverage_count"] == len(clustered) - 1
     assert (
         receipt["strategic8_role_policy"]
         == "probabilistic_cluster_boundaries_connected_notes_v6"
@@ -2584,6 +2632,8 @@ def test_private_strategic8_cluster_labels_never_enter_provider_inputs(
     registry["relations"].pop()
     for name in ("typed_links.yml", "typed_note_links.yml"):
         write_yaml(tmp_path / "02_source_memory" / "indexes" / name, registry)
+    errors, _ = runner._strategic8_oracle_acceptance(tmp_path, cases, report, oracle)
+    assert errors == ["strategic8_contextual_relationship_missing"]
     report["cluster_map"]["clusters"] = [exact_cluster]
 
     roles = report["cluster_map"]["clusters"][0]["source_roles"]
