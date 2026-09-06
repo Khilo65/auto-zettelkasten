@@ -5736,7 +5736,7 @@ def _relationship_candidate_system_prompt() -> str:
 
 def _relationship_adjudication_system_prompt() -> str:
     return (
-        "Auto-Zettelkasten relationship prompt v31, contract relationship-decision-v9. Read both "
+        "Auto-Zettelkasten relationship prompt v32, contract relationship-decision-v9. Read both "
         "complete atomic notes. Return JSON decisions keyed by every supplied pair_job_id, no extras: "
         "either {decision:no_relationship, reason, confidence} or "
         "{decision:relationship, connections:[...]}. Use one connection, or two for distinct propositions, containing comparison_proposition, "
@@ -5757,8 +5757,7 @@ def _relationship_adjudication_system_prompt() -> str:
         "complete notes' contributions. Across disciplines or methods, seek unconventional but source-grounded connections. "
         "The candidate comparison is a hypothesis, not the scope of either work. Before no_relationship, "
         "check a narrower contextual connection, shared reported result plus interpretation, or attributed process connection. "
-        "Then choose the tier before the subtype. Direct: the same sufficiently specific proposition, or one endpoint "
-        "explicitly establishes an intellectual bridge. Use contextual_connection for "
+        "Use contextual_connection for "
         "source-specific contributions to one concrete problem, practice, mechanism, or outcome, including successive institutional stages or "
         "an argued communication or legitimation process alongside a measured perception outcome. State the boundary. "
         "Sources need not compare works, link events, measure exposure, establish that the process caused the outcome, or prove a cross-stage causal chain. "

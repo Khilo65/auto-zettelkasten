@@ -233,20 +233,17 @@ def test_v9_parks_relationship_without_owned_endpoint_anchors() -> None:
     assert "complete semantic record" in str(result["parked"][0].get("error") or "")
 
 
-def test_v31_is_compact_domain_neutral_source_owned_and_complete() -> None:
+def test_v32_is_compact_domain_neutral_source_owned_and_complete() -> None:
     prompt = _relationship_adjudication_system_prompt()
 
-    assert "relationship prompt v31" in prompt
+    assert "relationship prompt v32" in prompt
     assert "allowed_evidence_anchor_ids" in prompt
     assert "another source's IDs are never interchangeable" in prompt
     assert "contract relationship-decision-v9" in prompt
     assert "source_a_basis describes only the supplied left_source_id" in prompt
     assert "source_b_basis only the supplied right_source_id" in prompt
     assert "whole work versus chapter, excerpt, or component" in prompt
-    assert "choose the tier before the subtype" in prompt
-    assert "same sufficiently specific proposition" in prompt
     assert "vocabulary, or pair order alone" in prompt
-    assert "explicitly establishes an intellectual bridge" in prompt
     assert "supports means the actor supplies evidence or argument" in prompt
     assert "undermines means the actor supplies materially incompatible" in prompt
     assert "qualifies means the actor establishes a condition" in prompt
@@ -299,6 +296,16 @@ def test_method_comparison_does_not_require_matching_case_results() -> None:
     assert "overlap is merely topical, lexical, or generic" in prompt
 
 
+def test_method_comparison_has_no_shared_proposition_or_author_bridge_prerequisite() -> None:
+    prompt = " ".join(_relationship_adjudication_system_prompt().split())
+
+    assert "choose the tier before the subtype" not in prompt
+    assert "Direct: the same sufficiently specific proposition" not in prompt
+    assert "explicitly establishes an intellectual bridge" not in prompt
+    assert "method changes what can be supported" in prompt
+    assert "Use the narrowest subtype" in prompt
+
+
 def test_contextual_comparison_uses_contributions_not_cross_source_proof() -> None:
     prompt = _relationship_adjudication_system_prompt()
 
@@ -329,9 +336,6 @@ def test_adjudication_checks_narrower_connections_before_rejecting_a_pair() -> N
         "neither erases an explicit author argument nor invalidates a contextual comparison",
     ):
         assert requirement in prompt
-    assert prompt.index("complete notes' contributions") < prompt.index(
-        "choose the tier before the subtype"
-    )
     assert "no bounded connection survives" in prompt
     assert "reason must represent both complete notes" in prompt
     assert "why the strongest narrower alternative fails" in prompt
