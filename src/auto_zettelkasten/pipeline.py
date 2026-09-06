@@ -17977,8 +17977,10 @@ def _following_unit(value: str, offset: int) -> str:
     if not re.match(r"(?:\s+|-(?=[A-Za-z]))", value[offset:]):
         return ""
     connectors = {
+        "although",
         "and",
         "at",
+        "but",
         "by",
         "during",
         "for",
@@ -17991,6 +17993,8 @@ def _following_unit(value: str, offset: int) -> str:
         "than",
         "to",
         "under",
+        "whereas",
+        "while",
         "with",
     }
     skipped = {

@@ -37,6 +37,7 @@ from .codex_attempt_guard import (
     current_codex_attempt_guard,
     reserve_codex_attempt,
 )
+from .extraction import is_ambiguous_pdf_heading
 from .fidelity import ANALYSIS_SECTION_KEYS, validate_atomic_replacements
 from .files import require_loopback_http_url
 from .models import (
@@ -238,7 +239,7 @@ DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
-SOURCE_BUNDLE_PROMPT_VERSION = "35"
+SOURCE_BUNDLE_PROMPT_VERSION = "36"
 SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v2"
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
@@ -5571,6 +5572,15 @@ def _source_bundle_prompt(
         )
         if context.get(key) not in (None, "", [], {})
     }
+    if isinstance(stable_context.get("heading_spans"), (list, tuple)):
+        stable_context["heading_spans"] = [
+            span for span in stable_context["heading_spans"]
+            if not (
+                isinstance(span, Mapping)
+                and span.get("page_ordinal")
+                and is_ambiguous_pdf_heading(str(span.get("label") or ""))
+            )
+        ]
     partial_rule = (
         "The content is incomplete. State the recovered and missing scope prominently, "
         "ground every claim in recovered content, and never claim to represent unseen sections."
@@ -6951,8 +6961,12 @@ def _chunk_prompt(
         "printed label separately from the supplied page map or visible page label. Never prefix a mapped printed label with PDF. "
         "Illustration, not source evidence: marker Page 42 with printed label 32 is PDF p. 42; printed p. 32. "
         "Verify each section opening against its heading on that page; omit an unsupported start."
+        " Attach the supporting locator directly to each retained claim, result, and cited work; "
+        "a section or chunk boundary does not locate an individual observation."
         " Preserve explicitly credited authors and speakers for quotations, definitions, and findings; "
         "do not flatten their contributions into the current author's voice."
+        " Keep investigators distinct from the subjects they investigate: documents examined by a study "
+        "are not inputs to the program or event it studies."
         " For each retained result, preserve the exact measured outcome and its qualifiers; "
         "bind its date to that result, not a neighboring comparison. A response about one specified outcome "
         "does not establish an effect or absence of effect on other outcomes."

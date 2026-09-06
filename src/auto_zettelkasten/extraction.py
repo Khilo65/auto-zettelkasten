@@ -1824,6 +1824,11 @@ def _printed_page_map(page_count: int, value: Any) -> dict[str, str]:
     }
 
 
+def is_ambiguous_pdf_heading(label: str) -> bool:
+    # ponytail: initials can mimic nested Roman headings; omit ambiguous hints until layout disambiguates them.
+    return bool(re.match(r"^[IVXLCDM]\.\s+[A-Z]\.\s", label))
+
+
 def _document_spans(
     page_matches: list[tuple[str, str]],
     printed_page_map: Mapping[str, str],
@@ -1864,7 +1869,9 @@ def _document_spans(
                     else figures
                 )
                 target.append(span)
-            elif known_heading.match(line) or numbered_heading.match(line):
+            elif (
+                known_heading.match(line) or numbered_heading.match(line)
+            ) and not is_ambiguous_pdf_heading(line):
                 headings.append(span)
             if len(headings) + len(tables) + len(figures) >= 512:
                 break

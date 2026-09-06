@@ -46,6 +46,15 @@ def test_blank_pdf_is_classified_for_vision_or_review_parking() -> None:
     assert result.reason in {"empty_or_scanned_pdf", "pdf_error:PdfStreamError"}
 
 
+def test_pdf_heading_candidates_do_not_promote_author_initials() -> None:
+    headings = ["I. Overview", "II. Design", "IV. A. Theory", "2. A. Researcher", "3.1 Limitations"]
+    fragments = [f"{initial}. R. Vale (2018) described the measurement" for initial in "IVXLCDM"]
+    text = "--- Page 1 ---\n" + "\n".join([*headings, *fragments])
+    result = classify_pdf_text(text, page_count=1)
+
+    assert [span["label"] for span in result.metrics["heading_spans"]] == headings
+
+
 @pytest.mark.parametrize("level", range(1, 7))
 def test_html_keeps_every_heading_level_separate_from_adjacent_paragraphs(level) -> None:
     raw = (

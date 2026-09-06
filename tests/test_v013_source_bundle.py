@@ -1546,7 +1546,7 @@ def test_ordinary_bundle_source_uses_one_call_and_no_profile_or_fidelity_call(
     ]
     assert profile["coverage"]["status"] == "partial"
     note = read_note(tmp_path / report.items[0]["note_path"])
-    assert note["frontmatter"]["source_bundle_prompt_version"] == "35"
+    assert note["frontmatter"]["source_bundle_prompt_version"] == "36"
 
 
 @pytest.mark.parametrize("observed_date", ["", "Published 2019; updated 2024"])
@@ -5016,6 +5016,72 @@ def test_quantitative_provenance_month_year_keeps_separate_yearlike_count(extra:
                 },
             }]},
             {"text": claim},
+        )
+
+
+@pytest.mark.parametrize("connector", ["but", "although", "whereas", "while"])
+def test_quantitative_provenance_accepts_year_range_before_contrast(
+    connector: str,
+) -> None:
+    payload = _bundle_payload()
+    anchor = payload["evidence_anchors"][0]
+    anchor["claim"] = (
+        f"The service recorded 850 visits between 2008 and 2014 {connector} "
+        "coverage remained limited."
+    )
+    anchor["quantitative_result"] = {
+        "estimate": "850 visits",
+        "period": "between 2008 and 2014",
+        "provenance": "source_reported",
+    }
+
+    assert _source_bundle_from_result(
+        payload,
+        {
+            "source_id": "source-zotero-A1",
+            "zotero_item_key": "A1",
+            "text": "Between 2008 and 2014, the service recorded 850 visits.",
+        },
+        "full_document",
+    ) is not None
+
+
+@pytest.mark.parametrize("connector", ["but", "although", "whereas", "while"])
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "2014 people were surveyed",
+        "sample 2014 remained unrepresentative",
+        "rank 2014 remained unchanged",
+        "between 2008 and 2014 people were surveyed",
+    ],
+)
+def test_quantitative_provenance_contrast_keeps_unmodeled_yearlike_counts(
+    connector: str, extra: str,
+) -> None:
+    payload = _bundle_payload()
+    anchor = payload["evidence_anchors"][0]
+    anchor["claim"] = (
+        f"The service recorded 850 visits between 2008 and 2014 {connector} {extra}."
+    )
+    anchor["quantitative_result"] = {
+        "estimate": "850 visits",
+        "period": "between 2008 and 2014",
+        "provenance": "source_reported",
+    }
+
+    with pytest.raises(
+        SourceBundleQuantitativeProvenanceError,
+        match="quantitative_anchor_contains_unmodeled_quantity",
+    ):
+        _source_bundle_from_result(
+            payload,
+            {
+                "source_id": "source-zotero-A1",
+                "zotero_item_key": "A1",
+                "text": anchor["claim"],
+            },
+            "full_document",
         )
 
 

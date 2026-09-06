@@ -39,6 +39,23 @@ def _completion(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def test_source_bundle_filters_cached_pdf_initials_without_losing_html_headings() -> None:
+    fragment = "M. R. Vale (2018) described the measurement"
+    spans = [
+        {"label": "I. Overview", "page_ordinal": 1, "printed_page": "3"},
+        {"label": fragment, "page_ordinal": 2, "printed_page": "4"},
+        {"label": fragment},  # Explicit HTML headings have no PDF ordinal.
+    ]
+    metadata = {"_source_context": {"heading_spans": spans}}
+    before = json.dumps(metadata)
+    prompt = _source_bundle_prompt("Unchanged source content.", metadata, None)
+    context = json.loads(prompt.splitlines()[0].split(": ", 1)[1])
+
+    assert context["heading_spans"] == [spans[0], spans[2]]
+    assert json.dumps(metadata) == before
+    assert "Unchanged source content." in prompt
+
+
 def test_atomic_prompt_v14_is_source_adaptive_and_statistics_aware() -> None:
     prompt = _system_prompt()
 
@@ -84,10 +101,10 @@ def test_atomic_prompt_v14_is_source_adaptive_and_statistics_aware() -> None:
     assert "silently reread" in prompt
 
 
-def test_source_bundle_prompt_v35_preserves_formatting_and_attribution_scope() -> None:
+def test_source_bundle_prompt_v36_preserves_formatting_and_attribution_scope() -> None:
     prompt = _source_bundle_system_prompt()
 
-    assert "source bundle prompt v35" in prompt
+    assert "source bundle prompt v36" in prompt
     assert "apply a footnote, only when the alignment or marker is explicit" in prompt
     assert "A footnote qualifies only the values bearing its explicit marker" in prompt
     assert "page metadata is not a statistic's observation date" in prompt
@@ -265,6 +282,9 @@ def test_chunk_final_check_preserves_pdf_and_printed_coordinates() -> None:
     assert "PDF p. 42; printed p. 32" in final
     assert "Preserve explicitly credited authors and speakers" in final
     assert "each section opening" in final
+    assert "supporting locator directly to each retained claim, result, and cited work" in final
+    assert "Keep investigators distinct from the subjects they investigate" in final
+    assert "documents examined by a study" in final
     assert "exact measured outcome and its qualifiers" in final
     assert "not a neighboring comparison" in final
     assert "absence of effect on other outcomes" in final
@@ -351,12 +371,12 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     )
     assert {
         "atomic_prompt_v14": digest(_system_prompt()),
-        "chunk_prompt_bundle_v35": digest(_chunk_system_prompt()),
-        "chunk_user_prompt_bundle_v35": digest(
+        "chunk_prompt_bundle_v36": digest(_chunk_system_prompt()),
+        "chunk_user_prompt_bundle_v36": digest(
             _chunk_prompt("A fictional source.", {}, None, "chunk-0001", "pages 1-2")
         ),
-        "source_bundle_prompt_v35": digest(_source_bundle_system_prompt()),
-        "source_bundle_user_prompt_v35": digest(
+        "source_bundle_prompt_v36": digest(_source_bundle_system_prompt()),
+        "source_bundle_user_prompt_v36": digest(
             _source_bundle_prompt("A fictional source.", {}, None)
         ),
         "codex_source_bundle_schema": bundle_identity["schema_hash"],
@@ -365,10 +385,10 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
         "codex_chunk_evidence_contract": digest(chunk_identity),
     } == {
         "atomic_prompt_v14": "8db9f2990d175816cb0100b92d84734ae7c2f930aade66825ed0412b22da3705",
-        "chunk_prompt_bundle_v35": "32878836a4cfa39eff61fe42769fcad996295275c780eade236f32ac98a0b22d",
-        "chunk_user_prompt_bundle_v35": "5b7fede5908f56fdee5cb4ddfee443c0c5b2eb7e63703bab9785136d9284e3f0",
-        "source_bundle_prompt_v35": "3613ca3e9c38f691e2ba93225da750b6ed58292cb2a78d13864581e993bdab68",
-        "source_bundle_user_prompt_v35": "fe31c24456507ac518dd9e8d2cc5c31a056e6b0daf5fb1c0617710b7d5e8a7e0",
+        "chunk_prompt_bundle_v36": "32878836a4cfa39eff61fe42769fcad996295275c780eade236f32ac98a0b22d",
+        "chunk_user_prompt_bundle_v36": "4adc842c7b001d4d588d942c955000b51b7fba2e709ba19ad9c7ea669c320568",
+        "source_bundle_prompt_v36": "00aa4930bae7e6e335202abb27bbcaead4b013808f2821846f3c5ed2f7e167c1",
+        "source_bundle_user_prompt_v36": "fe31c24456507ac518dd9e8d2cc5c31a056e6b0daf5fb1c0617710b7d5e8a7e0",
         "codex_source_bundle_schema": "1b9491a9f2d7bf9c4c8c62a5838180c2e8b171700211e2fe63cd77514d7192c2",
         "codex_source_bundle_contract": "e6e7dc65d7953e5fe777faf1dcb43cebf933c4d9e73ca890264e98a7cd08e023",
         "codex_chunk_evidence_schema": "130ebe184fc8dc0b3c08879abfeb0435500a47eecd78ed7e2387c095574d821c",
