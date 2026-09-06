@@ -768,6 +768,25 @@ def test_codex_contract_schemas_are_strict_recursively() -> None:
         visit(_codex_json_schema(contract_id))
 
 
+def test_codex_relationship_schema_binds_each_endpoint_anchor_pool() -> None:
+    original = json.dumps(CODEX_OUTPUT_CONTRACTS, sort_keys=True)
+    pools = {
+        "job-a": {"source_a": ["anchor-a"], "source_b": ["anchor-b"]},
+        "job-b": {"source_a": ["anchor-a"], "source_b": ["anchor-c"]},
+    }
+    schema = _codex_json_schema(
+        "relationship_adjudication", pair_job_ids=tuple(pools), pair_anchor_ids=pools,
+    )
+    for job_id, endpoints in pools.items():
+        connection = schema["properties"]["decisions"]["properties"][job_id]["anyOf"][1]["properties"]["connections"]["items"]
+        for endpoint, anchors in endpoints.items():
+            field = connection["properties"][f"{endpoint}_anchor_ids"]
+            assert field["minItems"] == 1
+            assert field["items"] == {"type": "string", "enum": anchors}
+    assert "anchor-c" not in schema["properties"]["decisions"]["properties"]["job-a"]["anyOf"][1]["properties"]["connections"]["items"]["properties"]["source_b_anchor_ids"]["items"]["enum"]
+    assert json.dumps(CODEX_OUTPUT_CONTRACTS, sort_keys=True) == original
+
+
 def test_codex_relationship_schema_requires_every_requested_pair() -> None:
     pair_ids = tuple(f"relationship-job-{value * 20}" for value in "abc")
     original = json.dumps(CODEX_OUTPUT_CONTRACTS, sort_keys=True)
@@ -792,7 +811,7 @@ def test_codex_relationship_request_keys_are_strict_and_reset(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
 ) -> None:
     pair_ids = ("relationship-job-a", "relationship-job-b")
-    context = {"pair_jobs": [{"pair_job_id": value} for value in pair_ids]}
+    context = {"pair_jobs": [{"pair_job_id": value, "allowed_evidence_anchor_ids": {"source_a": ["anchor-a"], "source_b": ["anchor-b"]}} for value in pair_ids]}
     reader = CodexReader("gpt-5.6-terra", allow_cloud=True)
     decision = {"decision": "no_relationship", "reason": "No bounded connection.", "confidence": "high"}
 
@@ -822,6 +841,7 @@ def test_codex_relationship_request_keys_are_strict_and_reset(
             result = reader.adjudicate_relationships([], LiteratureMapRequest(tmp_path), context=context)
             assert [row["pair_job_id"] for row in result["decisions"]] == list(pair_ids)
     assert readers_module._RELATIONSHIP_PAIR_JOB_IDS.get() == ()
+    assert readers_module._RELATIONSHIP_PAIR_ANCHOR_IDS.get() is None
     assert "decisions is an array" in readers_module._codex_contract_note("relationship_adjudication")
 
 
@@ -831,14 +851,18 @@ def test_codex_relationship_pair_bindings_are_thread_local(tmp_path: Path, monke
 
     def generate(*_args):
         before = readers_module._RELATIONSHIP_PAIR_JOB_IDS.get()
+        anchors = readers_module._RELATIONSHIP_PAIR_ANCHOR_IDS.get()
         barrier.wait(timeout=5)
         assert readers_module._RELATIONSHIP_PAIR_JOB_IDS.get() == before
+        assert readers_module._RELATIONSHIP_PAIR_ANCHOR_IDS.get() == anchors
+        assert anchors[before[0]]["source_b"] == [f"{before[0]}-anchor"]
         return json.dumps({"decisions": {before[0]: {"decision": "no_relationship", "reason": "Distinct scope.", "confidence": "high"}}})
 
     monkeypatch.setattr(reader, "_generate_text", generate)
     def invoke(pair_id):
-        result = reader.adjudicate_relationships([], LiteratureMapRequest(tmp_path), context={"pair_jobs": [{"pair_job_id": pair_id}]})
+        result = reader.adjudicate_relationships([], LiteratureMapRequest(tmp_path), context={"pair_jobs": [{"pair_job_id": pair_id, "allowed_evidence_anchor_ids": {"source_a": ["anchor-a"], "source_b": [f"{pair_id}-anchor"]}}]})
         assert readers_module._RELATIONSHIP_PAIR_JOB_IDS.get() == ()
+        assert readers_module._RELATIONSHIP_PAIR_ANCHOR_IDS.get() is None
         return result["decisions"][0]["pair_job_id"]
 
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -848,7 +872,7 @@ def test_codex_relationship_pair_bindings_are_thread_local(tmp_path: Path, monke
 def test_codex_relationship_admission_counts_bound_schema(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     reader = CodexReader("gpt-5.6-terra", allow_cloud=True)
     request = LiteratureMapRequest(tmp_path)
-    context = {"pair_jobs": [{"pair_job_id": f"job-{index}"} for index in range(8)]}
+    context = {"pair_jobs": [{"pair_job_id": f"job-{index}", "allowed_evidence_anchor_ids": {"source_a": ["anchor-a"], "source_b": [f"anchor-{index}"]}} for index in range(8)]}
     observed = []
     def fits(*_args, **kwargs):
         observed.append(kwargs["extra_input_tokens"])
@@ -861,6 +885,21 @@ def test_codex_relationship_admission_counts_bound_schema(tmp_path: Path, monkey
         reader.adjudicate_relationships([], request, context=context)
     assert len(observed) == 2 and observed[0] == observed[1] > 3000
     assert readers_module._RELATIONSHIP_PAIR_JOB_IDS.get() == ()
+    assert readers_module._RELATIONSHIP_PAIR_ANCHOR_IDS.get() is None
+
+
+@pytest.mark.parametrize("pools", [None, {}, {"source_a": ["anchor-a"]}, {"source_a": [], "source_b": ["anchor-b"]}, {"source_a": [None], "source_b": ["anchor-b"]}])
+def test_codex_relationship_missing_evidence_fails_before_authorization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pools: object,
+) -> None:
+    reader = CodexReader("gpt-5.6-terra", allow_cloud=True)
+    context = {"pair_jobs": [{"pair_job_id": "job-a", "allowed_evidence_anchor_ids": pools}]}
+    monkeypatch.setattr(reader, "_authorize_request", lambda: pytest.fail("invalid evidence must not authorize"))
+    with pytest.raises(ProviderError, match="anchor pools"):
+        reader.relationship_adjudication_fits([], LiteratureMapRequest(tmp_path), context=context)
+    with pytest.raises(ProviderError, match="anchor pools"):
+        reader.adjudicate_relationships([], LiteratureMapRequest(tmp_path), context=context)
+    assert readers_module._RELATIONSHIP_PAIR_ANCHOR_IDS.get() is None
 
 
 def test_codex_contract_identity_covers_tool_disable_manifest(
@@ -2171,22 +2210,25 @@ def test_codex_relationship_completion_binds_emitted_pair_schema(tmp_path: Path)
     reader = CodexReader("gpt-5.6-terra", allow_cloud=True)
     reader._preflight = fake_codex_preflight(tmp_path, executable, {})
     pair_ids = ("job-a", "job-b")
+    pools = {key: {"source_a": ["anchor-a"], "source_b": [f"{key}-anchor"]} for key in pair_ids}
     token = readers_module._RELATIONSHIP_PAIR_JOB_IDS.set(pair_ids)
+    anchor_token = readers_module._RELATIONSHIP_PAIR_ANCHOR_IDS.set(pools)
     try:
         value = reader._generate_with_reasoning(
             "system", "user", 2_048, 5, reasoning_effort="medium",
             output_contract="relationship_adjudication",
         )
     finally:
+        readers_module._RELATIONSHIP_PAIR_ANCHOR_IDS.reset(anchor_token)
         readers_module._RELATIONSHIP_PAIR_JOB_IDS.reset(token)
     captured = json.loads(capture.read_text(encoding="utf-8"))
     assert json.loads(captured["output_schema"]) == _codex_json_schema(
-        "relationship_adjudication", pair_job_ids=pair_ids,
+        "relationship_adjudication", pair_job_ids=pair_ids, pair_anchor_ids=pools,
     )
     assert value.completion["request_schema_hash"] == hashlib.sha256(
         captured["output_schema"].encode("utf-8")
     ).hexdigest()
-    assert value.completion["request_schema_policy"] == "required-pair-keys-v1"
+    assert value.completion["request_schema_policy"] == "required-pair-keys-endpoint-anchors-v2"
 
 
 @pytest.mark.parametrize("contract_id", sorted(CODEX_OUTPUT_CONTRACTS))

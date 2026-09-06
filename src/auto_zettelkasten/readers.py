@@ -22,6 +22,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from contextvars import ContextVar
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -275,6 +276,9 @@ _OUTPUT_CONTRACT: ContextVar[str | None] = ContextVar(
 )
 _RELATIONSHIP_PAIR_JOB_IDS: ContextVar[tuple[str, ...]] = ContextVar(
     "auto_zettelkasten_relationship_pair_job_ids", default=()
+)
+_RELATIONSHIP_PAIR_ANCHOR_IDS: ContextVar[Mapping[str, Mapping[str, list[str]]] | None] = ContextVar(
+    "auto_zettelkasten_relationship_pair_anchor_ids", default=None
 )
 _SOURCE_BUNDLE_ATTACHMENTS: ContextVar[tuple[Path, ...]] = ContextVar(
     "auto_zettelkasten_source_bundle_attachments", default=()
@@ -1402,7 +1406,7 @@ def codex_contract_identity(
         "cli_profile": cli_profile,
         "contract_id": contract_id,
         **(
-            {"request_schema_policy": "required-pair-keys-v1"}
+            {"request_schema_policy": "required-pair-keys-endpoint-anchors-v2"}
             if contract_id == "relationship_adjudication"
             else {}
         ),
@@ -1627,7 +1631,8 @@ def codex_execution_profile(reader: Any) -> str:
 
 
 def _codex_json_schema(
-    contract_id: str, *, pair_job_ids: tuple[str, ...] = ()
+    contract_id: str, *, pair_job_ids: tuple[str, ...] = (),
+    pair_anchor_ids: Mapping[str, Mapping[str, list[str]]] | None = None,
 ) -> dict[str, Any]:
     contract = CODEX_OUTPUT_CONTRACTS.get(contract_id)
     if contract is None:
@@ -1650,9 +1655,17 @@ def _codex_json_schema(
                 for alternative in alternatives
             ]
         }
-        return _codex_object({
-            "decisions": _codex_object({key: value_schema for key in pair_job_ids})
-        })
+        schemas = {key: deepcopy(value_schema) for key in pair_job_ids}
+        if pair_anchor_ids is not None:
+            if set(pair_anchor_ids) != set(pair_job_ids):
+                raise ProviderError("Codex relationship anchor pools must cover exact pair keys")
+            for key, endpoints in pair_anchor_ids.items():
+                connection = schemas[key]["anyOf"][1]["properties"]["connections"]["items"]
+                for endpoint, anchors in endpoints.items():
+                    connection["properties"][f"{endpoint}_anchor_ids"]["items"] = {
+                        "type": "string", "enum": list(anchors),
+                    }
+        return _codex_object({"decisions": _codex_object(schemas)})
     return dict(contract)
 
 
@@ -1667,6 +1680,28 @@ def _codex_relationship_pair_ids(context: Mapping[str, Any] | None) -> tuple[str
     ):
         raise ProviderError("Codex relationship pair IDs must be nonempty and unique")
     return ids
+
+
+def _codex_relationship_anchor_ids(
+    context: Mapping[str, Any] | None,
+) -> dict[str, dict[str, list[str]]]:
+    """Bind v9 evidence ownership before admission or provider authorization."""
+    _codex_relationship_pair_ids(context)
+    result = {}
+    for row in context["pair_jobs"]:
+        pools = row.get("allowed_evidence_anchor_ids")
+        if not isinstance(pools, Mapping) or set(pools) != {"source_a", "source_b"}:
+            raise ProviderError("Codex relationship requires both endpoint anchor pools")
+        for anchors in pools.values():
+            if (
+                not isinstance(anchors, list) or not anchors
+                or any(not isinstance(value, str) or not value.strip() for value in anchors)
+            ):
+                raise ProviderError("Codex relationship endpoint anchor pools must be nonempty string lists")
+        result[row["pair_job_id"]] = {
+            endpoint: sorted(set(anchors)) for endpoint, anchors in pools.items()
+        }
+    return result
 
 
 def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -2301,6 +2336,7 @@ class _CapabilityAwareReader:
                 _estimate_tokens(json.dumps(_codex_json_schema(
                     "relationship_adjudication",
                     pair_job_ids=_codex_relationship_pair_ids(context),
+                    pair_anchor_ids=_codex_relationship_anchor_ids(context),
                 ), sort_keys=True))
                 if self.name == "codex" else 0
             ),
@@ -2315,11 +2351,15 @@ class _CapabilityAwareReader:
     ) -> Mapping[str, Any]:
         """Return one complete decision for every immutable pair job."""
 
-        self._authorize_request()
         pair_ids = (
             _codex_relationship_pair_ids(context) if self.name == "codex" else ()
         )
+        anchor_ids = (
+            _codex_relationship_anchor_ids(context) if self.name == "codex" else None
+        )
+        self._authorize_request()
         token = _RELATIONSHIP_PAIR_JOB_IDS.set(pair_ids)
+        anchor_token = _RELATIONSHIP_PAIR_ANCHOR_IDS.set(anchor_ids)
         try:
             raw_response = self._literature_json_call(
                 _relationship_adjudication_system_prompt(),
@@ -2349,6 +2389,7 @@ class _CapabilityAwareReader:
                     exc.provider_completion = dict(completion)
                 raise
         finally:
+            _RELATIONSHIP_PAIR_ANCHOR_IDS.reset(anchor_token)
             _RELATIONSHIP_PAIR_JOB_IDS.reset(token)
 
     def verify_relationships(
@@ -2759,6 +2800,7 @@ class _CapabilityAwareReader:
             extra_input_tokens=(
                 _estimate_tokens(json.dumps(_codex_json_schema(
                     contract_id, pair_job_ids=_RELATIONSHIP_PAIR_JOB_IDS.get(),
+                    pair_anchor_ids=_RELATIONSHIP_PAIR_ANCHOR_IDS.get(),
                 ), sort_keys=True))
                 if self.name == "codex" and contract_id == "relationship_adjudication"
                 and _RELATIONSHIP_PAIR_JOB_IDS.get() else 0
@@ -4780,7 +4822,10 @@ class CodexReader(_CapabilityAwareReader):
             if contract_id == "relationship_adjudication" else ()
         )
         schema_text = json.dumps(
-            _codex_json_schema(contract_id, pair_job_ids=pair_ids),
+            _codex_json_schema(
+                contract_id, pair_job_ids=pair_ids,
+                pair_anchor_ids=_RELATIONSHIP_PAIR_ANCHOR_IDS.get(),
+            ),
             sort_keys=contract_id != "source_bundle",
         )
         if pair_ids:

@@ -56,6 +56,7 @@ from auto_zettelkasten.readers import (  # noqa: E402
     _CODEX_ERROR_ITEM_CATEGORIES,
     _codex_json_schema,
     _codex_relationship_pair_ids,
+    _codex_relationship_anchor_ids,
     _redact_codex_diagnostic,
     codex_contract_identity,
     current_provider_completion,
@@ -294,6 +295,7 @@ def _validate_completion(
     model: str,
     effort: str,
     pair_job_ids: tuple[str, ...] = (),
+    pair_anchor_ids: Mapping[str, Mapping[str, list[str]]] | None = None,
 ) -> None:
     expected = {
         **codex_contract_identity(
@@ -307,7 +309,9 @@ def _validate_completion(
             raise ValueError(f"provider completion {key} mismatch")
     if pair_job_ids:
         expected_hash = sha256_text(json.dumps(
-            _codex_json_schema(contract_id, pair_job_ids=pair_job_ids), sort_keys=True
+            _codex_json_schema(
+                contract_id, pair_job_ids=pair_job_ids, pair_anchor_ids=pair_anchor_ids,
+            ), sort_keys=True
         ))
         if completion.get("request_schema_hash") != expected_hash:
             raise ValueError("provider completion request_schema_hash mismatch")
@@ -798,6 +802,10 @@ def run_evaluation(
                         pair_job_ids=(
                             _codex_relationship_pair_ids(payload["arguments"].get("context"))
                             if contract_id == "relationship_adjudication" else ()
+                        ),
+                        pair_anchor_ids=(
+                            _codex_relationship_anchor_ids(payload["arguments"].get("context"))
+                            if contract_id == "relationship_adjudication" else None
                         ),
                     )
                     usage = _safe_completion(completion)["usage"]
