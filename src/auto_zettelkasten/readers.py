@@ -238,7 +238,7 @@ DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
-SOURCE_BUNDLE_PROMPT_VERSION = "32"
+SOURCE_BUNDLE_PROMPT_VERSION = "33"
 SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v2"
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
@@ -2956,7 +2956,10 @@ class _CapabilityAwareReader:
         user_prompt = (
             "The inspected content below consists of ordered source-grounded chunk "
             "memos from one oversized document. Synthesize them as one source without "
-            "inventing evidence absent from those memos.\n\n" + user_prompt
+            "inventing evidence absent from those memos. Reconcile structure across adjacent chunks, "
+            "retain the earliest supported section start, and copy PDF/printed locator pairs exactly. "
+            "A chapter start requires an explicit opening heading, not a chunk's coverage boundary; "
+            "omit an unverified start or range.\n\n" + user_prompt
         )
         output_tokens = self._reserved_output_tokens("source_bundle", min(
             int(
@@ -5630,6 +5633,8 @@ def _source_bundle_prompt(
         "For every attributed quotation, paraphrase, and definition, resolve its speaker or author from the local reporting clause "
         "and check that owner in every output field, including key_concepts_and_definitions; do not carry a neighboring speaker "
         "across a change of attribution. Do not manufacture disagreement between aligned speakers. "
+        "Every quotation must preserve one contiguous verbatim source span without inserted ellipses; "
+        "if shortening is needed or memos contain only an abridgment, use a labeled source-grounded paraphrase without quotation marks. "
         "Use explicit text anchors rather than unverified opening/closing locations. "
         "Each literature-position row must describe one distinct work, not a publisher's pooled reporting. Leave unknown years and titles empty; "
         "never borrow them from a neighboring citation, the cited event, or the current source's date. "
@@ -6824,7 +6829,8 @@ def _chunk_system_prompt() -> str:
         f"Every returned value must be a non-empty string. Required keys: {keys}. "
         "Preserve concrete claims, methods, data, qualifications, and contradictions, but avoid prose repetition. "
         "Include the optional key_concepts_and_definitions field only when this chunk explicitly defines or operationalizes a "
-        "consequential concept. Prefer a short exact quotation and available page, section, heading, or text-anchor locator. "
+        "consequential concept. Use a short contiguous verbatim quotation without inserted ellipses, or a labeled source-grounded paraphrase, "
+        "with an available page, section, heading, or text-anchor locator. "
         "Label paraphrases, invent nothing, and omit the field entirely when no qualifying definition exists. "
         "Include the optional source_structure_and_organization field only when this chunk exposes source-native headings or chapters. "
         "Preserve their titles, order, hierarchy, and available locator in concise Markdown bullets. Do not infer missing structure, "
@@ -6839,6 +6845,7 @@ def _chunk_system_prompt() -> str:
         "Reserve bare `p. N` or `pp. N-M` for supplied source-native printed labels; use "
         "ordinal_to_printed_page to convert when present, and keep the `PDF` prefix when no printed label is supplied. "
         "Treat every caller-provided chunk page range as a coverage boundary, not a chapter boundary. "
+        "Record a chapter start only at its actual opening heading; otherwise mark a continuation and omit its start. "
         "When a field is not reported in this chunk, say so briefly."
     )
 

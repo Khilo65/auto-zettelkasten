@@ -1165,6 +1165,16 @@ def test_long_key_concept_quotation_must_exist_in_inspected_text() -> None:
     with pytest.raises(ValueError, match="analysis_quote_not_found_in_source"):
         _source_bundle_from_result(payload, row, "full_document")
 
+    payload["analysis_sections"]["key_concepts_and_definitions"] = (
+        "**Model** — “news content passes through ... filters before reaching audiences” (p. 1)."
+    )
+    with pytest.raises(ValueError, match="analysis_quote_not_found_in_source"):
+        _source_bundle_from_result(payload, row, "full_document")
+    payload["analysis_sections"]["key_concepts_and_definitions"] = (
+        "**Model** — Paraphrase: institutional filters shape news reaching audiences (p. 1)."
+    )
+    assert _source_bundle_from_result(payload, row, "full_document") is not None
+
 
 def test_long_key_concept_quotation_accepts_ocr_line_wrap_hyphenation() -> None:
     payload = _bundle_payload()
@@ -1536,7 +1546,7 @@ def test_ordinary_bundle_source_uses_one_call_and_no_profile_or_fidelity_call(
     ]
     assert profile["coverage"]["status"] == "partial"
     note = read_note(tmp_path / report.items[0]["note_path"])
-    assert note["frontmatter"]["source_bundle_prompt_version"] == "32"
+    assert note["frontmatter"]["source_bundle_prompt_version"] == "33"
 
 
 @pytest.mark.parametrize("observed_date", ["", "Published 2019; updated 2024"])
@@ -2338,6 +2348,9 @@ def test_hierarchical_bundle_honors_the_supported_32k_output(
     reader = DeepSeekReader(allow_cloud=True, max_output_tokens=6_000)
 
     def generate(_system, _user, output_tokens, _deadline):
+        assert "earliest supported section start" in _user
+        assert "explicit opening heading" in _user
+        assert "omit an unverified start or range" in _user
         captured.append(output_tokens)
         return json.dumps(_bundle_payload())
 

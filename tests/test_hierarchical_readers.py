@@ -283,7 +283,7 @@ def test_deepseek_chunk_prompt_parsing_and_per_call_bounds(monkeypatch: pytest.M
     assert '"ordinal_to_printed_page": {"42": "32"' in prompt
     assert "COARSE INSPECTED SOURCE CHUNK" in prompt
     assert "key_concepts_and_definitions" in system_prompt
-    assert "exact quotation" in system_prompt
+    assert "contiguous verbatim quotation without inserted ellipses" in system_prompt
     assert "source_structure_and_organization" in system_prompt
     assert "source-native headings or chapters" in system_prompt
     assert "physical PDF ordinals" in system_prompt

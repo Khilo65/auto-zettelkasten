@@ -83,10 +83,10 @@ def test_atomic_prompt_v14_is_source_adaptive_and_statistics_aware() -> None:
     assert "silently reread" in prompt
 
 
-def test_source_bundle_prompt_v32_preserves_formatting_and_attribution_scope() -> None:
+def test_source_bundle_prompt_v33_preserves_formatting_and_attribution_scope() -> None:
     prompt = _source_bundle_system_prompt()
 
-    assert "source bundle prompt v32" in prompt
+    assert "source bundle prompt v33" in prompt
     assert "apply a footnote, only when the alignment or marker is explicit" in prompt
     assert "A footnote qualifies only the values bearing its explicit marker" in prompt
     assert "page metadata is not a statistic's observation date" in prompt
@@ -215,6 +215,10 @@ def test_source_bundle_final_review_covers_prose_citations_and_locators() -> Non
         "local reporting clause",
         "key_concepts_and_definitions",
         "do not carry a neighboring speaker",
+        "one contiguous verbatim source span",
+        "without inserted ellipses",
+        "memos contain only an abridgment",
+        "labeled source-grounded paraphrase without quotation marks",
         "explicit text anchors",
         "one distinct work",
         "unknown years and titles empty",
@@ -223,6 +227,15 @@ def test_source_bundle_final_review_covers_prose_citations_and_locators() -> Non
     ):
         assert requirement in final
     assert "three to eight" not in _source_bundle_system_prompt()
+
+
+def test_chunk_prompt_preserves_quote_and_chapter_start_boundaries() -> None:
+    prompt = _chunk_system_prompt()
+
+    assert "contiguous verbatim quotation without inserted ellipses" in prompt
+    assert "labeled source-grounded paraphrase" in prompt
+    assert "actual opening heading" in prompt
+    assert "mark a continuation and omit its start" in prompt
 
 
 def test_source_bundle_critique_distinguishes_totals_from_component_scopes() -> None:
@@ -306,9 +319,9 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     )
     assert {
         "atomic_prompt_v14": digest(_system_prompt()),
-        "chunk_prompt_v15": digest(_chunk_system_prompt()),
-        "source_bundle_prompt_v32": digest(_source_bundle_system_prompt()),
-        "source_bundle_user_prompt_v32": digest(
+        "chunk_prompt_bundle_v33": digest(_chunk_system_prompt()),
+        "source_bundle_prompt_v33": digest(_source_bundle_system_prompt()),
+        "source_bundle_user_prompt_v33": digest(
             _source_bundle_prompt("A fictional source.", {}, None)
         ),
         "codex_source_bundle_schema": bundle_identity["schema_hash"],
@@ -317,9 +330,9 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
         "codex_chunk_evidence_contract": digest(chunk_identity),
     } == {
         "atomic_prompt_v14": "8db9f2990d175816cb0100b92d84734ae7c2f930aade66825ed0412b22da3705",
-        "chunk_prompt_v15": "44bcaf5bd94ee37686021d925b64a2d3ed0bd5d82b89610c22dd5e0b2e810e20",
-        "source_bundle_prompt_v32": "9d6c44822ad4e152e092a602c9c92a73ce5d72532b3b2e99eba80c7f9ad0c21b",
-        "source_bundle_user_prompt_v32": "56c574d24421bebf647ad76933ae60574f64aeed5c7609e2e2b0ca2f37db6070",
+        "chunk_prompt_bundle_v33": "81ca9f1861b6b5d35fc921f09323ef10ac324b4d8d54d47aa523610377d429c0",
+        "source_bundle_prompt_v33": "bd936fa61114d202f9fffb9d5586a31a133a3cda06d0400792ca82600b1f2431",
+        "source_bundle_user_prompt_v33": "7e9becee190a22ae1d26d30d44a5864cd4c6e924dc869f3cc67089f4498eb892",
         "codex_source_bundle_schema": "1b9491a9f2d7bf9c4c8c62a5838180c2e8b171700211e2fe63cd77514d7192c2",
         "codex_source_bundle_contract": "e6e7dc65d7953e5fe777faf1dcb43cebf933c4d9e73ca890264e98a7cd08e023",
         "codex_chunk_evidence_schema": "130ebe184fc8dc0b3c08879abfeb0435500a47eecd78ed7e2387c095574d821c",
