@@ -84,10 +84,10 @@ def test_atomic_prompt_v14_is_source_adaptive_and_statistics_aware() -> None:
     assert "silently reread" in prompt
 
 
-def test_source_bundle_prompt_v34_preserves_formatting_and_attribution_scope() -> None:
+def test_source_bundle_prompt_v35_preserves_formatting_and_attribution_scope() -> None:
     prompt = _source_bundle_system_prompt()
 
-    assert "source bundle prompt v34" in prompt
+    assert "source bundle prompt v35" in prompt
     assert "apply a footnote, only when the alignment or marker is explicit" in prompt
     assert "A footnote qualifies only the values bearing its explicit marker" in prompt
     assert "page metadata is not a statistic's observation date" in prompt
@@ -240,6 +240,11 @@ def test_chunk_prompt_preserves_quote_and_chapter_start_boundaries() -> None:
     assert "labeled source-grounded paraphrase" in prompt
     assert "actual opening heading" in prompt
     assert "mark a continuation and omit its start" in prompt
+    assert "not a section boundary" in prompt
+    assert "authors, publication years, and titles" in prompt
+    assert "substantively engaged works in methods_and_data" in prompt
+    assert "do not copy an unengaged bibliography" in prompt
+    assert "year means the work's publication year" in _source_bundle_system_prompt()
 
 
 def test_chunk_final_check_preserves_pdf_and_printed_coordinates() -> None:
@@ -259,6 +264,10 @@ def test_chunk_final_check_preserves_pdf_and_printed_coordinates() -> None:
     assert "Illustration, not source evidence" in final
     assert "PDF p. 42; printed p. 32" in final
     assert "Preserve explicitly credited authors and speakers" in final
+    assert "each section opening" in final
+    assert "exact measured outcome and its qualifiers" in final
+    assert "not a neighboring comparison" in final
+    assert "absence of effect on other outcomes" in final
 
 
 def test_source_bundle_critique_distinguishes_totals_from_component_scopes() -> None:
@@ -342,12 +351,12 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     )
     assert {
         "atomic_prompt_v14": digest(_system_prompt()),
-        "chunk_prompt_bundle_v34": digest(_chunk_system_prompt()),
-        "chunk_user_prompt_bundle_v34": digest(
+        "chunk_prompt_bundle_v35": digest(_chunk_system_prompt()),
+        "chunk_user_prompt_bundle_v35": digest(
             _chunk_prompt("A fictional source.", {}, None, "chunk-0001", "pages 1-2")
         ),
-        "source_bundle_prompt_v34": digest(_source_bundle_system_prompt()),
-        "source_bundle_user_prompt_v34": digest(
+        "source_bundle_prompt_v35": digest(_source_bundle_system_prompt()),
+        "source_bundle_user_prompt_v35": digest(
             _source_bundle_prompt("A fictional source.", {}, None)
         ),
         "codex_source_bundle_schema": bundle_identity["schema_hash"],
@@ -356,10 +365,10 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
         "codex_chunk_evidence_contract": digest(chunk_identity),
     } == {
         "atomic_prompt_v14": "8db9f2990d175816cb0100b92d84734ae7c2f930aade66825ed0412b22da3705",
-        "chunk_prompt_bundle_v34": "81ca9f1861b6b5d35fc921f09323ef10ac324b4d8d54d47aa523610377d429c0",
-        "chunk_user_prompt_bundle_v34": "d5920eed15b27025b2c9ac87e775872eb7905f976e18c1149b00b17f228de184",
-        "source_bundle_prompt_v34": "6862e9c1dcb9f1d0cb76b8725c997981fd19411363ddb9faaaac0db360f6640f",
-        "source_bundle_user_prompt_v34": "fe31c24456507ac518dd9e8d2cc5c31a056e6b0daf5fb1c0617710b7d5e8a7e0",
+        "chunk_prompt_bundle_v35": "32878836a4cfa39eff61fe42769fcad996295275c780eade236f32ac98a0b22d",
+        "chunk_user_prompt_bundle_v35": "5b7fede5908f56fdee5cb4ddfee443c0c5b2eb7e63703bab9785136d9284e3f0",
+        "source_bundle_prompt_v35": "3613ca3e9c38f691e2ba93225da750b6ed58292cb2a78d13864581e993bdab68",
+        "source_bundle_user_prompt_v35": "fe31c24456507ac518dd9e8d2cc5c31a056e6b0daf5fb1c0617710b7d5e8a7e0",
         "codex_source_bundle_schema": "1b9491a9f2d7bf9c4c8c62a5838180c2e8b171700211e2fe63cd77514d7192c2",
         "codex_source_bundle_contract": "e6e7dc65d7953e5fe777faf1dcb43cebf933c4d9e73ca890264e98a7cd08e023",
         "codex_chunk_evidence_schema": "130ebe184fc8dc0b3c08879abfeb0435500a47eecd78ed7e2387c095574d821c",

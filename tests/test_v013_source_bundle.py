@@ -1546,7 +1546,7 @@ def test_ordinary_bundle_source_uses_one_call_and_no_profile_or_fidelity_call(
     ]
     assert profile["coverage"]["status"] == "partial"
     note = read_note(tmp_path / report.items[0]["note_path"])
-    assert note["frontmatter"]["source_bundle_prompt_version"] == "34"
+    assert note["frontmatter"]["source_bundle_prompt_version"] == "35"
 
 
 @pytest.mark.parametrize("observed_date", ["", "Published 2019; updated 2024"])
@@ -2352,6 +2352,12 @@ def test_hierarchical_bundle_honors_the_supported_32k_output(
         assert "explicit opening heading" in _user
         assert "source contents entry" in _user
         assert "omit an unverified start or range" in _user
+        final = _user.split("FINAL HIERARCHICAL CHECK:")[1]
+        assert _user.index("Grounded memo.") < _user.index(final)
+        assert "consistently in every output field" in final
+        assert "Ground substantive claims and cited works in the memos" in final
+        assert "navigation aids, not complete passages" in final
+        assert "A section start" in final
         captured.append(output_tokens)
         return json.dumps(_bundle_payload())
 
@@ -4913,6 +4919,104 @@ def test_quantitative_provenance_recognizes_year_modified_source_periods(
         )
         is not None
     )
+
+
+@pytest.mark.parametrize("prefix", ["In", "During", "Since"])
+def test_quantitative_provenance_recognizes_wrapped_year_cue(prefix: str) -> None:
+    anchor = {
+        "claim": "The broadcaster reached 24 million listeners in 2017.",
+        "quantitative_result": {
+            "estimate": "24 million", "period": "2017",
+            "provenance": "source_reported",
+        },
+    }
+    pipeline_module._validate_quantitative_provenance(
+        {"evidence_anchors": [anchor]},
+        {"text": f"The service expanded. {prefix}\n2017, the weekly reach was\n24 million listeners."},
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "In.\n2017, the weekly reach was 24 million listeners.",
+        "In\n\n2017, the weekly reach was 24 million listeners.",
+        "In\n--- Page 4 ---\n2017, the weekly reach was 24 million listeners.",
+        "Published:\n2017\nThe weekly reach was 24 million listeners.",
+        "Published in\n2017\nThe weekly reach was 24 million listeners.",
+        "In\n*2017, the weekly reach was 24 million listeners.",
+        "In\n2016, the weekly reach was 24 million listeners.",
+        "The count was\n2017 people and 24 million messages.",
+        "In our survey\n2017 people responded and 24 million messages were recorded.",
+        "In\n2017 people, 24 million messages were recorded.",
+    ],
+)
+def test_quantitative_provenance_keeps_wrapped_year_boundaries(text: str) -> None:
+    with pytest.raises(SourceBundleQuantitativeProvenanceError):
+        pipeline_module._validate_quantitative_provenance(
+            {"evidence_anchors": [{"quantitative_result": {
+                "estimate": "24 million", "period": "2017",
+                "provenance": "source_reported",
+            }}]},
+            {"text": text},
+        )
+
+
+def test_quantitative_provenance_preserves_yearlike_monthly_count() -> None:
+    pipeline_module._validate_quantitative_provenance(
+        {"evidence_anchors": [{
+            "claim": "May recorded 2017 orders.",
+            "quantitative_result": {
+                "estimate": "2017 orders", "provenance": "source_reported",
+            },
+        }]},
+        {"text": "Monthly order counts\nMay 2017 orders\nJune 45 orders"},
+    )
+
+
+@pytest.mark.parametrize("period", ["", "May 2017"])
+def test_quantitative_provenance_rejects_unmodeled_monthly_count(period: str) -> None:
+    with pytest.raises(
+        SourceBundleQuantitativeProvenanceError,
+        match="quantitative_anchor_contains_unmodeled_quantity",
+    ):
+        pipeline_module._validate_quantitative_provenance(
+            {"evidence_anchors": [{
+                "claim": "Monthly order counts: May 2017 orders; overall 23%.",
+                "quantitative_result": {
+                    "estimate": "23%", "period": period, "provenance": "source_reported",
+                },
+            }]},
+            {"text": f"In {period}, the overall response was 23%." if period else "Overall 23%."},
+        )
+
+
+def test_quantitative_provenance_preserves_published_in_narrative() -> None:
+    pipeline_module._validate_quantitative_provenance(
+        {"evidence_anchors": [{"quantitative_result": {
+            "estimate": "23%", "period": "2017", "provenance": "source_reported",
+        }}]},
+        {"text": "Published in a journal, the study in 2017 found 23% supported the policy."},
+    )
+
+
+@pytest.mark.parametrize("extra", ["among 2017 people", "and held rank 2017"])
+def test_quantitative_provenance_month_year_keeps_separate_yearlike_count(extra: str) -> None:
+    claim = f"A March 2017 poll found 23% favored the policy {extra}."
+    with pytest.raises(
+        SourceBundleQuantitativeProvenanceError,
+        match="quantitative_anchor_contains_unmodeled_quantity",
+    ):
+        pipeline_module._validate_quantitative_provenance(
+            {"evidence_anchors": [{
+                "claim": claim,
+                "quantitative_result": {
+                    "estimate": "23%", "period": "March 2017",
+                    "provenance": "source_reported",
+                },
+            }]},
+            {"text": claim},
+        )
 
 
 def test_quantitative_provenance_understands_fiscal_between_and_season_years() -> None:

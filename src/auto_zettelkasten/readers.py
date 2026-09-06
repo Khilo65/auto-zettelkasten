@@ -238,7 +238,7 @@ DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
-SOURCE_BUNDLE_PROMPT_VERSION = "34"
+SOURCE_BUNDLE_PROMPT_VERSION = "35"
 SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v2"
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
@@ -2956,10 +2956,12 @@ class _CapabilityAwareReader:
         user_prompt = (
             "The inspected content below consists of ordered source-grounded chunk "
             "memos from one oversized document. Synthesize them as one source without "
-            "inventing evidence absent from those memos. Reconcile structure across adjacent chunks, "
-            "retain the earliest supported section start, and copy PDF/printed locator pairs exactly. "
-            "A chapter start requires an explicit opening heading or source contents entry, not a chunk's coverage boundary; "
-            "omit an unverified start or range.\n\n" + user_prompt
+            "inventing evidence absent from those memos.\n\n" + user_prompt
+            + "\n\nFINAL HIERARCHICAL CHECK: Ground substantive claims and cited works in the memos; "
+            "extraction snippets are navigation aids, not complete passages. Reconcile structure across all chunks, "
+            "retain the earliest supported section start consistently in every output field, and copy PDF/printed locator pairs exactly. "
+            "A section start requires an explicit opening heading or source contents entry, not a chunk's coverage boundary; "
+            "omit an unverified start or range."
         )
         output_tokens = self._reserved_output_tokens("source_bundle", min(
             int(
@@ -5531,7 +5533,8 @@ def _source_bundle_system_prompt() -> str:
         "observation dates with semicolons in period. literature_positions contains up to eight distinct important "
         "substantively engaged works; return an empty array when none are recoverable, "
         "not the whole bibliography. Each row uses raw_citation, author, year, title, identifiers, engagement, "
-        "relation_label, and locator. observed_bibliographic_identity is a diagnostic object using title, creators, and date "
+        "relation_label, and locator. Here year means the work's publication year; leave it empty when only an event or study date is known. "
+        "observed_bibliographic_identity is a diagnostic object using title, creators, and date "
         "when visible in the source. Do not return stable IDs, source ownership, scope classification, support-envelope "
         "bookkeeping, library match status, missing-source recommendations, or a self-review object; the engine supplies or "
         "derives those fields locally. Before returning, silently self-review attribution, scope, conspicuous numbers, "
@@ -6830,6 +6833,8 @@ def _chunk_system_prompt() -> str:
         "Return only one JSON object and do not infer facts absent from the chunk. "
         f"Every returned value must be a non-empty string. Required keys: {keys}. "
         "Preserve concrete claims, methods, data, qualifications, and contradictions, but avoid prose repetition. "
+        "Retain the explicit authors, publication years, and titles of a few substantively engaged works in methods_and_data; "
+        "do not copy an unengaged bibliography or infer missing citation details. "
         "Include the optional key_concepts_and_definitions field only when this chunk explicitly defines or operationalizes a "
         "consequential concept. Use a short contiguous verbatim quotation without inserted ellipses, or a labeled source-grounded paraphrase, "
         "with an available page, section, heading, or text-anchor locator. "
@@ -6846,8 +6851,8 @@ def _chunk_system_prompt() -> str:
         "`--- Page N ---`, `PDF page N`, and caller-provided page scopes are physical PDF ordinals. "
         "Reserve bare `p. N` or `pp. N-M` for supplied source-native printed labels; use "
         "ordinal_to_printed_page to convert when present, and keep the `PDF` prefix when no printed label is supplied. "
-        "Treat every caller-provided chunk page range as a coverage boundary, not a chapter boundary. "
-        "Record a chapter start only at its actual opening heading; otherwise mark a continuation and omit its start. "
+        "Treat every caller-provided chunk page range as a coverage boundary, not a section boundary. "
+        "Record a section start only at its actual opening heading; otherwise mark a continuation and omit its start. "
         "When a field is not reported in this chunk, say so briefly."
     )
 
@@ -6945,9 +6950,12 @@ def _chunk_prompt(
         "FINAL LOCATOR CHECK: In every field, copy a physical ordinal from its page marker and any "
         "printed label separately from the supplied page map or visible page label. Never prefix a mapped printed label with PDF. "
         "Illustration, not source evidence: marker Page 42 with printed label 32 is PDF p. 42; printed p. 32. "
-        "Verify each chapter opening against its heading on that page; omit an unsupported start."
+        "Verify each section opening against its heading on that page; omit an unsupported start."
         " Preserve explicitly credited authors and speakers for quotations, definitions, and findings; "
         "do not flatten their contributions into the current author's voice."
+        " For each retained result, preserve the exact measured outcome and its qualifiers; "
+        "bind its date to that result, not a neighboring comparison. A response about one specified outcome "
+        "does not establish an effect or absence of effect on other outcomes."
     )
 
 

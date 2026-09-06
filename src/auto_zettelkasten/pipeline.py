@@ -16388,7 +16388,7 @@ _COMPACT_DAY_FIRST_RANGE_RE = re.compile(
 _PAGE_DATE_METADATA_LABEL_RE = re.compile(
     r"^\s*(?:date\s+published|publication\s+date|published|updated|accessed|retrieved|"
     r"last\s+(?:modified|updated))"
-    r"(?:\s+on)?\s*:?[ \t]*(.*)$",
+    r"(?:\s+(?:on|in))?\s*:?[ \t]*(.*)$",
     re.IGNORECASE,
 )
 _QUANTITATIVE_DATE_LOCALITY_LINES = 12
@@ -17212,10 +17212,20 @@ def _quantitative_source_index(source_text: str) -> _QuantitativeSourceIndex:
     calendar_dates_by_line = tuple(
         tuple(_calendar_dates(line)) for line in lines
     )
-    years_by_line = tuple(
+    years_by_line = [
         frozenset() if index in metadata_lines else frozenset(_source_year_values(line))
         for index, line in enumerate(lines)
-    )
+    ]
+    for index, line in enumerate(lines):
+        if (
+            index
+            and index not in metadata_lines
+            and index - 1 not in metadata_lines
+            and re.match(rf"\s*{_YEAR_TOKEN}\s*(?:,|$)", line)
+            and (prefix := re.search(r"\b[A-Za-z]+\s*$", lines[index - 1]))
+        ):
+            # Recover an adjacent date cue, never a yearlike count or another line's year.
+            years_by_line[index] |= _source_year_values(f"{prefix.group()} {line}")
     period_markers_by_line = tuple(
         frozenset()
         if index in metadata_lines
@@ -17267,7 +17277,7 @@ def _quantitative_source_index(source_text: str) -> _QuantitativeSourceIndex:
             for date in dates
         ),
         quantity_tokens_by_line=quantity_tokens_by_line,
-        years_by_line=years_by_line,
+        years_by_line=tuple(years_by_line),
         period_markers_by_line=period_markers_by_line,
         source_groups=tuple(source_groups),
         group_ids_by_token={

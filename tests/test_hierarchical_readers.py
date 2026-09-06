@@ -145,7 +145,7 @@ def test_hierarchical_prompts_preserve_identity_quantity_and_locator_roles() -> 
     assert "source-visible bibliographic identity" in chunk
     assert "duration, year, rank, page, or sample label" in chunk
     assert "exact noun, unit, and grammatical role" in chunk
-    assert "coverage boundary, not a chapter boundary" in chunk
+    assert "coverage boundary, not a section boundary" in chunk
     assert "The Making of Israel" in synthesis
     assert "source-visible identity" in synthesis
     assert "earliest supported section start" in synthesis
