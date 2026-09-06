@@ -8597,7 +8597,15 @@ def map_overlapping_clusters(
                     ),
                     "source_ids": sorted(proposal_sources),
                     "action": "reject",
-                    "reason": "no_valid_connected_family_relation",
+                    "reason": (
+                        "contextual_connections_only"
+                        if core_relations and all(
+                            _as_mapping(relation.get("comparability")).get(
+                                "accepted_relation_type"
+                            ) == "contextual_connection"
+                            for relation in core_relations
+                        ) else "no_valid_connected_family_relation"
+                    ),
                 }
             )
             continue
@@ -26927,6 +26935,7 @@ def _map_unclustered_reason_label(value: Any) -> str:
         "proposed_cluster_failed_evidence_matrix": "A proposed cluster failed its final locator-backed evidence check",
         "no_admitted_thematic_cluster": "No sufficiently connected thematic cluster was admitted",
         "no_valid_connected_family_relation": "No locator-backed relationship connected the proposed core studies",
+        "contextual_connections_only": "Contextual links alone do not qualify as a cluster core",
     }
     if reason in labels:
         return labels[reason]

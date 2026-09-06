@@ -275,7 +275,11 @@ def test_relationship_first_contextual_edge_does_not_create_core_only_cluster() 
 
     assert mapped["clusters"] == []
     assert mapped["rejected_proposals"][0]["reason"] == (
-        "no_valid_connected_family_relation"
+        "contextual_connections_only"
+    )
+
+    assert literature._map_unclustered_reason_label("contextual_connections_only") == (
+        "Contextual links alone do not qualify as a cluster core"
     )
 
 
