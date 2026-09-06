@@ -238,7 +238,7 @@ DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
-SOURCE_BUNDLE_PROMPT_VERSION = "33"
+SOURCE_BUNDLE_PROMPT_VERSION = "34"
 SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v2"
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
@@ -2958,7 +2958,7 @@ class _CapabilityAwareReader:
             "memos from one oversized document. Synthesize them as one source without "
             "inventing evidence absent from those memos. Reconcile structure across adjacent chunks, "
             "retain the earliest supported section start, and copy PDF/printed locator pairs exactly. "
-            "A chapter start requires an explicit opening heading, not a chunk's coverage boundary; "
+            "A chapter start requires an explicit opening heading or source contents entry, not a chunk's coverage boundary; "
             "omit an unverified start or range.\n\n" + user_prompt
         )
         output_tokens = self._reserved_output_tokens("source_bundle", min(
@@ -5638,6 +5638,8 @@ def _source_bundle_prompt(
         "Use explicit text anchors rather than unverified opening/closing locations. "
         "Each literature-position row must describe one distinct work, not a publisher's pooled reporting. Leave unknown years and titles empty; "
         "never borrow them from a neighboring citation, the cited event, or the current source's date. "
+        "A researcher's study of a named film, text, or dataset does not make that object the researcher's publication. "
+        "Keep the studied object in engagement; leave the study title empty when unreported. "
         "Do not credit a discussed work or its publisher with third-party commentary about it. "
         "Keep that commentary as a separate work, with author and title empty when not supplied. "
         "Apply each footnote only to its marked measure in every field, including limitations. "
@@ -6939,7 +6941,13 @@ def _chunk_prompt(
         f"Caller-provided locator: {locator or 'unspecified'}\n"
         f"Caller-provided section/page scope: {json.dumps(scope, ensure_ascii=False)}\n\n"
         "COARSE INSPECTED SOURCE CHUNK:\n"
-        f"{text}"
+        f"{text}\n\n"
+        "FINAL LOCATOR CHECK: In every field, copy a physical ordinal from its page marker and any "
+        "printed label separately from the supplied page map or visible page label. Never prefix a mapped printed label with PDF. "
+        "Illustration, not source evidence: marker Page 42 with printed label 32 is PDF p. 42; printed p. 32. "
+        "Verify each chapter opening against its heading on that page; omit an unsupported start."
+        " Preserve explicitly credited authors and speakers for quotations, definitions, and findings; "
+        "do not flatten their contributions into the current author's voice."
     )
 
 
