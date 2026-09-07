@@ -101,10 +101,10 @@ def test_atomic_prompt_v14_is_source_adaptive_and_statistics_aware() -> None:
     assert "silently reread" in prompt
 
 
-def test_source_bundle_prompt_v36_preserves_formatting_and_attribution_scope() -> None:
+def test_source_bundle_prompt_v37_preserves_formatting_and_attribution_scope() -> None:
     prompt = _source_bundle_system_prompt()
 
-    assert "source bundle prompt v36" in prompt
+    assert "source bundle prompt v37" in prompt
     assert "apply a footnote, only when the alignment or marker is explicit" in prompt
     assert "A footnote qualifies only the values bearing its explicit marker" in prompt
     assert "page metadata is not a statistic's observation date" in prompt
@@ -259,8 +259,8 @@ def test_chunk_prompt_preserves_quote_and_chapter_start_boundaries() -> None:
     assert "mark a continuation and omit its start" in prompt
     assert "not a section boundary" in prompt
     assert "authors, publication years, and titles" in prompt
-    assert "substantively engaged works in methods_and_data" in prompt
-    assert "do not copy an unengaged bibliography" in prompt
+    assert "prioritize substantively engaged works" in prompt
+    assert "Do not copy an unengaged bibliography" in prompt
     assert "year means the work's publication year" in _source_bundle_system_prompt()
 
 
@@ -272,14 +272,15 @@ def test_chunk_final_check_preserves_pdf_and_printed_coordinates() -> None:
     )
     final = prompt.split("FINAL LOCATOR CHECK:")[1]
 
-    assert source in prompt
-    assert prompt.index(source) < prompt.index(final)
-    assert "every field" in final
-    assert "physical ordinal from its page marker" in final
-    assert "printed label separately" in final
-    assert "Never prefix a mapped printed label with PDF" in final
-    assert "Illustration, not source evidence" in final
-    assert "PDF p. 42; printed p. 32" in final
+    annotated = "--- Page 42 ---\n[Citation locator: p. 32]\n32\nFindings\nThe effect was conditional."
+    assert annotated in prompt
+    assert prompt.index(annotated) < prompt.index(final)
+    assert annotated.replace("\n[Citation locator: p. 32]", "") == source
+    assert "one supporting page coordinate per citation" in final
+    assert "otherwise cite the physical marker as PDF p./pp." in final
+    assert "Do not output both coordinates or infer a missing printed label" in final
+    assert "Copy the adjacent Citation locator line verbatim" in final
+    assert "this line is navigation, not source evidence" in final
     assert "Preserve explicitly credited authors and speakers" in final
     assert "each section opening" in final
     assert "supporting locator directly to each retained claim, result, and cited work" in final
@@ -371,12 +372,12 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     )
     assert {
         "atomic_prompt_v14": digest(_system_prompt()),
-        "chunk_prompt_bundle_v36": digest(_chunk_system_prompt()),
-        "chunk_user_prompt_bundle_v36": digest(
+        "chunk_prompt_bundle_v37": digest(_chunk_system_prompt()),
+        "chunk_user_prompt_bundle_v37": digest(
             _chunk_prompt("A fictional source.", {}, None, "chunk-0001", "pages 1-2")
         ),
-        "source_bundle_prompt_v36": digest(_source_bundle_system_prompt()),
-        "source_bundle_user_prompt_v36": digest(
+        "source_bundle_prompt_v37": digest(_source_bundle_system_prompt()),
+        "source_bundle_user_prompt_v37": digest(
             _source_bundle_prompt("A fictional source.", {}, None)
         ),
         "codex_source_bundle_schema": bundle_identity["schema_hash"],
@@ -385,10 +386,10 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
         "codex_chunk_evidence_contract": digest(chunk_identity),
     } == {
         "atomic_prompt_v14": "8db9f2990d175816cb0100b92d84734ae7c2f930aade66825ed0412b22da3705",
-        "chunk_prompt_bundle_v36": "32878836a4cfa39eff61fe42769fcad996295275c780eade236f32ac98a0b22d",
-        "chunk_user_prompt_bundle_v36": "4adc842c7b001d4d588d942c955000b51b7fba2e709ba19ad9c7ea669c320568",
-        "source_bundle_prompt_v36": "00aa4930bae7e6e335202abb27bbcaead4b013808f2821846f3c5ed2f7e167c1",
-        "source_bundle_user_prompt_v36": "fe31c24456507ac518dd9e8d2cc5c31a056e6b0daf5fb1c0617710b7d5e8a7e0",
+        "chunk_prompt_bundle_v37": "1ef440d8148d4a58491ac2a74cf9d65c0d52f9f4d2e42278f1961e94e570dea2",
+        "chunk_user_prompt_bundle_v37": "13825c29551703fdc760ab0ad496ac3210658dfe290c36fa027f6c51f3d72a05",
+        "source_bundle_prompt_v37": "e8dade8fd31436e60a787b07289ebae5f3c948a6ff1332237a4fc79f3ec5be20",
+        "source_bundle_user_prompt_v37": "fe31c24456507ac518dd9e8d2cc5c31a056e6b0daf5fb1c0617710b7d5e8a7e0",
         "codex_source_bundle_schema": "1b9491a9f2d7bf9c4c8c62a5838180c2e8b171700211e2fe63cd77514d7192c2",
         "codex_source_bundle_contract": "e6e7dc65d7953e5fe777faf1dcb43cebf933c4d9e73ca890264e98a7cd08e023",
         "codex_chunk_evidence_schema": "130ebe184fc8dc0b3c08879abfeb0435500a47eecd78ed7e2387c095574d821c",
@@ -871,3 +872,60 @@ def test_generic_openai_provider_keeps_deterministic_nonreasoning_request(
     assert bodies[0]["temperature"] == 0
     assert "thinking" not in bodies[0]
     assert "reasoning_effort" not in bodies[0]
+
+
+@pytest.mark.parametrize("alias", ["_source_context", "source_context", "extraction_provenance", "extraction"])
+@pytest.mark.parametrize("page_map, expected", [
+    ({"2": "17"}, "p. 17"),
+    ({2: 17}, "p. 17"),
+    ({"2": " iv "}, "p. iv"),
+    ({"2": "IX"}, "p. IX"),
+    ({"2": "17", "9": "17"}, "PDF p. 2"),
+    ({"2": "iv", "9": "IV"}, "PDF p. 2"),
+    ({"2": "17", 2: "18"}, "PDF p. 2"),
+    ({"2": ""}, "PDF p. 2"),
+    ({"2": None}, "PDF p. 2"),
+    ({"2": []}, "PDF p. 2"),
+    ({"2": True}, "PDF p. 2"),
+    ({"2": "A-17"}, "PDF p. 2"),
+    ({"2": "17\nOther text"}, "PDF p. 2"),
+    ({}, "PDF p. 2"),
+    ([], "PDF p. 2"),
+    ("17", "PDF p. 2"),
+    (None, "PDF p. 2"),
+])
+def test_chunk_prompt_annotations_use_metadata_aliases_without_mutation(
+    alias: str, page_map: Any, expected: str,
+) -> None:
+    source = "--- Page 2 ---\nFirst body.\n\n--- Page 3 ---\nSecond body."
+    metadata = {alias: {"ordinal_to_printed_page": page_map}}
+    before = json.dumps(metadata)
+    prompt = _chunk_prompt(source, metadata, None, "chunk-0001", "pages 2-3")
+    annotated = source.replace("--- Page 2 ---", f"--- Page 2 ---\n[Citation locator: {expected}]")
+    annotated = annotated.replace("--- Page 3 ---", "--- Page 3 ---\n[Citation locator: PDF p. 3]")
+
+    assert annotated in prompt
+    assert annotated.replace(f"\n[Citation locator: {expected}]", "").replace(
+        "\n[Citation locator: PDF p. 3]", "",
+    ) == source
+    assert json.dumps(metadata) == before
+
+
+def test_chunk_prompt_context_precedence_matches_metadata_and_leaves_html_unmarked() -> None:
+    source = "--- Page 2 ---\nBody."
+    metadata = {
+        "_source_context": [],
+        "source_context": {"ordinal_to_printed_page": {"2": "iv"}},
+        "extraction": {"ordinal_to_printed_page": {"2": "17"}},
+    }
+    assert "--- Page 2 ---\n[Citation locator: p. iv]\nBody." in _chunk_prompt(
+        source, metadata, None, "", "",
+    )
+    metadata["_source_context"] = {}
+    assert "--- Page 2 ---\n[Citation locator: PDF p. 2]\nBody." in _chunk_prompt(
+        source, metadata, None, "", "",
+    )
+    html = "<h2>Results</h2><p>Quoted marker --- Page 2 --- stays in prose.</p>"
+    prompt = _chunk_prompt(html, metadata, None, "", "")
+    assert html in prompt
+    assert "[Citation locator:" not in prompt

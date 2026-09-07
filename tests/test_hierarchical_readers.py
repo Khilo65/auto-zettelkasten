@@ -142,14 +142,15 @@ def test_hierarchical_prompts_preserve_identity_quantity_and_locator_roles() -> 
         None,
     )
 
-    assert "source-visible bibliographic identity" in chunk
+    assert "source_visible_bibliographic_identity" in chunk
+    assert "distinguish them from supplied metadata" in chunk
     assert "duration, year, rank, page, or sample label" in chunk
     assert "exact noun, unit, and grammatical role" in chunk
     assert "coverage boundary, not a section boundary" in chunk
     assert "The Making of Israel" in synthesis
     assert "source-visible identity" in synthesis
     assert "earliest supported section start" in synthesis
-    assert "PDF/printed locator pairs exactly" in synthesis
+    assert "preserve the supplied locators exactly without converting or adding a page coordinate" in synthesis
 
 
 def test_journalism_prompt_separates_interviews_from_nonresponses() -> None:
@@ -287,7 +288,7 @@ def test_deepseek_chunk_prompt_parsing_and_per_call_bounds(monkeypatch: pytest.M
     assert "source_structure_and_organization" in system_prompt
     assert "source-native headings or chapters" in system_prompt
     assert "physical PDF ordinals" in system_prompt
-    assert "Reserve bare `p. N`" in system_prompt
+    assert "Use one page coordinate per citation" in system_prompt
 
 
 def test_deepseek_synthesis_returns_pipeline_analysis_and_uses_final_cap(monkeypatch: pytest.MonkeyPatch) -> None:

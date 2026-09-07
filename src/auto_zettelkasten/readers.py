@@ -239,7 +239,7 @@ DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
-SOURCE_BUNDLE_PROMPT_VERSION = "36"
+SOURCE_BUNDLE_PROMPT_VERSION = "37"
 SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v2"
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
@@ -2892,15 +2892,16 @@ class _CapabilityAwareReader:
         self._ensure_prompt_fits(
             system_prompt, user_prompt, output_tokens, label="coarse chunk"
         )
-        return _parse_chunk_evidence(
-            self._generate_with_reasoning(
-                system_prompt,
-                user_prompt,
-                output_tokens,
-                request_deadline,
-                reasoning_effort="high",
-                output_contract="chunk_evidence",
-            )
+        raw_response = self._generate_with_reasoning(
+            system_prompt,
+            user_prompt,
+            output_tokens,
+            request_deadline,
+            reasoning_effort="high",
+            output_contract="chunk_evidence",
+        )
+        return _canonicalize_chunk_evidence_locators(
+            _parse_chunk_evidence(raw_response), text, metadata,
         )
 
     def synthesize_document(
@@ -2960,7 +2961,7 @@ class _CapabilityAwareReader:
             "inventing evidence absent from those memos.\n\n" + user_prompt
             + "\n\nFINAL HIERARCHICAL CHECK: Ground substantive claims and cited works in the memos; "
             "extraction snippets are navigation aids, not complete passages. Reconcile structure across all chunks, "
-            "retain the earliest supported section start consistently in every output field, and copy PDF/printed locator pairs exactly. "
+            "retain the earliest supported section start consistently in every output field, and preserve the supplied locators exactly without converting or adding a page coordinate. "
             "A section start requires an explicit opening heading or source contents entry, not a chunk's coverage boundary; "
             "omit an unverified start or range."
         )
@@ -5535,6 +5536,7 @@ def _source_bundle_system_prompt() -> str:
         "substantively engaged works; return an empty array when none are recoverable, "
         "not the whole bibliography. Each row uses raw_citation, author, year, title, identifiers, engagement, "
         "relation_label, and locator. Here year means the work's publication year; leave it empty when only an event or study date is known. "
+        "Copy supplied author and title forms exactly; do not expand initials or add name components. "
         "observed_bibliographic_identity is a diagnostic object using title, creators, and date "
         "when visible in the source. Do not return stable IDs, source ownership, scope classification, support-envelope "
         "bookkeeping, library match status, missing-source recommendations, or a self-review object; the engine supplies or "
@@ -6843,8 +6845,11 @@ def _chunk_system_prompt() -> str:
         "Return only one JSON object and do not infer facts absent from the chunk. "
         f"Every returned value must be a non-empty string. Required keys: {keys}. "
         "Preserve concrete claims, methods, data, qualifications, and contradictions, but avoid prose repetition. "
-        "Retain the explicit authors, publication years, and titles of a few substantively engaged works in methods_and_data; "
-        "do not copy an unengaged bibliography or infer missing citation details. "
+        "In methods_and_data, prioritize substantively engaged works supporting the chunk’s principal "
+        "arguments and case studies. Retain their explicit authors, publication years, and titles. For each "
+        "retained work, distinguish its own methods from methods it reports from others, retain any "
+        "explicitly named original investigators, and include its reported evidence base or sample and "
+        "supporting locator. Do not copy an unengaged bibliography or infer missing citation details. "
         "Include the optional key_concepts_and_definitions field only when this chunk explicitly defines or operationalizes a "
         "consequential concept. Use a short contiguous verbatim quotation without inserted ellipses, or a labeled source-grounded paraphrase, "
         "with an available page, section, heading, or text-anchor locator. "
@@ -6852,15 +6857,28 @@ def _chunk_system_prompt() -> str:
         "Include the optional source_structure_and_organization field only when this chunk exposes source-native headings or chapters. "
         "Preserve their titles, order, hierarchy, and available locator in concise Markdown bullets. Do not infer missing structure, "
         "and omit the field when no reliable source-native structure is visible. "
-        "Include the source-visible bibliographic identity field source_visible_bibliographic_identity only for title, creators, date, edition, or identifiers visibly printed in this chunk; distinguish them from supplied metadata. "
-        "Statistical context must retain exact estimates and units plus any sample size, denominator, baseline, comparison "
-        "group, reference category, uncertainty measure, significance statement, and caveat needed for later plain-English explanation. "
-        "If the chunk contains no quantitative result, say so briefly in statistical_context. "
+        "In source_visible_bibliographic_identity, report only title, creators, date, edition, or identifiers "
+        "explicitly visible in this chunk, including self-identification in the body text; distinguish them "
+        "from supplied metadata. Omit unobserved identity attributes rather than asserting their absence. "
+        "Write methods_and_data before statistical_context. Select consequential quantitative observations "
+        "supporting the chunk’s central claims and methods, not an inventory of numbers. In "
+        "statistical_context use one line per distinct observation: Evidence: \"short contiguous source "
+        "clause\"; Reporter: ...; Measured entity: ...; Value and unit: ...; Qualification: ...; Locator: .... "
+        "Copy the supporting clause verbatim, including the words marking a forecast, estimate, comparison, "
+        "or uncertainty; then write source-grounded paraphrases consistent with it. Do not insert ellipses or "
+        "bracketed substitutions into the evidence clause. The terminal Locator identifies the quoted "
+        "Evidence clause itself; retain separate locators for additional contextual claims when needed. Keep "
+        "each observation’s reporting work or speaker, measured entity, exact estimates and units, sample or "
+        "denominator, comparison, date, uncertainty, and relevant qualification together. Distinguish "
+        "reported projections from observed values. Do not merge different observations from nearby passages. "
+        "If the reporting work is unnamed, say source account; never infer it. If no quantitative result is "
+        "present, say so briefly. "
         "Bind every number to its exact noun, unit, and grammatical role: a duration, year, rank, page, or sample label must never become a count. "
         "Keep page markers, section headings, and explicit text anchors in locators. "
         "`--- Page N ---`, `PDF page N`, and caller-provided page scopes are physical PDF ordinals. "
-        "Reserve bare `p. N` or `pp. N-M` for supplied source-native printed labels; use "
-        "ordinal_to_printed_page to convert when present, and keep the `PDF` prefix when no printed label is supplied. "
+        "Use one page coordinate per citation: when ordinal_to_printed_page unambiguously supplies a printed "
+        "label for the supporting physical page, cite that label as p./pp.; otherwise cite the physical "
+        "marker as PDF p./pp. Do not output both coordinates or infer a missing printed label. "
         "Treat every caller-provided chunk page range as a coverage boundary, not a section boundary. "
         "Record a section start only at its actual opening heading; otherwise mark a continuation and omit its start. "
         "When a field is not reported in this chunk, say so briefly."
@@ -6938,6 +6956,105 @@ def _source_prompt(text: str, metadata: Mapping[str, Any], question: str | None)
     )
 
 
+def _chunk_page_locators(metadata: Mapping[str, Any]) -> dict[str, str]:
+    context = next(
+        (
+            metadata[key]
+            for key in ("_source_context", "source_context", "extraction_provenance", "extraction")
+            if isinstance(metadata.get(key), Mapping)
+        ),
+        {},
+    )
+    supplied = context.get("ordinal_to_printed_page")
+    supplied = supplied if isinstance(supplied, Mapping) else {}
+    labels: dict[str, set[str]] = {}
+    owners: dict[str, set[str]] = {}
+    for ordinal, value in supplied.items():
+        page = str(ordinal)
+        label = str(value).strip() if isinstance(value, (str, int)) and not isinstance(value, bool) else ""
+        labels.setdefault(page, set()).add(label)
+        owners.setdefault(label.casefold(), set()).add(page)
+
+    locators: dict[str, str] = {}
+    for ordinal, candidates in labels.items():
+        label = next(iter(candidates)) if len(candidates) == 1 else ""
+        if (
+            re.fullmatch(r"(?:[0-9]+|[ivxlcdmIVXLCDM]+)", label)
+            and len(owners[label.casefold()]) == 1
+        ):
+            locators[ordinal] = f"p. {label}"
+    return locators
+
+
+def _chunk_text_with_locators(text: str, metadata: Mapping[str, Any]) -> str:
+    locators = _chunk_page_locators(metadata)
+
+    def annotate(match: re.Match[str]) -> str:
+        locator = locators.get(match.group(1), f"PDF p. {match.group(1)}")
+        return f"{match.group(0)}\n[Citation locator: {locator}]"
+
+    return re.sub(r"(?m)^--- Page ([0-9]+) ---$", annotate, text)
+
+
+def _canonicalize_chunk_evidence_locators(
+    evidence: Mapping[str, Any], text: str, metadata: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Locate unique quoted clauses; never validate their surrounding interpretations."""
+    markers = list(re.finditer(r"(?m)^--- Page ([0-9]+) ---[ \t]*\r?$", text))
+    try:
+        ordinals = [int(marker.group(1)) for marker in markers]
+    except ValueError:
+        return evidence
+    if not ordinals or ordinals != sorted(set(ordinals)) or ordinals[0] < 1:
+        return evidence
+    pages = [
+        (marker.group(1), " ".join(text[marker.end():
+            markers[index + 1].start() if index + 1 < len(markers) else len(text)
+        ].split()))
+        for index, marker in enumerate(markers)
+    ]
+    source = " ".join(text.split())
+    locators = _chunk_page_locators(metadata)
+    observation = re.compile(
+        r'^[ \t]*(?:[-*] )?Evidence: "(?P<quote>[^"\r\n]+)"; ',
+        flags=re.IGNORECASE,
+    )
+    terminal = re.compile(
+        r'; Locator: (?:Citation locator: )?'
+        r'(?P<locator>(?:PDF )?p\. (?:[1-9][0-9]*|[ivxlcdm]+))'
+        r'\.?[ \t]*\r?\n?$',
+        flags=re.IGNORECASE,
+    )
+    lines = str(evidence.get("statistical_context") or "").splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        match = observation.match(line)
+        locator_match = terminal.search(line, match.end()) if match else None
+        if not match or not locator_match:
+            continue
+        middle = line[match.end():locator_match.start()].casefold()
+        if not middle.startswith("reporter: "):
+            continue
+        for label in ("; measured entity: ", "; value and unit: ", "; qualification: "):
+            _, separator, middle = middle.partition(label)
+            if not separator:
+                break
+        if not separator:
+            continue
+        quote = " ".join(match.group("quote").split())
+        if len(quote) < 12 or len(quote.split()) < 3:
+            continue
+        first = source.find(quote)
+        if first < 0 or source.find(quote, first + 1) >= 0:
+            continue
+        matching = [ordinal for ordinal, body in pages if quote in body]
+        if len(matching) != 1:
+            continue
+        ordinal = matching[0]
+        locator = locators.get(ordinal, f"PDF p. {ordinal}")
+        lines[index] = line[:locator_match.start("locator")] + locator + line[locator_match.end("locator"): ]
+    return {**evidence, "statistical_context": "".join(lines)}
+
+
 def _chunk_prompt(
     text: str,
     metadata: Mapping[str, Any],
@@ -6956,10 +7073,11 @@ def _chunk_prompt(
         f"Caller-provided locator: {locator or 'unspecified'}\n"
         f"Caller-provided section/page scope: {json.dumps(scope, ensure_ascii=False)}\n\n"
         "COARSE INSPECTED SOURCE CHUNK:\n"
-        f"{text}\n\n"
-        "FINAL LOCATOR CHECK: In every field, copy a physical ordinal from its page marker and any "
-        "printed label separately from the supplied page map or visible page label. Never prefix a mapped printed label with PDF. "
-        "Illustration, not source evidence: marker Page 42 with printed label 32 is PDF p. 42; printed p. 32. "
+        f"{_chunk_text_with_locators(text, metadata)}\n\n"
+        "FINAL LOCATOR CHECK: Use one supporting page coordinate per citation. "
+        "When ordinal_to_printed_page unambiguously supplies a printed label for the supporting physical page, "
+        "cite that label as p./pp.; otherwise cite the physical marker as PDF p./pp. "
+        "Do not output both coordinates or infer a missing printed label. "
         "Verify each section opening against its heading on that page; omit an unsupported start."
         " Attach the supporting locator directly to each retained claim, result, and cited work; "
         "a section or chunk boundary does not locate an individual observation."
@@ -6970,6 +7088,8 @@ def _chunk_prompt(
         " For each retained result, preserve the exact measured outcome and its qualifiers; "
         "bind its date to that result, not a neighboring comparison. A response about one specified outcome "
         "does not establish an effect or absence of effect on other outcomes."
+        " Copy the adjacent Citation locator line verbatim for a page citation; "
+        "this line is navigation, not source evidence."
     )
 
 
@@ -6993,7 +7113,7 @@ def _synthesis_prompt(
         f"{_metadata_prompt(metadata, question, include_page_labels=True)}\n\n"
         "Synthesize the following ordered coarse chunk evidence into one source-level analysis. "
         "Resolve repetition, retain disagreements and qualifications, and preserve all useful locators. "
-        "Preserve source-visible identity separately from supplied metadata. Reconcile structure across adjacent chunks, retain the earliest supported section start, and copy PDF/printed locator pairs exactly. "
+        "Preserve source-visible identity separately from supplied metadata. Reconcile structure across adjacent chunks, retain the earliest supported section start, and preserve the supplied locators exactly without converting or adding a page coordinate. "
         "Keep exact technical figures in detailed_findings and use statistical_context to produce the separately labeled "
         "plain_english_interpretation required by the system instructions. "
         "Do not claim that a chunk summary proves anything beyond its supplied evidence.\n\n"

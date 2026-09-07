@@ -202,7 +202,7 @@ from .zotero import (
     scope_collection_snapshot,
 )
 
-CHUNKING_VERSION = "2"
+CHUNKING_VERSION = "3"
 CONTENT_CLASSIFIER_VERSION = "4"
 _RELATIONSHIP_BATCH_MAX_JOBS = 8
 _LEGACY_RELATIONSHIP_BATCH_MAX_JOBS = 8
@@ -23069,17 +23069,11 @@ def _ensure_analysis_contract(analysis: Mapping[str, Any]) -> dict[str, Any]:
     return completed
 
 
-def _split_document(
-    text: str, *, chunk_char_limit: int | None = None, max_chunks: int | None = None
-) -> list[str]:
-    chunk_char_limit = chunk_char_limit or ProcessingPolicy().chunk_char_limit
-    if max_chunks is None:
-        max_chunks = ProcessingPolicy().max_total_chunks
-    paragraphs = text.split("\n\n")
+def _pack_document_blocks(blocks: list[str], chunk_char_limit: int) -> list[str]:
     chunks: list[str] = []
     current: list[str] = []
     current_size = 0
-    for paragraph in paragraphs:
+    for paragraph in blocks:
         pieces = [
             paragraph[index : index + chunk_char_limit]
             for index in range(0, len(paragraph), chunk_char_limit)
@@ -23094,6 +23088,62 @@ def _split_document(
             current_size += len(piece) + (2 if len(current) > 1 else 0)
     if current:
         chunks.append("\n\n".join(current))
+    return chunks
+
+
+def _chapter_start_offsets(text: str) -> list[int]:
+    pages = list(re.finditer(r"^--- Page (\d+) ---\n", text, re.MULTILINE))
+    starts: list[int] = []
+    numbers: list[str] = []
+    for index, page in enumerate(pages):
+        end = pages[index + 1].start() if index + 1 < len(pages) else len(text)
+        lines = [line.strip() for line in text[page.end():end].splitlines() if line.strip()]
+        if len(lines) < 4:
+            continue
+        if not all(re.fullmatch(r"[1-9]\d*", line) for line in lines[:2]):
+            continue
+        title = lines[2]
+        if not (
+            3 <= len(title) <= 80
+            and title[0].isalpha()
+            and title[0].isupper()
+            and len(title.split()) >= 2
+            and not any(char.isdigit() for char in title)
+        ):
+            continue
+        starts.append(page.start())
+        numbers.append(lines[1])
+    # ponytail: incomplete layouts fall back; sequential tables can mimic chapters.
+    # These are cut hints only; use corroborated layout if semantic labels are needed.
+    if len(starts) < 3 or numbers != [str(number) for number in range(1, len(starts) + 1)]:
+        return []
+    return starts
+
+
+def _split_document(
+    text: str, *, chunk_char_limit: int | None = None, max_chunks: int | None = None
+) -> list[str]:
+    chunk_char_limit = chunk_char_limit or ProcessingPolicy().chunk_char_limit
+    if max_chunks is None:
+        max_chunks = ProcessingPolicy().max_total_chunks
+    chunks = _pack_document_blocks(text.split("\n\n"), chunk_char_limit)
+    starts = _chapter_start_offsets(text) if len(chunks) > 1 else []
+    if starts and all(start == 0 or text[start - 2:start] == "\n\n" for start in starts):
+        boundaries = sorted({0, *starts, len(text)})
+        blocks: list[str] = []
+        for start, end in zip(boundaries, boundaries[1:]):
+            block = text[start:end - 2 if end < len(text) else end]
+            blocks.extend(
+                _pack_document_blocks(block.split("\n\n"), chunk_char_limit)
+                if len(block) > chunk_char_limit else [block]
+            )
+        candidate = _pack_document_blocks(blocks, chunk_char_limit)
+        if (
+            len(candidate) <= len(chunks)
+            and all(len(chunk) <= chunk_char_limit for chunk in candidate)
+            and "\n\n".join(candidate) == text
+        ):
+            chunks = candidate
     if max_chunks > 0 and len(chunks) > max_chunks:
         raise DocumentCoverageLimitError(len(chunks), max_chunks)
     return [
