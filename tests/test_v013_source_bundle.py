@@ -4936,6 +4936,16 @@ def test_quantitative_provenance_recognizes_wrapped_year_cue(prefix: str) -> Non
     )
 
 
+def test_quantitative_provenance_recognizes_year_qualified_named_event() -> None:
+    pipeline_module._validate_quantitative_provenance(
+        {"evidence_anchors": [{"quantitative_result": {
+            "estimate": "23 million", "period": "1987 Harbor Summit",
+            "provenance": "source_reported",
+        }}]},
+        {"text": "In the\n1987 Harbor Summit, the unit distributed\n23 million notices."},
+    )
+
+
 @pytest.mark.parametrize(
     "text",
     [
@@ -4949,6 +4959,13 @@ def test_quantitative_provenance_recognizes_wrapped_year_cue(prefix: str) -> Non
         "The count was\n2017 people and 24 million messages.",
         "In our survey\n2017 people responded and 24 million messages were recorded.",
         "In\n2017 people, 24 million messages were recorded.",
+        "In the 2017 people surveyed, 24 million messages were recorded.",
+        "In the 2017 veteran War records, 24 million messages were recorded.",
+        "In the\n2017 veteran War records, 24 million messages were recorded.",
+        "In the\n2017 Veteran War records, 24 million messages were recorded.",
+        "In the\n2017 New York residents, 24 million messages were recorded.",
+        "The\n2017 Harbor Summit attendees sent 24 million messages.",
+        "In the\n2017 North Atlantic Islanders recorded 24 million messages.",
     ],
 )
 def test_quantitative_provenance_keeps_wrapped_year_boundaries(text: str) -> None:

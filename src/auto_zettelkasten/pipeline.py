@@ -3249,7 +3249,7 @@ def _source_bundle_dependency_fingerprint(
             "model": request.model,
             "prompt_version": request.prompt_version,
             "source_bundle_prompt_version": SOURCE_BUNDLE_PROMPT_VERSION,
-            "source_bundle_normalization_version": "13",
+            "source_bundle_normalization_version": "14",
         }
     if request.provider == "codex":
         execution = row.get("provider_execution_identity")
@@ -16970,6 +16970,7 @@ def _source_year_values(value: str) -> set[str]:
         year = match.group(1)
         prefix = value[max(0, match.start() - 30) : match.start()]
         suffix = value[match.end() : match.end() + 20]
+        event_suffix = value[match.end() :]
         if (
             stripped == year
             or re.search(
@@ -16982,6 +16983,12 @@ def _source_year_values(value: str) -> set[str]:
                 r"\s*(?:cohort|edition|election|index|report|study|survey|wave|year)\b",
                 suffix,
                 flags=re.IGNORECASE,
+            )
+            or re.match(
+                r"\s+(?:[A-Z][A-Za-z'’.-]*\s+){0,3}"
+                r"(?:Campaign|Conference|Conflict|Crisis|Election|Summit|War)"
+                r"\s*(?:[,;:.!?]|$)",
+                event_suffix,
             )
         ):
             years.add(year)
