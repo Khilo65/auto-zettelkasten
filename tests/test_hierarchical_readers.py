@@ -10,10 +10,13 @@ from typing import Any
 
 import pytest
 
+from auto_zettelkasten import readers as readers_module
+from auto_zettelkasten.codex_attempt_guard import deny_codex_attempts
 from auto_zettelkasten.ports import HierarchicalReaderProvider, ReaderProvider
 from auto_zettelkasten.readers import (
     CHUNK_EVIDENCE_KEYS,
     SECTION_KEYS,
+    CodexReader,
     DeepSeekReader,
     GeminiReader,
     OllamaReader,
@@ -317,6 +320,61 @@ def test_deepseek_synthesis_returns_pipeline_analysis_and_uses_final_cap(monkeyp
     assert "what changed, by how much, compared with what" in system_prompt
     assert "naturally rather than as a compulsory checklist" in system_prompt
     assert "statistical_context" in captured[0]["messages"][1]["content"]
+
+
+@pytest.mark.parametrize("reader_class", [DeepSeekReader, OpenRouterReader, GeminiReader, OllamaReader, CodexReader])
+def test_source_bundle_synthesis_admission_is_independent_of_direct_planning(
+    monkeypatch: pytest.MonkeyPatch, reader_class,
+) -> None:
+    model = {OpenRouterReader: "unknown/model", CodexReader: "gpt-5.6-luna"}
+    reader = reader_class(
+        **({"model": model[reader_class]} if reader_class in model else {}),
+        context_window_tokens=272_000, direct_read_fraction=0.5, request_deadline=600,
+    )
+    original_capabilities = dict(reader.capabilities)
+    original_fit = reader._ensure_prompt_fits
+    fit_calls, generated = [], []
+
+    class CapturedGeneration(Exception):
+        pass
+
+    def fit(system, user, output, **kwargs):
+        fit_calls.append((system, user, output, kwargs))
+        return original_fit(system, user, output, **kwargs)
+
+    def generate(system, user, output, deadline):
+        assert (system, user, output) == fit_calls[-1][:3]
+        assert deadline == 600.0
+        assert readers_module._OUTPUT_CONTRACT.get() == "source_bundle"
+        assert readers_module._REASONING_EFFORT.get() == ("medium" if reader.name == "codex" else "high")
+        generated.append((system, user, output))
+        raise CapturedGeneration
+
+    monkeypatch.setattr(reader, "_authorize_request", lambda: None)
+    monkeypatch.setattr(reader, "_ensure_prompt_fits", fit)
+    monkeypatch.setattr(reader, "_generate_text", generate)
+    monkeypatch.setattr(readers_module.subprocess, "Popen", lambda *a, **k: pytest.fail("provider subprocess called"))
+    monkeypatch.setattr(CodexReader, "_ensure_codex_preflight", lambda *a: pytest.fail("provider preflight called"))
+    memo = {"summary": "字"}
+    with deny_codex_attempts():
+        with pytest.raises(CapturedGeneration):
+            reader.synthesize_document_bundle([memo], {}, max_output_tokens=64_000, deadline_seconds=600)
+        system, user, output, _ = fit_calls[-1]
+        assert output == (32_768 if reader.name == "codex" else min(64_000, reader.capabilities["supported_output_tokens"]))
+        usable = min(int(reader.context_window_tokens * 0.8), 200_000) if reader.name == "codex" else int(reader.context_window_tokens * 0.8)
+        user_byte_limit = 3 * (usable - output - reader.prompt_reserve_tokens - readers_module._estimate_tokens(system))
+        memo["summary"] += "x" * (user_byte_limit - len(user.encode("utf-8")))
+        with pytest.raises(CapturedGeneration):
+            reader.synthesize_document_bundle([memo], {}, max_output_tokens=64_000, deadline_seconds=600)
+        system, user, output, kwargs = fit_calls[-1]
+        assert kwargs["context_fraction"] == 0.8
+        assert readers_module._estimate_tokens(system) + readers_module._estimate_tokens(user) + output + reader.prompt_reserve_tokens == usable
+        assert not reader._prompt_fits(system, user, output)
+        memo["summary"] += "x"
+        with pytest.raises(ProviderError, match="hierarchical source analysis bundle exceeds"):
+            reader.synthesize_document_bundle([memo], {}, max_output_tokens=64_000, deadline_seconds=600)
+    assert len(generated) == 2
+    assert dict(reader.capabilities) == original_capabilities
 
 
 @pytest.mark.parametrize("provider", ["gemini", "ollama"])

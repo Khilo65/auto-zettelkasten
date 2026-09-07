@@ -2982,6 +2982,7 @@ class _CapabilityAwareReader:
             user_prompt,
             output_tokens,
             label="hierarchical source analysis bundle",
+            context_fraction=0.8,
         )
         raw = self._generate_with_reasoning(
                 system_prompt,
