@@ -5036,15 +5036,24 @@ def test_quantitative_provenance_month_year_keeps_separate_yearlike_count(extra:
         )
 
 
-@pytest.mark.parametrize("connector", ["but", "although", "whereas", "while"])
-def test_quantitative_provenance_accepts_year_range_before_contrast(
-    connector: str,
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "but coverage remained limited",
+        "although coverage remained limited",
+        "whereas coverage remained limited",
+        "while coverage remained limited",
+        "before coverage ended",
+        "after coverage began",
+    ],
+)
+def test_quantitative_provenance_accepts_year_range_before_connector(
+    tail: str,
 ) -> None:
     payload = _bundle_payload()
     anchor = payload["evidence_anchors"][0]
     anchor["claim"] = (
-        f"The service recorded 850 visits between 2008 and 2014 {connector} "
-        "coverage remained limited."
+        f"The service recorded 850 visits between 2008 and 2014 {tail}."
     )
     anchor["quantitative_result"] = {
         "estimate": "850 visits",
@@ -5063,7 +5072,9 @@ def test_quantitative_provenance_accepts_year_range_before_contrast(
     ) is not None
 
 
-@pytest.mark.parametrize("connector", ["but", "although", "whereas", "while"])
+@pytest.mark.parametrize(
+    "connector", ["but", "although", "whereas", "while", "before", "after"]
+)
 @pytest.mark.parametrize(
     "extra",
     [
@@ -5073,7 +5084,7 @@ def test_quantitative_provenance_accepts_year_range_before_contrast(
         "between 2008 and 2014 people were surveyed",
     ],
 )
-def test_quantitative_provenance_contrast_keeps_unmodeled_yearlike_counts(
+def test_quantitative_provenance_connector_keeps_unmodeled_yearlike_counts(
     connector: str, extra: str,
 ) -> None:
     payload = _bundle_payload()
@@ -5084,6 +5095,40 @@ def test_quantitative_provenance_contrast_keeps_unmodeled_yearlike_counts(
     anchor["quantitative_result"] = {
         "estimate": "850 visits",
         "period": "between 2008 and 2014",
+        "provenance": "source_reported",
+    }
+
+    with pytest.raises(
+        SourceBundleQuantitativeProvenanceError,
+        match="quantitative_anchor_contains_unmodeled_quantity",
+    ):
+        _source_bundle_from_result(
+            payload,
+            {
+                "source_id": "source-zotero-A1",
+                "zotero_item_key": "A1",
+                "text": anchor["claim"],
+            },
+            "full_document",
+        )
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "the labelled sample 1987 before close",
+        "the total was 1987 before-tax dollars",
+        "the total was 1987 after-tax dollars",
+    ],
+)
+def test_quantitative_provenance_keeps_yearlike_counts_near_temporal_words(
+    extra: str,
+) -> None:
+    payload = _bundle_payload()
+    anchor = payload["evidence_anchors"][0]
+    anchor["claim"] = f"The service recorded 850 visits while {extra}."
+    anchor["quantitative_result"] = {
+        "estimate": "850 visits",
         "provenance": "source_reported",
     }
 

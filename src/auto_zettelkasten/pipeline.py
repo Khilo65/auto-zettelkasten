@@ -3249,7 +3249,7 @@ def _source_bundle_dependency_fingerprint(
             "model": request.model,
             "prompt_version": request.prompt_version,
             "source_bundle_prompt_version": SOURCE_BUNDLE_PROMPT_VERSION,
-            "source_bundle_normalization_version": "14",
+            "source_bundle_normalization_version": "15",
         }
     if request.provider == "codex":
         execution = row.get("provider_execution_identity")
@@ -17984,9 +17984,11 @@ def _following_unit(value: str, offset: int) -> str:
     if not re.match(r"(?:\s+|-(?=[A-Za-z]))", value[offset:]):
         return ""
     connectors = {
+        "after",
         "although",
         "and",
         "at",
+        "before",
         "but",
         "by",
         "during",
