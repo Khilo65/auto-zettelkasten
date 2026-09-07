@@ -377,6 +377,60 @@ def test_source_bundle_synthesis_admission_is_independent_of_direct_planning(
     assert dict(reader.capabilities) == original_capabilities
 
 
+@pytest.mark.parametrize("reader_class", [DeepSeekReader, OpenRouterReader, GeminiReader, OllamaReader, CodexReader])
+def test_hierarchical_bundle_excludes_global_navigation_fragments(
+    monkeypatch: pytest.MonkeyPatch, reader_class,
+) -> None:
+    model = {OpenRouterReader: "unknown/model", CodexReader: "gpt-5.6-luna"}
+    reader = reader_class(**({"model": model[reader_class]} if reader_class in model else {}))
+    retained = '### Observed findings\nThe comparison was inconclusive. Locator: p. vii.'
+    memos = [{"summary": retained, "locators": "p. vii"}]
+    fragments = ["9. Unselected numbered proposition", "Table 4. Unselected outcome", "Figure 5. Unselected mechanism"]
+    metadata = {"title": "Generic source", "_source_context": {
+        "source_id": "generic-source", "source_scope": "partial_document", "unresolved_pages": [9],
+        "ordinal_to_printed_page": {"7": "vii"},
+        **{key: [{"label": label, "page_ordinal": 9}] for key, label in zip(
+            ("heading_spans", "table_spans", "figure_spans"), fragments)},
+    }}
+    before = json.dumps([memos, metadata])
+    default_prompt = readers_module._source_bundle_prompt(retained, metadata, None)
+    fit_calls, generated = [], []
+    original_fit = reader._ensure_prompt_fits
+
+    class CapturedGeneration(Exception):
+        pass
+
+    def fit(system, user, output, **kwargs):
+        fit_calls.append((system, user, output))
+        return original_fit(system, user, output, **kwargs)
+
+    def generate(system, user, output, deadline):
+        assert (system, user, output) == fit_calls[-1]
+        generated.append(user)
+        raise CapturedGeneration
+
+    monkeypatch.setattr(reader, "_authorize_request", lambda: None)
+    monkeypatch.setattr(reader, "_ensure_prompt_fits", fit)
+    monkeypatch.setattr(reader, "_generate_text", generate)
+    monkeypatch.setattr(readers_module.subprocess, "Popen", lambda *a, **k: pytest.fail("provider subprocess called"))
+    monkeypatch.setattr(CodexReader, "_ensure_codex_preflight", lambda *a: pytest.fail("provider preflight called"))
+    with deny_codex_attempts():
+        with pytest.raises(CapturedGeneration):
+            reader.synthesize_document_bundle(memos, metadata)
+        hierarchy = generated[-1]
+        assert all(fragment not in hierarchy for fragment in fragments)
+        assert json.dumps(memos, ensure_ascii=False) in hierarchy
+        assert '"ordinal_to_printed_page": {"7": "vii"}' in hierarchy
+        assert '"source_id": "generic-source"' in hierarchy
+        assert '"unresolved_pages": [9]' in hierarchy
+        with pytest.raises(CapturedGeneration):
+            reader.read_source_bundle(retained, metadata)
+    assert generated[-1] == default_prompt
+    assert all(fragment in default_prompt for fragment in fragments)
+    assert readers_module._source_bundle_prompt(retained, metadata, None) == default_prompt
+    assert json.dumps([memos, metadata]) == before
+
+
 @pytest.mark.parametrize("provider", ["gemini", "ollama"])
 def test_gemini_and_ollama_apply_hierarchical_output_caps(
     monkeypatch: pytest.MonkeyPatch,

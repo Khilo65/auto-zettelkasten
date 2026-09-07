@@ -83,7 +83,7 @@ GAP_RULES = (
     "cross_cluster_integration",
     "author_stated_gap",
 )
-LITERATURE_ALGORITHM_VERSION = "38"
+LITERATURE_ALGORITHM_VERSION = "39"
 LITERATURE_FAMILY_PLAN_PROMPT_VERSION = "14"
 CLUSTER_PLAN_PROMPT_VERSION = "6"
 CLUSTER_PROPOSAL_PROMPT_VERSION = "17"
@@ -4382,6 +4382,7 @@ def _normalize_claims(
             for value in item.get("source_locators", []) or []
             if isinstance(value, Mapping)
         ]
+        traceable_locators = [value for value in explicit_locators if value.get("traceable")]
         explicit_locators.sort(
             key=lambda value: (
                 not bool(value.get("strong_synthesis_support")),
@@ -4421,6 +4422,16 @@ def _normalize_claims(
             if explicit_locators and explicit_locators[0].get("traceable")
             else _source_locator(locator)
         )
+        if len(traceable_locators) > 1:
+            combined = "; ".join(dict.fromkeys(str(value["raw"]) for value in traceable_locators))
+            strong = all(value.get("strong_synthesis_support") for value in traceable_locators)
+            source_locator = {
+                **source_locator,
+                "raw": combined,
+                "normalized": _normalized_locator(combined),
+                "strong_synthesis_support": strong,
+                "rejection_reason": "" if strong else "source_native_locator_required",
+            }
         if source_locator.get("raw"):
             locator = str(source_locator["raw"])
         quantitative_raw = (

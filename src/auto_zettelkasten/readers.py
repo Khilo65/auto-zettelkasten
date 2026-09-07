@@ -239,7 +239,7 @@ DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
-SOURCE_BUNDLE_PROMPT_VERSION = "37"
+SOURCE_BUNDLE_PROMPT_VERSION = "38"
 SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v2"
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
@@ -2950,9 +2950,16 @@ class _CapabilityAwareReader:
         if not chunk_memos:
             raise ValueError("chunk_memos must not be empty")
         system_prompt = _source_bundle_system_prompt()
+        prompt_metadata = dict(metadata)
+        source_context = metadata.get("_source_context")
+        if isinstance(source_context, Mapping):
+            prompt_metadata["_source_context"] = {
+                key: value for key, value in source_context.items()
+                if key not in ("heading_spans", "table_spans", "figure_spans")
+            }
         user_prompt = _source_bundle_prompt(
             json.dumps(list(chunk_memos), ensure_ascii=False, default=str),
-            metadata,
+            prompt_metadata,
             question,
         )
         user_prompt = (

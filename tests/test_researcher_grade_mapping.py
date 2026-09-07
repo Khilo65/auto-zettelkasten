@@ -1118,6 +1118,25 @@ def test_broad_generated_section_locator_cannot_support_synthesis() -> None:
     assert not literature._anchor_is_synthesis_eligible(normalized[0]["claims"][0])
 
 
+def test_discrete_page_locators_survive_claim_projection() -> None:
+    from auto_zettelkasten.profiles import _source_locator_payloads
+
+    profile = _profile("a")
+    anchor = profile["evidence_anchors"][0]
+    anchor["locator"] = "p. 7; p. 9"
+    anchor["source_locators"] = _source_locator_payloads(
+        anchor["locator"], source_id="a", evidence_anchor_id="anchor-a",
+    )
+    normalized = normalize_evidence_profiles([profile])[0]
+    claim = normalized["claims"][0]
+    assert claim["evidence_anchor_id"] == "anchor-a"
+    assert claim["locator"] == claim["source_locator"]["raw"] == "p. 7; p. 9"
+    reference = {"source_id": "a", "evidence_anchor_id": "anchor-a", "locator": "p. 7; p. 9"}
+    assert literature._reference_matches_profile(reference, normalized)
+    assert not literature._reference_matches_profile({**reference, "locator": "p. 7"}, normalized)
+    assert anchor["locator"] == "p. 7; p. 9"
+
+
 def test_dense_single_locator_quantitative_summary_is_composite() -> None:
     text = " ".join(
         [
@@ -2728,7 +2747,7 @@ def test_named_dataset_fallback_does_not_duplicate_exact_dataset_signal() -> Non
 
 
 def test_named_dataset_lineage_versions_are_explicit() -> None:
-    assert literature.LITERATURE_ALGORITHM_VERSION == "38"
+    assert literature.LITERATURE_ALGORITHM_VERSION == "39"
     assert literature.STUDY_LINEAGE_VERSION == "3"
     assert literature.INDEPENDENCE_ALGORITHM_VERSION == "3"
 
