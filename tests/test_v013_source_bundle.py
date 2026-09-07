@@ -6673,8 +6673,9 @@ def test_new_source_resolves_prior_literature_position_without_rereading_old_sou
     assert citing_position["matched_source_id"] == "source-zotero-itemb"
 
 
+@pytest.mark.parametrize("synthesis_enabled", [False, True])
 def test_zotero_metadata_correction_updates_projection_without_source_call(
-    tmp_path,
+    tmp_path, synthesis_enabled,
 ) -> None:
     original = {
         "key": "ITEMA",
@@ -6691,17 +6692,29 @@ def test_zotero_metadata_correction_updates_projection_without_source_call(
         "data": {
             **original["data"],
             "title": "Corrected canonical title",
+            "creators": [{"creatorType": "author", "name": "Correct Institute"}],
+            "date": "2020",
         },
     }
     reader = BundleReader()
+    request = MapRequest.from_dict({
+        "workspace": str(tmp_path), "provider": "ollama", "model": "bundle-v1",
+        "parallel": 1, "literature_policy": {"synthesis_enabled": synthesis_enabled},
+    })
     first = run_map(
-        MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1),
+        request,
         client=FakeZotero([original]),
         reader=reader,
         run_id="metadata-one",
     )
+    note = tmp_path / first.items[0]["note_path"]
+    before_note = read_note(note)
+    profile_path = tmp_path / "02_source_memory/profiles" / f"{first.items[0]['note_id']}.yml"
+    before_profile = read_yaml(profile_path)["profile"]
+    bundle_path = next((tmp_path / "02_source_memory/bundles").glob("*.yml"))
+    before_bundle = read_yaml(bundle_path)["bundle"]
     second = run_map(
-        MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1),
+        request,
         client=FakeZotero([corrected]),
         reader=reader,
         run_id="metadata-two",
@@ -6709,8 +6722,51 @@ def test_zotero_metadata_correction_updates_projection_without_source_call(
 
     assert reader.calls == 1
     assert second.reused_count == 1
-    note = tmp_path / first.items[0]["note_path"]
     assert "# Corrected canonical title" in note.read_text(encoding="utf-8")
+    profile = read_yaml(profile_path)["profile"]
+    for key in ("title", "creators", "date"):
+        assert profile["context"]["metadata"][key] == corrected["data"][key]
+        assert read_note(note)["frontmatter"][key] == corrected["data"][key]
+    assert profile["study_lineage"]["authors"] == ["Correct Institute"]
+    assert profile["dependency_hash"] != before_profile["dependency_hash"]
+    assert "author:One" not in profile["study_lineage"]["overlap_signals"]
+    assert "author:Correct Institute" in profile["study_lineage"]["overlap_signals"]
+    assert profile["evidence_anchors"] == before_profile["evidence_anchors"]
+    assert read_yaml(bundle_path)["bundle"] == before_bundle
+    assert read_note(note)["body"].split("## Thesis", 1)[1] == (
+        before_note["body"].split("## Thesis", 1)[1]
+    )
+    run_map(request, client=FakeZotero([corrected]), reader=reader,
+            run_id="metadata-three")
+    assert reader.calls == 1
+    assert read_yaml(profile_path)["profile"] == profile
+    if synthesis_enabled:
+        # Old runs could checkpoint stale identity under the corrected note's hash.
+        state = tmp_path / "11_state/runs/metadata-three/literature"
+        checkpoint_path = state / "profile_calls" / f"{first.items[0]['note_id']}.yml"
+        checkpoint = read_yaml(checkpoint_path)
+        checkpoint["profile"]["context"]["metadata"] = before_profile["context"]["metadata"]
+        checkpoint["profile"]["study_lineage"] = before_profile["study_lineage"]
+        write_yaml(checkpoint_path, checkpoint)
+        graph = pipeline_module._build_profiles_for_map(
+            tmp_path, pipeline_module.all_workspace_note_rows(tmp_path),
+            source_set={}, run_id="metadata-three", request=request,
+            reasoner=None, progress=None, resume=True,
+            profile_budget=_ProfileProviderBudget(state / "provider_usage.yml", 1),
+        )
+        assert graph["provider_calls"] == 0
+        assert graph["profiles"][0].study_lineage.authors == ["Correct Institute"]
+        assert read_yaml(checkpoint_path)["profile"]["context"]["metadata"] == profile["context"]["metadata"]
+    removed = {**corrected, "data": {**corrected["data"], "creators": [], "date": ""}}
+    run_map(request, client=FakeZotero([removed]), reader=reader,
+            run_id="metadata-four")
+    profile = read_yaml(profile_path)["profile"]
+    assert reader.calls == 1
+    assert "creators" not in profile["context"]["metadata"]
+    assert "date" not in profile["context"]["metadata"]
+    assert profile["study_lineage"]["authors"] == []
+    assert not any(value.startswith("author:") for value in profile["study_lineage"]["overlap_signals"])
+    assert read_yaml(bundle_path)["bundle"] == before_bundle
 
 
 def test_zotero_document_type_change_invalidates_source_bundle(tmp_path) -> None:

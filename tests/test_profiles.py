@@ -188,6 +188,32 @@ def test_methods_use_affirmed_evidence_section_terms() -> None:
     ) == []
 
 
+def test_metadata_refresh_preserves_evidence_and_complete_lineage() -> None:
+    note = _analytical_note().replace(
+        "## Method and Research Design",
+        "## Method and Research Design\n\nInstitutional series: Series A\nInstitutional series: Series B",
+    )
+    profile = deterministic_profile(note)
+    corrected = _with_frontmatter_updates(
+        note, title="Corrected title", DOI="10.1234/corrected", doi="10.1234/corrected",
+        creators=[{"creatorType": "author", "name": "Correct Institute"}], date="2020",
+    )
+    refreshed = profiles._refresh_profile_metadata(profile, corrected)
+    canonical = deterministic_profile(corrected)
+    assert refreshed.study_lineage == canonical.study_lineage
+    assert refreshed.study_family_id == canonical.study_family_id
+    for before, after in zip(profile.evidence_anchors, refreshed.evidence_anchors, strict=True):
+        old, new = before.to_dict(), after.to_dict()
+        assert old.pop("evidence_anchor_id") == new.pop("evidence_anchor_id")
+        for key in ("study_family_id", "revision_hash"):
+            old.pop(key)
+            new.pop(key)
+        assert old == new
+    assert profiles._refresh_profile_metadata(refreshed, corrected) == refreshed
+    with pytest.raises(ProfileContractError, match="source_id mismatch"):
+        profiles._refresh_profile_metadata(profile, _with_frontmatter_updates(note, source_id="other-source"))
+
+
 def test_current_profile_algorithm_refreshes_stale_bundle_methods_without_a_call() -> None:
     note = _analytical_note()
     profile = deterministic_profile(note)

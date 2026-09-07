@@ -130,6 +130,7 @@ from .profiles import (
     PROFILE_PROMPT_VERSION,
     ProfileContractError,
     ProfileParseError,
+    _refresh_profile_metadata,
     _source_locator_payloads,
     augment_profile_from_committed_note,
     build_evidence_profile,
@@ -2964,6 +2965,7 @@ def _finalize_prepared_row(
         append_jsonl(attempt_path, attempt)
     if row.get("reused") and row.get("note_path"):
         path = workspace / str(row["note_path"])
+        prior_note_text = internal_note_text(path)
         data = item_data(row["item"])
         update_note_frontmatter(
             path,
@@ -2996,6 +2998,33 @@ def _finalize_prepared_row(
                 "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
             },
         )
+        profiles_dir = workspace / "02_source_memory" / "profiles"
+        profile_path = profile_sidecar_path(profiles_dir, str(row["note_id"]))
+        if profile_path.is_file():
+            profile = load_profile_sidecar(profile_path)
+            refreshed = _refresh_profile_metadata(profile, internal_note_text(path))
+            if refreshed != profile:
+                policy, _, _ = _profile_dependency_policy(request, None, analytical=True)
+                route_policy = {
+                    key: profile.context[key]
+                    for key in ("profile_generation_route", "reasoner_identity")
+                    if key in profile.context
+                }
+                bundle_policy = {
+                    "profile_generation_route": "source_analysis_bundle",
+                    "reasoner_identity": "source-analysis-bundle:v1",
+                }
+                for stored_policy in (route_policy, {**policy, **route_policy}, bundle_policy):
+                    identity = dict(source_set_id="", provider=profile.provider,
+                                    model=profile.model, policy=stored_policy)
+                    if profile.dependency_hash == profile_dependency_fingerprint(
+                        prior_note_text, **identity
+                    ):
+                        refreshed.dependency_hash = profile_dependency_fingerprint(
+                            internal_note_text(path), **identity
+                        )
+                        break
+                save_profile(profiles_dir, refreshed)
         _write_fingerprint(workspace, row, str(row["note_path"]))
         return (
             _public_terminal_row(row),
@@ -14104,6 +14133,12 @@ def _build_profiles_for_map(
         mechanically_upgraded = False
         if profile is not None:
             checkpoint_hit = 1
+            refreshed = _refresh_profile_metadata(profile, text)
+            if refreshed != profile:
+                profile = refreshed
+                profile.dependency_hash = fingerprint
+                save_profile(profiles_dir, profile)
+                write_profile_checkpoint(literature_state, note_id, fingerprint, profile)
             cached_context = dict(getattr(profile, "context", {}) or {})
             cached_validation = validate_profile(
                 profile,
@@ -14159,6 +14194,7 @@ def _build_profiles_for_map(
                     ).is_file()
                 ):
                     profile = existing
+                    profile.dependency_hash = fingerprint
                     checkpoint_hit = 1
                 existing_dependency = str(existing_payload.get("dependency_hash") or "")
                 if profile is None and existing_dependency == fingerprint:

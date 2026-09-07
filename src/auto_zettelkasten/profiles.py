@@ -710,6 +710,63 @@ def _normalize_reasoner_scope_value(value: Any) -> Any:
 profile_note = build_evidence_profile
 
 
+def _refresh_profile_metadata(profile: Any, note_text: str) -> Any:
+    """Refresh source-controlled identity without regenerating source evidence."""
+    frontmatter, _ = _parse_note(note_text)
+    payload = profile_to_dict(profile)
+    for key in ("source_id", "note_id"):
+        if str(payload.get(key) or "") != str(frontmatter.get(key) or ""):
+            raise ProfileContractError(f"metadata refresh {key} mismatch")
+    context = dict(payload.get("context") or {})
+    metadata = _context_metadata(frontmatter)
+    context["metadata"] = metadata
+    for key in ("title", "date"):
+        if key in context:
+            context[key] = str(frontmatter.get(key) or "")
+    payload["context"] = context
+    lineage = dict(payload.get("study_lineage") or {})
+    if lineage:
+        canonical = _study_lineage_payload(
+            frontmatter, {}, source_id=payload["source_id"],
+            data_sources=[], populations=[], periods=[],
+        )
+        if any(lineage.get(key) != canonical[key] for key in ("authors", "institutions")):
+            lineage.update(authors=canonical["authors"], institutions=canonical["institutions"])
+            lineage["overlap_signals"] = _dedupe([
+                *(f"author:{value}" for value in canonical["authors"]),
+                *(value for value in lineage.get("overlap_signals", [])
+                  if not value.startswith("author:")),
+            ])
+            identity = {
+                "source_ids": lineage.get("source_ids", []),
+                "authors": lineage["authors"],
+                "datasets": lineage.get("datasets", []),
+                "periods": lineage.get("periods", []),
+                "institutional_series": [
+                    value.removeprefix("institutional_series:")
+                    for value in lineage.get("overlap_signals", [])
+                    if value.startswith("institutional_series:")
+                ],
+            }
+            lineage["study_lineage_id"] = "lineage-" + sha256_text(
+                json.dumps(identity, sort_keys=True, ensure_ascii=False)
+            )[:16]
+            payload["study_lineage"] = lineage
+    old_family = str(payload.get("study_family_id") or "")
+    new_family = _study_family(frontmatter)["identity"]
+    if old_family != new_family:
+        payload["study_family_id"] = new_family
+        for anchor in payload.get("evidence_anchors", []):
+            if old_family and anchor.get("study_family_id") == old_family:
+                anchor["study_family_id"] = new_family
+                anchor["revision_hash"] = ""
+    if payload == profile_to_dict(profile):
+        return profile
+    note_hash = semantic_note_hash(note_text)
+    payload.update(note_hash=note_hash, profile_id=f"profile-{note_hash[:16]}")
+    return profile_from_dict(payload)
+
+
 def augment_profile_from_committed_note(
     profile: Any,
     note_text: str,
@@ -726,6 +783,9 @@ def augment_profile_from_committed_note(
     and adds deterministic locator-backed anchors up to the public hard cap.
     """
 
+    refreshed = _refresh_profile_metadata(profile, note_text)
+    metadata_refreshed = refreshed != profile
+    profile = refreshed
     frontmatter, body = _parse_note(note_text)
     sections = _markdown_sections(_strip_generated_body(body))
     enriched_profile = _enrich_profile_v12_records(
@@ -733,7 +793,7 @@ def augment_profile_from_committed_note(
         frontmatter=frontmatter,
         sections=sections,
     )
-    records_enriched = enriched_profile != profile
+    records_enriched = enriched_profile != profile or metadata_refreshed
     profile = enriched_profile
     payload = profile_to_dict(profile)
     profile_generation_route = str(
