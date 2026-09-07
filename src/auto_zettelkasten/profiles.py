@@ -33,7 +33,7 @@ PROFILE_PROMPT_VERSION = "6"
 PROFILE_CLASSIFIER_VERSION = "3"
 PROFILE_ALGORITHM_VERSION = "9"
 COMMITTED_NOTE_ANCHOR_AUGMENTATION_VERSION = "8"
-ANCHOR_ALGORITHM_VERSION = "2"
+ANCHOR_ALGORITHM_VERSION = "3"
 SUPPORT_ENVELOPE_VERSION = "1"
 
 # Public lower-case aliases match the names persisted in dependency records.
@@ -53,7 +53,7 @@ GENERATED_NOTE_SECTION_MARKERS = (
 _SIDECAR_FIELDS = frozenset({"profile_schema_version", "profile"})
 _CHECKPOINT_FIELDS = frozenset({"checkpoint_schema_version", "fingerprint", "profile"})
 _TRACEABLE_LOCATOR = re.compile(
-    r"(?:\b(?:(?:p{1,2}\.\s*|p{1,2}\s+|pages?\s+|paragraphs?\s+)\d+(?:\s*[-\u2013\u2014]\s*\d+)?)\b|"
+    r"(?:\b(?:PDF\s+)?(?:(?:p{1,2}\.\s*|p{1,2}\s+|pages?\s+|paragraphs?\s+)\d+(?:\s*[-\u2013\u2014]\s*\d+)?)\b|"
     r"https?://[^\s>)\]}]+|"
     r"\b(?:section|heading)\s+[\"“']?[A-Za-z0-9][^\"”';,()]{1,100}|"
     r"\b(?:abstract|introduction|background|literature review|methods?|methodology|data|results?|findings?|"
@@ -61,7 +61,7 @@ _TRACEABLE_LOCATOR = re.compile(
     flags=re.IGNORECASE,
 )
 _PAGE_LOCATOR = re.compile(
-    r"\b(?P<label>p{1,2}\.|p{1,2}(?=\s)|pages?(?=\s))\s*(?P<start>\d+)(?:\s*[-\u2013\u2014]\s*(?P<end>\d+))?\b",
+    r"\b(?:PDF\s+)?(?P<label>p{1,2}\.|p{1,2}(?=\s)|pages?(?=\s))\s*(?P<start>\d+)(?:\s*[-\u2013\u2014]\s*(?P<end>\d+))?\b",
     flags=re.IGNORECASE,
 )
 _TABLE_LOCATOR = re.compile(r"\btable\s+\d+[a-z]?\b", flags=re.IGNORECASE)

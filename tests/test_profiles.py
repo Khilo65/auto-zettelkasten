@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from auto_zettelkasten import profiles
+from auto_zettelkasten import literature, profiles
 from auto_zettelkasten.models import (
     EvidenceAnchor,
     EvidenceFinding,
@@ -56,7 +56,7 @@ def test_profile_versions_are_explicit() -> None:
     assert PROFILE_PROMPT_VERSION == profiles.profile_prompt_version == "6"
     assert PROFILE_CLASSIFIER_VERSION == profiles.profile_classifier_version == "3"
     assert PROFILE_ALGORITHM_VERSION == profiles.profile_algorithm_version == "9"
-    assert ANCHOR_ALGORITHM_VERSION == "2"
+    assert ANCHOR_ALGORITHM_VERSION == "3"
     assert SUPPORT_ENVELOPE_VERSION == "1"
     assert COMMITTED_NOTE_ANCHOR_AUGMENTATION_VERSION == "8"
 
@@ -66,6 +66,65 @@ def test_actor_position_labels_are_not_misread_as_page_locators() -> None:
     assert profiles._first_locator("Positions P3 and P5 diverged") == ""
     assert profiles._first_locator("See p. 3 and pp. 5-7") == "p. 3; pp. 5-7"
     assert profiles._first_locator("See pages 12-14") == "pages 12-14"
+    assert (
+        profiles._first_locator("Compare PDF p. 3 with printed p. 3")
+        == "PDF p. 3; p. 3"
+    )
+    assert (
+        profiles._best_matching_source_locator(
+            "archival evidence supports the claim",
+            "archival evidence: PDF p. 3; unrelated discussion: p. 3",
+        )
+        == "PDF p. 3"
+    )
+
+
+def test_pdf_page_namespace_survives_typed_consumer_projection() -> None:
+    locator = "PDF p. 7; p. 7"
+    typed = profiles._source_locator_payloads(
+        locator, source_id="source-a", evidence_anchor_id="anchor-a"
+    )
+
+    assert [row["value"] for row in typed] == ["PDF p. 7", "p. 7"]
+    assert [row["page_start"] for row in typed] == [7, 7]
+    assert all(row["locator_type"] == "page" for row in typed)
+    assert all(row["source_native"] for row in typed)
+    assert all(row["supports_strong_assertion"] for row in typed)
+
+    normalized = literature.normalize_evidence_profiles(
+        [
+            {
+                "source_id": "source-a",
+                "note_id": "note-a",
+                "note_status": "analytical_atomic_note",
+                "evidence_eligibility": "substantive_bounded",
+                "evidence_anchors": [
+                    {
+                        "evidence_anchor_id": "anchor-a",
+                        "source_id": "source-a",
+                        "claim": "A source-grounded finding.",
+                        "locator": locator,
+                        "locators": [locator],
+                        "source_locators": typed,
+                        "support_envelope": {
+                            "empirical_role": "descriptive",
+                            "argument_role": "none",
+                            "coverage": "full_text",
+                            "scope": {},
+                            "restrictions": [],
+                            "support_status": "supported",
+                        },
+                    }
+                ],
+            }
+        ]
+    )[0]
+    claim = normalized["claims"][0]
+    reference = literature._evidence_ref(claim)
+
+    assert claim["locator"] == locator
+    assert reference["locator"] == locator
+    assert literature._human_locator_text(reference["locator"]) == locator
 
 
 def test_methods_ignore_negated_terms_in_mixed_prose() -> None:
@@ -954,7 +1013,7 @@ def test_profile_fingerprint_includes_every_declared_dependency() -> None:
     assert payload["classifier_version"] == "3"
     assert payload["algorithm_version"] == "9"
     assert payload["profile_schema_version"] == "1.3"
-    assert payload["anchor_algorithm_version"] == "2"
+    assert payload["anchor_algorithm_version"] == "3"
     assert payload["support_envelope_version"] == "1"
     assert baseline == profile_dependency_fingerprint(
         _with_generated_graph(note), **kwargs
@@ -987,7 +1046,7 @@ def test_profile_fingerprint_includes_every_declared_dependency() -> None:
         note, **kwargs, profile_schema_version="1.0"
     )
     assert baseline != profile_dependency_fingerprint(
-        note, **kwargs, anchor_algorithm_version="3"
+        note, **kwargs, anchor_algorithm_version="4"
     )
     assert baseline != profile_dependency_fingerprint(
         note, **kwargs, support_envelope_version="2"
