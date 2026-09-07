@@ -7342,3 +7342,120 @@ def test_spelled_percent_does_not_borrow_navigation_or_list_prefix(text: str) ->
             "quantitative_result": {"estimate": "75%", "provenance": "source_reported"}}]},
         {"text": text},
     )
+
+
+@pytest.mark.parametrize("misleading_prose", [True, False])
+def test_unresolved_page_contract_parks_instead_of_salvaging_note(tmp_path, monkeypatch, misleading_prose) -> None:
+    import socket
+    import subprocess
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("No network or subprocess calls are allowed")
+    monkeypatch.setattr(socket, "socket", forbidden)
+    monkeypatch.setattr(socket, "create_connection", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+
+    class SourceZotero(FakeZotero):
+        def fulltext(self, item_key):
+            return {"content": "--- Page 1 ---\nSurvey respondents reported 17% approval.\n"
+                    + "The report describes participant experiences. " * 40
+                    + "\n--- Page 2 ---\nInstructions helped participants find available options.",
+                    "contentType": "text/plain"}
+
+    class PageReader(BundleReader):
+        def read_source_bundle(self, text, metadata, question=None):
+            payload = super().read_source_bundle(text, metadata, question)
+            good = payload["evidence_anchors"][0]
+            good.update(claim="Instructions helped participants find available options.", locator="PDF page 2")
+            bad = {**deepcopy(good), "evidence_anchor_id": "anchor-bad",
+                   "claim": "Survey respondents reported 17% approval.", "locator": "PDF page 16",
+                   "quantitative_result": {"estimate": "17%", "provenance": "source_reported"}}
+            payload["evidence_anchors"].append(bad)
+            page = 16 if misleading_prose else 1
+            prose = f"Survey respondents reported 17% approval (PDF page {page})."
+            payload["analysis_sections"]["thesis"] = prose
+            payload["analysis_sections"]["evidence_and_data"] = prose
+            payload["compact_profile"]["thesis"] = prose
+            self.raw = deepcopy(payload)
+            return payload
+
+    item = {"key": "ITEMA", "data": {"key": "ITEMA", "itemType": "report", "title": "Service access pilot", "date": "2024"}}
+    client, reader = SourceZotero([item]), PageReader()
+    report = run_map(MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1),
+                     client=client, reader=reader, run_id="unresolved-page-contract")
+    assert report.validated_note_count == 0 and report.parked_for_review_count == 1
+    assert report.items[0]["reason"] == "source_bundle_quantitative_provenance_invalid:quantitative_page_locator_unresolved"
+    assert reader.calls == 1 and report.source_provider_call_count == 1 and report.literature_provider_call_count == 0
+    for directory, pattern in (("notes", "*.md"), ("profiles", "*.yml"), ("bundles", "*.yml")):
+        assert not list((tmp_path / "02_source_memory" / directory).glob(pattern))
+    assert not (read_yaml(tmp_path / "02_source_memory/indexes/typed_links.yml", {}) or {}).get("links")
+    failure_path = tmp_path / "11_state/runs/unresolved-page-contract/items/ITEMA/source_failure.yml"
+    failure = read_yaml(failure_path)
+    assert failure["status"] == "parked_for_review" and failure["retry_on_resume"] is False
+    assert failure["failure_class"] == "semantic_contract"
+    assert failure["raw_response"] == SourceAnalysisBundle.from_dict(reader.raw).to_dict()
+    direct_path = failure_path.with_name("direct.yml")
+    assert read_yaml(direct_path)["analysis"] == reader.raw
+    before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in (failure_path, direct_path)]
+    resumed = resume_map(tmp_path, "unresolved-page-contract", client=client, reader=reader)
+    assert resumed.parked_for_review_count == 1 and resumed.validated_note_count == 0
+    assert reader.calls == 1
+    assert before == [(path.read_bytes(), path.stat().st_mtime_ns) for path in (failure_path, direct_path)]
+
+
+@pytest.mark.parametrize("disabled", [False, True])
+@pytest.mark.parametrize("route", ["local_text", "codex_pdf_page_images", "codex_pdf_input_file"])
+def test_unresolved_page_contract_canonical_diagnostic_cannot_be_laundered(disabled, route) -> None:
+    payload = _bundle_payload()
+    payload["evidence_anchors"].append({**deepcopy(payload["evidence_anchors"][0]),
+        "evidence_anchor_id": "anchor-second", "claim": "A second independent finding remains."})
+    payload["component_diagnostics"] = [{
+        "component": "evidence_anchors", "row_index": 1,
+        "reason": "SourceBundleQuantitativeProvenanceError:quantitative_page_locator_unresolved",
+        "severity": "rejected", "rehydrate": False,
+        "raw": {"claim": "Survey respondents reported 17% approval.", "locator": "PDF page 16",
+                "quantitative_result": {"estimate": "17%", "provenance": "source_reported"}},
+    }]
+    row = {"source_id": "source-zotero-A1", "zotero_item_key": "A1", "content_route": route,
+           "text": "--- Page 1 ---\nSurvey respondents reported 17% approval."}
+    original = deepcopy(payload)
+    if not disabled and route == "local_text":
+        with pytest.raises(SourceBundleQuantitativeProvenanceError, match="quantitative_page_locator_unresolved"):
+            _source_bundle_from_result(payload, row, "full_document")
+    else:
+        bundle = _source_bundle_from_result(payload, row, "full_document", validate_quantitative_provenance=not disabled)
+        assert any(diagnostic.get("raw") == payload["component_diagnostics"][0]["raw"] for diagnostic in bundle.component_diagnostics)
+    assert payload == original
+
+
+@pytest.mark.parametrize("missing_thesis", [None, "", " \n "])
+def test_source_bundle_compact_thesis_fallback_survives_parse_and_replay(missing_thesis) -> None:
+    payload = _bundle_payload()
+    if missing_thesis is None:
+        del payload["analysis_sections"]["thesis"]
+    else:
+        payload["analysis_sections"]["thesis"] = missing_thesis
+    thesis = payload["compact_profile"]["thesis"] + " (p. 12)"
+    payload["compact_profile"]["thesis"] = thesis
+    original = deepcopy(payload)
+    row = {"source_id": "source-zotero-A1", "zotero_item_key": "A1"}
+    with deny_codex_attempts():
+        parsed = _parse_source_bundle_response(
+            payload, label="source bundle", expected_identity=payload["source_identity"],
+        )
+        normalized = _source_bundle_from_result(parsed, row, "full_document").to_dict()
+        replay = _source_bundle_from_result(normalized, row, "full_document").to_dict()
+    assert payload == original
+    assert replay == normalized
+    for result in (parsed, normalized, replay):
+        assert result["analysis_sections"]["thesis"] == thesis
+        assert result["compact_profile"]["thesis"] == thesis
+        assert not any(item.get("field") == "thesis" for item in result.get("component_diagnostics", []))
+
+
+def test_source_bundle_thesis_fallback_still_rejects_empty_core() -> None:
+    payload = _bundle_payload()
+    del payload["analysis_sections"]["thesis"]
+    payload["compact_profile"]["thesis"] = " "
+    with pytest.raises(ProviderError, match="omitted core content: thesis"):
+        readers_module._normalize_source_bundle_payload(payload)

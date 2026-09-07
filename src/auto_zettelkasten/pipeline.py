@@ -3250,7 +3250,7 @@ def _source_bundle_dependency_fingerprint(
             "model": request.model,
             "prompt_version": request.prompt_version,
             "source_bundle_prompt_version": SOURCE_BUNDLE_PROMPT_VERSION,
-            "source_bundle_normalization_version": "18",
+            "source_bundle_normalization_version": "19",
         }
     if request.provider == "codex":
         execution = row.get("provider_execution_identity")
@@ -16253,6 +16253,15 @@ def _source_bundle_from_result(
             for value in recommendations
         ]
     if validate_quantitative_provenance:
+        if not opaque_pdf_route and any(
+            isinstance(diagnostic, Mapping)
+            and diagnostic.get("component") == "evidence_anchors"
+            and diagnostic.get("rehydrate") is False
+            and diagnostic.get("reason") == "SourceBundleQuantitativeProvenanceError:quantitative_page_locator_unresolved"
+            for diagnostic in payload.get("component_diagnostics", []) or []
+        ):
+            # Removed rows cannot turn an unresolved page contract into a valid replay.
+            raise SourceBundleQuantitativeProvenanceError("quantitative_page_locator_unresolved")
         quantitative_source_cache: dict[Any, Any] = {}
         try:
             _validate_quantitative_provenance(
@@ -16275,9 +16284,12 @@ def _source_bundle_from_result(
                         source_cache=quantitative_source_cache,
                     )
                 except SourceBundleQuantitativeProvenanceError as exc:
-                    if str(exc) == "footnote_scope_combines_marked_and_unmarked_quantities":
-                        # The same scope may survive in prose; dropping only its
-                        # numeric anchor cannot establish that the note is safe.
+                    if str(exc) in {
+                        "footnote_scope_combines_marked_and_unmarked_quantities",
+                        "quantitative_page_locator_unresolved",
+                    }:
+                        # Failed source scope can survive in prose; dropping only
+                        # its numeric anchor cannot establish that the note is safe.
                         raise
                     rejected.append(
                         {

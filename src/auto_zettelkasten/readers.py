@@ -7781,6 +7781,8 @@ def _normalize_source_bundle_payload(
         if isinstance(normalized.get("compact_profile"), Mapping)
         else {}
     )
+    if not sections.get("thesis") and (thesis := _source_bundle_text(profile.get("thesis"))):
+        sections["thesis"] = thesis
     if sections.get("thesis"):
         profile["thesis"] = sections["thesis"]
     normalized["compact_profile"] = profile
@@ -7790,7 +7792,7 @@ def _normalize_source_bundle_payload(
         if isinstance(row, Mapping)
     ]
     has_core = {
-        "thesis": bool(sections.get("thesis") or profile.get("thesis")),
+        "thesis": bool(sections.get("thesis")),
         "method_and_research_design": bool(
             sections.get("method_and_research_design")
             or profile.get("method_or_knowledge_basis")
