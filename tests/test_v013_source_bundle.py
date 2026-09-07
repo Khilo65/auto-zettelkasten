@@ -7067,3 +7067,278 @@ def test_source_bundle_row_caps_include_rehydrated_diagnostics(count) -> None:
         bundle = _source_bundle_from_result(payload, row, "full_document")
         assert len(bundle.evidence_anchors) == 24
     assert payload == original
+
+
+@pytest.mark.parametrize(('locator', 'estimate', 'page_map', 'error'), [
+    ('PDF page 2', '75%', {}, 'reported_estimate_not_found_in_source'),
+    ('PDF page 2', '74%', {}, ''),
+    ('p. 9', '75%', {'1': '7', '2': '9'}, 'reported_estimate_not_found_in_source'),
+    ('p. 9', '74%', {'1': '7', '2': '9'}, ''),
+    ('PDF page 2', '74%', {'1': '2', '2': '9'}, ''),
+    ('PDF page 99', '75%', {}, 'quantitative_page_locator_unresolved'),
+    ('p. 2', '75%', {'1': '7', '2': '9'}, 'quantitative_page_locator_unresolved'),
+    ('p. 9', '75%', {'1': '9', '2': '9'}, 'quantitative_page_locator_unresolved'),
+    ('p. 9', '75%', {'bad': '9'}, 'quantitative_page_locator_unresolved'),
+    ('p. 2', '75%', {}, ''),  # Legacy lexical check: no authoritative printed map.
+    ('Heading "Results"', '75%', {}, ''),
+])
+def test_quantitative_page_scope(locator, estimate, page_map, error) -> None:
+    row = {
+        'text': '--- Page 1 ---\nThe website reached 75% of visitors.\n--- Page 2 ---\nThe campaign reached 74% of defectors.\n',
+        'coverage_metrics': {'ordinal_to_printed_page': page_map},
+    }
+    payload = {'evidence_anchors': [{
+        'claim': f'The campaign reached {estimate} of defectors.', 'locator': locator,
+        'quantitative_result': {'estimate': estimate, 'population': 'defectors', 'provenance': 'source_reported'},
+    }]}
+    if error:
+        with pytest.raises(SourceBundleQuantitativeProvenanceError, match=error):
+            pipeline_module._validate_quantitative_provenance(payload, row)
+    else:
+        pipeline_module._validate_quantitative_provenance(payload, row)
+
+
+@pytest.mark.parametrize('text', [
+    '--- Page 1 ---\n75% approval.\n--- Page 1 ---\n74% approval.',
+    '--- Page 2 ---\n75% approval.\n--- Page 1 ---\n74% approval.',
+    '--- Page X ---\n75% approval.\n--- Page 1 ---\n74% approval.',
+    '--- Page 0 ---\n75% approval.\n--- Page 1 ---\n74% approval.',
+    '75% approval without page markers.',
+])
+def test_quantitative_page_scope_rejects_unresolvable_markers(text) -> None:
+    with pytest.raises(SourceBundleQuantitativeProvenanceError, match='quantitative_page_locator_unresolved'):
+        pipeline_module._validate_quantitative_provenance(
+            {'evidence_anchors': [{'locator': 'PDF page 1', 'quantitative_result': {
+                'estimate': '75%', 'provenance': 'source_reported',
+            }}]}, {'text': text},
+        )
+
+
+@pytest.mark.parametrize(('last_page', 'provenance', 'estimate', 'period'), [
+    (2, 'source_reported', '17%', '2004'),
+    (3, 'source_reported', '17%', '2004'),
+    (2, 'system_derived', '50% relative increase', ''),
+    (3, 'system_derived', '50% relative increase', ''),
+])
+def test_quantitative_page_scope_preserves_contiguous_context_only(last_page, provenance, estimate, period) -> None:
+    if provenance == 'source_reported':
+        first, last = 'During 2004, survey respondents', 'reported 17% approval.'
+    else:
+        first, last = 'Approval increased from 20%', 'to 30%.'
+    text = f'--- Page 1 ---\n{first}\n'
+    if last_page == 3:
+        text += '--- Page 2 ---\nA separate discussion.\n'
+    text += f'--- Page {last_page} ---\n{last}\n'
+    payload = {'evidence_anchors': [{'locator': f'PDF page 1; PDF page {last_page}', 'quantitative_result': {
+        'estimate': estimate, 'period': period, 'provenance': provenance,
+    }}]}
+    if last_page == 3:
+        with pytest.raises(SourceBundleQuantitativeProvenanceError):
+            pipeline_module._validate_quantitative_provenance(payload, {'text': text})
+    else:
+        pipeline_module._validate_quantitative_provenance(payload, {'text': text})
+
+
+def test_quantitative_page_scope_singleton_salvage_replay_and_index_reuse(monkeypatch) -> None:
+    payload = _bundle_payload()
+    bad = payload['evidence_anchors'][0]
+    bad.update(claim='The campaign reached 75% of defectors.', locator='PDF page 2',
+               quantitative_result={'estimate': '75%', 'provenance': 'source_reported'})
+    row = {'source_id': 'source-zotero-A1', 'zotero_item_key': 'A1',
+           'text': '--- Page 1 ---\nThe website reached 75% of visitors.\n--- Page 2 ---\nThe campaign reached 74% of defectors.'}
+    with pytest.raises(SourceBundleQuantitativeProvenanceError):
+        _source_bundle_from_result(payload, row, 'full_document')
+    payload['evidence_anchors'].append({**deepcopy(bad), 'evidence_anchor_id': 'anchor-2',
+        'claim': 'The campaign reached 74% of defectors.',
+        'quantitative_result': {'estimate': '74%', 'provenance': 'source_reported'}})
+    indexed = []
+    original = pipeline_module._quantitative_source_index
+    def record(text):
+        indexed.append(text)
+        return original(text)
+    monkeypatch.setattr(pipeline_module, '_quantitative_source_index', record)
+    normalized = _source_bundle_from_result(payload, row, 'full_document').to_dict()
+    assert len(indexed) == 1
+    assert '75%' not in indexed[0]
+    assert len(normalized['evidence_anchors']) == 1
+    assert any(item.get('rehydrate') is False and 'reported_estimate_not_found_in_source' in item.get('reason', '') for item in normalized['component_diagnostics'])
+    assert _source_bundle_from_result(normalized, row, 'full_document').to_dict() == normalized
+
+
+@pytest.mark.parametrize('route', ['codex_pdf_page_images', 'codex_pdf_input_file'])
+def test_quantitative_page_scope_preserves_opaque_skip(route) -> None:
+    pipeline_module._validate_quantitative_provenance(
+        {'evidence_anchors': [{'locator': 'PDF page 999', 'quantitative_result': {'estimate': '75%'}}]},
+        {'content_route': route, 'text': 'No page markers.'},
+    )
+
+
+@pytest.mark.parametrize("location", [
+    {"locators": ["PDF page 2"]},
+    {"source_locators": [{"locator_type": "page", "value": "PDF page 2", "page_start": 2, "page_end": 2}]},
+])
+def test_quantitative_page_scope_covers_locator_aliases(location) -> None:
+    with pytest.raises(SourceBundleQuantitativeProvenanceError, match="reported_estimate_not_found_in_source"):
+        pipeline_module._validate_quantitative_provenance(
+            {"evidence_anchors": [{**location, "quantitative_result": {"estimate": "75%", "provenance": "source_reported"}}]},
+            {"text": "--- Page 1 ---\n75% approval.\n--- Page 2 ---\n74% approval."},
+        )
+
+
+def test_quantitative_page_scope_accepts_crlf_markers() -> None:
+    pipeline_module._validate_quantitative_provenance(
+        {"evidence_anchors": [{"locator": "PDF page 2", "quantitative_result": {"estimate": "74%", "provenance": "source_reported"}}]},
+        {"text": "--- Page 1 ---\r\n75% approval.\r\n--- Page 2 ---\r\n74% approval."},
+    )
+
+
+@pytest.mark.parametrize("prefix", ["Quote ", "Heading ", ""])
+@pytest.mark.parametrize("suffix", ["", " (PDF page 2)"])
+def test_quantitative_page_scope_ignores_quoted_page_looking_text(prefix, suffix) -> None:
+    payload = {"evidence_anchors": [{"locator": prefix + '"See p. 9 for details"' + suffix,
+        "quantitative_result": {"estimate": "75%", "provenance": "source_reported"}}]}
+    row = {"text": "--- Page 1 ---\n75% approval.\n--- Page 2 ---\n74% approval.",
+           "coverage_metrics": {"ordinal_to_printed_page": {"1": "7", "2": "9"}}}
+    if suffix:
+        with pytest.raises(SourceBundleQuantitativeProvenanceError, match="reported_estimate_not_found_in_source"):
+            pipeline_module._validate_quantitative_provenance(payload, row)
+    else:
+        pipeline_module._validate_quantitative_provenance(payload, row)
+
+
+def test_quantitative_page_scope_quote_canonical_replay_has_no_phantom_page_tag() -> None:
+    payload = _bundle_payload()
+    payload["evidence_anchors"][0].update(
+        claim="Approval was 75%.", locator='Quote "See p. 9 for details"',
+        quantitative_result={"estimate": "75%", "provenance": "source_reported"},
+    )
+    row = {"source_id": "source-zotero-A1", "zotero_item_key": "A1",
+           "text": "--- Page 1 ---\nSee p. 9 for details. Approval was 75%.\n--- Page 2 ---\nApproval was 74%.",
+           "coverage_metrics": {"ordinal_to_printed_page": {"1": "7", "2": "9"}}}
+    normalized = _source_bundle_from_result(payload, row, "full_document").to_dict()
+    assert len(normalized["evidence_anchors"]) == 1
+    assert all(item["locator_type"] == "quote_span" for item in normalized["evidence_anchors"][0]["source_locators"])
+    assert _source_bundle_from_result(normalized, row, "full_document").to_dict() == normalized
+
+
+@pytest.mark.parametrize(("written", "numeric"), [
+    ("zero percent", "0%"), ("thirteen percent", "13%"),
+    ("nineteen per cent", "19%"), ("twenty percent", "20%"),
+    ("Thirty percent", "30%"), ("sixty-eight percent", "68%"),
+    ("seventy five percent", "75%"), ("Ninety-nine per cent", "99%"),
+])
+def test_spelled_integer_percent_matches_source_and_claim(
+    written: str, numeric: str,
+) -> None:
+    assert pipeline_module._claimed_quantity_tokens(written) == {numeric}
+    for source_value, estimate in [(written, numeric), (numeric, written)]:
+        pipeline_module._validate_quantitative_provenance(
+            {"evidence_anchors": [{"claim": f"Approval was {estimate}.",
+                "quantitative_result": {"estimate": estimate, "provenance": "source_reported"}}]},
+            {"text": f"Approval was {source_value}."},
+        )
+
+
+@pytest.mark.parametrize(("written", "forbidden"), [
+    ("one hundred seventy-five percent", "75%"),
+    ("one hundred and seventy-five percent", "75%"),
+    ("two thousand seventy-five percent", "75%"),
+    ("twenty point seventy-five percent", "75%"),
+    ("one over seventy-five percent", "75%"),
+    ("one in seventy-five percent", "75%"),
+    ("one half of seventy-five percent", "75%"),
+    ("twenty to seventy-five percent", "75%"),
+    ("twenty–seventy-five percent", "75%"),
+    ("20 to seventy-five percent", "75%"),
+    ("20 / seventy-five percent", "75%"),
+    ("minus seventy-five percent", "75%"),
+    ("a change of - seventy-five percent", "75%"),
+    ("seventy-fifth percent", "75%"),
+    ("one hundred percent", "0%"),
+])
+def test_spelled_percent_does_not_accept_unsupported_numeric_tails(
+    written: str, forbidden: str,
+) -> None:
+    assert forbidden not in pipeline_module._claimed_quantity_tokens(written)
+
+
+def test_spelled_percent_keeps_wrong_value_and_year_rejections() -> None:
+    anchor = {"claim": "Approval was 23%.", "quantitative_result": {
+        "estimate": "23%", "period": "", "provenance": "source_reported",
+    }}
+    with pytest.raises(SourceBundleQuantitativeProvenanceError, match="reported_estimate_not_found_in_source"):
+        pipeline_module._validate_quantitative_provenance(
+            {"evidence_anchors": [anchor]}, {"text": "Approval was twenty-four percent."},
+        )
+    anchor["quantitative_result"]["period"] = "2004"
+    with pytest.raises(SourceBundleQuantitativeProvenanceError, match="period_date_not_local_to_reported_estimate"):
+        pipeline_module._validate_quantitative_provenance(
+            {"evidence_anchors": [anchor]},
+            {"text": "In 2004, a registry opened.\nRespondents reported twenty-three percent approval."},
+        )
+    pipeline_module._validate_quantitative_provenance(
+        {"evidence_anchors": [anchor]},
+        {"text": "In 2004, respondents reported twenty-three percent approval."},
+    )
+    anchor["claim"] = "Approval was 23% and rejection was thirty percent."
+    with pytest.raises(SourceBundleQuantitativeProvenanceError, match="quantitative_anchor_contains_unmodeled_quantity"):
+        pipeline_module._validate_quantitative_provenance(
+            {"evidence_anchors": [anchor]},
+            {"text": "In 2004, approval was twenty-three percent and rejection was thirty percent."},
+        )
+
+
+@pytest.mark.parametrize(("expression", "estimate"), [
+    ("twenty point five percent", "5%"),
+    ("one hundred seventy five percent", "75%"),
+    ("one hundred and five percent", "5%"),
+    ("seventy to seventy-five percent", "75%"),
+    ("twenty–seventy-five percent", "75%"),
+    ("one hundred\nseventy-five percent", "75%"),
+    ("one hundred and\nfive percent", "5%"),
+    ("seventy-\nfive percent", "5%"),
+    ("seventy\nfive percent", "5%"),
+    ("twenty point five\npercent", "5%"),
+    ("one hundred and five\npercent", "5%"),
+    ("seventy five\npercent", "5%"),
+    ("twenty point five per\ncent", "5%"),
+    ("twenty point five\r\npercent", "5%"),
+    ("twenty point five\rpercent", "5%"),
+])
+def test_spelled_percent_unsupported_expression_cannot_support_tail(
+    expression: str, estimate: str,
+) -> None:
+    assert estimate not in pipeline_module._claimed_quantity_tokens(expression)
+    assert len(pipeline_module._normalized_quantity_text(expression).splitlines()) == len(expression.splitlines())
+    with pytest.raises(SourceBundleQuantitativeProvenanceError, match="reported_estimate_not_found_in_source"):
+        pipeline_module._validate_quantitative_provenance(
+            {"evidence_anchors": [{"claim": f"Approval was {estimate}.",
+                "quantitative_result": {"estimate": estimate, "provenance": "source_reported"}}]},
+            {"text": f"Approval was {expression}."},
+        )
+
+
+@pytest.mark.parametrize("text", ["one of every two", "a dozen participants", "twelve participants", "one of the most useful"])
+def test_spelled_percent_preserves_other_cardinal_normalization(text: str) -> None:
+    expected = {
+        "one of every two": {"1", "2"}, "a dozen participants": {"12"},
+        "twelve participants": {"12"}, "one of the most useful": {"1"},
+    }
+    assert pipeline_module._claimed_quantity_tokens(text) == expected[text]
+
+
+@pytest.mark.parametrize("text", [
+    "--- Page 1 ---\nSeventy-five percent of respondents approved.",
+    "- Seventy-five percent of respondents approved.",
+    "Results\n  - Seventy-five percent of respondents approved.",
+    "Results\n7\nSeventy-five percent of respondents approved.",
+    "One hundred\n\nSeventy-five percent of respondents approved.",
+    "One hundred\n  \nSeventy-five percent of respondents approved.",
+    "One hundred\r\n\r\nSeventy-five percent of respondents approved.",
+])
+def test_spelled_percent_does_not_borrow_navigation_or_list_prefix(text: str) -> None:
+    pipeline_module._validate_quantitative_provenance(
+        {"evidence_anchors": [{"claim": "Approval was 75%.",
+            "quantitative_result": {"estimate": "75%", "provenance": "source_reported"}}]},
+        {"text": text},
+    )

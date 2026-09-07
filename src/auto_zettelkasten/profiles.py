@@ -33,7 +33,7 @@ PROFILE_PROMPT_VERSION = "6"
 PROFILE_CLASSIFIER_VERSION = "3"
 PROFILE_ALGORITHM_VERSION = "9"
 COMMITTED_NOTE_ANCHOR_AUGMENTATION_VERSION = "8"
-ANCHOR_ALGORITHM_VERSION = "3"
+ANCHOR_ALGORITHM_VERSION = "4"
 SUPPORT_ENVELOPE_VERSION = "1"
 
 # Public lower-case aliases match the names persisted in dependency records.
@@ -2555,6 +2555,10 @@ def _source_locator_payloads(
     locator = re.sub(r"\s+", " ", str(locator_text or "")).strip().strip(".;")
     if not locator:
         return []
+    unquoted_locator = re.sub(
+        r"[\"\u201c][^\"\u201d]*[\"\u201d]|(?<!\w)['\u2018][^'\u2019]*['\u2019](?!\w)",
+        " ", locator,
+    )
     records: list[tuple[str, str, int | None, int | None, bool, bool]] = []
     generated_fragments = [
         fragment.strip(" .:#")
@@ -2566,7 +2570,7 @@ def _source_locator_payloads(
             fragment
         ):
             records.append(("generated_heading", fragment, None, None, False, False))
-    for match in _PAGE_LOCATOR.finditer(locator):
+    for match in _PAGE_LOCATOR.finditer(unquoted_locator):
         start = int(match.group("start"))
         end = int(match.group("end") or start)
         records.append(
@@ -2586,7 +2590,7 @@ def _source_locator_payloads(
         ("paragraph", _PARAGRAPH_LOCATOR),
         ("quote_span", _QUOTE_SPAN_LOCATOR),
     ):
-        for match in pattern.finditer(locator):
+        for match in pattern.finditer(locator if locator_type == "quote_span" else unquoted_locator):
             value = match.group(0).strip()
             if _GENERATED_NOTE_HEADING.fullmatch(value) or _WEAK_BARE_LOCATOR.fullmatch(
                 value

@@ -33,7 +33,7 @@ from .extraction import (
     render_pdf_pages,
 )
 from .fidelity import _numeric_tokens as _fidelity_numeric_tokens
-from .fidelity import analyze_atomic_fidelity
+from .fidelity import _printed_to_ordinals, _source_pages, analyze_atomic_fidelity
 from .files import (
     append_jsonl,
     atomic_write_bytes,
@@ -3250,7 +3250,7 @@ def _source_bundle_dependency_fingerprint(
             "model": request.model,
             "prompt_version": request.prompt_version,
             "source_bundle_prompt_version": SOURCE_BUNDLE_PROMPT_VERSION,
-            "source_bundle_normalization_version": "17",
+            "source_bundle_normalization_version": "18",
         }
     if request.provider == "codex":
         execution = row.get("provider_execution_identity")
@@ -16253,22 +16253,12 @@ def _source_bundle_from_result(
             for value in recommendations
         ]
     if validate_quantitative_provenance:
-        quantitative_source_index = (
-            _quantitative_source_index(str(row.get("text") or ""))
-            if not opaque_pdf_route
-            and any(
-                isinstance(anchor, Mapping)
-                and isinstance(anchor.get("quantitative_result"), Mapping)
-                and anchor.get("quantitative_result")
-                for anchor in payload.get("evidence_anchors", []) or []
-            )
-            else None
-        )
+        quantitative_source_cache: dict[Any, Any] = {}
         try:
             _validate_quantitative_provenance(
                 payload,
                 row,
-                source_index=quantitative_source_index,
+                source_cache=quantitative_source_cache,
             )
         except SourceBundleQuantitativeProvenanceError:
             anchors = payload.get("evidence_anchors", [])
@@ -16276,13 +16266,13 @@ def _source_bundle_from_result(
                 raise
             accepted: list[Any] = []
             rejected: list[dict[str, Any]] = []
-            # Reuse the document index so bounded per-anchor salvage stays linear.
+            # Reuse scoped indexes across initial validation, salvage, and final validation.
             for index, anchor in enumerate(anchors):
                 try:
                     _validate_quantitative_provenance(
                         {"evidence_anchors": [anchor]},
                         row,
-                        source_index=quantitative_source_index,
+                        source_cache=quantitative_source_cache,
                     )
                 except SourceBundleQuantitativeProvenanceError as exc:
                     if str(exc) == "footnote_scope_combines_marked_and_unmarked_quantities":
@@ -16317,7 +16307,7 @@ def _source_bundle_from_result(
             _validate_quantitative_provenance(
                 payload,
                 row,
-                source_index=quantitative_source_index,
+                source_cache=quantitative_source_cache,
             )
     return SourceAnalysisBundle.from_dict(payload)
 
@@ -16417,11 +16407,57 @@ _CARDINAL_NUMBERS = {
 _CARDINAL_NUMBER_RE = re.compile(
     rf"\b({'|'.join(_CARDINAL_NUMBERS)})\b", re.IGNORECASE
 )
+_PERCENT_SMALL_NUMBERS = {
+    **{word: int(number) for word, number in _CARDINAL_NUMBERS.items() if word != "dozen"},
+    "zero": 0, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+}
+_PERCENT_TENS = dict(zip(
+    ("twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"),
+    range(20, 100, 10),
+))
+_SPELLED_PERCENT_RE = re.compile(
+    rf"(?<![\w-])(?:(?P<tens>{'|'.join(_PERCENT_TENS)})"
+    rf"(?:(?:[ \t]+|[-‐‑])(?P<unit>{'|'.join(word for word, number in _PERCENT_SMALL_NUMBERS.items() if 0 < number < 10)}))?"
+    rf"|(?P<small>{'|'.join(_PERCENT_SMALL_NUMBERS)}))"
+    r"[ \t\r\n]+(?:percent|per[ \t\r\n]+cent)\b", re.IGNORECASE,
+)
+_SPELLED_PERCENT_PREFIX_RE = re.compile(
+    rf"\b(?:{'|'.join(_PERCENT_SMALL_NUMBERS)}|{'|'.join(_PERCENT_TENS)}|"
+    r"hundred|thousand|million|billion|trillion|half|quarter|third|dozen)\b"
+    r"(?:[ \t/‐‑–—-]|\b(?:and|a|to|in|out|of|over|point|plus|minus)\b|"
+    r"(?:\r\n|\r|\n)(?![ \t]*[\r\n]))*\Z"
+    r"|\d(?:[ \t/‐‑–—-]|\b(?:and|a|to|in|out|of|over|point|plus|minus)\b)*\Z"
+    r"|(?:[+−-]|\b(?:minus|plus))[ \t]*\Z", re.IGNORECASE,
+)
+
+
+def _spelled_percent_value(match: re.Match[str]) -> str:
+    # ponytail: complete 0–99 integer percentages only; larger expressions need a parser.
+    prefix = match.string[:match.start()].rsplit("\n\n", 1)[-1]
+    if (
+        "\n" in match.group() or "\r" in match.group()
+        or (
+            _SPELLED_PERCENT_PREFIX_RE.search(prefix)
+            and not re.search(r"(?:^|[\r\n])[ \t]*-[ \t]+$", prefix)
+        )
+    ):
+        # Prevent the older single-cardinal pass from treating an unsupported tail as a value.
+        shielded = re.sub(r"[ \t‐‑-]+", "_", match.group())
+        return re.sub(r"(\r\n|\r|\n)", r"_\1_", shielded)
+    tens, unit, small = (value.casefold() if value else "" for value in match.groups())
+    number = (
+        _PERCENT_TENS[tens] + _PERCENT_SMALL_NUMBERS.get(unit, 0)
+        if tens else _PERCENT_SMALL_NUMBERS[small]
+    )
+    return f"{number}%"
 
 
 def _normalized_quantity_text(value: str) -> str:
     value = value.translate({0x2212: "-", 0xFE63: "-", 0xFF0D: "-"})
     value = _UNICODE_GROUP_SEPARATOR_RE.sub("", value)
+    if "cent" in value.casefold():
+        value = _SPELLED_PERCENT_RE.sub(_spelled_percent_value, value)
     value = re.sub(
         r"(?<![+\-\d.])(\d[\d,]*(?:\.\d+)?)\s*[-–—]\s*"
         r"(\d[\d,]*(?:\.\d+)?)(?!-\d{2}\b)",
@@ -17209,6 +17245,9 @@ def _quantitative_source_index(source_text: str) -> _QuantitativeSourceIndex:
         "",
         source_text,
     )
+    # Resolve or shield spelled percentages before splitting away a wrapped numeric prefix.
+    if "cent" in text.casefold():
+        text = _SPELLED_PERCENT_RE.sub(_spelled_percent_value, text)
     lines = tuple(text.splitlines())
     metadata_lines = frozenset(
         index
@@ -18888,7 +18927,86 @@ def _system_derived_estimate_supported(
     return True
 
 
+def _quantitative_page_groups(
+    anchor: Mapping[str, Any], row: Mapping[str, Any], cache: dict[Any, Any],
+) -> tuple[tuple[int, ...], ...] | None:
+    locator_values = [str(anchor.get("locator") or "")]
+    locator_values.extend(str(value) for value in anchor.get("locators", []) or [])
+    locator_values.extend(
+        str(value.get("value") or "")
+        for value in anchor.get("source_locators", []) or [] if isinstance(value, Mapping)
+    )
+    locators = _source_locator_payloads(
+        "; ".join(locator_values), source_id="", evidence_anchor_id="",
+    )
+    page_locators = [item for item in locators if item["locator_type"] in {"page", "page_range"}]
+    page_map = (row.get("coverage_metrics") or {}).get("ordinal_to_printed_page")
+    # Legacy lexical validation remains for unresolvable non-page locators and
+    # printed coordinates without an authoritative map; it does not verify scope.
+    page_locators = [item for item in page_locators if item["value"].casefold().startswith("pdf") or page_map]
+    if not page_locators:
+        return None
+    if "pages" not in cache:
+        text = str(row.get("text") or "")
+        markers = re.findall(r"(?m)^--- Page ([^\r\n]*?) ---[ \t]*\r?$", text)
+        valid = [int(value) for value in markers if re.fullmatch(r"[1-9]\d*", value)]
+        marker_lines = re.findall(r"(?m)^--- Page[^\r\n]*", text)
+        if not valid or len(valid) != len(marker_lines) or valid != sorted(set(valid)):
+            raise SourceBundleQuantitativeProvenanceError("quantitative_page_locator_unresolved")
+        cache["pages"] = _source_pages(text)
+        cache["printed"] = _printed_to_ordinals(page_map)
+    selected: set[int] = set()
+    for locator in page_locators:
+        start, end = locator["page_start"], locator["page_end"]
+        if start < 1 or end < start or end - start + 1 > len(cache["pages"]):
+            raise SourceBundleQuantitativeProvenanceError("quantitative_page_locator_unresolved")
+        for number in range(start, end + 1):
+            ordinals = (number,) if locator["value"].casefold().startswith("pdf") else cache["printed"].get(str(number), ())
+            if len(ordinals) != 1 or ordinals[0] not in cache["pages"]:
+                raise SourceBundleQuantitativeProvenanceError("quantitative_page_locator_unresolved")
+            selected.add(ordinals[0])
+    groups: list[list[int]] = []
+    for page in sorted(selected):
+        if not groups or page != groups[-1][-1] + 1:
+            groups.append([])
+        groups[-1].append(page)
+    return tuple(tuple(group) for group in groups)
+
+
 def _validate_quantitative_provenance(
+    payload: Mapping[str, Any], row: Mapping[str, Any], *,
+    source_index: _QuantitativeSourceIndex | None = None,
+    source_cache: dict[Any, Any] | None = None,
+) -> None:
+    if str(row.get("content_route") or "") in {"codex_pdf_page_images", "codex_pdf_input_file"}:
+        return
+    cache = source_cache if source_cache is not None else {}
+    for anchor in payload.get("evidence_anchors", []) or []:
+        if not isinstance(anchor, Mapping) or not isinstance(anchor.get("quantitative_result"), Mapping) or not anchor["quantitative_result"]:
+            continue
+        groups = _quantitative_page_groups(anchor, row, cache)
+        error = None
+        for group in groups if groups is not None else (None,):
+            key = ("index", group)
+            if key not in cache:
+                # ponytail: cache exact contiguous scopes; overlapping broad ranges
+                # may repeat indexing, merge index views only if benchmarks justify it.
+                text = "\n".join(cache["pages"][page] for page in group) if group is not None else str(row.get("text") or "")
+                cache[key] = source_index if group is None and source_index is not None else _quantitative_source_index(text)
+            try:
+                _validate_quantitative_source_provenance(
+                    {"evidence_anchors": [anchor]}, row, source_index=cache[key],
+                )
+            except SourceBundleQuantitativeProvenanceError as exc:
+                error = exc
+            else:
+                break
+        else:
+            if error is not None:
+                raise error
+
+
+def _validate_quantitative_source_provenance(
     payload: Mapping[str, Any],
     row: Mapping[str, Any],
     *,

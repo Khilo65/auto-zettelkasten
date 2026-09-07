@@ -56,7 +56,7 @@ def test_profile_versions_are_explicit() -> None:
     assert PROFILE_PROMPT_VERSION == profiles.profile_prompt_version == "6"
     assert PROFILE_CLASSIFIER_VERSION == profiles.profile_classifier_version == "3"
     assert PROFILE_ALGORITHM_VERSION == profiles.profile_algorithm_version == "9"
-    assert ANCHOR_ALGORITHM_VERSION == "3"
+    assert ANCHOR_ALGORITHM_VERSION == "4"
     assert SUPPORT_ENVELOPE_VERSION == "1"
     assert COMMITTED_NOTE_ANCHOR_AUGMENTATION_VERSION == "8"
 
@@ -1013,7 +1013,7 @@ def test_profile_fingerprint_includes_every_declared_dependency() -> None:
     assert payload["classifier_version"] == "3"
     assert payload["algorithm_version"] == "9"
     assert payload["profile_schema_version"] == "1.3"
-    assert payload["anchor_algorithm_version"] == "3"
+    assert payload["anchor_algorithm_version"] == "4"
     assert payload["support_envelope_version"] == "1"
     assert baseline == profile_dependency_fingerprint(
         _with_generated_graph(note), **kwargs
@@ -1046,7 +1046,7 @@ def test_profile_fingerprint_includes_every_declared_dependency() -> None:
         note, **kwargs, profile_schema_version="1.0"
     )
     assert baseline != profile_dependency_fingerprint(
-        note, **kwargs, anchor_algorithm_version="4"
+        note, **kwargs, anchor_algorithm_version="5"
     )
     assert baseline != profile_dependency_fingerprint(
         note, **kwargs, support_envelope_version="2"
@@ -1630,3 +1630,27 @@ def _with_frontmatter_updates(note: str, **updates: object) -> str:
     frontmatter.update(updates)
     yaml_text = yaml.safe_dump(frontmatter, sort_keys=False, allow_unicode=True).strip()
     return f"---\n{yaml_text}\n---\n{body}"
+
+
+@pytest.mark.parametrize("label", ["p. 9", "p. 9, Table 3, Figure 4, Chapter 5, Paragraph 6"])
+@pytest.mark.parametrize("prefix", ["Quote ", "Heading "])
+@pytest.mark.parametrize("suffix", ["", " (PDF page 2)"])
+def test_typed_locators_ignore_coordinates_inside_quoted_payload(label, prefix, suffix) -> None:
+    rows = profiles._source_locator_payloads(
+        prefix + '“' + label + '”' + suffix,
+        source_id="source-a", evidence_anchor_id="anchor-a",
+    )
+    assert [(row["locator_type"], row["value"]) for row in rows if row["locator_type"] != "quote_span"] == (
+        [("page", "PDF page 2")] if suffix else []
+    )
+    assert [row["value"] for row in rows if row["locator_type"] == "quote_span"] == (
+        ['“' + label + '”'] if len(label) >= 12 else []
+    )
+
+
+def test_typed_locators_ignore_page_syntax_inside_single_quoted_heading() -> None:
+    rows = profiles._source_locator_payloads(
+        "Heading 'p. 9 and Table 3' (PDF page 2)",
+        source_id="source-a", evidence_anchor_id="anchor-a",
+    )
+    assert [(row["locator_type"], row["value"]) for row in rows] == [("page", "PDF page 2")]
