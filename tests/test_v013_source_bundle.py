@@ -1919,6 +1919,124 @@ def test_stale_bundle_profile_is_refreshed_under_the_current_fingerprint(tmp_pat
     assert refreshed["dependency_hash"] == checkpoint["fingerprint"]
 
 
+def test_current_bundle_locator_enrichment_refreshes_dependency_without_a_call(
+    tmp_path,
+) -> None:
+    item = {
+        "key": "ITEMA",
+        "data": {
+            "key": "ITEMA",
+            "itemType": "journalArticle",
+            "title": "Institutions and Reform",
+            "date": "2024",
+            "creators": [{"creatorType": "author", "lastName": "One"}],
+        },
+    }
+    reader = BundleReader()
+    request = MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1)
+    report = run_map(
+        request,
+        client=FakeZotero([item]),
+        reader=reader,
+        run_id="bundle-locator-enrichment-seed",
+    )
+    profile_path = next((tmp_path / "02_source_memory" / "profiles").glob("*.yml"))
+    record = read_yaml(profile_path)
+    anchor = record["profile"]["evidence_anchors"][0]
+    anchor["locator"] = "PDF p. 7"
+    anchor["locators"] = ["PDF p. 7"]
+    anchor["source_locators"] = [
+        {
+            "locator_id": "stale-locator",
+            "evidence_anchor_id": anchor["evidence_anchor_id"],
+            "source_id": record["profile"]["source_id"],
+            "locator_type": "page",
+            "value": "p. 7",
+            "page_start": 7,
+            "page_end": 7,
+            "source_native": True,
+            "supports_strong_assertion": True,
+        }
+    ]
+    anchor["revision_hash"] = ""
+    record["profile"]["validity"][
+        "committed_note_anchor_augmentation_version"
+    ] = pipeline_module.COMMITTED_NOTE_ANCHOR_AUGMENTATION_VERSION
+    record["profile"]["dependency_hash"] = "stale-profile-dependency"
+    write_yaml(profile_path, record)
+
+    note_path = tmp_path / report.items[0]["note_path"]
+    note = read_note(note_path)["frontmatter"]
+    note_rows = [
+        {
+            "note_path": str(note_path.relative_to(tmp_path)),
+            "note_id": note["note_id"],
+            "source_id": note["source_id"],
+            "note_status": note["note_status"],
+            "validation_passed": True,
+        }
+    ]
+    run_id = "bundle-locator-enrichment-replay"
+    budget = _ProfileProviderBudget(
+        tmp_path / "11_state" / "runs" / run_id / "provider_usage.yml",
+        0,
+        provider=request.provider,
+        model=request.model,
+    )
+    refreshed_result = pipeline_module._build_profiles_for_map(
+        tmp_path,
+        note_rows,
+        source_set=report.source_set,
+        run_id=run_id,
+        request=request,
+        reasoner=None,
+        progress=None,
+        resume=False,
+        profile_budget=budget,
+    )
+    checkpoint_path = next(
+        (
+            tmp_path
+            / "11_state"
+            / "runs"
+            / run_id
+            / "literature"
+            / "profile_calls"
+        ).glob("*.yml")
+    )
+    refreshed = read_yaml(profile_path)["profile"]
+    checkpoint = read_yaml(checkpoint_path)
+
+    assert reader.calls == 1
+    assert refreshed_result["provider_calls"] == 0
+    assert refreshed["evidence_anchors"][0]["source_locators"][0]["value"] == (
+        "PDF p. 7"
+    )
+    assert refreshed["dependency_hash"] == checkpoint["fingerprint"]
+
+    before = (profile_path.read_bytes(), checkpoint_path.read_bytes())
+    replayed_result = pipeline_module._build_profiles_for_map(
+        tmp_path,
+        note_rows,
+        source_set=report.source_set,
+        run_id=run_id,
+        request=request,
+        reasoner=None,
+        progress=None,
+        resume=True,
+        profile_budget=_ProfileProviderBudget(
+            tmp_path / "11_state" / "runs" / run_id / "provider_usage.yml",
+            0,
+            provider=request.provider,
+            model=request.model,
+        ),
+    )
+
+    assert replayed_result["provider_calls"] == 0
+    assert replayed_result["checkpoint_hits"] == 1
+    assert (profile_path.read_bytes(), checkpoint_path.read_bytes()) == before
+
+
 def test_image_route_does_not_relabel_a_prior_bundle_as_reused(tmp_path) -> None:
     item = {
         "key": "ITEMA",
@@ -6723,3 +6841,80 @@ def test_hierarchical_source_synthesis_returns_the_canonical_bundle(tmp_path) ->
     assert result["bundle_schema_version"] == "1"
     assert route == "hierarchical_hierarchical_text"
     assert set(HierarchicalReader.chunk_output_tokens) == {8_000}
+
+
+@pytest.mark.parametrize("text", [
+    "A registry began in 2004.\nSurvey respondents reported 17% approval.\nThe survey recorded 29% disapproval.",
+    "A registry began in 2004. Survey respondents reported 17% approval. The survey recorded 29% disapproval.",
+    "Survey respondents reported 17% approval. A registry began in 2004.",
+    "A registry began in 2004. Survey respondents\nreported 17% approval.",
+    "Survey respondents reported 17% approval.\nA registry began in 2004.",
+    "A registry began in 2004.\nUnrelated context\nSurvey respondents reported 17% approval.",
+])
+def test_quantitative_provenance_rejects_adjacent_context_year(text: str) -> None:
+    anchor = {
+        "claim": "Respondents reported 17% approval.",
+        "quantitative_result": {
+            "statistic": "approval share", "estimand_type": "proportion",
+            "outcome_definition": "approval", "estimate": "17%",
+            "unit": "percent", "population": "Survey respondents",
+            "period": "2004", "provenance": "source_reported",
+        },
+    }
+    with pytest.raises(
+        SourceBundleQuantitativeProvenanceError,
+        match="period_date_not_local_to_reported_estimate",
+    ):
+        pipeline_module._validate_quantitative_provenance(
+            {"evidence_anchors": [anchor]}, {"text": text},
+        )
+    anchor["quantitative_result"]["period"] = ""
+    pipeline_module._validate_quantitative_provenance(
+        {"evidence_anchors": [anchor]}, {"text": text},
+    )
+
+
+@pytest.mark.parametrize("text", [
+    "In 2004, survey respondents\nreported 17% approval.",
+    "Survey respondents reported 17% approval\nin 2004.",
+    "Survey results in 2004:\nApproval: 17%\nDisapproval: 29%",
+    "Approval: 17%*.\nDisapproval: 29%.\n* Survey conducted in 2004.",
+])
+def test_quantitative_provenance_preserves_bound_year_context(text: str) -> None:
+    pipeline_module._validate_quantitative_provenance(
+        {"evidence_anchors": [{"quantitative_result": {
+            "estimate": "17%", "period": "2004", "provenance": "source_reported",
+        }}]},
+        {"text": text},
+    )
+
+
+@pytest.mark.parametrize(("text", "period", "estimate"), [
+    ("During 2004, U.S. respondents reported 17% approval.", "2004", "17%"),
+    ("During 2004, U.S.\nrespondents reported 17% approval.", "2004", "17%"),
+    ("During 2004, J.\nSmith reported 17% approval.", "2004", "17%"),
+    ("During 2004, J. Smith reported 17% approval.", "2004", "17%"),
+    ("On Oct. 7, 2004, respondents reported 17% approval.", "October 7, 2004", "17%"),
+    ("During 2004, respondents reported 17.5% approval.", "2004", "17.5%"),
+    ("During 2004, respondents reported 17% approval; 29% reported disapproval.", "2004", "29%"),
+])
+def test_quantitative_period_sentence_boundary_preserves_local_support(
+    text: str, period: str, estimate: str,
+) -> None:
+    pipeline_module._validate_quantitative_provenance(
+        {"evidence_anchors": [{"quantitative_result": {
+            "estimate": estimate, "period": period, "provenance": "source_reported",
+        }}]},
+        {"text": text},
+    )
+
+
+@pytest.mark.parametrize("title", ["Dr.", "Prof.", "Mr.", "Mrs.", "Ms."])
+@pytest.mark.parametrize("separator", [" ", "\n"])
+def test_quantitative_period_preserves_honorifics(title: str, separator: str) -> None:
+    pipeline_module._validate_quantitative_provenance(
+        {"evidence_anchors": [{"quantitative_result": {
+            "estimate": "17%", "period": "2004", "provenance": "source_reported",
+        }}]},
+        {"text": f"During 2004, {title}{separator}Smith reported 17% approval."},
+    )

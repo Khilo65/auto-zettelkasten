@@ -3249,7 +3249,7 @@ def _source_bundle_dependency_fingerprint(
             "model": request.model,
             "prompt_version": request.prompt_version,
             "source_bundle_prompt_version": SOURCE_BUNDLE_PROMPT_VERSION,
-            "source_bundle_normalization_version": "15",
+            "source_bundle_normalization_version": "16",
         }
     if request.provider == "codex":
         execution = row.get("provider_execution_identity")
@@ -17738,6 +17738,16 @@ def _same_year_column_table(
     )
 
 
+def _quantitative_sentence_ended(value: str) -> bool:
+    # ponytail: punctuation heuristic; prefer explicit source sentence spans when available.
+    value = value.rstrip()
+    return value.endswith((".", "?", "!")) and not re.search(
+        rf"(?:\b[A-Za-z]\.)+$|\b(?:{_MONTH_PATTERN}|dr|prof|mr|mrs|ms)\.$",
+        value,
+        re.I,
+    )
+
+
 def _line_has_local_year(
     line: int,
     matching_lines: Sequence[int],
@@ -17746,22 +17756,32 @@ def _line_has_local_year(
     *,
     year_column_table: Mapping[str, Mapping[str, Mapping[str, set[int]]]] | None = None,
 ) -> bool:
-    return any(
-        not any(
-            min(year_line, line) < boundary < max(year_line, line)
-            for boundary in metadata_lines
-        )
-        and (
-            abs(year_line - line) <= _QUANTITATIVE_DATE_LOCALITY_LINES
-            or _same_year_column_table(
-                source_lines,
-                year_line,
-                line,
-                year_column_table=year_column_table,
+    for year_line in matching_lines:
+        start, end = sorted((year_line, line))
+        if any(start < boundary < end for boundary in metadata_lines):
+            continue
+        if _same_year_column_table(
+            source_lines, year_line, line, year_column_table=year_column_table,
+        ):
+            return True
+        if end - start > _QUANTITATIVE_DATE_LOCALITY_LINES:
+            continue
+        if all(
+            value.strip() and not _quantitative_sentence_ended(value)
+            for value in source_lines[start:end]
+        ) or _same_quantitative_table(source_lines, year_line, line):
+            return True
+        if year_line > line and any(
+            _quantity_tokens(source_lines[line]).intersection(marked)
+            and _source_year_values(source_lines[year_line]).issubset(
+                _source_year_values(definition)
             )
-        )
-        for year_line in matching_lines
-    )
+            for marked, _unmarked, definition in _footnote_quantity_groups(
+                source_lines[line] + "\n" + source_lines[year_line]
+            )
+        ):
+            return True
+    return False
 
 
 def _line_has_local_period_marker(
@@ -18083,44 +18103,89 @@ def _quantitative_segments(value: str) -> list[str]:
 
 
 def _line_period_association_supported(
-    value: str,
+    source_lines: Sequence[str],
+    line: int,
     estimate_tokens: set[str],
     period_dates: set[tuple[int, int, int | None]],
     period_years: set[str],
     period_markers: set[str],
 ) -> bool:
-    segments = _quantitative_segments(value)
-    signatures = {
-        (
-            frozenset(_calendar_dates(segment)),
-            frozenset(_source_year_values(segment)),
-            frozenset(_named_period_markers(segment)),
-        )
-        for segment in segments
-        if _calendar_dates(segment)
-        or _source_year_values(segment)
-        or _named_period_markers(segment)
-    }
-    estimate_segments = [
-        segment
-        for segment in segments
-        if estimate_tokens.issubset(_claimed_quantity_tokens(segment))
-    ]
-    explicit_estimate_segments = [
-        segment
-        for segment in estimate_segments
-        if _calendar_dates(segment)
-        or _source_year_values(segment)
-        or _named_period_markers(segment)
-    ]
-    if explicit_estimate_segments:
-        return any(
-            period_dates.issubset(set(_calendar_dates(segment)))
-            and period_years.issubset(_source_year_values(segment))
-            and period_markers.issubset(_named_period_markers(segment))
-            for segment in explicit_estimate_segments
-        )
-    return len(signatures) <= 1
+    start = end = line
+    if not (
+        _calendar_dates(source_lines[line])
+        or _source_year_values(source_lines[line])
+        or _named_period_markers(source_lines[line])
+    ):
+        while start > max(0, line - _QUANTITATIVE_DATE_LOCALITY_LINES):
+            previous = source_lines[start - 1]
+            if not previous.strip() or _quantitative_sentence_ended(previous):
+                break
+            start -= 1
+        while end < min(len(source_lines) - 1, line + _QUANTITATIVE_DATE_LOCALITY_LINES):
+            if _quantitative_sentence_ended(source_lines[end]) or not source_lines[end + 1].strip():
+                break
+            end += 1
+    value = " ".join(source_lines[start : end + 1])
+    sentences: list[str] = []
+    offset = 0
+    for boundary in re.finditer(r"(?<=[.!?])\s+", value):
+        prefix = value[offset:boundary.start()]
+        if not _quantitative_sentence_ended(prefix):
+            continue
+        sentences.append(value[offset:boundary.start()])
+        offset = boundary.end()
+    sentences.append(value[offset:])
+    has_period = any(
+        _calendar_dates(sentence)
+        or _source_year_values(sentence)
+        or _named_period_markers(sentence)
+        for sentence in sentences
+    )
+    for sentence in sentences:
+        segments = _quantitative_segments(sentence)
+        signatures = {
+            (
+                frozenset(_calendar_dates(segment)),
+                frozenset(_source_year_values(segment)),
+                frozenset(_named_period_markers(segment)),
+            )
+            for segment in segments
+            if _calendar_dates(segment)
+            or _source_year_values(segment)
+            or _named_period_markers(segment)
+        }
+        estimate_segments = [
+            segment
+            for segment in segments
+            if estimate_tokens.issubset(_claimed_quantity_tokens(segment))
+        ]
+        explicit_estimate_segments = [
+            segment
+            for segment in estimate_segments
+            if _calendar_dates(segment)
+            or _source_year_values(segment)
+            or _named_period_markers(segment)
+        ]
+        if explicit_estimate_segments:
+            if any(
+                period_dates.issubset(set(_calendar_dates(segment)))
+                and period_years.issubset(_source_year_values(segment))
+                and period_markers.issubset(_named_period_markers(segment))
+                for segment in explicit_estimate_segments
+            ):
+                return True
+        elif estimate_segments and (
+            (not signatures and not has_period)
+            or any(
+                len(signatures) == 1
+                and period_dates.issubset(dates)
+                and period_years.issubset(years)
+                and period_markers.issubset(markers)
+                for dates, years, markers in signatures
+            )
+        ):
+            return True
+    return False
 
 
 def _defined_percentage_metrics(value: str) -> set[str]:
@@ -19132,7 +19197,8 @@ def _validate_quantitative_provenance(
                 line
                 for line in anchor_lines
                 if _line_period_association_supported(
-                    source_lines[line],
+                    source_lines,
+                    line,
                     estimate_tokens,
                     set(period_dates),
                     period_years,

@@ -728,11 +728,13 @@ def augment_profile_from_committed_note(
 
     frontmatter, body = _parse_note(note_text)
     sections = _markdown_sections(_strip_generated_body(body))
-    profile = _enrich_profile_v12_records(
+    enriched_profile = _enrich_profile_v12_records(
         profile,
         frontmatter=frontmatter,
         sections=sections,
     )
+    records_enriched = enriched_profile != profile
+    profile = enriched_profile
     payload = profile_to_dict(profile)
     profile_generation_route = str(
         (payload.get("context") or {}).get("profile_generation_route") or ""
@@ -759,7 +761,7 @@ def augment_profile_from_committed_note(
     if str(validity.get("committed_note_anchor_augmentation_version") or "") == (
         COMMITTED_NOTE_ANCHOR_AUGMENTATION_VERSION
     ):
-        return profile, methods_refreshed
+        return profile, records_enriched or methods_refreshed
     generated = profile_to_dict(
         deterministic_profile(
             note_text,
