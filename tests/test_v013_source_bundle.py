@@ -1548,7 +1548,7 @@ def test_ordinary_bundle_source_uses_one_call_and_no_profile_or_fidelity_call(
     ]
     assert profile["coverage"]["status"] == "partial"
     note = read_note(tmp_path / report.items[0]["note_path"])
-    assert note["frontmatter"]["source_bundle_prompt_version"] == "38"
+    assert note["frontmatter"]["source_bundle_prompt_version"] == "39"
 
 
 @pytest.mark.parametrize("observed_date", ["", "Published 2019; updated 2024"])
@@ -1801,23 +1801,32 @@ def test_source_bundle_prompt_change_invalidates_committed_note_reuse(
     request = MapRequest(
         tmp_path, provider="ollama", model="bundle-v1", parallel=1
     )
-    run_map(
-        request,
-        client=FakeZotero([item]),
-        reader=reader,
-        run_id="bundle-prompt-one",
-    )
-    monkeypatch.setattr(
-        "auto_zettelkasten.pipeline.SOURCE_BUNDLE_PROMPT_VERSION", "changed"
-    )
+    with monkeypatch.context() as previous:
+        previous.setattr(pipeline_module, "SOURCE_BUNDLE_PROMPT_VERSION", "38")
+        run_map(
+            request,
+            client=FakeZotero([item]),
+            reader=reader,
+            run_id="bundle-prompt-one",
+        )
+    assert reader.calls == 1
 
-    run_map(
+    reread = run_map(
         request,
         client=FakeZotero([item]),
         reader=reader,
         run_id="bundle-prompt-two",
     )
 
+    assert reread.reused_count == 0
+    assert reader.calls == 2
+    replay = run_map(
+        request,
+        client=FakeZotero([item]),
+        reader=reader,
+        run_id="bundle-prompt-three",
+    )
+    assert replay.reused_count == 1
     assert reader.calls == 2
 
 

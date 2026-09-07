@@ -239,7 +239,7 @@ DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
-SOURCE_BUNDLE_PROMPT_VERSION = "38"
+SOURCE_BUNDLE_PROMPT_VERSION = "39"
 SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v2"
 SOURCE_BUNDLE_ROW_LIMITS = {"evidence_anchors": 24, "literature_positions": 8}
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
@@ -7002,7 +7002,7 @@ def _chunk_text_with_locators(text: str, metadata: Mapping[str, Any]) -> str:
         locator = locators.get(match.group(1), f"PDF p. {match.group(1)}")
         return f"{match.group(0)}\n[Citation locator: {locator}]"
 
-    return re.sub(r"(?m)^--- Page ([0-9]+) ---$", annotate, text)
+    return re.sub(r"(?m)^--- Page ([0-9]+) ---(?=\r?$)", annotate, text)
 
 
 def _canonicalize_chunk_evidence_locators(

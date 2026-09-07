@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from auto_zettelkasten.models import LiteratureMapRequest
+from auto_zettelkasten.pipeline import _indexed_pdf_text_with_page_markers, _split_document
 from auto_zettelkasten.readers import (
     SECTION_KEYS,
     DeepSeekReader,
@@ -101,10 +102,10 @@ def test_atomic_prompt_v14_is_source_adaptive_and_statistics_aware() -> None:
     assert "silently reread" in prompt
 
 
-def test_source_bundle_prompt_v38_preserves_formatting_and_attribution_scope() -> None:
+def test_source_bundle_prompt_v39_preserves_formatting_and_attribution_scope() -> None:
     prompt = _source_bundle_system_prompt()
 
-    assert "source bundle prompt v38" in prompt
+    assert "source bundle prompt v39" in prompt
     assert "apply a footnote, only when the alignment or marker is explicit" in prompt
     assert "A footnote qualifies only the values bearing its explicit marker" in prompt
     assert "page metadata is not a statistic's observation date" in prompt
@@ -291,6 +292,38 @@ def test_chunk_final_check_preserves_pdf_and_printed_coordinates() -> None:
     assert "absence of effect on other outcomes" in final
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+@pytest.mark.parametrize("page_map", [{"1": "12", "2": "13"}, {}], ids=["printed", "pdf"])
+def test_chunk_prompt_annotates_preserved_indexed_pdf_line_endings(
+    newline: str, page_map: dict[str, str],
+) -> None:
+    source = newline.join([
+        "--- Page 1 ---", "First passage.", "", "--- Page 2 ---", "Second passage.",
+    ])
+    indexed = _indexed_pdf_text_with_page_markers(
+        source, {"indexedPages": 2, "totalPages": 2},
+    )
+    assert indexed == source
+    chunk, = _split_document(indexed, chunk_char_limit=1000)
+    assert chunk.split("\n", 1)[1].encode() == source.encode()
+    metadata = {"_source_context": {"ordinal_to_printed_page": page_map}}
+    before = json.dumps(metadata)
+    prompt = _chunk_prompt(chunk, metadata, None, "chunk-0001", "pages 1-2")
+    annotated = chunk
+    for ordinal in ("1", "2"):
+        locator = f"p. {page_map[ordinal]}" if ordinal in page_map else f"PDF p. {ordinal}"
+        marker = f"--- Page {ordinal} ---"
+        annotated = annotated.replace(marker, f"{marker}\n[Citation locator: {locator}]")
+    assert annotated in prompt
+    assert prompt.count("[Citation locator:") == 2
+    restored = annotated
+    for ordinal in ("1", "2"):
+        locator = f"p. {page_map[ordinal]}" if ordinal in page_map else f"PDF p. {ordinal}"
+        restored = restored.replace(f"\n[Citation locator: {locator}]", "")
+    assert restored.encode() == chunk.encode()
+    assert json.dumps(metadata) == before
+
+
 def test_source_bundle_critique_distinguishes_totals_from_component_scopes() -> None:
     prompt = _source_bundle_system_prompt()
 
@@ -372,12 +405,12 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     )
     assert {
         "atomic_prompt_v14": digest(_system_prompt()),
-        "chunk_prompt_bundle_v38": digest(_chunk_system_prompt()),
-        "chunk_user_prompt_bundle_v38": digest(
+        "chunk_prompt_bundle_v39": digest(_chunk_system_prompt()),
+        "chunk_user_prompt_bundle_v39": digest(
             _chunk_prompt("A fictional source.", {}, None, "chunk-0001", "pages 1-2")
         ),
-        "source_bundle_prompt_v38": digest(_source_bundle_system_prompt()),
-        "source_bundle_user_prompt_v38": digest(
+        "source_bundle_prompt_v39": digest(_source_bundle_system_prompt()),
+        "source_bundle_user_prompt_v39": digest(
             _source_bundle_prompt("A fictional source.", {}, None)
         ),
         "codex_source_bundle_schema": bundle_identity["schema_hash"],
@@ -386,10 +419,10 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
         "codex_chunk_evidence_contract": digest(chunk_identity),
     } == {
         "atomic_prompt_v14": "8db9f2990d175816cb0100b92d84734ae7c2f930aade66825ed0412b22da3705",
-        "chunk_prompt_bundle_v38": "1ef440d8148d4a58491ac2a74cf9d65c0d52f9f4d2e42278f1961e94e570dea2",
-        "chunk_user_prompt_bundle_v38": "13825c29551703fdc760ab0ad496ac3210658dfe290c36fa027f6c51f3d72a05",
-        "source_bundle_prompt_v38": "c4cbf5d0e77c93fd3219a745d2db968ffb5789faff13c99d9ff97312182a1a6f",
-        "source_bundle_user_prompt_v38": "fe31c24456507ac518dd9e8d2cc5c31a056e6b0daf5fb1c0617710b7d5e8a7e0",
+        "chunk_prompt_bundle_v39": "1ef440d8148d4a58491ac2a74cf9d65c0d52f9f4d2e42278f1961e94e570dea2",
+        "chunk_user_prompt_bundle_v39": "13825c29551703fdc760ab0ad496ac3210658dfe290c36fa027f6c51f3d72a05",
+        "source_bundle_prompt_v39": "4bcdb8675620b3fac97ee94cbd2097681eff6fffb2cdfc088d974e6f4d3d350f",
+        "source_bundle_user_prompt_v39": "fe31c24456507ac518dd9e8d2cc5c31a056e6b0daf5fb1c0617710b7d5e8a7e0",
         "codex_source_bundle_schema": "5e937e835e1ca6bb37ece21acd52e4c02ef8956cb456a4b656e1840ac9f08ff5",
         "codex_source_bundle_contract": "413826546dc0c3a651b82e5a88d251037adb6a9d7fcf27f5f6ab8c32cc94ccb3",
         "codex_chunk_evidence_schema": "130ebe184fc8dc0b3c08879abfeb0435500a47eecd78ed7e2387c095574d821c",
