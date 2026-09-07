@@ -2323,6 +2323,9 @@ def test_codex_transport_is_sanitized_schema_bound_and_tool_fail_closed(
     )
     if contract_id == "source_bundle":
         assert next(iter(json.loads(captured["output_schema"])["properties"])) == "evidence_anchors"
+        fields = json.loads(captured["output_schema"])["properties"]
+        assert fields["evidence_anchors"]["maxItems"] == 24
+        assert fields["literature_positions"]["maxItems"] == 8
     assert "--output-schema" in captured["argv"]
     assert 'forced_login_method="chatgpt"' in captured["argv"]
     assert "skills.bundled.enabled=false" in captured["argv"]

@@ -7,6 +7,8 @@ import threading
 import pytest
 
 import auto_zettelkasten.pipeline as pipeline_module
+import auto_zettelkasten.readers as readers_module
+from auto_zettelkasten.codex_attempt_guard import deny_codex_attempts
 from auto_zettelkasten.models import (
     EvidenceProfile,
     MapRequest,
@@ -6918,3 +6920,150 @@ def test_quantitative_period_preserves_honorifics(title: str, separator: str) ->
         }}]},
         {"text": f"During 2004, {title}{separator}Smith reported 17% approval."},
     )
+
+
+@pytest.mark.parametrize("field,limit", [("evidence_anchors", 24), ("literature_positions", 8)])
+@pytest.mark.parametrize("overflow", [None, "distinct", "duplicate", "malformed"])
+def test_source_bundle_row_caps_precede_intake_salvage(field, limit, overflow) -> None:
+    payload = _bundle_payload()
+    for name, count in (("evidence_anchors", 24), ("literature_positions", 8)):
+        key = "claim" if name == "evidence_anchors" else "raw_citation"
+        payload[name] = [
+            {**deepcopy(payload[name][0]), key: f"Independent source statement {index}."}
+            for index in range(count)
+        ]
+    if overflow:
+        extra = deepcopy(payload[field][0])
+        if overflow == "distinct":
+            extra["claim" if field == "evidence_anchors" else "raw_citation"] = "Another independent statement."
+        elif overflow == "malformed":
+            extra = {"broken": True}
+        payload[field].append(extra)
+    original = deepcopy(payload)
+    readers = (
+        lambda: _parse_source_bundle_response(payload, label="row cap fixture", expected_identity={"source_id": "source-zotero-A1", "zotero_key": "A1"}),
+        lambda: _source_bundle_from_result(payload, {
+            "source_id": "source-zotero-A1", "zotero_item_key": "A1", "text": "Supplied source text.",
+        }, "full_document"),
+        lambda: pipeline_module._ensure_source_result_contract(payload),
+    )
+    for read in readers:
+        if overflow:
+            with pytest.raises((ProviderError, ValueError), match=f"{field} cannot contain more than {limit} items"):
+                read()
+        else:
+            result = read()
+            result = result.to_dict() if isinstance(result, SourceAnalysisBundle) else result
+            assert len(result["evidence_anchors"]) == 24
+            assert len(result["literature_positions"]) == 8
+        assert payload == original
+
+
+def test_source_bundle_archival_representation_preserves_over_cap_rows(tmp_path) -> None:
+    payload = _bundle_payload()
+    for field, count in (("evidence_anchors", 25), ("literature_positions", 9)):
+        key = "claim" if field == "evidence_anchors" else "raw_citation"
+        payload[field] = [
+            {**deepcopy(payload[field][0]), key: f"Independent historical statement {index}."}
+            for index in range(count)
+        ]
+    original = deepcopy(payload)
+    archive = SourceAnalysisBundle.from_dict(payload).to_dict()
+    assert len(archive["evidence_anchors"]) == 25
+    assert len(archive["literature_positions"]) == 9
+    assert payload == original
+    sidecar = tmp_path / "02_source_memory" / "bundles" / "source-zotero-A1.yml"
+    write_yaml(sidecar, {"bundle": payload})
+    before = sidecar.read_bytes()
+    pipeline_module._rebuild_literature_memory_from_bundles(
+        tmp_path, source_ids={"source-zotero-A1"},
+    )
+    positions = read_yaml(tmp_path / "02_source_memory" / "indexes" / "literature_positions.yml")
+    assert len(positions["positions"]) == 9
+    assert sidecar.read_bytes() == before
+
+
+@pytest.mark.parametrize("reader_class", [
+    readers_module.DeepSeekReader, readers_module.OpenRouterReader,
+    readers_module.GeminiReader, readers_module.OllamaReader, readers_module.CodexReader,
+])
+@pytest.mark.parametrize("method", ["read_source_bundle", "synthesize_document_bundle"])
+@pytest.mark.parametrize("anchor_count,position_count", [(24, 8), (25, 8), (24, 9)])
+def test_public_source_bundle_row_caps_preserve_raw_without_retry(
+    monkeypatch, reader_class, method, anchor_count, position_count,
+) -> None:
+    models = {readers_module.OpenRouterReader: "unknown/model", readers_module.CodexReader: "gpt-5.6-luna"}
+    reader = reader_class(**({"model": models[reader_class]} if reader_class in models else {}))
+    payload = _bundle_payload()
+    for field, count in (("evidence_anchors", anchor_count), ("literature_positions", position_count)):
+        key = "claim" if field == "evidence_anchors" else "raw_citation"
+        payload[field] = [
+            {**deepcopy(payload[field][0]), key: f"Independent source statement {index}."}
+            for index in range(count)
+        ]
+    raw = json.dumps(payload)
+    generated = []
+
+    def generate(*args):
+        generated.append(args)
+        return raw
+
+    monkeypatch.setattr(reader, "_authorize_request", lambda: None)
+    monkeypatch.setattr(reader, "_generate_text", generate)
+    monkeypatch.setattr(readers_module.subprocess, "Popen", lambda *a, **k: pytest.fail("provider subprocess called"))
+    monkeypatch.setattr(readers_module.CodexReader, "_ensure_codex_preflight", lambda *a: pytest.fail("provider preflight called"))
+    metadata = {"_source_context": {"source_id": "source-zotero-A1", "zotero_key": "A1"}}
+    content = "Supplied source text." if method == "read_source_bundle" else [{"summary": "Supplied source text."}]
+    with deny_codex_attempts():
+        if anchor_count > 24 or position_count > 8:
+            with pytest.raises(ProviderError, match="cannot contain more than") as raised:
+                getattr(reader, method)(content, metadata)
+            assert raised.value.raw_response == raw
+            assert not pipeline_module._transport_retryable(raised.value)
+        else:
+            result = getattr(reader, method)(content, metadata)
+            assert len(result["evidence_anchors"]) == anchor_count
+            assert len(result["literature_positions"]) == position_count
+    assert len(generated) == 1
+    assert json.loads(raw) == payload
+
+
+@pytest.mark.parametrize("field,limit", [("evidence_anchors", 24), ("literature_positions", 8)])
+def test_source_bundle_checkpoint_rejects_overflow_without_reread(tmp_path, field, limit) -> None:
+    reader = BundleReader()
+    request = MapRequest(tmp_path, provider="ollama", model="bundle-v1")
+    metadata = {"_source_context": {"source_id": "source-zotero-A1", "zotero_key": "A1"}}
+    checkpoint = tmp_path / "checkpoint"
+    _read_document(reader, "Supplied source.", metadata, None, request=request, checkpoint_root=checkpoint)
+    path = checkpoint / "direct.yml"
+    saved = read_yaml(path)
+    saved["analysis"][field] = [deepcopy(saved["analysis"][field][0]) for _ in range(limit + 1)]
+    write_yaml(path, saved)
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match=f"{field} cannot contain more than {limit} items"):
+        _read_document(reader, "Supplied source.", metadata, None, request=request, checkpoint_root=checkpoint)
+    assert reader.calls == 1
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("count", [23, 24])
+def test_source_bundle_row_caps_include_rehydrated_diagnostics(count) -> None:
+    payload = _bundle_payload()
+    anchor = payload["evidence_anchors"][0]
+    payload["evidence_anchors"] = [
+        {**deepcopy(anchor), "claim": f"Independent source statement {index}."}
+        for index in range(count)
+    ]
+    payload["component_diagnostics"] = [{
+        "component": "evidence_anchors", "reason": "legacy optional-row parse failure",
+        "raw": {**deepcopy(anchor), "claim": "Additional source statement."},
+    }]
+    original = deepcopy(payload)
+    row = {"source_id": "source-zotero-A1", "zotero_item_key": "A1", "text": "Supplied source text."}
+    if count == 24:
+        with pytest.raises(ValueError, match="evidence_anchors cannot contain more than 24 items"):
+            _source_bundle_from_result(payload, row, "full_document")
+    else:
+        bundle = _source_bundle_from_result(payload, row, "full_document")
+        assert len(bundle.evidence_anchors) == 24
+    assert payload == original

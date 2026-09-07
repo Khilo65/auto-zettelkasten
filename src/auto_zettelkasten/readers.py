@@ -241,6 +241,7 @@ PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
 SOURCE_BUNDLE_PROMPT_VERSION = "38"
 SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v2"
+SOURCE_BUNDLE_ROW_LIMITS = {"evidence_anchors": 24, "literature_positions": 8}
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
 GAP_ADJUDICATION_MAX_OUTPUT_TOKENS = 32_000
@@ -397,7 +398,7 @@ CODEX_OUTPUT_CONTRACTS: Mapping[str, Mapping[str, Any]] = {
                         },
                     }
                 )
-            ),
+            ) | {"maxItems": SOURCE_BUNDLE_ROW_LIMITS["evidence_anchors"]},
             "analysis_sections": _codex_object(
                 {key: _CODEX_STRING for key in SECTION_KEYS}
             ),
@@ -443,7 +444,7 @@ CODEX_OUTPUT_CONTRACTS: Mapping[str, Mapping[str, Any]] = {
                         "locator": _CODEX_STRING,
                     }
                 )
-            ),
+            ) | {"maxItems": SOURCE_BUNDLE_ROW_LIMITS["literature_positions"]},
             "observed_bibliographic_identity": _codex_object(
                 {
                     "title": _CODEX_STRING,
@@ -7501,6 +7502,13 @@ def _normalize_provider_evidence_anchor(
     return row
 
 
+def _validate_source_bundle_row_limits(payload: Mapping[str, Any]) -> None:
+    for field_name, limit in SOURCE_BUNDLE_ROW_LIMITS.items():
+        rows = payload.get(field_name)
+        if isinstance(rows, list) and len(rows) > limit:
+            raise ValueError(f"{field_name} cannot contain more than {limit} items")
+
+
 def _parse_source_bundle_response(
     value: Any,
     *,
@@ -7579,6 +7587,10 @@ def _parse_source_bundle_response(
             candidate.get(SOURCE_BUNDLE_ENVELOPE_CONTRACT), Mapping
         ):
             candidate = candidate[SOURCE_BUNDLE_ENVELOPE_CONTRACT]
+        try:
+            _validate_source_bundle_row_limits(candidate)
+        except ValueError as exc:
+            raise ProviderError(f"{label}: {exc}") from exc
         try:
             provider_payload = _provider_source_bundle_payload(
                 candidate,

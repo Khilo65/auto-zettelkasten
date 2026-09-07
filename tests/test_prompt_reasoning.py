@@ -390,8 +390,8 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
         "chunk_user_prompt_bundle_v38": "13825c29551703fdc760ab0ad496ac3210658dfe290c36fa027f6c51f3d72a05",
         "source_bundle_prompt_v38": "c4cbf5d0e77c93fd3219a745d2db968ffb5789faff13c99d9ff97312182a1a6f",
         "source_bundle_user_prompt_v38": "fe31c24456507ac518dd9e8d2cc5c31a056e6b0daf5fb1c0617710b7d5e8a7e0",
-        "codex_source_bundle_schema": "1b9491a9f2d7bf9c4c8c62a5838180c2e8b171700211e2fe63cd77514d7192c2",
-        "codex_source_bundle_contract": "e6e7dc65d7953e5fe777faf1dcb43cebf933c4d9e73ca890264e98a7cd08e023",
+        "codex_source_bundle_schema": "5e937e835e1ca6bb37ece21acd52e4c02ef8956cb456a4b656e1840ac9f08ff5",
+        "codex_source_bundle_contract": "413826546dc0c3a651b82e5a88d251037adb6a9d7fcf27f5f6ab8c32cc94ccb3",
         "codex_chunk_evidence_schema": "130ebe184fc8dc0b3c08879abfeb0435500a47eecd78ed7e2387c095574d821c",
         "codex_chunk_evidence_contract": "14f169c8b8c4d0a86004198198d4c40f93ac911884e22a25dc0acde24dbf1035",
     }

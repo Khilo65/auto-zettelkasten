@@ -176,6 +176,7 @@ from .readers import (
     _normalize_source_bundle_payload,
     _normalize_provider_evidence_anchor,
     _parse_source_bundle_response,
+    _validate_source_bundle_row_limits,
     cancel_active_provider_responses,
     codex_contract_identity,
     codex_execution_profile,
@@ -3249,7 +3250,7 @@ def _source_bundle_dependency_fingerprint(
             "model": request.model,
             "prompt_version": request.prompt_version,
             "source_bundle_prompt_version": SOURCE_BUNDLE_PROMPT_VERSION,
-            "source_bundle_normalization_version": "16",
+            "source_bundle_normalization_version": "17",
         }
     if request.provider == "codex":
         execution = row.get("provider_execution_identity")
@@ -15908,6 +15909,7 @@ def _source_bundle_from_result(
 ) -> SourceAnalysisBundle | None:
     if str(result.get("bundle_schema_version") or "") != "1":
         return None
+    _validate_source_bundle_row_limits(result)
     payload = dict(result)
     expected_source_id = str(row.get("source_id") or "")
     expected_zotero_key = str(row.get("zotero_item_key") or "")
@@ -16000,6 +16002,7 @@ def _source_bundle_from_result(
                 for index, diagnostic in enumerate(diagnostics)
             ]
         payload["evidence_anchors"] = anchors
+        _validate_source_bundle_row_limits(payload)
 
     payload = _normalize_source_bundle_payload(payload)
     scope = (
@@ -22685,6 +22688,7 @@ def _read_document(
                     else bundle_reader(text, metadata, question)
                 )
                 try:
+                    _validate_source_bundle_row_limits(result)
                     SourceAnalysisBundle.from_dict(result)
                 except (TypeError, ValueError) as exc:
                     if attachments:
@@ -23119,6 +23123,7 @@ def _source_read_metadata_hash(metadata: Mapping[str, Any]) -> str:
 
 def _ensure_source_result_contract(result: Mapping[str, Any]) -> dict[str, Any]:
     if str(result.get("bundle_schema_version") or "") == "1":
+        _validate_source_bundle_row_limits(result)
         return SourceAnalysisBundle.from_dict(result).to_dict()
     return _ensure_analysis_contract(result)
 
