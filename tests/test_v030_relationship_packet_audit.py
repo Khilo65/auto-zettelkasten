@@ -82,6 +82,9 @@ def test_private_packet_audit_is_zero_provider_and_read_only(tmp_path: Path) -> 
     assert report["pair_job_count"] == 2
     assert report["frozen_packet_count"] == 1
     assert report["packets"][0]["repeated_source_occurrences"] == 1
+    assert report["packets"][0]["within_packet_source_deduplication"]["evidence"] == {
+        "pair_expanded_bytes": 0, "packet_unique_bytes": 0, "saved_bytes": 0,
+    }
     assert report["packets"][0]["within_packet_source_deduplication"][
         "atomic_notes"
     ]["saved_bytes"] > 0

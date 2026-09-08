@@ -442,7 +442,7 @@ def test_relationship_first_writer_receives_admitted_roles() -> None:
 
 def test_cluster_prompt_requires_connected_member_roles_v36() -> None:
     prompt = _cluster_synthesis_system_prompt()
-    assert "prompt v40" in prompt
+    assert "prompt v41" in prompt
     assert "member_roles must map every retained source_id" in prompt
     assert "at least two core sources connected by accepted relationships" in prompt
     assert "different instruments, samples, or time windows" in prompt

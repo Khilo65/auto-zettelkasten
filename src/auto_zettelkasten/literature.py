@@ -87,7 +87,7 @@ LITERATURE_ALGORITHM_VERSION = "39"
 LITERATURE_FAMILY_PLAN_PROMPT_VERSION = "14"
 CLUSTER_PLAN_PROMPT_VERSION = "6"
 CLUSTER_PROPOSAL_PROMPT_VERSION = "17"
-CLUSTER_SYNTHESIS_PROMPT_VERSION = "40"
+CLUSTER_SYNTHESIS_PROMPT_VERSION = "41"
 CLUSTER_PARTITION_POLICY_VERSION = "3"
 CLUSTER_VALIDATION_POLICY_VERSION = "4"
 CLUSTER_EMPTY_RETRY_POLICY_VERSION = "1"
@@ -3382,6 +3382,7 @@ def _same_retained_cluster_synthesis_inputs(
     if str(response.get("cluster_contract") or "") not in {
         "streamlined-full-note-v1",
         "streamlined-full-note-v2",
+        "streamlined-full-note-v3",
     }:
         return False
     retained = {
@@ -11557,6 +11558,7 @@ def validate_streamlined_cluster_synthesis(
 ) -> dict[str, Any]:
     """Mechanically validate full-note synthesis without re-judging its prose."""
 
+    note_based = response.get("cluster_contract") == "streamlined-full-note-v3"
     cluster_id = str(cluster.get("cluster_id") or "")
     proposed_ids = {
         str(value)
@@ -11675,6 +11677,11 @@ def validate_streamlined_cluster_synthesis(
         errors.append("cluster_id_mismatch")
     if unknown_retained:
         warnings.append("unknown_retained_member_ignored")
+        if note_based:
+            errors.append("unknown_retained_member")
+    if note_based and (unavailable := retained - claims_by_source.keys()):
+        errors.append("retained_member_source_unavailable")
+        retained -= unavailable
     if raw_dropped - proposed_ids:
         warnings.append("unknown_dropped_member_ignored")
     if raw_dropped & retained:
@@ -11745,9 +11752,9 @@ def validate_streamlined_cluster_synthesis(
                 warnings.append("cross_owned_study_finding_omitted")
                 errors.append("study_finding_cross_owned_evidence")
                 continue
-            if not valid_evidence:
+            if not valid_evidence and not note_based:
                 warnings.append("study_finding_requires_source_owned_evidence")
-            if finding_complete and valid_evidence:
+            if finding_complete and (note_based or valid_evidence):
                 finding_source_ids.add(source_id)
                 line_source_ids.append(source_id)
                 line_evidence.extend(valid_evidence)
@@ -11912,13 +11919,13 @@ def validate_streamlined_cluster_synthesis(
     contract = str(response.get("cluster_contract") or "")
     raw_dispositions = response.get(
         "acquisition_candidate_dispositions"
-        if contract == "streamlined-full-note-v2"
+        if contract in {"streamlined-full-note-v2", "streamlined-full-note-v3"}
         else "important_cited_works_not_yet_mapped",
         [],
     ) or []
     uses_legacy_recommendations = False
     if (
-        contract == "streamlined-full-note-v2"
+        contract in {"streamlined-full-note-v2", "streamlined-full-note-v3"}
         and not raw_dispositions
         and response.get("important_cited_works_not_yet_mapped")
     ):
@@ -11938,7 +11945,7 @@ def validate_streamlined_cluster_synthesis(
                 warnings.append("unknown_acquisition_candidate_ignored")
                 continue
             normalized_row = dict(row)
-            if contract != "streamlined-full-note-v2" or uses_legacy_recommendations:
+            if contract not in {"streamlined-full-note-v2", "streamlined-full-note-v3"} or uses_legacy_recommendations:
                 normalized_row["decision"] = "recommend"
             dispositions_by_id[identity].append(normalized_row)
     for identity, canonical in allowed_cited_works.items():
@@ -11961,7 +11968,7 @@ def validate_streamlined_cluster_synthesis(
         if not retained_attributions:
             disposition = "ineligible_member_removed"
         elif (
-            contract != "streamlined-full-note-v2" or uses_legacy_recommendations
+            contract not in {"streamlined-full-note-v2", "streamlined-full-note-v3"} or uses_legacy_recommendations
         ) and not rows:
             disposition = "unassessed_legacy_response"
         elif len(unique_rows) > 1:
@@ -17911,6 +17918,15 @@ def _project_cross_cluster_relationships(
             ]
             if evidence:
                 return row, evidence
+            if (
+                synthesis.get("cluster_contract") == "streamlined-full-note-v3"
+                and _cluster_projection_is_publishable(synthesis)
+                and source_id in profile_by_source
+                and source_id in cluster_by_id[cluster_id].get("source_ids", [])
+                and source_id in synthesis.get("retained_member_ids", [])
+                and str(row.get("finding") or "").strip()
+            ):
+                return row, []
         return None
 
     def label(cluster_id: str) -> str:
@@ -17997,8 +18013,13 @@ def _project_cross_cluster_relationships(
                     "connects the two questions but does not establish agreement between them."
                 )
             else:
+                contribution_label = (
+                    "supplies located evidence"
+                    if left_evidence and right_evidence
+                    else "contributes"
+                )
                 relationship = (
-                    f"{source_label} supplies located evidence to both literatures: in {label(left_id)}, "
+                    f"{source_label} {contribution_label} to both literatures: in {label(left_id)}, "
                     f"it contributes {left_finding} In {label(right_id)}, it contributes {right_finding} "
                     "This is a source-level bridge, not evidence that the clusters agree."
                 )
@@ -18745,7 +18766,7 @@ def _cluster_synthesis_profile_projection(
     *,
     include_legacy_claims: bool = False,
 ) -> dict[str, Any]:
-    """Give the writer the complete semantic note and all source-owned anchors."""
+    """Give the writer the complete semantic note; retain legacy adapter input."""
 
     selected = [
         {
@@ -18772,16 +18793,18 @@ def _cluster_synthesis_profile_projection(
                 and value not in (None, "", [], {})
             },
         }
-        for anchor in profile.get("claims", []) or []
+        for anchor in (profile.get("claims", []) or [])
+        if include_legacy_claims
         if isinstance(anchor, Mapping)
         and _anchor_is_synthesis_eligible(anchor)
     ]
     compact = _coverage_profile_projection(profile)
     compact.pop("claims", None)
-    compact["evidence_anchors"] = selected
+    compact.pop("evidence_anchors", None)
     if profile.get("observed_document_date_diagnostic"):
         compact["observed_document_date_diagnostic"] = profile["observed_document_date_diagnostic"]
     if include_legacy_claims:
+        compact["evidence_anchors"] = selected
         compact["claims"] = [
             {
                 **anchor,
@@ -19939,7 +19962,8 @@ def _cluster_relationship_context(
         right = str(relation.get("target_source_id") or "")
         if not left or not right or not {left, right}.issubset(source_ids):
             continue
-        if str(relation.get("output_contract") or "") == RELATIONSHIP_DECISION_CONTRACT:
+        output_contract = str(relation.get("output_contract") or "")
+        if output_contract in {RELATIONSHIP_DECISION_CONTRACT, "relationship-decision-v9"}:
             endpoint_evidence = (
                 relation.get("source_evidence"),
                 relation.get("target_evidence"),
@@ -19947,7 +19971,10 @@ def _cluster_relationship_context(
             if any(
                 not isinstance(value, Mapping)
                 or str(value.get("source_id") or "") != source_id
-                or not str(value.get("evidence_anchor_id") or "")
+                or (
+                    output_contract == "relationship-decision-v9"
+                    and not str(value.get("evidence_anchor_id") or "")
+                )
                 for value, source_id in zip(
                     endpoint_evidence, (left, right), strict=True
                 )
@@ -21832,7 +21859,7 @@ def build_literature_report(
                 "source_ids": ordered,
                 "source_roles": roles,
                 "family_relations": cluster["family_relations"],
-                "cluster_writer_contract": "streamlined-full-note-v2",
+                "cluster_writer_contract": "streamlined-full-note-v3",
             }
         )
         refresh_cluster_lineage(cluster)
@@ -22097,7 +22124,7 @@ def build_literature_report(
             ),
             "synthesis_lineage": str(cluster.get("synthesis_lineage") or ""),
         }
-        return synthesis_profiles, {
+        synthesis_context = {
             "_prior_validated_synthesis": (
                 {**dict(prior_validated_synthesis), "_prior_cluster": prior_cluster}
                 if _cluster_projection_is_publishable(prior_validated_synthesis)
@@ -22121,6 +22148,25 @@ def build_literature_report(
             ],
             "planned_neighbor_relationships": planned_neighbors,
         }
+        for field in (
+            "accepted_relationships", "neighbor_clusters", "planned_neighbor_relationships"
+        ):
+            synthesis_context[field] = [
+                {
+                    **row,
+                    "evidence": [
+                        {
+                            key: value for key, value in reference.items()
+                            if key not in {"evidence_anchor_id", "claim_id", "locator"}
+                        }
+                        for reference in row.get("evidence", []) or []
+                        if isinstance(reference, Mapping)
+                    ],
+                }
+                for row in synthesis_context[field]
+                if isinstance(row, Mapping)
+            ]
+        return synthesis_profiles, synthesis_context
 
     def refresh_cluster_lineage(cluster: dict[str, Any]) -> None:
         member_ids = [
@@ -22438,7 +22484,7 @@ def build_literature_report(
                 "semantic_identity": semantic_identity,
                 "source_roles": roles,
                 "family_relations": family_relations,
-                "cluster_writer_contract": "streamlined-full-note-v2",
+                "cluster_writer_contract": "streamlined-full-note-v3",
             }
         )
         refresh_cluster_lineage(child)
@@ -22914,7 +22960,7 @@ def build_literature_report(
                     },
                 )
                 if synthesis_response.get("cluster_contract")
-                in {"streamlined-full-note-v1", "streamlined-full-note-v2"}
+                in {"streamlined-full-note-v1", "streamlined-full-note-v2", "streamlined-full-note-v3"}
                 else validate_cluster_synthesis(
                     synthesis_response,
                     cluster,
@@ -25346,7 +25392,7 @@ def _cluster_markdown(
     cluster_by_id = cluster_by_id or {}
     if (
         synthesis.get("cluster_contract")
-        in {"streamlined-full-note-v1", "streamlined-full-note-v2"}
+        in {"streamlined-full-note-v1", "streamlined-full-note-v2", "streamlined-full-note-v3"}
     ):
         return _streamlined_cluster_markdown(
             cluster,

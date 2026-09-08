@@ -787,6 +787,16 @@ def test_codex_relationship_schema_binds_each_endpoint_anchor_pool() -> None:
     assert json.dumps(CODEX_OUTPUT_CONTRACTS, sort_keys=True) == original
 
 
+def test_note_based_relationship_schema_binds_pairs_without_anchor_pools() -> None:
+    context = {"pair_jobs": [{"pair_job_id": "job-a",
+                              "output_contract": "relationship-decision-v10"}]}
+    assert readers_module._codex_relationship_anchor_ids(context) is None
+    schema = _codex_json_schema("relationship_adjudication", pair_job_ids=("job-a",))
+    assert set(schema["properties"]["decisions"]["required"]) == {"job-a"}
+    assert "anchor" not in json.dumps(schema)
+    assert "evidence_anchor_id" not in json.dumps(_codex_json_schema("cluster_synthesis"))
+
+
 def test_codex_relationship_schema_requires_every_requested_pair() -> None:
     pair_ids = tuple(f"relationship-job-{value * 20}" for value in "abc")
     original = json.dumps(CODEX_OUTPUT_CONTRACTS, sort_keys=True)
@@ -2982,10 +2992,6 @@ elif contract == "bridge_shard_selection":
     payload = {{"shard_pairs": []}}
 elif contract == "relationship_adjudication":
     jobs = user.get("context", {{}}).get("pair_jobs", [])
-    source_evidence = user.get("context", {{}}).get("source_evidence", {{}})
-    def first_anchor(source_id):
-        row = (source_evidence.get(source_id) or [{{}}])[0]
-        return row.get("evidence_anchor_id") or row.get("claim_id") or row.get("finding_id") or ""
     payload = {{"decisions": [{{
         "pair_job_id": job["pair_job_id"],
         "decision": "relationship",
@@ -2997,8 +3003,6 @@ elif contract == "relationship_adjudication":
             "reference_source_id": None,
             "source_a_basis": "The left source describes institutional implementation.",
             "source_b_basis": "The right source describes implementation outcomes.",
-            "source_a_anchor_ids": [first_anchor(job["pair"]["left_source_id"])],
-            "source_b_anchor_ids": [first_anchor(job["pair"]["right_source_id"])],
             "reason": "The sources contribute complementary bounded evidence.",
             "boundary_or_qualification": "Limited to the synthetic fixture scope.",
             "confidence": "high",
@@ -3016,26 +3020,6 @@ elif contract == "relationship_adjudication":
 elif contract == "cluster_synthesis":
     cluster = user.get("context", {{}}).get("cluster", {{}})
     member_ids = sorted(cluster.get("source_ids", []))
-    evidence = {{}}
-
-    def collect_evidence(value):
-        if isinstance(value, dict):
-            source_id = value.get("source_id")
-            anchor_id = value.get("evidence_anchor_id") or value.get("claim_id")
-            locator = value.get("locator")
-            if source_id in member_ids and anchor_id and locator:
-                evidence.setdefault(source_id, {{
-                    "source_id": source_id,
-                    "evidence_anchor_id": anchor_id,
-                    "locator": locator,
-                }})
-            for child in value.values():
-                collect_evidence(child)
-        elif isinstance(value, list):
-            for child in value:
-                collect_evidence(child)
-
-    collect_evidence(user.get("profiles", []))
     payload = {{
         "cluster_id": cluster["cluster_id"],
         "status": "accepted",
@@ -3053,7 +3037,6 @@ elif contract == "cluster_synthesis":
                 "finding": "This source links institutions with implementation outcomes.",
                 "method_scope": "Synthetic document analysis.",
                 "relation_to_line": "supports",
-                "evidence": [evidence[source_id]],
                 "technical_result": "",
                 "plain_english_meaning": "",
             }} for source_id in member_ids],

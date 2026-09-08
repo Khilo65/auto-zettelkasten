@@ -3,6 +3,8 @@ from __future__ import annotations
 from itertools import permutations
 from typing import Any
 
+import pytest
+
 from auto_zettelkasten import literature
 from auto_zettelkasten.literature import (
     _cluster_answer_excerpt,
@@ -1445,7 +1447,8 @@ def test_evidence_thread_rejects_any_number_absent_from_cited_anchors() -> None:
     )
 
 
-def test_shared_located_source_projects_a_reciprocal_cluster_bridge_only() -> None:
+@pytest.mark.parametrize("contract", ["legacy", "streamlined-full-note-v3"])
+def test_shared_located_source_projects_a_reciprocal_cluster_bridge_only(contract: str) -> None:
     profiles = normalize_evidence_profiles(
         [_profile("shared"), _profile("left"), _profile("right")]
     )
@@ -1471,6 +1474,10 @@ def test_shared_located_source_projects_a_reciprocal_cluster_bridge_only() -> No
     ]
     syntheses = {
         cluster["cluster_id"]: {
+            "cluster_contract": contract,
+            "status": "reasoned",
+            "quality_status": "complete",
+            "retained_member_ids": cluster["source_ids"],
             "related_clusters": [],
             "source_contributions": [
                 {
@@ -1479,7 +1486,7 @@ def test_shared_located_source_projects_a_reciprocal_cluster_bridge_only() -> No
                         "The shared source supplies a distinct located contribution to "
                         f"{cluster['label']}."
                     ),
-                    "evidence": [_reference("shared")],
+                    "evidence": [_reference("shared")] if contract == "legacy" else [],
                 }
             ],
         }
@@ -1506,12 +1513,16 @@ def test_shared_located_source_projects_a_reciprocal_cluster_bridge_only() -> No
                 role["role"] = "context"
     syntheses = {
         cluster["cluster_id"]: {
+            "cluster_contract": contract,
+            "status": "reasoned",
+            "quality_status": "complete",
+            "retained_member_ids": cluster["source_ids"],
             "related_clusters": [],
             "source_contributions": [
                 {
                     "source_id": "shared",
                     "finding": "A located contextual contribution.",
-                    "evidence": [_reference("shared")],
+                    "evidence": [_reference("shared")] if contract == "legacy" else [],
                 }
             ],
         }

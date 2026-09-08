@@ -148,11 +148,10 @@ def test_source_bundle_preserves_coverage_lineage_and_prose_scope() -> None:
 def test_cluster_synthesis_requires_clause_support_not_just_source_ownership() -> None:
     prompt = _cluster_synthesis_system_prompt()
 
-    assert "Each cited anchor must support the attached finding" in prompt
+    assert "Ground each finding in its source's supplied atomic note" in prompt
     assert "Omit or narrow an unsupported clause" in prompt
-    assert "same-source anchor about a different finding" in prompt
+    assert "anchor" not in prompt
     assert "Each study finding is about exactly one source" in prompt
-    assert "every evidence object's source_id must equal that study finding's source_id" in prompt
     assert "Put cross-source comparisons in the line's synthesis" in prompt
 
 
@@ -475,7 +474,7 @@ def test_partial_source_prompt_prohibits_complete_document_inference() -> None:
 def test_cluster_prompt_preserves_inference_and_case_evidence() -> None:
     prompt = _cluster_synthesis_system_prompt()
 
-    assert "cluster synthesis prompt v40" in prompt
+    assert "cluster synthesis prompt v41" in prompt
     assert "Read every supplied atomic_note_markdown" in prompt
     assert "Every retained member" in prompt
     assert "specific study finding" in prompt
@@ -495,7 +494,7 @@ def test_cluster_prompt_preserves_observation_windows_without_excluding_context(
     from auto_zettelkasten.literature import _synthesis_stage_prompt_version
 
     prompt = _cluster_synthesis_system_prompt()
-    assert _synthesis_stage_prompt_version("cluster_synthesis") == "40"
+    assert _synthesis_stage_prompt_version("cluster_synthesis") == "41"
     assert "Preserve each source's observation period in cross-source comparisons" in prompt
     assert "explicitly dated context, not contemporaneous evidence" in prompt
     assert "different instruments, samples, or time windows" in prompt

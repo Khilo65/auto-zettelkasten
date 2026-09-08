@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
+
+import pytest
 
 from auto_zettelkasten.files import write_yaml
 from auto_zettelkasten.models import RelationshipPairJob
 from auto_zettelkasten.pipeline import _relationship_transport_context
 from auto_zettelkasten.readers import _relationship_adjudication_system_prompt
 from auto_zettelkasten.relationships import (
-    RELATIONSHIP_DECISION_CONTRACT,
     ingest_relationship_decision_batch,
     persist_relationship_registry,
     projected_related_links,
@@ -60,7 +62,7 @@ def _v9_job() -> RelationshipPairJob:
             "left": list(left["evidence_anchors"]),
             "right": list(right["evidence_anchors"]),
         },
-        output_contract=RELATIONSHIP_DECISION_CONTRACT,
+        output_contract="relationship-decision-v9",
     )
 
 
@@ -81,6 +83,67 @@ def _connection(
     }
 
 
+@pytest.mark.parametrize("has_anchor_inventory", [False, True])
+def test_note_based_decision_preserves_basis_without_selected_anchors(
+    tmp_path: Path, has_anchor_inventory: bool,
+) -> None:
+    job = replace(_v9_job(), output_contract="relationship-decision-v10")
+    profiles = [_v9_profile("A"), _v9_profile("B")]
+    if not has_anchor_inventory:
+        profiles = [_profile("A"), _profile("B")]
+        job = replace(job, profiles={"left": profiles[0], "right": profiles[1]},
+                      selected_evidence={})
+    connection = _connection("The notes make complementary contributions.")
+    result = ingest_relationship_decision_batch(
+        {"decisions": [{"pair_job_id": job.pair_job_id,
+                        "decision": "relationship", "connections": [connection]}]},
+        pair_jobs=[job], profiles=profiles,
+    )
+    assert result["parked"] == []
+    relation = result["accepted"][0]
+    assert relation["left_endpoint_claim"] == connection["source_a_basis"][0]
+    assert relation["right_endpoint_claim"] == connection["source_b_basis"]
+    assert relation["reason"] == connection["reason"]
+    assert relation["source_evidence_anchor_ids"] == []
+    assert relation["target_evidence_anchor_ids"] == []
+
+    persist_relationship_registry(
+        tmp_path, structural_relations=[], accepted_relations=result["accepted"],
+    )
+    registry = persist_relationship_registry(tmp_path, structural_relations=[])
+    assert registry["current_pair_decisions"][0]["status"] == "accepted"
+    for source_id, target_id in (("A", "B"), ("B", "A")):
+        projected = projected_related_links(
+            source_id, profiles, registry["links"], max_inferred_links=0,
+        )
+        assert projected[0]["target_note_id"] == f"note-{target_id.lower()}"
+        assert projected[0]["reason"] == connection["reason"]
+
+    connection["actor_source_id"] = "unknown-source"
+    invalid = ingest_relationship_decision_batch(
+        {"decisions": [{"pair_job_id": job.pair_job_id,
+                        "decision": "relationship", "connections": [connection]}]},
+        pair_jobs=[job], profiles=profiles,
+    )
+    assert invalid["accepted"] == []
+    assert invalid["parked"]
+
+
+def test_note_based_transport_retains_notes_without_anchor_inventory() -> None:
+    job = replace(
+        _v9_job(), output_contract="relationship-decision-v10",
+        atomic_notes={"left": {"markdown": "Complete A note."},
+                      "right": {"markdown": "Complete B note."}},
+    )
+    context = _relationship_transport_context(
+        [job], decision_contract="relationship-decision-v10",
+    )
+    assert context["source_documents"]["A"]["markdown"] == "Complete A note."
+    assert context["source_documents"]["B"]["markdown"] == "Complete B note."
+    assert "anchor" not in json.dumps(context)
+    assert "selected_evidence" not in json.dumps(context)
+
+
 def test_relationship_packet_scopes_anchor_choices_to_each_pair() -> None:
     job_ab = _v9_job()
     source_c = _v9_profile("C")
@@ -91,10 +154,10 @@ def test_relationship_packet_scopes_anchor_choices_to_each_pair() -> None:
             "left": _v9_profile("A")["evidence_anchors"],
             "right": source_c["evidence_anchors"],
         },
-        output_contract=RELATIONSHIP_DECISION_CONTRACT,
+        output_contract="relationship-decision-v9",
     )
     context = _relationship_transport_context(
-        [job_ab, job_ac], decision_contract=RELATIONSHIP_DECISION_CONTRACT,
+        [job_ab, job_ac], decision_contract="relationship-decision-v9",
     )
     assert [row["allowed_evidence_anchor_ids"] for row in context["pair_jobs"]] == [
         {"source_a": ["anchor-a"], "source_b": ["anchor-b"]},
@@ -233,13 +296,12 @@ def test_v9_parks_relationship_without_owned_endpoint_anchors() -> None:
     assert "complete semantic record" in str(result["parked"][0].get("error") or "")
 
 
-def test_v34_is_compact_domain_neutral_source_owned_and_complete() -> None:
+def test_v35_is_compact_domain_neutral_source_owned_and_complete() -> None:
     prompt = _relationship_adjudication_system_prompt()
 
-    assert "relationship prompt v34" in prompt
-    assert "allowed_evidence_anchor_ids" in prompt
-    assert "another source's IDs are never interchangeable" in prompt
-    assert "contract relationship-decision-v9" in prompt
+    assert "relationship prompt v35" in prompt
+    assert "anchor" not in prompt
+    assert "contract relationship-decision-v10" in prompt
     assert "source_a_basis describes only the supplied left_source_id" in prompt
     assert "source_b_basis only the supplied right_source_id" in prompt
     assert "whole work versus chapter, excerpt, or component" in prompt
@@ -251,7 +313,6 @@ def test_v34_is_compact_domain_neutral_source_owned_and_complete() -> None:
     assert "contextual_connection are symmetric" in prompt
     assert "directional types require exact supplied endpoints as actor/reference" in prompt
     assert "ACTOR [relation type] REFERENCE" in prompt
-    assert "exact evidence-anchor IDs owned by that endpoint" in prompt
     assert "the evidence source normally supports the dependent work" in prompt
     assert "does not support the evidence source merely by relying on it" in prompt
     assert "every ID appears exactly once" in prompt
@@ -351,8 +412,6 @@ def test_adjudication_scopes_absence_claims_to_supplied_summary_evidence() -> No
     for requirement in (
         "notes are summaries: silence is not evidence of source absence",
         "unless a note explicitly establishes absence",
-        "anchor lists are selected evidence, not exhaustive source summaries",
-        "reread the full note even when no anchor states the fact",
         "not supplied in the note",
         "apply this to reasons and qualifications",
         "a shared causal outcome or comparable scores are not required",

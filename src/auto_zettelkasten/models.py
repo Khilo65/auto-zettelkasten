@@ -2303,7 +2303,7 @@ class RelationshipPairJob:
     graph_context: dict[str, Any] = field(default_factory=dict)
     candidate_basis: list[dict[str, Any]] = field(default_factory=list)
     prior_pair_memory: dict[str, Any] = field(default_factory=dict)
-    output_contract: str = "relationship-decision-v9"
+    output_contract: str = "relationship-decision-v10"
 
     def __post_init__(self) -> None:
         if (
@@ -2319,6 +2319,7 @@ class RelationshipPairJob:
             "relationship-decision-v7",
             "relationship-decision-v8",
             "relationship-decision-v9",
+            "relationship-decision-v10",
         }:
             raise ValueError("relationship pair job output contract is invalid")
         left, right = sorted((self.left_source_id, self.right_source_id))
@@ -2506,7 +2507,7 @@ class RelationshipDecision:
     boundary_or_qualification: str = ""
     confidence: str = ""
     connection_id: str = ""
-    output_contract: str = "relationship-decision-v9"
+    output_contract: str = "relationship-decision-v10"
 
     def __post_init__(self) -> None:
         if self.decision not in {
@@ -2522,6 +2523,7 @@ class RelationshipDecision:
             "relationship-decision-v7",
             "relationship-decision-v8",
             "relationship-decision-v9",
+            "relationship-decision-v10",
         }:
             raise ValueError("relationship decision output contract is invalid")
         pair = {self.left_source_id, self.right_source_id}
@@ -2591,6 +2593,7 @@ class RelationshipDecision:
                             "relationship-decision-v7",
                             "relationship-decision-v8",
                             "relationship-decision-v9",
+                            "relationship-decision-v10",
                         }
                         else "legacy"
                     ),
@@ -2601,17 +2604,22 @@ class RelationshipDecision:
                             "relationship-decision-v7",
                             "relationship-decision-v8",
                             "relationship-decision-v9",
+                            "relationship-decision-v10",
                         }
                         else "legacy"
                     ),
                     (
                         self.left_evidence_anchor_ids
-                        if self.output_contract != "relationship-decision-v8"
+                        if self.output_contract not in {
+                            "relationship-decision-v8", "relationship-decision-v10"
+                        }
                         else ["optional"]
                     ),
                     (
                         self.right_evidence_anchor_ids
-                        if self.output_contract != "relationship-decision-v8"
+                        if self.output_contract not in {
+                            "relationship-decision-v8", "relationship-decision-v10"
+                        }
                         else ["optional"]
                     ),
                 )

@@ -10,15 +10,15 @@ from .models import RelationshipDecision, RelationshipPairJob
 from .navigation import TYPED_SOURCE_RELATIONS, rank_human_related_links
 
 
-RELATIONSHIP_PROMPT_VERSION = "34"
+RELATIONSHIP_PROMPT_VERSION = "35"
 RELATIONSHIP_DISCOVERY_PROMPT_VERSION = "20"
 RELATIONSHIP_REGISTRY_SCHEMA_VERSION = "7"
-RELATIONSHIP_DECISION_SCHEMA_VERSION = "9"
-RELATIONSHIP_DECISION_CONTRACT = "relationship-decision-v9"
+RELATIONSHIP_DECISION_SCHEMA_VERSION = "10"
+RELATIONSHIP_DECISION_CONTRACT = "relationship-decision-v10"
 RELATIONSHIP_ENVELOPE_CONTRACTS = frozenset(
-    {"relationship-decision-v8", RELATIONSHIP_DECISION_CONTRACT}
+    {"relationship-decision-v8", "relationship-decision-v9", RELATIONSHIP_DECISION_CONTRACT}
 )
-RELATIONSHIP_DECISION_NORMALIZATION_VERSION = "3"
+RELATIONSHIP_DECISION_NORMALIZATION_VERSION = "4"
 SUBSTANTIVE_RELATION_TYPES = frozenset(
     {
         "supports",
@@ -427,7 +427,7 @@ def _normalize_provider_decision_row(
             warnings.append(f"anchor_dropped_unknown:{anchor_id}")
     normalized["left_evidence_anchor_ids"] = left_ids
     normalized["right_evidence_anchor_ids"] = right_ids
-    if contract == RELATIONSHIP_DECISION_CONTRACT and left_ids and right_ids:
+    if contract == "relationship-decision-v9" and left_ids and right_ids:
         normalized["left_endpoint_claim"] = str(
             left_anchors[left_ids[0]].get("claim")
             or left_anchors[left_ids[0]].get("proposition")
@@ -2625,6 +2625,7 @@ def _final_v4_relation(row: Mapping[str, Any]) -> bool:
                     ("relationship-decision-v6", "6"),
                     ("relationship-decision-v7", "7"),
                     ("relationship-decision-v8", "8"),
+                    ("relationship-decision-v9", "9"),
                 }
             )
         )
@@ -2655,6 +2656,7 @@ def _final_v4_decision(
                     ("relationship-decision-v6", "6"),
                     ("relationship-decision-v7", "7"),
                     ("relationship-decision-v8", "8"),
+                    ("relationship-decision-v9", "9"),
                 }
             )
         )
@@ -2678,6 +2680,7 @@ def _publishable_machine_relation(row: Mapping[str, Any]) -> bool:
                 "relationship-decision-v6",
                 "relationship-decision-v7",
                 "relationship-decision-v8",
+                "relationship-decision-v9",
                 RELATIONSHIP_DECISION_CONTRACT,
             }
         )

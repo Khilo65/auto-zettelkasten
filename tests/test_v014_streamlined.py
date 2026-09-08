@@ -250,6 +250,8 @@ def test_streamlined_cluster_rebinds_locator_only_finding_evidence() -> None:
     response["lines_of_inquiry"][0]["study_findings"][1]["evidence"] = "p. 999"
 
     normalized = _validate_streamlined_cluster_response(response)
+    # Historical v2 artifacts retain their original locator admission policy.
+    normalized["cluster_contract"] = "streamlined-full-note-v2"
     validated = validate_streamlined_cluster_synthesis(
         normalized, cluster, profiles
     )
@@ -271,6 +273,48 @@ def test_streamlined_cluster_rebinds_locator_only_finding_evidence() -> None:
     assert validated["source_contributions"][0]["evidence"][0][
         "evidence_anchor_id"
     ] == "anchor-A"
+
+
+def test_note_based_cluster_accepts_findings_without_anchors_and_checks_ownership() -> None:
+    profiles = [_profile("A"), _profile("B")]
+    cluster = {"cluster_id": "cluster-one", "source_ids": ["A", "B"]}
+    response = _streamlined_response(cluster, profiles)
+    response["cluster_contract"] = "streamlined-full-note-v3"
+    for profile in profiles:
+        profile["evidence_anchors"] = []
+    findings = response["lines_of_inquiry"][0]["study_findings"]
+    for finding in findings:
+        finding.pop("evidence")
+
+    result = validate_streamlined_cluster_synthesis(response, cluster, profiles)
+    assert result["status"] == "reasoned"
+    assert result["retained_member_ids"] == ["A", "B"]
+    assert [row["finding"] for row in result["source_contributions"]] == [
+        row["finding"] for row in findings
+    ]
+    assert result["supporting_evidence"] == []
+    assert result["quality_errors"] == result["quality_warnings"] == []
+    markdown = _cluster_markdown(cluster, None, None, synthesis=result)
+    assert findings[0]["finding"] in markdown
+
+    historical = validate_streamlined_cluster_synthesis(
+        {**response, "cluster_contract": "streamlined-full-note-v2"}, cluster, profiles
+    )
+    assert historical["status"] == "partial"
+    assert "study_finding_requires_source_owned_evidence" in historical["quality_warnings"]
+
+    findings[0]["evidence"] = [{"source_id": "B", "locator": "p. 10"}]
+    cross_owned = validate_streamlined_cluster_synthesis(response, cluster, profiles)
+    assert "study_finding_cross_owned_evidence" in cross_owned["quality_errors"]
+    assert "A" not in cross_owned["retained_member_ids"]
+
+    findings[0].pop("evidence")
+    findings[0]["source_id"] = "unknown"
+    response["retained_member_ids"].append("unknown")
+    unknown = validate_streamlined_cluster_synthesis(response, cluster, profiles)
+    assert unknown["status"] == "partial"
+    assert "unknown" not in unknown["retained_member_ids"]
+    assert "unknown_retained_member" in unknown["quality_errors"]
 
 
 def test_streamlined_cluster_ignores_only_cross_owned_evidence_rows() -> None:
@@ -1351,7 +1395,11 @@ def test_cluster_projection_contains_full_semantic_note_without_graph_blocks() -
     assert "Complete source argument." in projected["atomic_note_markdown"]
     assert "Generated neighbor" not in projected["atomic_note_markdown"]
     assert "claims" not in projected
-    assert projected["evidence_anchors"] == [
+    assert "evidence_anchors" not in projected
+    legacy = _cluster_synthesis_profile_projection(
+        profile, {"source_ids": ["A"]}, include_legacy_claims=True
+    )
+    assert legacy["evidence_anchors"] == [
         {
             "evidence_anchor_id": "anchor-A",
             "source_id": "A",
@@ -1589,7 +1637,7 @@ def test_cluster_writer_reuses_explicitly_dropped_candidate_subset(
     tmp_path: Path,
 ) -> None:
     response = {
-        "cluster_contract": "streamlined-full-note-v2",
+        "cluster_contract": "streamlined-full-note-v3",
         "cluster_id": "cluster-one",
         "status": "accepted",
         "title": "Cluster One",
@@ -1926,6 +1974,11 @@ def test_independent_cluster_writers_run_concurrently_with_full_notes() -> None:
             }
 
         def synthesize_cluster(self, projected, request, *, context=None):
+            assert all("evidence_anchors" not in row and "claims" not in row for row in projected)
+            for relation in context["accepted_relationships"]:
+                for reference in relation["evidence"]:
+                    assert reference["claim"] == "The supplied relationship contribution."
+                    assert not {"evidence_anchor_id", "claim_id", "locator"} & reference.keys()
             seen_writer_context.append(dict(context["cluster"]))
             seen_notes.append(
                 {
@@ -1960,6 +2013,14 @@ def test_independent_cluster_writers_run_concurrently_with_full_notes() -> None:
                 "relation_type": "supports",
                 "provenance": "human_curated",
                 "active": True,
+                "source_evidence": {
+                    "source_id": "A", "evidence_anchor_id": "anchor-A", "locator": "p. 10",
+                    "claim": "The supplied relationship contribution.",
+                },
+                "target_evidence": {
+                    "source_id": "B", "evidence_anchor_id": "anchor-B", "locator": "p. 10",
+                    "claim": "The supplied relationship contribution.",
+                },
             }
         ],
         stage_callback=stage_callback,

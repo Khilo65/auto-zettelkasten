@@ -255,14 +255,20 @@ def _packet_report(
         {source_id for job in jobs for source_id in (job.left_source_id, job.right_source_id)}
     )
     expanded = {key: 0 for key in ("atomic_notes", "profiles", "evidence")}
+    transported = {
+        "atomic_notes": context["source_documents"],
+        "profiles": context["source_profiles"],
+        "evidence": context.get("source_evidence", {}),
+    }
     for job in jobs:
-        for values in _source_values(job).values():
-            for key in expanded:
-                expanded[key] += _bytes(values[key])
+        for source_id in (job.left_source_id, job.right_source_id):
+            for key, values in transported.items():
+                if source_id in values:
+                    expanded[key] += _bytes(values[source_id])
     unique = {
         "atomic_notes": sum(_bytes(value) for value in context["source_documents"].values()),
         "profiles": sum(_bytes(value) for value in context["source_profiles"].values()),
-        "evidence": sum(_bytes(value) for value in context["source_evidence"].values()),
+        "evidence": sum(_bytes(value) for value in transported["evidence"].values()),
     }
     return {
         "batch_id": batch_id,

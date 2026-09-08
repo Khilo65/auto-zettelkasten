@@ -626,7 +626,7 @@ def test_legacy_review_pending_relationships_do_not_enter_cluster_context() -> N
     ] == ["verified"]
 
 
-def test_v9_cluster_context_requires_source_owned_anchor_evidence() -> None:
+def test_note_based_cluster_context_accepts_claims_and_checks_source_ownership() -> None:
     base = {
         "source_id": "a",
         "target_source_id": "b",
@@ -640,6 +640,19 @@ def test_v9_cluster_context_requires_source_owned_anchor_evidence() -> None:
         {
             **base,
             "relation_id": "claim-only",
+            "source_evidence": {"source_id": "a", "claim": "A claim"},
+            "target_evidence": {"source_id": "b", "claim": "B claim"},
+        },
+        {
+            **base,
+            "relation_id": "cross-owned",
+            "source_evidence": {"source_id": "b", "claim": "A claim"},
+            "target_evidence": {"source_id": "b", "claim": "B claim"},
+        },
+        {
+            **base,
+            "output_contract": "relationship-decision-v9",
+            "relation_id": "historical-claim-only",
             "source_evidence": {"source_id": "a", "claim": "A claim"},
             "target_evidence": {"source_id": "b", "claim": "B claim"},
         },
@@ -661,10 +674,10 @@ def test_v9_cluster_context_requires_source_owned_anchor_evidence() -> None:
 
     context = _cluster_relationship_context(relationships, {"a", "b"})
 
-    assert [row["relation_id"] for row in context] == ["owned-anchors"]
+    assert [row["relation_id"] for row in context] == ["claim-only", "owned-anchors"]
     assert [
         (row["source_id"], row["evidence_anchor_id"])
-        for row in context[0]["evidence"]
+        for row in context[1]["evidence"]
     ] == [("a", "a-1"), ("b", "b-1")]
 
 
@@ -780,10 +793,12 @@ class _WarningBearingGlobalReasoner(_GlobalOnlyReasoner):
         evidence = [
             {
                 "source_id": profile["source_id"],
-                "evidence_anchor_id": profile["evidence_anchors"][0][
+                # This adapter returns a frozen legacy response. Current writer
+                # packets no longer supply the historical anchor inventory.
+                "evidence_anchor_id": _profile(profile["source_id"])["evidence_anchors"][0][
                     "evidence_anchor_id"
                 ],
-                "locator": profile["evidence_anchors"][0]["locator"],
+                "locator": _profile(profile["source_id"])["evidence_anchors"][0]["locator"],
             }
             for profile in profiles
         ]

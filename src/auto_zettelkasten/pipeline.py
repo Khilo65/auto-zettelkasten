@@ -151,7 +151,6 @@ from .relationships import (
     projected_related_links,
     relationship_decision_key,
     RELATIONSHIP_ENVELOPE_CONTRACTS,
-    RELATIONSHIP_DECISION_CONTRACT,
     RELATIONSHIP_DECISION_NORMALIZATION_VERSION,
     RELATIONSHIP_DISCOVERY_PROMPT_VERSION,
     RELATIONSHIP_PROMPT_VERSION,
@@ -11726,7 +11725,7 @@ def _relationship_transport_context(
             in {"relationship-decision-v7", *RELATIONSHIP_ENVELOPE_CONTRACTS}
             else {}
         )
-        if decision_contract == RELATIONSHIP_DECISION_CONTRACT:
+        if decision_contract == "relationship-decision-v9":
             row["allowed_evidence_anchor_ids"] = {
                 label: sorted({
                     str(anchor["evidence_anchor_id"])
@@ -11766,6 +11765,9 @@ def _relationship_transport_context(
                     or selected_evidence.get(source_id)
                     or []
                 )
+        if decision_contract == "relationship-decision-v10":
+            for source_id in (job.left_source_id, job.right_source_id):
+                source_profiles[source_id].pop("evidence_anchors", None)
         pair_jobs.append(row)
     payload = {
         "source_documents": {
@@ -11778,7 +11780,8 @@ def _relationship_transport_context(
     }
     if decision_contract in {
         "relationship-decision-v7",
-        *RELATIONSHIP_ENVELOPE_CONTRACTS,
+        "relationship-decision-v8",
+        "relationship-decision-v9",
     }:
         payload["source_evidence"] = {
             key: source_evidence[key] for key in sorted(source_evidence)

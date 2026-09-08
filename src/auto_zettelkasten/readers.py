@@ -638,14 +638,6 @@ CODEX_OUTPUT_CONTRACTS: Mapping[str, Mapping[str, Any]] = {
                                             },
                                             "source_a_basis": _CODEX_STRING,
                                             "source_b_basis": _CODEX_STRING,
-                                            "source_a_anchor_ids": {
-                                                **_CODEX_STRINGS,
-                                                "minItems": 1,
-                                            },
-                                            "source_b_anchor_ids": {
-                                                **_CODEX_STRINGS,
-                                                "minItems": 1,
-                                            },
                                             "reason": _CODEX_STRING,
                                             "boundary_or_qualification": _CODEX_STRING,
                                             "confidence": {
@@ -730,9 +722,6 @@ CODEX_OUTPUT_CONTRACTS: Mapping[str, Mapping[str, Any]] = {
                                     "finding": _CODEX_STRING,
                                     "method_scope": _CODEX_STRING,
                                     "relation_to_line": _CODEX_STRING,
-                                    "evidence": _codex_array(
-                                        _CODEX_EVIDENCE_REFERENCE
-                                    ),
                                     "technical_result": _CODEX_STRING,
                                     "plain_english_meaning": _CODEX_STRING,
                                 }
@@ -751,12 +740,6 @@ CODEX_OUTPUT_CONTRACTS: Mapping[str, Mapping[str, Any]] = {
                         "cluster_id": _CODEX_STRING,
                         "relation_type": _CODEX_STRING,
                         "relationship": _CODEX_STRING,
-                        "current_evidence": _codex_array(
-                            _CODEX_EVIDENCE_REFERENCE
-                        ),
-                        "target_evidence": _codex_array(
-                            _CODEX_EVIDENCE_REFERENCE
-                        ),
                     }
                 )
             ),
@@ -1665,9 +1648,12 @@ def _codex_json_schema(
             for key, endpoints in pair_anchor_ids.items():
                 connection = schemas[key]["properties"]["connections"]["items"]
                 for endpoint, anchors in endpoints.items():
-                    connection["properties"][f"{endpoint}_anchor_ids"]["items"] = {
-                        "type": "string", "enum": list(anchors),
+                    field = f"{endpoint}_anchor_ids"
+                    connection["properties"][field] = {
+                        "type": "array", "minItems": 1,
+                        "items": {"type": "string", "enum": list(anchors)},
                     }
+                    connection["required"].append(field)
         return _codex_object({"decisions": _codex_object(schemas)})
     return dict(contract)
 
@@ -1687,9 +1673,12 @@ def _codex_relationship_pair_ids(context: Mapping[str, Any] | None) -> tuple[str
 
 def _codex_relationship_anchor_ids(
     context: Mapping[str, Any] | None,
-) -> dict[str, dict[str, list[str]]]:
-    """Bind v9 evidence ownership before admission or provider authorization."""
+) -> dict[str, dict[str, list[str]]] | None:
+    """Retain legacy v9 pool binding; note-based jobs need only pair identity."""
     _codex_relationship_pair_ids(context)
+    if all(row.get("output_contract") == "relationship-decision-v10"
+           for row in context["pair_jobs"]):
+        return None
     result = {}
     for row in context["pair_jobs"]:
         pools = row.get("allowed_evidence_anchor_ids")
@@ -1837,7 +1826,7 @@ class _CapabilityAwareReader:
     timeout: float
     connect_timeout: float
     request_deadline: float | None
-    relationship_decision_contract = "relationship-decision-v9"
+    relationship_decision_contract = "relationship-decision-v10"
     reasoning_effort: str | None = None
 
     def _configure_capabilities(self) -> None:
@@ -5842,23 +5831,18 @@ def _relationship_candidate_system_prompt() -> str:
 
 def _relationship_adjudication_system_prompt() -> str:
     return (
-        "Auto-Zettelkasten relationship prompt v34, contract relationship-decision-v9. Read both "
+        "Auto-Zettelkasten relationship prompt v35, contract relationship-decision-v10. Read both "
         "complete atomic notes. Return JSON decisions keyed by every supplied pair_job_id, no extras: "
         "either {decision:no_relationship, reason, confidence} or "
         "{decision:relationship, connections:[...]}. Use one connection, or two for distinct propositions, containing comparison_proposition, "
         "primary_relation_type, secondary_relation_types, actor_source_id, "
-        "reference_source_id, source_a_basis, source_b_basis, source_a_anchor_ids, source_b_anchor_ids, reason, "
+        "reference_source_id, source_a_basis, source_b_basis, reason, "
         "boundary_or_qualification, confidence. source_a_basis describes only the supplied "
         "left_source_id note and source_b_basis only the supplied right_source_id note. "
-        "For each basis, return one or more exact evidence-anchor IDs owned by that endpoint in source_a_anchor_ids and source_b_anchor_ids. "
-        "Resolve source_a and source_b separately for every pair_job_id using that pair's allowed_evidence_anchor_ids lists. "
-        "Choose only IDs from the corresponding list; another source's IDs are never interchangeable, even when its claim or quotation is identical. "
         "Distinguish source assertions from analytical cautions in the notes; "
         "attribute those cautions to the note or system, not the source unless explicitly attributed. "
         "Notes are summaries: silence is not evidence of source absence. Unless a note explicitly establishes absence, "
         "say 'not supplied in the note', not 'the source does not report it'. Apply this to reasons and qualifications. "
-        "Anchor lists are selected evidence, not exhaustive source summaries. Before alleging absence, "
-        "reread the full note even when no anchor states the fact. "
         "Preserve visible scope (whole work versus chapter, excerpt, or component), "
         "construct and outcome, unit and level of analysis, process stage, method, "
         "evidentiary role and status, and causal strength. Find a bounded joint-reading connection from the "
@@ -6097,7 +6081,7 @@ def _debate_system_prompt() -> str:
 def _cluster_synthesis_system_prompt() -> str:
     return (
         "You are the full-note cluster writer for Auto-Zettelkasten cluster "
-        "synthesis prompt v40 and contract streamlined-full-note-v2. Read every supplied atomic_note_markdown before "
+        "synthesis prompt v41 and contract streamlined-full-note-v3. Read every supplied atomic_note_markdown before "
         "drafting. Copy cluster_id exactly from context.cluster.cluster_id. Return "
         "exactly one JSON object with cluster_id, status, title, "
         "organizing_mode, organizing_problem, optional guiding_question, optional "
@@ -6108,20 +6092,16 @@ def _cluster_synthesis_system_prompt() -> str:
         "rejected; it is the writer decision, not a copied planning or registry "
         "status. Each line of inquiry contains title, synthesis, and "
         "study_findings. Each study finding is about exactly one source; "
-        "every evidence object's source_id must equal that study finding's source_id. "
         "Put cross-source comparisons in the line's synthesis, supported by separate source-specific study findings. "
         "Preserve each source's observation period in cross-source comparisons; evidence from another period "
         "may provide explicitly dated context, not contemporaneous evidence. "
         "Each study finding contains source_id, finding, "
-        "method_scope, relation_to_line, and evidence, plus technical_result and "
+        "method_scope and relation_to_line, plus technical_result and "
         "plain_english_meaning only when it reports a technical statistic whose "
         "meaning is not already intuitive. Do not add a plain-English duplicate of "
         "ordinary prose or an already clear percentage. relation_to_line is supports, "
-        "qualifies, contrasts, extends, applies, or contextualizes. Evidence uses "
-        "an array of objects; every object copies source_id, evidence_anchor_id, "
-        "and locator exactly from a supplied source-owned anchor. Each cited anchor must support the attached finding, "
-        "not merely belong to that source. Omit or narrow an unsupported clause; never borrow a "
-        "same-source anchor about a different finding. Every retained member must "
+        "qualifies, contrasts, extends, applies, or contextualizes. Ground each finding in its "
+        "source's supplied atomic note. Omit or narrow an unsupported clause. Every retained member must "
         "have at least one specific study finding. member_roles must map every retained source_id to core, context, or bridge: "
         "core directly answers the organizing problem; context supplies supporting, boundary, methodological, practitioner, "
         "or background evidence; bridge materially connects another literature or mechanism. Retain at least two core sources "
@@ -8680,7 +8660,7 @@ def _validate_streamlined_cluster_response(
         or ""
     ).strip()
     result = {
-        "cluster_contract": "streamlined-full-note-v2",
+        "cluster_contract": "streamlined-full-note-v3",
         "cluster_id": str(payload.get("cluster_id") or "").strip(),
         "status": str(payload.get("status") or "accepted").strip().casefold(),
         "title": str(payload.get("title") or organizing_problem).strip(),

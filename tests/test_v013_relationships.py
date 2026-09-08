@@ -114,7 +114,7 @@ def test_v7_relationship_requires_claim_owned_primary_anchor_per_endpoint() -> N
     prompt = _relationship_adjudication_system_prompt()
     assert "source_a_basis" in prompt
     assert "source_b_basis" in prompt
-    assert "source_a_anchor_ids" in prompt
+    assert "source_a_anchor_ids" not in prompt
 
 
 def test_v7_relationship_accepts_unambiguous_plural_anchor_fields() -> None:
