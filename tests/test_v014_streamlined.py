@@ -4,6 +4,8 @@ import threading
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+import pytest
+
 from auto_zettelkasten.files import read_yaml, write_yaml
 from auto_zettelkasten.indexes import _compact_cluster_catalogue
 from auto_zettelkasten.literature import (
@@ -2604,3 +2606,127 @@ def test_v014_migration_keeps_only_current_probabilistic_decision_per_pair(
     migrate_v014_schema(tmp_path)
 
     assert read_yaml(primary)["links"] == [current]
+
+
+@pytest.mark.parametrize("member_count, external_count", [(4, 2), (4, 4), (60, 2)])
+def test_note_based_partition_preserves_sibling_and_external_neighbors(
+    tmp_path: Path, member_count: int, external_count: int,
+) -> None:
+    parent_ids = [f"S{index:02d}" for index in range(member_count)]
+    external_ids = list("EFGH")[:external_count]
+    source_ids = [*parent_ids, *external_ids]
+    profiles = [_profile(source_id) for source_id in source_ids]
+    for profile in profiles:
+        profile["evidence_anchors"] = []
+
+    def proposal(cluster_id, members):
+        return {
+            "cluster_id": cluster_id,
+            "title": cluster_id,
+            "semantic_identity": cluster_id,
+            "organizing_problem": f"The specific contribution of {cluster_id}.",
+            "members": [{"source_id": value, "role": "core"} for value in members],
+        }
+
+    class Reasoner:
+        name = "local"
+        model = "test"
+
+        def cluster_synthesis_fits(self, projected, request, *, context=None):
+            return len(projected) <= 2
+
+        def plan_clusters(self, projected, request, *, context=None):
+            partition = context.get("cluster_plan_mode") == "partition"
+            members = context["compact_parent_cluster"]["source_ids"] if partition else parent_ids
+            prefix = "external-child" if partition and members[0] == "E" else "child"
+            return {
+                "clusters": (
+                    [proposal(f"{prefix}-{index // 2}", members[index:index + 2])
+                     for index in range(0, len(members), 2)]
+                    if partition else
+                    [proposal("parent", parent_ids), proposal("external", external_ids)]
+                ),
+                "neighbor_relationships": [{
+                    "left_cluster_id": f"{prefix}-0" if partition else "parent",
+                    "right_cluster_id": f"{prefix}-1" if partition else "external",
+                    "basis_source_ids": [members[0], members[2]] if partition else [parent_ids[0], "E"],
+                    "relationship": "Different perspectives on the same institutional process.",
+                }],
+                "unclustered_sources": [],
+            }
+
+        def synthesize_cluster(self, projected, request, *, context=None):
+            assert all("atomic_note_markdown" in row for row in projected)
+            assert all("claims" not in row and "evidence_anchors" not in row for row in projected)
+            response = _streamlined_response(context["cluster"], projected)
+            response["cluster_contract"] = "streamlined-full-note-v3"
+            for finding in response["lines_of_inquiry"][0]["study_findings"]:
+                finding.pop("evidence")
+            return response
+
+    reasoner = Reasoner()
+    request = LiteratureMapRequest(tmp_path)
+    calls = _CheckpointedReasonerCalls(tmp_path, "partition", reasoner, request)
+    notes = [{
+            "source_id": value, "title": f"Source {value}", "source_scope": "full_document",
+            "body": f"# Source {value}\n\nComplete source-specific note for {value}.",
+        } for value in source_ids]
+    report = build_literature_report(
+        profiles, reasoner=reasoner, request=request, source_notes=notes, reasoner_call=calls,
+    )
+    clusters = {row["label"]: row for row in report["cluster_registry"]["clusters"]}
+    external_label = "external" if external_count == 2 else "external-child-0"
+    expected_external = {"external"} if external_count == 2 else {"external-child-0", "external-child-1"}
+    assert set(clusters) == expected_external | {f"child-{index}" for index in range(member_count // 2)}
+    syntheses = report["cluster_syntheses"]
+    targets = {
+        label: {row["target_cluster_id"] for row in syntheses[cluster["cluster_id"]]["related_clusters"]
+                if row.get("projection_origin") == "global_cluster_plan"}
+        for label, cluster in clusters.items()
+    }
+    assert clusters["child-1"]["cluster_id"] in targets["child-0"]
+    assert clusters["child-0"]["cluster_id"] in targets["child-1"]
+    assert clusters[external_label]["cluster_id"] in targets["child-0"]
+    assert clusters["child-0"]["cluster_id"] in targets[external_label]
+    assert clusters[external_label]["cluster_id"] not in targets["child-1"]
+    previous = {**report["cluster_registry"], "cluster_syntheses": syntheses}
+    before_calls = calls.provider_calls
+    replay = build_literature_report(
+        profiles, reasoner=reasoner, request=request, source_notes=notes,
+        reasoner_call=calls, previous_registry=previous,
+    )
+    assert calls.provider_calls == before_calls
+    assert {
+        row["cluster_id"]: row.get("planned_neighbor_relationships", [])
+        for row in replay["cluster_registry"]["clusters"]
+    } == {
+        row["cluster_id"]: row.get("planned_neighbor_relationships", [])
+        for row in report["cluster_registry"]["clusters"]
+    }
+    assert {
+        key: value["related_clusters"] for key, value in replay["cluster_syntheses"].items()
+    } == {key: value["related_clusters"] for key, value in syntheses.items()}
+
+
+@pytest.mark.parametrize("basis, target, retained", [
+    (["A"], "right", ["B"]),
+    (["A", "B", "unknown"], "right", ["B"]),
+    (["A", "B"], "unknown", ["B"]),
+    (["A", "B"], "right", []),
+])
+def test_note_based_neighbor_projection_rejects_invalid_ownership(basis, target, retained) -> None:
+    clusters = [
+        {"cluster_id": "left", "source_ids": ["A"], "planned_neighbor_relationships": [{
+            "target_cluster_id": target, "basis_source_ids": basis,
+            "relationship": "A contextual connection.", "evidence": [],
+        }]},
+        {"cluster_id": "right", "source_ids": ["B"]},
+    ]
+    syntheses = {
+        "left": {"cluster_contract": "streamlined-full-note-v3", "status": "reasoned",
+                 "retained_member_ids": ["A"], "related_clusters": []},
+        "right": {"cluster_contract": "streamlined-full-note-v3", "status": "reasoned",
+                  "retained_member_ids": retained, "related_clusters": []},
+    }
+    _project_planned_cluster_neighbors(clusters, syntheses)
+    assert all(not row["related_clusters"] for row in syntheses.values())

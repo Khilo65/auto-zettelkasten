@@ -5506,6 +5506,7 @@ def test_ordinary_small_family_completes_below_quota_without_rejudging(
     }
     def handler(stage, provider_profiles, context):
         assert stage == "relationship_candidate_selection"
+        assert provider_profiles == []
         if "required_pairs" in context:
             assert provider_profiles == []
             assert context["required_pairs"] == [["B", "D"], ["C", "D"]]
@@ -5515,6 +5516,7 @@ def test_ordinary_small_family_completes_below_quota_without_rejudging(
                 for pair, job in zip(context["required_pairs"], context["bridge_jobs"], strict=True)
             ]
             return {"candidates": candidates}
+        assert {row["source_id"] for row in context["catalogue"]} == set("ABCD")
         job = context["bridge_jobs"][0]
         assert set(job["left_source_ids"]) == set(job["right_source_ids"]) == set("ABCD")
         return {"candidates": [

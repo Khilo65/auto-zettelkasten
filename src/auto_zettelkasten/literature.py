@@ -88,7 +88,7 @@ LITERATURE_FAMILY_PLAN_PROMPT_VERSION = "14"
 CLUSTER_PLAN_PROMPT_VERSION = "7"
 CLUSTER_PROPOSAL_PROMPT_VERSION = "17"
 CLUSTER_SYNTHESIS_PROMPT_VERSION = "41"
-CLUSTER_PARTITION_POLICY_VERSION = "3"
+CLUSTER_PARTITION_POLICY_VERSION = "4"
 CLUSTER_VALIDATION_POLICY_VERSION = "5"
 CLUSTER_EMPTY_RETRY_POLICY_VERSION = "1"
 GAP_REASONING_PROMPT_VERSION = "12"
@@ -2018,6 +2018,8 @@ class _CheckpointedReasonerCalls:
                 is_codex
                 and prior_failure.get("failure_class") == "transport"
             ):
+                if self.quota_stop_event is not None:
+                    self.quota_stop_event.set()
                 self._terminal_transport_failure = {
                     "status": "terminal",
                     "failure_class": "transport",
@@ -2032,8 +2034,6 @@ class _CheckpointedReasonerCalls:
                     self.terminal_transport_path,
                     self._terminal_transport_failure,
                 )
-                if self.quota_stop_event is not None:
-                    self.quota_stop_event.set()
             raise LiteratureSynthesisPartialError(
                 f"literature_synthesis_terminal_failure:{stage}:{key}"
             )
@@ -2349,6 +2349,10 @@ class _CheckpointedReasonerCalls:
             self._record_failure()
             failure_class = _synthesis_failure_class(exc)
             codex_transport_failure = is_codex and failure_class == "transport"
+            if (
+                failure_class == "quota" or codex_transport_failure
+            ) and self.quota_stop_event is not None:
+                self.quota_stop_event.set()
             if codex_transport_failure:
                 with self._state_lock:
                     if not self._terminal_transport_failure:
@@ -2366,10 +2370,6 @@ class _CheckpointedReasonerCalls:
                             self.terminal_transport_path,
                             self._terminal_transport_failure,
                         )
-            if (
-                failure_class == "quota" or codex_transport_failure
-            ) and self.quota_stop_event is not None:
-                self.quota_stop_event.set()
             deferred_empty_retry = str(
                 getattr(exc, "empty_retry_deferred", "") or ""
             )
@@ -20802,6 +20802,7 @@ def build_literature_report(
             if isinstance(row, Mapping)
         )
         cluster_plan_state = {
+            "partition_policy_version": CLUSTER_PARTITION_POLICY_VERSION,
             "status": "partial" if planning_failed else "complete",
             "source_card_hashes": source_card_hashes,
             "source_state_hash": source_state_hash,
@@ -20980,6 +20981,11 @@ def build_literature_report(
         propositions=propositions,
         topic_neighborhoods=topic_neighborhoods,
     )
+    planned_cluster_ids = {
+        str(row.get("proposal_id") or ""): str(row["cluster_id"])
+        for row in clustered["clusters"]
+        if row.get("proposal_id")
+    }
     if uses_global_cluster_plan:
         proposal_by_id = {
             str(row.get("proposal_id") or ""): row
@@ -21059,6 +21065,8 @@ def build_literature_report(
             )
             if (
                 prior_children
+                and prior_plan_state.get("partition_policy_version")
+                == CLUSTER_PARTITION_POLICY_VERSION
                 and all(
                     _cluster_projection_is_publishable(
                         _as_mapping(prior_syntheses.get(str(row["cluster_id"])))
@@ -21441,9 +21449,12 @@ def build_literature_report(
     clustered["clusters"] = list(registry["clusters"])
     if global_plan_neighbors:
         cluster_id_by_plan_id = {
+            **planned_cluster_ids,
+            **{
             str(row.get("proposal_id") or ""): str(row.get("cluster_id") or "")
             for row in registry["clusters"]
             if row.get("proposal_id") and row.get("cluster_id")
+            },
         }
         planned_by_cluster: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for row in global_plan_neighbors:
@@ -21467,9 +21478,10 @@ def build_literature_report(
                     }
                 )
         for cluster in registry["clusters"]:
-            cluster["planned_neighbor_relationships"] = planned_by_cluster.get(
-                str(cluster.get("cluster_id") or ""), []
-            )
+            if not cluster.get("partition_root_id"):
+                cluster["planned_neighbor_relationships"] = planned_by_cluster.get(
+                    str(cluster.get("cluster_id") or ""), []
+                )
     clustered["unclustered_sources"] = _reconcile_final_unclustered_sources(
         normalized,
         registry["clusters"],
@@ -22152,11 +22164,14 @@ def build_literature_report(
                 for value in row.get("evidence", []) or []
                 if isinstance(value, Mapping)
             ]
-            if basis and evidence:
+            if basis:
                 inherited_neighbors.append(
                     {
                         **dict(row),
-                        "basis_source_ids": basis,
+                        "basis_source_ids": sorted(
+                            set(basis)
+                            | (set(original_basis) - set(parent.get("source_ids", []) or []))
+                        ),
                         "evidence": evidence,
                         "partition_original_basis_source_ids": original_basis,
                         "partition_parent_target_id": str(
@@ -22470,9 +22485,12 @@ def build_literature_report(
             basis = sorted(
                 str(value)
                 for value in neighbor.get("basis_source_ids", []) or []
-                if str(value) in parent_ids
             )
-            if left is None or right is None or left is right or not basis:
+            if (
+                left is None or right is None or left is right or not basis
+                or not set(basis).issubset(parent_ids)
+                or not str(neighbor.get("relationship") or "").strip()
+            ):
                 continue
             partition_neighbor_specs.append(
                 {
@@ -22492,14 +22510,6 @@ def build_literature_report(
         if root_id:
             partition_leaves_by_root[root_id].append(leaf)
 
-    def owned_neighbor_evidence(source_ids: set[str]) -> list[dict[str, Any]]:
-        for source_id in sorted(source_ids):
-            profile = normalized_by_source.get(source_id, {})
-            for claim in profile.get("claims", []) or []:
-                if isinstance(claim, Mapping):
-                    return [_evidence_ref(claim)]
-        return []
-
     for spec in partition_neighbor_specs:
         root_id = str(spec.get("root_id") or "")
         leaves = partition_leaves_by_root.get(root_id, [])
@@ -22512,17 +22522,16 @@ def build_literature_report(
             for right in right_leaves:
                 if left is right:
                     continue
+                pair_basis = basis_ids & (set(left["source_ids"]) | set(right["source_ids"]))
+                if not (pair_basis & set(left["source_ids"]) and pair_basis & set(right["source_ids"])):
+                    continue
                 for current, target in ((left, right), (right, left)):
-                    owned_basis = set(current["source_ids"]) & basis_ids
-                    evidence = owned_neighbor_evidence(owned_basis)
-                    if not owned_basis or not evidence:
-                        continue
                     current["planned_neighbor_relationships"].append(
                         {
                             "target_cluster_id": str(target["cluster_id"]),
                             "relationship": str(spec.get("relationship") or ""),
-                            "basis_source_ids": sorted(owned_basis),
-                            "evidence": evidence,
+                            "basis_source_ids": sorted(pair_basis),
+                            "evidence": [],
                         }
                     )
 
@@ -22562,7 +22571,13 @@ def build_literature_report(
                             for key, value in dict(row).items()
                             if key != "partition_original_basis_source_ids"
                         }
-                        | {"target_cluster_id": str(target["cluster_id"])}
+                        | {
+                            "target_cluster_id": str(target["cluster_id"]),
+                            "basis_source_ids": sorted(
+                                set(row.get("basis_source_ids", []) or [])
+                                & (set(leaf["source_ids"]) | set(target["source_ids"]))
+                            ),
+                        }
                     )
             leaf["planned_neighbor_relationships"] = resolved_neighbors
             if unassigned_neighbors:

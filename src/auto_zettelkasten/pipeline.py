@@ -209,7 +209,7 @@ _RELATIONSHIP_BATCH_MAX_JOBS = 8
 _LEGACY_RELATIONSHIP_BATCH_MAX_JOBS = 8
 _RELATIONSHIP_DISCOVERY_PAGE_SIZE = 64
 _RELATIONSHIP_SELECTION_STATE_SCHEMA_VERSION = "4"
-_RELATIONSHIP_DISCOVERY_POLICY_VERSION = "ordinary-family-scope-v302"
+_RELATIONSHIP_DISCOVERY_POLICY_VERSION = "ordinary-family-scope-v303"
 _RELATIONSHIP_SEMANTIC_POLICY_VERSION = "source-owned-bases-v26"
 _SOURCE_BUNDLE_QUOTE_LOCATOR = re.compile(
     r'^["\u201c](?P<quote>[^"\u201d]+)["\u201d]'
@@ -8738,7 +8738,7 @@ def _run_relationship_reasoning(
                 for pair in sorted(resolved_pairs)
                 if pair[0] in source_ids and pair[1] in source_ids
             ]
-            task_profiles = [
+            task_profiles = [] if ordinary_decisions else [
                 _relationship_evidence_projection(
                     profile_by_source[source_id],
                     lean_by_source[source_id],

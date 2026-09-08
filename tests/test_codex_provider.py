@@ -575,7 +575,7 @@ def test_codex_source_transport_failure_stops_queue_and_is_terminal(
 
 
 def test_codex_literature_transport_failure_stops_replenishment_and_is_terminal(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class TransportFailureReasoner:
         name = "codex"
@@ -585,15 +585,25 @@ def test_codex_literature_transport_failure_stops_replenishment_and_is_terminal(
         def __init__(self) -> None:
             self.calls = 0
             self.quota_stop_event = threading.Event()
+            self.started = threading.Barrier(4)
 
         def select_relationship_candidates(self, profiles, request, *, context=None):
             del profiles, request, context
             self.calls += 1
+            self.started.wait(timeout=5)
             raise ProviderTransportError(
                 "unexpected 404", transport_kind="codex_cli"
             )
 
     reasoner = TransportFailureReasoner()
+    original_write = literature_module.write_yaml
+
+    def check_stop_before_terminal_write(path, payload):
+        if path.name == "terminal_transport_failure.yml":
+            assert reasoner.quota_stop_event.is_set()
+        return original_write(path, payload)
+
+    monkeypatch.setattr(literature_module, "write_yaml", check_stop_before_terminal_write)
     request = LiteratureMapRequest(
         workspace=tmp_path,
         provider="codex",
