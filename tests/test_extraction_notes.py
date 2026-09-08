@@ -650,3 +650,40 @@ def _minimal_pdf(text: str) -> bytes:
         content.extend(f"{offset:010d} 00000 n \n".encode())
     content.extend(f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
     return bytes(content)
+
+
+@pytest.mark.parametrize('prefix', ['', 'Introductory finding.\n\n'])
+def test_atomic_section_subheadings_preserve_findings_for_validation_and_profiles(prefix):
+    from copy import deepcopy
+    from auto_zettelkasten.notes import _section_text
+    from auto_zettelkasten.profiles import _markdown_sections
+
+    analysis = {key: 'Source-grounded content.' for key in SECTION_KEYS}
+    analysis['detailed_findings'] = prefix + '## Conditions\nFirst result.\n### Detail\nQualification.\n## Limitations\nSecond result.'
+    original = deepcopy(analysis)
+    rendered = render_atomic_note({**_note_frontmatter(
+        status='analytical_atomic_note', source_scope='full_document', coverage_gate='passed'),
+        'reader_provider': 'test', 'reader_model': 'test'}, analysis)
+    assert validate_atomic_note(rendered).passed
+    body = parse_atomic_note(rendered)[1]
+    findings = _section_text(body, 'Detailed Findings')
+    assert findings == _markdown_sections(body)['Detailed Findings']
+    assert '### Conditions\nFirst result.\n#### Detail\nQualification.\n### Limitations\nSecond result.' in findings
+    assert analysis == original
+
+
+def test_atomic_section_heading_formatting_leaves_valid_markdown_and_code_intact():
+    from auto_zettelkasten.notes import _nested_section_markdown
+
+    valid = '### Existing subsection\nText.\n#### Child\nMore.'
+    assert _nested_section_markdown(valid) == valid
+    for marker in ('```', '~~~~'):
+        code = f'{marker}\n# literal heading\n## literal subheading\n{marker}\n'
+        assert _nested_section_markdown(code + '# Section\nContent.') == code + '### Section\nContent.'
+    assert _nested_section_markdown('# Parent\n## Child\n### Grandchild') == '### Parent\n#### Child\n##### Grandchild'
+    analysis = {key: 'Content.' for key in SECTION_KEYS}
+    analysis['detailed_findings'] = ''
+    text = render_atomic_note({**_note_frontmatter(
+        status='analytical_atomic_note', source_scope='full_document', coverage_gate='passed'),
+        'reader_provider': 'test', 'reader_model': 'test'}, analysis)
+    assert 'missing_section:detailed-findings' in validate_atomic_note(text).errors

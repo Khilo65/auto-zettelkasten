@@ -317,6 +317,31 @@ def _project_source_navigation(body: str, frontmatter: Mapping[str, Any]) -> str
     return f"{body[:offset]}\n{block}\n\n{remainder}"
 
 
+def _nested_section_markdown(content: str) -> str:
+    """Keep supplied headings beneath the renderer-owned level-two section."""
+    lines = content.splitlines(keepends=True)
+    headings: list[tuple[int, re.Match[str]]] = []
+    fence = ""
+    for index, line in enumerate(lines):
+        marker = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+        if fence:
+            if marker and marker[1][0] == fence[0] and len(marker[1]) >= len(fence) and not marker[2].strip():
+                fence = ""
+            continue
+        if marker and (marker[1][0] == "~" or "`" not in marker[2]):
+            fence = marker[1]
+            continue
+        heading = re.match(r"^( {0,3})(#{1,6})(?=[ \t]|$)", line)
+        if heading:
+            headings.append((index, heading))
+    shift = max(0, 3 - min((len(match[2]) for _, match in headings), default=3))
+    if not shift:
+        return content
+    for index, match in headings:
+        lines[index] = match[1] + "#" * min(6, len(match[2]) + shift) + lines[index][match.end():]
+    return "".join(lines)
+
+
 def render_atomic_note(frontmatter: Mapping[str, Any], analysis: Mapping[str, Any]) -> str:
     yaml_text = _dump_frontmatter(frontmatter)
     title = str(frontmatter.get("title") or "Untitled Source")
@@ -331,7 +356,7 @@ def render_atomic_note(frontmatter: Mapping[str, Any], analysis: Mapping[str, An
             ]
         )
     for key, heading in SECTION_HEADINGS:
-        content = str(analysis.get(key, "")).strip()
+        content = _nested_section_markdown(str(analysis.get(key, "")).strip())
         if key in OPTIONAL_SECTION_KEYS and not content:
             continue
         lines.extend([f"## {heading}", "", content, ""])
