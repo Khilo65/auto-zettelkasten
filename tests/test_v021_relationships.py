@@ -129,6 +129,37 @@ def test_note_based_decision_preserves_basis_without_selected_anchors(
     assert invalid["parked"]
 
 
+def test_compact_final_decision_needs_only_type_rationale_and_real_endpoints(tmp_path: Path) -> None:
+    profiles = [_profile("A"), _profile("B")]
+    job = RelationshipPairJob(
+        left_source_id="A", right_source_id="B",
+        profiles={"left": profiles[0], "right": profiles[1]},
+        output_contract="relationship-decision-v11",
+    )
+    row = {"pair_job_id": job.pair_job_id, "decision": "relationship",
+           "relation_type": "supports", "actor_source_id": "B", "reference_source_id": "A",
+           "reason": "B supplies an argument that supports A's contribution."}
+    result = ingest_relationship_decision_batch({"decisions": [row]}, pair_jobs=[job])
+    assert result["parked"] == []
+    relation = result["accepted"][0]
+    assert relation["reason"] == row["reason"] == relation["comparison_proposition"]
+    assert relation["left_endpoint_claim"] == relation["right_endpoint_claim"] == ""
+    registry = persist_relationship_registry(tmp_path, structural_relations=[], accepted_relations=result["accepted"])
+    assert registry["current_pair_decisions"][0]["status"] == "accepted"
+    for source_id, target_id in (("A", "B"), ("B", "A")):
+        links = projected_related_links(source_id, profiles, registry["links"], max_inferred_links=0)
+        assert links[0]["target_note_id"] == f"note-{target_id.lower()}"
+        assert links[0]["reason"] == row["reason"]
+    for invalid in ({"actor_source_id": "unknown"}, {"relation_type": "invented"}, {"reason": ""}):
+        rejected = ingest_relationship_decision_batch({"decisions": [{**row, **invalid}]}, pair_jobs=[job])
+        assert not rejected["accepted"]
+        assert rejected["parked"] or rejected["needs_more_context"]
+    negative = ingest_relationship_decision_batch({"decisions": [{"pair_job_id": job.pair_job_id,
+        "decision": "no_relationship", "reason": "The supplied contributions have no useful connection."}]}, pair_jobs=[job])
+    assert len(negative["no_relationship"]) == 1
+    assert not negative["accepted"]
+
+
 def test_note_based_transport_retains_notes_without_anchor_inventory() -> None:
     job = replace(
         _v9_job(), output_contract="relationship-decision-v10",

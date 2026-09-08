@@ -2320,6 +2320,7 @@ class RelationshipPairJob:
             "relationship-decision-v8",
             "relationship-decision-v9",
             "relationship-decision-v10",
+            "relationship-decision-v11",
         }:
             raise ValueError("relationship pair job output contract is invalid")
         left, right = sorted((self.left_source_id, self.right_source_id))
@@ -2524,6 +2525,7 @@ class RelationshipDecision:
             "relationship-decision-v8",
             "relationship-decision-v9",
             "relationship-decision-v10",
+            "relationship-decision-v11",
         }:
             raise ValueError("relationship decision output contract is invalid")
         pair = {self.left_source_id, self.right_source_id}
@@ -2611,14 +2613,16 @@ class RelationshipDecision:
                     (
                         self.left_evidence_anchor_ids
                         if self.output_contract not in {
-                            "relationship-decision-v8", "relationship-decision-v10"
+                            "relationship-decision-v8", "relationship-decision-v10",
+                            "relationship-decision-v11",
                         }
                         else ["optional"]
                     ),
                     (
                         self.right_evidence_anchor_ids
                         if self.output_contract not in {
-                            "relationship-decision-v8", "relationship-decision-v10"
+                            "relationship-decision-v8", "relationship-decision-v10",
+                            "relationship-decision-v11",
                         }
                         else ["optional"]
                     ),

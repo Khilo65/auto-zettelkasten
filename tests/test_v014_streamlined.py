@@ -2223,6 +2223,7 @@ def test_global_plan_reuse_and_incremental_family_context() -> None:
     changed_profiles = [
         dict(
             profiles[0],
+            thesis="Changed note thesis.",
             evidence_anchors=[
                 {
                     **profiles[0]["evidence_anchors"][0],

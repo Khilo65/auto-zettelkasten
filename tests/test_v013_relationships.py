@@ -33,25 +33,17 @@ def test_relationship_discovery_uses_lean_recall_first_prompt() -> None:
     prompt = _relationship_candidate_system_prompt()
 
     assert LITERATURE_RELATIONSHIP_PROMPT_VERSION == RELATIONSHIP_PROMPT_VERSION
-    assert "Prefer fewer grounded pairs to filling a target" in prompt
-    assert "not a published relationship" in prompt
-    assert "navigation hypothesis that may be wrong" in prompt
-    assert "each endpoint profile independently supplies" in prompt
-    assert "must not invent an unstated mediator" in prompt
-    assert "remove the family goal and self-check" in prompt
-    assert "return no_more_candidates even below" in prompt
-    assert "max_inferred_pairs" in prompt
-    assert "bridge_job_id" in prompt
-    assert "target_candidate_count" in prompt
-    assert "left_source_id" in prompt
-    assert "right_source_id" in prompt
-    assert "comparison_proposition" in prompt
-    assert "why_compare" not in prompt
-    assert "bridge_family" not in prompt
+    assert "intellectually meaningful relationships across works" in prompt
+    assert "navigation goals and family labels are hypotheses, not evidence" in prompt
+    assert "no later model adds an explanation" in prompt
+    assert "not reasons to manufacture links" in prompt
+    assert "does not make" in prompt
+    for field in ("max_inferred_pairs", "bridge_job_id", "left_source_id", "right_source_id",
+                  "decision", "relation_type", "reason", "job_outcomes", "no_more_candidates"):
+        assert field in prompt
     assert "evidence_anchor_ids" not in prompt
-    assert "job_outcomes" in prompt
-    assert "no_more_candidates" in prompt
-    assert "Neither status requests automatic continuation" in prompt
+    assert "source_a_basis" not in prompt
+    assert "Neither requests automatic continuation" in prompt
     assert RELATIONSHIP_CANDIDATE_MAX_OUTPUT_TOKENS == 64_000
     assert RELATIONSHIP_MAX_OUTPUT_TOKENS == 128_000
 

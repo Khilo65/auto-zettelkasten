@@ -452,7 +452,6 @@ def test_neighbor_families_are_compared_and_neighbor_changes_invalidate_replay(
         "neighboring_families": [
             {"left_family_id": "old-one", "right_family_id": "two", "reason": "Different measures of one construct."},
             {"left_family_id": "two", "right_family_id": "one", "reason": "The same comparison in reverse."},
-            {"left_family_id": "missing", "right_family_id": "three"},
         ],
     }
     request = LiteratureMapRequest(
@@ -547,6 +546,46 @@ def test_neighbor_candidate_quota_stays_bounded_when_packets_split(
     assert sum(job["target_candidate_count"] for job in neighbor_jobs) <= 24
     if context_budget == 15_000:
         assert len(neighbor_jobs) > 1
+
+
+@pytest.mark.parametrize("ambiguous", [False, True])
+def test_unresolved_neighbor_is_not_silently_reported_covered(tmp_path: Path, ambiguous: bool) -> None:
+    families = [
+        {"family_id": "one", "label": "ambiguous", "source_ids": ["A", "B"]},
+        {"family_id": "two", "label": "ambiguous", "source_ids": ["C", "D"]},
+    ]
+    with pytest.raises(ValueError, match="unresolved neighboring family reference"):
+        _run(tmp_path, [_profile(s) for s in "ABCD"],
+             _Calls(lambda *_args: pytest.fail("unresolved routing must stop before discovery")),
+             shared_family_plan={
+                 "lean_index_hash": "lean", "literature_families": families,
+                 "discovery_jobs": [], "neighboring_families": [{
+                     "left_family_id": "ambiguous" if ambiguous else "missing",
+                     "right_family_id": "two",
+                 }],
+             })
+
+
+def test_mutual_unclustered_job_does_not_cover_library_connections(tmp_path: Path) -> None:
+    calls = _Calls(lambda _stage, _profiles, context: {
+        "candidates": [], "job_outcomes": [
+            {"bridge_job_id": job["bridge_job_id"], "status": "no_more_candidates"}
+            for job in context["bridge_jobs"]
+        ],
+    })
+    result = _run(tmp_path, [_profile(s) for s in "ABCD"], calls, shared_family_plan={
+        "lean_index_hash": "lean",
+        "literature_families": [{"family_id": "one", "source_ids": ["A", "B"]}],
+        "discovery_jobs": [
+            {"job_id": "assigned", "family": "one", "left_source_ids": ["A"], "right_source_ids": ["B"]},
+            {"job_id": "mutual", "family": "", "left_source_ids": ["C"], "right_source_ids": ["D"]},
+        ],
+    })
+    covered = {(left, right) for _, _, context in calls.seen for job in context["bridge_jobs"]
+               for left in job["left_source_ids"] for right in job["right_source_ids"]
+               if job["bridge_job_id"].startswith("source-coverage-")}
+    assert covered == {("C", "A"), ("C", "B"), ("D", "A"), ("D", "B")}
+    assert result["relationship_stage_complete"] is True
 
 
 @pytest.mark.parametrize(
@@ -5286,3 +5325,165 @@ def test_cluster_membership_relations_are_reciprocal() -> None:
     )
     assert member["source_id"] == reciprocal["target_source_id"] == "A"
     assert member["target_cluster_id"] == reciprocal["source_id"] == "cluster-one"
+
+
+class _OrdinaryReasoner(_Reasoner):
+    ordinary_relationship_decision_contract = "relationship-decision-v11"
+    relationship_decision_contract = "relationship-decision-v10"
+
+
+def _ordinary_candidate(left: str, right: str, decision: str = "relationship") -> dict[str, Any]:
+    return {
+        "left_source_id": left, "right_source_id": right, "decision": decision,
+        "relation_type": "contextual_connection" if decision == "relationship" else "",
+        "actor_source_id": None, "reference_source_id": None,
+        "reason": "The notes connect institutional choices with implementation outcomes.",
+        "rank": 1,
+    }
+
+
+@pytest.mark.parametrize("decision", ["relationship", "no_relationship"])
+@pytest.mark.parametrize("frozen", [False, True])
+def test_ordinary_linking_finishes_during_discovery_and_replays(tmp_path: Path, decision: str, frozen: bool) -> None:
+    profiles = [_profile(source_id) for source_id in "AB"]
+    calls = _Calls(lambda stage, _profiles, _context: {
+        "candidates": [_ordinary_candidate("A", "B", decision)],
+    } if stage == "relationship_candidate_selection" else pytest.fail("extra judgment"))
+    result = _run(tmp_path, profiles, calls, reasoner=_OrdinaryReasoner())
+    assert result["relationship_stage_complete"] is True, result["parked"]
+    assert len(result["accepted"] if decision == "relationship" else result["no_relationship"]) == 1
+    assert len(calls.seen) == 1
+    assert result["provider_batch_count"] == 0
+    job_inputs = list((tmp_path / "11_state" / "runs" / calls.run_id / "relationship_jobs").glob("*/input.json"))
+    assert len(job_inputs) == 1
+    job = json.loads(job_inputs[0].read_text())
+    assert job["selected_evidence"] == {}
+    assert not any(job["atomic_notes"].values())
+    assert job["output_contract"] == "relationship-decision-v11"
+    _commit_relationship_selection_state(tmp_path, result, catalogue_revision=result["reconciled_catalogue_revision"])
+    replay = _run(tmp_path, profiles, _Calls(lambda *_args: pytest.fail("replay provider call")), reasoner=_OrdinaryReasoner(),
+                  frozen_pair_jobs=[RelationshipPairJob.from_dict(job)] if frozen else None)
+    assert replay["semantic_noop"] is True
+
+
+@pytest.mark.parametrize("kind", ["conflict", "missing_decision"])
+def test_ordinary_malformed_decisions_do_not_trigger_another_judgment(tmp_path: Path, kind: str) -> None:
+    row = _ordinary_candidate("A", "B")
+    if kind == "missing_decision":
+        row.pop("decision")
+    rows = [row] + ([_ordinary_candidate("A", "B", "no_relationship")] if kind == "conflict" else [])
+    calls = _Calls(lambda stage, _profiles, _context: {"candidates": rows}
+                   if stage == "relationship_candidate_selection" else pytest.fail("extra judgment"))
+    result = _run(tmp_path, [_profile(source_id) for source_id in "AB"], calls, reasoner=_OrdinaryReasoner())
+    assert result["accepted"] == []
+    assert result["parked"]
+    assert result["relationship_stage_complete"] is False
+    assert len(calls.seen) == 1
+
+
+@pytest.mark.parametrize("omit", [False, True])
+def test_ordinary_mandatory_pair_uses_compact_decision_and_preserves_omission(tmp_path: Path, omit: bool) -> None:
+    write_yaml(tmp_path / "02_source_memory" / "indexes" / "literature_positions.yml", {
+        "positions": [{"current_source_id": "A", "matched_source_id": "B",
+                       "engagement": "Explicit source citation.", "literature_position_id": "position-ab"}],
+    })
+    def handler(stage, provider_profiles, context):
+        assert stage == "relationship_candidate_selection"
+        assert provider_profiles == []
+        assert context["required_pairs"] == [["A", "B"]]
+        assert "atomic_notes" not in context and "source_evidence" not in context
+        row = _ordinary_candidate("A", "B")
+        row["bridge_job_id"] = context["bridge_jobs"][0]["bridge_job_id"]
+        return {"candidates": [] if omit else [row]}
+    calls = _Calls(handler)
+    result = _run(tmp_path, [_profile(source_id) for source_id in "AB"], calls, reasoner=_OrdinaryReasoner())
+    assert len(calls.seen) == 1
+    assert result["provider_batch_count"] == 1
+    assert bool(result["accepted"]) is not omit
+    assert bool(result["parked"]) is omit
+    assert result["no_relationship"] == []
+
+
+@pytest.mark.parametrize("prior_contract,prior_prompt", [
+    ("relationship-decision-v10", "35"), ("relationship-decision-v10", "21"),
+])
+def test_ordinary_refreshes_prior_full_note_decisions(tmp_path: Path, prior_contract: str, prior_prompt: str) -> None:
+    profiles = [_profile(source_id) for source_id in "AB"]
+    write_yaml(tmp_path / "02_source_memory" / "indexes" / "typed_links.yml", {
+        "relations": [{"relation_id": "old", "source_id": "A", "target_source_id": "B",
+                       "relation_type": "contextual_connection", "active": True,
+                       "output_contract": prior_contract}],
+        "current_pair_decisions": [{"source_ids": ["A", "B"], "status": "accepted",
+            "relation_ids": ["old"], "provider": "test-provider", "model": "test-model",
+            "prompt_version": prior_prompt,
+            "input_profile_hashes": {p.source_id: stable_hash(profile_to_dict(p)) for p in profiles}}],
+    })
+    def handler(stage, _profiles, context):
+        assert stage == "relationship_candidate_selection"
+        assert context["required_pairs"] == [["A", "B"]]
+        return {"candidates": [{**_ordinary_candidate("A", "B"),
+            "bridge_job_id": context["bridge_jobs"][0]["bridge_job_id"]}]}
+    calls = _Calls(handler)
+    result = _run(tmp_path, profiles, calls, reasoner=_OrdinaryReasoner())
+    assert len(calls.seen) == 1
+    assert result["accepted"][0]["output_contract"] == "relationship-decision-v11"
+    assert result["accepted"][0]["prompt_version"] == "21"
+
+
+def test_ordinary_acceptance_does_not_require_an_unused_second_call_budget(tmp_path: Path) -> None:
+    def handler(stage, _profiles, context):
+        assert stage == "relationship_candidate_selection"
+        job_id = context["bridge_jobs"][0]["bridge_job_id"]
+        return {"candidates": [{**_ordinary_candidate("A", "B"), "bridge_job_id": job_id}],
+                "job_outcomes": [{"bridge_job_id": job_id, "status": "no_more_candidates"}]}
+    calls = _Calls(handler)
+    calls.max_calls = 1
+    calls.cumulative_provider_calls = 0
+    result = _run(tmp_path, [_profile(s) for s in "AB"], calls, reasoner=_OrdinaryReasoner(),
+        request=LiteratureMapRequest(tmp_path, provider="test-provider", model="test-model",
+            literature_policy=LiteratureMappingPolicy(cluster_generation_enabled=False)),
+        shared_family_plan={"lean_index_hash": "lean",
+            "literature_families": [{"family_id": "one", "source_ids": ["A", "B"]}],
+            "discovery_jobs": [{"job_id": "one", "family": "one",
+                "left_source_ids": ["A"], "right_source_ids": ["B"], "candidate_quota": 1}]})
+    assert result["relationship_stage_complete"] is True, result["parked"]
+    assert len(result["accepted"]) == 1
+    assert calls.cumulative_provider_calls == 1
+    assert result["candidate_dispositions"][0]["disposition"] == "accepted"
+
+
+def test_ordinary_negative_remains_current_when_another_source_arrives(tmp_path: Path) -> None:
+    profiles = [_profile(source_id) for source_id in "AB"]
+    first = _run(tmp_path, profiles, _Calls(lambda *_args: {
+        "candidates": [_ordinary_candidate("A", "B", "no_relationship")]}), reasoner=_OrdinaryReasoner())
+    pipeline_module.persist_relationship_registry(tmp_path, structural_relations=[], accepted_relations=[],
+        no_relationship_decisions=first["no_relationship"], parked_rows=[])
+    _commit_relationship_selection_state(tmp_path, first, catalogue_revision=first["reconciled_catalogue_revision"])
+    def handler(stage, _profiles, context):
+        assert stage == "relationship_candidate_selection"
+        assert context["prior_negative_pairs"] == [["A", "B"]]
+        return {"candidates": [_ordinary_candidate("A", "C")]}
+    calls = _Calls(handler)
+    result = _run(tmp_path, [*profiles, _profile("C")], calls, reasoner=_OrdinaryReasoner())
+    assert result["relationship_stage_complete"] is True, result["parked"]
+    assert len(calls.seen) == 1
+    assert result["accepted"][0]["target_source_id"] == "C"
+
+
+@pytest.mark.parametrize("decision,extra", [
+    ("no_relationship", {"secondary_relation_types": ["supports"]}),
+    ("no_relationship", {"connections": [{"primary_relation_type": "supports"}]}),
+    ("relationship", {"source_a_anchor_ids": ["unknown-anchor"]}),
+    ("relationship", {"actor_source_id": "unknown-source"}),
+    ("no_relationship", {"reason": "   "}),
+    ("no_relationship", {"reason": True}),
+])
+def test_ordinary_rejects_hidden_active_fields_before_projection(tmp_path: Path, decision: str, extra: dict[str, Any]) -> None:
+    calls = _Calls(lambda stage, _profiles, _context: {
+        "candidates": [{**_ordinary_candidate("A", "B", decision), **extra}],
+    } if stage == "relationship_candidate_selection" else pytest.fail("extra judgment"))
+    result = _run(tmp_path, [_profile(source_id) for source_id in "AB"], calls, reasoner=_OrdinaryReasoner())
+    assert result["accepted"] == []
+    assert result["no_relationship"] == []
+    assert result["parked"]
+    assert len(calls.seen) == 1

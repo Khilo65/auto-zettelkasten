@@ -2970,7 +2970,11 @@ elif contract == "relationship_candidate_selection":
         candidates.append({{
             "left_source_id": pair[0],
             "right_source_id": pair[1],
-            "comparison_proposition": "Both sources address institutional implementation outcomes.",
+            "decision": "relationship",
+            "relation_type": "complements",
+            "actor_source_id": None,
+            "reference_source_id": None,
+            "reason": "The sources contribute complementary institutional implementation evidence.",
             "bridge_job_id": job["bridge_job_id"],
             "rank": rank,
         }})
@@ -2978,7 +2982,11 @@ elif contract == "relationship_candidate_selection":
         candidates.append({{
             "left_source_id": ids[0],
             "right_source_id": ids[1],
-            "comparison_proposition": "Both sources address institutional implementation outcomes.",
+            "decision": "relationship",
+            "relation_type": "complements",
+            "actor_source_id": None,
+            "reference_source_id": None,
+            "reason": "The sources contribute complementary institutional implementation evidence.",
             "bridge_job_id": "",
             "rank": 1,
         }})
@@ -3177,14 +3185,13 @@ def test_public_codex_map_runs_relationships_and_replays_without_calls_or_semant
     } == {
         "source_bundle": 1,
         "relationship_candidate_selection": 1,
-        "relationship_adjudication": 1,
         "literature_family_plan": 1,
         "cluster_synthesis": 1,
     }
     assert {row["model"] for row in calls if row["contract"] == "source_bundle"} == {"gpt-5.6-luna"}
     assert any(row["contract"] == "literature_family_plan" for row in calls)
     assert any(row["contract"] == "relationship_candidate_selection" for row in calls)
-    assert any(row["contract"] == "relationship_adjudication" for row in calls)
+    assert not any(row["contract"] == "relationship_adjudication" for row in calls)
     assert any(row["contract"] == "cluster_synthesis" for row in calls)
     captured = json.loads(app_server_capture.read_text(encoding="utf-8"))
     requests = [row for row in captured["messages"] if row.get("id") is not None]

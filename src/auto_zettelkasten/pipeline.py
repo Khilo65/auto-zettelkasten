@@ -6292,7 +6292,7 @@ def _merge_literature_family_plans(
                 )
             )
         )
-        if pair[0] in families and pair[1] in families and pair[0] != pair[1]:
+        if pair[0] and pair[1] and pair[0] != pair[1]:
             neighbors.setdefault(pair, dict(row))
     dispositions: dict[str, dict[str, Any]] = {}
     for raw in [
@@ -6678,8 +6678,8 @@ def _validate_literature_family_plan(
         }
         for row in raw_neighbors
         if isinstance(row, Mapping)
-        and str(row.get("left_family_id") or "") in family_ids
-        and str(row.get("right_family_id") or "") in family_ids
+        and str(row.get("left_family_id") or "")
+        and str(row.get("right_family_id") or "")
         and str(row.get("left_family_id") or "")
         != str(row.get("right_family_id") or "")
     ]
@@ -6834,7 +6834,11 @@ def _relationship_adjudication_identity(
     payload = {
                 "provider": provider,
                 "model": model,
-                "adjudication_prompt_version": RELATIONSHIP_PROMPT_VERSION,
+                "adjudication_prompt_version": (
+                    RELATIONSHIP_DISCOVERY_PROMPT_VERSION
+                    if decision_contract == "relationship-decision-v11"
+                    else RELATIONSHIP_PROMPT_VERSION
+                ),
                 "output_contract": decision_contract,
                 "decision_normalization_version": (
                     RELATIONSHIP_DECISION_NORMALIZATION_VERSION
@@ -6843,7 +6847,9 @@ def _relationship_adjudication_identity(
             }
     if provider == "codex":
         payload["provider_execution_identity"] = codex_stage_identity(
-            "relationship_adjudication",
+            ("relationship_candidate_selection"
+             if decision_contract == "relationship-decision-v11"
+             else "relationship_adjudication"),
             model,
             reasoning_effort or "medium",
             cli_profile=cli_profile,
@@ -7016,12 +7022,23 @@ def _run_relationship_reasoning(
             "relationship_discovery_status": "complete",
             "relationship_discovery_incomplete_jobs": [],
         }
+    ordinary_decisions = (
+        getattr(reasoner, "ordinary_relationship_decision_contract", "")
+        == "relationship-decision-v11"
+        and (frozen_pair_jobs is None or all(
+            job.output_contract == "relationship-decision-v11" for job in frozen_pair_jobs
+        ))
+    )
+    decision_prompt_version = (
+        RELATIONSHIP_DISCOVERY_PROMPT_VERSION if ordinary_decisions
+        else RELATIONSHIP_PROMPT_VERSION
+    )
     selector = getattr(reasoner, "select_relationship_candidates", None)
     adjudicator = getattr(reasoner, "adjudicate_relationships", None)
     if (
         reasoner_calls is None
         or not callable(selector)
-        or not callable(adjudicator)
+        or (not ordinary_decisions and not callable(adjudicator))
     ):
         if request.literature_policy.cluster_generation_enabled is not False:
             return {
@@ -7048,9 +7065,11 @@ def _run_relationship_reasoning(
                 "relationship_reasoner_capability_unavailable"
             ],
         }
-    decision_contract = str(
-        getattr(reasoner, "relationship_decision_contract", "")
-        or "relationship-decision-v4"
+    decision_contract = (
+        "relationship-decision-v11" if ordinary_decisions else str(
+            getattr(reasoner, "relationship_decision_contract", "")
+            or "relationship-decision-v4"
+        )
     )
     batch_max_jobs = (
         _RELATIONSHIP_BATCH_MAX_JOBS
@@ -7544,6 +7563,14 @@ def _run_relationship_reasoning(
         current_relation_ids = {
             str(value) for value in row.get("relation_ids", []) or []
         }
+        if ordinary_decisions:
+            fresh = fresh and str(row.get("prompt_version") or "") == decision_prompt_version and all(
+                str(relation.get("output_contract") or "") == decision_contract
+                for relation in registry.get("relations", []) or []
+                if isinstance(relation, Mapping)
+                and str(relation.get("relation_id") or "") in current_relation_ids
+                and bool(relation.get("active", True))
+            )
         if fresh and active_relation_ids & current_relation_ids:
             visible_pairs.add(pair)
         elif fresh:
@@ -7626,7 +7653,7 @@ def _run_relationship_reasoning(
                 or str(current_negative.get("model") or "")
                 != relationship_model
                 or str(current_negative.get("prompt_version") or "")
-                != RELATIONSHIP_PROMPT_VERSION
+                != decision_prompt_version
             ):
                 continue
         if prior_state and any(
@@ -7643,7 +7670,7 @@ def _run_relationship_reasoning(
                 target_hash,
                 provider=relationship_provider,
                 model=relationship_model,
-                prompt_version=RELATIONSHIP_PROMPT_VERSION,
+                prompt_version=decision_prompt_version,
                 policy_identity=relationship_policy_identity,
             )
             for source_hash in current_hash_aliases[pair[0]]
@@ -7663,7 +7690,7 @@ def _run_relationship_reasoning(
                     target_hash,
                     provider=relationship_provider,
                     model=relationship_model,
-                    prompt_version=RELATIONSHIP_PROMPT_VERSION,
+                    prompt_version=decision_prompt_version,
                 )
                 for source_hash in current_hash_aliases[pair[0]]
                 for target_hash in current_hash_aliases[pair[1]]
@@ -7887,7 +7914,8 @@ def _run_relationship_reasoning(
     ) // batch_max_jobs
     pair_capacity = adjudication_call_capacity * batch_max_jobs
     inferred_capacity = (
-        min(possible_pair_count, max(0, pair_capacity - len(mandatory_basis)))
+        (possible_pair_count if ordinary_decisions
+         else min(possible_pair_count, max(0, pair_capacity - len(mandatory_basis))))
         if can_discover
         else 0
     )
@@ -8511,7 +8539,13 @@ def _run_relationship_reasoning(
                 canonical_families.get(str(neighbor.get(key) or ""), "")
                 for key in ("left_family_id", "right_family_id")
             })
-            if len(family_ids) != 2 or "" in family_ids:
+            if "" in family_ids:
+                raise ValueError(
+                    "unresolved neighboring family reference: "
+                    + str(neighbor.get("left_family_id") or "")
+                    + " / " + str(neighbor.get("right_family_id") or "")
+                )
+            if len(family_ids) != 2:
                 continue
             left = set(family_rows[family_ids[0]].get("source_ids", []) or []) & eligible_ids
             right = set(family_rows[family_ids[1]].get("source_ids", []) or []) & eligible_ids
@@ -8540,8 +8574,24 @@ def _run_relationship_reasoning(
         # discovery for analytical endpoints omitted from every planned job.
         # ponytail: O(u*n) routing for u uncovered sources; shard if it dominates.
         covered_ids = set().union(*discovery_scopes)
-        for source_id in sorted(eligible_ids - covered_ids):
-            other_ids = sorted(eligible_ids - {source_id})
+        assigned_ids = {
+            source_id for family in family_rows.values()
+            for source_id in family.get("source_ids", []) or []
+        }
+        requested_ids = {
+            source_id for job in discovery_jobs
+            if job.get("requested_collection_pair")
+            for side in ("left_source_ids", "right_source_ids")
+            for source_id in job.get(side, []) or []
+        }
+        # A mutual job between unclustered notes does not examine their links
+        # to the rest of the library. Reuse the bounded source-coverage route.
+        for source_id in sorted((eligible_ids - covered_ids) | (eligible_ids - assigned_ids - requested_ids)):
+            examined_with = set().union(*(
+                right if source_id in left else left if source_id in right else set()
+                for left, right in routed_sides
+            ))
+            other_ids = sorted(eligible_ids - {source_id} - examined_with)
             if not other_ids:
                 continue
             job_id = "source-coverage-" + stable_hash(source_id)[:16]
@@ -10032,6 +10082,7 @@ def _run_relationship_reasoning(
     )
     if (
         remaining_calls is not None
+        and not ordinary_decisions
         and not reuse_selected_pool
         and shared_plan_active
         and request.literature_policy.cluster_generation_enabled is not False
@@ -10278,10 +10329,15 @@ def _run_relationship_reasoning(
     candidate_basis_by_pair: dict[
         tuple[str, str], list[dict[str, Any]]
     ] = defaultdict(list)
-    for raw in [
-        *(bridge_payload.get("candidates", []) or []),
-        *(general_payload.get("candidates", []) or []),
-    ]:
+    basis_rows = (
+        [row for _pool, _key, _index, row in candidate_items
+         if not row.get("_candidate_disposition")]
+        if ordinary_decisions else [
+            *(bridge_payload.get("candidates", []) or []),
+            *(general_payload.get("candidates", []) or []),
+        ]
+    )
+    for raw in basis_rows:
         if not isinstance(raw, Mapping):
             continue
         pair = canonical_pair(
@@ -10305,7 +10361,10 @@ def _run_relationship_reasoning(
         for row in inferred_rows
     }
     for pair, basis in mandatory_basis.items():
-        candidate_by_pair[pair] = list(basis)
+        candidate_by_pair[pair] = [
+            *basis,
+            *(candidate_basis_by_pair.get(pair, []) if ordinary_decisions else []),
+        ]
     if reuse_selected_pool and prior_selected_candidates is not None:
         candidate_by_pair = {
             pair: [dict(row) for row in basis]
@@ -10314,7 +10373,7 @@ def _run_relationship_reasoning(
 
     selected_candidates = _selected_candidate_rows(candidate_by_pair)
     selected_candidate_pool_hash = stable_hash(selected_candidates)
-    if frozen_pair_jobs is None:
+    if frozen_pair_jobs is None and not ordinary_decisions:
         selected_source_ids = {
             source_id for pair in candidate_by_pair for source_id in pair
         }
@@ -10360,9 +10419,12 @@ def _run_relationship_reasoning(
         {
             "provider": provider_name,
             "model": model_name,
-            "prompt_version": RELATIONSHIP_PROMPT_VERSION,
+            "prompt_version": decision_prompt_version,
             "output_contract": decision_contract,
-            "transport_policy": "source-evidence-only-v2",
+            "transport_policy": (
+                "compact-note-decisions-v1" if ordinary_decisions
+                else "source-evidence-only-v2"
+            ),
             "policy_identity": relationship_policy_identity,
         }
     )
@@ -10370,7 +10432,7 @@ def _run_relationship_reasoning(
     for pair in (
         [] if frozen_pair_jobs is not None else sorted(candidate_by_pair)
     ):
-        selected = {
+        selected = {} if ordinary_decisions else {
             side: _selected_relationship_evidence(
                 profile_by_source[source_id],
                 requested_ids={
@@ -10599,7 +10661,7 @@ def _run_relationship_reasoning(
             provider=provider_name,
             model=model_name,
             reasoner_backend=reasoner_backend,
-            prompt_version=RELATIONSHIP_PROMPT_VERSION,
+            prompt_version=decision_prompt_version,
         )
         valid = bool(
             validation["accepted"] or validation["no_relationship"]
@@ -10609,6 +10671,88 @@ def _run_relationship_reasoning(
     responses: list[dict[str, Any]] = []
     unresolved: list[RelationshipPairJob] = []
     preparked: list[dict[str, Any]] = list(discovery_parked)
+
+    def ordinary_row(
+        job: RelationshipPairJob, rows: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any] | None:
+        # Routing hypotheses and deterministic completion are not model decisions.
+        judgments = [row for row in rows if (
+            "decision" in row or (row.get("left_source_id") and not str(
+                row.get("discovery_route") or ""
+            ).startswith("deterministic_"))
+        )]
+        if not judgments:
+            return None
+        allowed_fields = {
+            "left_source_id", "right_source_id", "decision", "relation_type",
+            "actor_source_id", "reference_source_id", "reason", "bridge_job_id", "rank",
+            "comparison_proposition",
+            # Deterministic discovery provenance is retained in the immutable job.
+            "discovery_route", "discovery_job_id", "discovery_family", "discovery_job_quota",
+            "requested_collection_pair", "discovery_pass", "discovery_provenance",
+        }
+        if any(set(row) - allowed_fields for row in judgments):
+            return {"pair_job_id": job.pair_job_id,
+                    "decision": "invalid_ordinary_decision_fields"}
+        if any(
+            any(not isinstance(row.get(key), str) for key in (
+                "left_source_id", "right_source_id", "decision", "relation_type", "reason",
+            )) or any(row.get(key) is not None and not isinstance(row[key], str)
+                      for key in ("actor_source_id", "reference_source_id", "comparison_proposition"))
+            for row in judgments
+        ):
+            return {"pair_job_id": job.pair_job_id,
+                    "decision": "invalid_ordinary_decision_shape"}
+        if any(str(row.get(key) or "").strip() not in {"", job.left_source_id, job.right_source_id}
+               for row in judgments for key in ("actor_source_id", "reference_source_id")):
+            return {"pair_job_id": job.pair_job_id,
+                    "decision": "ordinary_decision_unknown_endpoint"}
+        meanings = {
+            tuple(str(row.get(key) or "").strip() for key in (
+                "decision", "relation_type", "actor_source_id", "reference_source_id",
+            )) for row in judgments
+        }
+        if len(meanings) != 1:
+            return {"pair_job_id": job.pair_job_id,
+                    "decision": "conflicting_ordinary_decisions"}
+        raw = judgments[0]
+        return {
+            "pair_job_id": job.pair_job_id,
+            "decision": str(raw.get("decision") or "missing_ordinary_decision").strip(),
+            "relation_type": str(raw.get("relation_type") or "").strip(),
+            "actor_source_id": str(raw.get("actor_source_id") or "").strip(),
+            "reference_source_id": str(raw.get("reference_source_id") or "").strip(),
+            "comparison_proposition": str(raw.get("comparison_proposition") or raw.get("reason") or "").strip(),
+            "reason": str(raw.get("reason") or "").strip(),
+        }
+
+    def complete_job(job: RelationshipPairJob, row: Mapping[str, Any], *, batch_id: str = "") -> None:
+        row = {**dict(row), "reasoner_backend": reasoner_backend,
+               "provider": provider_name, "model": model_name}
+        paths = (job_root / job.pair_job_id, global_job_root / job.pair_job_id)
+        for path in paths:
+            write_json(path / "provider_result.json", row)
+        valid, validation = validate_cached_job(job, row)
+        if not valid:
+            reason = ",".join(sorted({str(value.get("reason") or "")
+                for value in [*validation["needs_more_context"], *validation["parked"]]
+                if value.get("reason")})) or "relationship_decision_needs_review"
+            preparked.append({"pair_job_id": job.pair_job_id,
+                "source_id": job.left_source_id, "target_source_id": job.right_source_id,
+                "status": "parked_for_review", "reason": reason})
+            write_yaml(paths[0] / "status.yml", {
+                "pair_job_id": job.pair_job_id, "status": "parked_for_review",
+                "reason": reason, "decision_identity": decision_identity})
+            return
+        for path in paths:
+            write_json(path / "result.json", row)
+            write_yaml(path / "status.yml", {
+                "pair_job_id": job.pair_job_id, "status": "completed",
+                **({"batch_id": batch_id} if batch_id and path == paths[0] else {}),
+                "decision_identity": decision_identity,
+                "reasoner_backend": reasoner_backend,
+                "provider": provider_name, "model": model_name})
+        responses.append(row)
     for job in jobs:
         job_path = job_root / job.pair_job_id
         result_path = job_path / "result.json"
@@ -10650,7 +10794,12 @@ def _run_relationship_reasoning(
                     reusable_result_path.read_text(encoding="utf-8")
                 )
             except (OSError, json.JSONDecodeError):
-                unresolved.append(job)
+                if ordinary_decisions:
+                    preparked.append({"pair_job_id": job.pair_job_id,
+                        "source_id": job.left_source_id, "target_source_id": job.right_source_id,
+                        "reason": "ordinary_decision_cache_unreadable"})
+                else:
+                    unresolved.append(job)
                 continue
             if isinstance(payload, Mapping):
                 valid, validation = validate_cached_job(job, payload)
@@ -10703,8 +10852,32 @@ def _run_relationship_reasoning(
                     },
                 )
         else:
-            unresolved.append(job)
+            direct = ordinary_row(job, job.candidate_basis) if ordinary_decisions else None
+            if direct is not None:
+                complete_job(job, direct)
+            else:
+                unresolved.append(job)
     provider_batch_count = 0
+    ordinary_catalogue = {
+        str(row["source_id"]): row for row in lean_discovery_projection(
+            list(profile_by_source.values()), catalogue_payload,
+        )
+    } if ordinary_decisions else {}
+
+    def packet_context_for(packet: Sequence[RelationshipPairJob]) -> dict[str, Any]:
+        if not ordinary_decisions:
+            return _relationship_transport_context(packet, decision_contract=decision_contract)
+        ids = {source_id for job in packet for source_id in (job.left_source_id, job.right_source_id)}
+        return {
+            "catalogue": [ordinary_catalogue[source_id] for source_id in sorted(ids)],
+            "required_pairs": [list((job.left_source_id, job.right_source_id)) for job in packet],
+            "bridge_jobs": [{
+                "bridge_job_id": job.pair_job_id,
+                "left_source_ids": [job.left_source_id],
+                "right_source_ids": [job.right_source_id],
+                "target_candidate_count": 1,
+            } for job in packet],
+        }
     job_packets = _pack_relationship_rows(
         unresolved,
         pair_for=lambda job: (job.left_source_id, job.right_source_id),
@@ -10713,9 +10886,7 @@ def _run_relationship_reasoning(
             if decision_contract in RELATIONSHIP_ENVELOPE_CONTRACTS
             else profile_by_source
         ),
-        context_for=lambda packet: _relationship_transport_context(
-            packet, decision_contract=decision_contract
-        ),
+        context_for=packet_context_for,
         max_chars=catalogue_char_budget,
         max_rows=batch_max_jobs,
     )
@@ -10726,9 +10897,7 @@ def _run_relationship_reasoning(
     def adjudicate_packet(
         packet: Sequence[RelationshipPairJob],
     ) -> Mapping[str, Any]:
-        packet_context = _relationship_transport_context(
-            packet, decision_contract=decision_contract
-        )
+        packet_context = packet_context_for(packet)
         packet_source_ids = sorted(
             {
                 source_id
@@ -10752,19 +10921,32 @@ def _run_relationship_reasoning(
                 [job.to_dict() for job in packet]
             ),
         )
-        return reasoner_calls(
-            "relationship_adjudication",
+        response = reasoner_calls(
+            "relationship_candidate_selection" if ordinary_decisions else "relationship_adjudication",
             batch.batch_id,
-            "adjudicate_relationships",
+            "select_relationship_candidates" if ordinary_decisions else "adjudicate_relationships",
             packet_profiles,
             packet_context,
         )
+        if not ordinary_decisions:
+            return response
+        by_pair: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+        expected = {(job.left_source_id, job.right_source_id): job for job in packet}
+        for raw in response.get("candidates", []) or []:
+            if not isinstance(raw, Mapping):
+                continue
+            pair = canonical_pair(str(raw.get("left_source_id") or ""),
+                                  str(raw.get("right_source_id") or ""))
+            if pair not in expected or str(raw.get("bridge_job_id") or "") != expected[pair].pair_job_id:
+                raise ValueError("ordinary_decision_outside_required_pair_scope")
+            by_pair[pair].append(dict(raw))
+        return {"decisions": [row for job in packet
+            if (row := ordinary_row(job, by_pair.get((job.left_source_id, job.right_source_id), []))) is not None]}
+
 
     runnable_packets = []
     for packet in job_packets:
-        packet_context = _relationship_transport_context(
-            packet, decision_contract=decision_contract
-        )
+        packet_context = packet_context_for(packet)
         packet_source_ids = sorted(
             {
                 source_id
@@ -10839,9 +11021,7 @@ def _run_relationship_reasoning(
     else:
         relationship_stage_seconds = 0.0
     for packet in job_packets:
-        packet_context = _relationship_transport_context(
-            packet, decision_contract=decision_contract
-        )
+        packet_context = packet_context_for(packet)
         packet_source_ids = sorted(
             {
                 source_id
@@ -10959,85 +11139,7 @@ def _run_relationship_reasoning(
                         },
                     )
                     continue
-                row = job_rows[0]
-                row = {
-                    **row,
-                    "reasoner_backend": reasoner_backend,
-                    "provider": provider_name,
-                    "model": model_name,
-                }
-                write_json(
-                    job_root / job.pair_job_id / "provider_result.json",
-                    row,
-                )
-                write_json(
-                    global_job_root
-                    / job.pair_job_id
-                    / "provider_result.json",
-                    row,
-                )
-                valid, validation = validate_cached_job(job, row)
-                if not valid:
-                    reason_rows = [
-                        *validation["needs_more_context"],
-                        *validation["parked"],
-                    ]
-                    reason = ",".join(
-                        sorted(
-                            {
-                                str(value.get("reason") or "")
-                                for value in reason_rows
-                                if str(value.get("reason") or "")
-                            }
-                        )
-                    ) or "relationship_decision_needs_review"
-                    preparked.append(
-                        {
-                            "pair_job_id": job.pair_job_id,
-                            "source_id": job.left_source_id,
-                            "target_source_id": job.right_source_id,
-                            "status": "parked_for_review",
-                            "reason": reason,
-                        }
-                    )
-                    write_yaml(
-                        status_path,
-                        {
-                            "pair_job_id": job.pair_job_id,
-                            "status": "parked_for_review",
-                            "reason": reason,
-                            "decision_identity": decision_identity,
-                        },
-                    )
-                    continue
-                write_json(job_root / job.pair_job_id / "result.json", row)
-                write_json(
-                    global_job_root / job.pair_job_id / "result.json", row
-                )
-                write_yaml(
-                    status_path,
-                    {
-                        "pair_job_id": job.pair_job_id,
-                        "status": "completed",
-                        "batch_id": batch.batch_id,
-                        "decision_identity": decision_identity,
-                        "reasoner_backend": reasoner_backend,
-                        "provider": provider_name,
-                        "model": model_name,
-                    },
-                )
-                write_yaml(
-                    global_job_root / job.pair_job_id / "status.yml",
-                    {
-                        "pair_job_id": job.pair_job_id,
-                        "status": "completed",
-                        "decision_identity": decision_identity,
-                        "reasoner_backend": reasoner_backend,
-                        "provider": provider_name,
-                        "model": model_name,
-                    },
-                )
-                responses.append(row)
+                complete_job(job, job_rows[0], batch_id=batch.batch_id)
             write_yaml(
                 batch_root / "batch.yml",
                 {**batch.to_dict(), "status": "completed"},
@@ -11092,7 +11194,7 @@ def _run_relationship_reasoning(
         provider=provider_name,
         model=model_name,
         reasoner_backend=reasoner_backend,
-        prompt_version=RELATIONSHIP_PROMPT_VERSION,
+        prompt_version=decision_prompt_version,
     )
     for row in [*validated["accepted"], *validated["no_relationship"]]:
         row["relationship_policy_identity"] = relationship_policy_identity
@@ -11172,7 +11274,19 @@ def _run_relationship_reasoning(
         and not terminal_rows
         and not discovery_parked
     )
+    if ordinary_decisions:
+        final_dispositions = {
+            canonical_pair(str(row["source_id"]), str(row["target_source_id"])):
+                ("accepted" if row.get("decision") == "relationship" else "no_relationship")
+            for row in [*validated["accepted"], *validated["no_relationship"]]
+        }
+        for row in candidate_dispositions:
+            pair = tuple(row.get("pair", []))
+            if row.get("disposition") == "selected_for_adjudication":
+                row["disposition"] = final_dispositions.get(pair, "parked_contract_failure")
     disposition_priority = {
+        "accepted": 0,
+        "no_relationship": 0,
         "selected_for_adjudication": 0,
         "already_visible": 1,
         "current_no_relationship": 2,

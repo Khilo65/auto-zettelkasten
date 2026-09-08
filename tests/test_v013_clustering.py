@@ -9,9 +9,11 @@ from auto_zettelkasten.literature import (
     _CheckpointedReasonerCalls,
     _cluster_plan_call_settings,
     _cluster_planning_card,
+    _cluster_family_cards,
     _cluster_projection_is_publishable,
     _cluster_relationship_context,
     _global_plan_proposals,
+    _shared_family_cluster_plan,
     _project_planned_cluster_neighbors,
     build_literature_report,
     map_overlapping_clusters,
@@ -64,27 +66,54 @@ def _profile(source_id: str, *, partial: bool = False) -> dict:
     }
 
 
-def test_partial_substantive_profile_contributes_bounded_planning_anchors() -> None:
+def test_partial_substantive_profile_contributes_compact_note_context() -> None:
     normalized = normalize_evidence_profiles([_profile("partial", partial=True)])[0]
 
     assert normalized["analytical"] is True
     assert normalized["evidence_eligibility"] == "substantive_bounded"
     card = _cluster_planning_card(normalized)
-    assert 3 <= len(card["evidence_references"]) <= 5
-    assert {row["planning_roles"][0] for row in card["evidence_references"]} == {
-        "thesis",
-        "method",
-        "major_finding",
-        "mechanism",
-        "limitation",
-    }
-    assert all(
-        row["support_boundary"]["coverage"] == "limited_text"
-        for row in card["evidence_references"]
-    )
+    assert card["thesis"] == "Thesis for partial"
+    assert card["method"] == "comparative analysis"
+    assert not {"claims", "evidence_anchors", "evidence_references"} & card.keys()
 
 
-def test_global_plan_uses_only_source_owned_member_and_neighbor_anchors() -> None:
+@pytest.mark.parametrize("partial", [False, True])
+def test_note_based_planning_and_admission_need_no_anchor_inventory(partial: bool) -> None:
+    raw_profiles = [_profile(source_id, partial=partial and source_id == "c") for source_id in ("a", "b", "c")]
+    for profile in raw_profiles:
+        profile["evidence_anchors"] = []
+    profiles = normalize_evidence_profiles(raw_profiles)
+    shared = {"literature_families": [{
+        "family_id": "family", "label": "Connected contributions",
+        "organizing_problem": "How do the contributions connect?",
+        "source_ids": ["a", "b", "c", "unknown"],
+        "proposed_roles": {"c": "boundary"},
+    }]}
+    plan = _shared_family_cluster_plan(shared, profiles)
+    cards = [_cluster_planning_card(profile) for profile in profiles]
+    family_cards = _cluster_family_cards([plan], cards)
+    assert family_cards[0]["source_ids"] == ["a", "b", "c"]
+    assert "evidence_references" not in family_cards[0]
+    assert all("evidence_anchor_ids" not in member for member in family_cards[0]["members"])
+    accepted = [{
+        "relation_id": "a-b", "source_ids": ["a", "b"],
+        "relation_type": "complements", "reason": "Their distinct contributions illuminate the same mechanism.",
+        "cluster_evidence_eligible": True,
+    }]
+    proposals, _, _, _ = _global_plan_proposals(plan, profiles, accepted_relationships=accepted)
+    assert proposals[0]["supporting_evidence"] == []
+    mapped = map_overlapping_clusters(profiles, proposals=proposals)
+    assert len(mapped["clusters"]) == 1
+    assert mapped["clusters"][0]["source_ids"] == ["a", "b"]
+    assert mapped["clusters"][0]["relation_ids"] == ["a-b"]
+    assert mapped["clusters"][0]["family_relations"][0]["evidence"] == []
+    assert any(row["source_id"] == "c" for row in mapped["unclustered_sources"])
+    invalid = [{**accepted[0], "source_ids": ["a", "unknown"]}]
+    proposals, _, _, _ = _global_plan_proposals(plan, profiles, accepted_relationships=invalid)
+    assert map_overlapping_clusters(profiles, proposals=proposals)["clusters"] == []
+
+
+def test_global_plan_uses_note_membership_and_rejects_unknown_neighbors() -> None:
     profiles = normalize_evidence_profiles([_profile("a"), _profile("b")])
     response = {
         "clusters": [
@@ -129,10 +158,7 @@ def test_global_plan_uses_only_source_owned_member_and_neighbor_anchors() -> Non
     assert not unclustered
     assert proposals[0]["formation_route"] == "global_cluster_plan"
     assert proposals[0]["source_roles"] == {"a": "core", "b": "core"}
-    assert {
-        row["evidence_anchor_id"]
-        for row in proposals[0]["supporting_evidence"]
-    } == {"a-anchor-1", "b-anchor-1"}
+    assert proposals[0]["supporting_evidence"] == []
 
 
 def test_relationship_first_global_plan_requires_verified_pair_connectivity() -> None:
@@ -217,11 +243,7 @@ def test_relationship_first_global_plan_requires_verified_pair_connectivity() ->
         len(row["source_ids"]) == 2
         for row in mapped["clusters"][0]["family_relations"]
     )
-    assert {
-        reference["evidence_anchor_id"]
-        for row in mapped["clusters"][0]["family_relations"]
-        for reference in row["evidence"]
-    } == {"a-anchor-2", "b-anchor-2", "c-anchor-2"}
+    assert all(row["evidence"] == [] for row in mapped["clusters"][0]["family_relations"])
     assert any(
         row["proposal_id"] == "unsupported"
         and row["reason"] == "no_valid_connected_family_relation"
@@ -638,6 +660,10 @@ def test_note_based_cluster_context_accepts_claims_and_checks_source_ownership()
     }
     relationships = [
         {
+            **base, "output_contract": "relationship-decision-v11",
+            "relation_id": "ordinary-note-link", "reason": "A useful connection.",
+        },
+        {
             **base,
             "relation_id": "claim-only",
             "source_evidence": {"source_id": "a", "claim": "A claim"},
@@ -674,14 +700,15 @@ def test_note_based_cluster_context_accepts_claims_and_checks_source_ownership()
 
     context = _cluster_relationship_context(relationships, {"a", "b"})
 
-    assert [row["relation_id"] for row in context] == ["claim-only", "owned-anchors"]
+    assert [row["relation_id"] for row in context] == ["ordinary-note-link", "claim-only", "owned-anchors"]
     assert [
         (row["source_id"], row["evidence_anchor_id"])
-        for row in context[1]["evidence"]
+        for row in context[2]["evidence"]
     ] == [("a", "a-1"), ("b", "b-1")]
 
 
-def test_planned_cluster_neighbors_project_reciprocally() -> None:
+@pytest.mark.parametrize("note_based", [False, True])
+def test_planned_cluster_neighbors_project_reciprocally(note_based: bool) -> None:
     evidence = [
         {"source_id": "a", "evidence_anchor_id": "a-1", "locator": "p. 1"},
         {"source_id": "b", "evidence_anchor_id": "b-1", "locator": "p. 2"},
@@ -694,7 +721,8 @@ def test_planned_cluster_neighbors_project_reciprocally() -> None:
                 {
                     "target_cluster_id": "right",
                     "relationship": "Different stages of the same problem.",
-                    "evidence": evidence,
+                    "evidence": [] if note_based else evidence,
+                    "basis_source_ids": ["a", "b"],
                 }
             ],
         },
@@ -705,12 +733,17 @@ def test_planned_cluster_neighbors_project_reciprocally() -> None:
                 {
                     "target_cluster_id": "left",
                     "relationship": "Different stages of the same problem.",
-                    "evidence": evidence,
+                    "evidence": [] if note_based else evidence,
+                    "basis_source_ids": ["a", "b"],
                 }
             ],
         },
     ]
-    syntheses = {"left": {"related_clusters": []}, "right": {"related_clusters": []}}
+    syntheses = {cluster["cluster_id"]: {
+        "cluster_contract": "streamlined-full-note-v3" if note_based else "legacy",
+        "status": "reasoned", "quality_status": "complete",
+        "retained_member_ids": cluster["source_ids"], "related_clusters": [],
+    } for cluster in clusters}
 
     _project_planned_cluster_neighbors(clusters, syntheses)
 
@@ -719,6 +752,12 @@ def test_planned_cluster_neighbors_project_reciprocally() -> None:
     assert left["target_cluster_id"] == "right"
     assert right["target_cluster_id"] == "left"
     assert left["relationship_id"] == right["relationship_id"]
+    if note_based:
+        for synthesis in syntheses.values():
+            synthesis["related_clusters"] = []
+            synthesis["retained_member_ids"] = []
+        _project_planned_cluster_neighbors(clusters, syntheses)
+        assert all(synthesis["related_clusters"] == [] for synthesis in syntheses.values())
 
 
 class _GlobalOnlyReasoner:
@@ -911,7 +950,7 @@ class _ShardedPlanReasoner:
     @property
     def capabilities(self) -> dict:
         return {
-            "context_window_tokens": 80_000,
+            "context_window_tokens": 28_000,
             "supported_output_tokens": 16_000,
             "request_deadline_seconds": 600,
             "capability_identity": "bounded-shard-test",

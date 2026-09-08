@@ -15,6 +15,23 @@ from auto_zettelkasten.pipeline import (
 )
 
 
+def test_neighbor_references_survive_until_all_planning_packets_are_merged() -> None:
+    neighbor = {"left_family_id": "old-one", "right_family_id": "two", "reason": "Useful adjacent contributions."}
+    first = _validate_literature_family_plan(
+        {"literature_families": [], "discovery_jobs": [], "neighboring_families": [neighbor]},
+        lean_rows=[{"source_id": s} for s in "ABCD"], requested_collection_keys=[], allow_empty=True,
+    )
+    assert first["neighboring_families"] == [neighbor]
+    interim = _merge_literature_family_plans(first, {"literature_families": [
+        {"family_id": "one", "source_ids": ["A", "B"], "supersedes_family_ids": ["old-one"]},
+    ]})
+    assert interim["neighboring_families"] == [neighbor]
+    complete = _merge_literature_family_plans(interim, {"literature_families": [
+        {"family_id": "two", "source_ids": ["C", "D"]},
+    ]})
+    assert complete["neighboring_families"] == [neighbor]
+
+
 def test_reviewed_family_exclusion_keeps_other_memberships() -> None:
     result = _apply_reviewed_family_exclusions(
         {

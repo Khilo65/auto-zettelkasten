@@ -577,7 +577,11 @@ CODEX_OUTPUT_CONTRACTS: Mapping[str, Mapping[str, Any]] = {
                     {
                         "left_source_id": _CODEX_STRING,
                         "right_source_id": _CODEX_STRING,
-                        "comparison_proposition": _CODEX_STRING,
+                        "decision": {"type": "string", "enum": ["relationship", "no_relationship"]},
+                        "relation_type": _CODEX_STRING,
+                        "actor_source_id": {"anyOf": [_CODEX_STRING, {"type": "null"}]},
+                        "reference_source_id": {"anyOf": [_CODEX_STRING, {"type": "null"}]},
+                        "reason": _CODEX_STRING,
                         "bridge_job_id": _CODEX_STRING,
                         "rank": _CODEX_INTEGER,
                     }
@@ -675,7 +679,6 @@ CODEX_OUTPUT_CONTRACTS: Mapping[str, Mapping[str, Any]] = {
                                     "source_id": _CODEX_STRING,
                                     "membership_reason": _CODEX_STRING,
                                     "role": _CODEX_STRING,
-                                    "evidence_anchor_ids": _CODEX_STRINGS,
                                 }
                             )
                         ),
@@ -689,7 +692,6 @@ CODEX_OUTPUT_CONTRACTS: Mapping[str, Mapping[str, Any]] = {
                         "right_cluster_id": _CODEX_STRING,
                         "relationship": _CODEX_STRING,
                         "basis_source_ids": _CODEX_STRINGS,
-                        "evidence_anchor_ids": _CODEX_STRINGS,
                     }
                 )
             ),
@@ -1827,6 +1829,7 @@ class _CapabilityAwareReader:
     connect_timeout: float
     request_deadline: float | None
     relationship_decision_contract = "relationship-decision-v10"
+    ordinary_relationship_decision_contract = "relationship-decision-v11"
     reasoning_effort: str | None = None
 
     def _configure_capabilities(self) -> None:
@@ -5789,43 +5792,36 @@ def _relationship_bridge_shard_system_prompt() -> str:
 
 def _relationship_candidate_system_prompt() -> str:
     return (
-        "You retrieve comparisons for Auto-Zettelkasten relationship discovery prompt v20. "
-        "Return exactly one JSON object with candidates and job_outcomes arrays. Each candidate "
-        "contains only left_source_id, right_source_id, comparison_proposition, "
-        "bridge_job_id, and rank. Use only supplied IDs, put the "
-        "canonical lexicographically earlier ID on the left, and never repeat a "
-        "pair. A candidate is a request for later full-note comparison, not a "
-        "published relationship. Treat every family label, why_examine, and "
-        "discovery_goal as a navigation hypothesis that may be wrong, never as "
-        "evidence. Keep a pair only when each endpoint profile independently supplies "
-        "its side of one bounded comparison. Novel synthesis may connect those two "
-        "supplied contributions, but must not invent an unstated mediator, causal "
-        "pathway, construct or actor equivalence, outcome link, or empirical "
-        "classification. A valid sequence requires one work's studied output or "
-        "construct to be the other's studied input or construct; a valid theory-to-"
-        "application bridge requires the same mechanism or object. Before returning each pair, "
-        "remove the family goal and self-check that the two endpoint profiles alone still support "
-        "the stated comparison; otherwise omit it. Prefer fewer grounded pairs to filling a "
-        "target. If "
-        "only broad adjacency remains, return no_more_candidates even below the "
-        "requested target. Respect max_inferred_pairs as the maximum "
-        "number of candidates in this response. Return as many useful pairs as fit "
-        "comfortably in this response. When discovery_mode is bridge_only, return only pairs whose "
-        "supplied collection memberships are disjoint. For bridge_only packets, "
-        "each candidate must name a supplied bridge_job_id and place one endpoint "
-        "on each of that job's source sides. Meet each job's target_candidate_count "
-        "when useful. A source may appear in several genuinely useful comparisons. "
-        "When discovery_mode is complementary_family_discovery, do not repeat "
-        "prior_candidate_pairs and fulfill each supplied family job independently. "
-        "For every supplied discovery job, return exactly one job_outcomes "
-        "row for every supplied bridge_job_id. Use completed when the job was examined "
-        "successfully in this response, or no_more_candidates when you exhausted that job's "
-        "non-trivial comparisons. Neither status requests automatic continuation. A candidate floor is a minimum coverage target, not "
-        "a cap; return additional useful candidates when they are non-trivial. "
-        "Cover multiple theoretical, mechanistic, empirical, "
-        "institutional, implementation, outcome, sequence, and boundary families "
-        "rather than stopping after citations or one theme. Full-note "
-        "adjudication later decides whether and how the works relate."
+        "Auto-Zettelkasten ordinary relationship prompt v21, contract relationship-decision-v11. "
+        "Identify intellectually meaningful relationships across works, disciplines, and levels of abstraction. "
+        "Reason from substantive contributions rather than shared vocabulary alone. Recognize connections "
+        "that broaden understanding or bring different ideas into productive relation. Distinguish useful "
+        "connections from arbitrary associations, and do not attribute claims to a work that it does not make. "
+        "Use the supplied compact note content; navigation goals and family labels are hypotheses, not evidence. "
+        "A contextual or analytical bridge need not share a research question, method, population, or period. "
+        "Keep explanations as specific as the supplied content supports, without inventing detailed findings, "
+        "causal claims, or author engagement. These are final ordinary link decisions; no later model adds an explanation. "
+        "Return one JSON object with candidates and job_outcomes arrays. Each candidate contains only "
+        "left_source_id, right_source_id, decision, relation_type, actor_source_id, reference_source_id, "
+        "reason, bridge_job_id, and rank. Use exact supplied IDs in canonical lexicographic pair order; "
+        "never repeat a pair. For a useful link, decision is relationship and reason is a short explanation "
+        "of why the works are worth reading together. Choose the strongest supported existing type: "
+        "supports, undermines, qualifies, extends, complements, contrasts, rival_explanation, boundary_contrast, "
+        "methodological_fault_line, sequential_relationship, interpretive_or_normative_disagreement, or contextual_connection. "
+        "Supports/undermines describe supporting/incompatible evidence or argument; qualifies establishes a condition; "
+        "extends builds on the reference work; rival_explanation offers a competing explanation; "
+        "sequential_relationship gives an intellectual or process sequence. "
+        "For these directional types, actor and reference must be the two exact endpoints in the supported direction. "
+        "Other types are symmetric and may use null actor/reference. Citation or chronology alone establishes neither support nor direction. "
+        "For an explicitly examined pair with no useful connection, use no_relationship with an honest reason "
+        "and empty relation_type and null actor/reference. An omitted pair is unexamined, not rejected. "
+        "When required_pairs are supplied, return one decision for each, including no_relationship when appropriate. "
+        "Respect max_inferred_pairs, prior_candidate_pairs, and excluded pairs. For each supplied bridge job, "
+        "put one endpoint on each of its source sides and name its bridge_job_id. For bridge_only, "
+        "use only pairs with disjoint supplied collection memberships. Return useful connections within the limit; "
+        "targets are navigation aids, not reasons to manufacture links. Return one job_outcomes row for every "
+        "supplied bridge_job_id, with completed if examined successfully or no_more_candidates if exhausted. "
+        "Neither requests automatic continuation. No invented IDs, locators, evidence inventories, or Markdown."
     )
 
 
@@ -6023,7 +6019,7 @@ def _literature_family_plan_system_prompt() -> str:
 def _cluster_plan_system_prompt() -> str:
     return (
         "You are the global collection-clustering reasoner for Auto-Zettelkasten "
-        "cluster plan prompt v6. Return exactly one JSON object containing "
+        "cluster plan prompt v7. Return exactly one JSON object containing "
         "clusters and neighbor_relationships. For backward compatibility you may "
         "also return an unclustered_sources array, but local code computes current "
         "non-membership and does not need reasons from you. Each cluster "
@@ -6031,12 +6027,10 @@ def _cluster_plan_system_prompt() -> str:
         "organizing_problem, optional guiding_question, optional central_tension, "
         "coherence_rationale, and members. organizing_mode is question, debate, "
         "mechanism, outcome, method, case, historical_problem, or practice_problem. "
-        "Each member contains source_id and membership_reason; role and "
-        "evidence_anchor_ids are optional descriptive routing metadata and never "
-        "determine whether the member may contribute later. Use at least two members. "
+        "Each member contains source_id, membership_reason, and role. Use at least two members. "
         "A neighbor relationship contains left_cluster_id, "
-        "right_cluster_id, relationship, basis_source_ids, and evidence_anchor_ids. "
-        "Its source IDs must come from the supplied cards; anchor IDs are optional. "
+        "right_cluster_id, relationship, and basis_source_ids. "
+        "Its source IDs must belong to the linked clusters and come from the supplied cards. "
         "Return one record per neighboring pair; local code "
         "projects both directions. Do not summarize every source again. Do not infer coherence "
         "from shared tags, methods, geography, or vocabulary alone. Preserve "

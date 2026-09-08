@@ -11,12 +11,14 @@ from .navigation import TYPED_SOURCE_RELATIONS, rank_human_related_links
 
 
 RELATIONSHIP_PROMPT_VERSION = "35"
-RELATIONSHIP_DISCOVERY_PROMPT_VERSION = "20"
+RELATIONSHIP_DISCOVERY_PROMPT_VERSION = "21"
 RELATIONSHIP_REGISTRY_SCHEMA_VERSION = "7"
 RELATIONSHIP_DECISION_SCHEMA_VERSION = "10"
 RELATIONSHIP_DECISION_CONTRACT = "relationship-decision-v10"
+ORDINARY_RELATIONSHIP_DECISION_CONTRACT = "relationship-decision-v11"
 RELATIONSHIP_ENVELOPE_CONTRACTS = frozenset(
-    {"relationship-decision-v8", "relationship-decision-v9", RELATIONSHIP_DECISION_CONTRACT}
+    {"relationship-decision-v8", "relationship-decision-v9",
+     RELATIONSHIP_DECISION_CONTRACT, ORDINARY_RELATIONSHIP_DECISION_CONTRACT}
 )
 RELATIONSHIP_DECISION_NORMALIZATION_VERSION = "4"
 SUBSTANTIVE_RELATION_TYPES = frozenset(
@@ -527,6 +529,7 @@ def _v8_connection_rows(
             connection.get("proposition")
             or connection.get("comparison_proposition")
             or connection.get("shared_proposition")
+            or (connection.get("reason") if job.output_contract == ORDINARY_RELATIONSHIP_DECISION_CONTRACT else "")
             or ""
         )
         actor = text(
@@ -539,6 +542,13 @@ def _v8_connection_rows(
             or connection.get("reference")
             or ""
         )
+        if job.output_contract == ORDINARY_RELATIONSHIP_DECISION_CONTRACT and (
+            {actor, reference} - {"", job.left_source_id, job.right_source_id}
+            or (bool(actor or reference) and {actor, reference} != {job.left_source_id, job.right_source_id})
+        ):
+            parked.append({"pair_job_id": job.pair_job_id,
+                           "reason": "direction_does_not_use_job_pair", "raw": connection})
+            continue
         endpoint_aliases = {
             "source_a": job.left_source_id,
             "left": job.left_source_id,
@@ -2626,6 +2636,7 @@ def _final_v4_relation(row: Mapping[str, Any]) -> bool:
                     ("relationship-decision-v7", "7"),
                     ("relationship-decision-v8", "8"),
                     ("relationship-decision-v9", "9"),
+                    (ORDINARY_RELATIONSHIP_DECISION_CONTRACT, "11"),
                 }
             )
         )
@@ -2657,6 +2668,7 @@ def _final_v4_decision(
                     ("relationship-decision-v7", "7"),
                     ("relationship-decision-v8", "8"),
                     ("relationship-decision-v9", "9"),
+                    (ORDINARY_RELATIONSHIP_DECISION_CONTRACT, "11"),
                 }
             )
         )
@@ -2682,6 +2694,7 @@ def _publishable_machine_relation(row: Mapping[str, Any]) -> bool:
                 "relationship-decision-v8",
                 "relationship-decision-v9",
                 RELATIONSHIP_DECISION_CONTRACT,
+                ORDINARY_RELATIONSHIP_DECISION_CONTRACT,
             }
         )
         or (

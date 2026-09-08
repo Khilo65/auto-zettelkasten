@@ -2889,13 +2889,17 @@ def test_incomplete_cluster_verdict_gets_one_checkpointed_repair_call(
             is_repair = bool((context or {}).get("repair_requirements"))
             self.calls.append("repair" if is_repair else "synthesis")
             cluster = context["cluster"]
+            assert all("claims" not in row and "evidence_anchors" not in row for row in profiles)
+            member_ids = {row["source_id"] for row in profiles}
+            # Replay the legacy response from its frozen source fixtures;
+            # current writer input does not carry the old anchor inventory.
             evidence = [
                 {
                     "source_id": row["source_id"],
-                    "claim_id": row["claims"][0]["claim_id"],
-                    "locator": row["claims"][0]["locator"],
+                    "claim_id": row["findings"][0]["claim_id"],
+                    "locator": row["findings"][0]["locator"],
                 }
-                for row in profiles
+                for row in rows if row["source_id"] in member_ids
             ]
             return {
                 "cluster_id": cluster["cluster_id"],
@@ -2998,13 +3002,17 @@ def test_failed_quality_repair_stays_partial_and_does_not_publish_a_thin_cluster
                 "repair" if (context or {}).get("repair_requirements") else "synthesis"
             )
             cluster = context["cluster"]
+            assert all("claims" not in row and "evidence_anchors" not in row for row in profiles)
+            member_ids = {row["source_id"] for row in profiles}
+            # Replay the legacy response from its frozen source fixtures;
+            # current writer input does not carry the old anchor inventory.
             evidence = [
                 {
                     "source_id": row["source_id"],
-                    "claim_id": row["claims"][0]["claim_id"],
-                    "locator": row["claims"][0]["locator"],
+                    "claim_id": row["findings"][0]["claim_id"],
+                    "locator": row["findings"][0]["locator"],
                 }
-                for row in profiles
+                for row in rows if row["source_id"] in member_ids
             ]
             return {
                 "cluster_id": cluster["cluster_id"],
