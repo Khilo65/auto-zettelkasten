@@ -12,7 +12,7 @@ import unicodedata
 from .files import atomic_write_text, now_iso, read_yaml, sha256_text, slugify, write_yaml
 from .notes import read_note
 
-SOURCE_CATALOGUE_SCHEMA_VERSION = "7"
+SOURCE_CATALOGUE_SCHEMA_VERSION = "8"
 SOURCE_CATALOGUE_SHARD_MAX_CHARS = 36_000
 SOURCE_CATALOGUE_ROUTING_CARD_MAX_CHARS = 1_500
 
@@ -1655,15 +1655,21 @@ def _catalogue_relationship_rows(workspace: Path) -> list[dict[str, Any]]:
         and row.get("source_id")
         and row.get("target_source_id")
         and row.get("relation_id", row.get("link_id"))
-        and _relationship_confidence(row) >= 0.55
+        and _catalogue_relationship_accepted(row)
     ]
 
 
-def _relationship_confidence(row: Mapping[str, Any]) -> float:
+def _catalogue_relationship_accepted(row: Mapping[str, Any]) -> bool:
+    if row.get("output_contract") == "relationship-decision-v11":
+        return (
+            row.get("decision") == "relationship"
+            and row.get("decision_status") == "accepted"
+            and row.get("verification_status") == "final"
+        )
     try:
-        return float(row.get("confidence", 1))
+        return float(row.get("confidence", 1)) >= 0.55
     except (TypeError, ValueError):
-        return 0
+        return False
 
 
 def _catalogue_relationship_ids(

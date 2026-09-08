@@ -97,9 +97,9 @@ def test_build_source_catalogue_projects_profiles_into_collection_shards(tmp_pat
     assert result["source_count"] == 2
     assert result["literature_count"] == 2
     assert result["shard_count"] == 2
-    assert SOURCE_CATALOGUE_SCHEMA_VERSION == "7"
-    assert catalogue["schema_version"] == "7"
-    assert cluster_catalogue["schema_version"] == "7"
+    assert SOURCE_CATALOGUE_SCHEMA_VERSION == "8"
+    assert catalogue["schema_version"] == "8"
+    assert cluster_catalogue["schema_version"] == "8"
     assert catalogue["revision_hash"] == result["revision_hash"]
     assert {row["title"] for row in catalogue["literatures"]} == {"Mediation", "Conflict relapse"}
     assert all(len(row["facets"]) <= 3 for row in catalogue["sources"])
@@ -139,7 +139,7 @@ def test_build_source_catalogue_upgrades_schema_two_locally_and_replays_stably(
     upgraded_bytes = catalogue_path.read_bytes()
     replay = build_source_catalogue(tmp_path, [profile], [note])
 
-    assert yaml.safe_load(upgraded_bytes)["schema_version"] == "7"
+    assert yaml.safe_load(upgraded_bytes)["schema_version"] == "8"
     assert str(catalogue_path) in upgraded["changed_paths"]
     assert replay["changed_paths"] == []
     assert catalogue_path.read_bytes() == upgraded_bytes
@@ -403,3 +403,28 @@ def test_virtual_topic_indexes_are_bounded_overlapping_and_replay_stable(
     replay = build_source_catalogue(tmp_path, profiles, notes)
     assert replay["changed_paths"] == []
     assert {path: path.read_bytes() for path in virtual_paths} == before
+
+
+def test_catalogue_admits_final_ordinary_links_without_confidence(tmp_path: Path) -> None:
+    from auto_zettelkasten.indexes import _catalogue_relationship_rows
+
+    ordinary = {
+        "source_id": "s1", "target_source_id": "s2", "active": True,
+        "output_contract": "relationship-decision-v11",
+        "decision": "relationship", "decision_status": "accepted",
+        "verification_status": "final", "confidence": "",
+    }
+    variants = [
+        {"relation_id": "accepted"},
+        {"relation_id": "pending", "verification_status": "pending"},
+        {"relation_id": "rejected", "decision_status": "rejected"},
+        {"relation_id": "inactive", "active": False},
+        {"relation_id": "legacy-low", "output_contract": "relationship-decision-v4", "confidence": 0.4},
+        {"relation_id": "legacy-high", "output_contract": "relationship-decision-v4", "confidence": 0.8},
+    ]
+    path = tmp_path / "02_source_memory" / "indexes" / "typed_links.yml"
+    path.parent.mkdir(parents=True)
+    path.write_text(yaml.safe_dump({"links": [{**ordinary, **row} for row in variants]}))
+    assert [row["relation_id"] for row in _catalogue_relationship_rows(tmp_path)] == [
+        "accepted", "legacy-high",
+    ]

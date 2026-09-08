@@ -26,12 +26,12 @@ from .notes import (
 )
 
 
-PROFILE_SCHEMA_VERSION = "1.3"
+PROFILE_SCHEMA_VERSION = "1.4"
 PROFILE_SIDECAR_VERSION = "1"
 PROFILE_CHECKPOINT_VERSION = "1"
-PROFILE_PROMPT_VERSION = "6"
+PROFILE_PROMPT_VERSION = "7"
 PROFILE_CLASSIFIER_VERSION = "3"
-PROFILE_ALGORITHM_VERSION = "9"
+PROFILE_ALGORITHM_VERSION = "10"
 COMMITTED_NOTE_ANCHOR_AUGMENTATION_VERSION = "8"
 ANCHOR_ALGORITHM_VERSION = "4"
 SUPPORT_ENVELOPE_VERSION = "1"
@@ -320,8 +320,9 @@ def profile_dependency_payload(
         "classifier_version": str(effective_classifier_version),
         "algorithm_version": str(effective_algorithm_version),
         "profile_schema_version": str(profile_schema_version),
-        "anchor_algorithm_version": str(anchor_algorithm_version),
-        "support_envelope_version": str(support_envelope_version),
+        **({"anchor_algorithm_version": str(anchor_algorithm_version),
+            "support_envelope_version": str(support_envelope_version)}
+           if str(profile_schema_version) != PROFILE_SCHEMA_VERSION else {}),
     }
 
 
@@ -391,59 +392,15 @@ def build_profile_prompt(note_text: str) -> str:
         "boundaries": ["string"],
         "gaps": ["string"],
         "future_research": ["string"],
-        "findings": [],
-        "study_lineage": None,
-        "evidence_anchors": [
-            {
-                "claim": "one bounded finding, argument, observation, or recommendation",
-                "finding_type": "string",
-                "direction": "string",
-                "magnitude": "string",
-                "comparison": "string",
-                "conditions": ["string"],
-                "plain_english_meaning": "string",
-                "uncertainty": "string",
-                "locator": "source-native page, table, figure, chapter, or heading",
-                "locators": ["string"],
-                "qualifiers": ["string"],
-                "support_envelope": {
-                    "empirical_role": "allowed enum",
-                    "argument_role": "allowed enum",
-                    "coverage": "allowed enum",
-                    "scope": {"dimension": ["string"]},
-                    "restrictions": ["string"],
-                    "support_status": "allowed enum",
-                },
-            }
-        ],
+
     }
     return (
         "Create one source-faithful evidence profile from the committed Markdown note below. "
         "Use only this note; do not reread, request, or infer from source full text. Return exactly one JSON object with no fences or commentary. "
         f"Return only this lean analytical shape: {json.dumps(response_shape, sort_keys=True, separators=(',', ':'))}. "
-        "Use only these support_envelope values: empirical_role is descriptive, associational, causal, "
-        "mechanism_evidence, or none; argument_role is conceptual, interpretive, normative, methodological, "
-        "practitioner_guidance, or none; coverage is full_text, limited_text, abstract, metadata, or unknown; "
-        "support_status describes source attribution, not whether the source proves the claim: use supported when the committed note "
-        "explicitly reports that the source makes the finding, argument, observation, or recommendation; support_unknown when the note "
-        "does not let you tell; limited for limited-source coverage; and unsupported only when the note itself does not support attributing "
-        "the statement to the source. A practitioner recommendation can therefore be supported while its restrictions say that it does "
-        "not establish effectiveness. Use none when a role does not apply. "
-        "profile_schema must be evidence_profile. Keep findings empty and study_lineage null. Do not output IDs, source_locators, "
-        "quantitative_result, coverage, validity, context, features, provider, model, dependency hashes, note_status, or any key absent "
-        "from the lean shape; the engine derives those records after the call. Every declared string field must contain a string; use "
-        "an empty string rather than null, an array, or an object. "
-        "For an analytical full-document note, request 8-20 synthesis-relevant evidence anchors when the note supports that many; "
-        "24 is a hard maximum. Do not pad, invent, or collapse an entire detailed note into one omnibus anchor. Adapt the anchors to the "
-        "source: studies may supply findings or mechanisms; theoretical or interpretive work may supply arguments; institutional, meeting, "
-        "conference, policy, practitioner, or web sources may supply observations, recommendations, commitments, or documented practice. "
-        "Keep distinct synthesis-relevant contributions separate when they have different locators or support boundaries. Keep substantive "
-        "findings and anchors only for analytical full-document notes. "
-        "Every substantive anchor needs a traceable locator string and a support_envelope. A page, page range, table, figure, chapter, "
-        "or source-native heading may be used. Do not use a generated atomic-note heading such as Detailed Findings (1) as the locator. "
-        "Statistical anchors also need a plain-English meaning. Preserve whether a number is an "
-        "observed rate, model-predicted probability, coefficient, marginal effect, odds ratio, raw percentage, or other estimand; "
-        "do not transform or equate them.\n\n"
+        "Capture the note's research questions, concepts, methods, mechanisms, populations, outcomes and boundaries "
+        "as compact discovery features. Keep source attribution and distinguish reported findings from interpretation. "
+        "Use empty arrays for features the note does not supply.\n\n"
         f"COMMITTED MARKDOWN NOTE:\n{committed_note}"
     )
 
@@ -560,66 +517,9 @@ def _normalize_reasoner_profile_payload(
         normalized[field_name] = _normalize_reasoner_string_list(
             normalized.get(field_name)
         )
-    # Findings mirror anchors in the current profile model. Keeping only the
-    # bounded anchors avoids duplicate contract surfaces and loses no content.
-    normalized["findings"] = []
-    # Stable lineage is derived from controlled note metadata and explicit note
-    # sections after the call; the model need not reproduce that persistence type.
+    normalized.pop("findings", None)
+    normalized.pop("evidence_anchors", None)
     normalized["study_lineage"] = None
-    raw_anchors = normalized.get("evidence_anchors")
-    if not isinstance(raw_anchors, list):
-        return normalized
-    anchors: list[Any] = []
-    for raw_anchor in raw_anchors:
-        if not isinstance(raw_anchor, Mapping):
-            anchors.append(raw_anchor)
-            continue
-        anchor = dict(raw_anchor)
-        for field_name in ("conditions", "qualifiers"):
-            anchor[field_name] = _normalize_reasoner_string_list(
-                anchor.get(field_name)
-            )
-        raw_legacy_locators = anchor.get("locators")
-        locator_objects: list[Mapping[str, Any]] = []
-        locator_values: list[str] = []
-        if isinstance(raw_legacy_locators, str):
-            locator_values = [raw_legacy_locators] if raw_legacy_locators else []
-        elif isinstance(raw_legacy_locators, Mapping):
-            locator_objects.append(raw_legacy_locators)
-            locator_value = str(raw_legacy_locators.get("value") or "").strip()
-            if locator_value:
-                locator_values.append(locator_value)
-        elif isinstance(raw_legacy_locators, list):
-            for raw_locator in raw_legacy_locators:
-                if isinstance(raw_locator, str) and raw_locator:
-                    locator_values.append(raw_locator)
-                elif isinstance(raw_locator, Mapping):
-                    locator_objects.append(raw_locator)
-                    locator_value = str(raw_locator.get("value") or "").strip()
-                    if locator_value:
-                        locator_values.append(locator_value)
-        if raw_legacy_locators is not None:
-            anchor["locators"] = list(dict.fromkeys(locator_values))
-        if isinstance(anchor.get("locator"), Mapping):
-            anchor["locator"] = str(anchor["locator"].get("value") or "")
-        raw_envelope = anchor.get("support_envelope")
-        if not isinstance(raw_envelope, Mapping):
-            anchors.append(anchor)
-            continue
-        envelope = dict(raw_envelope)
-        raw_scope = envelope.get("scope")
-        if isinstance(raw_scope, Mapping):
-            envelope["scope"] = {
-                str(key): _normalize_reasoner_scope_value(value)
-                for key, value in raw_scope.items()
-            }
-        anchor["support_envelope"] = envelope
-        # Typed locators and quantitative records are deterministically derived
-        # from these strings and finding fields after controlled metadata is bound.
-        anchor.pop("source_locators", None)
-        anchor.pop("quantitative_result", None)
-        anchors.append(anchor)
-    normalized["evidence_anchors"] = anchors
     return normalized
 
 
@@ -776,181 +676,26 @@ def augment_profile_from_committed_note(
     model: str,
     policy: Any = None,
 ) -> tuple[Any, bool]:
-    """Merge newly derivable note anchors into a mechanical profile once.
-
-    Existing v1.1 sidecars can predate the richer atomic-note sections. This
-    repair reads only the committed Markdown note, preserves current anchors,
-    and adds deterministic locator-backed anchors up to the public hard cap.
-    """
+    """Refresh committed-note metadata without rebuilding an evidence inventory."""
 
     refreshed = _refresh_profile_metadata(profile, note_text)
-    metadata_refreshed = refreshed != profile
-    profile = refreshed
+    payload = profile_to_dict(refreshed)
+    payload["profile_schema_version"] = PROFILE_SCHEMA_VERSION
+    payload.pop("findings", None)
+    payload.pop("evidence_anchors", None)
     frontmatter, body = _parse_note(note_text)
-    sections = _markdown_sections(_strip_generated_body(body))
-    enriched_profile = _enrich_profile_v12_records(
-        profile,
-        frontmatter=frontmatter,
-        sections=sections,
-    )
-    records_enriched = enriched_profile != profile or metadata_refreshed
-    profile = enriched_profile
-    payload = profile_to_dict(profile)
-    profile_generation_route = str(
-        (payload.get("context") or {}).get("profile_generation_route") or ""
-    )
-    validity = dict(payload.get("validity") or {})
-    methods_refreshed = False
-    if str(validity.get("algorithm_version") or "") != PROFILE_ALGORITHM_VERSION:
+    if str((payload.get("validity") or {}).get("algorithm_version") or "") != PROFILE_ALGORITHM_VERSION:
         canonical_methods = {term.casefold() for term in _METHOD_TERMS}
-        refreshed_methods = _dedupe(
-            [
-                *[
-                    str(value).strip()
-                    for value in payload.get("methods", []) or []
-                    if str(value).strip().casefold() not in canonical_methods
-                ],
-                *_methods(sections),
-            ]
-        )
-        payload["methods"] = refreshed_methods
-        validity["algorithm_version"] = PROFILE_ALGORITHM_VERSION
-        payload["validity"] = validity
-        profile = profile_from_dict(payload)
-        methods_refreshed = True
-    if str(validity.get("committed_note_anchor_augmentation_version") or "") == (
-        COMMITTED_NOTE_ANCHOR_AUGMENTATION_VERSION
-    ):
-        return profile, records_enriched or methods_refreshed
-    generated = profile_to_dict(
-        deterministic_profile(
-            note_text,
-            source_set_id=source_set_id,
-            provider=provider,
-            model=model,
-            policy=policy,
-        )
+        payload["methods"] = _dedupe([
+            *[str(value).strip() for value in payload.get("methods", [])
+              if str(value).strip().casefold() not in canonical_methods],
+            *_methods(_markdown_sections(_strip_generated_body(body))),
+        ])
+    current = _apply_controlled_profile_metadata(
+        profile_from_dict(payload), note_text, frontmatter,
+        source_set_id=source_set_id, provider=provider, model=model, policy=policy,
     )
-    existing_anchors = [
-        dict(anchor)
-        for anchor in payload.get("evidence_anchors", []) or []
-        if isinstance(anchor, Mapping)
-    ]
-    # A current reasoner profile already contains the source-selected evidence
-    # units needed for synthesis. Adding broad, mechanically generated section
-    # summaries on top of a complete 8+ anchor profile duplicates evidence and
-    # can make an otherwise valid source fail because the mechanical summary has
-    # no independent plain-English gloss. Mechanical augmentation remains useful
-    # for legacy or genuinely sparse profiles only.
-    reasoned_profile_complete = (
-        (
-            len(existing_anchors) >= 8
-            or (
-                bool(existing_anchors)
-                and profile_generation_route == "source_analysis_bundle"
-            )
-        )
-        and str(provider).casefold() not in {"deterministic", "mechanical"}
-    )
-    if reasoned_profile_complete:
-        validity.update(
-            committed_note_anchor_augmentation_version=COMMITTED_NOTE_ANCHOR_AUGMENTATION_VERSION,
-            committed_note_anchor_count_before=len(existing_anchors),
-            committed_note_anchor_count_after=len(existing_anchors),
-            committed_note_anchor_count_added=0,
-        )
-        payload["validity"] = validity
-        return profile_from_dict(payload), True
-    generated_anchors = [
-        dict(anchor)
-        for anchor in generated.get("evidence_anchors", []) or []
-        if isinstance(anchor, Mapping)
-    ]
-    generated_by_semantic_key = {
-        (
-            re.sub(r"\s+", " ", str(anchor.get("claim") or "")).casefold().strip(),
-            str(anchor.get("evidence_role") or "").casefold().strip(),
-        ): anchor
-        for anchor in generated_anchors
-        if str(anchor.get("claim") or "").strip()
-    }
-    merged_by_id: dict[str, dict[str, Any]] = {}
-    existing_semantic_keys = {
-        (
-            re.sub(r"\s+", " ", str(anchor.get("claim") or "")).casefold().strip(),
-            str(anchor.get("evidence_role") or "").casefold().strip(),
-        )
-        for anchor in existing_anchors
-        if str(anchor.get("claim") or "").strip()
-    }
-    for origin, anchor in [
-        *(("existing", anchor) for anchor in existing_anchors),
-        *(("generated", anchor) for anchor in generated_anchors),
-    ]:
-        anchor_id = str(anchor.get("evidence_anchor_id") or "")
-        semantic_key = (
-            re.sub(r"\s+", " ", str(anchor.get("claim") or "")).casefold().strip(),
-            str(anchor.get("evidence_role") or "").casefold().strip(),
-        )
-        if origin == "generated" and semantic_key in existing_semantic_keys:
-            continue
-        if anchor_id and anchor_id not in merged_by_id:
-            candidate = dict(anchor)
-            if origin == "existing":
-                generated_match = generated_by_semantic_key.get(semantic_key)
-                if generated_match and _has_strong_source_locator(generated_match):
-                    current_locator = str(candidate.get("locator") or "").strip()
-                    if (
-                        not current_locator
-                        or _WEAK_BARE_LOCATOR.fullmatch(current_locator)
-                        or not _has_strong_source_locator(candidate)
-                    ):
-                        candidate["locator"] = str(generated_match.get("locator") or "")
-                        candidate["locators"] = list(
-                            generated_match.get("locators") or []
-                        )
-                        candidate["source_locators"] = [
-                            dict(row)
-                            for row in generated_match.get("source_locators", []) or []
-                            if isinstance(row, Mapping)
-                        ]
-                        candidate["revision_hash"] = ""
-            if _ambiguous_mechanical_composite_anchor(candidate):
-                envelope = dict(candidate.get("support_envelope") or {})
-                restrictions = [
-                    str(value)
-                    for value in envelope.get("restrictions", []) or []
-                    if str(value).strip()
-                ]
-                restriction = (
-                    "Mechanical composite spans too many distinct source locations; "
-                    "split or lazily reprofile it before substantive synthesis"
-                )
-                if restriction not in restrictions:
-                    restrictions.append(restriction)
-                envelope.update(
-                    support_status="support_unknown", restrictions=restrictions
-                )
-                candidate["support_envelope"] = envelope
-                # Support status is part of the anchor content revision even
-                # though the source-local identity remains stable.
-                candidate["revision_hash"] = ""
-            merged_by_id[anchor_id] = candidate
-    merged = list(merged_by_id.values())[:24]
-    payload["evidence_anchors"] = merged
-    validity.update(
-        committed_note_anchor_augmentation_version=COMMITTED_NOTE_ANCHOR_AUGMENTATION_VERSION,
-        committed_note_anchor_count_before=len(existing_anchors),
-        committed_note_anchor_count_after=len(merged),
-        committed_note_anchor_count_added=max(0, len(merged) - len(existing_anchors)),
-    )
-    payload["validity"] = validity
-    # The dependency hash identifies the same committed note and profile route;
-    # downstream synthesis fingerprints independently include anchor revisions.
-    payload["dependency_hash"] = str(
-        profile_to_dict(profile).get("dependency_hash") or ""
-    )
-    return profile_from_dict(payload), True
+    return current, current != profile
 
 
 def _ambiguous_mechanical_composite_anchor(anchor: Mapping[str, Any]) -> bool:
@@ -1005,34 +750,8 @@ def deterministic_profile(
         exclusion_reason = _limited_reason(note_status, source_scope, sections)
     source_role = _source_role(frontmatter, sections) if not limited else "context_only"
     questions = [] if limited else _research_questions(sections)
-    detailed_findings = sections.get("Detailed Findings", "")
-    plain_english = sections.get("Plain-English Interpretation", "")
-    locator_text = sections.get("Locators", "")
     populations = [] if limited else _populations(sections)
     outcomes = [] if limited else _labeled_values(body, "outcomes")
-    finding_payloads = (
-        []
-        if limited
-        else _extract_findings(
-            detailed_findings,
-            plain_english,
-            locator_text,
-            note_id=str(frontmatter.get("note_id") or ""),
-            populations=populations,
-            outcomes=outcomes,
-        )
-    )
-    if not limited:
-        finding_payloads.extend(
-            _extract_central_argument_findings(
-                sections,
-                locator_text,
-                note_id=str(frontmatter.get("note_id") or ""),
-                populations=populations,
-                outcomes=outcomes,
-            )
-        )
-    findings = [_construct_finding(payload) for payload in finding_payloads[:24]]
     support_boundaries = _support_boundaries(sections, exclusion_reason)
     semantic_hash = semantic_note_hash(note_text)
     dependency_hash = profile_dependency_fingerprint(
@@ -1125,7 +844,6 @@ def deterministic_profile(
             if not limited
             else None
         ),
-        "findings": findings,
         "limitations": []
         if limited
         else _content_items(sections.get("Limitations", "")),
@@ -1143,11 +861,7 @@ def deterministic_profile(
         "model": model,
         "dependency_hash": dependency_hash,
     }
-    return _enrich_profile_v12_records(
-        _construct_profile(canonical),
-        frontmatter=frontmatter,
-        sections=sections,
-    )
+    return _construct_profile(canonical)
 
 
 def _enrich_profile_v12_records(
@@ -1158,6 +872,8 @@ def _enrich_profile_v12_records(
 ) -> Any:
     """Mechanically add v1.2 records when the public model supports them."""
 
+    if getattr(profile, "profile_schema_version", "") == PROFILE_SCHEMA_VERSION:
+        return profile
     profile_class, _ = _model_classes()
     profile_fields = {field.name for field in fields(profile_class)}
     anchor_class, _ = _anchor_classes()
@@ -1303,7 +1019,7 @@ def _enrich_profile_v12_records(
                 anchor["revision_hash"] = ""
         enriched.append(anchor)
     payload["evidence_anchors"] = enriched
-    payload["profile_schema_version"] = PROFILE_SCHEMA_VERSION
+    payload["profile_schema_version"] = profile.profile_schema_version
     return profile_from_dict(payload)
 
 
@@ -1419,7 +1135,7 @@ def validate_profile(
             warnings.append(
                 f"anchor_{index}:typed_quantitative_result_unresolved"
             )
-    if substantive and not anchors:
+    if substantive and not anchors and payload.get("profile_schema_version") != PROFILE_SCHEMA_VERSION:
         errors.append("analytical_profile_requires_substantive_anchor")
     return ProfileValidation(
         passed=not errors,
@@ -1437,7 +1153,6 @@ def profile_to_dict(profile: Any) -> dict[str, Any]:
     if not isinstance(profile, profile_class) or not is_dataclass(profile):
         raise ProfileContractError("profile must be an EvidenceProfile dataclass")
     payload = _canonical_value(profile.to_dict())
-    payload["profile_schema_version"] = PROFILE_SCHEMA_VERSION
     payload.pop("excluded_from_synthesis", None)
     return payload
 
@@ -1454,9 +1169,9 @@ def profile_from_dict(payload: Mapping[str, Any]) -> Any:
         )
     values = dict(payload)
     version = str(values.get("profile_schema_version") or "1.0")
-    if version not in {"1.0", "1.1", "1.2", PROFILE_SCHEMA_VERSION}:
+    if version not in {"1.0", "1.1", "1.2", "1.3", PROFILE_SCHEMA_VERSION}:
         raise ProfileContractError(f"unsupported profile_schema_version: {version!r}")
-    values["profile_schema_version"] = PROFILE_SCHEMA_VERSION
+    values["profile_schema_version"] = version
     legacy_excluded = bool(values.get("excluded_from_synthesis", False))
     values.setdefault(
         "evidence_eligibility",
@@ -2865,127 +2580,8 @@ def _apply_controlled_profile_metadata(
     source_id = str(frontmatter.get("source_id") or "")
     _, body = _parse_note(note_text)
     sections = _markdown_sections(_strip_generated_body(body))
-    anchor_class, _ = _anchor_classes()
-    anchor_fields = {field.name for field in fields(anchor_class)}
-    filtered_findings: list[dict[str, Any]] = []
-    omitted_findings = 0
-    for finding in payload.get("findings", []) or []:
-        candidate = dict(finding)
-        locator = str(candidate.get("locator") or "").strip()
-        if not _TRACEABLE_LOCATOR.search(locator):
-            locator = next(
-                (
-                    str(value).strip()
-                    for value in candidate.get("locators", []) or []
-                    if _TRACEABLE_LOCATOR.search(str(value))
-                ),
-                "",
-            )
-            if locator:
-                candidate["locator"] = locator
-        statistical = bool(candidate.get("is_statistical")) or bool(
-            _STATISTICAL_FIGURE.search(str(candidate.get("claim") or ""))
-        )
-        if not locator or (
-            statistical
-            and not str(candidate.get("plain_english_meaning") or "").strip()
-        ):
-            omitted_findings += 1
-            continue
-        filtered_findings.append(candidate)
-    payload["findings"] = filtered_findings
-    filtered_anchors: list[dict[str, Any]] = []
-    for anchor in payload.get("evidence_anchors", []) or []:
-        candidate = dict(anchor)
-        locator_values = [str(candidate.get("locator") or "")]
-        locator_values.extend(
-            str(value) for value in candidate.get("locators", []) or []
-        )
-        locator = next(
-            (value for value in locator_values if _TRACEABLE_LOCATOR.search(value)), ""
-        )
-        statistical = (
-            str(candidate.get("finding_type") or "").casefold() == "statistical"
-            or bool(_STATISTICAL_FIGURE.search(str(candidate.get("claim") or "")))
-            or bool(_STATISTICAL_FIGURE.search(str(candidate.get("magnitude") or "")))
-            or bool(_STATISTICAL_FIGURE.search(str(candidate.get("uncertainty") or "")))
-        )
-        envelope = dict(candidate.get("support_envelope") or {})
-        if _is_analytical_full_document(frontmatter):
-            # Coverage belongs to the selected source representation and is
-            # controlled by note lineage, not by the profile model. A model
-            # previously labelled many full PDFs as limited_text and thereby
-            # erased whole thematic literatures during cluster admission.
-            envelope["coverage"] = "full_text"
-            if (
-                str(envelope.get("support_status") or "") == "unsupported"
-                and str(envelope.get("argument_role") or "none") != "none"
-            ):
-                # Argumentative, normative, interpretive, and practitioner
-                # anchors establish what the source says. Their restrictions
-                # still determine what that statement cannot prove.
-                envelope["support_status"] = "supported"
-            candidate["support_envelope"] = envelope
-        if "source_locators" in anchor_fields:
-            supplied_locators = candidate.get("source_locators")
-            if not isinstance(supplied_locators, list) or not supplied_locators:
-                candidate["source_locators"] = _source_locator_payloads(
-                    locator,
-                    source_id=source_id,
-                    evidence_anchor_id=str(candidate.get("evidence_anchor_id") or ""),
-                )
-            else:
-                # A model may not promote a generated atomic-note heading by
-                # labelling it source-native. Reclassify known generated values.
-                candidate["source_locators"] = [
-                    {
-                        **dict(row),
-                        "locator_type": "generated_heading",
-                        "source_native": False,
-                        "supports_strong_assertion": False,
-                    }
-                    if isinstance(row, Mapping)
-                    and _GENERATED_NOTE_HEADING.fullmatch(
-                        str(row.get("value") or "").strip()
-                    )
-                    else dict(row)
-                    for row in supplied_locators
-                    if isinstance(row, Mapping)
-                ]
-        if (
-            "quantitative_result" in anchor_fields
-            and statistical
-            and not candidate.get("quantitative_result")
-        ):
-            candidate["quantitative_result"] = _quantitative_result_payload(
-                candidate,
-                source_id=source_id,
-                evidence_anchor_id=str(candidate.get("evidence_anchor_id") or ""),
-                populations=list(payload.get("populations") or []),
-                periods=list(payload.get("periods") or []),
-                outcomes=list(payload.get("outcomes") or []),
-            )
-        source_locator_valid = (
-            _has_strong_source_locator(candidate)
-            if "source_locators" in anchor_fields
-            else bool(locator and _TRACEABLE_LOCATOR.search(locator))
-        )
-        if not source_locator_valid or (
-            statistical
-            and not str(candidate.get("plain_english_meaning") or "").strip()
-        ):
-            continue
-        candidate.update(
-            evidence_anchor_id="",
-            revision_hash="",
-            source_id=source_id,
-            study_family_id=_study_family(frontmatter)["identity"],
-            locator=locator,
-        )
-        if {"source_locators", "quantitative_result"}.intersection(anchor_fields):
-            candidate = _rebind_anchor_extension_ids(candidate, anchor_class)
-        filtered_anchors.append(candidate)
-    payload["evidence_anchors"] = filtered_anchors
+    payload.pop("findings", None)
+    payload.pop("evidence_anchors", None)
     note_hash = semantic_note_hash(note_text)
     payload.update(
         profile_schema="evidence_profile",
@@ -3010,7 +2606,6 @@ def _apply_controlled_profile_metadata(
         profile_prompt_version=PROFILE_PROMPT_VERSION,
         classifier_version=PROFILE_CLASSIFIER_VERSION,
         algorithm_version=PROFILE_ALGORITHM_VERSION,
-        omitted_untraceable_or_uninterpreted_finding_count=omitted_findings,
     )
     payload["validity"] = validity
     coverage = dict(payload.get("coverage") or {})

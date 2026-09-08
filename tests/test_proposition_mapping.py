@@ -1052,7 +1052,7 @@ def test_nested_proposals_with_the_same_human_label_merge_into_one_cluster() -> 
     mapped = map_overlapping_clusters(
         rows,
         proposals=[proposal("narrow", ["a", "b"]), proposal("broad", ["a", "b", "c"])],
-        propositions=[],
+        propositions=build_literature_propositions(rows),
     )
 
     assert len(mapped["clusters"]) == 1

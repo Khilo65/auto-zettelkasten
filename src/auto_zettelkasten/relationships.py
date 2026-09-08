@@ -20,7 +20,7 @@ RELATIONSHIP_ENVELOPE_CONTRACTS = frozenset(
     {"relationship-decision-v8", "relationship-decision-v9",
      RELATIONSHIP_DECISION_CONTRACT, ORDINARY_RELATIONSHIP_DECISION_CONTRACT}
 )
-RELATIONSHIP_DECISION_NORMALIZATION_VERSION = "4"
+RELATIONSHIP_DECISION_NORMALIZATION_VERSION = "5"
 SUBSTANTIVE_RELATION_TYPES = frozenset(
     {
         "supports",
@@ -532,6 +532,21 @@ def _v8_connection_rows(
             or (connection.get("reason") if job.output_contract == ORDINARY_RELATIONSHIP_DECISION_CONTRACT else "")
             or ""
         )
+        direction_warnings: list[str] = []
+        if (
+            job.output_contract == ORDINARY_RELATIONSHIP_DECISION_CONTRACT
+            and relation_type in SUBSTANTIVE_RELATION_TYPES - SYMMETRIC_RELATION_TYPES
+            and all(key in connection for key in ("actor_source_id", "reference_source_id"))
+            and all(
+                value is None or (isinstance(value, str) and not value.strip())
+                for value in (
+                    connection.get("actor_source_id"), connection.get("reference_source_id"),
+                    connection.get("actor"), connection.get("reference"),
+                )
+            )
+        ):
+            direction_warnings.append(f"missing_direction_normalized_to_contextual:{relation_type}")
+            relation_type = "contextual_connection"
         actor = text(
             connection.get("actor_source_id")
             or connection.get("actor")
@@ -629,6 +644,7 @@ def _v8_connection_rows(
                 )[:16],
                 "output_contract": job.output_contract,
                 "_contract_warnings": [
+                    *direction_warnings,
                     *(
                         ["normalized_relation_decision_shorthand"]
                         if shorthand

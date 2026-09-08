@@ -81,6 +81,7 @@ def _profile(source_id: str, *, literature: str = "") -> dict[str, Any]:
 
 def _relationship_profile(source_id: str) -> EvidenceProfile:
     return EvidenceProfile(
+        profile_schema_version="1.3",  # Legacy v4 relationship evidence contract.
         source_id=source_id,
         note_id=f"note-{source_id.lower()}",
         context={

@@ -46,25 +46,16 @@ def _profile(source_id: str) -> dict[str, object]:
     }
 
 
-def test_source_bundle_prompt_uses_one_shot_statistical_interpretation() -> None:
+def test_source_bundle_prompt_uses_one_shot_statistical_interpretation():
     prompt = _source_bundle_system_prompt()
-
-    assert "source bundle prompt v39" in prompt
+    assert "source bundle prompt v40" in prompt
     assert "key_concepts_and_definitions" in prompt
     assert "source_structure_and_organization" in prompt
-    assert "omit the field entirely" in prompt
-    assert "short exact quotation" in prompt
-    assert "supplied page number" in prompt
-    assert "never invent locators" in prompt
-    assert "9 percentage points lower" in prompt
-    assert "22.5% lower relative" in prompt
-    assert "odds, hazards, risks, and probabilities distinct" in prompt
-    assert "Do not convert a logit coefficient or interaction" in prompt
-    assert "p-value is not an effect size" in prompt
-    assert "Do not return stable IDs" in prompt
-    assert "or a self-review object" in prompt
-    assert "another model call" in prompt
-    assert "without calculating new ones" not in prompt
+    assert "plain English alongside their technical meaning" in prompt
+    assert "original scales" in prompt
+    assert "modeled estimates" in prompt
+    assert "evidence_anchors" not in prompt
+
 
 
 def test_cluster_plan_can_omit_unclustered_reasons() -> None:

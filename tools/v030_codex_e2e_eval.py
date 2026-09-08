@@ -47,6 +47,10 @@ _GRAPH500_CASE_COUNT = 500
 _GRAPH500_RELATIONSHIP_LIMIT = 233
 _GRAPH500_DEADLINE_SECONDS = 14_400
 _GRAPH500_STAGE = "graph500"
+_GRAPH212_STAGE = "graph212"
+_GRAPH212_SELECTION_SHA256 = (
+    "91ad01a514eafe57ac3c82b4e312838c0d863ad2221f2340e99ca244b681cf15"
+)
 _GRAPH500_QUESTION = "Which relationships and clusters organize this sample?"
 _GRAPH500_CONFIG_SHA256 = (
     "62cb726a98c75db3cdef5d5b721d5a762d411e52e6a1ff9c4559720e3c913d75"
@@ -1225,9 +1229,11 @@ def _manifest_settings(
     )
     if kind == "raw_e2e" and settings.case_count > 40:
         raise ValueError("raw E2E gate supports at most 40 cases")
+    reduced_graph = settings.stage == _GRAPH212_STAGE
+    graph_identity = _GRAPH212_SELECTION_SHA256 if reduced_graph else _GRAPH500_MANIFEST_SHA256
     if kind == "graph_e2e" and (
-        settings.case_count != _GRAPH500_CASE_COUNT
-        or settings.stage != _GRAPH500_STAGE
+        settings.case_count != (212 if reduced_graph else _GRAPH500_CASE_COUNT)
+        or settings.stage not in {_GRAPH500_STAGE, _GRAPH212_STAGE}
         or settings.source_attempt_limit != 0
         or settings.relationship_attempt_limit != _GRAPH500_RELATIONSHIP_LIMIT
         or settings.total_attempt_limit != _GRAPH500_RELATIONSHIP_LIMIT
@@ -1235,9 +1241,9 @@ def _manifest_settings(
         or settings.stage_deadline_seconds != _GRAPH500_DEADLINE_SECONDS
         or not settings.clusters_enabled
         or manifest.get("selection_manifest_sha256")
-        != _GRAPH500_MANIFEST_SHA256
+        != graph_identity
     ):
-        raise ValueError("graph E2E controls do not match the frozen 500-work gate")
+        raise ValueError("graph E2E controls do not match the frozen graph gate")
     if gate != settings.manifest_binding():
         raise ValueError("E2E manifest gate controls are not canonical")
     if kind == "raw_e2e":
@@ -1283,6 +1289,17 @@ def _graph_inputs(
     authorization_path: Path | None = None,
 ) -> tuple[Path, list[dict[str, Any]], dict[str, Any]]:
     workspace = base._private(Path(str(manifest.get("workspace") or "")), label="workspace")
+    reduced = settings.stage == _GRAPH212_STAGE
+    approved: dict[str, Any] | None = None
+    if reduced:
+        approved_path = base._private(
+            Path(str(manifest.get("approved_selection") or "")), label="approved selection"
+        )
+        if base._inside(approved_path, workspace) or base.sha256_file(approved_path) != _GRAPH212_SELECTION_SHA256:
+            raise ValueError("graph212 requires the approved external selection")
+        approved = base._mapping(json.loads(approved_path.read_text()), label="approved selection")
+        if approved.get("source_count") != 212 or len(approved.get("sources", [])) != 212:
+            raise ValueError("graph212 approved selection count mismatch")
     if not workspace.is_dir():
         raise ValueError("graph E2E workspace does not exist")
     config_path = _workspace_file(
@@ -1295,7 +1312,10 @@ def _graph_inputs(
         "11_state/workspace_manifest.yml",
         label="workspace manifest",
     )
-    if base.sha256_file(workspace_manifest) != _GRAPH500_WORKSPACE_MANIFEST_SHA256:
+    if (
+        reduced and not _workspace_manifest_is_bound(workspace)
+        or not reduced and base.sha256_file(workspace_manifest) != _GRAPH500_WORKSPACE_MANIFEST_SHA256
+    ):
         raise ValueError("graph E2E workspace manifest is not frozen")
     selection_value = manifest.get("selection_manifest")
     if selection_value != "11_state/harness_bakeoff_manifest.yml":
@@ -1317,7 +1337,8 @@ def _graph_inputs(
     calculated_identity = base.sha256_text(
         json.dumps(selection_identity, sort_keys=True, ensure_ascii=False)
     )
-    if claimed_identity != _GRAPH500_MANIFEST_SHA256 or calculated_identity != claimed_identity:
+    expected_identity = str(manifest.get("materialized_selection_sha256") or "") if reduced else _GRAPH500_MANIFEST_SHA256
+    if not base._SHA256.fullmatch(expected_identity) or claimed_identity != expected_identity or calculated_identity != claimed_identity:
         raise ValueError("graph E2E frozen selection identity mismatch")
     if (
         selection.get("schema_version") != "1"
@@ -1332,6 +1353,21 @@ def _graph_inputs(
     ]
     if len(sources) != settings.case_count:
         raise ValueError("graph E2E selection source count mismatch")
+    if approved is not None:
+        fields = (
+            "source_id", "note_id", "phase", "primary_stratum_id", "note_path",
+            "semantic_note_sha256", "profile_path", "profile_sha256", "bundle_path",
+            "bundle_sha256", "deepest_leaf_packet_key",
+        )
+        expected_rows = [
+            {
+                **{key: row[key] for key in fields},
+                "origin_note_sha256": row["provenance_bindings"][0]["files"]["note"]["sha256"],
+            }
+            for row in approved["sources"]
+        ]
+        if sorted(sources, key=lambda row: row.get("source_id", "")) != sorted(expected_rows, key=lambda row: row["source_id"]):
+            raise ValueError("graph212 materialized sources differ from approved frozen selection")
     source_ids: set[str] = set()
     note_ids: set[str] = set()
     packets: set[str] = set()
@@ -1399,18 +1435,23 @@ def _graph_inputs(
     if (
         len(strata) != 20
         or "" in strata
-        or int(sampling.get("selected_packet_count", -1)) != 51
+        or int(sampling.get("selected_packet_count", -1)) != (23 if reduced else 51)
         or packets != selected_packets
         or "" in packets
     ):
         raise ValueError("graph E2E stratification or packet coverage mismatch")
+    if approved is not None and packets != set(approved["selected_packet_keys"]):
+        raise ValueError("graph212 packet selection mismatch")
     if require_frozen_notes:
         for relative in baseline_paths:
             _workspace_file(workspace, relative, label="graph baseline")
+        expected_count = manifest.get("baseline_file_count") if reduced else _GRAPH500_BASELINE_FILE_COUNT
+        expected_baseline = str(manifest.get("baseline_sha256") or "") if reduced else _GRAPH500_BASELINE_SHA256
         if (
-            len(baseline_paths) != _GRAPH500_BASELINE_FILE_COUNT
-            or _inventory_sha256(workspace, baseline_paths)
-            != _GRAPH500_BASELINE_SHA256
+            type(expected_count) is not int
+            or len(baseline_paths) != expected_count
+            or not base._SHA256.fullmatch(expected_baseline)
+            or _inventory_sha256(workspace, baseline_paths) != expected_baseline
         ):
             raise ValueError("graph E2E frozen baseline identity mismatch")
         _assert_exact_fresh_inventory(
@@ -1421,7 +1462,7 @@ def _graph_inputs(
             ),
         )
     source_set = {
-        "source_set_id": f"source-set-{_GRAPH500_MANIFEST_SHA256[:20]}",
+        "source_set_id": f"source-set-{expected_identity[:20]}",
         "source_ids": sorted(source_ids),
         "note_ids": sorted(note_ids),
     }
@@ -1786,7 +1827,7 @@ def _graph_gate(
         "evaluation_id": evaluation_id,
         "mode": mode,
         "manifest_sha256": manifest_sha256,
-        "selection_manifest_sha256": _GRAPH500_MANIFEST_SHA256,
+        "selection_manifest_sha256": manifest["selection_manifest_sha256"],
         "code_commit": code_commit,
         "run_id": run_id,
         "source_model": "none",

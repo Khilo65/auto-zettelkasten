@@ -366,8 +366,9 @@ def test_evidence_bounded_partial_document_profile_is_analytical() -> None:
     assert profile["evidence_eligibility"] == "substantive_bounded"
     assert "excluded_from_synthesis" not in profile
     assert profile["validity"]["status"] == "valid"
-    assert profile["findings"]
-    assert profile["evidence_anchors"]
+    assert "findings" not in profile
+    assert "evidence_anchors" not in profile
+    assert profile["profile_schema_version"] == "1.4"
     assert _profile_is_analytical(profile) is True
 
 

@@ -281,6 +281,7 @@ def test_typed_untagged_profiles_cluster_semantically_and_tags_are_only_tiebreak
 ):
     typed = [
         EvidenceProfile(
+            profile_schema_version="1.3",  # Explicit historical proposition mapper input.
             source_id=f"source-{index}",
             note_id=f"note-{index}",
             study_family_id=f"family-{index}",

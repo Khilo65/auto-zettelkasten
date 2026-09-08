@@ -55,10 +55,12 @@ def _profile(source_id: str) -> dict[str, Any]:
 def _response(
     cluster: Mapping[str, Any],
     profiles: Sequence[Mapping[str, Any]],
+    *, legacy: bool = False,
 ) -> dict[str, Any]:
     source_ids = [str(row["source_id"]) for row in profiles]
-    return {
-        "cluster_contract": "streamlined-full-note-v1",
+    response = {
+        "cluster_contract": "streamlined-full-note-v1" if legacy else "streamlined-full-note-v4",
+        "debate_state": "complementary_positions",
         "cluster_id": str(cluster["cluster_id"]),
         "status": "accepted",
         "title": "Shared family",
@@ -95,6 +97,11 @@ def _response(
             }
         ],
     }
+    if not legacy:
+        for line in response["lines_of_inquiry"]:
+            for finding in line["study_findings"]:
+                finding.pop("evidence", None)
+    return response
 
 
 @pytest.mark.parametrize("candidate_cluster", [True, False])

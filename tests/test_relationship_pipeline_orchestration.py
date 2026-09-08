@@ -112,6 +112,7 @@ class _Calls:
 
 def _profile(source_id: str, *, collection: str = "") -> EvidenceProfile:
     return EvidenceProfile(
+        profile_schema_version="1.3",  # Explicit legacy fixtures exercise v6/v8 evidence contracts.
         source_id=source_id,
         note_id=f"note-{source_id.lower()}",
         context={

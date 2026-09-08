@@ -83,11 +83,11 @@ GAP_RULES = (
     "cross_cluster_integration",
     "author_stated_gap",
 )
-LITERATURE_ALGORITHM_VERSION = "39"
+LITERATURE_ALGORITHM_VERSION = "40"
 LITERATURE_FAMILY_PLAN_PROMPT_VERSION = "14"
 CLUSTER_PLAN_PROMPT_VERSION = "7"
 CLUSTER_PROPOSAL_PROMPT_VERSION = "17"
-CLUSTER_SYNTHESIS_PROMPT_VERSION = "41"
+CLUSTER_SYNTHESIS_PROMPT_VERSION = "42"
 CLUSTER_PARTITION_POLICY_VERSION = "4"
 CLUSTER_VALIDATION_POLICY_VERSION = "5"
 CLUSTER_EMPTY_RETRY_POLICY_VERSION = "1"
@@ -3341,6 +3341,7 @@ def _same_retained_cluster_synthesis_inputs(
             "guiding_question",
             "central_tension",
             "bottom_line",
+            "debate_state",
             "differences",
             "limits",
             "retained_member_ids",
@@ -3383,6 +3384,7 @@ def _same_retained_cluster_synthesis_inputs(
         "streamlined-full-note-v1",
         "streamlined-full-note-v2",
         "streamlined-full-note-v3",
+        "streamlined-full-note-v4",
     }:
         return False
     retained = {
@@ -5204,7 +5206,9 @@ def _reconcile_evidence_base_groups(rows: list[dict[str, Any]]) -> None:
                 claim["independence_status"] = independence_status
 
 
-def normalize_evidence_profiles(profiles: Sequence[Any]) -> list[dict[str, Any]]:
+def normalize_evidence_profiles(
+    profiles: Sequence[Any], *, include_claims: bool = True
+) -> list[dict[str, Any]]:
     """Pure compatibility boundary for EvidenceProfile models and current note rows."""
     normalized: list[dict[str, Any]] = []
     for position, value in enumerate(profiles):
@@ -5284,7 +5288,7 @@ def normalize_evidence_profiles(profiles: Sequence[Any]) -> list[dict[str, Any]]
             and not limited_coverage
             and evidence_eligibility not in {"context_only", "unavailable"}
         )
-        claims = _normalize_claims(raw, source_id, family_id)
+        claims = _normalize_claims(raw, source_id, family_id) if include_claims else []
         metadata_date = str(
             raw.get("date")
             or context.get("date")
@@ -5515,6 +5519,10 @@ def normalize_evidence_profiles(profiles: Sequence[Any]) -> list[dict[str, Any]]
         ).strip():
             normalized[-1]["observed_document_date_diagnostic"] = observed_date
     _reconcile_evidence_base_groups(normalized)
+    if not include_claims:
+        for row in normalized:
+            row.pop("claims", None)
+            row.pop("evidence_anchors", None)
     return sorted(normalized, key=lambda row: (row["source_id"], row["note_id"]))
 
 
@@ -8423,7 +8431,7 @@ def map_overlapping_clusters(
     analytical = [row for row in rows if row.get("analytical")]
     profile_by_source = {str(row["source_id"]): row for row in analytical}
     proposition_rows = [
-        dict(row) for row in (propositions or build_literature_propositions(rows))
+        dict(row) for row in (build_literature_propositions(rows) if propositions is None else propositions)
     ]
     min_backed = max(3, int(_policy_value(policy, "source_backed_threshold", 3)))
     min_emerging = 2
@@ -10583,6 +10591,8 @@ def _cluster_display_question(
 def _cluster_researcher_status(cluster: Mapping[str, Any]) -> str:
     """Translate admission strength into one useful, non-technical label."""
 
+    if cluster.get("analysis_basis") == "atomic_notes":
+        return f"{len(cluster.get('source_ids', []) or [])}-source thematic cluster"
     status = str(
         cluster.get("qualification_status") or cluster.get("status") or ""
     )
@@ -11555,7 +11565,7 @@ def validate_streamlined_cluster_synthesis(
 ) -> dict[str, Any]:
     """Mechanically validate full-note synthesis without re-judging its prose."""
 
-    note_based = response.get("cluster_contract") == "streamlined-full-note-v3"
+    note_based = response.get("cluster_contract") in {"streamlined-full-note-v3", "streamlined-full-note-v4"}
     cluster_id = str(cluster.get("cluster_id") or "")
     proposed_ids = {
         str(value)
@@ -11570,7 +11580,7 @@ def validate_streamlined_cluster_synthesis(
             )
             if isinstance(anchor, Mapping)
         ]
-        for profile in profiles
+        for profile in (() if note_based else profiles)
         if profile.get("source_id")
     }
 
@@ -11676,7 +11686,7 @@ def validate_streamlined_cluster_synthesis(
         warnings.append("unknown_retained_member_ignored")
         if note_based:
             errors.append("unknown_retained_member")
-    if note_based and (unavailable := retained - claims_by_source.keys()):
+    if note_based and (unavailable := retained - {str(row.get("source_id") or "") for row in profiles}):
         errors.append("retained_member_source_unavailable")
         retained -= unavailable
     if raw_dropped - proposed_ids:
@@ -11916,13 +11926,13 @@ def validate_streamlined_cluster_synthesis(
     contract = str(response.get("cluster_contract") or "")
     raw_dispositions = response.get(
         "acquisition_candidate_dispositions"
-        if contract in {"streamlined-full-note-v2", "streamlined-full-note-v3"}
+        if contract in {"streamlined-full-note-v2", "streamlined-full-note-v3", "streamlined-full-note-v4"}
         else "important_cited_works_not_yet_mapped",
         [],
     ) or []
     uses_legacy_recommendations = False
     if (
-        contract in {"streamlined-full-note-v2", "streamlined-full-note-v3"}
+        contract in {"streamlined-full-note-v2", "streamlined-full-note-v3", "streamlined-full-note-v4"}
         and not raw_dispositions
         and response.get("important_cited_works_not_yet_mapped")
     ):
@@ -11942,7 +11952,7 @@ def validate_streamlined_cluster_synthesis(
                 warnings.append("unknown_acquisition_candidate_ignored")
                 continue
             normalized_row = dict(row)
-            if contract not in {"streamlined-full-note-v2", "streamlined-full-note-v3"} or uses_legacy_recommendations:
+            if contract not in {"streamlined-full-note-v2", "streamlined-full-note-v3", "streamlined-full-note-v4"} or uses_legacy_recommendations:
                 normalized_row["decision"] = "recommend"
             dispositions_by_id[identity].append(normalized_row)
     for identity, canonical in allowed_cited_works.items():
@@ -11965,7 +11975,7 @@ def validate_streamlined_cluster_synthesis(
         if not retained_attributions:
             disposition = "ineligible_member_removed"
         elif (
-            contract not in {"streamlined-full-note-v2", "streamlined-full-note-v3"} or uses_legacy_recommendations
+            contract not in {"streamlined-full-note-v2", "streamlined-full-note-v3", "streamlined-full-note-v4"} or uses_legacy_recommendations
         ) and not rows:
             disposition = "unassessed_legacy_response"
         elif len(unique_rows) > 1:
@@ -14950,6 +14960,45 @@ def _strict_claim_adjudications(
     ]
 
 
+def _note_based_debate_registry(
+    clusters: Sequence[Mapping[str, Any]],
+    syntheses: Mapping[str, Any],
+    *,
+    policy: Any = None,
+) -> dict[str, Any]:
+    """Project the writer's judgment; never infer debate from contrast or counts."""
+    assessments = []
+    for cluster in clusters:
+        cluster_id = str(cluster["cluster_id"])
+        synthesis = _as_mapping(syntheses.get(cluster_id))
+        state = str(synthesis.get("debate_state") or "")
+        explanation = str(synthesis.get("bottom_line") or synthesis.get("synthesis") or "").strip()
+        assessed = (
+            _cluster_projection_is_publishable(synthesis)
+            and state in DEBATE_STATES and bool(explanation)
+        )
+        state = state if assessed else "unassessed"
+        promoted = assessed and state == "mapped_debate" and bool(
+            _policy_value(policy, "auto_promote_debates", True)
+        )
+        assessments.append({
+            "debate_id": f"debate-{_stable_hash([cluster_id, state])[:12]}",
+            "cluster_id": cluster_id,
+            "classification": state,
+            "status": state,
+            "explanation": explanation if assessed else "Debate was not assessed by an accepted synthesis.",
+            "promoted": promoted,
+            "automation_status": "promoted" if promoted else "mapped" if assessed else "pending",
+            "source_ids": list(synthesis.get("retained_member_ids", []) or []),
+            "analysis_basis": "cluster_synthesis",
+            "refresh_pending": bool(synthesis.get("refresh_pending")),
+        })
+    assessments.sort(key=lambda row: row["cluster_id"])
+    debates = [row for row in assessments if row["promoted"]]
+    return {"assessments": assessments, "debates": debates, "debate_candidates": [],
+            "debate_count": len(debates), "debate_candidate_count": 0}
+
+
 def build_debate_registry(
     profiles: Sequence[Any],
     clusters: Sequence[Mapping[str, Any]],
@@ -17831,8 +17880,8 @@ def _project_planned_cluster_neighbors(
                 retained_current = current_sources & set(synthesis.get("retained_member_ids", []))
                 retained_target = target_sources & set(target_synthesis.get("retained_member_ids", []))
                 if not (
-                    synthesis.get("cluster_contract") == "streamlined-full-note-v3"
-                    and target_synthesis.get("cluster_contract") == "streamlined-full-note-v3"
+                    synthesis.get("cluster_contract") in {"streamlined-full-note-v3", "streamlined-full-note-v4"}
+                    and target_synthesis.get("cluster_contract") in {"streamlined-full-note-v3", "streamlined-full-note-v4"}
                     and _cluster_projection_is_publishable(synthesis)
                     and _cluster_projection_is_publishable(target_synthesis)
                     and basis_ids.issubset(retained_current | retained_target)
@@ -17929,7 +17978,7 @@ def _project_cross_cluster_relationships(
             if evidence:
                 return row, evidence
             if (
-                synthesis.get("cluster_contract") == "streamlined-full-note-v3"
+                synthesis.get("cluster_contract") in {"streamlined-full-note-v3", "streamlined-full-note-v4"}
                 and _cluster_projection_is_publishable(synthesis)
                 and source_id in profile_by_source
                 and source_id in cluster_by_id[cluster_id].get("source_ids", [])
@@ -20144,23 +20193,6 @@ def build_literature_report(
 ) -> dict[str, Any]:
     """Pure end-to-end mapper over already-built evidence profiles."""
     accepted_relationship_rows = accepted_relationships or ()
-    normalized = normalize_evidence_profiles(profiles)
-    independence = build_independence_records(normalized)
-    locator_audit = build_locator_audit(normalized)
-    coverage_register = build_coverage_register(normalized, source_set=source_set)
-    _notify_stage(stage_callback, "evidence_anchors")
-    _notify_stage(stage_callback, "relation_mapping")
-    relations = map_profile_relations(normalized)
-    _notify_stage(stage_callback, "topic_neighborhoods")
-    topic_neighborhoods = map_topic_neighborhoods(normalized, relations)
-    _notify_stage(stage_callback, "proposition_mapping")
-    propositions = build_literature_propositions(normalized)
-    _notify_stage(stage_callback, "clustering")
-    analytical_families = {
-        str(row.get("study_family_id") or row.get("source_id") or "")
-        for row in normalized
-        if row.get("analytical")
-    }
     shared_plan = (
         dict(shared_literature_plan)
         if isinstance(shared_literature_plan, Mapping)
@@ -20172,6 +20204,29 @@ def build_literature_report(
     uses_global_cluster_plan = bool(shared_plan) or callable(
         getattr(reasoner, "plan_clusters", None)
     )
+    normalized = normalize_evidence_profiles(
+        profiles, include_claims=not uses_global_cluster_plan
+    )
+    independence = (
+        {"study_lineages": [], "independence_assessments": [], "evidence_base_groups": []}
+        if uses_global_cluster_plan else build_independence_records(normalized)
+    )
+    locator_audit = {} if uses_global_cluster_plan else build_locator_audit(normalized)
+    coverage_register = build_coverage_register(normalized, source_set=source_set)
+    if not uses_global_cluster_plan:
+        _notify_stage(stage_callback, "evidence_anchors")
+    _notify_stage(stage_callback, "relation_mapping")
+    relations = [] if uses_global_cluster_plan else map_profile_relations(normalized)
+    _notify_stage(stage_callback, "topic_neighborhoods")
+    topic_neighborhoods = map_topic_neighborhoods(normalized, relations)
+    if not uses_global_cluster_plan:
+        _notify_stage(stage_callback, "proposition_mapping")
+    propositions = [] if uses_global_cluster_plan else build_literature_propositions(normalized)
+    _notify_stage(stage_callback, "clustering")
+    analytical_families = {
+        str(row.get("study_family_id") or row.get("source_id") or "")
+        for row in normalized if row.get("analytical")
+    }
     global_plan_parked: list[dict[str, Any]] = []
     global_plan_neighbors: list[dict[str, Any]] = []
     global_plan_unclustered: list[dict[str, Any]] = []
@@ -21313,8 +21368,12 @@ def build_literature_report(
             propositions=propositions,
             topic_neighborhoods=topic_neighborhoods,
         )
-    _notify_stage(stage_callback, "evidence_matrices")
-    admission_matrices = build_evidence_matrices(normalized, clustered["clusters"])
+    if not uses_global_cluster_plan:
+        _notify_stage(stage_callback, "evidence_matrices")
+    admission_matrices = (
+        [] if uses_global_cluster_plan
+        else build_evidence_matrices(normalized, clustered["clusters"])
+    )
     admitted_cluster_ids = (
         {
             str(cluster["cluster_id"])
@@ -21488,7 +21547,8 @@ def build_literature_report(
         clustered.get("unclustered_sources", []) or [],
         rejected_matrix_clusters,
     )
-    _apply_researcher_display_safeguards(registry["clusters"], normalized)
+    if not uses_global_cluster_plan:
+        _apply_researcher_display_safeguards(registry["clusters"], normalized)
     mapped_propositions = sorted(
         {
             str(proposition["proposition_id"]): dict(proposition)
@@ -21499,10 +21559,10 @@ def build_literature_report(
         key=lambda row: str(row["proposition_id"]),
     )
     _notify_stage(stage_callback, "support_validation")
-    matrices = build_evidence_matrices(normalized, registry["clusters"])
-    deterministic_debates = build_debate_registry(
+    matrices = ([] if uses_global_cluster_plan else build_evidence_matrices(normalized, registry["clusters"]))
+    deterministic_debates = ({"assessments": []} if uses_global_cluster_plan else build_debate_registry(
         normalized, registry["clusters"], policy=policy
-    )
+    ))
     deterministic_debate_by_cluster = {
         str(row["cluster_id"]): row for row in deterministic_debates["assessments"]
     }
@@ -21672,7 +21732,7 @@ def build_literature_report(
                 "source_ids": ordered,
                 "source_roles": roles,
                 "family_relations": cluster["family_relations"],
-                "cluster_writer_contract": "streamlined-full-note-v3",
+                "cluster_writer_contract": "streamlined-full-note-v4",
             }
         )
         refresh_cluster_lineage(cluster)
@@ -21935,6 +21995,9 @@ def build_literature_report(
             ),
             "synthesis_lineage": str(cluster.get("synthesis_lineage") or ""),
         }
+        if uses_global_cluster_plan:
+            for field in ("proposition_ids", "propositions", "effective_evidence_base_count", "independent_study_family_count"):
+                cluster_card.pop(field, None)
         synthesis_context = {
             "_prior_validated_synthesis": (
                 {**dict(prior_validated_synthesis), "_prior_cluster": prior_cluster}
@@ -22298,7 +22361,7 @@ def build_literature_report(
                 "semantic_identity": semantic_identity,
                 "source_roles": roles,
                 "family_relations": family_relations,
-                "cluster_writer_contract": "streamlined-full-note-v3",
+                "cluster_writer_contract": "streamlined-full-note-v4",
             }
         )
         refresh_cluster_lineage(child)
@@ -22774,14 +22837,15 @@ def build_literature_report(
                     },
                 )
                 if synthesis_response.get("cluster_contract")
-                in {"streamlined-full-note-v1", "streamlined-full-note-v2", "streamlined-full-note-v3"}
+                in {"streamlined-full-note-v1", "streamlined-full-note-v2", "streamlined-full-note-v3", "streamlined-full-note-v4"}
+                else {
+                    "cluster_id": cluster_id, "status": "partial",
+                    "quality_status": "partial", "parked_for_review": True,
+                    "quality_errors": ["cluster_synthesis_unrecognized_contract"],
+                } if uses_global_cluster_plan
                 else validate_cluster_synthesis(
-                    synthesis_response,
-                    cluster,
-                    normalized,
-                    deterministic_debate=deterministic_debate_by_cluster.get(
-                        cluster_id, {}
-                    ),
+                    synthesis_response, cluster, normalized,
+                    deterministic_debate=deterministic_debate_by_cluster.get(cluster_id, {}),
                     all_clusters=registry["clusters"],
                 )
             )
@@ -23333,7 +23397,8 @@ def build_literature_report(
             clustered.get("unclustered_sources", []) or [],
             rejected_matrix_clusters,
         )
-        _apply_researcher_display_safeguards(registry["clusters"], normalized)
+        if not uses_global_cluster_plan:
+            _apply_researcher_display_safeguards(registry["clusters"], normalized)
         mapped_propositions = sorted(
             {
                 str(proposition["proposition_id"]): dict(proposition)
@@ -23343,10 +23408,10 @@ def build_literature_report(
             }.values(),
             key=lambda row: str(row["proposition_id"]),
         )
-        matrices = build_evidence_matrices(normalized, registry["clusters"])
-        deterministic_debates = build_debate_registry(
+        matrices = ([] if uses_global_cluster_plan else build_evidence_matrices(normalized, registry["clusters"]))
+        deterministic_debates = ({"assessments": []} if uses_global_cluster_plan else build_debate_registry(
             normalized, registry["clusters"], policy=policy
-        )
+        ))
         deterministic_debate_by_cluster = {
             str(row["cluster_id"]): row
             for row in deterministic_debates["assessments"]
@@ -23359,10 +23424,12 @@ def build_literature_report(
         else _quantitative_comparison_records(cluster_syntheses)
     )
     _notify_stage(stage_callback, "debate_mapping", active_cluster="")
-    debates = apply_cluster_syntheses_to_debates(
-        deterministic_debates,
-        cluster_syntheses,
-        policy=policy,
+    debates = (
+        _note_based_debate_registry(registry["clusters"], cluster_syntheses, policy=policy)
+        if uses_global_cluster_plan
+        else apply_cluster_syntheses_to_debates(
+            deterministic_debates, cluster_syntheses, policy=policy
+        )
     )
     _notify_stage(stage_callback, "gap_detection")
     # Built-in v0.14 maps leave gap research to a downstream workflow. Keep
@@ -23392,8 +23459,9 @@ def build_literature_report(
         row for row in generated_candidates if not row.get("specificity_errors")
     ]
     _notify_stage(stage_callback, "internal_falsification")
-    validated, search_log = search_and_validate_gaps(
-        candidates, normalized, policy=policy
+    validated, search_log = (
+        ([], []) if uses_global_cluster_plan
+        else search_and_validate_gaps(candidates, normalized, policy=policy)
     )
     deterministic_rejections = [
         row
@@ -23477,10 +23545,9 @@ def build_literature_report(
             for row in navigation.get("typed_relations", []) or []
             if isinstance(row, Mapping)
         }
-        for row in build_proposition_source_relations(
-            navigation_profiles,
-            mapped_propositions,
-        ):
+        for row in ([] if uses_global_cluster_plan else build_proposition_source_relations(
+            navigation_profiles, mapped_propositions,
+        )):
             relation_by_id[str(row["relation_id"])] = row
         navigation["typed_relations"] = [
             relation_by_id[key] for key in sorted(relation_by_id)
@@ -23508,7 +23575,7 @@ def build_literature_report(
     else:
         navigation = build_navigation_projection(
             None,
-            profiles,
+            normalized if uses_global_cluster_plan else profiles,
             source_notes,
             navigation_policy=navigation_policy,
             propositions=mapped_propositions,
@@ -23596,6 +23663,9 @@ def build_literature_report(
     manifest = {
         "mapper_version": CURRENT_ENGINE_VERSION,
         "algorithm_version": LITERATURE_ALGORITHM_VERSION,
+        "analysis_basis": "atomic_notes" if uses_global_cluster_plan else "legacy_claims",
+        "report_contract_version": "2" if uses_global_cluster_plan else "1",
+        "gap_evaluation_status": "not_evaluated" if uses_global_cluster_plan else "evaluated",
         "profile_count": len(normalized),
         "analytical_profile_count": sum(1 for row in normalized if row["analytical"]),
         "limited_profile_count": sum(1 for row in normalized if row["limited"]),
@@ -23730,6 +23800,20 @@ def build_literature_report(
         "not_method_ready_bundle": True,
         "not_manuscript_text": True,
     }
+    if uses_global_cluster_plan:
+        for cluster in registry["clusters"]:
+            cluster["analysis_basis"] = "atomic_notes"
+            for field in (
+                "effective_evidence_base_count", "independent_study_family_count",
+                "core_evidence_base_group_ids", "qualifying_proposition_family_count",
+            ):
+                cluster.pop(field, None)
+        for field in tuple(manifest):
+            if field.startswith(("strict_", "strong_gap_")) or field in {
+                "proposition_count", "quantitative_comparison_count",
+                "unsupported_quantitative_comparison_count", "rejected_generated_locator_count",
+            }:
+                manifest.pop(field, None)
     incomplete_synthesis_ids = {
         cluster_id
         for cluster_id, synthesis in cluster_syntheses.items()
@@ -23804,7 +23888,7 @@ def build_literature_report(
             "unclustered_sources": clustered["unclustered_sources"],
             "max_cluster_memberships": clustered["max_cluster_memberships"],
         },
-        "evidence_matrices": matrices,
+        **({} if uses_global_cluster_plan else {"evidence_matrices": matrices}),
         "cluster_syntheses": cluster_syntheses,
         "cluster_acquisition_ledger": acquisition_ledger,
         "cluster_source_contributions": {
@@ -23816,6 +23900,7 @@ def build_literature_report(
         "coverage_register": coverage_register,
         "debate_registry": debates,
         "gap_registry": {
+            "status": "not_evaluated" if uses_global_cluster_plan else "evaluated",
             "allowed_rules": list(GAP_RULES),
             "gaps": gaps,
             "rejected_candidates": rejected_gaps,
@@ -25206,7 +25291,7 @@ def _cluster_markdown(
     cluster_by_id = cluster_by_id or {}
     if (
         synthesis.get("cluster_contract")
-        in {"streamlined-full-note-v1", "streamlined-full-note-v2", "streamlined-full-note-v3"}
+        in {"streamlined-full-note-v1", "streamlined-full-note-v2", "streamlined-full-note-v3", "streamlined-full-note-v4"}
     ):
         return _streamlined_cluster_markdown(
             cluster,
@@ -26882,7 +26967,7 @@ def _literature_map_markdown_v09(
         (
             "## What this map does\n\n"
             "This is the collection-level overview of the frozen Zotero source set. Atomic notes analyze individual "
-            "sources; cluster notes compare sources that address the same propositions; this map shows how those "
+            "sources; cluster notes synthesize related works; this map shows how those "
             "clusters, relationships, and collection-relative gaps fit together. It does not make a claim about the "
             "complete published literature."
         ),
@@ -27042,7 +27127,9 @@ def _literature_map_markdown_v09(
             f"- {_gap_wikilink(gap)} — {status}"
             + (f": {statement}" if statement else "")
         )
-    if not gap_lines:
+    if report.get("gap_registry", {}).get("status") == "not_evaluated":
+        gap_lines = ["Gap research was not evaluated by this mapping workflow."]
+    elif not gap_lines:
         gap_lines.append(
             "No gap survived the collection-wide specificity, non-obviousness, worth, and internal-falsification gates. "
             "This means no defensible collection-relative gap was established, not that the wider literature has no gaps."
@@ -27112,7 +27199,7 @@ def _literature_map_markdown_v09(
     sections.append(
         "## Navigate\n\n"
         "- [[clusters/INDEX|Cluster Index]] — concise navigation to the admitted clusters\n"
-        "- [[gaps/INDEX|Gap Registry Index]] — collection-relative gaps and leads\n"
+        "- [[gaps/INDEX|Gap Registry Index]] — gap evaluation status\n"
         "- [[02_source_memory/indexes/INDEX|Source Index]] — every generated source note"
     )
     return _markdown_with_frontmatter(frontmatter, "\n\n".join(sections))
@@ -27571,7 +27658,9 @@ def _literature_map_markdown(
         )
     else:
         searched_count = len(report.get("internal_search_log", []) or [])
-        if searched_count:
+        if gap_registry.get("status") == "not_evaluated":
+            gap_outcome = "Gap research was not evaluated by this mapping workflow."
+        elif searched_count:
             gap_outcome = (
                 f"No candidate survived adjudication after {searched_count} collection-wide internal search"
                 f"{'es' if searched_count != 1 else ''}."
@@ -27595,7 +27684,7 @@ def _literature_map_markdown(
     sections.append(
         "## Navigate\n\n"
         "- [[clusters/INDEX|Cluster Index]] — every admitted research conversation\n"
-        "- [[gaps/INDEX|Gap Registry Index]] — visible collection-relative gaps and leads\n"
+        "- [[gaps/INDEX|Gap Registry Index]] — gap evaluation status\n"
         "- [[02_source_memory/indexes/INDEX|Source Index]] — every generated source note"
     )
     return _markdown_with_frontmatter(
@@ -27710,6 +27799,11 @@ def persist_literature_report(
         directory.mkdir(parents=True, exist_ok=True)
 
     generated_at = now_iso()
+    note_based = report.get("manifest", {}).get("analysis_basis") == "atomic_notes"
+    retired_artifacts = {
+        "evidence_matrices", "propositions", "study_lineage_registry",
+        "independence_assessments", "quantitative_comparisons", "locator_audit",
+    } if note_based else set()
     clusters = list(report["cluster_registry"]["clusters"])
     gaps = list(report["gap_registry"]["gaps"])
     profile_by_source = {
@@ -27736,7 +27830,7 @@ def persist_literature_report(
             cluster_id = str(cluster_id)
             if cluster_id in cluster_by_id:
                 rejected_gaps_by_cluster[cluster_id].append(dict(gap))
-    matrix_by_cluster = {row["cluster_id"]: row for row in report["evidence_matrices"]}
+    matrix_by_cluster = {row["cluster_id"]: row for row in report.get("evidence_matrices", [])}
     debate_by_cluster = {
         row["cluster_id"]: row for row in report["debate_registry"]["assessments"]
     }
@@ -27792,7 +27886,7 @@ def persist_literature_report(
         compatibility_clusters,
         {
             "updated_at": generated_at,
-            "minimum_independent_study_families": 2,
+            **({} if note_based else {"minimum_independent_study_families": 2}),
             "clusters": clusters,
             "unclustered_sources": report["cluster_registry"]["unclustered_sources"],
         },
@@ -27835,10 +27929,11 @@ def persist_literature_report(
     quantitative_path = root / "quantitative_comparisons.yml"
     locator_audit_path = root / "locator_audit.yml"
     coverage_register_path = root / "coverage_register.yml"
-    write_yaml(
-        matrix_path,
-        {"updated_at": generated_at, "matrices": report["evidence_matrices"]},
-    )
+    if not note_based:
+        write_yaml(
+            matrix_path,
+            {"updated_at": generated_at, "matrices": report["evidence_matrices"]},
+        )
     navigation_facets_payload = {
         "updated_at": generated_at,
         "purpose": "machine_navigation_only",
@@ -27940,10 +28035,11 @@ def persist_literature_report(
             "counts": canonical_manifest,
         },
     }
-    write_yaml(
-        proposition_path,
-        {"updated_at": generated_at, "propositions": report.get("propositions", [])},
-    )
+    if not note_based:
+        write_yaml(
+            proposition_path,
+            {"updated_at": generated_at, "propositions": report.get("propositions", [])},
+        )
     write_yaml(
         debate_path, {"updated_at": generated_at, **dict(report["debate_registry"])}
     )
@@ -27954,23 +28050,25 @@ def persist_literature_report(
         acquisition_ledger_path,
         dict(report.get("cluster_acquisition_ledger", {})),
     )
-    write_yaml(
-        study_lineage_path,
-        {
-            "updated_at": generated_at,
-            "version": STUDY_LINEAGE_VERSION,
-            "study_lineages": report.get("study_lineages", []),
-            "evidence_base_groups": report.get("evidence_base_groups", []),
-        },
-    )
-    write_yaml(
-        independence_path,
-        {
-            "updated_at": generated_at,
-            "version": INDEPENDENCE_ALGORITHM_VERSION,
-            "assessments": report.get("independence_assessments", []),
-        },
-    )
+    if not note_based:
+        write_yaml(
+            study_lineage_path,
+            {
+                "updated_at": generated_at,
+                "version": STUDY_LINEAGE_VERSION,
+                "study_lineages": report.get("study_lineages", []),
+                "evidence_base_groups": report.get("evidence_base_groups", []),
+            },
+        )
+    if not note_based:
+        write_yaml(
+            independence_path,
+            {
+                "updated_at": generated_at,
+                "version": INDEPENDENCE_ALGORITHM_VERSION,
+                "assessments": report.get("independence_assessments", []),
+            },
+        )
     write_yaml(
         source_contributions_path,
         {
@@ -27978,17 +28076,19 @@ def persist_literature_report(
             "clusters": report.get("cluster_source_contributions", {}),
         },
     )
-    write_yaml(
-        quantitative_path,
-        {
-            "updated_at": generated_at,
-            "comparisons": report.get("quantitative_comparisons", []),
-        },
-    )
-    write_yaml(
-        locator_audit_path,
-        {"updated_at": generated_at, **dict(report.get("locator_audit", {}))},
-    )
+    if not note_based:
+        write_yaml(
+            quantitative_path,
+            {
+                "updated_at": generated_at,
+                "comparisons": report.get("quantitative_comparisons", []),
+            },
+        )
+    if not note_based:
+        write_yaml(
+            locator_audit_path,
+            {"updated_at": generated_at, **dict(report.get("locator_audit", {}))},
+        )
     write_yaml(
         coverage_register_path,
         dict(report.get("coverage_register", {})),
@@ -28028,6 +28128,7 @@ def persist_literature_report(
     gap_merge_ledger_path = root / "gap_merge_ledger.yml"
     search_path = root / "internal_search_log.yml"
     gap_status = (
+        "not_evaluated" if report.get("gap_registry", {}).get("status") == "not_evaluated" else
         "complete_no_qualifying_gaps"
         if not clusters
         else (
@@ -28079,7 +28180,9 @@ def persist_literature_report(
         "Only bounded, non-obvious collection gaps that survive internal search and feasibility checks appear here.",
         "",
     ]
-    if not gaps:
+    if note_based:
+        gap_index = ["# Gap Registry", "", "Gap research was not evaluated by this mapping workflow."]
+    elif not gaps:
         gap_index.extend(
             [
                 "No candidate survived the specificity, non-obviousness, worth, and collection-wide falsification gates.",
@@ -28290,7 +28393,9 @@ def persist_literature_report(
         "Only bounded, non-obvious collection gaps that survive internal search and feasibility checks appear here.",
         "",
     ]
-    if not gaps:
+    if note_based:
+        canonical_gap_index = ["# Gap Registry", "", "Gap research was not evaluated by this mapping workflow."]
+    elif not gaps:
         canonical_gap_index.extend(
             [
                 "No candidate survived the specificity, non-obviousness, worth, and collection-wide falsification gates.",
@@ -28454,6 +28559,10 @@ def persist_literature_report(
         "cluster_index": str(canonical_cluster_index_path),
         "gap_index": str(canonical_gap_index_path),
     }
+    canonical_artifacts = {
+        key: value for key, value in canonical_artifacts.items()
+        if key not in retired_artifacts
+    }
     manifest_lineage_fields = (
         "note_projection_hashes",
         "semantic_note_hashes",
@@ -28515,6 +28624,11 @@ def persist_literature_report(
         "index": str(index_path),
         "canonical_map": str(canonical_manifest_path),
     }
+    artifact_names = {
+        key: value for key, value in artifact_names.items()
+        if key not in retired_artifacts
+    }
+    paths = [path for path in paths if path.stem not in retired_artifacts]
     manifest_payload = _preserve_existing_projection_fields(
         manifest_path,
         {
@@ -28794,6 +28908,7 @@ def build_literature_map(
         ),
     }
     gap_status = (
+        "not_evaluated" if report.get("gap_registry", {}).get("status") == "not_evaluated" else
         "complete_no_qualifying_gaps"
         if not clusters
         else (

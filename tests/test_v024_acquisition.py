@@ -453,6 +453,11 @@ def test_cluster_acquisition_receipt_exists_before_writer_and_finishes_active(
             ledger = read_yaml(ledger_path)
             assert ledger["revisions"][0]["state"] == "pending"
             response = _cluster_response(context["cluster"], projected)
+            response["cluster_contract"] = "streamlined-full-note-v4"
+            response["debate_state"] = "complementary_positions"
+            for line in response["lines_of_inquiry"]:
+                for finding in line["study_findings"]:
+                    finding.pop("evidence", None)
             response["acquisition_candidate_dispositions"] = [
                 {
                     "external_source_id": "missing-1",

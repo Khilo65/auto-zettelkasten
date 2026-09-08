@@ -51,7 +51,7 @@ def _bundle_from_prompt(prompt: str, marker: str = "bundle-profile") -> dict[str
     assert source_match and key_match
     source_id = source_match.group(1)
     return {
-        "bundle_schema_version": "1",
+        "bundle_schema_version": "2",
         "source_identity": {
             "source_id": source_id,
             "zotero_key": key_match.group(1),
@@ -69,16 +69,6 @@ def _bundle_from_prompt(prompt: str, marker: str = "bundle-profile") -> dict[str
             "inferential_design": "descriptive",
             "concepts": [marker],
         },
-        "evidence_anchors": [
-            {
-                "evidence_anchor_id": f"anchor-{source_id}",
-                "source_id": source_id,
-                "claim": "The source advances a bounded institutional argument.",
-                "locator": "p. 1",
-                "planning_roles": ["thesis", "major_finding"],
-                "salience_priority": 10,
-            }
-        ],
         "literature_positions": [],
         "missing_source_recommendations": [],
         "self_review": {"passed": True},
@@ -585,7 +575,7 @@ class _ExplicitReasoner:
         context: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
         self.profile_calls += 1
-        assert context and context["profile_prompt_version"] == "6"
+        assert context and context["profile_prompt_version"] == "7"
         return _profile_response(str(note["committed_note"]), "explicit-profile")
 
     def propose_clusters(
@@ -637,6 +627,8 @@ class _ConcurrentReasoner(_ExplicitReasoner):
 
 
 class _RelationshipThenClusterFailureReasoner(_ExplicitReasoner):
+    ordinary_relationship_decision_contract = "relationship-decision-v11"
+
     def select_relationship_candidates(
         self,
         profiles: Sequence[EvidenceProfile],
@@ -644,53 +636,21 @@ class _RelationshipThenClusterFailureReasoner(_ExplicitReasoner):
         *,
         context: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
-        left, right = profiles[:2]
-        return {
-            "candidates": [
-                {
-                    "source_id": left.source_id,
-                    "target_kind": "source",
-                    "target_id": right.source_id,
-                    "why_relevant": "Both sources address the same bounded institutional proposition.",
-                    "comparison_unit": "institutional proposition",
-                    "confidence": 0.9,
-                }
-            ]
-        }
+        catalogue = (context or {}).get("catalogue") or [profile_to_dict(p) for p in profiles]
+        left, right = catalogue[:2]
+        return {"candidates": [{
+            "left_source_id": left["source_id"],
+            "right_source_id": right["source_id"],
+            "decision": "relationship",
+            "bridge_job_id": str(((context or {}).get("bridge_jobs") or [{}])[0].get("bridge_job_id") or ""),
+            "relation_type": "complements",
+            "actor_source_id": None,
+            "reference_source_id": None,
+            "reason": "The sources provide complementary evidence for the same bounded institutional proposition.",
+        }]}
 
-    def adjudicate_relationships(
-        self,
-        profiles: Sequence[EvidenceProfile],
-        request: LiteratureMapRequest,
-        *,
-        context: Mapping[str, Any] | None = None,
-    ) -> Mapping[str, Any]:
-        assert context
-        return {
-            "decisions": [
-                {
-                    "pair_job_id": job["pair_job_id"],
-                    "decision": "relationship",
-                    "pair": job["pair"],
-                    "relation_type": "complements",
-                    "actor_source_id": job["pair"]["left_source_id"],
-                    "reference_source_id": job["pair"]["right_source_id"],
-                    "forward_label": "complements",
-                    "inverse_label": "complements",
-                    "comparison_proposition": "The sources address the same bounded institutional proposition.",
-                    "reason": "The sources provide complementary evidence for the same bounded institutional proposition.",
-                    "left_evidence_anchor_ids": [
-                        job["selected_evidence"]["left"][0]["evidence_anchor_id"]
-                    ],
-                    "right_evidence_anchor_ids": [
-                        job["selected_evidence"]["right"][0]["evidence_anchor_id"]
-                    ],
-                    "confidence": "high",
-                    "output_contract": "relationship-decision-v4",
-                }
-                for job in context["pair_jobs"]
-            ]
-        }
+    def adjudicate_relationships(self, *_args: Any, **_kwargs: Any) -> Mapping[str, Any]:
+        raise AssertionError("Ordinary decisions must not trigger a second model judge")
 
     def propose_clusters(
         self,
@@ -1243,7 +1203,7 @@ def test_profile_content_remains_source_owned_across_collection_maps(
     assert "source_set_id" not in profile.context
 
 
-def test_current_mechanical_profile_reuses_unchanged_inspected_source_content(
+def test_stale_mechanical_profile_refresh_preserves_inspected_source_content_without_call(
     tmp_path: Path,
     sample_items,
 ) -> None:
@@ -1266,15 +1226,15 @@ def test_current_mechanical_profile_reuses_unchanged_inspected_source_content(
     )
     profile.validity.update(
         {
-            "profile_prompt_version": "6",
+            "profile_prompt_version": "7",
             "classifier_version": "3",
-            "algorithm_version": "9",
+            "algorithm_version": "10",
             "legacy_profile_upgraded_mechanically": True,
         }
     )
     save_profile(tmp_path / "02_source_memory" / "profiles", profile)
-    profile_path = next((tmp_path / "02_source_memory" / "profiles").glob("*.yml"))
-    frozen_profile = profile_path.read_bytes()
+    frozen_profile = profile_to_dict(profile)
+    frozen_note = (tmp_path / first.items[0]["note_path"]).read_bytes()
     replay_reasoner = _RecoveringReasoner({"ITEMA"})
 
     manifest = build_map(
@@ -1288,7 +1248,13 @@ def test_current_mechanical_profile_reuses_unchanged_inspected_source_content(
 
     assert manifest.status == "built"
     assert replay_reasoner.profile_calls == 0
-    assert profile_path.read_bytes() == frozen_profile
+    refreshed = profile_to_dict(_only_profile(tmp_path))
+    for field in ("source_id", "note_id", "source_hash", "concepts", "methods", "mechanisms"):
+        assert refreshed[field] == frozen_profile[field]
+    assert refreshed["note_hash"] != "stale-projection-hash"
+    assert refreshed["dependency_hash"] != "stale-dependency"
+    assert "evidence_anchors" not in refreshed
+    assert (tmp_path / first.items[0]["note_path"]).read_bytes() == frozen_note
 
 
 def test_stale_deterministic_profile_refreshes_methods_and_dependency_without_a_call(
@@ -1336,7 +1302,7 @@ def test_stale_deterministic_profile_refreshes_methods_and_dependency_without_a_
     assert result.status == "built"
     assert replay_reasoner.profile_calls == 0
     assert refreshed.methods == expected_methods
-    assert refreshed.validity["algorithm_version"] == "9"
+    assert refreshed.validity["algorithm_version"] == "10"
     assert refreshed.dependency_hash == checkpoint["fingerprint"]
 
 
@@ -1432,7 +1398,7 @@ def test_limited_note_uses_deterministic_profile_without_builtin_call(
         ).read_text(encoding="utf-8")
     )
     assert replay.status == "built"
-    assert refreshed.validity["algorithm_version"] == "9"
+    assert refreshed.validity["algorithm_version"] == "10"
     assert refreshed.dependency_hash == checkpoint["fingerprint"]
 
 
@@ -1555,7 +1521,7 @@ def test_cloud_builtin_profile_route_requires_consent(reader) -> None:
         reader.profile_source({"profile_prompt": "private committed note"})
 
 
-def test_builtin_profile_prompt_v3_requires_typed_lineage_locators_and_quantitative_results(
+def test_builtin_profile_prompt_requests_compact_note_based_discovery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
@@ -1569,17 +1535,17 @@ def test_builtin_profile_prompt_v3_requires_typed_lineage_locators_and_quantitat
     monkeypatch.setattr(DeepSeekReader, "_generate_text", generate)
     reader = DeepSeekReader(allow_cloud=True)
 
-    assert (
-        reader.profile_source(
-            {"profile_prompt": "committed note only"},
-            context={"profile_prompt_version": "6"},
-        )
-        == {}
+    profile = reader.profile_source(
+        {"profile_prompt": "committed note only"},
+        context={"profile_prompt_version": "7"},
     )
-    assert "profile prompt v6" in captured["system"]
-    assert "source_locators" in captured["system"]
-    assert "quantitative_result" in captured["system"]
-    assert "study_lineage" in captured["system"]
+    assert profile["profile_schema_version"] == "1.4"
+    assert "evidence_anchors" not in profile
+    assert "compact discovery profile" in captured["system"]
+    assert "committed atomic note" in captured["system"]
+    assert "source_locators" not in captured["system"]
+    assert "quantitative_result" not in captured["system"]
+    assert "evidence_anchors" not in captured["system"]
     assert captured["user"] == "committed note only"
     with pytest.raises(ProviderError, match="unsupported profile prompt version: 2"):
         reader.profile_source(
@@ -1617,6 +1583,7 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
             "organizing_mode": "question",
             "organizing_problem": "How does legitimacy shape settlement durability?",
             "bottom_line": "Legitimacy is associated with durability in the supplied scope.",
+            "debate_state": "complementary_positions",
             "lines_of_inquiry": [
                 {
                     "title": "Legitimacy and durability",
@@ -1627,13 +1594,6 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
                             "finding": "A source-specific result remains relevant.",
                             "method_scope": "Comparative case study.",
                             "relation_to_line": "supports",
-                            "evidence": [
-                                {
-                                    "source_id": "source-a",
-                                    "evidence_anchor_id": "claim-a",
-                                    "locator": "p. 10",
-                                }
-                            ],
                         }
                     ],
                 }
@@ -1826,9 +1786,9 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
         "Temporal: 2000-2020",
         "Regional: African civil wars",
     ]
-    assert synthesis["cluster_contract"] == "streamlined-full-note-v3"
+    assert synthesis["cluster_contract"] == "streamlined-full-note-v4"
     assert synthesis["lines_of_inquiry"][0]["study_findings"][0]["source_id"] == "source-a"
-    assert "cluster synthesis prompt v41" in system_prompts["full-note cluster writer"]
+    assert "cluster synthesis prompt v42" in system_prompts["full-note cluster writer"]
     assert "Read every supplied atomic_note_markdown" in system_prompts[
         "full-note cluster writer"
     ]

@@ -588,6 +588,7 @@ def test_evidence_profile_and_finding_are_serializable() -> None:
         confidence="moderate",
     )
     profile = EvidenceProfile(
+        profile_schema_version="1.3",  # Historical finding/anchor serialization remains supported.
         profile_id="profile-1",
         note_id="note-1",
         source_id="source-1",

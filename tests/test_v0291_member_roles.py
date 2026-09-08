@@ -48,10 +48,12 @@ def _profile(source_id: str) -> dict[str, Any]:
 def _response(
     cluster: Mapping[str, Any],
     profiles: Sequence[Mapping[str, Any]],
+    *, legacy: bool = False,
 ) -> dict[str, Any]:
     source_ids = [str(row["source_id"]) for row in profiles]
-    return {
-        "cluster_contract": "streamlined-full-note-v2",
+    response = {
+        "cluster_contract": "streamlined-full-note-v2" if legacy else "streamlined-full-note-v4",
+        "debate_state": "complementary_positions",
         "cluster_id": str(cluster["cluster_id"]),
         "title": str(cluster.get("label") or "Mapped findings"),
         "organizing_mode": "question",
@@ -88,6 +90,11 @@ def _response(
         "related_clusters": [],
         "acquisition_candidate_dispositions": [],
     }
+    if not legacy:
+        for line in response["lines_of_inquiry"]:
+            for finding in line["study_findings"]:
+                finding.pop("evidence", None)
+    return response
 
 
 def test_writer_roles_survive_validation_and_contributions() -> None:
@@ -273,13 +280,11 @@ def test_writer_roles_propagate_through_registry_round_trip() -> None:
         {"source_id": "B", "role": "core"},
         {"source_id": "C", "role": "context"},
     ]
-    assert cluster["independent_study_family_count"] == 2
-    assert cluster["effective_evidence_base_count"] == 2
-    assert cluster["core_evidence_base_group_ids"] == sorted(
-        str(row["evidence_base_group_id"])
-        for row in report["profiles"]
-        if row["source_id"] in {"A", "B"}
-    )
+    assert cluster["canonical_work_count"] == 3
+    assert cluster["core_source_ids"] == ["A", "B"]
+    assert "independent_study_family_count" not in cluster
+    assert "effective_evidence_base_count" not in cluster
+    assert "core_evidence_base_group_ids" not in cluster
     assert cluster["qualification_status"] == "emerging_cluster"
     assert cluster["source_backed"] is False
     assert {
@@ -442,7 +447,7 @@ def test_relationship_first_writer_receives_admitted_roles() -> None:
 
 def test_cluster_prompt_requires_connected_member_roles_v36() -> None:
     prompt = _cluster_synthesis_system_prompt()
-    assert "prompt v41" in prompt
+    assert "prompt v42" in prompt
     assert "member_roles must map every retained source_id" in prompt
     assert "at least two core sources connected by accepted relationships" in prompt
     assert "different instruments, samples, or time windows" in prompt
@@ -484,7 +489,7 @@ def test_member_without_resolved_evidence_is_removed_before_admission() -> None:
         "source_ids": ["A", "B"],
         "candidate_roles": {"A": "core", "B": "context"},
     }
-    response = _response(cluster, profiles)
+    response = _response(cluster, profiles, legacy=True)
     response["lines_of_inquiry"][0]["study_findings"][1]["evidence"] = []
 
     validated = validate_streamlined_cluster_synthesis(response, cluster, profiles)

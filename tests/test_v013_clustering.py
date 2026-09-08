@@ -829,43 +829,22 @@ class _WarningBearingGlobalReasoner(_GlobalOnlyReasoner):
     def synthesize_cluster(self, profiles, request, *, context=None):
         self.synthesis_calls += 1
         cluster = context["cluster"]
-        evidence = [
-            {
-                "source_id": profile["source_id"],
-                # This adapter returns a frozen legacy response. Current writer
-                # packets no longer supply the historical anchor inventory.
-                "evidence_anchor_id": _profile(profile["source_id"])["evidence_anchors"][0][
-                    "evidence_anchor_id"
-                ],
-                "locator": _profile(profile["source_id"])["evidence_anchors"][0]["locator"],
-            }
-            for profile in profiles
-        ]
         return {
-            "cluster_id": cluster["cluster_id"],
-            "scope": cluster["shared_question"],
-            "boundaries": [],
-            "coherence_rationale": "Both sources directly address the bounded question.",
-            "synthesis": (
-                "Both sources identify a comparable pattern while using distinct cases "
-                "and methods. Their agreement supplies a coherent answer to the shared "
-                "question. The cluster therefore records a recurring empirical pattern."
-            ),
-            "debate_state": "qualified_agreement",
-            "central_findings": [
-                {
-                    "finding": "The sources report a comparable bounded pattern.",
-                    "proposition_id": cluster["proposition_ids"][0],
-                    "evidence": evidence,
-                }
-            ],
-            "source_contributions": [
-                {
-                    "source_id": profiles[0]["source_id"],
-                    "finding": "The first source supplies bounded evidence.",
-                    "evidence": [evidence[0]],
-                }
-            ],
+            "cluster_contract": "streamlined-full-note-v4",
+            "cluster_id": cluster["cluster_id"], "status": "accepted",
+            "title": "Related findings", "organizing_mode": "question",
+            "organizing_problem": "What do the studies contribute?",
+            "bottom_line": "The sources contribute complementary bounded findings.",
+            "debate_state": "complementary_positions",
+            "retained_member_ids": [row["source_id"] for row in profiles],
+            "member_roles": {row["source_id"]: "core" for row in profiles},
+            "lines_of_inquiry": [{
+                "title": "Contributions", "synthesis": "The sources supply complementary findings.",
+                "study_findings": [{"source_id": row["source_id"],
+                    "finding": f"Source {row['source_id']} supplies bounded evidence.",
+                    "method_scope": "Comparative analysis", "relation_to_line": "contextualizes"}
+                    for row in profiles],
+            }],
         }
 
 
@@ -876,18 +855,18 @@ def test_global_plan_publishes_usable_synthesis_with_advisory_quality_warnings(
     profiles = [_profile("a"), _profile("b")]
     profiles[0]["sample_id"] = "sample-a"
     profiles[1]["sample_id"] = "sample-b"
-    original_validator = literature.validate_cluster_synthesis
+    original_validator = literature.validate_streamlined_cluster_synthesis
 
     def advisory_validator(*args, **kwargs):
         result = original_validator(*args, **kwargs)
         result.update(
-            status="partial",
-            quality_status="incomplete",
-            quality_errors=["advisory_quality_warning"],
+            status="reasoned",
+            quality_status="warning",
+            quality_warnings=["advisory_quality_warning"],
         )
         return result
 
-    monkeypatch.setattr(literature, "validate_cluster_synthesis", advisory_validator)
+    monkeypatch.setattr(literature, "validate_streamlined_cluster_synthesis", advisory_validator)
     report = build_literature_report(
         profiles,
         reasoner=reasoner,
@@ -915,7 +894,7 @@ def test_global_plan_keeps_fatal_membership_synthesis_parked(
     fatal_error: str,
 ) -> None:
     reasoner = _WarningBearingGlobalReasoner()
-    original_validator = literature.validate_cluster_synthesis
+    original_validator = literature.validate_streamlined_cluster_synthesis
 
     def fatal_validator(*args, **kwargs):
         result = original_validator(*args, **kwargs)
@@ -927,7 +906,7 @@ def test_global_plan_keeps_fatal_membership_synthesis_parked(
         )
         return result
 
-    monkeypatch.setattr(literature, "validate_cluster_synthesis", fatal_validator)
+    monkeypatch.setattr(literature, "validate_streamlined_cluster_synthesis", fatal_validator)
     report = build_literature_report(
         [_profile("a"), _profile("b")],
         reasoner=reasoner,

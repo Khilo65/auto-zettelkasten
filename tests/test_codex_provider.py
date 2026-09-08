@@ -229,7 +229,6 @@ def test_codex_contract_capabilities_and_typed_retry_policy() -> None:
         "gap_adjudication": 12_288,
     }
     assert CODEX_OUTPUT_CONTRACTS["source_bundle"]["required"] == [
-        "evidence_anchors",
         "analysis_sections",
         "compact_profile",
         "literature_positions",
@@ -258,30 +257,11 @@ def test_codex_contract_capabilities_and_typed_retry_policy() -> None:
     )
 
 
-def test_codex_image_bundle_without_evidence_is_typed_invalid(
+def test_codex_image_bundle_accepts_note_analysis_without_anchor_inventory(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     prompts: list[str] = []
-    payload = {
-        "analysis_sections": {
-            key: "No recovered source text is available." for key in SECTION_KEYS
-        },
-        "compact_profile": {
-            "thesis": "No thesis is recoverable.",
-            "method_or_knowledge_basis": "",
-            "source_genre": "",
-            "inferential_design": "",
-            "mechanisms": [],
-            "outcomes": [],
-            "cases": [],
-            "populations": [],
-            "periods": [],
-            "datasets": [],
-        },
-        "evidence_anchors": [],
-        "literature_positions": [],
-        "observed_bibliographic_identity": {"title": "", "creators": [], "date": ""},
-    }
+    payload = _valid_source_bundle_payload()
     def generate(_reader: CodexReader, _system: str, user: str, *_args, **_kwargs):
         prompts.append(user)
         return payload
@@ -289,13 +269,22 @@ def test_codex_image_bundle_without_evidence_is_typed_invalid(
     monkeypatch.setattr(CodexReader, "_generate_with_reasoning", generate)
     reader = CodexReader("gpt-5.6-luna", allow_cloud=True)
 
+    result = reader.read_source_bundle(
+        "",
+        {"_source_context": {"source_id": "source-zotero-A1", "zotero_key": "A1"}},
+        attachment_paths=[tmp_path / "page.png"],
+    )
+    assert result["bundle_schema_version"] == "2"
+    assert result["analysis_sections"] == payload["analysis_sections"]
+    assert "evidence_anchors" not in result
+    assert "attached page images are the inspected source content" in prompts[0]
+    payload.pop("analysis_sections")
     with pytest.raises(ProviderInvalidSourceBundle):
         reader.read_source_bundle(
             "",
             {"_source_context": {"source_id": "source-zotero-A1", "zotero_key": "A1"}},
             attachment_paths=[tmp_path / "page.png"],
         )
-    assert "attached page images are the inspected source content" in prompts[0]
 
 
 def test_codex_evidence_profile_contract_remains_dormant_in_production(
@@ -1608,19 +1597,6 @@ def _valid_source_bundle_payload() -> dict[str, object]:
             "periods": [],
             "datasets": [],
         },
-        "evidence_anchors": [
-            {
-                "claim": "The attached source supports the bounded claim.",
-                "locator": "p. 1",
-                "planning_roles": ["finding"],
-                "salience_priority": 10,
-                "evidence_role": "descriptive",
-                "support_boundary": "The attached PDF only.",
-                "plain_english_meaning": "The source supports the claim.",
-                "uncertainty": "No external evidence was considered.",
-                "quantitative_result": None,
-            }
-        ],
         "literature_positions": [],
         "observed_bibliographic_identity": {
             "title": "",
@@ -1931,7 +1907,8 @@ def test_codex_pdf_app_server_sends_exact_ordered_file_text_and_contract(
         attachment_paths=[pdf],
     )
 
-    assert result["evidence_anchors"][0]["locator"] == "p. 1"
+    assert result["analysis_sections"] == _valid_source_bundle_payload()["analysis_sections"]
+    assert "evidence_anchors" not in result
     captured = json.loads(capture.read_text(encoding="utf-8"))
     assert captured["argv"][1] == "app-server"
     assert 'model_provider="openai"' in captured["argv"]
@@ -1978,7 +1955,7 @@ def test_codex_pdf_app_server_sends_exact_ordered_file_text_and_contract(
         "networkAccess": False,
     }
     assert turn["outputSchema"]["additionalProperties"] is False
-    assert next(iter(turn["outputSchema"]["properties"])) == "evidence_anchors"
+    assert next(iter(turn["outputSchema"]["properties"])) == "analysis_sections"
     assert current_provider_completion()["usage"] == {
         "input_tokens": 12,
         "cached_input_tokens": 3,
@@ -2009,7 +1986,7 @@ def test_codex_pdf_app_server_accepts_only_the_expected_code_mode_warning(
             )
         )
 
-    assert invoke("code_mode_warning")["evidence_anchors"]
+    assert invoke("code_mode_warning")["analysis_sections"] == _valid_source_bundle_payload()["analysis_sections"]
     with pytest.raises(ProviderIsolationFailure, match="warning"):
         invoke("unknown_warning")
     with pytest.raises(ProviderIsolationFailure, match="tool"):
@@ -2342,9 +2319,9 @@ def test_codex_transport_is_sanitized_schema_bound_and_tool_fail_closed(
         codex_contract_identity(contract_id, reader.model, "high", "0.152.1")["schema_hash"]
     )
     if contract_id == "source_bundle":
-        assert next(iter(json.loads(captured["output_schema"])["properties"])) == "evidence_anchors"
+        assert next(iter(json.loads(captured["output_schema"])["properties"])) == "analysis_sections"
         fields = json.loads(captured["output_schema"])["properties"]
-        assert fields["evidence_anchors"]["maxItems"] == 24
+        assert "evidence_anchors" not in fields
         assert fields["literature_positions"]["maxItems"] == 8
     assert "--output-schema" in captured["argv"]
     assert 'forced_login_method="chatgpt"' in captured["argv"]
@@ -2900,7 +2877,7 @@ except json.JSONDecodeError:
     user = {{}}
 properties = tuple(sorted(schema["properties"]))
 contracts = {{
-    ("analysis_sections", "compact_profile", "evidence_anchors", "literature_positions", "observed_bibliographic_identity"): "source_bundle",
+    ("analysis_sections", "compact_profile", "literature_positions", "observed_bibliographic_identity"): "source_bundle",
     ("discovery_jobs", "literature_families", "neighboring_families", "source_dispositions"): "literature_family_plan",
     ("candidates", "job_outcomes"): "relationship_candidate_selection",
     ("decisions",): "relationship_adjudication",
@@ -2928,17 +2905,6 @@ if contract == "source_bundle":
             "outcomes": ["implementation outcomes"],
             "cases": [], "populations": [], "periods": [], "datasets": [],
         }},
-        "evidence_anchors": [{{
-            "claim": "The source links institutions with implementation outcomes.",
-            "locator": "p. 1",
-            "planning_roles": ["finding"],
-            "salience_priority": 10,
-            "evidence_role": "descriptive",
-            "support_boundary": "Synthetic fixture scope.",
-            "plain_english_meaning": "Institutional context matters for implementation.",
-            "uncertainty": "The fixture supports only this bounded claim.",
-            "quantitative_result": None,
-        }}],
         "literature_positions": [],
         "observed_bibliographic_identity": {{"title": "", "creators": [], "date": ""}},
     }}
@@ -3048,6 +3014,7 @@ elif contract == "cluster_synthesis":
         "guiding_question": "How do institutions shape implementation outcomes?",
         "central_tension": "Institutional design and practical implementation may diverge.",
         "bottom_line": "Both sources show that institutions shape implementation outcomes within the synthetic fixture.",
+        "debate_state": "complementary_positions",
         "lines_of_inquiry": [{{
             "title": "Institutional implementation",
             "synthesis": "The two sources provide complementary evidence about institutional implementation.",

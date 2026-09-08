@@ -102,47 +102,22 @@ def test_atomic_prompt_v14_is_source_adaptive_and_statistics_aware() -> None:
     assert "silently reread" in prompt
 
 
-def test_source_bundle_prompt_v39_preserves_formatting_and_attribution_scope() -> None:
-    prompt = _source_bundle_system_prompt()
-
-    assert "source bundle prompt v39" in prompt
-    assert "apply a footnote, only when the alignment or marker is explicit" in prompt
-    assert "A footnote qualifies only the values bearing its explicit marker" in prompt
-    assert "page metadata is not a statistic's observation date" in prompt
-    assert "omit the year rather than borrowing it from page metadata" in prompt
-    assert "Every numeric date or year endpoint" in prompt
-    assert "never attach a global conflict or study start date" in prompt
-    assert "Put a derived number only in estimate" in prompt
-    assert "Every numeric statistic" in prompt
-    assert "do not expand them into newly calculated full integers" in prompt
-    assert "Do not infer a subgroup claim from an aggregate count" in prompt
-    assert "singular or plural cardinality" in prompt
-    assert "do not infer a group's position" in prompt
-    assert "selected journalistic examples are not a survey" in prompt
-    assert "Each literature-position row represents exactly one distinct work" in prompt
-    assert "operative dates, deadlines, effective dates, and signing dates" in prompt
-    assert 'Quote "exact unique source words"' in prompt
-    assert "12–120 characters" in prompt
-    assert "Descriptive paragraph labels are not locators" in prompt
-    assert "physical PDF ordinals" in prompt
-    assert "Reserve bare `p. N`" in prompt
-
-
-def test_source_bundle_preserves_coverage_lineage_and_prose_scope() -> None:
+def test_source_bundle_v40_requests_detailed_source_content_without_claim_inventory():
     system = _source_bundle_system_prompt()
-    prompt = _source_bundle_prompt("A fictional source.", {}, None)
+    prompt = _source_bundle_prompt("Original source text.", {}, None)
+    assert "source bundle prompt v40" in system
+    for content in ("thesis", "methods", "evidence and data", "examples", "qualifications",
+                    "author or speaker", "marked footnotes", "page, chapter", "exact quotations",
+                    "compact_profile", "literature_positions", "recoverable"):
+        assert content in system
+    assert "evidence_anchors" not in system + prompt
+    assert "quantitative_result" not in system + prompt
+    assert "FINAL QUANTITATIVE COPY GATE" not in prompt
+    assert "Original source text." in prompt
 
-    assert "canonical dataset title and explicitly stated edition" in system
-    assert "hosting site or presentation format" in system
-    assert "located anchors for central mechanisms and author interpretations" in system
-    assert "resulting rank and its rank change" in prompt
-    assert "In every analysis section and compact_profile, a footnote still qualifies only its explicitly marked measure" in prompt
-    assert "explicitly marked footnote's temporal scope in period" in prompt
-    assert "never erase a required marked-footnote scope" in prompt
-    assert "numeric optional field other than period" in prompt
-    assert "table row or column header" in prompt
-    assert "Preserve the selected table year in period" in prompt
-    assert "never erase a required table-year scope" in prompt
+
+
+
 
 
 def test_cluster_synthesis_requires_clause_support_not_just_source_ownership() -> None:
@@ -155,99 +130,22 @@ def test_cluster_synthesis_requires_clause_support_not_just_source_ownership() -
     assert "Put cross-source comparisons in the line's synthesis" in prompt
 
 
-def test_source_bundle_prompt_keeps_numeric_values_out_of_statistic_labels() -> None:
-    prompt = _source_bundle_system_prompt()
-
-    assert "statistic names the reported measure or statistic type" in prompt
-    assert "Do not repeat or concatenate numeric estimates in statistic" in prompt
 
 
-def test_source_bundle_prompt_splits_distinct_quantitative_observations() -> None:
-    prompt = _source_bundle_system_prompt()
-
-    assert "Use one quantitative_result for one observation" in prompt
-    assert "split them into separate evidence anchors" in prompt
-    assert "Do not join distinct observation dates with semicolons" in prompt
 
 
-def test_source_bundle_prompt_requires_a_final_quantitative_copy_gate() -> None:
-    prompt = _source_bundle_prompt("The source reports 42 percent.", {}, None)
-
-    assert "FINAL QUANTITATIVE COPY GATE" in prompt
-    assert "One quantitative_result is one observation" in prompt
-    assert "split distinct outcomes, categories" in prompt
-    assert "Overall rank, sub-index score, and sub-index rank" in prompt
-    assert "Sample size and geographic coverage are not components" in prompt
-    assert "A prose sentence or list is not a joint statistic" in prompt
-    assert "Never copy a footnote period or qualifier" in prompt
-    assert "omit a lower-salience result instead of combining observations" in prompt
-    assert "same source sentence explicitly binds the same number and noun" in prompt
-    assert 'set that optional string to ""' in prompt
-    assert "Do not copy study-level sample or coverage" in prompt
-    assert "Set quantitative_result to null only when estimate fails" in prompt
-    assert "INSPECTED SOURCE CONTENT" in prompt
-    assert prompt.index("INSPECTED SOURCE CONTENT") < prompt.index(
-        "FINAL QUANTITATIVE COPY GATE"
-    )
 
 
-def test_source_bundle_prompt_illustrates_measure_specific_footnote_scope() -> None:
-    prompt = _source_bundle_prompt("A fictional source.", {}, None)
-
-    assert "Illustration, not source evidence" in prompt
-    assert "measure A; measure B*" in prompt
-    assert "only B inherits period P and organization Q" in prompt
-    assert "A inherits neither from that footnote" in prompt
-    assert "retain independently source-stated observation periods" in prompt
 
 
-def test_source_bundle_prompt_separates_qualitative_classifications_from_counts() -> None:
-    prompt = _source_bundle_prompt("A fictional source.", {}, None)
-
-    assert "Keep qualitative classifications such as 'one of the most ...'" in prompt
-    assert "separate nonquantitative evidence anchor or source-grounded analysis prose" in prompt
-    assert "retain genuine one-person, one-item, or per-unit counts numerically" in prompt
 
 
-def test_source_bundle_final_review_covers_prose_citations_and_locators() -> None:
-    source = (
-        "Regional total: 90; North: 60; South: 30. "
-        "Scores: access 8, trust 7, reach 6. "
-        "Rates: 2 deliveries*; 3 visits. *First week only. "
-        "Opening: Ada criticizes restrictions. Closing: Ben defends access. "
-        "Journal Q published a 2001 study and a separate undated commentary."
-    )
-    prompt = _source_bundle_prompt(source, {}, None)
-    final = prompt.split("FINAL WHOLE-SOURCE CHECK:")[1]
 
-    assert prompt.index(source) < prompt.index("FINAL QUANTITATIVE COPY GATE")
-    assert prompt.index("FINAL QUANTITATIVE COPY GATE") < prompt.index(final)
-    for requirement in (
-        "all analysis sections, compact_profile, evidence_anchors, and literature_positions",
-        "Critiques, superlatives, contrasts, and locators are factual claims too",
-        "population, period, measure, and category",
-        "totals and subtotals",
-        "all comparable displayed values",
-        "aligned speakers",
-        "every attributed quotation, paraphrase, and definition",
-        "local reporting clause",
-        "key_concepts_and_definitions",
-        "do not carry a neighboring speaker",
-        "one contiguous verbatim source span",
-        "without inserted ellipses",
-        "memos contain only an abridgment",
-        "labeled source-grounded paraphrase without quotation marks",
-        "explicit text anchors",
-        "one distinct work",
-        "unknown years and titles empty",
-        "A researcher's study of a named film, text, or dataset",
-        "does not make that object the researcher's publication",
-        "leave the study title empty when unreported",
-        "marked measure in every field",
-        "same call",
-    ):
-        assert requirement in final
-    assert "three to eight" not in _source_bundle_system_prompt()
+
+
+
+
+
 
 
 def test_chunk_prompt_preserves_quote_and_chapter_start_boundaries() -> None:
@@ -261,7 +159,7 @@ def test_chunk_prompt_preserves_quote_and_chapter_start_boundaries() -> None:
     assert "authors, publication years, and titles" in prompt
     assert "prioritize substantively engaged works" in prompt
     assert "Do not copy an unengaged bibliography" in prompt
-    assert "year means the work's publication year" in _source_bundle_system_prompt()
+    assert "leave unknown metadata empty" in _source_bundle_system_prompt()
 
 
 def test_chunk_final_check_preserves_pdf_and_printed_coordinates() -> None:
@@ -323,72 +221,25 @@ def test_chunk_prompt_annotates_preserved_indexed_pdf_line_endings(
     assert json.dumps(metadata) == before
 
 
-def test_source_bundle_critique_distinguishes_totals_from_component_scopes() -> None:
-    prompt = _source_bundle_system_prompt()
-
-    assert "A total and a geographic or demographic subset are not competing estimates" in prompt
-    assert "including subtotals omitted from your evidence anchors" in prompt
-    assert "same population, period, measure, and category" in prompt
-    assert "Do not invent a source-quality criticism" in prompt
 
 
-def test_source_bundle_checks_repeated_dates_and_temporal_field_roles() -> None:
-    source = "The 2019 report describes expansion from 30 to 40 regions in 2017."
-    final = _source_bundle_prompt(source, {}, None).split("FINAL WHOLE-SOURCE CHECK:")[1]
-
-    assert "Distinguish the date of a design, sample, or instrument change from the report edition" in final
-    assert "Use the source's change date consistently across every section" in final
-    assert "a temporal window belongs in period, not sample or uncertainty" in final
-    assert "retain independently source-stated observation periods" in final
-    assert "leave unmarked sibling observations unscoped" not in final
 
 
-def test_source_bundle_checks_comparative_score_and_rank_scope() -> None:
-    source = "Access: score 7, rank 80. Reach: score 6, rank 20."
-    final = _source_bundle_prompt(source, {}, None).split("FINAL WHOLE-SOURCE CHECK:")[1]
-
-    assert "relative strengths and weaknesses must name their comparison set" in final
-    assert "a weak cross-entity rank does not imply a low within-entity score" in final
-    assert "Do not interchange score and rank" in final
 
 
-def test_source_bundle_keeps_rated_target_in_grouped_prose() -> None:
-    source = "Region A rated service X lower. Region B rated service Y lower."
-    final = _source_bundle_prompt(source, {}, None).split("FINAL WHOLE-SOURCE CHECK:")[1]
-
-    assert "preserve who is measured and what or whom they are rating" in final
-    assert "Split a summary list when its examples concern different targets or outcomes" in final
-    assert "Check prose comparisons against the evidence anchors and supplied passages" in final
 
 
-def test_source_bundle_preserves_comparative_referents_and_direction() -> None:
-    final = _source_bundle_prompt(
-        "Sanctions affected both groups, but such action was less frequent for group B.",
-        {},
-        None,
-    ).split("FINAL WHOLE-SOURCE CHECK:")[1]
-
-    assert "resolve source pronouns and contrast markers first" in final
-    assert "explicitly name the actor, group, outcome, expression, or measure" in final
-    assert "do not use former or latter" in final
-    assert "never reverse who or what is higher, lower, more, or less frequent" in final
 
 
-def test_source_bundle_emits_evidence_before_analysis() -> None:
-    prompt = _source_bundle_system_prompt()
-
-    assert "Emit evidence_anchors first" in prompt
-    assert "carry their attribution and scope into the later analysis_sections" in prompt
 
 
-def test_source_bundle_keeps_criticism_attributed_to_its_reporting_work() -> None:
-    final = _source_bundle_prompt(
-        "A Delta Press report is criticized in a separate commentary.", {}, None,
-    ).split("FINAL WHOLE-SOURCE CHECK:")[1]
 
-    assert "Do not credit a discussed work or its publisher with third-party commentary" in final
-    assert "Keep that commentary as a separate work" in final
-    assert "author and title empty when not supplied" in final
+
+
+
+
+
+
 
 
 def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
@@ -404,12 +255,12 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
     )
     assert {
         "atomic_prompt_v14": digest(_system_prompt()),
-        "chunk_prompt_bundle_v39": digest(_chunk_system_prompt()),
-        "chunk_user_prompt_bundle_v39": digest(
+        "chunk_prompt_bundle_v40": digest(_chunk_system_prompt()),
+        "chunk_user_prompt_bundle_v40": digest(
             _chunk_prompt("A fictional source.", {}, None, "chunk-0001", "pages 1-2")
         ),
-        "source_bundle_prompt_v39": digest(_source_bundle_system_prompt()),
-        "source_bundle_user_prompt_v39": digest(
+        "source_bundle_prompt_v40": digest(_source_bundle_system_prompt()),
+        "source_bundle_user_prompt_v40": digest(
             _source_bundle_prompt("A fictional source.", {}, None)
         ),
         "codex_source_bundle_schema": bundle_identity["schema_hash"],
@@ -418,12 +269,12 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
         "codex_chunk_evidence_contract": digest(chunk_identity),
     } == {
         "atomic_prompt_v14": "8db9f2990d175816cb0100b92d84734ae7c2f930aade66825ed0412b22da3705",
-        "chunk_prompt_bundle_v39": "1ef440d8148d4a58491ac2a74cf9d65c0d52f9f4d2e42278f1961e94e570dea2",
-        "chunk_user_prompt_bundle_v39": "13825c29551703fdc760ab0ad496ac3210658dfe290c36fa027f6c51f3d72a05",
-        "source_bundle_prompt_v39": "4bcdb8675620b3fac97ee94cbd2097681eff6fffb2cdfc088d974e6f4d3d350f",
-        "source_bundle_user_prompt_v39": "fe31c24456507ac518dd9e8d2cc5c31a056e6b0daf5fb1c0617710b7d5e8a7e0",
-        "codex_source_bundle_schema": "5e937e835e1ca6bb37ece21acd52e4c02ef8956cb456a4b656e1840ac9f08ff5",
-        "codex_source_bundle_contract": "413826546dc0c3a651b82e5a88d251037adb6a9d7fcf27f5f6ab8c32cc94ccb3",
+        "chunk_prompt_bundle_v40": "1ef440d8148d4a58491ac2a74cf9d65c0d52f9f4d2e42278f1961e94e570dea2",
+        "chunk_user_prompt_bundle_v40": "13825c29551703fdc760ab0ad496ac3210658dfe290c36fa027f6c51f3d72a05",
+        "source_bundle_prompt_v40": "95ce1b464908e1c169b7f2ff71620832e758a8e44d380fa49e999f9d7a0bb1bd",
+        "source_bundle_user_prompt_v40": "549c46f156b10241178c9bf7401b56ddcef778b5465bf7325aa14e25dfc8ae1e",
+        "codex_source_bundle_schema": "1f0ff3c8a6b465335c254aee9ea4096e65d3e76aea53daf94eb2c5d25f855b72",
+        "codex_source_bundle_contract": "a9b70cb5a6df925b964543d8bdfcdef2e872655b578db9702aaf96191d9ec272",
         "codex_chunk_evidence_schema": "130ebe184fc8dc0b3c08879abfeb0435500a47eecd78ed7e2387c095574d821c",
         "codex_chunk_evidence_contract": "14f169c8b8c4d0a86004198198d4c40f93ac911884e22a25dc0acde24dbf1035",
     }
@@ -474,7 +325,7 @@ def test_partial_source_prompt_prohibits_complete_document_inference() -> None:
 def test_cluster_prompt_preserves_inference_and_case_evidence() -> None:
     prompt = _cluster_synthesis_system_prompt()
 
-    assert "cluster synthesis prompt v41" in prompt
+    assert "cluster synthesis prompt v42" in prompt
     assert "Read every supplied atomic_note_markdown" in prompt
     assert "Every retained member" in prompt
     assert "specific study finding" in prompt
@@ -494,7 +345,7 @@ def test_cluster_prompt_preserves_observation_windows_without_excluding_context(
     from auto_zettelkasten.literature import _synthesis_stage_prompt_version
 
     prompt = _cluster_synthesis_system_prompt()
-    assert _synthesis_stage_prompt_version("cluster_synthesis") == "41"
+    assert _synthesis_stage_prompt_version("cluster_synthesis") == "42"
     assert "Preserve each source's observation period in cross-source comparisons" in prompt
     assert "explicitly dated context, not contemporaneous evidence" in prompt
     assert "different instruments, samples, or time windows" in prompt

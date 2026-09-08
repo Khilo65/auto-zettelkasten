@@ -159,9 +159,9 @@ def test_hierarchical_prompts_preserve_identity_quantity_and_locator_roles() -> 
 def test_journalism_prompt_separates_interviews_from_nonresponses() -> None:
     prompt = _source_bundle_system_prompt()
 
-    assert "actually interviewed" in prompt
+    assert "people interviewed" in prompt
     assert "merely contacted" in prompt
-    assert "reported as nonresponsive" in prompt
+    assert "source's actual knowledge basis" in prompt
 
 
 def _openai_response(content: dict[str, str], *, fenced: bool = False) -> dict[str, Any]:

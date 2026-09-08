@@ -107,6 +107,8 @@ def _bundle_payload() -> dict:
         "analysis_sections": {
             "thesis": "The author argues that monitoring changes implementation.",
             "method_and_research_design": "Comparative qualitative analysis.",
+            "evidence_and_data": "Recovered comparative evidence on monitoring.",
+            "detailed_findings": "Monitoring changes implementation.",
         },
         "compact_profile": {
             "thesis": "Monitoring changes implementation.",
@@ -242,9 +244,8 @@ observed_bibliographic_identity:
         "source_id": "source-zotero-A1",
         "zotero_key": "A1",
     }
-    assert recovered["bundle_schema_version"] == "1"
-    assert recovered["evidence_anchors"][0]["source_id"] == "source-zotero-A1"
-    assert recovered["evidence_anchors"][0]["evidence_anchor_id"]
+    assert recovered["bundle_schema_version"] == "2"
+    assert "evidence_anchors" not in recovered
     assert recovered["literature_positions"][0]["year"] == "1997"
     assert (
         recovered["literature_positions"][0]["current_source_id"]
@@ -279,9 +280,7 @@ def test_source_bundle_repairs_only_lexical_json_defects() -> None:
     )
 
     assert recovered["analysis_sections"]["thesis"]
-    assert recovered["evidence_anchors"][0]["quantitative_result"]["sample"] == (
-        "1093 (same model sample)"
-    )
+    assert "evidence_anchors" not in recovered
     assert any(
         row.get("reason") == "conservative_json_lexical_recovery"
         for row in recovered["component_diagnostics"]
@@ -323,11 +322,9 @@ def test_local_recovery_prefers_the_unique_text_completion(monkeypatch) -> None:
     import auto_zettelkasten.readers as readers
 
     shorter = _bundle_payload()
-    shorter["evidence_anchors"][0]["quantitative_result"] = {
-        "sample": "175 (122 ethnic",
-    }
+    shorter["analysis_sections"]["evidence_and_data"] = "175 (122 ethnic"
     complete = deepcopy(shorter)
-    complete["evidence_anchors"][0]["quantitative_result"]["sample"] = (
+    complete["analysis_sections"]["evidence_and_data"] = (
         "175 (122 ethnic, 53 nonethnic)"
     )
     monkeypatch.setattr(
@@ -350,12 +347,10 @@ def test_local_recovery_prefers_the_unique_text_completion(monkeypatch) -> None:
         },
     )
 
-    assert recovered["evidence_anchors"][0]["quantitative_result"]["sample"] == (
-        "175 (122 ethnic, 53 nonethnic)"
-    )
+    assert recovered["analysis_sections"]["evidence_and_data"] == "175 (122 ethnic, 53 nonethnic)"
 
 
-def test_source_bundle_coerces_optional_evidence_scalars_without_losing_anchor() -> None:
+def test_current_source_bundle_discards_unsolicited_legacy_scalar_inventory() -> None:
     payload = _bundle_payload()
     payload["evidence_anchors"][0]["salience_priority"] = "high"
     payload["evidence_anchors"][0]["quantitative_result"] = {
@@ -376,14 +371,8 @@ def test_source_bundle_coerces_optional_evidence_scalars_without_losing_anchor()
         },
     )
 
-    anchor = recovered["evidence_anchors"][0]
-    assert anchor["salience_priority"] == 10
-    assert anchor["quantitative_result"]["statistic"] == "-2.4"
-    assert anchor["quantitative_result"]["estimate"] == "0.42"
-    assert anchor["quantitative_result"]["baseline"] == "0"
-    assert anchor["quantitative_result"]["sample"] == "1093"
-    assert anchor["quantitative_result"]["provenance"] == "source_reported"
-    assert "provider_comment" not in anchor["quantitative_result"]
+    assert "evidence_anchors" not in recovered
+    assert recovered["analysis_sections"]["thesis"] == payload["analysis_sections"]["thesis"]
 
 
 def test_saved_source_failure_reparses_locally_without_provider_call(
@@ -1439,7 +1428,7 @@ def test_literature_match_is_excluded_from_bundle_semantic_identity() -> None:
 
 
 def test_profile_v13_serializes_one_evidence_eligibility_field() -> None:
-    profile = EvidenceProfile(
+    profile = EvidenceProfile(profile_schema_version="1.3",
         note_id="note-1",
         source_id="source-1",
         evidence_eligibility="context_only",
@@ -1529,8 +1518,8 @@ def test_ordinary_bundle_source_uses_one_call_and_no_profile_or_fidelity_call(
     profile = read_yaml(
         next((tmp_path / "02_source_memory" / "profiles").glob("*.yml"))
     )["profile"]
-    assert profile["profile_schema_version"] == "1.3"
-    assert profile["findings"] == []
+    assert profile["profile_schema_version"] == "1.4"
+    assert "findings" not in profile
     assert profile["context"]["profile_generation_route"] == "source_analysis_bundle"
     assert profile["context"]["source_analysis_bundle_dependency_fingerprint"]
     assert profile["context"]["thesis"] == "Grounded thesis; see page 1."
@@ -1548,7 +1537,7 @@ def test_ordinary_bundle_source_uses_one_call_and_no_profile_or_fidelity_call(
     ]
     assert profile["coverage"]["status"] == "partial"
     note = read_note(tmp_path / report.items[0]["note_path"])
-    assert note["frontmatter"]["source_bundle_prompt_version"] == "39"
+    assert note["frontmatter"]["source_bundle_prompt_version"] == "40"
 
 
 @pytest.mark.parametrize("observed_date", ["", "Published 2019; updated 2024"])
@@ -1580,151 +1569,36 @@ def test_observed_document_date_reaches_writer_without_replacing_canonical_date(
             assert "observed_document_date_diagnostic" not in value
     assert projected["year"] == "2019"
     assert normalized["year"] == "2019"
-    assert all(
-        not anchor.get("quantitative_result")
-        or anchor["quantitative_result"].get("period") != observed_date
-        for anchor in profile["evidence_anchors"]
-    )
+    assert "evidence_anchors" not in profile
 
 
-def test_atomic_note_projects_accepted_quantitative_evidence_without_salience_loss(
-    tmp_path,
-) -> None:
-    class QuantitativeZotero(FakeZotero):
-        def fulltext(self, item_key):
-            result = super().fulltext(item_key)
-            assert result is not None
-            result["content"] += (
-                " In 2024, the reported outcome fell by 4 percentage points."
-                " The source reports 42 treated cases and compares 17 controls."
-                " The district's rank declined by 3 places to 21st."
-            )
-            return result
+def test_current_atomic_note_keeps_original_quantities_without_anchor_append(tmp_path):
+    result_text = "The source reports 42 treated cases and 17 controls (p. 1)."
 
-    class QuantitativeBundleReader(BundleReader):
+    class CurrentReader(BundleReader):
         def read_source_bundle(self, text, metadata, question=None):
             payload = super().read_source_bundle(text, metadata, question)
-            valid = deepcopy(payload["evidence_anchors"][0])
-            valid.update(
-                evidence_anchor_id="",
-                claim="In 2024, the reported outcome fell.",
-                salience_priority=10,
-                quantitative_result={
-                    "statistic": "case count",
-                    "estimate": "4",
-                    "unit": "percentage points",
-                    "provenance": "source_reported",
-                },
-            )
-            valid.pop("revision_hash", None)
-            tied_duplicate = deepcopy(valid)
-            tied_duplicate.update(
-                evidence_anchor_id="",
-                locator="p. 13",
-                locators=["p. 13"],
-            )
-            lower_salience = deepcopy(valid)
-            lower_salience.update(
-                evidence_anchor_id="",
-                claim="The source reports 17 controls.",
-                salience_priority=9,
-                quantitative_result={
-                    "statistic": "control count",
-                    "estimate": "17",
-                    "unit": "controls",
-                    "provenance": "source_reported",
-                },
-            )
-            invalid = deepcopy(valid)
-            invalid.update(
-                evidence_anchor_id="",
-                claim="The source reports 42 cases among 17 controls.",
-                salience_priority=11,
-            )
-            payload["evidence_anchors"].extend(
-                [valid, tied_duplicate, lower_salience, invalid]
-            )
-            for claim, estimate in (
-                ("The district's rank declined by 3 places.", "3 places"),
-                ("The district's resulting rank is 21st.", "21st"),
-                ("The district's rank declined by 3 places to 21st.", "3 places"),
-            ):
-                split_rank = deepcopy(valid)
-                split_rank.update(
-                    claim=claim,
-                    quantitative_result={
-                        "estimate": estimate,
-                        "provenance": "source_reported",
-                    },
-                )
-                payload["evidence_anchors"].append(split_rank)
+            payload["bundle_schema_version"] = "2"
+            payload["analysis_sections"]["evidence_and_data"] = result_text
+            payload["evidence_anchors"][0]["claim"] = "A duplicate claim must not be appended."
             return payload
 
-    item = {
-        "key": "ITEMA",
-        "data": {
-            "key": "ITEMA",
-            "itemType": "journalArticle",
-            "title": "Institutions and Reform",
-            "date": "2024",
-            "creators": [{"creatorType": "author", "lastName": "One"}],
-        },
-    }
-
-    reader = QuantitativeBundleReader()
-    client = QuantitativeZotero([item])
-    report = run_map(
-        MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1),
-        client=client,
-        reader=reader,
-        run_id="quantitative-note-projection",
-    )
-
+    reader = CurrentReader()
+    client = FakeZotero([{"key": "ITEMA", "data": {"key": "ITEMA", "itemType": "journalArticle", "title": "A source"}}])
+    report = run_map(MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1),
+                     client=client, reader=reader, run_id="source2-original-evidence")
+    assert report.validated_note_count == 1
     note_path = tmp_path / report.items[0]["note_path"]
     note = read_note(note_path)
-    projection = (
-        "In 2024, the reported outcome fell. Estimate: 4; Unit: percentage points."
-    )
-    assert note["body"].count(projection) == 1
-    assert note["body"].count("The source reports 17 controls.") == 1
-    assert "42 cases among 17 controls" not in note["body"]
-    assert "The district's rank declined by 3 places." in note["body"]
-    assert "The district's resulting rank is 21st." in note["body"]
-    assert "rank declined by 3 places to 21st" not in note["body"]
-    profile = read_yaml(
-        next((tmp_path / "02_source_memory" / "profiles").glob("*.yml"))
-    )["profile"]
-    rank_claims = {
-        anchor["claim"] for anchor in profile["evidence_anchors"]
-        if "district" in anchor["claim"]
-    }
-    assert rank_claims == {
-        "The district's rank declined by 3 places.",
-        "The district's resulting rank is 21st.",
-    }
-    bundle = read_yaml(
-        next((tmp_path / "02_source_memory" / "bundles").glob("*.yml"))
-    )["bundle"]
-    assert sum(
-        row["claim"] == "In 2024, the reported outcome fell."
-        for row in bundle["evidence_anchors"]
-    ) == 2
-    assert bundle["analysis_sections"]["evidence_and_data"].count(projection) == 1
-    assert bundle["analysis_sections"]["evidence_and_data"].count(
-        "The source reports 17 controls."
-    ) == 1
-    before = (note["sha256"], note_path.stat().st_mtime_ns)
-
-    replay = resume_map(
-        tmp_path,
-        "quantitative-note-projection",
-        client=client,
-        reader=reader,
-    )
-
-    assert replay.source_provider_call_count == report.source_provider_call_count == 1
-    assert reader.calls == 1
-    assert (read_note(note_path)["sha256"], note_path.stat().st_mtime_ns) == before
+    assert note["body"].count(result_text) == 1
+    assert "A duplicate claim" not in note["body"]
+    bundle = read_yaml(next((tmp_path / "02_source_memory/bundles").glob("*.yml")))["bundle"]
+    profile = read_yaml(next((tmp_path / "02_source_memory/profiles").glob("*.yml")))["profile"]
+    assert "evidence_anchors" not in bundle and "evidence_anchors" not in profile
+    before = (note_path.read_bytes(), note_path.stat().st_mtime_ns)
+    replay = resume_map(tmp_path, "source2-original-evidence", client=client, reader=reader)
+    assert reader.calls == replay.source_provider_call_count == report.source_provider_call_count == 1
+    assert (note_path.read_bytes(), note_path.stat().st_mtime_ns) == before
 
 
 def test_source_calls_share_the_cumulative_profile_budget_and_replay_is_free(
@@ -1926,11 +1800,11 @@ def test_stale_bundle_profile_is_refreshed_under_the_current_fingerprint(tmp_pat
         "Comparative qualitative analysis",
         "survey",
     ]
-    assert refreshed["validity"]["algorithm_version"] == "9"
+    assert refreshed["validity"]["algorithm_version"] == "10"
     assert refreshed["dependency_hash"] == checkpoint["fingerprint"]
 
 
-def test_current_bundle_locator_enrichment_refreshes_dependency_without_a_call(
+def test_current_bundle_profile_refresh_retires_legacy_inventory_without_a_call(
     tmp_path,
 ) -> None:
     item = {
@@ -1953,6 +1827,9 @@ def test_current_bundle_locator_enrichment_refreshes_dependency_without_a_call(
     )
     profile_path = next((tmp_path / "02_source_memory" / "profiles").glob("*.yml"))
     record = read_yaml(profile_path)
+    record["profile"]["profile_schema_version"] = "1.3"
+    record["profile"]["evidence_anchors"] = deepcopy(_bundle_payload()["evidence_anchors"])
+    record["profile"]["evidence_anchors"][0]["source_id"] = record["profile"]["source_id"]
     anchor = record["profile"]["evidence_anchors"][0]
     anchor["locator"] = "PDF p. 7"
     anchor["locators"] = ["PDF p. 7"]
@@ -1972,7 +1849,7 @@ def test_current_bundle_locator_enrichment_refreshes_dependency_without_a_call(
     anchor["revision_hash"] = ""
     record["profile"]["validity"][
         "committed_note_anchor_augmentation_version"
-    ] = pipeline_module.COMMITTED_NOTE_ANCHOR_AUGMENTATION_VERSION
+    ] = "8"
     record["profile"]["dependency_hash"] = "stale-profile-dependency"
     write_yaml(profile_path, record)
 
@@ -2020,9 +1897,8 @@ def test_current_bundle_locator_enrichment_refreshes_dependency_without_a_call(
 
     assert reader.calls == 1
     assert refreshed_result["provider_calls"] == 0
-    assert refreshed["evidence_anchors"][0]["source_locators"][0]["value"] == (
-        "PDF p. 7"
-    )
+    assert "evidence_anchors" not in refreshed
+    assert refreshed["profile_schema_version"] == "1.4"
     assert refreshed["dependency_hash"] == checkpoint["fingerprint"]
 
     before = (profile_path.read_bytes(), checkpoint_path.read_bytes())
@@ -6731,7 +6607,7 @@ def test_zotero_metadata_correction_updates_projection_without_source_call(
     assert profile["dependency_hash"] != before_profile["dependency_hash"]
     assert "author:One" not in profile["study_lineage"]["overlap_signals"]
     assert "author:Correct Institute" in profile["study_lineage"]["overlap_signals"]
-    assert profile["evidence_anchors"] == before_profile["evidence_anchors"]
+    assert "evidence_anchors" not in profile and "evidence_anchors" not in before_profile
     assert read_yaml(bundle_path)["bundle"] == before_bundle
     assert read_note(note)["body"].split("## Thesis", 1)[1] == (
         before_note["body"].split("## Thesis", 1)[1]
@@ -7006,7 +6882,6 @@ def test_source_bundle_row_caps_precede_intake_salvage(field, limit, overflow) -
         payload[field].append(extra)
     original = deepcopy(payload)
     readers = (
-        lambda: _parse_source_bundle_response(payload, label="row cap fixture", expected_identity={"source_id": "source-zotero-A1", "zotero_key": "A1"}),
         lambda: _source_bundle_from_result(payload, {
             "source_id": "source-zotero-A1", "zotero_item_key": "A1", "text": "Supplied source text.",
         }, "full_document"),
@@ -7080,14 +6955,15 @@ def test_public_source_bundle_row_caps_preserve_raw_without_retry(
     metadata = {"_source_context": {"source_id": "source-zotero-A1", "zotero_key": "A1"}}
     content = "Supplied source text." if method == "read_source_bundle" else [{"summary": "Supplied source text."}]
     with deny_codex_attempts():
-        if anchor_count > 24 or position_count > 8:
+        if position_count > 8:
             with pytest.raises(ProviderError, match="cannot contain more than") as raised:
                 getattr(reader, method)(content, metadata)
             assert raised.value.raw_response == raw
             assert not pipeline_module._transport_retryable(raised.value)
         else:
             result = getattr(reader, method)(content, metadata)
-            assert len(result["evidence_anchors"]) == anchor_count
+            assert "evidence_anchors" not in result
+            assert result["bundle_schema_version"] == "2"
             assert len(result["literature_positions"]) == position_count
     assert len(generated) == 1
     assert json.loads(raw) == payload

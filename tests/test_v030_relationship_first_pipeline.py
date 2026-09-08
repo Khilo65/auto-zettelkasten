@@ -38,7 +38,7 @@ class _RelationshipReasoner:
     name = "relationship-first-test"
     model = "relationship-first-v1"
     is_cloud = False
-    relationship_decision_contract = "relationship-decision-v4"
+    ordinary_relationship_decision_contract = "relationship-decision-v11"
 
     def __init__(self, *, timeout: bool = False) -> None:
         self.timeout = timeout
@@ -66,59 +66,26 @@ class _RelationshipReasoner:
         *,
         context: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
-        del request, context
+        del request
         self.candidate_calls += 1
-        left, right = profiles[:2]
-        return {
-            "candidates": [
-                {
-                    "source_id": left.source_id,
-                    "target_kind": "source",
-                    "target_id": right.source_id,
-                    "why_relevant": "Both sources address the same bounded proposition.",
-                    "comparison_unit": "bounded proposition",
-                    "confidence": 0.9,
-                }
-            ]
-        }
-
-    def adjudicate_relationships(
-        self,
-        profiles: Sequence[EvidenceProfile],
-        request: LiteratureMapRequest,
-        *,
-        context: Mapping[str, Any] | None = None,
-    ) -> Mapping[str, Any]:
-        del profiles, request
-        self.adjudication_calls += 1
         if self.timeout:
             raise TimeoutError("synthetic relationship timeout")
-        assert context
-        return {
-            "decisions": [
-                {
-                    "pair_job_id": job["pair_job_id"],
-                    "decision": "relationship",
-                    "pair": job["pair"],
-                    "relation_type": "complements",
-                    "actor_source_id": job["pair"]["left_source_id"],
-                    "reference_source_id": job["pair"]["right_source_id"],
-                    "forward_label": "complements",
-                    "inverse_label": "complements",
-                    "comparison_proposition": "The sources address the same bounded proposition.",
-                    "reason": "The sources provide complementary evidence.",
-                    "left_evidence_anchor_ids": [
-                        job["selected_evidence"]["left"][0]["evidence_anchor_id"]
-                    ],
-                    "right_evidence_anchor_ids": [
-                        job["selected_evidence"]["right"][0]["evidence_anchor_id"]
-                    ],
-                    "confidence": "0.9",
-                    "output_contract": "relationship-decision-v4",
-                }
-                for job in context["pair_jobs"]
-            ]
-        }
+        catalogue = (context or {}).get("catalogue") or [profile_to_dict(p) for p in profiles]
+        left, right = catalogue[:2]
+        return {"candidates": [{
+            "left_source_id": left["source_id"],
+            "right_source_id": right["source_id"],
+            "decision": "relationship",
+            "bridge_job_id": str(((context or {}).get("bridge_jobs") or [{}])[0].get("bridge_job_id") or ""),
+            "relation_type": "complements",
+            "actor_source_id": None,
+            "reference_source_id": None,
+            "reason": "The sources provide complementary evidence for the bounded proposition.",
+        }]}
+
+    def adjudicate_relationships(self, *_args: Any, **_kwargs: Any) -> Mapping[str, Any]:
+        self.adjudication_calls += 1
+        raise AssertionError("Ordinary relationships must not make a second judge call")
 
     def select_relationship_bridge_shards(
         self,
@@ -145,15 +112,8 @@ class _RelationshipReasoner:
 
 
 class _TerminalRelationshipReasoner(_RelationshipReasoner):
-    def adjudicate_relationships(
-        self,
-        profiles: Sequence[EvidenceProfile],
-        request: LiteratureMapRequest,
-        *,
-        context: Mapping[str, Any] | None = None,
-    ) -> Mapping[str, Any]:
-        del profiles, request, context
-        self.adjudication_calls += 1
+    def select_relationship_candidates(self, *_args: Any, **_kwargs: Any) -> Mapping[str, Any]:
+        self.candidate_calls += 1
         raise ValueError("synthetic terminal relationship failure")
 
 
@@ -335,7 +295,7 @@ def test_clusters_off_preserves_history_runs_relationships_and_replays_exactly(
     assert first.metadata["cluster_map"]["preserved_clusters"]
     assert reasoner.candidate_calls > 0
     assert reasoner.bridge_calls > 0
-    assert reasoner.adjudication_calls > 0
+    assert reasoner.adjudication_calls == 0
     assert reasoner.cluster_calls == 0
     assert _cluster_preservation_snapshot(tmp_path) == protected
     registry = (
@@ -575,7 +535,7 @@ def test_clusters_off_receipt_replay_rejects_changed_protected_state(
         literature_policy=policy,
         reasoner=reasoner,
     )
-    calls = reasoner.adjudication_calls
+    calls = (reasoner.candidate_calls, reasoner.adjudication_calls)
     gap_path = (
         tmp_path
         / "03_literature_synthesis"
@@ -601,7 +561,7 @@ def test_clusters_off_receipt_replay_rejects_changed_protected_state(
             resume=True,
         )
 
-    assert reasoner.adjudication_calls == calls
+    assert (reasoner.candidate_calls, reasoner.adjudication_calls) == calls
 
 
 def test_fresh_map_family_timeout_preserves_absent_cluster_outputs(
@@ -657,7 +617,7 @@ def test_clusters_off_partial_relationship_stage_preserves_protected_state(
     assert result.metadata["literature_packet"]["status"] == "partial"
     assert result.metadata["literature_packet"]["retry_on_resume"] is True
     assert reasoner.candidate_calls > 0
-    assert reasoner.adjudication_calls > 0
+    assert reasoner.adjudication_calls == 0
     assert reasoner.cluster_calls == 0
     assert _cluster_preservation_snapshot(tmp_path) == protected
 
@@ -715,7 +675,8 @@ def test_terminal_relationship_failure_stops_before_cluster_synthesis(
     assert result.metadata["literature_packet"]["reason"].endswith(
         "terminal_incomplete_relationships"
     )
-    assert reasoner.adjudication_calls > 0
+    assert reasoner.candidate_calls > 0
+    assert reasoner.adjudication_calls == 0
     assert reasoner.cluster_calls == 0
     assert all(
         (path.read_bytes(), path.stat().st_mtime_ns) == before
@@ -734,7 +695,7 @@ def test_terminal_relationship_failure_stops_before_cluster_synthesis(
         ).glob("*.yml")
     )
 
-    adjudication_calls = reasoner.adjudication_calls
+    candidate_calls = reasoner.candidate_calls
     replay_run_id = f"{run_id}-fresh"
     replay = build_map(
         tmp_path,
@@ -746,7 +707,7 @@ def test_terminal_relationship_failure_stops_before_cluster_synthesis(
     )
 
     assert replay.status == "partial"
-    assert reasoner.adjudication_calls == adjudication_calls
+    assert reasoner.candidate_calls == candidate_calls
     assert reasoner.cluster_calls == 0
     assert all(
         (path.read_bytes(), path.stat().st_mtime_ns) == before

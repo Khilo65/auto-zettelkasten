@@ -74,10 +74,12 @@ def _profile(source_id: str) -> dict[str, Any]:
 def _streamlined_response(
     cluster: Mapping[str, Any],
     profiles: Sequence[Mapping[str, Any]],
+    *, legacy: bool = False,
 ) -> dict[str, Any]:
     source_ids = [str(row["source_id"]) for row in profiles]
-    return {
-        "cluster_contract": "streamlined-full-note-v1",
+    response = {
+        "cluster_contract": "streamlined-full-note-v1" if legacy else "streamlined-full-note-v4",
+        "debate_state": "emerging_convergence",
         "cluster_id": str(cluster["cluster_id"]),
         "title": str(cluster.get("label") or "Mapped findings"),
         "organizing_mode": "question",
@@ -112,6 +114,12 @@ def _streamlined_response(
         "limits": ["The studies use different settings."],
         "related_clusters": [],
     }
+
+    if not legacy:
+        for line in response["lines_of_inquiry"]:
+            for finding in line["study_findings"]:
+                finding.pop("evidence", None)
+    return response
 
 
 def test_provider_concurrency_round_trips_and_validates(tmp_path: Path) -> None:
@@ -247,7 +255,7 @@ def test_streamlined_cluster_rebinds_locator_only_finding_evidence() -> None:
         "label": "Cluster One",
         "source_ids": ["A", "B"],
     }
-    response = _streamlined_response(cluster, profiles)
+    response = _streamlined_response(cluster, profiles, legacy=True)
     response["lines_of_inquiry"][0]["study_findings"][0]["evidence"] = "p. 10"
     response["lines_of_inquiry"][0]["study_findings"][1]["evidence"] = "p. 999"
 
@@ -286,7 +294,7 @@ def test_note_based_cluster_accepts_findings_without_anchors_and_checks_ownershi
         profile["evidence_anchors"] = []
     findings = response["lines_of_inquiry"][0]["study_findings"]
     for finding in findings:
-        finding.pop("evidence")
+        finding.pop("evidence", None)
 
     result = validate_streamlined_cluster_synthesis(response, cluster, profiles)
     assert result["status"] == "reasoned"
@@ -322,7 +330,7 @@ def test_note_based_cluster_accepts_findings_without_anchors_and_checks_ownershi
 def test_streamlined_cluster_ignores_only_cross_owned_evidence_rows() -> None:
     profiles = [_profile("A"), _profile("B"), _profile("C")]
     cluster = {"cluster_id": "cluster-one", "source_ids": ["A", "B", "C"]}
-    response = _streamlined_response(cluster, profiles)
+    response = _streamlined_response(cluster, profiles, legacy=True)
     findings = response["lines_of_inquiry"][0]["study_findings"]
     findings[0]["evidence"].append(
         {
@@ -384,7 +392,7 @@ def test_streamlined_cluster_ignores_only_cross_owned_evidence_rows() -> None:
 
     line = response["lines_of_inquiry"][0]
     line["synthesis"] = "A and B supply contrasting source-specific findings."
-    line["study_findings"] = _streamlined_response(cluster, profiles)[
+    line["study_findings"] = _streamlined_response(cluster, profiles, legacy=True)[
         "lines_of_inquiry"
     ][0]["study_findings"]
     repaired = validate_streamlined_cluster_synthesis(response, cluster, profiles)
@@ -1176,7 +1184,8 @@ def test_book_chapters_count_as_one_canonical_work(tmp_path: Path) -> None:
 
     cluster = report["cluster_registry"]["clusters"][0]
     assert cluster["canonical_work_count"] == 1
-    assert cluster["independent_study_family_count"] == 1
+    assert cluster["canonical_work_count"] == 1
+    assert "independent_study_family_count" not in cluster
     assert cluster["qualification_status"] == "evidence_concentrated_cluster"
     assert cluster["status"] == "evidence_concentrated_cluster"
     assert cluster["source_backed"] is False
@@ -1639,7 +1648,8 @@ def test_cluster_writer_reuses_explicitly_dropped_candidate_subset(
     tmp_path: Path,
 ) -> None:
     response = {
-        "cluster_contract": "streamlined-full-note-v3",
+        "cluster_contract": "streamlined-full-note-v4",
+        "debate_state": "complementary_positions",
         "cluster_id": "cluster-one",
         "status": "accepted",
         "title": "Cluster One",
@@ -2659,9 +2669,9 @@ def test_note_based_partition_preserves_sibling_and_external_neighbors(
             assert all("atomic_note_markdown" in row for row in projected)
             assert all("claims" not in row and "evidence_anchors" not in row for row in projected)
             response = _streamlined_response(context["cluster"], projected)
-            response["cluster_contract"] = "streamlined-full-note-v3"
+            response["cluster_contract"] = "streamlined-full-note-v4"
             for finding in response["lines_of_inquiry"][0]["study_findings"]:
-                finding.pop("evidence")
+                finding.pop("evidence", None)
             return response
 
     reasoner = Reasoner()
@@ -2730,3 +2740,38 @@ def test_note_based_neighbor_projection_rejects_invalid_ownership(basis, target,
     }
     _project_planned_cluster_neighbors(clusters, syntheses)
     assert all(not row["related_clusters"] for row in syntheses.values())
+
+
+@pytest.mark.parametrize("provider", ["codex", "deepseek"])
+def test_current_full_note_writer_exact_serializer_boundary(tmp_path, monkeypatch, provider):
+    import json
+    from auto_zettelkasten.readers import CodexReader, DeepSeekReader, ProviderError
+
+    reader = (CodexReader("gpt-5.6-terra") if provider == "codex" else
+              DeepSeekReader(context_window_tokens=272_000))
+    request = LiteratureMapRequest(tmp_path, provider=provider, model=reader.model)
+    profiles = [{"source_id": "A", "atomic_note_markdown": "Complete first note."},
+                {"source_id": "B", "atomic_note_markdown": ""}]
+    context = {"cluster": {"cluster_id": "boundary", "source_ids": ["A", "B"]}}
+    low, high = 0, int(reader.context_window_tokens) * 4
+    while low < high:
+        midpoint = (low + high + 1) // 2
+        profiles[1]["atomic_note_markdown"] = "x" * midpoint
+        if reader.cluster_synthesis_fits(profiles, request, context=context):
+            low = midpoint
+        else:
+            high = midpoint - 1
+    assert low > 0
+    profiles[1]["atomic_note_markdown"] = "x" * low
+    assert reader.cluster_synthesis_fits(profiles, request, context=context)
+    system, user, output, _ = reader._cluster_synthesis_call_inputs(profiles, request, context)
+    assert json.loads(user)["profiles"] == profiles  # Fitting must not truncate either note.
+    assert "streamlined-full-note-v4" in system
+    reader._ensure_prompt_fits(system, user, output, label="cluster synthesis", context_fraction=0.8)
+
+    profiles[1]["atomic_note_markdown"] += "x"
+    assert not reader.cluster_synthesis_fits(profiles, request, context=context)
+    monkeypatch.setattr(type(reader), "_authorize_request", lambda self: None)
+    monkeypatch.setattr(type(reader), "_generate_text", lambda *args, **kwargs: pytest.fail("over-budget writer launched"))
+    with pytest.raises(ProviderError, match="context budget"):
+        reader.synthesize_cluster(profiles, request, context=context)

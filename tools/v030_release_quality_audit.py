@@ -19,6 +19,7 @@ import zipfile
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from email.parser import BytesParser
+from itertools import combinations
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any
@@ -55,7 +56,9 @@ _JUDGMENT_POLICY = {
         "uncaptured material attachment or parent conflict."
     ),
 }
-_MODES = {"strategic8": 8, "exhaustive40": 40, "stratified500": 500}
+_MODES = {"strategic8": 8, "exhaustive40": 40, "stratified500": 500, "stratified212": 212}
+_STRATIFIED_MODES = {"stratified500", "stratified212"}
+_OMISSION_POLICY = "within-cross-balanced-v1"
 _RELATION_LIMIT = 200
 _MEMBERSHIP_LIMIT = 200
 _DECISION_LIMIT = 100
@@ -442,6 +445,46 @@ def _review_row(
 def _row_group(row: Mapping[str, Any], strata: Mapping[str, str]) -> str:
     ids = _source_ids(_mapping(row.get("payload", {}), label="review payload"))
     return "|".join(sorted({strata.get(source_id, "unknown") for source_id in ids}))
+
+
+def _omission_supplement(
+    strata: Mapping[str, str],
+    decisions: Sequence[Mapping[str, Any]],
+    artifact: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Review unaccepted pairs separately; never count them as negative accuracy."""
+    accepted = {
+        tuple(sorted(_source_ids(row))) for row in decisions
+        if str(row.get("decision_status") or row.get("status") or "") == "accepted"
+    }
+    proposed = {tuple(sorted(_source_ids(row))) for row in decisions}
+    within, cross = [], []
+    for pair in combinations(sorted(strata), 2):
+        if pair in accepted:
+            continue
+        row = _review_row(
+            "omitted_pair", artifact,
+            {"source_ids": list(pair), "recorded_decision": pair in proposed},
+            ("material_error", "clear_useful_connection_missed", "systematic_failure"),
+        )
+        (within if strata[pair[0]] == strata[pair[1]] else cross).append(row)
+    sampled = [
+        *_balanced_limit(within, 50, group_for=lambda row: _row_group(row, strata)),
+        *_balanced_limit(cross, 50, group_for=lambda row: _row_group(row, strata)),
+    ]
+    selected = {row["review_id"] for row in sampled}
+    sampled.extend(_balanced_limit(
+        [row for row in [*within, *cross] if row["review_id"] not in selected],
+        100 - len(sampled), group_for=lambda row: _row_group(row, strata),
+    ))
+    supplement = {
+        "policy": _OMISSION_POLICY, "seed": _SEED,
+        "interpretation": "An isolated defensible omission is a limitation; material or systematic failures block advancement. This sample does not estimate library-wide recall.",
+        "population_count": len(within) + len(cross),
+        "rows": _stable_rows(sampled),
+    }
+    supplement["identity"] = _digest(supplement)
+    return supplement
 
 
 def _load_sources(
@@ -1751,7 +1794,7 @@ def prepare(
         raise ValueError("strategic8 requires its private source manifest")
     sources, strata, artifacts = _load_sources(workspace, mode, source_manifest_path)
     exhaustive = mode == "exhaustive40"
-    full_graph = mode != "stratified500"
+    full_graph = mode not in _STRATIFIED_MODES
     note_bindings: list[dict[str, Any]] = []
     baseline_manifest_artifact: dict[str, str] | None = None
     custody_manifest_artifact: dict[str, str] | None = None
@@ -2124,6 +2167,9 @@ def prepare(
         packet["selection_identity"] = _digest(
             [_STRATIFIED_POLICY_REVISION, _SEED, packet["sampling_counts"], rows]
         )
+    if mode == "stratified212":
+        packet["selection_policy"][mode] = packet["selection_policy"]["stratified500"]
+        packet["omission_review"] = _omission_supplement(strata, pair_decisions, typed_artifact)
     packet["packet_identity"] = _digest(packet)
     _write_private_yaml(packet_path, packet)
     if exhaustive:
@@ -2168,7 +2214,7 @@ def _verify_packet(workspace: Path, packet: Mapping[str, Any]) -> list[dict[str,
     identity = str(without_identity.pop("packet_identity", ""))
     if identity != _digest(without_identity):
         raise ValueError("review packet identity hash is invalid")
-    if packet["mode"] == "stratified500":
+    if packet["mode"] in _STRATIFIED_MODES:
         if (
             packet.get("selection_policy_revision") != _STRATIFIED_POLICY_REVISION
             or packet.get("selection_seed") != _SEED
@@ -2201,6 +2247,21 @@ def _verify_packet(workspace: Path, packet: Mapping[str, Any]) -> list[dict[str,
         artifact_hashes[key] = expected
 
     rows = [_mapping(row, label="review row") for row in packet.get("rows", []) or []]
+    if packet["mode"] == "stratified212":
+        supplement = _mapping(packet.get("omission_review"), label="omission supplement")
+        payload = dict(supplement)
+        identity = payload.pop("identity", None)
+        if (
+            payload.get("policy") != _OMISSION_POLICY
+            or payload.get("seed") != _SEED
+            or identity != _digest(payload)
+            or len(payload.get("rows", [])) > 100
+        ):
+            raise ValueError("omission review supplement is invalid or stale")
+        omitted = [_mapping(row, label="omitted pair") for row in payload.get("rows", [])]
+        if any(row.get("kind") != "omitted_pair" for row in omitted):
+            raise ValueError("omission supplement contains a different row kind")
+        rows.extend(omitted)
     if not rows:
         raise ValueError("review packet contains no rows")
     seen: set[str] = set()
@@ -2535,6 +2596,8 @@ def score(
     metadata_only_non_pretense: list[bool] = []
     for row in rows:
         judgment = by_id[str(row["review_id"])]
+        if row.get("kind") == "omitted_pair":
+            continue
         if row.get("kind") == "note":
             prefix = f"variant_{current_variants[str(row['review_id'])].casefold()}_"
             current = {
@@ -2641,7 +2704,7 @@ def score(
         "source_grounded_rate_at_least_0_90": metrics["source_grounded_rate"] >= 0.90,
         "all_audited_syntheses_supported": bool(supported) and all(supported),
     }
-    if decisions or packet["mode"] == "stratified500":
+    if decisions or packet["mode"] in _STRATIFIED_MODES:
         checks["rejected_unclustered_accuracy_at_least_0_90"] = _rate(decisions) >= 0.90
     if packet["mode"] == "exhaustive40":
         checks.update(
@@ -2689,6 +2752,17 @@ def score(
                 >= 0.80,
             }
         )
+    if packet["mode"] == "stratified212":
+        metrics["omission_review"] = {
+            "reviewed": len(values("omitted_pair", "material_error")),
+            "clear_useful_connections_missed": sum(values("omitted_pair", "clear_useful_connection_missed")),
+            "material_errors": sum(values("omitted_pair", "material_error")),
+            "systematic_failures": sum(values("omitted_pair", "systematic_failure")),
+        }
+        checks["no_material_or_systematic_omission_failure"] = not (
+            any(values("omitted_pair", "material_error"))
+            or any(values("omitted_pair", "systematic_failure"))
+        )
     report = {
         "score_schema_version": "1",
         "status": "passed" if all(checks.values()) else "failed",
@@ -2724,7 +2798,7 @@ def score(
             "material_errors": 0,
             "overall_pass_rate": 0.90,
             "exhaustive40_relationship_membership_point_accuracy": 0.90,
-            "stratified500_relationship_membership_wilson_95_lower": 0.80,
+            f"{'stratified212' if packet['mode'] == 'stratified212' else 'stratified500'}_relationship_membership_wilson_95_lower": 0.80,
             "type_direction_accuracy": 0.90,
             "role_accuracy": 0.90,
             "rejected_unclustered_accuracy": 0.90,

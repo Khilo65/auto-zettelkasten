@@ -10,7 +10,7 @@ from typing import Any, Literal, Mapping
 
 CURRENT_ENGINE_VERSION = "0.30.0"
 CURRENT_ARTIFACT_SCHEMA_VERSION = "1.20"
-CURRENT_PROFILE_SCHEMA_VERSION = "1.3"
+CURRENT_PROFILE_SCHEMA_VERSION = "1.4"
 CURRENT_ATOMIC_PROMPT_VERSION = "14"
 
 
@@ -2096,7 +2096,7 @@ class MissingSourceRecommendation:
 class SourceAnalysisBundle:
     """Canonical source-owned output of one source-reading call."""
 
-    bundle_schema_version: str = "1"
+    bundle_schema_version: str = "2"
     source_identity: dict[str, str] = field(default_factory=dict)
     observed_bibliographic_identity: dict[str, Any] = field(default_factory=dict)
     scope_assessment: dict[str, Any] = field(default_factory=dict)
@@ -2111,8 +2111,8 @@ class SourceAnalysisBundle:
     component_diagnostics: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        if self.bundle_schema_version != "1":
-            raise ValueError("source analysis bundle schema must be 1")
+        if self.bundle_schema_version not in {"1", "2"}:
+            raise ValueError("source analysis bundle schema must be 1 or 2")
         source_identity = self.source_identity
         if not isinstance(source_identity, Mapping) or not any(
             str(source_identity.get(key) or "")
@@ -2162,7 +2162,8 @@ class SourceAnalysisBundle:
         object.__setattr__(
             self,
             "evidence_anchors",
-            _canonicalize_anchor_ids(list(self.evidence_anchors)),
+            _canonicalize_anchor_ids(list(self.evidence_anchors))
+            if self.bundle_schema_version == "1" else [],
         )
 
     def semantic_dict(self) -> dict[str, Any]:
@@ -2184,9 +2185,8 @@ class SourceAnalysisBundle:
             "scope_assessment": dict(self.scope_assessment),
             "analysis_sections": dict(self.analysis_sections),
             "compact_profile": dict(self.compact_profile),
-            "evidence_anchors": [
-                anchor.to_dict() for anchor in self.evidence_anchors
-            ],
+            **({"evidence_anchors": [anchor.to_dict() for anchor in self.evidence_anchors]}
+               if self.bundle_schema_version == "1" else {}),
             "literature_positions": [
                 position.to_dict() for position in self.literature_positions
             ],
@@ -2274,7 +2274,8 @@ class SourceAnalysisBundle:
             compact_profile=_normalized_bundle_profile(
                 optional_mapping("compact_profile")
             ),
-            evidence_anchors=optional_rows("evidence_anchors", EvidenceAnchor),
+            evidence_anchors=(optional_rows("evidence_anchors", EvidenceAnchor)
+                              if schema_value == "1" else []),
             literature_positions=optional_rows(
                 "literature_positions", LiteraturePosition
             ),
@@ -2797,15 +2798,19 @@ class EvidenceProfile:
             "1.0",
             "1.1",
             "1.2",
+            "1.3",
             CURRENT_PROFILE_SCHEMA_VERSION,
         }:
-            raise ValueError("profile_schema_version must be 1.0, 1.1, 1.2, or 1.3")
+            raise ValueError("profile_schema_version must be 1.0, 1.1, 1.2, 1.3, or 1.4")
         lineage = self.study_lineage
         if isinstance(lineage, Mapping):
             lineage = StudyLineage.from_dict(lineage)
         elif lineage is not None and not isinstance(lineage, StudyLineage):
             raise ValueError("study_lineage must be a StudyLineage, mapping, or null")
         self.study_lineage = lineage
+        if self.profile_schema_version == CURRENT_PROFILE_SCHEMA_VERSION:
+            self.findings = []
+            self.evidence_anchors = []
         normalized_findings: list[EvidenceFinding] = []
         for finding in self.findings:
             if isinstance(finding, EvidenceFinding):
@@ -2850,11 +2855,10 @@ class EvidenceProfile:
         if len(normalized_anchors) > 24:
             raise ValueError("evidence_anchors cannot contain more than 24 items")
         self.evidence_anchors = normalized_anchors
-        self.profile_schema_version = CURRENT_PROFILE_SCHEMA_VERSION
 
     def to_dict(self) -> dict[str, Any]:
         payload = _jsonable(self)
-        payload["profile_schema_version"] = CURRENT_PROFILE_SCHEMA_VERSION
+        payload["profile_schema_version"] = self.profile_schema_version
         payload.pop("excluded_from_synthesis", None)
         payload["study_lineage"] = (
             self.study_lineage.to_dict() if self.study_lineage is not None else None
@@ -2862,6 +2866,9 @@ class EvidenceProfile:
         payload["evidence_anchors"] = [
             anchor.to_dict() for anchor in self.evidence_anchors
         ]
+        if self.profile_schema_version == CURRENT_PROFILE_SCHEMA_VERSION:
+            payload.pop("findings", None)
+            payload.pop("evidence_anchors", None)
         return payload
 
 

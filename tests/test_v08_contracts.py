@@ -90,7 +90,7 @@ def test_profile_1_3_round_trips_typed_locator_quantitative_result_and_lineage()
         confidence="high",
     )
     profile = EvidenceProfile(
-        profile_schema_version="1.1",
+        profile_schema_version="1.3",
         source_id="source-1",
         study_lineage=lineage,
         evidence_anchors=[anchor],

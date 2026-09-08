@@ -7,6 +7,7 @@ import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+from urllib.parse import parse_qsl, quote, urlsplit
 
 import yaml
 
@@ -89,6 +90,8 @@ NON_SOURCE_FRONTMATTER_FIELDS = frozenset(
         "related_notes",
         "review_status",
         "source_faithfulness_review",
+        "source_pdf_uri",
+        "zotero_item_uri",
         "structural_validation",
         "tags",
         "updated_at",
@@ -104,6 +107,8 @@ GRAPH_END_MARKER = "<!-- auto-zettelkasten:graph:end -->"
 LITERATURE_HEADING = "## Position in the Literature"
 LITERATURE_START_MARKER = "<!-- auto-zettelkasten:literature:start -->"
 LITERATURE_END_MARKER = "<!-- auto-zettelkasten:literature:end -->"
+SOURCE_START_MARKER = "<!-- auto-zettelkasten:source:start -->"
+SOURCE_END_MARKER = "<!-- auto-zettelkasten:source:end -->"
 NOTE_METADATA_SCHEMA_VERSION = "2"
 REQUIRED_LIMITED_FRONTMATTER = (REQUIRED_FRONTMATTER - {"reader_provider", "reader_model"}) | {
     "source_scope",
@@ -243,10 +248,79 @@ def source_obsidian_tags(normalized_tags: Sequence[str], note_status: str) -> li
     return sorted(tags)
 
 
+def _source_navigation_link(frontmatter: Mapping[str, Any]) -> str:
+    # Attachment identity is bound by acquisition, never inferred from note prose.
+    pdf_uri = str(frontmatter.get("source_pdf_uri") or "")
+    match = re.fullmatch(
+        r"zotero://open-pdf/(?:library|groups/[1-9][0-9]*)/items/[A-Z0-9]{8}"
+        r"(?:\?([^\s<>]*))?", pdf_uri
+    )
+    if match:
+        query = match.group(1) or ""
+        pairs = parse_qsl(query, keep_blank_values=True)
+        if (
+            len(dict(pairs)) == len(pairs)
+            and (not query or pairs)
+            and all(
+                (key == "page" and re.fullmatch(r"[1-9][0-9]*", value))
+                or (key == "annotation" and re.fullmatch(r"[A-Z0-9]{8}", value))
+                for key, value in pairs
+            )
+            and not re.search(r"[()\[\]#]", query)
+        ):
+            return f"[Open PDF in Zotero]({pdf_uri})"
+    url = str(frontmatter.get("url") or "").strip()
+    if re.match(r"https?://", url) and not re.search(r"[\s<>]", url):
+        try:
+            if urlsplit(url).hostname:
+                destination = quote(url, safe=":/?#[]@!$&'*+,;=%")
+                return f"[Open source]({destination})"
+        except ValueError:
+            pass
+    item_uri = str(frontmatter.get("zotero_item_uri") or "")
+    if re.fullmatch(
+        r"zotero://select/(?:library|groups/[1-9][0-9]*)/items/[A-Z0-9]{8}",
+        item_uri,
+    ):
+        return f"[Open source in Zotero]({item_uri})"
+    key = str(frontmatter.get("zotero_item_key") or "")
+    if re.fullmatch(r"[A-Z0-9]{8}", key):
+        return f"[Open source in Zotero](zotero://select/library/items/{key})"
+    return ""
+
+
+def _managed_source_block(body: str) -> re.Match[str] | None:
+    return re.search(
+        rf"^{re.escape(SOURCE_START_MARKER)}[ \t]*$\n?.*?"
+        rf"^{re.escape(SOURCE_END_MARKER)}[ \t]*$",
+        body,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+
+
+def _project_source_navigation(body: str, frontmatter: Mapping[str, Any]) -> str:
+    counts = (body.count(SOURCE_START_MARKER), body.count(SOURCE_END_MARKER))
+    managed = _managed_source_block(body)
+    if counts not in {(0, 0), (1, 1)} or (counts == (1, 1) and not managed):
+        raise ValueError("ambiguous_managed_source_block")
+    link = _source_navigation_link(frontmatter)
+    block = f"{SOURCE_START_MARKER}\n{link}\n{SOURCE_END_MARKER}" if link else ""
+    if managed:
+        return f"{body[:managed.start()]}{block}{body[managed.end():]}" if block else (
+            _without_markdown_span(body, managed.start(), managed.end()) + "\n"
+        )
+    if not block:
+        return body
+    title = re.search(r"^# [^\n]*\n", body, flags=re.MULTILINE)
+    offset = title.end() if title else 0
+    remainder = body[offset:].lstrip("\n")
+    return f"{body[:offset]}\n{block}\n\n{remainder}"
+
+
 def render_atomic_note(frontmatter: Mapping[str, Any], analysis: Mapping[str, Any]) -> str:
     yaml_text = _dump_frontmatter(frontmatter)
     title = str(frontmatter.get("title") or "Untitled Source")
-    lines = ["---", yaml_text, "---", "", f"# {title}", ""]
+    lines = ["", f"# {title}", ""]
     if frontmatter.get("note_status") == "partial_document_atomic_note":
         lines.extend(
             [
@@ -261,7 +335,8 @@ def render_atomic_note(frontmatter: Mapping[str, Any], analysis: Mapping[str, An
         if key in OPTIONAL_SECTION_KEYS and not content:
             continue
         lines.extend([f"## {heading}", "", content, ""])
-    return "\n".join(lines)
+    body = "\n".join(lines)
+    return f"---\n{yaml_text}\n---\n{_project_source_navigation(body, frontmatter)}"
 
 
 def public_note_frontmatter(frontmatter: Mapping[str, Any]) -> dict[str, Any]:
@@ -402,11 +477,8 @@ def render_limited_note(frontmatter: Mapping[str, Any], content: Mapping[str, An
         }[status]
     yaml_text = _dump_frontmatter(frontmatter)
     title = str(frontmatter.get("title") or "Untitled Source")
-    return "\n".join(
+    body = "\n".join(
         [
-            "---",
-            yaml_text,
-            "---",
             "",
             f"# {title}",
             "",
@@ -420,6 +492,8 @@ def render_limited_note(frontmatter: Mapping[str, Any], content: Mapping[str, An
             "",
         ]
     )
+
+    return f"---\n{yaml_text}\n---\n{_project_source_navigation(body, frontmatter)}"
 
 
 def validate_limited_note(text: str) -> NoteValidation:
@@ -666,6 +740,9 @@ def strip_review_status_material(text: str, *, update_versions: bool = False) ->
 
 def _strip_generated_note_sections(body: str) -> str:
     body = _strip_review_status_sections(body)
+    source = _managed_source_block(body)
+    if source:
+        body = _without_markdown_span(body, source.start(), source.end())
     literature = _managed_literature_block(body)
     if literature:
         section = re.search(
@@ -781,12 +858,11 @@ def _strip_review_status_sections(body: str) -> str:
 def update_note_frontmatter(path: Path, updates: Mapping[str, Any]) -> None:
     note = read_note(path)
     frontmatter = dict(note["frontmatter"])
-    if all(
+    unchanged_metadata = all(
         frontmatter.get(key) == value
         for key, value in updates.items()
         if key != "updated_at"
-    ):
-        return
+    )
     body = str(note["body"])
     old_title = str(frontmatter.get("title") or "")
     frontmatter.update(dict(updates))
@@ -799,6 +875,9 @@ def update_note_frontmatter(path: Path, updates: Mapping[str, Any]) -> None:
             count=1,
             flags=re.MULTILINE,
         )
+    body = _project_source_navigation(body, frontmatter)
+    if unchanged_metadata and body == str(note["body"]):
+        return
     workspace = _workspace_for_note(path)
     if workspace is not None:
         _write_note_metadata(workspace, path, frontmatter)
@@ -1210,8 +1289,7 @@ def _limited_primary_content(
         ).strip()
         if supplied:
             return supplied
-        source_file = str(frontmatter.get("source_file") or "the recorded source location")
-        return f"A full-document source is available at `{source_file}`."
+        return "A full-document source is available for analysis."
     supplied_metadata = payload.get("metadata") or payload.get("citation_metadata") or payload.get("available_summary") or payload.get("available_content")
     if isinstance(supplied_metadata, Mapping):
         rows = [(str(key), value) for key, value in supplied_metadata.items() if value not in (None, "", [], {})]

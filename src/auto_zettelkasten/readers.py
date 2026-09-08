@@ -239,9 +239,9 @@ DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
-SOURCE_BUNDLE_PROMPT_VERSION = "39"
-SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v2"
-SOURCE_BUNDLE_ROW_LIMITS = {"evidence_anchors": 24, "literature_positions": 8}
+SOURCE_BUNDLE_PROMPT_VERSION = "40"
+SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v3"
+SOURCE_BUNDLE_ROW_LIMITS = {"literature_positions": 8}
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
 CLUSTER_PROPOSAL_MAX_OUTPUT_TOKENS = 64_000
 GAP_ADJUDICATION_MAX_OUTPUT_TOKENS = 32_000
@@ -373,32 +373,6 @@ _CODEX_SOURCE_ROLE = _codex_object(
 CODEX_OUTPUT_CONTRACTS: Mapping[str, Mapping[str, Any]] = {
     "source_bundle": _codex_object(
         {
-            "evidence_anchors": _codex_array(
-                _codex_object(
-                    {
-                        "claim": {
-                            "type": "string",
-                            "description": (
-                                "One evidence observation; a quantitative claim must "
-                                "not contain unrelated numeric values or dates."
-                            ),
-                        },
-                        "locator": _CODEX_STRING,
-                        "planning_roles": _CODEX_STRINGS,
-                        "salience_priority": _CODEX_INTEGER,
-                        "evidence_role": _CODEX_STRING,
-                        "support_boundary": _CODEX_STRING,
-                        "plain_english_meaning": _CODEX_STRING,
-                        "uncertainty": _CODEX_STRING,
-                        "quantitative_result": {
-                            "anyOf": [
-                                _CODEX_QUANTITATIVE_RESULT,
-                                {"type": "null"},
-                            ]
-                        },
-                    }
-                )
-            ) | {"maxItems": SOURCE_BUNDLE_ROW_LIMITS["evidence_anchors"]},
             "analysis_sections": _codex_object(
                 {key: _CODEX_STRING for key in SECTION_KEYS}
             ),
@@ -478,48 +452,9 @@ CODEX_OUTPUT_CONTRACTS: Mapping[str, Mapping[str, Any]] = {
                     "boundaries",
                     "gaps",
                     "future_research",
-                    "findings",
                 )
             },
             "study_lineage": {"type": "null"},
-            "evidence_anchors": _codex_array(
-                _codex_object(
-                    {
-                        "claim": _CODEX_STRING,
-                        "finding_type": _CODEX_STRING,
-                        "direction": _CODEX_STRING,
-                        "magnitude": _CODEX_STRING,
-                        "comparison": _CODEX_STRING,
-                        "conditions": _CODEX_STRINGS,
-                        "plain_english_meaning": _CODEX_STRING,
-                        "uncertainty": _CODEX_STRING,
-                        "locator": _CODEX_STRING,
-                        "locators": _CODEX_STRINGS,
-                        "qualifiers": _CODEX_STRINGS,
-                        "support_envelope": _codex_object(
-                            {
-                                "empirical_role": _CODEX_STRING,
-                                "argument_role": _CODEX_STRING,
-                                "coverage": _CODEX_STRING,
-                                "scope": _codex_object(
-                                    {
-                                        key: _CODEX_STRINGS
-                                        for key in (
-                                            "population",
-                                            "case",
-                                            "geography",
-                                            "period",
-                                            "outcome",
-                                        )
-                                    }
-                                ),
-                                "restrictions": _CODEX_STRINGS,
-                                "support_status": _CODEX_STRING,
-                            }
-                        ),
-                    }
-                )
-            ),
         }
     ),
     "literature_family_plan": _codex_object(
@@ -712,6 +647,7 @@ CODEX_OUTPUT_CONTRACTS: Mapping[str, Mapping[str, Any]] = {
             "guiding_question": _CODEX_STRING,
             "central_tension": _CODEX_STRING,
             "bottom_line": _CODEX_STRING,
+            "debate_state": {"type": "string", "enum": ['mapped_debate', 'mapped_consensus', 'emerging_convergence', 'aligned_institutional_guidance', 'within_program_consistency', 'mixed_evidence', 'conditional_relationship', 'complementary_positions', 'parallel_literatures', 'single_position', 'no_debate']},
             "lines_of_inquiry": _codex_array(
                 _codex_object(
                     {
@@ -2076,8 +2012,6 @@ class _CapabilityAwareReader:
                 label="source analysis bundle response",
                 expected_identity=_source_bundle_expected_identity(metadata),
             )
-            if attachments and not bundle.get("evidence_anchors"):
-                raise ValueError("image-backed source bundle contains no evidence")
             return bundle
         except Exception as exc:
             _preserve_provider_failure(exc, raw)
@@ -2149,22 +2083,19 @@ class _CapabilityAwareReader:
         question: str | None = None,
         context: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
-        """Generate profile-prompt-v6 JSON from committed note text only."""
+        """Generate profile-prompt-v7 JSON from committed note text only."""
 
         del (
             question
         )  # A question is a projection lens, not part of the base evidence profile.
         self._authorize_request()
-        prompt_version = str((context or {}).get("profile_prompt_version") or "6")
-        if prompt_version != "6":
+        prompt_version = str((context or {}).get("profile_prompt_version") or "7")
+        if prompt_version != "7":
             raise ProviderError(f"unsupported profile prompt version: {prompt_version}")
         user_prompt = str(note.get("profile_prompt") or "").strip()
         if not user_prompt:
             raise ProviderError("profile_source requires a profile_prompt")
         system_prompt = _profile_system_prompt()
-        # Evidence profiles contain many typed fields and can be materially
-        # larger than the final atomic-note synthesis. Reusing the 3,000-token
-        # note cap caused valid profile JSON to be truncated mid-object.
         output_tokens = self._reserved_output_tokens(
             "evidence_profile",
             max(self.max_output_tokens, PROFILE_MAX_OUTPUT_TOKENS),
@@ -2173,7 +2104,7 @@ class _CapabilityAwareReader:
         self._ensure_prompt_fits(
             system_prompt, user_prompt, output_tokens, label="evidence profile"
         )
-        return _parse_json_object(
+        payload = _parse_json_object(
             self._generate_with_reasoning(
                 system_prompt,
                 user_prompt,
@@ -2184,6 +2115,10 @@ class _CapabilityAwareReader:
             ),
             label="profile response",
         )
+
+        from .profiles import _normalize_reasoner_profile_payload
+
+        return _normalize_reasoner_profile_payload(payload)
 
     def select_relationship_shards(
         self,
@@ -5437,112 +5372,35 @@ def _source_bundle_system_prompt() -> str:
     keys = ", ".join(REQUIRED_SECTION_KEYS)
     return (
         f"You are the source-reading reasoner for Auto-Zettelkasten source bundle prompt v{SOURCE_BUNDLE_PROMPT_VERSION}. "
-        "Capture the thesis, knowledge basis, important evidence, detailed findings, limitations, literature position, "
-        "and distinct contribution. Include the consequential data, examples, historical analogies, mechanisms, nulls, "
-        "counterexamples, and qualifications needed to evaluate the argument. Distinguish reported observations, modeled "
-        "estimates, author interpretations, recommendations, and your explanation. Stay within the recovered-document scope. "
-        "The optional key_concepts_and_definitions field is only for consequential concepts that the supplied source explicitly "
-        "defines or operationalizes and whose definition is recoverable from the supplied content. Do not include merely mentioned "
-        "terms or external definitions. Prefer a short exact "
-        "quotation with a supplied page number; otherwise cite a section, heading, or explicit text anchor. Clearly label "
-        "source-grounded paraphrases, never disguise them as quotations, and never invent locators. Use concise Markdown bullets "
-        "such as '**Term** — “source wording” (p. 12).' If no qualifying definition exists, omit the field entirely; do not return "
-        "a placeholder. "
-        "The optional source_structure_and_organization field is a short source-native navigation outline, not an argument map. "
-        "Include it only when headings are recoverable. Preserve the source's actual order and titles: for an article or chapter, "
-        "include major headings and only consequential first-level subheadings; for a book, include chapters and only essential "
-        "subchapters; for an edited volume, include recoverable chapter titles and authors. Add brief page ranges or other supplied "
-        "locators when available. For a partial source, label the outline partial and include only visible structure. Use concise nested "
-        "Markdown bullets. Do not infer missing headings, invent a table of contents, reproduce minor subheadings, or encode links among "
-        "claims. Omit source_structure_and_organization entirely when reliable structure is unavailable. "
-        "Adapt to the source form: quantitative work retains population, period, sample, unit, variables, baseline, "
-        "comparison, estimates, uncertainty, interactions, robustness, and design limits; qualitative and comparative work "
-        "retains case selection, evidence, chronology, mechanisms, decisive examples, alternatives, and generalization limits; "
-        "historical work retains chronology, sources, analogies, inferences, and boundaries; theoretical or normative work "
-        "retains assumptions, logical sequence, propositions, rivals, examples, and scope; institutional or practitioner work "
-        "separates evidence and consultations from recommendations and implementation constraints; reviews retain the "
-        "organizing debate, important cited positions, evidence bases, unresolved questions, and the author's contribution. "
-        "Legal, policy, and institutional sources must preserve explicitly stated operative dates, deadlines, effective dates, and signing dates, "
-        "keep their distinct roles, and never substitute bibliographic metadata. "
-        "For a book-like source, identify whether it is an authored monograph, edited volume, collected work, chapter or "
-        "contribution, partial excerpt, or composition-uncertain. An authored monograph needs book-level analysis and a bounded "
-        "chapter outline in source_structure_and_organization when headings are recoverable. An edited or collected volume needs "
-        "the editors' framing plus chapter "
-        "title, chapter author, thesis, evidence or method, and contribution for consequential recoverable chapters. Keep "
-        "book-level and chapter-level claims distinct and never attribute a contributor's claim to an editor or the whole volume. "
-        "Formatting and attribution carry scope. Pair chart or table labels with values, and apply a footnote, only when "
-        "the alignment or marker is explicit; otherwise state the ambiguity. A footnote qualifies only the values bearing its "
-        "explicit marker: split marked and unmarked sibling values into separate evidence anchors and quantitative results. "
-        "Published, Updated, Accessed, and Retrieved page metadata is not a statistic's observation date. A full calendar date "
-        "in quantitative_result.period must be locally stated with the reported estimate in the source content; when the local "
-        "date omits a year, omit the year rather than borrowing it from page metadata. Every numeric date or year endpoint in "
-        "period must be locally stated with that estimate; never attach a global conflict or study start date to a later total. "
-        "Do not infer a subgroup claim from an aggregate "
-        "count. Preserve the exact speaker or author and singular or plural cardinality in every analysis, compact-profile, "
-        "and anchor field; do not infer a group's position from actions or quotations about that group, and keep author "
-        "interpretations or intent claims attributed. Describe methods only as the source reports them: selected journalistic "
-        "examples are not a survey, systematic sample, or case-study design. For journalistic sources, distinguish people actually "
-        "interviewed from people or organizations merely contacted, asked for comment, or reported as nonresponsive. "
-        "Each literature-position row represents exactly "
-        "one distinct work; never pool works, years, claims, or locators. "
-        "Use associational wording for observational evidence unless the design and source justify causality. Attribute "
-        "qualitative explanatory claims to the author. Never turn a recommendation into a demonstrated result. Preserve every "
-        "important source-reported number on its original scale with its estimand, comparison, reference group, denominator, "
-        "baseline, uncertainty, and observed range. Keep modeled and observed quantities distinct. A simple derivation is "
-        "allowed only when all inputs are explicit; retain the source statistic and label the derivation system_derived. "
-        "A total and a geographic or demographic subset are not competing estimates. Before alleging a discrepancy, "
-        "check the same population, period, measure, and category and reconcile the source's explicit components, "
-        "including subtotals omitted from your evidence anchors. Describe different scopes separately; retain a discrepancy "
-        "claim only if a contradiction remains between comparable quantities. Do not invent a source-quality criticism "
-        "to fill a limitations section. "
-        "Put a derived number only in estimate. Every numeric statistic, estimand type, outcome definition, unit, scale, "
-        "baseline, reference or comparison group, denominator, sample, uncertainty, population, and model value must be "
-        "stated explicitly in the source; otherwise leave that field empty or say it is not reported without a number. "
-        "Name a derived operation and direction in words. Preserve million, billion, abbreviation, fraction, and other reported "
-        "scales exactly; do not expand them into newly calculated full integers. "
-        "In plain English, explain the two to four most important findings rather than repeating the abstract. Keep the "
-        "technical statistic beside the explanation. A move from 40% to 31% is 9 percentage points lower and, when useful, "
-        "22.5% lower relative to the 40% baseline. Keep odds, hazards, risks, and probabilities distinct. Do not convert a "
-        "logit coefficient or interaction into a percentage without a reported marginal effect, predicted probability, or "
-        "all required inputs. A p-value is not an effect size or the probability that a hypothesis is true. Locators are "
-        "approximate navigation aids and must not be invented. `--- Page N ---`, `PDF page N`, and caller-provided page scopes "
-        "are physical PDF ordinals. Reserve bare `p. N` or `pp. N-M` for supplied source-native printed labels; use "
-        "ordinal_to_printed_page to convert when present, and keep the `PDF` prefix when no printed label is supplied. "
-        f"Return exactly one JSON object for {SOURCE_BUNDLE_ENVELOPE_CONTRACT} with only these top-level fields: "
-        "evidence_anchors, analysis_sections, compact_profile, literature_positions, and "
-        "observed_bibliographic_identity. "
-        "Emit evidence_anchors first; carry their attribution and scope into the later analysis_sections "
-        "and compact_profile. Recheck prose against the supplied source, not only the selected anchors. "
-        f"analysis_sections is an object with readable Markdown strings for these required keys: {keys}. It may also contain "
-        "key_concepts_and_definitions and source_structure_and_organization only under their rules above. "
-        "For required fields only, use a short 'Not applicable to this source form' string when necessary. compact_profile is an object containing "
-        "thesis, method_or_knowledge_basis, source_genre, inferential_design, and bounded arrays for mechanisms, outcomes, "
-        "cases, populations, periods, and datasets. In datasets, use the source's canonical dataset title and explicitly stated edition "
-        "or sample, not the hosting site or presentation format; describe dashboards, summaries, and analyses in method_or_knowledge_basis. "
-        "Do not invent a dataset identity when none is recoverable. evidence_anchors is an array of no more than 24 consequential rows. "
-        "Include located anchors for central mechanisms and author interpretations as well as quantitative results; "
-        "do not fill the budget with secondary numbers while omitting the argument's decisive evidence. Each "
-        "row uses claim, locator, planning_roles, salience_priority, evidence_role, support_boundary, plain_english_meaning, "
-        'uncertainty, and optional quantitative_result. For locator use a supplied page or numbered paragraph, Heading "exact heading", '
-        'or Quote "exact unique source words" (12–120 characters) when no supplied page or heading exists. '
-        "Descriptive paragraph labels are not locators. evidence_role should be a short controlled description such as "
-        "causal, associational, descriptive, mechanism_evidence, conceptual, methodological, normative, or "
-        "practitioner_guidance. quantitative_result may use statistic, estimand_type, outcome_definition, estimate, unit, "
-        "scale, baseline, reference_group, comparison_group, denominator, sample, uncertainty, population, period, model, "
-        "and provenance. Within quantitative_result, statistic names the reported measure or statistic type, while estimate "
-        "holds its numeric value or values. Do not repeat or concatenate numeric estimates in statistic. Use one "
-        "quantitative_result for one observation. When values belong to distinct dates, groups, models, or table rows, split "
-        "them into separate evidence anchors unless the source itself defines one joint statistic. Do not join distinct "
-        "observation dates with semicolons in period. literature_positions contains up to eight distinct important "
-        "substantively engaged works; return an empty array when none are recoverable, "
-        "not the whole bibliography. Each row uses raw_citation, author, year, title, identifiers, engagement, "
-        "relation_label, and locator. Here year means the work's publication year; leave it empty when only an event or study date is known. "
-        "Copy supplied author and title forms exactly; do not expand initials or add name components. "
-        "observed_bibliographic_identity is a diagnostic object using title, creators, and date "
-        "when visible in the source. Do not return stable IDs, source ownership, scope classification, support-envelope "
-        "bookkeeping, library match status, missing-source recommendations, or a self-review object; the engine supplies or "
-        "derives those fields locally. Before returning, silently self-review attribution, scope, conspicuous numbers, "
-        "statistical scale, and causal wording inside this same call. This is not another model call or a separate note section."
+        "Write a detailed, source-faithful atomic note. Explain the thesis, knowledge basis, methods, "
+        "evidence and data, findings, examples, mechanisms, limitations, literature position and distinct contribution. "
+        "Preserve consequential quantities with their original scales, comparison groups, observation periods, "
+        "uncertainty and qualifications. Distinguish observations, modeled estimates, author interpretations and "
+        "recommendations. Keep observational associations distinct from causal evidence and preserve operative dates "
+        "separately from publication metadata. Describe the source's actual knowledge basis, including the distinction "
+        "between people interviewed and those merely contacted. Attribute claims to the correct author or speaker, and preserve the scope of table labels "
+        "and marked footnotes. Explain the important results in plain English alongside their technical meaning. "
+        "Adapt to the source: retain case selection and chronology in qualitative work, assumptions and logical "
+        "steps in theoretical work, and the evidence behind practical recommendations. For books, distinguish "
+        "the author's argument from editors' framing and individual contributors' arguments. Summarize consequential "
+        "chapters with their authors, theses, evidence or methods and contributions when recoverable. "
+        "Use useful page, chapter, heading or table references when supplied. Keep exact quotations faithful to "
+        "the source wording and distinguish them from paraphrases. Stay within the recovered content. "
+        "key_concepts_and_definitions is optional: include consequential definitions or operationalizations "
+        "recoverable from the source. source_structure_and_organization is optional: preserve the actual order "
+        "and titles of recoverable major headings or book chapters, with useful supplied locators. "
+        f"Return exactly one JSON object for {SOURCE_BUNDLE_ENVELOPE_CONTRACT} with analysis_sections, compact_profile, "
+        "literature_positions, and observed_bibliographic_identity. "
+        f"analysis_sections contains readable Markdown strings for these required keys: {keys}. "
+        "It may also contain key_concepts_and_definitions and source_structure_and_organization. "
+        "For an inapplicable required section, state briefly why it does not apply to this source. "
+        "compact_profile contains thesis, method_or_knowledge_basis, source_genre, inferential_design, "
+        "and bounded arrays for mechanisms, outcomes, cases, populations, periods and datasets. "
+        "Use recoverable dataset identities. literature_positions contains up to eight distinct important "
+        "substantively engaged works, or an empty array. Each row uses raw_citation, author, year, title, "
+        "identifiers, engagement, relation_label and locator; retain one work per row and leave unknown metadata "
+        "empty. observed_bibliographic_identity contains title, creators and date visible in the source. "
+        "The engine supplies stable identity and coverage metadata."
     )
 
 
@@ -5595,75 +5453,7 @@ def _source_bundle_prompt(
         f"Question lens: {question or 'none'}\n"
         f"Scope rule: {partial_rule}\n\n"
         f"INSPECTED SOURCE CONTENT:\n{text}\n\n"
-        "FINAL QUANTITATIVE COPY GATE: Check every evidence_anchors.quantitative_result "
-        "against the same local passage above. For source_reported "
-        "values, every numeric token in estimate and every numeric date or year endpoint in "
-        "period must appear verbatim in that passage. Do not round, approximate, infer "
-        "endpoints, or borrow dates from metadata or context. One quantitative_result is one "
-        "observation and one measure: split distinct outcomes, categories, dates, groups, models, "
-        "table rows, and footnote scopes into separate evidence anchors even when the source lists "
-        "them together or they describe the same entity. Overall rank, sub-index score, and "
-        "sub-index rank are separate observations; so are a resulting rank and its rank change. "
-        "Keep each claim to its single modeled observation, preserving consequential results as separate anchors. "
-        "Keep qualitative classifications such as 'one of the most ...' in a separate nonquantitative evidence anchor or source-grounded analysis prose, "
-        "not in a quantitative anchor's claim. Do not encode that phrase as numeric 1; retain genuine one-person, one-item, or per-unit counts numerically. "
-        "Sample size and geographic coverage are not "
-        "components of one estimate. A prose sentence or list is not a joint statistic; combine "
-        "values only when the source explicitly names one measure that requires every component. "
-        "Never copy a footnote period or qualifier to an unmarked sibling value. "
-        "In every analysis section and compact_profile, a footnote still qualifies only its explicitly marked measure. "
-        "Illustration, not source evidence: 'measure A; measure B*. *Measured during period P by organization Q' "
-        "means only B inherits period P and organization Q; A inherits neither from that footnote. "
-        "Name the marked measure; do not generalize its caveat to the whole chart, list, or source. If the "
-        "24-row limit would be exceeded, omit a lower-salience result instead of combining "
-        "observations. Do not use a semicolon to pack separate numeric observations into any "
-        "field. Before emitting a row, keep a numeric optional field other than period only when the same source "
-        "sentence explicitly binds the same number and noun or measure to that exact estimate; "
-        "otherwise set that optional string to \"\". Do not copy study-level sample or coverage "
-        "into a different result. Set period to \"\" by default. Use period only when the same "
-        "sentence or explicitly marked table row or column header states every date or year with the estimate. "
-        "Preserve the selected table year in period when an unambiguous row-column alignment binds it to the value. "
-        "Also retain an explicitly marked footnote's temporal scope in period, in its own words, without inferred dates; "
-        "a document title, report edition, publication date, page metadata, or global study "
-        "timeframe does not qualify. Every numeric value in the anchor claim must belong to and "
-        "be encoded by that row's single quantitative observation; split the anchor or omit the "
-        "extra value otherwise. "
-        "For system_derived values, "
-        "every input must be explicit in that passage. If only period fails a check, set period "
-        "to \"\" unless it is explicitly table-year- or footnote-bound; never erase a required table-year scope, and "
-        "never erase a required marked-footnote scope to pass validation. "
-        "Set quantitative_result to null only when estimate fails, and remove that "
-        "unsupported number from the anchor claim, plain-English meaning, and analysis prose; "
-        "retain only supported nonnumeric meaning. Never replace an unsupported numeric value "
-        "with a prose placeholder such as "
-        "'not reported'.\n\n"
-        "FINAL WHOLE-SOURCE CHECK: Review all analysis sections, compact_profile, evidence_anchors, and literature_positions "
-        "against the supplied source in this same call. Critiques, superlatives, contrasts, and locators are factual claims too. "
-        "Before alleging a discrepancy, match population, period, measure, and category, and reconcile explicit totals and subtotals. "
-        "Before claiming strongest or weakest, check all comparable displayed values; selected examples are not an exhaustive ranking. "
-        "Even relative strengths and weaknesses must name their comparison set: a weak cross-entity rank does not imply a low within-entity score. "
-        "Do not interchange score and rank. In every prose comparison, preserve who is measured and what or whom they are rating. "
-        "For every comparison, resolve source pronouns and contrast markers first, then explicitly name the actor, group, outcome, expression, or measure receiving each direction in every output field; do not use former or latter, and never reverse who or what is higher, lower, more, or less frequent. "
-        "Split a summary list when its examples concern different targets or outcomes. "
-        "Check prose comparisons against the evidence anchors and supplied passages, not just a neighboring sentence. "
-        "For every attributed quotation, paraphrase, and definition, resolve its speaker or author from the local reporting clause "
-        "and check that owner in every output field, including key_concepts_and_definitions; do not carry a neighboring speaker "
-        "across a change of attribution. Do not manufacture disagreement between aligned speakers. "
-        "Every quotation must preserve one contiguous verbatim source span without inserted ellipses; "
-        "if shortening is needed or memos contain only an abridgment, use a labeled source-grounded paraphrase without quotation marks. "
-        "Use explicit text anchors rather than unverified opening/closing locations. "
-        "Each literature-position row must describe one distinct work, not a publisher's pooled reporting. Leave unknown years and titles empty; "
-        "never borrow them from a neighboring citation, the cited event, or the current source's date. "
-        "A researcher's study of a named film, text, or dataset does not make that object the researcher's publication. "
-        "Keep the studied object in engagement; leave the study title empty when unreported. "
-        "Do not credit a discussed work or its publisher with third-party commentary about it. "
-        "Keep that commentary as a separate work, with author and title empty when not supplied. "
-        "Apply each footnote only to its marked measure in every field, including limitations. "
-        "Check field roles: a temporal window belongs in period, not sample or uncertainty. "
-        "Do not copy a marked footnote's scope to unmarked siblings; retain independently source-stated observation periods. "
-        "Distinguish the date of a design, sample, or instrument change from the report edition. "
-        "Use the source's change date consistently across every section; reconcile repeated factual statements before returning. "
-        "Correct or omit unsupported clauses instead of inventing criticism to fill a section. Return only the requested bundle, not a review."
+
     )
 
 
@@ -5740,29 +5530,11 @@ def _atomic_fidelity_prompt(
 
 def _profile_system_prompt() -> str:
     return (
-        "You are the evidence-profile reader for Auto-Zettelkasten profile prompt v6. "
-        "Use only the committed Markdown note supplied by the user. Return exactly one JSON object with no Markdown fences, "
-        "commentary, inferred full text, or literature-level cluster, debate, or gap proposals. Extract roughly 8-20 "
-        "synthesis-relevant evidence anchors when the note supports that many, never more than 24 and never padded. Anchor "
-        "identity must use source identity, a source-native locator or span, and evidence role rather than list position or "
-        "paraphrase wording. Do not collapse a detailed note into one omnibus anchor when separate contributions have different "
-        "locators or support boundaries. Adapt the evidence to the source rather than forcing every item into an academic-study form. "
-        "Each anchor needs a support_envelope distinguishing empirical and argument roles, coverage, scope, and restrictions. "
-        "Use exactly these values: empirical_role descriptive, associational, causal, mechanism_evidence, or none; argument_role "
-        "conceptual, interpretive, normative, methodological, practitioner_guidance, or none; coverage full_text, limited_text, "
-        "abstract, metadata, or unknown. support_status describes attribution to the source, not independent verification: use supported "
-        "when the note explicitly shows that the source makes the finding, argument, observation, or recommendation; support_unknown "
-        "when attribution is unclear; limited for limited coverage; and unsupported only when the note does not support the attribution. "
-        "A supported practitioner recommendation may still carry a restriction that it does not establish effectiveness. Every anchor must "
-        "provide traceable locator strings. Return the lean shape supplied by the user: keep findings empty and study_lineage null, "
-        "and do not output IDs, typed source_locators, quantitative_result, or persistence metadata because the engine derives them. "
-        "Use an empty string rather than null, an array, or an object for every declared string field, and add no keys outside the "
-        "supplied lean shape. Generated atomic-note headings cannot support a strong synthesis assertion. Statistical anchors must preserve "
-        "in their claim and fields whether a result is an observed rate, predicted probability, coefficient, marginal effect, odds ratio, percentage, "
-        "reference groups, denominators, uncertainty, and source-reported versus derived values. Never convert or equate unlike "
-        "estimands. Source-level concepts, methods, cases, and outcomes are retrieval "
-        "metadata and must not be copied automatically into every anchor. Preserve technical findings, plain-English meanings, "
-        "qualifications, and traceable locators exactly to the degree supported by the note."
+        "Create a compact discovery profile from the supplied committed atomic note. "
+        "Use the note's research questions, concepts, methods, mechanisms, cases, populations, "
+        "outcomes and scope to make its contribution discoverable across literatures. "
+        "Preserve source attribution and limitations. Return only the requested JSON shape; "
+        "the engine supplies identity, coverage and persistence metadata."
     )
 
 
@@ -6075,11 +5847,11 @@ def _debate_system_prompt() -> str:
 def _cluster_synthesis_system_prompt() -> str:
     return (
         "You are the full-note cluster writer for Auto-Zettelkasten cluster "
-        "synthesis prompt v41 and contract streamlined-full-note-v3. Read every supplied atomic_note_markdown before "
+        "synthesis prompt v42 and contract streamlined-full-note-v4. Read every supplied atomic_note_markdown before "
         "drafting. Copy cluster_id exactly from context.cluster.cluster_id. Return "
         "exactly one JSON object with cluster_id, status, title, "
         "organizing_mode, organizing_problem, optional guiding_question, optional "
-        "central_tension, bottom_line, lines_of_inquiry, differences, limits, "
+        "central_tension, bottom_line, debate_state, lines_of_inquiry, differences, limits, "
         "related_clusters, retained_member_ids, member_roles, optional dropped_members, optional "
         "material_exclusions, acquisition_candidate_dispositions, optional "
         "split_proposals, and optional missing_member_ids. Status is accepted or "
@@ -6158,6 +5930,9 @@ def _cluster_synthesis_system_prompt() -> str:
         "status, and citing-source characterizations. "
         "Return material_exclusions only for intellectually important boundary cases; "
         "you need not explain every unretained candidate. "
+        "Classify debate_state as mapped_debate, mapped_consensus, emerging_convergence, aligned_institutional_guidance, within_program_consistency, mixed_evidence, conditional_relationship, complementary_positions, parallel_literatures, single_position, no_debate. "
+        "Explain that classification through the synthesis and its source contributions. Different methods, populations "
+        "or outcomes alone establish neither disagreement nor consensus. "
         "Do not generate research gaps or administrative diagnostics."
     )
 
@@ -6585,8 +6360,10 @@ def _cluster_proposal_profile(
         if isinstance(topic_scores, Mapping)
         else []
     )
+    current_note_profile = raw.get("profile_schema_version") == "1.4"
     anchors = []
     for finding in (
+        [] if current_note_profile else
         raw.get("evidence_anchors") or raw.get("findings") or raw.get("claims") or []
     ):
         value = (
@@ -6667,7 +6444,7 @@ def _cluster_proposal_profile(
         "periods": values(raw.get("periods"), dimensions.get("period")),
         "populations": values(raw.get("populations")),
         "outcomes": values(raw.get("outcomes"), dimensions.get("outcome")),
-        "evidence_anchors": anchors,
+        **({"evidence_anchors": anchors} if not current_note_profile else {}),
     }
 
 
@@ -7289,7 +7066,7 @@ def _provider_source_bundle_payload(
         if returned and returned.casefold() != expected.casefold():
             raise ProviderError(f"source_identity.{key} does not match requested source")
     identity.update(expected_identity)
-    normalized["bundle_schema_version"] = "1"
+    normalized["bundle_schema_version"] = "2"
     normalized["source_identity"] = identity
     for field_name in (
         "observed_bibliographic_identity",
@@ -7302,50 +7079,7 @@ def _provider_source_bundle_payload(
     normalized["missing_source_recommendations"] = []
 
     source_id = str(expected_identity.get("source_id") or "")
-    anchors: list[Any] = []
-    for value in normalized.get("evidence_anchors", []) or []:
-        if not isinstance(value, Mapping):
-            anchors.append(value)
-            continue
-        row = _normalize_provider_evidence_anchor(
-            value,
-            expected_source_id=source_id,
-            discard_generated_ids=True,
-        )
-        role = str(row.get("evidence_role") or "").strip().casefold()
-        row["support_envelope"] = {
-            "empirical_role": (
-                "causal"
-                if role == "causal"
-                else "associational"
-                if any(token in role for token in ("associat", "regression"))
-                else "descriptive"
-                if any(token in role for token in ("descript", "quantitative"))
-                else "mechanism_evidence"
-                if "mechanism" in role
-                else "none"
-            ),
-            "argument_role": (
-                "methodological"
-                if "method" in role
-                else "normative"
-                if "normative" in role
-                else "practitioner_guidance"
-                if any(token in role for token in ("pract", "guidance"))
-                else "conceptual"
-                if any(token in role for token in ("concept", "theor", "argument"))
-                else "none"
-            ),
-            "coverage": "unknown",
-            "restrictions": (
-                [str(row.get("support_boundary"))]
-                if str(row.get("support_boundary") or "").strip()
-                else []
-            ),
-            "support_status": "supported",
-        }
-        anchors.append(row)
-    normalized["evidence_anchors"] = anchors
+    normalized.pop("evidence_anchors", None)
 
     positions: list[Any] = []
     for value in normalized.get("literature_positions", []) or []:
@@ -7477,7 +7211,10 @@ def _normalize_provider_evidence_anchor(
 
 
 def _validate_source_bundle_row_limits(payload: Mapping[str, Any]) -> None:
-    for field_name, limit in SOURCE_BUNDLE_ROW_LIMITS.items():
+    limits = dict(SOURCE_BUNDLE_ROW_LIMITS)
+    if str(payload.get("bundle_schema_version") or "") == "1":
+        limits["evidence_anchors"] = 24
+    for field_name, limit in limits.items():
         rows = payload.get(field_name)
         if isinstance(rows, list) and len(rows) > limit:
             raise ValueError(f"{field_name} cannot contain more than {limit} items")
@@ -7562,7 +7299,7 @@ def _parse_source_bundle_response(
         ):
             candidate = candidate[SOURCE_BUNDLE_ENVELOPE_CONTRACT]
         try:
-            _validate_source_bundle_row_limits(candidate)
+            _validate_source_bundle_row_limits({**candidate, "bundle_schema_version": "2"})
         except ValueError as exc:
             raise ProviderError(f"{label}: {exc}") from exc
         try:
@@ -7760,11 +7497,10 @@ def _normalize_source_bundle_payload(
     if sections.get("thesis"):
         profile["thesis"] = sections["thesis"]
     normalized["compact_profile"] = profile
-    anchors = [
-        row
-        for row in normalized.get("evidence_anchors", []) or []
-        if isinstance(row, Mapping)
-    ]
+    legacy_anchors = (
+        [row for row in normalized.get("evidence_anchors", []) or [] if isinstance(row, Mapping)]
+        if str(normalized.get("bundle_schema_version") or "") == "1" else []
+    )
     has_core = {
         "thesis": bool(sections.get("thesis")),
         "method_and_research_design": bool(
@@ -7772,15 +7508,9 @@ def _normalize_source_bundle_payload(
             or profile.get("method_or_knowledge_basis")
             or profile.get("method")
         ),
-        "evidence_and_data": bool(sections.get("evidence_and_data") or anchors),
-        "detailed_findings": bool(
-            sections.get("detailed_findings")
-            or any(
-                "major_finding" in (row.get("planning_roles") or [])
-                or str(row.get("claim") or "").strip()
-                for row in anchors
-            )
-        ),
+        "evidence_and_data": bool(sections.get("evidence_and_data") or legacy_anchors),
+        "detailed_findings": bool(sections.get("detailed_findings") or any(
+            str(row.get("claim") or "").strip() for row in legacy_anchors)),
     }
     missing_core = [key for key, present in has_core.items() if not present]
     if missing_core:
@@ -8653,8 +8383,11 @@ def _validate_streamlined_cluster_response(
         or payload.get("title")
         or ""
     ).strip()
+    debate_state = payload.get("debate_state", "")
+    if not isinstance(debate_state, str) or debate_state not in ['', 'mapped_debate', 'mapped_consensus', 'emerging_convergence', 'aligned_institutional_guidance', 'within_program_consistency', 'mixed_evidence', 'conditional_relationship', 'complementary_positions', 'parallel_literatures', 'single_position', 'no_debate']:
+        raise ProviderError("invalid streamlined cluster debate_state")
     result = {
-        "cluster_contract": "streamlined-full-note-v3",
+        "cluster_contract": "streamlined-full-note-v4",
         "cluster_id": str(payload.get("cluster_id") or "").strip(),
         "status": str(payload.get("status") or "accepted").strip().casefold(),
         "title": str(payload.get("title") or organizing_problem).strip(),
@@ -8663,6 +8396,7 @@ def _validate_streamlined_cluster_response(
         "guiding_question": str(payload.get("guiding_question") or "").strip(),
         "central_tension": str(payload.get("central_tension") or "").strip(),
         "bottom_line": str(payload.get("bottom_line") or "").strip(),
+        "debate_state": debate_state,
     }
     if (
         not result["cluster_id"]

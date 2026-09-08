@@ -97,6 +97,7 @@ from .models import (
 from .notes import (
     GRAPH_END_MARKER,
     GRAPH_START_MARKER,
+    _source_navigation_link,
     internal_note_text,
     item_data,
     item_key,
@@ -124,7 +125,6 @@ from .ports import (
     ZoteroClient,
 )
 from .profiles import (
-    COMMITTED_NOTE_ANCHOR_AUGMENTATION_VERSION,
     PROFILE_ALGORITHM_VERSION,
     PROFILE_CLASSIFIER_VERSION,
     PROFILE_PROMPT_VERSION,
@@ -2533,7 +2533,7 @@ def run_pipeline(
     debate_count = sum(
         1
         for row in debate_rows
-        if isinstance(row, Mapping) and row.get("classification") == "mapped_debate"
+        if isinstance(row, Mapping) and row.get("classification") == "mapped_debate" and row.get("promoted", True)
     )
     consensus_count = sum(
         1
@@ -2969,6 +2969,7 @@ def _finalize_prepared_row(
         update_note_frontmatter(
             path,
             {
+                **{key: row[key] for key in ("source_pdf_uri", "zotero_item_uri", "attachment_key") if row.get(key)},
                 "title": str(
                     data.get("title")
                     or row.get("zotero_item_key")
@@ -3011,7 +3012,7 @@ def _finalize_prepared_row(
                 }
                 bundle_policy = {
                     "profile_generation_route": "source_analysis_bundle",
-                    "reasoner_identity": "source-analysis-bundle:v1",
+                    "reasoner_identity": "source-analysis-bundle:v2",
                 }
                 for stored_policy in (route_policy, {**policy, **route_policy}, bundle_policy):
                     identity = dict(source_set_id="", provider=profile.provider,
@@ -3142,7 +3143,7 @@ def _commit_source_bundle(
     semantic_fingerprint = stable_hash(bundle.semantic_dict())
     dependency_fingerprint = _source_bundle_dependency_fingerprint(row, request)
     bundle_record = {
-        "source_analysis_bundle_schema_version": "1",
+        "source_analysis_bundle_schema_version": bundle.bundle_schema_version,
         "semantic_fingerprint": semantic_fingerprint,
         "dependency_fingerprint": dependency_fingerprint,
         "bundle": bundle.to_dict(),
@@ -3165,7 +3166,7 @@ def _commit_source_bundle(
         model=request.model,
         policy={
             "profile_generation_route": "source_analysis_bundle",
-            "reasoner_identity": "source-analysis-bundle:v1",
+            "reasoner_identity": "source-analysis-bundle:v2",
         },
     )
     profile.context = {
@@ -3184,12 +3185,6 @@ def _commit_source_bundle(
     )
     profile.evidence_eligibility = eligibility  # type: ignore[assignment]
     profile.excluded_from_synthesis = eligibility != "substantive_bounded"
-    if bundle.evidence_anchors:
-        profile.evidence_anchors = sorted(
-            bundle.evidence_anchors,
-            key=lambda anchor: -anchor.salience_priority,
-        )[:24]
-        profile.findings = []
     compact = dict(bundle.compact_profile)
     for field_name in (
         "research_questions",
@@ -3252,8 +3247,8 @@ def _commit_source_bundle(
     }
     profile.validity = {
         **dict(profile.validity or {}),
-        "source_analysis_bundle": "1",
-        "profile_prompt_version": "bundle-v1",
+        "source_analysis_bundle": bundle.bundle_schema_version,
+        "profile_prompt_version": "bundle-v2",
     }
     save_profile(workspace / "02_source_memory" / "profiles", profile)
     with _LITERATURE_MEMORY_LOCK:
@@ -3278,7 +3273,7 @@ def _source_bundle_dependency_fingerprint(
             "model": request.model,
             "prompt_version": request.prompt_version,
             "source_bundle_prompt_version": SOURCE_BUNDLE_PROMPT_VERSION,
-            "source_bundle_normalization_version": "19",
+            "source_bundle_normalization_version": "20",
         }
     if request.provider == "codex":
         execution = row.get("provider_execution_identity")
@@ -10453,6 +10448,7 @@ def _run_relationship_reasoning(
             "model": model_name,
             "prompt_version": decision_prompt_version,
             "output_contract": decision_contract,
+            "decision_normalization_version": RELATIONSHIP_DECISION_NORMALIZATION_VERSION,
             "transport_policy": (
                 "compact-note-decisions-v1" if ordinary_decisions
                 else "source-evidence-only-v2"
@@ -10727,7 +10723,8 @@ def _run_relationship_reasoning(
             return {"pair_job_id": job.pair_job_id,
                     "decision": "invalid_ordinary_decision_fields"}
         if any(
-            any(not isinstance(row.get(key), str) for key in (
+            not {"actor_source_id", "reference_source_id"} <= row.keys()
+            or any(not isinstance(row.get(key), str) for key in (
                 "left_source_id", "right_source_id", "decision", "relation_type", "reason",
             )) or any(row.get(key) is not None and not isinstance(row[key], str)
                       for key in ("actor_source_id", "reference_source_id", "comparison_proposition"))
@@ -11739,7 +11736,7 @@ def _relationship_evidence_projection(
     include_anchors: bool,
 ) -> EvidenceProfile:
     row = profile_to_dict(profile)
-    anchors = row.get("evidence_anchors") or row.get("claims") or []
+    anchors = (row.get("evidence_anchors") or row.get("claims") or []) if include_anchors else []
     compact_anchors = [
         EvidenceAnchor(
             evidence_anchor_id=str(
@@ -11769,6 +11766,7 @@ def _relationship_evidence_projection(
         and (anchor.get("evidence_anchor_id") or anchor.get("claim_id"))
     ][:3]
     return EvidenceProfile(
+        profile_schema_version="1.3" if include_anchors else "1.4",
         source_id=str(row.get("source_id") or ""),
         note_id=str(row.get("note_id") or ""),
         context={
@@ -15116,7 +15114,6 @@ def _finalize_literature_projection_hashes(
                 "profile_prompt": PROFILE_PROMPT_VERSION,
                 "profile_classifier": PROFILE_CLASSIFIER_VERSION,
                 "profile_algorithm": PROFILE_ALGORITHM_VERSION,
-                "committed_note_anchor_augmentation": COMMITTED_NOTE_ANCHOR_AUGMENTATION_VERSION,
                 "source_classifier": CONTENT_CLASSIFIER_VERSION,
                 "chunking": CHUNKING_VERSION,
             },
@@ -15962,57 +15959,6 @@ def _prepare_item(
         else _ensure_analysis_contract(source_result)
     )
     if bundle is not None:
-        quantitative = [
-            anchor
-            for anchor in bundle.evidence_anchors
-            if anchor.quantitative_result is not None
-            and anchor.quantitative_result.estimate.strip()
-            and anchor.claim.strip()
-        ]
-        if quantitative:
-            analysis_text = "\n".join(str(value) for value in analysis.values()).casefold()
-            projections: list[str] = []
-            for anchor in quantitative:
-                projection = anchor.claim.strip()
-                represented = projection.casefold()
-                details: list[str] = []
-                for label, value in (
-                    ("Estimate", anchor.quantitative_result.estimate.strip()),
-                    ("Unit", anchor.quantitative_result.unit.strip()),
-                    ("Scale", anchor.quantitative_result.scale.strip()),
-                ):
-                    normalized_value = " ".join(value.casefold().split())
-                    normalized_represented = " ".join(represented.split())
-                    if label == "Estimate":
-                        value_tokens = _claimed_quantity_tokens(value)
-                        value_is_represented = bool(value_tokens) and value_tokens.issubset(
-                            _claimed_quantity_tokens(represented)
-                        )
-                    else:
-                        pattern = re.escape(normalized_value)
-                        if normalized_value[:1].isalnum():
-                            pattern = rf"(?<!\w){pattern}"
-                        if normalized_value[-1:].isalnum():
-                            pattern = rf"{pattern}(?!\w)"
-                        value_is_represented = bool(normalized_value) and bool(
-                            re.search(pattern, normalized_represented)
-                        )
-                    if value and not value_is_represented:
-                        details.append(f"{label}: {value}")
-                        represented += f" {value.casefold()}"
-                if details:
-                    projection = f"{projection} {'; '.join(details)}."
-                normalized = projection.casefold()
-                if normalized not in analysis_text and normalized not in {
-                    value.casefold() for value in projections
-                }:
-                    projections.append(projection)
-            if projections:
-                existing = str(analysis.get("evidence_and_data") or "").rstrip()
-                projected = "\n".join(f"- {claim}" for claim in projections)
-                analysis["evidence_and_data"] = (
-                    f"{existing}\n\n{projected}" if existing else projected
-                )
         bundle_payload = bundle.to_dict()
         bundle_payload["analysis_sections"] = dict(analysis)
         base["source_analysis_bundle"] = bundle_payload
@@ -16092,10 +16038,11 @@ def _source_bundle_from_result(
     *,
     validate_quantitative_provenance: bool = True,
 ) -> SourceAnalysisBundle | None:
-    if str(result.get("bundle_schema_version") or "") != "1":
+    if str(result.get("bundle_schema_version") or "") not in {"1", "2"}:
         return None
     _validate_source_bundle_row_limits(result)
     payload = dict(result)
+    legacy_anchors = str(result.get("bundle_schema_version")) == "1"
     expected_source_id = str(row.get("source_id") or "")
     expected_zotero_key = str(row.get("zotero_item_key") or "")
     identity = (
@@ -16120,7 +16067,7 @@ def _source_bundle_from_result(
     )
     payload["source_identity"] = identity
     values = payload.get("evidence_anchors", [])
-    if isinstance(values, list):
+    if legacy_anchors and isinstance(values, list):
         payload["evidence_anchors"] = [
             _normalize_provider_evidence_anchor(
                 value,
@@ -16149,7 +16096,7 @@ def _source_bundle_from_result(
         payload["literature_positions"] = normalized_positions
 
     diagnostics = payload.get("component_diagnostics", [])
-    if isinstance(diagnostics, list):
+    if legacy_anchors and isinstance(diagnostics, list):
         anchors = (
             list(payload.get("evidence_anchors", []))
             if isinstance(payload.get("evidence_anchors"), list)
@@ -16274,7 +16221,7 @@ def _source_bundle_from_result(
             ):
                 raise ValueError("analysis_quote_not_found_in_source")
     anchors = payload.get("evidence_anchors", [])
-    if isinstance(anchors, list):
+    if legacy_anchors and isinstance(anchors, list):
         normalized_anchors = []
         seen_anchors: set[str] = set()
         rejected_locator_diagnostics: list[dict[str, Any]] = []
@@ -16437,7 +16384,7 @@ def _source_bundle_from_result(
             else value
             for value in recommendations
         ]
-    if validate_quantitative_provenance:
+    if legacy_anchors and validate_quantitative_provenance:
         if not opaque_pdf_route and any(
             isinstance(diagnostic, Mapping)
             and diagnostic.get("component") == "evidence_anchors"
@@ -19960,6 +19907,9 @@ def _write_frozen_content(checkpoint_root: Path, content: Mapping[str, Any]) -> 
     allowed = {
         "content_hash",
         "source_file",
+        "attachment_key",
+        "source_pdf_uri",
+        "zotero_item_uri",
         "content_route",
         "media_type",
         "source_scope",
@@ -20372,9 +20322,9 @@ def _source_reader_metadata(
         "_source_context": {
             "source_id": source_id,
             "zotero_key": zotero_key,
-            "attachment_key": str(
-                item_data(item).get("parentItem") and zotero_key or ""
-            ),
+            "attachment_key": str(content.get("attachment_key") or (
+                zotero_key if item_data(item).get("itemType") == "attachment" else ""
+            )),
             "source_file": str(content.get("source_file") or ""),
             "custody_sha256": str(content.get("content_hash") or ""),
             "route": str(content.get("content_route") or ""),
@@ -20397,6 +20347,24 @@ def _source_reader_metadata(
             "figure_spans": list(metrics.get("figure_spans", []) or []),
         },
     }
+
+
+def _with_source_navigation(content: dict[str, Any], target: Mapping[str, Any]) -> dict[str, Any]:
+    """Bind navigation to the selected attachment independently of model output."""
+    key = item_key(target)
+    if not re.fullmatch(r"[A-Z0-9]{8}", key):
+        return content
+    data = item_data(target)
+    content["zotero_item_uri"] = f"zotero://select/library/items/{key}"
+    if data.get("itemType") == "attachment" and content.get("media_type") == "application/pdf":
+        content["attachment_key"] = key
+        uri = f"zotero://open-pdf/library/items/{key}"
+        supplied = str(data.get("source_pdf_uri") or "")
+        # Only an actual attachment's supplied annotation/page address may extend its URL.
+        if (supplied == uri or supplied.startswith(uri + "?")) and _source_navigation_link({"source_pdf_uri": supplied}):
+            uri = supplied
+        content["source_pdf_uri"] = uri
+    return content
 
 
 def _acquire_content(
@@ -20512,7 +20480,7 @@ def _acquire_content(
                     parent_data,
                     data,
                 )
-                candidates.append(candidate)
+                candidates.append(_with_source_navigation(candidate, target))
                 base["attempts"].append(
                     _attempt(
                         base,
@@ -20591,13 +20559,13 @@ def _acquire_content(
                 )
             )
             if local_candidate is not None:
-                candidates.append(local_candidate)
+                candidates.append(_with_source_navigation(local_candidate, target))
             elif local_primary_pdf:
-                failed_primary_pdf = _failed_pdf_candidate(
+                failed_primary_pdf = _with_source_navigation(_failed_pdf_candidate(
                     extracted,
                     content_hash=local_hash,
                     source_file=str(extraction_path),
-                )
+                ), target)
         if target is item and str(data.get("itemType", "")) != "attachment":
             continue
         try:
@@ -20684,13 +20652,13 @@ def _acquire_content(
             )
         )
         if downloaded_candidate is not None:
-            candidates.append(downloaded_candidate)
+            candidates.append(_with_source_navigation(downloaded_candidate, target))
         elif downloaded_primary_pdf:
-            failed_primary_pdf = _failed_pdf_candidate(
+            failed_primary_pdf = _with_source_navigation(_failed_pdf_candidate(
                 extracted,
                 content_hash=document_hash,
                 source_file=str(custody_path),
-            )
+            ), target)
     if primary_pdf_attempted:
         actual_primary = [
             row for row in candidates if row.get("actual_primary_pdf") is True
@@ -21639,6 +21607,9 @@ def _frontmatter(
         "citation_key": _citation_key(data),
         "zotero_item_key": row["zotero_item_key"],
         "source_file": row["source_file"],
+        "source_pdf_uri": str(row.get("source_pdf_uri") or ""),
+        "zotero_item_uri": str(row.get("zotero_item_uri") or ""),
+        "attachment_key": str(row.get("attachment_key") or ""),
         "creators": data.get("creators", [])
         if isinstance(data.get("creators", []), list)
         else [],
@@ -23437,7 +23408,7 @@ def _source_read_metadata_hash(metadata: Mapping[str, Any]) -> str:
 
 
 def _ensure_source_result_contract(result: Mapping[str, Any]) -> dict[str, Any]:
-    if str(result.get("bundle_schema_version") or "") == "1":
+    if str(result.get("bundle_schema_version") or "") in {"1", "2"}:
         _validate_source_bundle_row_limits(result)
         return SourceAnalysisBundle.from_dict(result).to_dict()
     return _ensure_analysis_contract(result)
