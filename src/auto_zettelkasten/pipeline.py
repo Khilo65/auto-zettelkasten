@@ -154,6 +154,7 @@ from .relationships import (
     RELATIONSHIP_DECISION_NORMALIZATION_VERSION,
     RELATIONSHIP_DISCOVERY_PROMPT_VERSION,
     RELATIONSHIP_PROMPT_VERSION,
+    SYMMETRIC_RELATION_TYPES,
     stable_hash,
     validate_relationship_decision_rows,
 )
@@ -10693,7 +10694,7 @@ def _run_relationship_reasoning(
         )
         valid = bool(
             validation["accepted"] or validation["no_relationship"]
-        ) and not bool(validation["needs_more_context"])
+        ) and not bool(validation["needs_more_context"] or validation["parked"])
         return valid, validation
 
     responses: list[dict[str, Any]] = []
@@ -10741,11 +10742,19 @@ def _run_relationship_reasoning(
                 "decision", "relation_type", "actor_source_id", "reference_source_id",
             )) for row in judgments
         }
+        selected = [judgments[0]]
         if len(meanings) != 1:
-            return {"pair_job_id": job.pair_job_id,
-                    "decision": "conflicting_ordinary_decisions"}
-        raw = judgments[0]
-        return {
+            if len(judgments) != 2 or len(meanings) != 2 or any(
+                decision != "relationship" or relation_type not in SYMMETRIC_RELATION_TYPES
+                or actor or reference
+                for decision, relation_type, actor, reference in meanings
+            ):
+                return {"pair_job_id": job.pair_job_id,
+                        "decision": "conflicting_ordinary_decisions"}
+            # Existing pair envelopes retain two independent symmetric readings.
+            selected = [next(row for row in judgments if row["relation_type"].strip() == kind)
+                        for kind in sorted({meaning[1] for meaning in meanings})]
+        connections = [{
             "pair_job_id": job.pair_job_id,
             "decision": str(raw.get("decision") or "missing_ordinary_decision").strip(),
             "relation_type": str(raw.get("relation_type") or "").strip(),
@@ -10753,7 +10762,10 @@ def _run_relationship_reasoning(
             "reference_source_id": str(raw.get("reference_source_id") or "").strip(),
             "comparison_proposition": str(raw.get("comparison_proposition") or raw.get("reason") or "").strip(),
             "reason": str(raw.get("reason") or "").strip(),
-        }
+        } for raw in selected]
+        if len(connections) == 1:
+            return connections[0]
+        return {"pair_job_id": job.pair_job_id, "decision": "relationship", "connections": connections}
 
     def complete_job(job: RelationshipPairJob, row: Mapping[str, Any], *, batch_id: str = "") -> None:
         row = {**dict(row), "reasoner_backend": reasoner_backend,

@@ -5333,6 +5333,68 @@ class _OrdinaryReasoner(_Reasoner):
     relationship_decision_contract = "relationship-decision-v10"
 
 
+@pytest.mark.parametrize("provider", ["codex", "deepseek"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_ordinary_distinct_symmetric_connections_persist_and_replay(tmp_path: Path, provider: str, reverse: bool) -> None:
+    profiles = [_profile(source_id) for source_id in "AB"]
+    rows = [{**_ordinary_candidate("A", "B"), "relation_type": kind, "reason": reason}
+            for kind, reason in (
+                ("complements", "The accounts supply complementary measures of reputation."),
+                ("methodological_fault_line", "The surveys differ in sampling and measurement scope."),
+            )]
+    if reverse:
+        rows.reverse()
+    calls = _Calls(lambda stage, *_args: {"candidates": rows}
+                   if stage == "relationship_candidate_selection" else pytest.fail("extra judgment"))
+    reasoner = _OrdinaryReasoner()
+    reasoner.name = provider
+    result = _run(tmp_path, profiles, calls, reasoner=reasoner)
+    assert result["relationship_stage_complete"] is True, result["parked"]
+    assert {row["relation_type"]: row["reason"] for row in result["accepted"]} == {
+        row["relation_type"]: row["reason"] for row in rows}
+    assert len(calls.seen) == 1
+    for source_id in "AB":
+        links = pipeline_module.projected_related_links(source_id, profiles, result["accepted"], max_inferred_links=10)
+        assert len(links) == 2
+    _commit_relationship_selection_state(tmp_path, result, catalogue_revision=result["reconciled_catalogue_revision"])
+    replay = _run(tmp_path, profiles, _Calls(lambda *_args: pytest.fail("replay provider call")), reasoner=reasoner)
+    assert replay["semantic_noop"] is True
+
+
+def test_ordinary_partial_connection_envelope_cannot_complete_pair(tmp_path: Path) -> None:
+    rows = [{**_ordinary_candidate("A", "B"), "relation_type": "complements"},
+            {**_ordinary_candidate("A", "B"), "relation_type": "methodological_fault_line", "reason": ""}]
+    calls = _Calls(lambda stage, *_args: {"candidates": rows}
+                   if stage == "relationship_candidate_selection" else pytest.fail("extra judgment"))
+    result = _run(tmp_path, [_profile(source_id) for source_id in "AB"], calls, reasoner=_OrdinaryReasoner())
+    assert result["relationship_stage_complete"] is False
+    assert result["parked"]
+    assert not list((tmp_path / "11_state/relationship_jobs").glob("*/result.json"))
+    assert len(calls.seen) == 1
+
+
+@pytest.mark.parametrize("kind", ["third_role", "duplicate_bad_member", "negative", "directed"])
+def test_ordinary_multiple_roles_keep_conflicts_and_overflow_blocking(tmp_path: Path, kind: str) -> None:
+    rows = [{**_ordinary_candidate("A", "B"), "relation_type": "complements"},
+            {**_ordinary_candidate("A", "B"), "relation_type": "methodological_fault_line"}]
+    if kind == "third_role":
+        rows.append(_ordinary_candidate("A", "B"))
+    elif kind == "duplicate_bad_member":
+        rows.append({**rows[1], "reason": ""})
+    elif kind == "negative":
+        rows[1] = _ordinary_candidate("A", "B", "no_relationship")
+    else:
+        rows = [{**rows[0], "relation_type": "supports", "actor_source_id": actor,
+                 "reference_source_id": reference} for actor, reference in [("A", "B"), ("B", "A")]]
+    calls = _Calls(lambda stage, *_args: {"candidates": rows}
+                   if stage == "relationship_candidate_selection" else pytest.fail("extra judgment"))
+    result = _run(tmp_path, [_profile(source_id) for source_id in "AB"], calls, reasoner=_OrdinaryReasoner())
+    assert result["relationship_stage_complete"] is False
+    assert result["parked"]
+    assert not list((tmp_path / "11_state/relationship_jobs").glob("*/result.json"))
+    assert len(calls.seen) == 1
+
+
 def _ordinary_candidate(left: str, right: str, decision: str = "relationship") -> dict[str, Any]:
     return {
         "left_source_id": left, "right_source_id": right, "decision": decision,
