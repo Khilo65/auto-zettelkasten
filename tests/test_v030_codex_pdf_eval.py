@@ -1586,6 +1586,88 @@ def test_acceptance_binds_direct_pdf_route_and_transport_evidence(
     assert "direct_pdf_transport_mismatch" in transport_errors
 
 
+@pytest.mark.parametrize(
+    "variant",
+    ["ordinary", "legacy", "unfinalized", "missing_negative", "wrong_job"],
+)
+def test_acceptance_binds_ordinary_final_decisions_without_adjudication(
+    tmp_path: Path, variant: str
+) -> None:
+    manifest_path = _manifest(tmp_path / "private")
+    manifest, cases, workspace = runner._validated_manifest(
+        manifest_path, sha256_file(manifest_path)
+    )
+    run_id = str(manifest["run_id"])
+    report = _write_accepted_run(
+        workspace,
+        runner._request(manifest, workspace),
+        runner.ManifestZoteroClient(cases),
+        run_id,
+    )
+    index = workspace / "02_source_memory" / "indexes"
+    registry = read_yaml(index / "typed_links.yml")
+    accepted = registry["relations"][0]
+    accepted.update(
+        output_contract="relationship-decision-v11",
+        decision_schema_version="11",
+        verification_status="final",
+        pair_job_id="ordinary-positive",
+    )
+    negative_pair = [
+        report["items"][2]["source_id"], report["items"][3]["source_id"]
+    ]
+    negative = {
+        **accepted,
+        "source_id": negative_pair[0],
+        "target_source_id": negative_pair[1],
+        "decision_status": "no_relationship",
+        "pair_job_id": "ordinary-negative",
+        "active": False,
+    }
+    registry["links"] = [dict(accepted)]
+    registry["pair_decisions"] = [dict(accepted), negative]
+    registry["current_pair_decisions"][0]["pair_job_id"] = "ordinary-positive"
+    registry["current_pair_decisions"].append({
+        "source_ids": negative_pair,
+        "status": "no_relationship",
+        "pair_job_id": "ordinary-negative",
+        "active": True,
+    })
+    if variant == "legacy":
+        negative.update(
+            output_contract="relationship-decision-v10", decision_schema_version="10"
+        )
+    elif variant == "unfinalized":
+        negative["verification_status"] = "pending"
+    elif variant == "missing_negative":
+        registry["pair_decisions"].pop()
+    elif variant == "wrong_job":
+        negative["pair_job_id"] = "superseded-negative"
+    for name in ("typed_links.yml", "typed_note_links.yml"):
+        write_yaml(index / name, registry)
+    state = read_yaml(index / "relationship_selection_state.yml")
+    state["selected_candidates"] = [
+        {"pair": row["source_ids"]} for row in registry["current_pair_decisions"]
+    ]
+    write_yaml(index / "relationship_selection_state.yml", state)
+    run_root = workspace / "11_state" / "runs" / run_id
+    usage_path = run_root / "literature" / "synthesis" / "provider_usage.yml"
+    usage = read_yaml(usage_path)
+    usage["attempts"] = usage["attempts"][:1]
+    usage["provider_call_count"] = 1
+    write_yaml(usage_path, usage)
+    report.update(
+        literature_provider_call_count=1, synthesis_call_count=1, provider_call_count=5
+    )
+    write_yaml(run_root / "run_report.yml", report)
+
+    errors, _ = runner._acceptance(workspace, run_id, cases, report)
+
+    assert errors == (
+        [] if variant == "ordinary" else ["required_relationship_contracts_missing"]
+    )
+
+
 def test_acceptance_allows_complete_empty_relationship_discovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1642,10 +1724,11 @@ def test_acceptance_allows_complete_empty_relationship_discovery(
         / "relationship_selection_state.yml"
     )
     state = read_yaml(state_path)
-    state["selected_candidates"] = [{"source_ids": ["source-a", "source-b"]}]
+    state["selected_candidates"] = [{"pair": ["source-a", "source-b"]}]
     write_yaml(state_path, state)
     selected_errors, _ = runner._acceptance(workspace, run_id, cases, report)
     assert "required_relationship_contracts_missing" in selected_errors
+    assert "selected_relationship_pair_coverage_incomplete" in selected_errors
     state["selected_candidates"] = []
     write_yaml(state_path, state)
 

@@ -5487,3 +5487,116 @@ def test_ordinary_rejects_hidden_active_fields_before_projection(tmp_path: Path,
     assert result["no_relationship"] == []
     assert result["parked"]
     assert len(calls.seen) == 1
+
+
+@pytest.mark.parametrize("overlapping_sides", [False, True])
+@pytest.mark.parametrize("omit_completion", [False, True])
+def test_ordinary_small_family_completes_below_quota_without_rejudging(
+    tmp_path: Path, overlapping_sides: bool, omit_completion: bool,
+) -> None:
+    profiles = [_profile(source_id) for source_id in "ABCD"]
+    plan = {
+        "lean_index_hash": "lean",
+        "literature_families": [{"family_id": "family", "label": "Declared family",
+                                 "source_ids": list("ABCD"), "candidate_cluster": True}],
+        "discovery_jobs": [{"job_id": "family-job", "family": "Declared family",
+                            "left_source_ids": list("ABCD" if overlapping_sides else "AB"),
+                            "right_source_ids": list("ABCD" if overlapping_sides else "CD"),
+                            "candidate_quota": 4}],
+    }
+    def handler(stage, provider_profiles, context):
+        assert stage == "relationship_candidate_selection"
+        if "required_pairs" in context:
+            assert provider_profiles == []
+            assert context["required_pairs"] == [["B", "D"], ["C", "D"]]
+            candidates = [] if omit_completion else [
+                {**_ordinary_candidate(*pair, "no_relationship"),
+                 "bridge_job_id": job["bridge_job_id"]}
+                for pair, job in zip(context["required_pairs"], context["bridge_jobs"], strict=True)
+            ]
+            return {"candidates": candidates}
+        job = context["bridge_jobs"][0]
+        assert set(job["left_source_ids"]) == set(job["right_source_ids"]) == set("ABCD")
+        return {"candidates": [
+            {**_ordinary_candidate(left, right), "bridge_job_id": job["bridge_job_id"]}
+            for left, right in [("A", "B"), ("A", "C"), ("A", "D"), ("B", "C")]
+        ], "job_outcomes": [{"bridge_job_id": job["bridge_job_id"], "status": "no_more_candidates"}]}
+    calls = _Calls(handler)
+    result = _run(tmp_path, profiles, calls, reasoner=_OrdinaryReasoner(), shared_family_plan=plan)
+    assert len(calls.seen) == 2, result["parked"]
+    assert len(result["accepted"]) == 4
+    assert len(result["no_relationship"]) == (0 if omit_completion else 2)
+    assert bool(result["parked"]) is omit_completion
+    assert result["pair_job_count"] == 6
+    if not omit_completion:
+        _commit_relationship_selection_state(tmp_path, result, catalogue_revision=result["reconciled_catalogue_revision"])
+        replay = _run(tmp_path, profiles, _Calls(lambda *_: pytest.fail("resolved decision regenerated")),
+                      reasoner=_OrdinaryReasoner(), shared_family_plan=plan)
+        assert replay["semantic_noop"] is True
+
+
+@pytest.mark.parametrize("scope", ["unknown", "ambiguous", "mixed_family", "explicit", "endpoint_only"])
+def test_ordinary_family_normalization_preserves_hard_scopes(tmp_path: Path, scope: str) -> None:
+    family = {"family_id": "family", "label": "Family", "source_ids": list("ABCD"),
+              "candidate_cluster": True}
+    job = {"job_id": "scoped", "family": "Family", "left_source_ids": list("AB"),
+           "right_source_ids": list("CD"), "candidate_quota": 1}
+    families = [family]
+    if scope == "unknown":
+        job["family"] = "unknown"
+    elif scope == "ambiguous":
+        families.append({**family, "family_id": "second"})
+    elif scope == "mixed_family":
+        family["source_ids"] = list("ABC")
+    elif scope == "explicit":
+        job["requested_collection_pair"] = ["C1", "C2"]
+    else:
+        job["endpoint_coverage_only"] = True
+    observed = []
+    def handler(stage, _profiles, context):
+        assert stage.endswith("candidate_selection")
+        if "required_pairs" in context:
+            return {"candidates": [
+                {**_ordinary_candidate(*pair, "no_relationship"), "bridge_job_id": row["bridge_job_id"]}
+                for pair, row in zip(context["required_pairs"], context["bridge_jobs"], strict=True)
+            ]}
+        candidates = []
+        for row in context["bridge_jobs"]:
+            if row["bridge_job_id"] == "scoped":
+                observed.append(row)
+                assert row["left_source_ids"] == list("AB")
+                assert row["right_source_ids"] == list("CD")
+                candidates.extend({**_ordinary_candidate(*pair), "bridge_job_id": "scoped"}
+                                  for pair in [("A", "B"), ("A", "C")])
+        return {"candidates": candidates, "job_outcomes": [
+            {"bridge_job_id": row["bridge_job_id"], "status": "no_more_candidates"}
+            for row in context["bridge_jobs"]
+        ]}
+    result = _run(tmp_path, [_profile(source_id) for source_id in "ABCD"], _Calls(handler),
+                  reasoner=_OrdinaryReasoner(), shared_family_plan={
+                      "lean_index_hash": "lean", "literature_families": families, "discovery_jobs": [job]})
+    assert observed
+    assert [(row["source_id"], row["target_source_id"]) for row in result["accepted"]] == [("A", "C")]
+
+
+def test_ordinary_family_completion_keeps_full_page_bound(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(pipeline_module, "_RELATIONSHIP_DISCOVERY_PAGE_SIZE", 5)
+    def handler(stage, _profiles, context):
+        assert stage == "relationship_candidate_selection"
+        assert "required_pairs" not in context
+        job = context["bridge_jobs"][0]
+        return {"candidates": [{**_ordinary_candidate("A", "B"), "bridge_job_id": job["bridge_job_id"]}],
+                "job_outcomes": [{"bridge_job_id": job["bridge_job_id"], "status": "no_more_candidates"}]}
+    calls = _Calls(handler)
+    result = _run(tmp_path, [_profile(source_id) for source_id in "ABCD"], calls,
+                  reasoner=_OrdinaryReasoner(), shared_family_plan={
+                      "lean_index_hash": "lean",
+                      "literature_families": [{"family_id": "family", "source_ids": list("ABCD"),
+                                               "candidate_cluster": True}],
+                      "discovery_jobs": [{"job_id": "family", "family": "family", "candidate_quota": 1,
+                                          "left_source_ids": list("AB"), "right_source_ids": list("CD")}],
+                  })
+    assert len(calls.seen) == 1
+    assert len(result["accepted"]) == 1
+    assert result["no_relationship"] == []
+    assert not any(row.get("deterministic_family_completion_count") for row in result["relationship_discovery_jobs"])

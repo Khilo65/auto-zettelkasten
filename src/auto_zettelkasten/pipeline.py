@@ -209,7 +209,7 @@ _RELATIONSHIP_BATCH_MAX_JOBS = 8
 _LEGACY_RELATIONSHIP_BATCH_MAX_JOBS = 8
 _RELATIONSHIP_DISCOVERY_PAGE_SIZE = 64
 _RELATIONSHIP_SELECTION_STATE_SCHEMA_VERSION = "4"
-_RELATIONSHIP_DISCOVERY_POLICY_VERSION = "quota-independent-family-coverage-v301"
+_RELATIONSHIP_DISCOVERY_POLICY_VERSION = "ordinary-family-scope-v302"
 _RELATIONSHIP_SEMANTIC_POLICY_VERSION = "source-owned-bases-v26"
 _SOURCE_BUNDLE_QUOTE_LOCATOR = re.compile(
     r'^["\u201c](?P<quote>[^"\u201d]+)["\u201d]'
@@ -8493,11 +8493,26 @@ def _run_relationship_reasoning(
             dict(row) for row in shared_family_plan.get("discovery_jobs", []) or []
             if isinstance(row, Mapping)
         ]
+        def ordinary_family_scope(job: Mapping[str, Any], source_ids: set[str]) -> bool:
+            matching_ids = family_aliases.get(str(job.get("family") or "").strip(), set())
+            return bool(
+                ordinary_decisions
+                and len(matching_ids) == 1
+                and not job.get("requested_collection_pair")
+                and not job.get("endpoint_coverage_only")
+                and len(source_ids) >= 2
+                and source_ids <= set(
+                    family_rows[next(iter(matching_ids))].get("source_ids", []) or []
+                )
+            )
+
         discovery_scopes: list[set[str]] = []
         for job in discovery_jobs:
             left = set(job.get("left_source_ids", []) or []) & analytical_source_ids & set(lean_by_source)
             right = set(job.get("right_source_ids", []) or []) & analytical_source_ids & set(lean_by_source)
-            if left - right and right - left:
+            if ordinary_family_scope(job, left | right):
+                discovery_scopes.append(left | right)
+            elif left - right and right - left:
                 discovery_scopes.append(left ^ right)
         # A family assignment must remain discoverable even when the planner
         # omits members from its jobs or uses an unresolvable family label.
@@ -8631,9 +8646,26 @@ def _run_relationship_reasoning(
                     and str(value) in analytical_source_ids
                 }
             )
-            overlap = set(left_ids) & set(right_ids)
-            left_ids = [value for value in left_ids if value not in overlap]
-            right_ids = [value for value in right_ids if value not in overlap]
+            family_reference = str(raw_job.get("family") or "").strip()
+            matching_family_ids = family_aliases.get(family_reference, set())
+            family_id = (
+                next(iter(matching_family_ids))
+                if len(matching_family_ids) == 1
+                else family_reference
+            )
+            requested_collection_pair = list(
+                raw_job.get("requested_collection_pair", []) or []
+            )
+            supplied_ids = sorted(set(left_ids) | set(right_ids))
+            is_ordinary_family_scope = ordinary_family_scope(raw_job, set(supplied_ids))
+            if is_ordinary_family_scope:
+                # Internal navigation sides do not restrict a declared family.
+                # Use only supplied endpoints; explicit comparison scopes stay hard.
+                left_ids = right_ids = supplied_ids
+            else:
+                overlap = set(left_ids) & set(right_ids)
+                left_ids = [value for value in left_ids if value not in overlap]
+                right_ids = [value for value in right_ids if value not in overlap]
             if not left_ids or not right_ids:
                 discovery_job_accounting[job_id] = {
                     "bridge_job_id": job_id,
@@ -8648,25 +8680,17 @@ def _run_relationship_reasoning(
                     "packet_status": "not_scheduled",
                 }
                 continue
-            family_reference = str(raw_job.get("family") or "").strip()
-            matching_family_ids = family_aliases.get(family_reference, set())
-            family_id = (
-                next(iter(matching_family_ids))
-                if len(matching_family_ids) == 1
-                else family_reference
-            )
             family_source_ids = (
                 [] if raw_job.get("endpoint_coverage_only")
+                or (ordinary_decisions and not is_ordinary_family_scope)
                 else sorted(set(left_ids) | set(right_ids))
-            )
-            requested_collection_pair = list(
-                raw_job.get("requested_collection_pair", []) or []
             )
             quota = int(raw_job.get("candidate_quota", 24) or 24)
             initial_pairs = {
                 canonical_pair(left, right)
                 for left in left_ids
                 for right in right_ids
+                if left != right
             } - resolved_pairs
             family_pairs = (
                 set(combinations(family_source_ids, 2)) - resolved_pairs
@@ -9919,15 +9943,23 @@ def _run_relationship_reasoning(
                 or accounting.get("packet_status") != "completed"
             ):
                 continue
-            family_pairs = set(combinations(family_source_ids, 2)) - resolved_pairs
+            family_pairs = set(combinations(family_source_ids, 2))
+            if not ordinary_decisions:
+                family_pairs -= resolved_pairs
             if (
                 len(family_pairs) > _RELATIONSHIP_DISCOVERY_PAGE_SIZE
-                or int(accounting.get("planner_target_candidates", 0) or 0)
-                != len(family_pairs)
+                or (
+                    not ordinary_decisions
+                    and int(accounting.get("planner_target_candidates", 0) or 0)
+                    != len(family_pairs - resolved_pairs)
+                )
             ):
                 continue
             residual_pairs = sorted(
-                family_pairs - discovered_pairs_for_job(job_id)
+                family_pairs - resolved_pairs - (
+                    set(discovered_pairs()) if ordinary_decisions
+                    else discovered_pairs_for_job(job_id)
+                )
             )
             if not residual_pairs:
                 continue

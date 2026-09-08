@@ -54,7 +54,10 @@ from auto_zettelkasten.readers import (
     codex_contract_identity,
     codex_source_bundle_attachment_identity,
 )
-from auto_zettelkasten.relationships import stable_hash
+from auto_zettelkasten.relationships import (
+    ORDINARY_RELATIONSHIP_DECISION_CONTRACT,
+    stable_hash,
+)
 from auto_zettelkasten.workspace import assert_compatible
 from v030_codex_campaign_guard import CodexCampaignGuard
 
@@ -2277,6 +2280,36 @@ def _relationship_errors(
         or registry.get("current_pair_decisions")
         or (state.get("selected_candidates") if isinstance(state, Mapping) else [])
     )
+    # Ordinary discovery persists final decisions itself, including negatives.
+    # Require the legacy phase unless every current pair has its matching final
+    # ordinary decision; a contract label on an unrelated/old row is insufficient.
+    ordinary_decisions = {
+        (
+            tuple(sorted((
+                str(row.get("source_id") or ""),
+                str(row.get("target_source_id") or ""),
+            ))),
+            str(row.get("pair_job_id") or ""),
+            str(row.get("decision_status") or ""),
+        )
+        for row in registry.get("pair_decisions", []) or []
+        if isinstance(row, Mapping)
+        and row.get("output_contract") == ORDINARY_RELATIONSHIP_DECISION_CONTRACT
+        and str(row.get("decision_schema_version") or "") == "11"
+        and row.get("verification_status") == "final"
+        and row.get("pair_job_id")
+        and row.get("decision_status") in {"accepted", "no_relationship"}
+    }
+    if current_pairs and all(
+        (
+            tuple(sorted(str(value) for value in row.get("source_ids", []) or [])),
+            str(row.get("pair_job_id") or ""),
+            str(row.get("status") or row.get("decision_status") or ""),
+        ) in ordinary_decisions
+        for row in registry.get("current_pair_decisions", []) or []
+        if isinstance(row, Mapping) and row.get("active", True)
+    ):
+        requires_adjudication = False
     if not accepted:
         if require_accepted:
             errors.append("accepted_relationship_missing")
@@ -2304,7 +2337,7 @@ def _relationship_errors(
         for row in accepted
     ):
         errors.append("accepted_relationship_not_reciprocally_projected")
-    return errors, True
+    return errors, requires_adjudication
 
 
 def _answer_matches(text: str, spans: Sequence[str], expected: str) -> bool:

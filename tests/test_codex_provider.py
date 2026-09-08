@@ -2966,7 +2966,8 @@ elif contract == "relationship_candidate_selection":
     jobs = user.get("context", {{}}).get("bridge_jobs", [])
     candidates = []
     for rank, job in enumerate(jobs, 1):
-        pair = sorted([job["left_source_ids"][0], job["right_source_ids"][0]])
+        pair = next(sorted([left, right]) for left in job["left_source_ids"]
+                    for right in job["right_source_ids"] if left != right)
         candidates.append({{
             "left_source_id": pair[0],
             "right_source_id": pair[1],
