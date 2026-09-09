@@ -629,6 +629,89 @@ def _custody_origin_root(path: Path, manifest: Mapping[str, Any]) -> Path:
     return base._private(path.parent.parent / name, label="source custody origin")
 
 
+def _validated_html_scope_corrections(
+    manifest: Mapping[str, Any],
+    sources: Sequence[Mapping[str, Any]],
+    protected_roots: Sequence[Path],
+) -> dict[str, dict[str, str]]:
+    """Bind the three reviewed abstract-only HTML outcomes without rewriting custody."""
+    value = manifest.get("html_scope_correction")
+    digest = str(manifest.get("html_scope_correction_sha256") or "")
+    if value is None and not digest:
+        return {}
+    if not isinstance(value, str) or not Path(value).is_absolute():
+        raise ValueError("HTML scope correction must be an absolute private path")
+    path = base._private(Path(value), label="HTML scope correction")
+    if any(base._inside(path, root) for root in protected_roots):
+        raise ValueError("HTML scope correction must be outside protected workspaces")
+    correction = _private_json(
+        path, digest, label="HTML scope correction", filename="PRIVATE_HTML_SCOPE_CORRECTION.json"
+    )
+    if (
+        set(correction) != {"schema_version", "kind", "code_commit", "source_custody_manifest_sha256", "evidence_receipt", "sources"}
+        or correction.get("schema_version") != "1"
+        or correction.get("kind") != "v030_private_html_scope_correction"
+        or correction.get("code_commit") != manifest.get("code_commit")
+        or correction.get("source_custody_manifest_sha256") != manifest.get("source_custody_manifest_sha256")
+        or manifest.get("gate", {}).get("stage") != "strategic40"
+    ):
+        raise ValueError("HTML scope correction identity is invalid")
+    evidence = base._mapping(correction.get("evidence_receipt"), label="HTML scope evidence")
+    if set(evidence) != {"path", "sha256"} or not isinstance(evidence.get("path"), str) or not Path(evidence["path"]).is_absolute():
+        raise ValueError("HTML scope evidence binding is invalid")
+    evidence_path = base._private(Path(evidence["path"]), label="HTML scope evidence")
+    evidence_sha = str(evidence.get("sha256") or "")
+    if not base._SHA256.fullmatch(evidence_sha) or not evidence_path.is_file() or base.sha256_file(evidence_path) != evidence_sha:
+        raise ValueError("HTML scope evidence SHA-256 mismatch")
+    rows = correction.get("sources")
+    if not isinstance(rows, list) or len(rows) != 3:
+        raise ValueError("HTML scope correction requires exactly three sources")
+    by_id = {str(source["source_id"]): source for source in sources}
+    corrected: dict[str, dict[str, str]] = {}
+    for value in rows:
+        row = base._mapping(value, label="HTML scope correction source")
+        source_id = str(row.get("source_id") or "")
+        source = by_id.get(source_id)
+        if source is None or source_id in corrected:
+            raise ValueError("HTML scope correction source identity is invalid")
+        raw = source.get("raw") or {}
+        selected = source["selected"]
+        original = {"terminal_status": selected["terminal_status"], "source_scope": selected["scope"]}
+        expected = {"terminal_status": "limited_note", "source_scope": "abstract_only"}
+        if (
+            set(row) != {"source_id", "parent_key", "raw_sha256", "original", "corrected"}
+            or row.get("parent_key") != source["parent_key"]
+            or source.get("disposition") != "substantive_raw_source"
+            or raw.get("media_type") != "text/html"
+            or row.get("raw_sha256") != raw.get("sha256")
+            or row.get("original") != original
+            or original != {"terminal_status": "validated_note", "source_scope": "full_document"}
+            or row.get("corrected") != expected
+        ):
+            raise ValueError("HTML scope correction differs from bound custody or reviewed scope")
+        corrected[source_id] = expected
+    try:
+        receipt = base._mapping(json.loads(evidence_path.read_text(encoding="utf-8")), label="HTML scope evidence receipt")
+    except json.JSONDecodeError as exc:
+        raise ValueError("HTML scope evidence receipt must be JSON") from exc
+    runs = receipt.get("runs")
+    if receipt.get("status") != "passed" or not isinstance(runs, list) or not runs:
+        raise ValueError("HTML scope evidence receipt has no passed runs")
+    parent_keys = {by_id[source_id]["parent_key"] for source_id in corrected}
+    for value in runs:
+        run = base._mapping(value, label="HTML scope evidence run")
+        notes = run.get("notes")
+        if run.get("status") != "completed" or not isinstance(notes, list) or len(notes) != 3:
+            raise ValueError("HTML scope evidence run is incomplete")
+        notes = [base._mapping(note, label="HTML scope evidence note") for note in notes]
+        if (
+            {str(note.get("key") or "") for note in notes} != parent_keys
+            or any(note.get("scope") != "abstract_only" or note.get("profile_context_only") is not True for note in notes)
+        ):
+            raise ValueError("HTML scope correction does not match the reviewed notes")
+    return corrected
+
+
 def _validate_strategic_custody(
     manifest_path: Path,
     manifest_sha256: str,
@@ -732,6 +815,9 @@ def _validate_strategic_custody(
             template_sha256,
         )
 
+    scope_corrections = _validated_html_scope_corrections(
+        manifest, sources, [workspace, *protected_roots]
+    )
     _, cases, live_workspace = base._validated_manifest(
         manifest_path, manifest_sha256, settings
     )
@@ -779,11 +865,16 @@ def _validate_strategic_custody(
         raw = source.get("raw")
         selected = base._mapping(source.get("selected"), label="source custody selection")
         parent_key = str(source["parent_key"])
+        correction = scope_corrections.get(str(source["source_id"]))
+        expected_status = correction["terminal_status"] if correction else selected["terminal_status"]
+        expected_scope = correction["source_scope"] if correction else selected["scope"]
         if (
             case["case_id"] != parent_key.casefold()
             or case["parent"] != source["parent_record"]
             or case["media_type"] != selected["media_type"]
-            or case["expected_terminal_status"] != selected["terminal_status"]
+            or case["expected_terminal_status"] != expected_status
+            or (correction is not None or case["expected_source_scope"])
+            and case["expected_source_scope"] != expected_scope
             or (
                 settings.case_count == 8
                 and case["cluster_expectation"]

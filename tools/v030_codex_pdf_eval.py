@@ -1202,13 +1202,22 @@ def _validated_manifest(
         )
         if terminal_status not in {"validated_note", "limited_note"}:
             raise ValueError(f"{case_id} expected terminal status is invalid")
-        metadata_only = terminal_status == "limited_note"
-        if metadata_only and not settings.allow_metadata_only:
+        limited = terminal_status == "limited_note"
+        if limited and not settings.allow_metadata_only:
             raise ValueError(f"{case_id} metadata-only cases are not allowed")
         media_type = str(
             row.get("media_type")
-            or ("application/json" if metadata_only else "application/pdf")
+            or ("application/json" if limited else "application/pdf")
         )
+        metadata_only = limited and media_type == "application/json"
+        source_scope = str(expected.get("source_scope", row.get("expected_source_scope", "")))
+        if (
+            metadata_only and source_scope not in {"", "metadata_only"}
+            or limited and not metadata_only
+            and (media_type != "text/html" or source_scope != "abstract_only")
+            or not limited and source_scope not in {"", "full_document", "partial_document"}
+        ):
+            raise ValueError(f"{case_id} expected source scope is invalid")
         allowed_media = (
             {"application/pdf", "text/html"}
             if settings.allow_html
@@ -1216,8 +1225,6 @@ def _validated_manifest(
         )
         if not metadata_only and media_type not in allowed_media:
             raise ValueError(f"{case_id} media_type is unsupported")
-        if metadata_only and media_type != "application/json":
-            raise ValueError(f"{case_id} metadata-only media_type must be application/json")
         digest = str(row.get("sha256") or "")
         path = _case_path(root, row, settings)
         if metadata_only:
@@ -1227,7 +1234,8 @@ def _validated_manifest(
         else:
             if not _SHA256.fullmatch(digest):
                 raise ValueError(f"{case_id} sha256 is invalid")
-            assert path is not None
+            if path is None:
+                raise ValueError(f"{case_id} raw case requires a file")
             if path in seen_paths:
                 raise ValueError("case file paths must be unique")
             if sha256_file(path) != digest:
@@ -1287,6 +1295,7 @@ def _validated_manifest(
                 "sha256": digest,
                 "media_type": media_type,
                 "expected_terminal_status": terminal_status,
+                "expected_source_scope": source_scope,
                 "expected_route": route,
                 "expected_pdf_fallback": pdf_fallback,
                 "expected_selected_pages": pages,
@@ -1914,7 +1923,10 @@ def _route_errors(
             errors.append(f"{case_id}:frozen_content_missing")
             continue
         expected_route = str(row["expected_route"])
-        if row.get("expected_terminal_status") == "limited_note":
+        expected_scope = str(row.get("expected_source_scope") or "")
+        if expected_scope and str(content.get("source_scope") or "") != expected_scope:
+            errors.append(f"{case_id}:source_scope_mismatch")
+        if row.get("expected_terminal_status") == "limited_note" and row.get("media_type") == "application/json":
             if (
                 str(content.get("content_route") or "") != expected_route
                 or str(content.get("source_scope") or "") != "metadata_only"

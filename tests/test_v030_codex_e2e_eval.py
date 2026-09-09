@@ -1457,6 +1457,20 @@ def test_mixed_raw_fresh_run_and_exact_replay(tmp_path: Path) -> None:
     assert calls_path.read_bytes() == provider_calls
 
 
+def test_raw_limited_html_keeps_file_attachment_and_scope(tmp_path: Path) -> None:
+    path = _manifest(tmp_path / "private")
+    manifest = json.loads(path.read_text())
+    html = manifest["cases"][1]
+    html["expected"].update(terminal_status="limited_note", source_scope="abstract_only")
+    path.write_text(json.dumps(manifest))
+    _, settings = runner._manifest_settings(path, sha256_file(path))
+    _, cases, _ = runner.base._validated_manifest(path, sha256_file(path), settings)
+    assert cases[1]["expected_terminal_status"] == "limited_note"
+    assert cases[1]["expected_source_scope"] == "abstract_only"
+    assert cases[1]["path"].is_file()
+    assert cases[1]["attachment"]["key"] == "A2"
+
+
 def test_raw_e2e_binds_exact_html_route_and_requires_a_relationship(
     tmp_path: Path,
 ) -> None:
@@ -1611,6 +1625,119 @@ def test_gate_binding_case_count_and_media_fail_closed(tmp_path: Path) -> None:
             manifest_path=manifest,
             manifest_sha256=sha256_file(manifest),
         )
+
+
+@pytest.mark.parametrize("defect", [
+    None, "missing_correction", "tampered_correction", "tampered_evidence", "code_commit",
+    "custody_hash", "fourth_source", "duplicate_source", "source_id", "parent_key",
+    "raw_sha256", "original_status", "original_scope", "corrected_status", "corrected_scope",
+    "undeclared_downgrade", "missing_scope", "missing_attachment", "missing_file",
+    "changed_fulltext", "metadata_with_file", "substituted_source", "failed_evidence",
+    "empty_runs", "failed_run", "empty_notes", "mismatched_notes", "wrong_reviewed_scope",
+    "not_context_only",
+])
+def test_strategic40_binds_only_three_reviewed_html_scope_corrections(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str | None,
+) -> None:
+    live8, live40, custody8, custody40 = _strategic_manifests(tmp_path)
+    _bind_synthetic_strategic_fixture(monkeypatch, custody8, custody40)
+    original_custody = custody40.read_bytes()
+    sources = [row for row in json.loads(original_custody)["sources"]
+               if (row.get("raw") or {}).get("media_type") == "text/html"][:3]
+    evidence = tmp_path / "review.json"
+    reviewed_notes = [{"key": source["parent_key"], "scope": "abstract_only", "profile_context_only": True}
+                      for source in sources]
+    review = {"status": "passed", "runs": [
+        {"status": "completed", "provider_configuration": provider, "notes": deepcopy(reviewed_notes)}
+        for provider in ("codex", "deepseek")
+    ]}
+    if defect == "failed_evidence":
+        review["status"] = "failed"
+    elif defect == "empty_runs":
+        review["runs"] = []
+    elif defect == "failed_run":
+        review["runs"][1]["status"] = "failed"
+    elif defect == "empty_notes":
+        review["runs"][1]["notes"] = []
+    elif defect == "mismatched_notes":
+        review["runs"][1]["notes"][0]["key"] = "OTHER"
+    elif defect == "wrong_reviewed_scope":
+        review["runs"][1]["notes"][0]["scope"] = "full_document"
+    elif defect == "not_context_only":
+        review["runs"][1]["notes"][0]["profile_context_only"] = False
+    evidence.write_text(json.dumps(review))
+    correction = {
+        "schema_version": "1", "kind": "v030_private_html_scope_correction",
+        "code_commit": CODE_COMMIT, "source_custody_manifest_sha256": sha256_file(custody40),
+        "evidence_receipt": {"path": str(evidence), "sha256": sha256_file(evidence)},
+        "sources": [{
+            "source_id": source["source_id"], "parent_key": source["parent_key"],
+            "raw_sha256": source["raw"]["sha256"],
+            "original": {"terminal_status": "validated_note", "source_scope": "full_document"},
+            "corrected": {"terminal_status": "limited_note", "source_scope": "abstract_only"},
+        } for source in sources],
+    }
+    manifest = json.loads(live40.read_text())
+    selected = {source["parent_key"].casefold() for source in sources}
+    changed = [case for case in manifest["cases"] if case["case_id"] in selected]
+    for case in changed:
+        case["expected"].update(terminal_status="limited_note", source_scope="abstract_only")
+    first = correction["sources"][0]
+    if defect in {"code_commit", "custody_hash"}:
+        correction["code_commit" if defect == "code_commit" else "source_custody_manifest_sha256"] = "0" * (40 if defect == "code_commit" else 64)
+    elif defect == "fourth_source":
+        correction["sources"].append(deepcopy(first))
+    elif defect == "duplicate_source":
+        correction["sources"][1] = deepcopy(first)
+    elif defect == "substituted_source":
+        extra = next(row for row in json.loads(original_custody)["sources"]
+                     if (row.get("raw") or {}).get("media_type") == "text/html" and row["parent_key"].casefold() not in selected)
+        first.update(source_id=extra["source_id"], parent_key=extra["parent_key"], raw_sha256=extra["raw"]["sha256"])
+        changed[0]["expected"].update(terminal_status="validated_note")
+        changed[0]["expected"].pop("source_scope")
+        next(case for case in manifest["cases"] if case["case_id"] == extra["parent_key"].casefold())["expected"].update(
+            terminal_status="limited_note", source_scope="abstract_only")
+    elif defect in {"source_id", "parent_key", "raw_sha256"}:
+        first[defect] = "wrong"
+    elif defect in {"original_status", "original_scope", "corrected_status", "corrected_scope"}:
+        section, field = defect.split("_")
+        first[section]["terminal_status" if field == "status" else "source_scope"] = "wrong"
+    elif defect == "undeclared_downgrade":
+        extra = next(case for case in manifest["cases"] if case["media_type"] == "text/html" and case["case_id"] not in selected)
+        extra["expected"].update(terminal_status="limited_note", source_scope="abstract_only")
+    elif defect == "missing_scope":
+        changed[0]["expected"].pop("source_scope")
+    elif defect == "missing_attachment":
+        changed[0].pop("zotero_attachment")
+    elif defect == "missing_file":
+        changed[0].pop("file")
+    elif defect == "changed_fulltext":
+        next(case for case in changed if case.get("zotero_fulltext"))["zotero_fulltext"]["content"] = "unbound"
+    elif defect == "metadata_with_file":
+        metadata = next(case for case in manifest["cases"] if case["media_type"] == "application/json")
+        metadata.update(file=changed[0]["file"], sha256=changed[0]["sha256"])
+    correction_path = tmp_path / "PRIVATE_HTML_SCOPE_CORRECTION.json"
+    correction_path.write_text(json.dumps(correction))
+    manifest.update(html_scope_correction=str(correction_path), html_scope_correction_sha256=sha256_file(correction_path))
+    if defect == "missing_correction":
+        manifest.pop("html_scope_correction")
+        manifest.pop("html_scope_correction_sha256")
+    elif defect == "tampered_correction":
+        correction_path.write_text(correction_path.read_text() + "\n")
+    elif defect == "tampered_evidence":
+        evidence.write_text('{"status":"failed"}')
+    live40.write_text(json.dumps(manifest))
+    if defect:
+        with pytest.raises(ValueError):
+            runner._manifest_settings(live40, sha256_file(live40))
+    else:
+        _, settings = runner._manifest_settings(live40, sha256_file(live40))
+        _, cases, _ = runner.base._validated_manifest(live40, sha256_file(live40), settings)
+        assert sum(case["expected_terminal_status"] == "validated_note" for case in cases) == 31
+        assert sum(case["expected_terminal_status"] == "limited_note" for case in cases) == 9
+        assert len(runner._validated_custody_sources(custody40, json.loads(original_custody), expected_count=40, verify_origin=True)) == 40
+        runner._manifest_settings(live8, sha256_file(live8))
+    assert custody40.read_bytes() == original_custody
 
 
 def test_strategic_manifests_bind_exact_private_custody_and_derivation(

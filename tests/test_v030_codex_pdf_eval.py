@@ -35,6 +35,46 @@ SPEC.loader.exec_module(runner)
 CODE_COMMIT = "a" * 40
 
 
+@pytest.mark.parametrize("route", ["html_text", "zotero_fulltext"])
+@pytest.mark.parametrize("defect", [None, "scope", "raw_hash", "content_hash", "source_file"])
+def test_limited_html_route_retains_custody_checks(
+    tmp_path: Path, route: str, defect: str | None,
+) -> None:
+    source = tmp_path / "01_custody/files/source.html"
+    source.parent.mkdir(parents=True)
+    source.write_text("<html>Frozen abstract.</html>")
+    fulltext = "Frozen abstract."
+    content = {
+        "source_file": str(source) if route == "html_text" else "zotero://select/library/items/A1",
+        "content_hash": sha256_file(source) if route == "html_text" else runner.sha256_text(fulltext),
+        "content_route": route, "media_type": "text/html", "source_scope": "abstract_only",
+    }
+    case = {
+        "case_id": "html", "parent": {"key": "P1"}, "attachment": {"key": "A1"},
+        "path": source, "sha256": sha256_file(source), "media_type": "text/html",
+        "zotero_fulltext": {"content": fulltext, "contentType": "text/html"},
+        "expected_route": route, "expected_terminal_status": "limited_note",
+        "expected_source_scope": "abstract_only",
+    }
+    if defect == "scope":
+        content["source_scope"] = "full_document"
+    elif defect == "raw_hash":
+        source.write_text("changed")
+    elif defect == "content_hash":
+        content["content_hash"] = "0" * 64
+    elif defect == "source_file":
+        content["source_file"] = str(tmp_path / "missing")
+    write_yaml(tmp_path / "11_state/runs/run/items/P1/frozen_content.yml", content)
+    errors, _ = runner._route_errors(
+        tmp_path, "run", [case],
+        runner.GateSettings(kind="raw_e2e", allow_html=True, require_direct_image_route=False),
+    )
+    assert errors == (
+        [] if defect is None else ["html:source_scope_mismatch"] if defect == "scope"
+        else ["html:custody_binding_mismatch"]
+    )
+
+
 def _clean_repo() -> tuple[str, bool]:
     return CODE_COMMIT, False
 
