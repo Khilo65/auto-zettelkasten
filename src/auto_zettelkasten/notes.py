@@ -304,6 +304,15 @@ def _project_source_navigation(body: str, frontmatter: Mapping[str, Any]) -> str
     if counts not in {(0, 0), (1, 1)} or (counts == (1, 1) and not managed):
         raise ValueError("ambiguous_managed_source_block")
     link = _source_navigation_link(frontmatter)
+    if link and (
+        link.startswith("[Open PDF in Zotero]")
+        or Path(str(frontmatter.get("source_file") or "")).suffix.lower() == ".pdf"
+        or "pdf" in str(frontmatter.get("content_route") or "").lower()
+    ):
+        link += (
+            "\n\n> [!warning] Tables and charts\n"
+            "> Verify table and chart values, labels and comparisons against the original PDF before relying on them."
+        )
     block = f"{SOURCE_START_MARKER}\n{link}\n{SOURCE_END_MARKER}" if link else ""
     if managed:
         return f"{body[:managed.start()]}{block}{body[managed.end():]}" if block else (

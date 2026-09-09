@@ -606,8 +606,9 @@ def test_completed_raw_pdf_checkpoint_bypasses_helper_and_persists_no_pdf_bytes(
     assert base64.b64encode(document) not in persisted
 
 
-def test_adequate_codex_pdf_keeps_embedded_text_route(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("native", ["available", "unavailable", "over_budget"])
+def test_adequate_codex_pdf_prefers_full_attachment_with_bounded_text_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, native: str
 ) -> None:
     from auto_zettelkasten import pipeline
 
@@ -665,6 +666,12 @@ def test_adequate_codex_pdf_keeps_embedded_text_route(
     custody.write_bytes(b"pdf")
     item = {"key": "A1", "data": {"key": "A1", "itemType": "journalArticle"}}
 
+    reader = _pdf_capable_reader()
+    if native == "unavailable":
+        reader.pdf_input_file_status = lambda: {"pdf_input_file_capability": False}
+    if native == "over_budget":
+        monkeypatch.setattr(pipeline, "_codex_pdf_input_file_preflight", lambda *_args: {"admitted": False})
+
     candidate, extracted = _custodied_pdf_candidate(
         b"pdf",
         custody,
@@ -674,11 +681,20 @@ def test_adequate_codex_pdf_keeps_embedded_text_route(
         _request(tmp_path),
         actual_primary_pdf=True,
         cancelled=None,
-        reader=_pdf_capable_reader(),
+        reader=reader,
     )
 
-    assert extracted.route == "pypdf_text"
-    assert candidate and "document_route" not in candidate
+    assert candidate
+    if native == "available":
+        assert extracted.route == "codex_pdf_input_file"
+        assert candidate["text"] == ""
+        identity = candidate["document_route"]["identity_payload"]
+        assert identity["custody_sha256"] == hashlib.sha256(b"pdf").hexdigest()
+        assert identity["probe_evidence"]["page_count"] == 17
+    else:
+        assert extracted.route == "pypdf_text"
+        assert "document_route" not in candidate
+        assert candidate["text"] == prose
 
 
 def test_non_codex_pdf_keeps_existing_extraction_policy(
@@ -1289,9 +1305,7 @@ def test_damaged_numeral_recovery_is_shared_and_never_silently_complete(
         ),
     )
     reader = SimpleNamespace(
-        pdf_input_file_status=lambda: pytest.fail(
-            "damaged text must use selected local recovery"
-        )
+        pdf_input_file_status=lambda: {"pdf_input_file_capability": False}
     )
     candidate, result = _custodied_pdf_candidate(
         document,
@@ -1319,8 +1333,8 @@ def test_damaged_numeral_recovery_is_shared_and_never_silently_complete(
         assert result.coverage_metrics["ocr_page_count"] == 0
 
 
-@pytest.mark.parametrize("fallback", ["none", "images"])
-def test_damaged_numeral_preserves_other_codex_fallback_policies(
+@pytest.mark.parametrize("fallback", ["none", "images", "ocr"])
+def test_damaged_numeral_prefers_full_pdf_before_local_fallback(
     monkeypatch, tmp_path, fallback
 ):
     from auto_zettelkasten import extraction
@@ -1351,3 +1365,46 @@ def test_damaged_numeral_preserves_other_codex_fallback_policies(
         and candidate["document_route"]["identity_payload"]["route"]
         == "codex_pdf_input_file"
     )
+
+
+@pytest.mark.parametrize("source_kind", ["standalone", "multiple", "bounded_excerpt"])
+def test_native_acquisition_keeps_selected_attachment_over_its_index(monkeypatch, tmp_path, source_kind):
+    from auto_zettelkasten import pipeline
+    from test_pdf_recovery import _pdf, _prose
+
+    text = _prose("article", 220)
+    document = _pdf([text])
+    child = {"key": "PDFNAT01", "data": {
+        "key": "PDFNAT01", "itemType": "attachment", "contentType": "application/pdf",
+        "title": "Appendix A" if source_kind == "bounded_excerpt" else "Full text PDF",
+        "filename": "source.pdf",
+    }}
+    parent = {"key": "PARENT01", "data": {
+        "key": "PARENT01", "itemType": "book" if source_kind == "bounded_excerpt" else "journalArticle",
+        "title": "Study of articles",
+    }}
+    other = {"key": "SUPPLE01", "data": {
+        "key": "SUPPLE01", "itemType": "attachment", "contentType": "application/pdf",
+        "title": "Supplementary figures", "filename": "supplement.pdf",
+    }}
+    class Zotero:
+        def children(self, key):
+            return [] if source_kind == "standalone" else [child, other] if source_kind == "multiple" else [child]
+        def fulltext(self, key):
+            return {"content": text, "contentType": "application/pdf", "indexedPages": 1, "totalPages": 1} if key in {"PDFNAT01", "SUPPLE01"} else None
+        def file(self, key):
+            return (document, "application/pdf") if key in {"PDFNAT01", "SUPPLE01"} else None
+
+    monkeypatch.setattr(pipeline, "extract_pdf_from_probe", lambda *_a, **_k: pytest.fail("no OCR for admitted PDF"))
+    result = pipeline._acquire_content(
+        tmp_path, child if source_kind == "standalone" else parent, Zotero(),
+        {"source_id": "source-zotero-PARENT01", "attempts": []}, _request(tmp_path), None,
+        reader=_pdf_capable_reader(),
+    )
+    assert result["content_route"] == "codex_pdf_input_file"
+    assert result["attachment_key"] == "PDFNAT01"
+    assert result["source_pdf_uri"] == "zotero://open-pdf/library/items/PDFNAT01"
+    assert result["text"] == ""
+    assert result["document_route"]["identity_payload"]["custody_sha256"] == hashlib.sha256(document).hexdigest()
+    if source_kind == "bounded_excerpt":
+        assert result["source_scope"] == "partial_document"

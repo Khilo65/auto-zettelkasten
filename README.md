@@ -98,26 +98,28 @@ substantive cluster findings. Evidence-bounded partial documents can participate
 in relationships and, when enabled, clusters, with their recovered scope
 carried into synthesis.
 
-For PDF sources, the mapper prefers the actual primary Zotero attachment and
-preserves page markers throughout extraction. One no-OCR structural probe
-records per-page text quality, visual resources, suspicious pages, render
-candidates, and custody evidence before routing. Adequate born-digital text uses
-`pypdf`. With `ocr=auto`, explicit cloud consent, and the pinned Codex CLI
-profile, inadequate pages may instead be rendered as ordered PNG attachments to
-the source-bundle call: at most 16 pages, maximum side 2,048 pixels, and no
-enlargement. The 200,000-token preflight includes image, reasoning, output, and
-uncertainty reservations. Codex CLI 0.145.0 does not support original-PDF input.
-The existing `ocr=off` and `ocr=required` semantics are unchanged. OpenAI API
-[PDF file preprocessing](https://developers.openai.com/api/docs/guides/file-inputs)
-is a separate transport capability and is not used by this CLI route.
+For PDF sources, the mapper prefers the actual primary Zotero attachment.
+With `ocr=auto`, explicit cloud consent and a PDF-capable Codex companion,
+the subscription route sends the original PDF to source generation. The local
+structural probe supplies custody, page geometry and input-size estimates;
+its extracted text is not substituted for an admitted PDF attachment.
+Admission retains the existing decoded-file limit below 50 MB and estimated
+200,000-token budget including reasoning, output and uncertainty reserves.
 
-The existing bounded PDFium/Tesseract route remains available for local OCR and
-typed attachment recovery. Quota, timeout, and interruption pause without local
-recovery; authentication, isolation, integrity, and unknown capability failures
-remain fail-closed. Extraction provenance records the selected route and page
-coverage. A visibly textual page that remains unreadable produces a limited note
-rather than a falsely complete analysis. Tables may be flattened only when their
-labels, values, and surrounding explanation remain readable.
+When PDF attachment input is unavailable or exceeds those limits, the mapper
+uses adequate embedded text or the configured local OCR/page-image fallback.
+A saved recovery from a previously rejected attachment is reused to avoid
+repeating the failed request. API-key routes retain their existing extraction
+policies; explicit `ocr=off` and `ocr=required` behavior is unchanged.
+Quota, timeout and interruption pause without automatic alternate calls;
+authentication, isolation and integrity failures remain fail-closed.
+
+PDF notes include a short reminder to verify table and chart values, labels
+and comparisons against the original PDF. Neither direct PDF input nor OCR
+guarantees correct interpretation. The reminder is generated in code beside
+the source link, not added to the source-analysis prompt or used as a new
+validation requirement. Extraction provenance continues to disclose the
+selected route and recovered page coverage.
 
 Original Zotero tags and their normalized forms remain provenance. The graph
 projection derives conservative, typed subject tags from existing profile

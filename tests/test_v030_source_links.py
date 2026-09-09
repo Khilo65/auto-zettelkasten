@@ -137,3 +137,21 @@ def test_ambiguous_source_block_refresh_fails_without_changing_note(tmp_path: Pa
     with pytest.raises(ValueError, match="ambiguous_managed_source_block"):
         update_note_frontmatter(path, {"source_pdf_uri": "zotero://open-pdf/library/items/PDFTEST1"})
     assert path.read_text() == broken
+
+
+@pytest.mark.parametrize("route", ["pypdf_text", "pdfium_tesseract", "codex_pdf_input_file"])
+def test_pdf_verification_notice_is_once_outside_analysis_and_survives_refresh(tmp_path, route):
+    metadata = _metadata(content_route=route, source_pdf_uri="zotero://open-pdf/library/items/PDFTEST1")
+    path, validation = write_atomic_note(tmp_path, metadata, _analysis())
+    assert validation.passed
+    notice = "Verify table and chart values, labels and comparisons against the original PDF before relying on them."
+    text = path.read_text()
+    assert text.count(notice) == 1
+    assert notice not in canonical_source_note_text(internal_note_text(path))
+    update_note_frontmatter(path, {"title": "Corrected metadata"})
+    assert path.read_text().count(notice) == 1
+    frozen = (path.read_bytes(), path.stat().st_mtime_ns)
+    update_note_frontmatter(path, {"title": "Corrected metadata"})
+    assert (path.read_bytes(), path.stat().st_mtime_ns) == frozen
+    html = render_atomic_note(_metadata(source_file="/private/source.html", content_route="html_text"), _analysis())
+    assert notice not in html

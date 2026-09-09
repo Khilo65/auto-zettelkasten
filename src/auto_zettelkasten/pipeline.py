@@ -206,7 +206,7 @@ from .zotero import (
 )
 
 CHUNKING_VERSION = "3"
-CONTENT_CLASSIFIER_VERSION = "5"
+CONTENT_CLASSIFIER_VERSION = "6"
 _RELATIONSHIP_BATCH_MAX_JOBS = 8
 _LEGACY_RELATIONSHIP_BATCH_MAX_JOBS = 8
 _RELATIONSHIP_DISCOVERY_PAGE_SIZE = 64
@@ -20723,6 +20723,15 @@ def _acquire_content(
                     }
                 )
             return failed_primary_pdf
+    native_attachment_keys = {
+        row["attachment_key"] for row in candidates
+        if row.get("attachment_key") and row.get("content_route") == "codex_pdf_input_file"
+    }
+    candidates = [
+        row for row in candidates
+        if not (row.get("content_route") == "zotero_fulltext"
+                and row.get("attachment_key") in native_attachment_keys)
+    ]
     if candidates:
         return max(
             candidates,
@@ -20983,30 +20992,7 @@ def _custodied_pdf_candidate(
         and request.provider == "codex"
         and request.allow_cloud
     )
-    if (
-        codex_auto
-        and probe.adequacy is not None
-        and probe.adequacy.is_full_publication
-    ):
-        extracted = ExtractionResult(
-            status="succeeded",
-            text=probe.embedded_text,
-            route="pypdf_text",
-            media_type="application/pdf",
-            page_count=probe.page_count,
-            adequacy=probe.adequacy,
-        )
-        return (
-            _custodied_pdf_candidate_from_extraction(
-                extracted,
-                document_hash,
-                custody_path,
-                attachment,
-                source_item,
-                actual_primary_pdf,
-            ),
-            extracted,
-        )
+    # A matching recovery records a prior attachment failure; do not retry it.
     if codex_auto and request.extraction_policy.pdf_fallback == "ocr":
         cached_recovery = _load_pdf_local_recovery_cache(
             custody_path, document_hash, request
@@ -21023,14 +21009,7 @@ def _custodied_pdf_candidate(
                 ),
                 cached_recovery,
             )
-    prefer_local_recovery = (
-        codex_auto
-        and request.extraction_policy.pdf_fallback == "ocr"
-        and any(
-            _pdf_text_has_damaged_numeral(page.embedded_text) for page in probe.pages
-        )
-    )
-    if not codex_auto or prefer_local_recovery:
+    if not codex_auto:
         extracted = extract_pdf_from_probe(
             document,
             probe,
@@ -21186,6 +21165,30 @@ def _custodied_pdf_candidate(
                 return candidate, extracted
             native_reason = "pdf_token_ceiling_exceeded"
 
+    if (
+        codex_auto
+        and probe.adequacy is not None
+        and probe.adequacy.is_full_publication
+    ):
+        extracted = ExtractionResult(
+            status="succeeded",
+            text=probe.embedded_text,
+            route="pypdf_text",
+            media_type="application/pdf",
+            page_count=probe.page_count,
+            adequacy=probe.adequacy,
+        )
+        return (
+            _custodied_pdf_candidate_from_extraction(
+                extracted,
+                document_hash,
+                custody_path,
+                attachment,
+                source_item,
+                actual_primary_pdf,
+            ),
+            extracted,
+        )
     fallback = request.extraction_policy.pdf_fallback
     if fallback == "ocr":
         extracted = extract_pdf_from_probe(
