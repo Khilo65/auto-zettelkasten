@@ -1685,8 +1685,6 @@ def test_codex_chunk_envelope_that_cannot_fit_fails_before_any_provider_call(
 
     reader = CodexReader("gpt-5.6-luna", allow_cloud=True, reasoning_effort="medium")
     reader._preflight = {"version": "0.152.1"}
-    if framed_boundary:
-        reader.context_window_tokens = 12_000
     request = MapRequest(tmp_path, processing=ProcessingPolicy())
     _apply_reader_policy(reader, request.processing)
     monkeypatch.setattr(reader, "_generate_text", lambda *args, **kwargs: pytest.fail("provider called for an impossible envelope"))
@@ -1704,6 +1702,11 @@ def test_codex_chunk_envelope_that_cannot_fit_fails_before_any_provider_call(
     question = "Q" * 334 if framed_boundary else "Question " * 75_000
     text = "A" * (10_000 if framed_boundary else 500_000)
     if framed_boundary:
+        # Fit the bare prompt exactly; real chunk framing must still overflow.
+        bare_tokens = readers_module._estimate_tokens(readers_module._chunk_system_prompt()) + readers_module._estimate_tokens(
+            readers_module._chunk_prompt("", {}, question, "chunk-0001", "document chunk 1/1")
+        )
+        reader.context_window_tokens = int((bare_tokens + reader.prompt_reserve_tokens + CODEX_CONTRACT_RESERVATIONS["chunk_evidence"]) / reader.direct_read_fraction)
         assert reader.chunk_evidence_fits(
             "", {}, question, chunk_id="chunk-0001", locator="document chunk 1/1",
             max_output_tokens=request.processing.chunk_output_tokens,

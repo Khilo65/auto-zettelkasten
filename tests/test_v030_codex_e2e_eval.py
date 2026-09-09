@@ -1130,6 +1130,31 @@ def test_raw_workspace_config_hash_matches_current_initialized_config(
     )
 
 
+@pytest.mark.parametrize("prompt_version", ["14", "15"])
+def test_raw_workspace_binds_exact_current_and_legacy_config(
+    tmp_path: Path, prompt_version: str,
+) -> None:
+    manifest = _manifest(tmp_path / "private")
+    config = manifest.parent / "auto-zettelkasten.yml"
+    config.write_text(
+        config.read_text().replace("prompt_version: '15'", f"prompt_version: '{prompt_version}'"),
+        encoding="utf-8",
+    )
+    assert sha256_file(config) == (
+        runner._LEGACY_RAW_CONFIG_SHA256
+        if prompt_version == "14"
+        else runner._RAW_CONFIG_SHA256
+    )
+    _, settings = runner._manifest_settings(manifest, sha256_file(manifest))
+    assert settings.kind == "raw_e2e"
+
+    config.write_text(
+        config.read_text().replace("parallel: 4", "parallel: 5"), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="raw E2E workspace identity is not frozen"):
+        runner._manifest_settings(manifest, sha256_file(manifest))
+
+
 def test_provider_free_pdf_route_uses_verified_reader_without_model_turn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

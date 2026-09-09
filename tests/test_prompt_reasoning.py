@@ -59,10 +59,19 @@ def test_source_bundle_filters_cached_pdf_initials_without_losing_html_headings(
     assert "Unchanged source content." in prompt
 
 
-def test_atomic_prompt_v14_is_source_adaptive_and_statistics_aware() -> None:
+@pytest.mark.parametrize("builder", [_system_prompt, _source_bundle_system_prompt, _chunk_system_prompt])
+def test_atomic_generation_requests_item_level_author_date_pages(builder):
+    prompt = builder()
+    assert "every detailed finding or finding bullet, quotation, evidence/data item, and key concept or definition" in prompt
+    assert "(Author, Date, p. N)" in prompt
+    assert "(Author, Date, pp. N–M)" in prompt
+    assert "use an available section or heading" in prompt
+
+
+def test_atomic_prompt_v15_is_source_adaptive_and_statistics_aware() -> None:
     prompt = _system_prompt()
 
-    assert "atomic prompt v14" in prompt
+    assert "atomic prompt v15" in prompt
     assert "optional key_concepts_and_definitions" in prompt
     assert "omit key_concepts_and_definitions entirely" in prompt
     assert "optional source_structure_and_organization" in prompt
@@ -104,10 +113,10 @@ def test_atomic_prompt_v14_is_source_adaptive_and_statistics_aware() -> None:
     assert "silently reread" in prompt
 
 
-def test_source_bundle_v40_requests_detailed_source_content_without_claim_inventory():
+def test_source_bundle_v41_requests_detailed_source_content_without_claim_inventory():
     system = _source_bundle_system_prompt()
     prompt = _source_bundle_prompt("Original source text.", {}, None)
-    assert "source bundle prompt v40" in system
+    assert "source bundle prompt v41" in system
     for content in ("thesis", "methods", "evidence and data", "examples", "qualifications",
                     "author or speaker", "marked footnotes", "page, chapter", "exact quotations",
                     "compact_profile", "literature_positions", "recoverable"):
@@ -256,13 +265,13 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
         "chunk_evidence", "gpt-5.6-luna", "medium"
     )
     assert {
-        "atomic_prompt_v14": digest(_system_prompt()),
-        "chunk_prompt_bundle_v40": digest(_chunk_system_prompt()),
-        "chunk_user_prompt_bundle_v40": digest(
+        "atomic_prompt_v15": digest(_system_prompt()),
+        "chunk_prompt_bundle_v41": digest(_chunk_system_prompt()),
+        "chunk_user_prompt_bundle_v41": digest(
             _chunk_prompt("A fictional source.", {}, None, "chunk-0001", "pages 1-2")
         ),
-        "source_bundle_prompt_v40": digest(_source_bundle_system_prompt()),
-        "source_bundle_user_prompt_v40": digest(
+        "source_bundle_prompt_v41": digest(_source_bundle_system_prompt()),
+        "source_bundle_user_prompt_v41": digest(
             _source_bundle_prompt("A fictional source.", {}, None)
         ),
         "codex_source_bundle_schema": bundle_identity["schema_hash"],
@@ -270,11 +279,11 @@ def test_final_source_prompt_schema_and_contract_hashes_are_frozen() -> None:
         "codex_chunk_evidence_schema": chunk_identity["schema_hash"],
         "codex_chunk_evidence_contract": digest(chunk_identity),
     } == {
-        "atomic_prompt_v14": "8db9f2990d175816cb0100b92d84734ae7c2f930aade66825ed0412b22da3705",
-        "chunk_prompt_bundle_v40": "1ef440d8148d4a58491ac2a74cf9d65c0d52f9f4d2e42278f1961e94e570dea2",
-        "chunk_user_prompt_bundle_v40": "13825c29551703fdc760ab0ad496ac3210658dfe290c36fa027f6c51f3d72a05",
-        "source_bundle_prompt_v40": "95ce1b464908e1c169b7f2ff71620832e758a8e44d380fa49e999f9d7a0bb1bd",
-        "source_bundle_user_prompt_v40": "549c46f156b10241178c9bf7401b56ddcef778b5465bf7325aa14e25dfc8ae1e",
+        "atomic_prompt_v15": "765b175c633cc9ca29d9c2e430e56f05da27e2d5347da629d0fac4df5060fb62",
+        "chunk_prompt_bundle_v41": "af848529945ebb68cee343345219ab01f4f931b145c81acb9360fd1db9d089a2",
+        "chunk_user_prompt_bundle_v41": "13825c29551703fdc760ab0ad496ac3210658dfe290c36fa027f6c51f3d72a05",
+        "source_bundle_prompt_v41": "889c54b3f656019783a56f33db7b9c37e5371a0add38f2c2f5b66f5277cbd4f3",
+        "source_bundle_user_prompt_v41": "549c46f156b10241178c9bf7401b56ddcef778b5465bf7325aa14e25dfc8ae1e",
         "codex_source_bundle_schema": "1f0ff3c8a6b465335c254aee9ea4096e65d3e76aea53daf94eb2c5d25f855b72",
         "codex_source_bundle_contract": "a9b70cb5a6df925b964543d8bdfcdef2e872655b578db9702aaf96191d9ec272",
         "codex_chunk_evidence_schema": "130ebe184fc8dc0b3c08879abfeb0435500a47eecd78ed7e2387c095574d821c",

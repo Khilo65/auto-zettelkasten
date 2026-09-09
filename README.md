@@ -101,12 +101,12 @@ carried into synthesis.
 For PDF sources, the mapper prefers the actual primary Zotero attachment.
 With `ocr=auto`, explicit cloud consent and a PDF-capable Codex companion,
 the subscription route sends the original PDF to source generation. The local
-structural probe supplies custody, page geometry and input-size estimates;
-its extracted text is not substituted for an admitted PDF attachment.
-Admission retains the existing decoded-file limit below 50 MB and estimated
-200,000-token budget including reasoning, output and uncertainty reserves.
+structural probe supplies custody and page metadata; its extracted text is not
+substituted for an admitted PDF attachment. Native PDFs are sent in one request
+without preemptive chunking or a per-page image-token estimate. The decoded-file
+limit remains below 50 MB; the provider enforces its actual service limits.
 
-When PDF attachment input is unavailable or exceeds those limits, the mapper
+When PDF attachment input is unavailable or exceeds the file limit, the mapper
 uses adequate embedded text or the configured local OCR/page-image fallback.
 A saved recovery from a previously rejected attachment is reused to avoid
 repeating the failed request. API-key routes retain their existing extraction
@@ -120,6 +120,13 @@ guarantees correct interpretation. The reminder is generated in code beside
 the source link, not added to the source-analysis prompt or used as a new
 validation requirement. Extraction provenance continues to disclose the
 selected route and recovered page coverage.
+
+All atomic-note generation routes request parenthetical citations beside each
+detailed finding, quotation, evidence/data item, and concept or definition:
+`(Author, Date, p. N)` or `(Author, Date, pp. N–M)`. Unpaginated sources use an
+available section or heading. This is a prompt instruction, not a new validator
+or model call. The deterministic Open PDF link remains separate from citations;
+model-written page references do not create Zotero highlights or page targets.
 
 Original Zotero tags and their normalized forms remain provenance. The graph
 projection derives conservative, typed subject tags from existing profile

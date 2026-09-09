@@ -288,16 +288,6 @@ def test_custodied_inadequate_pdf_selects_raw_pdf_route_without_local_ocr(
             _inadequate_probe(b"pdf", width=0),
             "unknown_pdf_geometry",
         ),
-        (
-            b"pdf",
-            _inadequate_probe(
-                b"pdf",
-                page_count=30,
-                width=2_048,
-                height=2_048,
-            ),
-            "pdf_token_ceiling_exceeded",
-        ),
     ],
 )
 def test_raw_pdf_admission_fails_without_explicit_fallback(
@@ -424,6 +414,8 @@ def test_explicit_image_fallback_is_used_only_after_raw_pdf_admission_fails(
     custody = tmp_path / "custody.pdf"
     custody.write_bytes(document)
 
+    reader = _pdf_capable_reader()
+    reader.pdf_input_file_status = lambda: {"pdf_input_file_capability": False}
     candidate, extracted = _custodied_pdf_candidate(
         document,
         custody,
@@ -433,7 +425,7 @@ def test_explicit_image_fallback_is_used_only_after_raw_pdf_admission_fails(
         _request(tmp_path, pdf_fallback="images"),
         actual_primary_pdf=True,
         cancelled=None,
-        reader=_pdf_capable_reader(),
+        reader=reader,
     )
 
     assert extracted.route == "codex_pdf_page_images"
@@ -606,9 +598,10 @@ def test_completed_raw_pdf_checkpoint_bypasses_helper_and_persists_no_pdf_bytes(
     assert base64.b64encode(document) not in persisted
 
 
-@pytest.mark.parametrize("native", ["available", "unavailable", "over_budget"])
+@pytest.mark.parametrize("native", ["available", "unavailable"])
+@pytest.mark.parametrize("page_count", [17, 768, 998])
 def test_adequate_codex_pdf_prefers_full_attachment_with_bounded_text_fallback(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, native: str
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, native: str, page_count: int
 ) -> None:
     from auto_zettelkasten import pipeline
 
@@ -619,7 +612,7 @@ def test_adequate_codex_pdf_prefers_full_attachment_with_bounded_text_fallback(
             str(number),
             612,
             792,
-            "1%2%3%4% Chart labels" if number == 17 else prose,
+            "1%2%3%4% Chart labels" if number == page_count else prose,
             hashlib.sha256(prose.encode()).hexdigest(),
             len(prose),
             70,
@@ -632,14 +625,14 @@ def test_adequate_codex_pdf_prefers_full_attachment_with_bounded_text_fallback(
             False,
             False,
         )
-        for number in range(1, 18)
+        for number in range(1, page_count + 1)
     )
     adequacy = ContentAdequacy(
         ContentAdequacyClass.FULL_PDF_TEXT,
         "full_document",
         "passed",
         "full_pdf_text",
-        metrics={"page_count": 17},
+        metrics={"page_count": page_count},
     )
     probe = PDFStructuralProbe(
         "succeeded",
@@ -647,14 +640,14 @@ def test_adequate_codex_pdf_prefers_full_attachment_with_bounded_text_fallback(
         "application/pdf",
         hashlib.sha256(b"pdf").hexdigest(),
         3,
-        17,
+        page_count,
         pages,
         prose,
         adequacy,
         {},
         (),
-        tuple(range(1, 18)),
-        tuple(str(number) for number in range(1, 18)),
+        tuple(range(1, page_count + 1)),
+        tuple(str(number) for number in range(1, page_count + 1)),
     )
     monkeypatch.setattr(pipeline, "probe_pdf_bytes", lambda *_args, **_kwargs: probe)
     monkeypatch.setattr(
@@ -669,8 +662,8 @@ def test_adequate_codex_pdf_prefers_full_attachment_with_bounded_text_fallback(
     reader = _pdf_capable_reader()
     if native == "unavailable":
         reader.pdf_input_file_status = lambda: {"pdf_input_file_capability": False}
-    if native == "over_budget":
-        monkeypatch.setattr(pipeline, "_codex_pdf_input_file_preflight", lambda *_args: {"admitted": False})
+    monkeypatch.setattr(pipeline, "codex_source_bundle_image_preflight",
+                        lambda *_args: pytest.fail("native PDFs must not use page-image token estimates"))
 
     candidate, extracted = _custodied_pdf_candidate(
         b"pdf",
@@ -689,8 +682,10 @@ def test_adequate_codex_pdf_prefers_full_attachment_with_bounded_text_fallback(
         assert extracted.route == "codex_pdf_input_file"
         assert candidate["text"] == ""
         identity = candidate["document_route"]["identity_payload"]
+        assert identity["route_version"] == "2"
+        assert "projected_preflight" not in identity
         assert identity["custody_sha256"] == hashlib.sha256(b"pdf").hexdigest()
-        assert identity["probe_evidence"]["page_count"] == 17
+        assert identity["probe_evidence"]["page_count"] == page_count
     else:
         assert extracted.route == "pypdf_text"
         assert "document_route" not in candidate

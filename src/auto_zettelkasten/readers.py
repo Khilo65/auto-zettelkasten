@@ -239,7 +239,7 @@ DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
-SOURCE_BUNDLE_PROMPT_VERSION = "40"
+SOURCE_BUNDLE_PROMPT_VERSION = "41"
 SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v3"
 SOURCE_BUNDLE_ROW_LIMITS = {"literature_positions": 8}
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
@@ -5298,10 +5298,19 @@ class OllamaReader(_CapabilityAwareReader):
             raise ProviderError("ollama returned an unexpected response") from exc
 
 
+ATOMIC_CITATION_INSTRUCTION = (
+    "Attach a parenthetical source citation to every detailed finding or finding bullet, quotation, "
+    "evidence/data item, and key concept or definition, using (Author, Date, p. N) or "
+    "(Author, Date, pp. N–M). If page numbers are unavailable, use an available section or heading "
+    "in the same citation instead; never invent a page number. "
+)
+
+
 def _system_prompt() -> str:
     keys = ", ".join(REQUIRED_SECTION_KEYS)
     return (
         f"You create source-faithful atomic notes using Auto-Zettelkasten atomic prompt v{CURRENT_ATOMIC_PROMPT_VERSION}. "
+        f"{ATOMIC_CITATION_INSTRUCTION}"
         "Adapt the analysis to the source actually supplied: it may be an academic article or book, a report, policy or legal "
         "document, archival material, conference or meeting record, practitioner guidance, speech, working paper, blog post, "
         "or another evidence-bearing source. Do not force a nonacademic source into an academic-study template. "
@@ -5312,7 +5321,7 @@ def _system_prompt() -> str:
         "terms, general background concepts, or definitions imported from outside the source. "
         "Prefer a short exact quotation when the wording is recoverable, followed by its page number when supplied; otherwise use "
         "a section, heading, or explicit text anchor. Clearly label a source-grounded paraphrase as a paraphrase, never present it "
-        "as a quotation, and never invent a page number. Use concise Markdown bullets such as '**Term** — “source wording” (p. 12).' "
+        "as a quotation, and never invent a page number. Use concise Markdown bullets such as '**Term** — “source wording” (Author, Date, p. 12).' "
         "If no qualifying definition exists, omit key_concepts_and_definitions entirely; do not return a placeholder. "
         "The optional source_structure_and_organization field is a short source-native navigation outline, not an argument map. "
         "Include it only when headings are recoverable. Preserve the source's actual order and titles: for an article or chapter, "
@@ -5372,6 +5381,7 @@ def _source_bundle_system_prompt() -> str:
     keys = ", ".join(REQUIRED_SECTION_KEYS)
     return (
         f"You are the source-reading reasoner for Auto-Zettelkasten source bundle prompt v{SOURCE_BUNDLE_PROMPT_VERSION}. "
+        f"{ATOMIC_CITATION_INSTRUCTION}"
         "Write a detailed, source-faithful atomic note. Explain the thesis, knowledge basis, methods, "
         "evidence and data, findings, examples, mechanisms, limitations, literature position and distinct contribution. "
         "Preserve consequential quantities with their original scales, comparison groups, observation periods, "
@@ -6602,6 +6612,7 @@ def _chunk_system_prompt() -> str:
     keys = ", ".join(REQUIRED_CHUNK_EVIDENCE_KEYS)
     return (
         "You extract compact, source-faithful evidence from one coarse document chunk. "
+        f"{ATOMIC_CITATION_INSTRUCTION}"
         "Return only one JSON object and do not infer facts absent from the chunk. "
         f"Every returned value must be a non-empty string. Required keys: {keys}. "
         "Preserve concrete claims, methods, data, qualifications, and contradictions, but avoid prose repetition. "

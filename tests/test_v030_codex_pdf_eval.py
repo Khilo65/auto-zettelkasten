@@ -1526,6 +1526,42 @@ def test_acceptance_rejects_relationship_endpoint_outside_four_sources(
     assert "relationship_endpoint_outside_gate" in errors
 
 
+@pytest.mark.parametrize(
+    "variant", ["current", "obsolete_preflight", "null_preflight", "unknown_version"]
+)
+def test_acceptance_native_pdf_v2_omits_estimated_preflight(
+    tmp_path: Path, variant: str
+) -> None:
+    manifest_path = _manifest(tmp_path / "private")
+    manifest, cases, workspace = runner._validated_manifest(
+        manifest_path, sha256_file(manifest_path)
+    )
+    request = runner._request(manifest, workspace)
+    client = runner.ManifestZoteroClient(cases)
+    run_id = str(manifest["run_id"])
+    report = _write_accepted_run(workspace, request, client, run_id)
+    route_path = (
+        workspace / "11_state" / "runs" / run_id / "items" / "P2" / "document_route.yml"
+    )
+    route = read_yaml(route_path)
+    identity = route["identity_payload"]
+    identity["route_version"] = "2"
+    if variant != "obsolete_preflight":
+        identity.pop("projected_preflight")
+    if variant == "null_preflight":
+        identity["projected_preflight"] = None
+    if variant == "unknown_version":
+        identity["route_version"] = "3"
+    route["identity"] = runner.stable_hash(identity)
+    write_yaml(route_path, route)
+
+    errors, _ = runner._acceptance(workspace, run_id, cases, report)
+    if variant == "current":
+        assert errors == []
+    else:
+        assert "case-2:route_identity_mismatch" in errors
+
+
 def test_acceptance_binds_direct_pdf_route_and_transport_evidence(
     tmp_path: Path,
 ) -> None:

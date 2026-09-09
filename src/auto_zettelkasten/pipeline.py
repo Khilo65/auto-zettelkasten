@@ -206,7 +206,7 @@ from .zotero import (
 )
 
 CHUNKING_VERSION = "3"
-CONTENT_CLASSIFIER_VERSION = "6"
+CONTENT_CLASSIFIER_VERSION = "7"
 _RELATIONSHIP_BATCH_MAX_JOBS = 8
 _LEGACY_RELATIONSHIP_BATCH_MAX_JOBS = 8
 _RELATIONSHIP_DISCOVERY_PAGE_SIZE = 64
@@ -20938,41 +20938,6 @@ def _apply_bibliographic_scope(
     return row
 
 
-def _codex_pdf_input_file_preflight(
-    extracted_text: str,
-    metadata: Mapping[str, Any],
-    question: str | None,
-    page_dimensions: Sequence[tuple[int, int]],
-) -> dict[str, Any]:
-    prompt_only = codex_source_bundle_image_preflight(
-        "", metadata, question, page_dimensions
-    )
-    with_extracted_text = codex_source_bundle_image_preflight(
-        extracted_text, metadata, question, ()
-    )
-    prompt_tokens = int(prompt_only["document_input_tokens"])
-    extracted_text_tokens = max(
-        0,
-        int(with_extracted_text["document_input_tokens"]) - prompt_tokens,
-    )
-    vision_tokens = int(prompt_only["image_tokens"])
-    document_input = prompt_tokens + extracted_text_tokens + vision_tokens
-    uncertainty = max(16_384, (document_input + 3) // 4)
-    combined = document_input + 32_768 + 32_768 + uncertainty
-    return {
-        "prompt_text_tokens": prompt_tokens,
-        "pdf_extracted_text_tokens": extracted_text_tokens,
-        "image_tokens": vision_tokens,
-        "document_input_tokens": document_input,
-        "reasoning_reservation_tokens": 32_768,
-        "output_reservation_tokens": 32_768,
-        "uncertainty_tokens": uncertainty,
-        "combined_tokens": combined,
-        "ceiling_tokens": 200_000,
-        "admitted": combined <= 200_000,
-    }
-
-
 def _custodied_pdf_candidate(
     document: bytes,
     custody_path: Path,
@@ -21100,70 +21065,55 @@ def _custodied_pdf_candidate(
                 source_item,
                 actual_primary_pdf,
             )
-            reader_metadata = _source_reader_metadata(
-                source_item,
-                str(base.get("source_id") or ""),
-                item_key(source_item),
-                candidate,
-            )
-            projected_preflight = _codex_pdf_input_file_preflight(
-                extracted.text,
-                reader_metadata,
-                request.question,
-                [(page.width, page.height) for page in probe.pages],
-            )
-            if projected_preflight["admitted"]:
-                probe_evidence = {
-                    "status": probe.status,
-                    "reason": probe.reason,
-                    "custody_byte_count": probe.custody_byte_count,
-                    "page_count": probe.page_count,
-                    "suspicious_pages": list(probe.suspicious_pages),
-                    "render_candidate_pages": list(probe.render_candidate_pages),
-                    "pages": [
-                        {
-                            key: value
-                            for key, value in page.to_dict().items()
-                            if key != "embedded_text"
-                        }
-                        for page in probe.pages
-                    ],
-                }
-                helper_identity = helper_status.get("_helper_manifest_identity")
-                identity_payload = {
-                    "route_version": "1",
-                    "route": "codex_pdf_input_file",
-                    "custody_file": str(custody_path.resolve()),
-                    "custody_sha256": document_hash,
-                    "custody_byte_count": len(document),
-                    "file_policy": {
-                        "media_type": "application/pdf",
-                        "maximum_bytes_exclusive": 50_000_000,
-                        "detail": "auto",
-                    },
-                    "model_profile": {
-                        "model": request.model,
-                        "reasoning_effort": request.reasoning_effort or "medium",
-                        "cli_version": str(helper_status.get("version") or ""),
-                    },
-                    "fallback_policy": request.extraction_policy.pdf_fallback,
-                    "attachment_capability": codex_source_bundle_attachment_identity(
-                        str(helper_status.get("version") or "0.145.0"),
-                        helper_identity
-                        if isinstance(helper_identity, Mapping)
-                        else None,
-                    ),
-                    "probe_evidence": probe_evidence,
-                    "projected_preflight": projected_preflight,
-                }
-                candidate["document_route"] = {
-                    "identity_payload": identity_payload,
-                    "identity": stable_hash(identity_payload),
-                    "recovery": {"state": "not_selected"},
-                }
-                candidate["text"] = ""
-                return candidate, extracted
-            native_reason = "pdf_token_ceiling_exceeded"
+            probe_evidence = {
+                "status": probe.status,
+                "reason": probe.reason,
+                "custody_byte_count": probe.custody_byte_count,
+                "page_count": probe.page_count,
+                "suspicious_pages": list(probe.suspicious_pages),
+                "render_candidate_pages": list(probe.render_candidate_pages),
+                "pages": [
+                    {
+                        key: value
+                        for key, value in page.to_dict().items()
+                        if key != "embedded_text"
+                    }
+                    for page in probe.pages
+                ],
+            }
+            helper_identity = helper_status.get("_helper_manifest_identity")
+            identity_payload = {
+                "route_version": "2",
+                "route": "codex_pdf_input_file",
+                "custody_file": str(custody_path.resolve()),
+                "custody_sha256": document_hash,
+                "custody_byte_count": len(document),
+                "file_policy": {
+                    "media_type": "application/pdf",
+                    "maximum_bytes_exclusive": 50_000_000,
+                    "detail": "auto",
+                },
+                "model_profile": {
+                    "model": request.model,
+                    "reasoning_effort": request.reasoning_effort or "medium",
+                    "cli_version": str(helper_status.get("version") or ""),
+                },
+                "fallback_policy": request.extraction_policy.pdf_fallback,
+                "attachment_capability": codex_source_bundle_attachment_identity(
+                    str(helper_status.get("version") or "0.145.0"),
+                    helper_identity
+                    if isinstance(helper_identity, Mapping)
+                    else None,
+                ),
+                "probe_evidence": probe_evidence,
+            }
+            candidate["document_route"] = {
+                "identity_payload": identity_payload,
+                "identity": stable_hash(identity_payload),
+                "recovery": {"state": "not_selected"},
+            }
+            candidate["text"] = ""
+            return candidate, extracted
 
     if (
         codex_auto

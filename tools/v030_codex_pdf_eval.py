@@ -1994,7 +1994,11 @@ def _route_errors(
                 errors.append(f"{case_id}:pdf_input_route_missing")
                 identity = {}
             if (
-                identity.get("route_version") != "1"
+                identity.get("route_version") not in ("1", "2")
+                or (
+                    identity.get("route_version") == "2"
+                    and "projected_preflight" in identity
+                )
                 or Path(str(identity.get("custody_file") or "")).resolve()
                 != source_file
                 or identity.get("custody_sha256") != str(row["sha256"])
@@ -2030,7 +2034,7 @@ def _route_errors(
                 or probe.get("custody_byte_count") != source_file_size
             ):
                 errors.append(f"{case_id}:probe_custody_evidence_mismatch")
-            if not _preflight_valid(
+            if identity.get("route_version") == "1" and not _preflight_valid(
                 identity.get("projected_preflight"),
                 expected_image_tokens=(
                     _image_token_estimate(probe_dimensions) if probe_valid else None

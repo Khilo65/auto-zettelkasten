@@ -44,6 +44,7 @@ def test_provider_routes_use_same_current_source_contract(monkeypatch, provider)
     monkeypatch.setattr(reader, "_generate_with_reasoning", generate)
     result = reader.read_source_bundle("Original source text.", {"_source_context": {"source_id": "s1"}})
     assert len(calls) == 1
+    assert "(Author, Date, p. N)" in calls[0][0]
     assert calls[0][2]["output_contract"] == "source_bundle"
     assert "evidence_anchors" not in calls[0][0] + calls[0][1]
     assert "FINAL QUANTITATIVE COPY GATE" not in calls[0][1]

@@ -22,7 +22,6 @@ from auto_zettelkasten.models import (
     MapRequest,
 )
 from auto_zettelkasten.pipeline import (
-    _codex_pdf_input_file_preflight,
     _custodied_pdf_candidate,
     _load_pdf_local_recovery_cache,
     _read_document,
@@ -204,26 +203,6 @@ def _raw_route(custody: Path) -> dict:
         "identity": stable_hash(payload),
         "recovery": {"state": "not_selected"},
     }
-
-
-def test_raw_pdf_preflight_counts_each_input_component_once(monkeypatch) -> None:
-    from auto_zettelkasten import pipeline
-
-    def fake_preflight(text, _metadata, _question, dimensions):
-        return {
-            "document_input_tokens": 100 + len(text),
-            "image_tokens": 50 if dimensions else 0,
-        }
-
-    monkeypatch.setattr(pipeline, "codex_source_bundle_image_preflight", fake_preflight)
-    result = _codex_pdf_input_file_preflight("x" * 20, {}, None, [(612, 792)])
-
-    assert result["prompt_text_tokens"] == 100
-    assert result["pdf_extracted_text_tokens"] == 20
-    assert result["image_tokens"] == 50
-    assert result["document_input_tokens"] == 170
-    assert result["uncertainty_tokens"] == 16_384
-    assert result["combined_tokens"] == 82_090
 
 
 def test_raw_pdf_checkpoint_uses_0152_identity_and_replays_without_reader(
@@ -652,5 +631,4 @@ def test_raw_route_does_not_embed_probe_text_in_provider_prompt(
     )
     assert extracted.text == "Sparse embedded text"
     assert candidate is not None and candidate["text"] == ""
-    estimate = candidate["document_route"]["identity_payload"]["projected_preflight"]
-    assert estimate["pdf_extracted_text_tokens"] > 0
+    assert "projected_preflight" not in candidate["document_route"]["identity_payload"]
