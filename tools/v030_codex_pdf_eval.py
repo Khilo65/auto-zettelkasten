@@ -1288,6 +1288,7 @@ def _validated_manifest(
                 "media_type": media_type,
                 "expected_terminal_status": terminal_status,
                 "expected_route": route,
+                "expected_pdf_fallback": pdf_fallback,
                 "expected_selected_pages": pages,
                 "expectations": expectations,
                 "parent": parent,
@@ -2010,7 +2011,7 @@ def _route_errors(
                     "reasoning_effort": REASONING_EFFORT,
                     "cli_version": DIRECT_PDF_CLI_VERSION,
                 }
-                or identity.get("fallback_policy") != "none"
+                or identity.get("fallback_policy") != row.get("expected_pdf_fallback", "none")
                 or not _direct_pdf_attachment_capability_valid(
                     identity.get("attachment_capability")
                 )
@@ -2823,7 +2824,7 @@ def _acceptance(
     relationship_errors, requires_relationship_adjudication = _relationship_errors(
         workspace,
         source_ids,
-        require_accepted=settings.kind == "raw_e2e",
+        require_accepted=settings.kind == "raw_e2e" and settings.relationship_attempt_limit > 0,
     )
     errors.extend(relationship_errors)
 

@@ -2324,3 +2324,40 @@ def test_cluster_acceptance_rejects_retained_and_dropped_member_overlap(
     )
 
     assert "cluster_synthesis_membership_contradiction" in errors
+
+
+@pytest.mark.parametrize("fallback", ["ocr", "images"])
+def test_native_route_binds_declared_fallback_without_requiring_it_was_used(tmp_path, fallback):
+    path = _manifest(tmp_path / "private")
+    manifest, cases, workspace = runner._validated_manifest(path, sha256_file(path))
+    report = _write_accepted_run(workspace, runner._request(manifest, workspace), runner.ManifestZoteroClient(cases), manifest["run_id"])
+    manifest["pdf_fallback"] = fallback
+    path.write_text(json.dumps(manifest))
+    _, declared_cases, _ = runner._validated_manifest(path, sha256_file(path))
+    for case in declared_cases:
+        if case["expected_route"] != runner.PDF_INPUT_ROUTE:
+            continue
+        route_path = workspace / "11_state/runs" / manifest["run_id"] / "items" / case["parent"]["key"] / "document_route.yml"
+        route = read_yaml(route_path)
+        route["identity_payload"]["fallback_policy"] = fallback
+        route["identity"] = runner.stable_hash(route["identity_payload"])
+        write_yaml(route_path, route)
+    errors, _ = runner._acceptance(workspace, manifest["run_id"], declared_cases, report)
+    assert errors == []
+    old_errors, _ = runner._acceptance(workspace, manifest["run_id"], cases, report)
+    assert "case-2:route_identity_mismatch" in old_errors
+    assert "case-4:route_identity_mismatch" in old_errors
+
+
+@pytest.mark.parametrize("graph_allowance", [0, 8])
+def test_source_only_gate_does_not_require_an_accepted_relationship(tmp_path, graph_allowance):
+    path = _manifest(tmp_path / "private")
+    manifest, cases, workspace = runner._validated_manifest(path, sha256_file(path))
+    report = _write_accepted_run(workspace, runner._request(manifest, workspace), runner.ManifestZoteroClient(cases), manifest["run_id"])
+    indexes = workspace / "02_source_memory/indexes"
+    empty = {"relations": [], "pair_decisions": [], "current_pair_decisions": []}
+    for name in ["typed_links.yml", "typed_note_links.yml"]:
+        write_yaml(indexes / name, empty)
+    settings = runner.GateSettings(kind="raw_e2e", relationship_attempt_limit=graph_allowance, total_attempt_limit=6 + graph_allowance)
+    errors, _ = runner._acceptance(workspace, manifest["run_id"], cases, report, settings)
+    assert ("accepted_relationship_missing" in errors) == bool(graph_allowance)
