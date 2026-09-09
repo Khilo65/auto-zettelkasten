@@ -440,9 +440,11 @@ def test_relationship_first_writer_receives_admitted_roles() -> None:
         },
     )
 
-    assert received_roles == {"A": "context", "B": "core", "C": "core"}
+    # Accepted contextual links no longer force a core member into a context role.
+    assert received_roles == {"A": "core", "B": "core", "C": "core"}
     assert receipt_roles == received_roles
     assert report["cluster_registry"]["pending_revisions"] == []
+    assert next(iter(report["cluster_syntheses"].values()))["member_roles"]["A"] == "context"
 
 
 def test_cluster_prompt_requires_connected_member_roles_v36() -> None:

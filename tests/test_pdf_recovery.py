@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 import auto_zettelkasten.extraction as extraction
 
 
@@ -380,3 +382,49 @@ def _pdf(pages: list[str]) -> bytes:
         f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
     )
     return bytes(content)
+
+
+@pytest.mark.parametrize("numeral", ["~OO,OOO", "5OO,OOO", "500,OOO"])
+def test_damaged_numeral_uses_ocr_without_inferring_a_replacement(monkeypatch, numeral):
+    original = (
+        _prose("damaged", 90)
+        + f" Reported total {numeral}, of which 50,000 were executions."
+    )
+    recovered = original.replace(numeral, "500,000")
+    calls = []
+
+    def recover(_data, page_index, _languages):
+        calls.append(page_index)
+        return extraction._OCRPageResult(
+            text=recovered, route="pdfium_tesseract", available=True
+        )
+
+    monkeypatch.setattr(extraction, "_ocr_pdf_page", recover)
+    first, last = _prose("first", 90), _prose("last", 90)
+    result = extraction.extract_bytes(
+        _pdf([first, original, last]), media_type="application/pdf"
+    )
+    assert calls == [1]
+    assert first in result.text and last in result.text
+    assert recovered in result.text and numeral not in result.text
+    assert result.coverage_metrics["unresolved_pages"] == ()
+    assert result.coverage_metrics["ocr_page_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    [
+        "~100,000",
+        "500,000",
+        "0,50",
+        "12,345",
+        "O, OOO and OO,OOO",
+        "COO,OOO and WHO,500",
+        "1%2%3%4% Chart labels",
+        "الوساطة والأدلة ١٢٣٬٤٥٦",
+    ],
+)
+def test_valid_text_with_numbers_or_acronyms_does_not_trigger_ocr(fragment):
+    text = _prose("ordinary", 90) + " " + fragment
+    assert extraction._page_text_is_suspicious(text) is False
+    assert extraction._short_ocr_text_is_readable(text) is True

@@ -5490,7 +5490,7 @@ def test_ordinary_refreshes_prior_full_note_decisions(tmp_path: Path, prior_cont
     result = _run(tmp_path, profiles, calls, reasoner=_OrdinaryReasoner())
     assert len(calls.seen) == 1
     assert result["accepted"][0]["output_contract"] == "relationship-decision-v11"
-    assert result["accepted"][0]["prompt_version"] == "21"
+    assert result["accepted"][0]["prompt_version"] == pipeline_module.RELATIONSHIP_DISCOVERY_PROMPT_VERSION
 
 
 def test_ordinary_acceptance_does_not_require_an_unused_second_call_budget(tmp_path: Path) -> None:
@@ -5642,6 +5642,58 @@ def test_ordinary_family_normalization_preserves_hard_scopes(tmp_path: Path, sco
                       "lean_index_hash": "lean", "literature_families": families, "discovery_jobs": [job]})
     assert observed
     assert [(row["source_id"], row["target_source_id"]) for row in result["accepted"]] == [("A", "C")]
+
+
+@pytest.mark.parametrize("provider", ["codex", "deepseek"])
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("already_covered", [False, True])
+def test_cross_family_job_does_not_hide_internal_pairs(
+    tmp_path: Path, provider: str, reverse: bool, already_covered: bool,
+) -> None:
+    profiles = [_profile(source_id) for source_id in "ABCD"]
+    sides = [list("AC"), list("BD")] if already_covered else [list("AB"), list("CD")]
+    if reverse:
+        sides.reverse()
+    plan = {
+        "lean_index_hash": "lean",
+        "literature_families": [
+            {"family_id": members, "source_ids": list(members)} for members in ["AB", "CD"]
+        ],
+        "discovery_jobs": [{"job_id": "cross", "family": "bridge",
+                            "left_source_ids": sides[0], "right_source_ids": sides[1],
+                            "candidate_quota": 4}],
+    }
+    observed = set()
+    def handler(stage, _profiles, context):
+        assert stage == "relationship_candidate_selection", "no extra judgment"
+        candidates = []
+        for job in context["bridge_jobs"]:
+            left, right = set(job["left_source_ids"]), set(job["right_source_ids"])
+            if job["bridge_job_id"] == "cross":
+                assert [sorted(left), sorted(right)] == sides
+                pairs = [("A", "B" if already_covered else "C", "relationship")]
+            else:
+                assert left == right
+                observed.add(tuple(sorted(left)))
+                pairs = [(*sorted(left), "relationship" if left == set("AB") else "no_relationship")]
+            candidates.extend({**_ordinary_candidate(a, b, decision), "bridge_job_id": job["bridge_job_id"]}
+                              for a, b, decision in pairs)
+        return {"candidates": candidates, "job_outcomes": [
+            {"bridge_job_id": job["bridge_job_id"], "status": "no_more_candidates"}
+            for job in context["bridge_jobs"]]}
+    calls = _Calls(handler)
+    reasoner = _OrdinaryReasoner()
+    reasoner.name = provider
+    result = _run(tmp_path, profiles, calls, reasoner=reasoner, shared_family_plan=plan)
+    assert observed == (set() if already_covered else {("A", "B"), ("C", "D")})
+    assert result["relationship_stage_complete"] is True, result["parked"]
+    assert {(row["source_id"], row["target_source_id"]) for row in result["accepted"]} == (
+        {("A", "B")} if already_covered else {("A", "B"), ("A", "C")})
+    assert len(result["no_relationship"]) == (0 if already_covered else 1)
+    _commit_relationship_selection_state(tmp_path, result, catalogue_revision=result["reconciled_catalogue_revision"])
+    replay = _run(tmp_path, profiles, _Calls(lambda *_: pytest.fail("resolved decision regenerated")),
+                  reasoner=reasoner, shared_family_plan=plan)
+    assert replay["semantic_noop"] is True
 
 
 def test_ordinary_family_completion_keeps_full_page_bound(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

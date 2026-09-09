@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from enum import Enum
 from html.parser import HTMLParser
@@ -260,6 +260,14 @@ class PDFPageImage:
         }
 
 
+@dataclass(slots=True)
+class _HTMLBody:
+    parts: list[str] = field(default_factory=list)
+    paragraphs: int = 0
+    headings: int = 0
+    primary: bool = False
+
+
 class _HTMLTextExtractor(HTMLParser):
     def __init__(self, *, preserve_tables: bool = False) -> None:
         super().__init__()
@@ -269,7 +277,10 @@ class _HTMLTextExtractor(HTMLParser):
         self.abstract_parts: list[str] = []
         self.meta: dict[str, str] = {}
         self.hidden_depth = 0
-        self.article_depth = 0
+        self._body_stack: list[tuple[str, _HTMLBody | None, _HTMLBody | None, bool]] = []
+        self._articles: list[_HTMLBody] = []
+        self._explicit_bodies: dict[int, _HTMLBody] = {}
+        self.has_specific_body = False
         self._abstract_containers: list[str] = []
         self.has_article_container = False
         self.paragraph_count = 0
@@ -311,17 +322,38 @@ class _HTMLTextExtractor(HTMLParser):
             str(key).casefold() == "selected" for key, _value in attrs
         ):
             self.selected_option_parts = []
-        if tag in {"article", "main"}:
-            self.article_depth += 1
-            self.has_article_container = True
+        article, body, excluded = self._body_stack[-1][1:] if self._body_stack else (None, None, False)
+        identity = " ".join(
+            value for key, value in attributes.items()
+            if key in {"id", "class", "name", "itemprop", "role", "data-test", "data-testid", "data-qa", "data-module"}
+        )
+        identity = re.sub(r"([a-z])([A-Z])", r"\1-\2", identity).casefold()
+        excluded = excluded or bool(self.hidden_depth) or tag in {"aside", "nav", "footer"} or bool(re.search(
+            r"(?:^|[^a-z])(?:sub-?comments?|comments?|related|recommendations?|recommended)(?:$|[^a-z])",
+            identity,
+        ))
+        if tag == "article" and not excluded:
+            article = _HTMLBody(primary=bool(article and article.primary))
+            self._articles.append(article)
+        if not excluded and re.search(r"(?:^|[^a-z])article[-_ ]?body(?:$|[^a-z])", identity):
+            # Sibling body fragments belong together only within the same article.
+            if body is None:
+                body = self._explicit_bodies.setdefault(id(article) if article else len(self._explicit_bodies), _HTMLBody())
+        if tag not in _HTML_VOID_ELEMENTS:
+            self._body_stack.append((tag, article, body, excluded))
+        candidate = None if excluded else body or article
+        if tag == "h1" and not excluded:
+            for _tag, ancestor, _body, _excluded in self._body_stack:
+                if ancestor:
+                    ancestor.primary = True
         if tag == "p":
             self.paragraph_count += 1
-            if self.article_depth:
-                self.article_paragraph_count += 1
+            if candidate:
+                candidate.paragraphs += 1
         if tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
             self.heading_count += 1
-            if self.article_depth:
-                self.article_heading_count += 1
+            if candidate:
+                candidate.headings += 1
             if self._heading_tag:
                 self.heading_spans = None
             if not self.hidden_depth and not self._heading_hidden_tags:
@@ -334,8 +366,8 @@ class _HTMLTextExtractor(HTMLParser):
             self._abstract_containers.append(tag)
         if tag in {"p", "br", "div", "section", "article", "main", "li", "h1", "h2", "h3", "h4", "h5", "h6"}:
             self.parts.append("\n")
-            if self.article_depth:
-                self.article_parts.append("\n")
+            if candidate:
+                candidate.parts.append("\n")
             if self._abstract_containers:
                 self.abstract_parts.append("\n")
 
@@ -369,8 +401,10 @@ class _HTMLTextExtractor(HTMLParser):
             self.hidden_depth -= 1
         if self._abstract_containers and tag == self._abstract_containers[-1]:
             self._abstract_containers.pop()
-        if tag in {"article", "main"} and self.article_depth:
-            self.article_depth -= 1
+        for index in range(len(self._body_stack) - 1, -1, -1):
+            if self._body_stack[index][0] == tag:
+                del self._body_stack[index:]
+                break
 
     def handle_data(self, data: str) -> None:
         if not self.hidden_depth:
@@ -379,8 +413,7 @@ class _HTMLTextExtractor(HTMLParser):
                 self._heading_parts.append(data)
             if self.selected_option_parts is not None:
                 self.selected_option_parts.append(data)
-            if self.article_depth:
-                self.article_parts.append(data)
+            self._append_body_text(data)
             if self._abstract_containers:
                 self.abstract_parts.append(data)
 
@@ -389,6 +422,23 @@ class _HTMLTextExtractor(HTMLParser):
         if self._heading_tag or self._heading_hidden_tags:
             self.heading_spans = None
         self._finish_selected_option()
+        # ponytail: h1 identifies an unlabelled primary article; add structural
+        # signals if a publisher omits both h1 and an explicit body identity.
+        primary_articles = [article for article in self._articles if article.primary]
+        candidates = list(self._explicit_bodies.values()) or primary_articles or self._articles
+        self.has_specific_body = bool(self._explicit_bodies or primary_articles)
+        self.has_article_container = bool(candidates)
+        if candidates:
+            candidate = max(candidates, key=lambda body: len(" ".join(body.parts)))
+            self.article_parts = candidate.parts
+            self.article_paragraph_count = candidate.paragraphs
+            self.article_heading_count = candidate.headings
+
+    def _append_body_text(self, text: str) -> None:
+        if self._body_stack:
+            _tag, article, body, excluded = self._body_stack[-1]
+            if not excluded and (candidate := body or article):
+                candidate.parts.append(text)
 
     def _finish_selected_option(self) -> None:
         if self.selected_option_parts is None:
@@ -397,8 +447,7 @@ class _HTMLTextExtractor(HTMLParser):
         if label:
             marker = f"\nSelected option: {label}\n"
             self.parts.append(marker)
-            if self.article_depth:
-                self.article_parts.append(marker)
+            self._append_body_text(marker)
             if self._abstract_containers:
                 self.abstract_parts.append(marker)
         self.selected_option_parts = None
@@ -624,7 +673,8 @@ def classify_html_content(
         and parser.article_paragraph_count >= 2
     )
     strong_visible_body = (
-        metrics["word_count"] >= 500
+        not parser.has_specific_body
+        and metrics["word_count"] >= 500
         and max(structured_block_count, visible_block_count) >= 4
     )
     full_article_evidence = strong_article_body or strong_visible_body
@@ -690,6 +740,7 @@ def classify_html_content(
             "visible_block_count": visible_block_count,
             "article_section_count": section_count,
             "has_article_container": parser.has_article_container,
+            "has_specific_body": parser.has_specific_body,
             "strong_article_body": strong_article_body,
             "strong_visible_body": strong_visible_body,
             "explicit_abstract": explicit_abstract,
@@ -1237,7 +1288,9 @@ def extract_pdf_from_probe(
                 final_pages[index] = recovered.text
                 page_routes[index] = recovered.route or "ocr"
                 ocr_pages.append(index + 1)
-            elif not recovered.nonprose_or_blank:
+            elif not recovered.nonprose_or_blank or _pdf_text_has_damaged_numeral(
+                embedded_pages[index]
+            ):
                 unresolved_pages.append(index + 1)
                 page_routes[index] = "unresolved"
             else:
@@ -1247,12 +1300,19 @@ def extract_pdf_from_probe(
                 page_routes[index] = "nonprose_or_blank"
     elif suspicious_pages:
         for index in sorted(suspicious_pages):
-            if _pdf_page_is_nonprose(data, index):
+            if not _pdf_text_has_damaged_numeral(
+                embedded_pages[index]
+            ) and _pdf_page_is_nonprose(data, index):
                 page_routes[index] = "nonprose_or_blank"
             else:
                 page_routes[index] = "unresolved"
                 unresolved_pages.append(index + 1)
 
+    for page_number in unresolved_pages:
+        if _pdf_text_has_damaged_numeral(embedded_pages[page_number - 1]):
+            # Keep the page marker and coverage failure, but do not invite the
+            # source reader to reconstruct a value from known damaged text.
+            final_pages[page_number - 1] = ""
     text = _page_marked_text(final_pages)
     final_analysis = _document_text_analysis(final_pages)
     extraction_route = (
@@ -1699,7 +1759,21 @@ def _page_marked_text(pages: list[str]) -> str:
     )
 
 
+def _pdf_text_has_damaged_numeral(text: str) -> bool:
+    # ponytail: only unmistakable O/comma numeral damage; other glyph errors
+    # need separate evidence before extending local OCR selection.
+    return any(
+        "O" in token
+        and (token.startswith("~") or any(char.isdigit() for char in token))
+        for token in re.findall(
+            r"(?<![\w,])~?[0-9O]{1,3}(?:,[0-9O]{3})+(?!\w|,[0-9O])", text
+        )
+    )
+
+
 def _page_text_is_suspicious(text: str, *, repeated_units: set[str] | None = None) -> bool:
+    if _pdf_text_has_damaged_numeral(text):
+        return True
     alphanumeric_count = sum(character.isalnum() for character in text)
     words = _alphabetic_words(text)
     if alphanumeric_count < 40 or len(words) < 6:
@@ -1718,7 +1792,7 @@ def _short_ocr_text_is_readable(text: str) -> bool:
     """Accept a legible short title or divider after OCR without weakening routing."""
 
     normalized = re.sub(r"\s+", " ", str(text or "")).strip()
-    if not normalized or any(
+    if not normalized or _pdf_text_has_damaged_numeral(normalized) or any(
         term in normalized.casefold() for term in _BOILERPLATE_TERMS
     ):
         return False

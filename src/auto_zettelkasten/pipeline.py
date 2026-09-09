@@ -24,6 +24,7 @@ from .extraction import (
     ContentAdequacyClass,
     ExtractionCancelled,
     ExtractionResult,
+    _pdf_text_has_damaged_numeral,
     classify_content_adequacy,
     classify_metadata_only,
     extract_bytes,
@@ -205,12 +206,12 @@ from .zotero import (
 )
 
 CHUNKING_VERSION = "3"
-CONTENT_CLASSIFIER_VERSION = "4"
+CONTENT_CLASSIFIER_VERSION = "5"
 _RELATIONSHIP_BATCH_MAX_JOBS = 8
 _LEGACY_RELATIONSHIP_BATCH_MAX_JOBS = 8
 _RELATIONSHIP_DISCOVERY_PAGE_SIZE = 64
 _RELATIONSHIP_SELECTION_STATE_SCHEMA_VERSION = "4"
-_RELATIONSHIP_DISCOVERY_POLICY_VERSION = "ordinary-family-scope-v303"
+_RELATIONSHIP_DISCOVERY_POLICY_VERSION = "ordinary-family-scope-v304"
 _RELATIONSHIP_SEMANTIC_POLICY_VERSION = "source-owned-bases-v26"
 _SOURCE_BUNDLE_QUOTE_LOCATOR = re.compile(
     r'^["\u201c](?P<quote>[^"\u201d]+)["\u201d]'
@@ -8503,13 +8504,16 @@ def _run_relationship_reasoning(
             )
 
         discovery_scopes: list[set[str]] = []
+        discovery_pair_scopes: list[tuple[set[str], set[str]]] = []
         for job in discovery_jobs:
             left = set(job.get("left_source_ids", []) or []) & analytical_source_ids & set(lean_by_source)
             right = set(job.get("right_source_ids", []) or []) & analytical_source_ids & set(lean_by_source)
             if ordinary_family_scope(job, left | right):
                 discovery_scopes.append(left | right)
+                discovery_pair_scopes.append((left | right, left | right))
             elif left - right and right - left:
                 discovery_scopes.append(left ^ right)
+                discovery_pair_scopes.append((left - right, right - left))
         # A family assignment must remain discoverable even when the planner
         # omits members from its jobs or uses an unresolvable family label.
         for family_id, family in sorted(family_rows.items()):
@@ -8517,9 +8521,21 @@ def _run_relationship_reasoning(
                 set(family.get("source_ids", []) or [])
                 & set(lean_by_source) & analytical_source_ids
             )
-            if len(coverage_source_ids) < 2 or any(
-                set(coverage_source_ids) <= scope for scope in discovery_scopes
-            ):
+            # Endpoint presence does not cover pairs on the same side of a
+            # cross-family job. Reuse resolved pairs and actual legal scopes.
+            covered = all(
+                pair in resolved_pairs or any(
+                    (pair[0] in left and pair[1] in right)
+                    or (pair[1] in left and pair[0] in right)
+                    for left, right in discovery_pair_scopes
+                )
+                for pair in combinations(coverage_source_ids, 2)
+            ) if ordinary_decisions else (
+                len(coverage_source_ids) < 2 or any(
+                    set(coverage_source_ids) <= scope for scope in discovery_scopes
+                )
+            )
+            if covered:
                 continue
             job_id = "family-coverage-" + stable_hash(family)[:16]
             while any(job.get("job_id") == job_id for job in discovery_jobs):
@@ -8533,6 +8549,7 @@ def _run_relationship_reasoning(
                 "candidate_quota": 24,
             })
             discovery_scopes.append(set(coverage_source_ids))
+            discovery_pair_scopes.append((set(coverage_source_ids), set(coverage_source_ids)))
         eligible_ids = analytical_source_ids & set(lean_by_source)
         canonical_families = {
             alias: next(iter(ids))
@@ -20000,7 +20017,7 @@ def _write_pdf_local_recovery_cache(
     write_yaml(
         manifest_path,
         {
-            "cache_version": "1",
+            "cache_version": "2",
             "custody_sha256": custody_hash,
             "extraction_version": request.extraction_version,
             "ocr_languages": list(request.extraction_policy.languages),
@@ -20043,7 +20060,7 @@ def _load_pdf_local_recovery_cache(
     if not isinstance(manifest, Mapping):
         raise ProviderIsolationFailure("PDF recovery cache manifest is invalid")
     expected_binding = {
-        "cache_version": "1",
+        "cache_version": "2",
         "custody_sha256": custody_hash,
         "extraction_version": request.extraction_version,
         "ocr_languages": list(request.extraction_policy.languages),
@@ -20437,13 +20454,15 @@ def _acquire_content(
             )
             if effective_media_type == "application/pdf":
                 marked_text = _indexed_pdf_text_with_page_markers(text, fulltext)
-                if marked_text is None:
+                if marked_text is None or _pdf_text_has_damaged_numeral(marked_text):
                     base["attempts"].append(
                         _attempt(
                             base,
                             "zotero_fulltext",
                             "failed",
-                            f"{target_key}:indexed_pdf_missing_page_boundaries",
+                            f"{target_key}:indexed_pdf_missing_page_boundaries"
+                            if marked_text is None
+                            else f"{target_key}:indexed_pdf_damaged_numeral",
                             input_hash=sha256_text(text),
                         )
                     )
@@ -21004,7 +21023,14 @@ def _custodied_pdf_candidate(
                 ),
                 cached_recovery,
             )
-    if not codex_auto:
+    prefer_local_recovery = (
+        codex_auto
+        and request.extraction_policy.pdf_fallback == "ocr"
+        and any(
+            _pdf_text_has_damaged_numeral(page.embedded_text) for page in probe.pages
+        )
+    )
+    if not codex_auto or prefer_local_recovery:
         extracted = extract_pdf_from_probe(
             document,
             probe,

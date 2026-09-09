@@ -2758,7 +2758,7 @@ def test_named_dataset_fallback_does_not_duplicate_exact_dataset_signal() -> Non
 
 
 def test_named_dataset_lineage_versions_are_explicit() -> None:
-    assert literature.LITERATURE_ALGORITHM_VERSION == "40"
+    assert literature.LITERATURE_ALGORITHM_VERSION == "41"
     assert literature.STUDY_LINEAGE_VERSION == "3"
     assert literature.INDEPENDENCE_ALGORITHM_VERSION == "3"
 

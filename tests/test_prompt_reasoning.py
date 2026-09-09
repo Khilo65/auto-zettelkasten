@@ -10,6 +10,7 @@ from auto_zettelkasten.models import LiteratureMapRequest
 from auto_zettelkasten.pipeline import _indexed_pdf_text_with_page_markers, _split_document
 from auto_zettelkasten.readers import (
     SECTION_KEYS,
+    CodexReader,
     DeepSeekReader,
     OpenRouterReader,
     ProviderError,
@@ -23,6 +24,7 @@ from auto_zettelkasten.readers import (
     _system_prompt,
     codex_contract_identity,
 )
+from auto_zettelkasten.relationships import RELATIONSHIP_DISCOVERY_PROMPT_VERSION
 
 
 def _analysis() -> dict[str, str]:
@@ -360,6 +362,34 @@ def test_gap_prompt_rejects_invented_resolution_details() -> None:
 
     assert "gap prompt v12" in prompt
     assert "Do not invent named cases, datasets, instruments" in prompt
+
+
+@pytest.mark.parametrize("provider", ["codex", "deepseek"])
+def test_ordinary_relationship_request_defines_sequence_direction(
+    monkeypatch: pytest.MonkeyPatch, provider: str,
+) -> None:
+    reader = (
+        CodexReader(model="gpt-5.6-terra", allow_cloud=True)
+        if provider == "codex" else DeepSeekReader(allow_cloud=True)
+    )
+    prompts: list[str] = []
+
+    def literature_json_call(system_prompt, user_prompt, **kwargs):
+        prompts.append(system_prompt)
+        assert kwargs["contract_id"] == "relationship_candidate_selection"
+        return {"candidates": [], "job_outcomes": []}
+
+    monkeypatch.setattr(reader, "_literature_json_call", literature_json_call)
+    reader.select_relationship_candidates(
+        [], LiteratureMapRequest(
+            workspace=".", provider=provider, model=reader.model, allow_cloud=True,
+        ),
+    )
+
+    assert len(prompts) == 1
+    assert f"ordinary relationship prompt v{RELATIONSHIP_DISCOVERY_PROMPT_VERSION}" in prompts[0]
+    assert "sequential_relationship means the actor precedes the reference" in prompts[0]
+    assert "Citation or chronology alone establishes neither support nor direction" in prompts[0]
 
 
 def test_legacy_relationship_request_supplies_connection_fields(

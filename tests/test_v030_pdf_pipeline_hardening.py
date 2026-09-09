@@ -558,6 +558,18 @@ def test_recovered_ocr_is_consumed_only_by_matching_new_run(
     )
     assert calls == 1
 
+    cache_manifest = (
+        workspace / "11_state" / "pdf_local_recovery"
+        / hashlib.sha256(document).hexdigest() / "manifest.yml"
+    )
+    manifest = read_yaml(cache_manifest)
+    assert manifest["cache_version"] == "2"
+    manifest["cache_version"] = "1"
+    write_yaml(cache_manifest, manifest)
+    assert _load_pdf_local_recovery_cache(
+        custody, hashlib.sha256(document).hexdigest(), _request(workspace)
+    ) is None
+
 
 def test_legacy_default_pdf_fallback_receipt_matches_without_writes(
     tmp_path: Path,

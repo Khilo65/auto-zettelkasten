@@ -83,7 +83,7 @@ GAP_RULES = (
     "cross_cluster_integration",
     "author_stated_gap",
 )
-LITERATURE_ALGORITHM_VERSION = "40"
+LITERATURE_ALGORITHM_VERSION = "41"
 LITERATURE_FAMILY_PLAN_PROMPT_VERSION = "14"
 CLUSTER_PLAN_PROMPT_VERSION = "7"
 CLUSTER_PROPOSAL_PROMPT_VERSION = "17"
@@ -7341,11 +7341,12 @@ def _family_relation_connected_components(
         return []
     adjacency: dict[str, set[str]] = {source_id: set() for source_id in core_source_ids}
     for relation in relations:
+        comparability = _as_mapping(relation.get("comparability"))
+        # Current note relationships can connect a family without claiming
+        # causal support; historical family admission keeps its stricter gate.
         if (
-            _as_mapping(relation.get("comparability")).get(
-                "accepted_relation_type"
-            )
-            == "contextual_connection"
+            comparability.get("accepted_relation_type") == "contextual_connection"
+            and comparability.get("connectivity_basis") != "accepted_note_relationship"
         ):
             continue
         members = sorted(
@@ -18997,6 +18998,7 @@ def _global_plan_proposals(
                         "comparability": {
                             "passed": True,
                             "accepted_relationship_id": relationship_id,
+                            "connectivity_basis": "accepted_note_relationship",
                             "accepted_relation_type": str(
                                 relationship.get("relation_type") or ""
                             ),

@@ -78,7 +78,10 @@ def test_partial_substantive_profile_contributes_compact_note_context() -> None:
 
 
 @pytest.mark.parametrize("partial", [False, True])
-def test_note_based_planning_and_admission_need_no_anchor_inventory(partial: bool) -> None:
+@pytest.mark.parametrize("relation_type", ["complements", "contextual_connection"])
+def test_note_based_planning_and_admission_need_no_anchor_inventory(
+    partial: bool, relation_type: str,
+) -> None:
     raw_profiles = [_profile(source_id, partial=partial and source_id == "c") for source_id in ("a", "b", "c")]
     for profile in raw_profiles:
         profile["evidence_anchors"] = []
@@ -97,7 +100,7 @@ def test_note_based_planning_and_admission_need_no_anchor_inventory(partial: boo
     assert all("evidence_anchor_ids" not in member for member in family_cards[0]["members"])
     accepted = [{
         "relation_id": "a-b", "source_ids": ["a", "b"],
-        "relation_type": "complements", "reason": "Their distinct contributions illuminate the same mechanism.",
+        "relation_type": relation_type, "reason": "Their distinct contributions illuminate the same mechanism.",
         "cluster_evidence_eligible": True,
     }]
     proposals, _, _, _ = _global_plan_proposals(plan, profiles, accepted_relationships=accepted)
@@ -161,9 +164,13 @@ def test_global_plan_uses_note_membership_and_rejects_unknown_neighbors() -> Non
     assert proposals[0]["supporting_evidence"] == []
 
 
-def test_relationship_first_global_plan_requires_verified_pair_connectivity() -> None:
+@pytest.mark.parametrize("relation_type", ["complements", "contextual_connection"])
+def test_relationship_first_global_plan_requires_verified_pair_connectivity(
+    relation_type: str,
+) -> None:
     profiles = normalize_evidence_profiles(
-        [_profile(source_id) for source_id in ("a", "b", "c", "x", "y")]
+        [{**_profile(source_id), "evidence_anchors": []}
+         for source_id in ("a", "b", "c", "x", "y")]
     )
     response = {
         "clusters": [
@@ -201,7 +208,7 @@ def test_relationship_first_global_plan_requires_verified_pair_connectivity() ->
         {
             "relation_id": relation_id,
             "source_ids": [left, right],
-            "relation_type": "complements",
+            "relation_type": relation_type,
             "reason": "The pair supports a bounded comparison.",
             "cluster_evidence_eligible": True,
             "evidence": [
@@ -244,6 +251,11 @@ def test_relationship_first_global_plan_requires_verified_pair_connectivity() ->
         for row in mapped["clusters"][0]["family_relations"]
     )
     assert all(row["evidence"] == [] for row in mapped["clusters"][0]["family_relations"])
+    assert all(
+        row["comparability"]["accepted_relation_type"] == relation_type
+        for row in mapped["clusters"][0]["family_relations"]
+    )
+    assert mapped["clusters"][0]["propositions"] == []
     assert any(
         row["proposal_id"] == "unsupported"
         and row["reason"] == "no_valid_connected_family_relation"
@@ -251,7 +263,7 @@ def test_relationship_first_global_plan_requires_verified_pair_connectivity() ->
     )
 
 
-def test_relationship_first_contextual_edge_does_not_create_core_only_cluster() -> None:
+def test_historical_contextual_edge_does_not_create_core_only_cluster() -> None:
     profiles = normalize_evidence_profiles([_profile("a"), _profile("b")])
     response = {
         "clusters": [
@@ -293,6 +305,8 @@ def test_relationship_first_contextual_edge_does_not_create_core_only_cluster() 
         profiles,
         accepted_relationships=accepted,
     )
+    # Historical adapted proposals carry no validated note-connectivity basis.
+    proposals[0]["family_relations"][0]["comparability"].pop("connectivity_basis")
     mapped = map_overlapping_clusters(profiles, proposals=proposals)
 
     assert mapped["clusters"] == []
@@ -353,6 +367,7 @@ def test_relationship_first_contextual_edge_retains_non_core_neighbor() -> None:
         profiles,
         accepted_relationships=accepted,
     )
+    proposals[0]["source_roles"]["c"] = "context"
     mapped = map_overlapping_clusters(profiles, proposals=proposals)
 
     assert mapped["clusters"][0]["core_source_ids"] == ["a", "b"]
@@ -846,6 +861,45 @@ class _WarningBearingGlobalReasoner(_GlobalOnlyReasoner):
                     for row in profiles],
             }],
         }
+
+
+def test_contextual_note_family_survives_current_writer_validation() -> None:
+    profiles = [{**_profile(source_id), "evidence_anchors": []} for source_id in "abc"]
+    reasoner = _WarningBearingGlobalReasoner()
+    report = build_literature_report(
+        profiles,
+        reasoner=reasoner,
+        request={"source_set_id": "set", "literature_policy": {}},
+        source_notes=[{
+            "source_id": row["source_id"], "title": row["title"],
+            "body": row["thesis"], "source_scope": "full_document",
+        } for row in profiles],
+        shared_literature_plan={"literature_families": [{
+            "family_id": "contextual-family", "label": "Institutional pressure",
+            "organizing_problem": "How do institutions respond to external pressure?",
+            "source_ids": list("abc"), "candidate_cluster": True,
+            "proposed_roles": {source_id: "core" for source_id in "abc"},
+        }]},
+        accepted_relationships=[{
+            "relation_id": f"{left}-{right}", "source_id": left,
+            "target_source_id": right, "relation_type": "contextual_connection",
+            "reason": "The notes describe distinct responses to external pressure.",
+            "output_contract": "relationship-decision-v11",
+            "verification_status": "final", "active": True,
+            "cluster_evidence_eligible": True,
+        } for left, right in (("a", "b"), ("b", "c"))],
+    )
+
+    assert reasoner.synthesis_calls == 1
+    cluster, = report["cluster_registry"]["clusters"]
+    synthesis = report["cluster_syntheses"][cluster["cluster_id"]]
+    assert _cluster_projection_is_publishable(synthesis)
+    assert synthesis["member_roles"] == {source_id: "core" for source_id in "abc"}
+    assert cluster["relation_ids"] == ["a-b", "b-c"]
+    assert cluster["propositions"] == []
+    assert not literature._family_relation_graph_connected(
+        {"a", "c"}, cluster["family_relations"],
+    )
 
 
 def test_global_plan_publishes_usable_synthesis_with_advisory_quality_warnings(

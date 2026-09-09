@@ -1239,3 +1239,115 @@ def test_quota_auth_and_isolation_never_select_local_recovery(
     else:
         result = _prepare_item(tmp_path, tmp_path / "run", 0, item, request, SimpleNamespace(), reader, None)
         assert result["terminal_status"] == "parked_for_review"
+
+
+@pytest.mark.parametrize("provider", ["codex", "deepseek"])
+@pytest.mark.parametrize(
+    "recovery", ["corrected", "unchanged", "unavailable", "off", "blank"]
+)
+def test_damaged_numeral_recovery_is_shared_and_never_silently_complete(
+    monkeypatch, tmp_path, provider, recovery
+):
+    from auto_zettelkasten import extraction
+    from test_pdf_recovery import _pdf, _prose
+
+    original = (
+        _prose("damaged", 90)
+        + " Reported total ~OO,OOO, of which 50,000 were executions."
+    )
+    clean_pages = [_prose(label, 90) for label in ("first", "middle", "later", "last")]
+    document = _pdf([clean_pages[0], original, *clean_pages[1:]])
+    custody = tmp_path / "source.pdf"
+    custody.write_bytes(document)
+    calls = []
+
+    def recover(_data, page_index, _languages):
+        assert recovery != "off"
+        calls.append(page_index)
+        return extraction._OCRPageResult(
+            text=(
+                original.replace("~OO,OOO", "500,000")
+                if recovery == "corrected"
+                else ""
+                if recovery == "blank"
+                else original
+            ),
+            nonprose_or_blank=recovery == "blank",
+            route="pdfium_tesseract",
+            available=recovery != "unavailable",
+        )
+
+    monkeypatch.setattr(extraction, "_ocr_pdf_page", recover)
+    monkeypatch.setattr(extraction, "_pdf_page_is_nonprose", lambda *_args: True)
+    request = replace(
+        _request(tmp_path, pdf_fallback="ocr"),
+        provider=provider,
+        model="gpt-5.6-luna" if provider == "codex" else "deepseek-v4-flash",
+        literature_model="gpt-5.6-terra" if provider == "codex" else None,
+        extraction_policy=ExtractionPolicy(
+            ocr="off" if recovery == "off" else "auto", pdf_fallback="ocr"
+        ),
+    )
+    reader = SimpleNamespace(
+        pdf_input_file_status=lambda: pytest.fail(
+            "damaged text must use selected local recovery"
+        )
+    )
+    candidate, result = _custodied_pdf_candidate(
+        document,
+        custody,
+        {},
+        {"key": "A1", "data": {"key": "A1", "itemType": "journalArticle"}},
+        {"source_id": "source-zotero-A1"},
+        request,
+        actual_primary_pdf=True,
+        cancelled=None,
+        reader=reader,
+    )
+    assert calls == ([] if recovery == "off" else [1])
+    assert all(page in result.text for page in clean_pages)
+    if recovery == "corrected":
+        assert candidate is not None and "document_route" not in candidate
+        assert "total 500,000" in result.text and "~OO,OOO" not in result.text
+        assert result.adequacy.is_full_publication
+    else:
+        assert candidate is not None and result.source_scope == "partial_document"
+        assert not result.adequacy.is_full_publication
+        assert original not in result.text and "~OO,OOO" not in result.text
+        assert "--- Page 2 ---" in result.text
+        assert result.coverage_metrics["unresolved_pages"] == (2,)
+        assert result.coverage_metrics["ocr_page_count"] == 0
+
+
+@pytest.mark.parametrize("fallback", ["none", "images"])
+def test_damaged_numeral_preserves_other_codex_fallback_policies(
+    monkeypatch, tmp_path, fallback
+):
+    from auto_zettelkasten import extraction
+    from test_pdf_recovery import _pdf, _prose
+
+    document = _pdf([_prose("damaged", 220) + " Reported total ~OO,OOO."])
+    custody = tmp_path / "source.pdf"
+    custody.write_bytes(document)
+    monkeypatch.setattr(
+        extraction,
+        "_ocr_pdf_page",
+        lambda *_args: pytest.fail("local OCR not selected"),
+    )
+    candidate, result = _custodied_pdf_candidate(
+        document,
+        custody,
+        {},
+        {"key": "A1", "data": {"key": "A1", "itemType": "journalArticle"}},
+        {"source_id": "source-zotero-A1"},
+        _request(tmp_path, pdf_fallback=fallback),
+        actual_primary_pdf=True,
+        cancelled=None,
+        reader=_pdf_capable_reader(),
+    )
+    assert result.route == "codex_pdf_input_file"
+    assert (
+        candidate
+        and candidate["document_route"]["identity_payload"]["route"]
+        == "codex_pdf_input_file"
+    )

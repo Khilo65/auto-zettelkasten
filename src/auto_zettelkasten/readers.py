@@ -5564,7 +5564,7 @@ def _relationship_bridge_shard_system_prompt() -> str:
 
 def _relationship_candidate_system_prompt() -> str:
     return (
-        "Auto-Zettelkasten ordinary relationship prompt v21, contract relationship-decision-v11. "
+        "Auto-Zettelkasten ordinary relationship prompt v22, contract relationship-decision-v11. "
         "Identify intellectually meaningful relationships across works, disciplines, and levels of abstraction. "
         "Reason from substantive contributions rather than shared vocabulary alone. Recognize connections "
         "that broaden understanding or bring different ideas into productive relation. Distinguish useful "
@@ -5582,7 +5582,7 @@ def _relationship_candidate_system_prompt() -> str:
         "methodological_fault_line, sequential_relationship, interpretive_or_normative_disagreement, or contextual_connection. "
         "Supports/undermines describe supporting/incompatible evidence or argument; qualifies establishes a condition; "
         "extends builds on the reference work; rival_explanation offers a competing explanation; "
-        "sequential_relationship gives an intellectual or process sequence. "
+        "sequential_relationship means the actor precedes the reference in an intellectual or process sequence. "
         "For these directional types, actor and reference must be the two exact endpoints in the supported direction. "
         "Other types are symmetric and may use null actor/reference. Citation or chronology alone establishes neither support nor direction. "
         "For an explicitly examined pair with no useful connection, use no_relationship with an honest reason "

@@ -189,6 +189,84 @@ def test_clean_full_article_html_passes_full_document_gate() -> None:
     assert adequacy.metrics["paragraph_count"] == 4
 
 
+@pytest.mark.parametrize("body_tag", ['div data-test="articleBody"', 'article'])
+def test_short_article_body_cannot_borrow_comments_or_page_furniture(body_tag) -> None:
+    from auto_zettelkasten.pipeline import _content_candidate
+
+    abstract = "This description supplies only a bounded summary of the publication."
+    furniture = "Unrelated recommendations and reader comment evidence. " * 70
+    raw = (
+        f'<meta name="description" content="{abstract}"><main><article>'
+        '<h1>Restricted publication</h1>'
+        f'<{body_tag}><p>Only the opening is available.</p>'
+        '<div><div>Subscribe to read</div><br></div>'
+        f'<section id="related-articles"><article><h2>Recommendation</h2>'
+        f'<p>{furniture}</p></article></section></{body_tag.split()[0]}>'
+        f'<article data-test="comment"><h3>Reader author</h3><p>{furniture}</p>'
+        f'<article data-test="subComment"><p>{furniture}</p></article></article>'
+        f'</article><p>{furniture}</p><p>{furniture}</p></main>'
+    )
+    extracted = extract_bytes(raw.encode(), media_type="text/html")
+    indexed = classify_content_adequacy(
+        raw, media_type="text/html", raw_html=raw,
+        coverage_metadata={"indexedChars": len(raw), "totalChars": len(raw)},
+    )
+    for adequacy, text in ((extracted.adequacy, extracted.text), (indexed, raw)):
+        assert adequacy.source_scope == "abstract_only"
+        assert adequacy.coverage_gate == "limited"
+        assert not adequacy.metrics["strong_article_body"]
+        assert not adequacy.metrics["strong_visible_body"]
+        assert adequacy.metrics["article_paragraph_count"] == 1
+        candidate = _content_candidate(
+            adequacy, text=text, content_hash="test", source_file="source.html",
+            content_route="html_text", media_type="text/html",
+        )
+        assert candidate["text"] == abstract
+        assert candidate["rank"] == 40
+    # Coverage selection does not rewrite source-page text or heading evidence.
+    assert "Reader author" in extracted.text
+    assert {"label": "Reader author"} in extracted.coverage_metrics["heading_spans"]
+
+
+@pytest.mark.parametrize("inner_tag", ["div", "article"])
+def test_full_explicit_body_outside_article_survives_subscription_controls(inner_tag) -> None:
+    paragraph = "The source reports complete evidence and explains its limitations. " * 25
+    raw = (
+        f'<div class="publication__article-body-wrapper"><{inner_tag}>'
+        f'<p>{paragraph}</p><p>{paragraph}</p>'
+        f'<div class="paywall-fade">Register to continue</div></{inner_tag}></div>'
+        '<article data-test="comment"><p>A reader response.</p></article>'
+    )
+    adequacy = classify_html_content(raw)
+    assert adequacy.is_full_publication
+    assert adequacy.metrics["strong_article_body"]
+    assert adequacy.metrics["article_paragraph_count"] == 2
+    assert adequacy.paywall_markers == ("paywall",)
+
+
+def test_fragmented_explicit_body_in_one_article_keeps_its_paragraphs() -> None:
+    paragraph = "The source reports complete evidence and explains its limitations. " * 10
+    raw = '<article><h1>Full publication</h1>' + ''.join(
+        f'<div itemprop="articleBody"><p>{paragraph}</p></div>' for _ in range(4)
+    ) + '</article>'
+    adequacy = classify_html_content(raw)
+    assert adequacy.is_full_publication
+    assert adequacy.metrics["article_paragraph_count"] == 4
+
+
+@pytest.mark.parametrize("wrapper", ["section", "main"])
+def test_unscoped_visible_dashboard_is_not_bounded_by_incidental_article(wrapper) -> None:
+    paragraph = "This public dashboard reports comparable measures across countries. " * 25
+    raw = (
+        f'<{wrapper}><h1>Dashboard</h1>' + f'<p>{paragraph}</p>' * 4
+        + '<article><h2>News widget</h2><p>One short update.</p></article>'
+        + f'</{wrapper}><footer>Purchase FAQs</footer>'
+    )
+    adequacy = classify_html_content(raw)
+    assert adequacy.is_full_publication
+    assert adequacy.metrics["strong_visible_body"]
+
+
 def test_visible_html_preserves_selected_option_despite_footer_purchase() -> None:
     paragraph = (
         "This public profile reports comparative reputation measures, rankings, "

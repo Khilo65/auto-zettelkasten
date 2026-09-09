@@ -458,3 +458,110 @@ def test_acquisition_prefers_full_raw_html_with_selected_state(
     assert "Selected option: Israel" in content["text"]
     assert "Selected option: 2024" in content["text"]
     assert "Selected option: Global" in content["text"]
+
+
+@pytest.mark.parametrize("provider", ["codex", "deepseek"])
+@pytest.mark.parametrize("numeral", ["~OO,OOO", "500,000"])
+@pytest.mark.parametrize("fallback", ["unavailable", "raw", "abstract"])
+def test_indexed_pdf_damage_cannot_bypass_local_recovery(
+    monkeypatch, tmp_path, provider, numeral, fallback
+):
+    from auto_zettelkasten import extraction
+    from auto_zettelkasten.files import sha256_text
+    from test_pdf_recovery import _pdf, _prose
+
+    text = _prose("indexed", 220) + f" Reported total {numeral}."
+    clean_raw_text = _prose("raw", 220) + " Reported total 500,000."
+    document = _pdf([clean_raw_text])
+    parent = {
+        "key": "PARENTA1",
+        "data": {
+            "key": "PARENTA1",
+            "itemType": "journalArticle",
+            "title": "Primary article",
+        },
+    }
+    child = {
+        "key": "PDFKEYA1",
+        "data": {
+            "key": "PDFKEYA1",
+            "itemType": "attachment",
+            "title": "Full text PDF",
+            "filename": "article.pdf",
+            "contentType": "application/pdf",
+        },
+    }
+    abstract = "This study examines mediation outcomes and describes the relevant methods and evidence."
+
+    class Zotero:
+        def children(self, _key):
+            return [child]
+
+        def fulltext(self, key):
+            if key == "PDFKEYA1":
+                return {
+                    "content": text,
+                    "contentType": "application/pdf",
+                    "indexedPages": 1,
+                    "totalPages": 1,
+                }
+            if fallback == "abstract":
+                return {
+                    "content": f"<div class='abstract'>Abstract: {abstract}</div>",
+                    "contentType": "text/html",
+                }
+            return None
+
+        def file(self, key):
+            return (
+                (document, "application/pdf")
+                if fallback == "raw" and key == "PDFKEYA1"
+                else None
+            )
+
+    monkeypatch.setattr(
+        extraction,
+        "_ocr_pdf_page",
+        lambda *_args: pytest.fail("clean raw PDF needs no OCR"),
+    )
+    base = {"source_id": "source-zotero-PARENTA1", "attempts": []}
+    request = MapRequest(
+        tmp_path,
+        provider=provider,
+        model="gpt-5.6-luna" if provider == "codex" else "deepseek-v4-flash",
+        literature_model="gpt-5.6-terra" if provider == "codex" else None,
+        allow_cloud=True,
+        extraction_policy=ExtractionPolicy(pdf_fallback="ocr"),
+    )
+    result = _acquire_content(tmp_path, parent, Zotero(), base, request, None)
+    rejected = [
+        attempt
+        for attempt in base["attempts"]
+        if "indexed_pdf_damaged_numeral" in attempt["reason"]
+    ]
+    if numeral == "~OO,OOO":
+        assert len(rejected) == 1
+        assert rejected[0]["status"] == "failed" and rejected[0][
+            "input_hash"
+        ] == sha256_text(text)
+        assert numeral not in result["text"]
+        if fallback == "unavailable":
+            assert result["source_scope"] == "metadata_only"
+        elif fallback == "abstract":
+            assert (
+                result["source_scope"] == "abstract_only" and abstract in result["text"]
+            )
+    else:
+        assert rejected == []
+        assert result["source_scope"] == "full_document"
+        if fallback != "raw":
+            assert (
+                result["content_route"] == "zotero_fulltext"
+                and numeral in result["text"]
+            )
+    if fallback == "raw":
+        assert (
+            result["source_scope"] == "full_document"
+            and result["content_route"] == "pypdf_text"
+        )
+        assert clean_raw_text in result["text"]
