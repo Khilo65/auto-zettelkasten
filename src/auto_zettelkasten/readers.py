@@ -4759,6 +4759,24 @@ class CodexReader(_CapabilityAwareReader):
             raise exc
         return _ProviderText(content, completion)
 
+    def _codex_request_schema(self, contract_id: str) -> dict[str, Any]:
+        return _codex_json_schema(
+            contract_id,
+            pair_job_ids=(
+                _RELATIONSHIP_PAIR_JOB_IDS.get()
+                if contract_id == "relationship_adjudication" else ()
+            ),
+            pair_anchor_ids=_RELATIONSHIP_PAIR_ANCHOR_IDS.get(),
+        )
+
+    def _codex_execution_identity(
+        self, contract_id: str, effort: str, version: str,
+    ) -> dict[str, Any]:
+        return codex_contract_identity(contract_id, self.model, effort, version)
+
+    def _codex_configuration_arguments(self) -> tuple[str, ...]:
+        return ()
+
     def _generate_text(
         self,
         system_prompt: str,
@@ -4786,16 +4804,13 @@ class CodexReader(_CapabilityAwareReader):
         assert self._preflight is not None
         effort = _REASONING_EFFORT.get() or "medium"
         version = str(self._preflight.get("version") or "0.145.0")
-        identity = codex_contract_identity(contract_id, self.model, effort, version)
+        identity = self._codex_execution_identity(contract_id, effort, version)
         pair_ids = (
             _RELATIONSHIP_PAIR_JOB_IDS.get()
             if contract_id == "relationship_adjudication" else ()
         )
         schema_text = json.dumps(
-            _codex_json_schema(
-                contract_id, pair_job_ids=pair_ids,
-                pair_anchor_ids=_RELATIONSHIP_PAIR_ANCHOR_IDS.get(),
-            ),
+            self._codex_request_schema(contract_id),
             sort_keys=contract_id != "source_bundle",
         )
         if pair_ids:
@@ -4915,6 +4930,7 @@ class CodexReader(_CapabilityAwareReader):
                 "-c",
                 "agents.enabled=false",
             ])
+            command.extend(self._codex_configuration_arguments())
             command.extend(_CODEX_SKILL_ARGUMENTS)
             command.extend(_codex_retry_arguments(version))
             command.extend(_codex_tool_feature_arguments(version))
