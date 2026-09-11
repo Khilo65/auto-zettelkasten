@@ -187,7 +187,8 @@ def verify_projection(workspace: Path, prepared: Mapping[str, Any], registry: Ma
 
 
 def execute_mapping(workspace: Path, cohort: Mapping[str, Any], prepared: Mapping[str, Any],
-                    *, reader: Any, calls: Any, request: Any, evidence: Path) -> dict[str, Any]:
+                    *, reader: Any, calls: Any, request: Any, evidence: Path,
+                    max_calls: int = 24) -> dict[str, Any]:
     from auto_zettelkasten.profiles import profile_from_dict
     from v030_linking_experiment_direct import run_direct
     from v030_linking_experiment_planner import run_planner
@@ -233,7 +234,7 @@ def execute_mapping(workspace: Path, cohort: Mapping[str, Any], prepared: Mappin
 
         result = run_direct(descriptions, profiles, call=call, fits=fits, max_records=reader.max_records,
                             preserve_raw=preserve_raw, persist_page=persist_page,
-                            provider=reader.name, model=reader.model)
+                            provider=reader.name, model=reader.model, max_calls=max_calls)
     persist(workspace, prepared, result)
     return result
 
@@ -291,7 +292,11 @@ def run_campaign(manifest_path: Path, authorization_path: Path, *, replay: bool 
     offline = json.loads(Path(manifest["offline_acceptance"]).read_text())
     if offline.get("status") != "passed" or offline.get("code_commit") != manifest["code_commit"]:
         raise ValueError("offline prerequisites are not accepted for this code")
-    if manifest["source_attempt_limit"] != 0 or manifest["relationship_attempt_limit"] != 24:
+    diagnostic = manifest.get("single_call_diagnostic") is True
+    call_limit = 1 if diagnostic else 24
+    if (manifest["source_attempt_limit"] != 0 or manifest["relationship_attempt_limit"] != call_limit
+            or (diagnostic and (manifest.get("approach") != "direct"
+                               or manifest.get("model") != "gpt-5.6-luna"))):
         raise ValueError("campaign allowance differs from approved plan")
     if manifest["reasoning_effort"] != "max" or manifest["deadline_seconds"] != 14_400:
         raise ValueError("campaign reasoning or deadline changed")
@@ -302,7 +307,9 @@ def run_campaign(manifest_path: Path, authorization_path: Path, *, replay: bool 
     workspace = Path(manifest["workspace"])
     evidence = manifest_path.parent
     if replay:
-        if json.loads((evidence / "RUN_RECEIPT.json").read_text())["status"] != "mechanical_pass_review_pending":
+        if json.loads((evidence / "RUN_RECEIPT.json").read_text())["status"] not in {
+            "mechanical_pass_review_pending", "diagnostic_completed_review_pending"
+        }:
             raise ValueError("exact replay requires mechanically completed campaign")
     elif (evidence / "RUN_RECEIPT.json").exists():
         raise ValueError("one campaign per arm; no automatic retry")
@@ -319,7 +326,7 @@ def run_campaign(manifest_path: Path, authorization_path: Path, *, replay: bool 
     request = experiment_request(
         workspace, model=manifest["model"], run_id=manifest["run_id"],
         source_set_id=manifest["source_set_id"], allow_cloud=True,
-        literature_policy=LiteratureMappingPolicy(max_synthesis_calls=24,
+        literature_policy=LiteratureMappingPolicy(max_synthesis_calls=call_limit,
                                                   literature_deadline_seconds=14_400,
                                                   cluster_generation_enabled=False),
     )
@@ -327,25 +334,28 @@ def run_campaign(manifest_path: Path, authorization_path: Path, *, replay: bool 
                                     experiment_identity=manifest["experiment_identity"],
                                     input_char_budget=750_000 * 3)
     settings = base.GateSettings(stage=manifest["stage"], case_count=len(cohort["records"]),
-                                 source_attempt_limit=0, relationship_attempt_limit=24,
-                                 total_attempt_limit=24, stage_deadline_seconds=14_400)
+                                 source_attempt_limit=0, relationship_attempt_limit=call_limit,
+                                 total_attempt_limit=call_limit, stage_deadline_seconds=14_400)
     before = base._gate_snapshot(workspace) if replay else None
     started = time.monotonic()
     guard = None if replay else CodexCampaignGuard.start(
         authorization_path, digest(authorization_path.read_bytes()), repository_root=repository,
         stage=manifest["stage"], manifest_path=manifest_path, manifest_sha256=digest(manifest_path.read_bytes()),
         evaluation_id=manifest["evaluation_id"], run_id=manifest["run_id"],
-        source_attempt_limit=0, relationship_attempt_limit=24, total_attempt_limit=24,
+        source_attempt_limit=0, relationship_attempt_limit=call_limit, total_attempt_limit=call_limit,
     )
     reader.attempt_guard = guard
     try:
         with (deny_codex_attempts() if replay else guard.activate()), base._stage_deadline(settings):
             result = execute_mapping(workspace, cohort, prepared, reader=reader, calls=calls,
-                                     request=request, evidence=evidence)
+                                     request=request, evidence=evidence, max_calls=call_limit)
         if not replay:
             save(evidence / "RESULT.json", result)
         successful = (result.get("status") == "completed_paging" if manifest["approach"] == "direct"
                       else result.get("relationship_stage_complete") is True)
+        if diagnostic:
+            successful = (result.get("status") in {"completed_paging", "incomplete_budget"}
+                          and len(result.get("completed_requests", [])) == 1)
         if not successful or result.get("parked") or result.get("needs_more_context"):
             raise ValueError("arm incomplete or failed; preserved result requires diagnosis")
         verify_cohort(cohort)
@@ -355,7 +365,8 @@ def run_campaign(manifest_path: Path, authorization_path: Path, *, replay: bool 
             receipt = {"status": "passed", "provider_calls": 0, "protected_files": len(before)}
             save(evidence / "REPLAY_RECEIPT.json", receipt)
         else:
-            receipt = {"status": "mechanical_pass_review_pending", **accounting(calls, guard),
+            receipt = {"status": ("diagnostic_completed_review_pending" if diagnostic
+                                  else "mechanical_pass_review_pending"), **accounting(calls, guard),
                        "elapsed_seconds": time.monotonic() - started,
                        "result_sha256": digest((evidence / "RESULT.json").read_bytes())}
             guard.finish("passed")

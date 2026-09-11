@@ -1,4 +1,6 @@
 """Frozen source custody and real persistence/replay checks without providers."""
+import json
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -118,7 +120,10 @@ def test_cohort_tampering_rejected_before_workspace_creation(tmp_path):
     assert not (tmp_path / "mapping").exists()
 
 
-def test_incomplete_refresh_retains_completed_direct_links(tmp_path):
+@pytest.mark.parametrize("call_limit, status, count_expected", [
+    (24, "failed_call", 2), (1, "incomplete_budget", 1),
+])
+def test_incomplete_refresh_retains_completed_direct_links(tmp_path, call_limit, status, count_expected):
     cohort = cohort_at(tmp_path / "original")
     workspace = tmp_path / "mapping"
     prepared = comparison.prepare_workspace(workspace, cohort)
@@ -139,8 +144,8 @@ def test_incomplete_refresh_retains_completed_direct_links(tmp_path):
 
     result = comparison.execute_mapping(workspace, cohort, prepared, reader=reader,
                                         calls=interrupted_call, request=SimpleNamespace(source_set_id="frozen-two"),
-                                        evidence=tmp_path / "evidence")
-    assert result["status"] == "failed_call" and count == 2
+                                        evidence=tmp_path / "evidence", max_calls=call_limit)
+    assert result["status"] == status and count == count_expected
     assert len(result["accepted"]) == 1
     for row in prepared["note_rows"]:
         assert len(read_note(workspace / row["note_path"])["frontmatter"]["related_notes"]) == 1
@@ -149,6 +154,11 @@ def test_incomplete_refresh_retains_completed_direct_links(tmp_path):
 @pytest.mark.parametrize("changed, message", [
     ({"source_attempt_limit": 1}, "allowance"),
     ({"relationship_attempt_limit": 25}, "allowance"),
+    ({"relationship_attempt_limit": 1}, "allowance"),
+    ({"relationship_attempt_limit": 1, "single_call_diagnostic": True,
+      "approach": "planner", "model": "gpt-5.6-luna"}, "allowance"),
+    ({"relationship_attempt_limit": 1, "single_call_diagnostic": True,
+      "approach": "direct", "model": "gpt-5.6-terra"}, "allowance"),
     ({"reasoning_effort": "medium"}, "reasoning"),
     ({"deadline_seconds": 15000}, "deadline"),
 ])
@@ -212,3 +222,87 @@ def test_accounting_distinguishes_reservations_reasoning_and_missing_usage(tmp_p
         ledger_path.write_text(comparison.canonical({**reservations[0], **violation}))
         with pytest.raises(ValueError, match="source call or automatic retry"):
             comparison.accounting(calls, guard)
+
+
+def test_single_call_campaign_preserves_saturated_result_and_replays(tmp_path, monkeypatch):
+    import v030_codex_pdf_eval as base
+    import v030_linking_experiment_reader as transport
+    from v030_codex_campaign_guard import CodexCampaignGuard
+
+    repository = Path(comparison.__file__).resolve().parents[1]
+    monkeypatch.chdir(repository)
+    monkeypatch.setattr(base, "_repository_state", lambda: ("frozen-commit", False))
+    monkeypatch.setenv("AUTO_ZETTELKASTEN_CODEX", "offline-test")
+    cohort = cohort_at(tmp_path / "original")
+    originals = _gate_snapshot(tmp_path / "original")
+    arm, workspace = tmp_path / "diagnostic", tmp_path / "diagnostic/workspace"
+    prepared = comparison.prepare_workspace(workspace, cohort)
+    cohort["common_descriptions"] = prepared["descriptions"]
+    ledger_path = arm / "ledger.jsonl"
+    ledger_path.write_text("")
+    started, finished, dispatches = [], [], []
+    guard = SimpleNamespace(ledger_path=ledger_path, activate=nullcontext,
+                            finish=lambda status, **kwargs: finished.append(status))
+
+    def start(*args, **kwargs):
+        assert kwargs["source_attempt_limit"] == 0
+        assert kwargs["relationship_attempt_limit"] == kwargs["total_attempt_limit"] == 1
+        started.append(kwargs)
+        return guard
+
+    def make_reader(model, *, max_records, **kwargs):
+        reader = OfflineReader()
+        reader.model, reader.max_records = model, max_records
+
+        def provider(*args, **kwargs):
+            dispatches.append(args)
+            assert len(dispatches) == 1, "diagnostic or replay launched a second call"
+            assert args[1].literature_policy.max_synthesis_calls == 1
+            ledger_path.write_text(comparison.canonical(
+                {"record": "reserved", "role": "relationship", "job_attempt_number": 1}) + "\n")
+            return {"candidates": [{"left_source_id": "source-0", "right_source_id": "source-1",
+                                    "decision": "relationship", "relation_type": "contextual_connection",
+                                    "actor_source_id": None, "reference_source_id": None,
+                                    "reason": "A grounded comparison between institutional explanations."}]}
+
+        reader.select_direct_candidates = provider
+        return reader
+
+    monkeypatch.setattr(CodexCampaignGuard, "start", start)
+    monkeypatch.setattr(transport, "ExperimentCodexReader", make_reader)
+    manifest = {"code_commit": "frozen-commit", "source_attempt_limit": 0,
+                "relationship_attempt_limit": 1, "single_call_diagnostic": True,
+                "approach": "direct", "model": "gpt-5.6-luna", "reasoning_effort": "max",
+                "deadline_seconds": 14400, "workspace": str(workspace), "capability": {},
+                "run_id": "diagnostic-one", "evaluation_id": "diagnostic-one",
+                "source_set_id": "frozen-two", "stage": "linking_comparison_212",
+                "experiment_identity": {"version": "single-call-test"},
+                "prepared_inventory": _gate_snapshot(workspace)}
+    for field, data in {"cohort": cohort, "prepared": prepared, "capacity": {"max_records": 1},
+                        "helper": {"offline": True}, "offline_acceptance": {
+                            "status": "passed", "code_commit": "frozen-commit"}}.items():
+        path = arm / f"{field}.json"
+        comparison.save(path, data)
+        manifest[field], manifest[field + "_sha256"] = str(path), comparison.digest(path.read_bytes())
+    manifest_path, authorization = arm / "MANIFEST.json", arm / "AUTHORIZATION.json"
+    comparison.save(manifest_path, manifest)
+    comparison.save(authorization, {"offline": True})
+    receipt = comparison.run_campaign(manifest_path, authorization)
+    assert receipt["status"] == "diagnostic_completed_review_pending"
+    assert receipt["graph_calls"] == receipt["logical_attempts"] == 1
+    result_bytes = (arm / "RESULT.json").read_bytes()
+    result = json.loads(result_bytes)
+    assert result["status"] == "incomplete_budget" and result["calls"] == 1
+    assert result["exhaustive_discovery"] is False
+    assert len(result["accepted"]) == len(result["completed_requests"]) == 1
+    assert len(list((arm / "pages").glob("*.json"))) == 2  # raw page and validated result
+    protected, receipt_bytes = _gate_snapshot(workspace), (arm / "RUN_RECEIPT.json").read_bytes()
+    replay = comparison.run_campaign(manifest_path, authorization, replay=True)
+    assert replay["status"] == "passed" and replay["provider_calls"] == 0
+    assert len(dispatches) == len(started) == 1 and finished == ["passed"]
+    assert _gate_snapshot(workspace) == protected
+    assert (arm / "RESULT.json").read_bytes() == result_bytes
+    assert (arm / "RUN_RECEIPT.json").read_bytes() == receipt_bytes
+    assert _gate_snapshot(tmp_path / "original") == originals
+    with pytest.raises(ValueError, match="one campaign per arm"):
+        comparison.run_campaign(manifest_path, authorization)
