@@ -10,7 +10,7 @@ from auto_zettelkasten import readers as r
 
 INPUT_CEILING = 750_000
 LINKING_OUTPUT_ALLOWANCE = 65_536
-EXPERIMENT_ID = "v030-linking-comparison-v1"
+EXPERIMENT_ID = "v030-linking-comparison-v3-helper-idle600"
 LINK_CONTRACT = "relationship_candidate_selection"
 PLAN_CONTRACT = "literature_family_plan"
 ROUTING_CONTRACTS = {PLAN_CONTRACT, "relationship_shard_selection", "bridge_shard_selection"}
@@ -104,7 +104,8 @@ class ExperimentCodexReader(r.CodexReader):
         return result
 
     def _codex_configuration_arguments(self) -> tuple[str, ...]:
-        return ("-c", f"model_context_window={self.context_window_tokens}")
+        return ("-c", f"model_context_window={self.context_window_tokens}",
+                "-c", "model_providers.openai.stream_idle_timeout_ms=600000")
 
     def _reserved_output_tokens(self, contract_id: str, requested: int) -> int:
         if contract_id == LINK_CONTRACT:

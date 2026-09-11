@@ -179,7 +179,8 @@ def test_manifest_limits_rejected_before_campaign_start(tmp_path, monkeypatch, c
                 **changed}
     for field in ("cohort", "capacity", "prepared", "helper", "offline_acceptance"):
         path = tmp_path / f"{field}.json"
-        comparison.save(path, {"status": "passed", "code_commit": "frozen-commit"})
+        comparison.save(path, {"status": "passed", "code_commit": "frozen-commit",
+                               "helper_sha256": manifest.get("helper_sha256")})
         manifest[field] = str(path)
         manifest[field + "_sha256"] = comparison.digest(path.read_bytes())
     path = tmp_path / "manifest.json"
@@ -224,7 +225,8 @@ def test_accounting_distinguishes_reservations_reasoning_and_missing_usage(tmp_p
             comparison.accounting(calls, guard)
 
 
-def test_single_call_campaign_preserves_saturated_result_and_replays(tmp_path, monkeypatch):
+@pytest.mark.parametrize("verified_helper", [False, True])
+def test_single_call_campaign_preserves_saturated_result_and_replays(tmp_path, monkeypatch, verified_helper):
     import v030_codex_pdf_eval as base
     import v030_linking_experiment_reader as transport
     from v030_codex_campaign_guard import CodexCampaignGuard
@@ -282,11 +284,18 @@ def test_single_call_campaign_preserves_saturated_result_and_replays(tmp_path, m
                         "helper": {"offline": True}, "offline_acceptance": {
                             "status": "passed", "code_commit": "frozen-commit"}}.items():
         path = arm / f"{field}.json"
+        if field == "offline_acceptance":
+            data["helper_sha256"] = manifest["helper_sha256"] if verified_helper else "0" * 64
         comparison.save(path, data)
         manifest[field], manifest[field + "_sha256"] = str(path), comparison.digest(path.read_bytes())
     manifest_path, authorization = arm / "MANIFEST.json", arm / "AUTHORIZATION.json"
     comparison.save(manifest_path, manifest)
     comparison.save(authorization, {"offline": True})
+    if not verified_helper:
+        with pytest.raises(ValueError, match="offline helper verification"):
+            comparison.run_campaign(manifest_path, authorization)
+        assert started == dispatches == []
+        return
     receipt = comparison.run_campaign(manifest_path, authorization)
     assert receipt["status"] == "diagnostic_completed_review_pending"
     assert receipt["graph_calls"] == receipt["logical_attempts"] == 1

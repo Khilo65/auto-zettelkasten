@@ -292,6 +292,8 @@ def run_campaign(manifest_path: Path, authorization_path: Path, *, replay: bool 
     offline = json.loads(Path(manifest["offline_acceptance"]).read_text())
     if offline.get("status") != "passed" or offline.get("code_commit") != manifest["code_commit"]:
         raise ValueError("offline prerequisites are not accepted for this code")
+    if offline.get("helper_sha256") != manifest["helper_sha256"]:
+        raise ValueError("offline helper verification does not match the pinned executable")
     diagnostic = manifest.get("single_call_diagnostic") is True
     call_limit = 1 if diagnostic else 24
     if (manifest["source_attempt_limit"] != 0 or manifest["relationship_attempt_limit"] != call_limit

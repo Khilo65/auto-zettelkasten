@@ -40,7 +40,8 @@ def test_default_transport_unchanged_and_private_contract_identity():
     assert identity["output_reservation"] == LINKING_OUTPUT_ALLOWANCE
     assert identity["schema_hash"] != normal._codex_execution_identity(LINK_CONTRACT, "max", "0.152.1")["schema_hash"]
     assert identity["service_output_cap_supported"] is False
-    assert direct._codex_configuration_arguments() == ("-c", "model_context_window=872000")
+    assert direct._codex_configuration_arguments() == (
+        "-c", "model_context_window=872000", "-c", "model_providers.openai.stream_idle_timeout_ms=600000")
 
 
 def test_exact_wire_budget_counts_schema_exclusions_and_utf8():
@@ -85,7 +86,8 @@ def test_max_effort_reservation_and_receipt_without_provider(monkeypatch):
     assert completion["reasoning_effort"] == "max"
     assert completion["output_reservation"] == 65536
     assert completion["estimated_complete_input_tokens"] > 2048
-    assert completion["configuration_arguments"] == ["-c", "model_context_window=872000"]
+    assert completion["configuration_arguments"] == [
+        "-c", "model_context_window=872000", "-c", "model_providers.openai.stream_idle_timeout_ms=600000"]
     assert r._REASONING_EFFORT.get() is None
 
 
