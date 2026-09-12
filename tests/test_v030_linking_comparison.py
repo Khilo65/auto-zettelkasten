@@ -73,6 +73,7 @@ def test_mapping_preserves_originals_pdf_access_reciprocal_links_and_exact_repla
     cohort["common_descriptions"] = prepared["descriptions"]
     request = experiment_request(workspace, model="gpt-5.6-terra", run_id="replay-test", source_set_id="frozen-two")
     response = {"candidates": [{"left_source_id": "source-0", "right_source_id": "source-1",
+                               "left_source_title": "Distinct work 0", "right_source_title": "Distinct work 1",
                                "decision": "relationship", "relation_type": "contextual_connection",
                                "actor_source_id": None, "reference_source_id": None,
                                "reason": "The works connect institutional explanations across scales."}]}
@@ -138,6 +139,7 @@ def test_incomplete_refresh_retains_completed_direct_links(tmp_path, call_limit,
         if count == 2:
             raise TimeoutError("synthetic interruption")
         return {"candidates": [{"left_source_id": "source-0", "right_source_id": "source-1",
+                               "left_source_title": "Distinct work 0", "right_source_title": "Distinct work 1",
                                 "decision": "relationship", "relation_type": "contextual_connection",
                                 "actor_source_id": None, "reference_source_id": None,
                                 "reason": "A grounded conceptual bridge across the two works."}]}
@@ -263,6 +265,7 @@ def test_single_call_campaign_preserves_saturated_result_and_replays(tmp_path, m
             ledger_path.write_text(comparison.canonical(
                 {"record": "reserved", "role": "relationship", "job_attempt_number": 1}) + "\n")
             return {"candidates": [{"left_source_id": "source-0", "right_source_id": "source-1",
+                               "left_source_title": "Distinct work 0", "right_source_title": "Distinct work 1",
                                     "decision": "relationship", "relation_type": "contextual_connection",
                                     "actor_source_id": None, "reference_source_id": None,
                                     "reason": "A grounded comparison between institutional explanations."}]}

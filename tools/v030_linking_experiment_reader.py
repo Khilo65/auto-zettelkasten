@@ -11,7 +11,7 @@ from auto_zettelkasten import readers as r
 
 INPUT_CEILING = 750_000
 LINKING_OUTPUT_ALLOWANCE = 65_536
-EXPERIMENT_ID = "v030-linking-comparison-v4-campaign-deadline"
+EXPERIMENT_ID = "v030-linking-comparison-v5-source-titles"
 CAMPAIGN_SECONDS = 14_400
 LINK_CONTRACT = "relationship_candidate_selection"
 PLAN_CONTRACT = "literature_family_plan"
@@ -27,8 +27,8 @@ def direct_system_prompt() -> str:
     return (
         original[:original.index("Return one JSON object")]
         + "Return a JSON object with only candidates. Each candidate contains only "
-        "left_source_id, right_source_id, decision, relation_type, actor_source_id, "
-        "reference_source_id, and reason. "
+        "left_source_id, right_source_id, left_source_title, right_source_title, decision, relation_type, actor_source_id, "
+        "reference_source_id, and reason. Copy each selected work's exact supplied title alongside its ID. "
         + original[original.index("Use exact supplied IDs"):original.index("When required_pairs")]
         + "Consider useful relationships throughout the supplied descriptions. Respect max_inferred_pairs "
         "and excluded_pairs; never return an excluded or duplicate pair. A shorter response ends this "

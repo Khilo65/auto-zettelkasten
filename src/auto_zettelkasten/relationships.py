@@ -11,7 +11,7 @@ from .navigation import TYPED_SOURCE_RELATIONS, rank_human_related_links
 
 
 RELATIONSHIP_PROMPT_VERSION = "35"
-RELATIONSHIP_DISCOVERY_PROMPT_VERSION = "22"
+RELATIONSHIP_DISCOVERY_PROMPT_VERSION = "23"
 RELATIONSHIP_REGISTRY_SCHEMA_VERSION = "7"
 RELATIONSHIP_DECISION_SCHEMA_VERSION = "10"
 RELATIONSHIP_DECISION_CONTRACT = "relationship-decision-v10"
@@ -161,6 +161,21 @@ def relationship_decision_key(
     if policy_identity:
         payload["policy_identity"] = str(policy_identity)
     return stable_hash(payload)
+
+
+def relationship_source_identity_error(
+    row: Mapping[str, Any], source_titles: Mapping[str, Any]
+) -> str:
+    """Bind declared works to exact destinations; never resolve a title by guessing."""
+    for side in ("left", "right"):
+        source_id = row.get(f"{side}_source_id")
+        title = row.get(f"{side}_source_title")
+        expected = source_titles.get(source_id) if isinstance(source_id, str) else None
+        if not isinstance(expected, str) or not expected.strip():
+            return f"{side}_source_identity_unavailable"
+        if not isinstance(title, str) or " ".join(title.split()) != " ".join(expected.split()):
+            return f"{side}_source_title_mismatch"
+    return ""
 
 
 def candidate_rows(

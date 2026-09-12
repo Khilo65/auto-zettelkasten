@@ -36,7 +36,7 @@ def test_default_transport_unchanged_and_private_contract_identity():
     props = direct._codex_request_schema(LINK_CONTRACT)["properties"]
     assert set(props) == {"candidates"}
     assert set(props["candidates"]["items"]["required"]) == {
-        "left_source_id", "right_source_id", "decision", "relation_type",
+        "left_source_id", "right_source_id", "left_source_title", "right_source_title", "decision", "relation_type",
         "actor_source_id", "reference_source_id", "reason"}
     identity = direct._codex_execution_identity(LINK_CONTRACT, "max", "0.152.1")
     assert identity["output_reservation"] == LINKING_OUTPUT_ALLOWANCE

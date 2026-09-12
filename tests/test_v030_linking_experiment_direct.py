@@ -16,6 +16,8 @@ def inputs(count=8):
 
 def candidate(left="source-0", right="source-1", **changes):
     return {"left_source_id": left, "right_source_id": right, "decision": "relationship",
+            "left_source_title": f"Work {left.removeprefix('source-')}",
+            "right_source_title": f"Work {right.removeprefix('source-')}",
             "relation_type": "contextual_connection", "actor_source_id": None,
             "reference_source_id": None, "reason": "The works connect institutions across distinct scales.", **changes}
 
@@ -140,3 +142,35 @@ def test_no_relationship_completed_and_oversized_response_preserved_first():
     result, events, _ = runner([{"candidates": [candidate(), candidate("source-1", "source-2")]}], max_records=1)
     assert result["status"] == "failed_response"
     assert [kind for kind, _ in events] == ["raw"]
+
+
+def test_wrong_valid_destination_is_parked_before_job_creation_and_old_format_is_explicit():
+    rows, profiles = inputs()
+    # The intended Work 1 is paired with another existing ID, the observed failure class.
+    wrong = candidate(right_source_id="source-7")
+    legacy = {key: value for key, value in wrong.items() if not key.endswith("_title")}
+    old, _ = adapt_response({"candidates": [legacy]}, descriptions=rows, profiles=profiles,
+                            require_source_titles=False)
+    assert old["accepted"][0]["target_note_id"] == "note-7"
+    batch, jobs = adapt_response({"candidates": [wrong, candidate("source-2", "source-3")]},
+                                 descriptions=rows, profiles=profiles)
+    assert batch["parked"][0]["reason"] == "right_source_title_mismatch"
+    assert batch["parked"][0]["raw"] == wrong
+    assert len(jobs) == len(batch["accepted"]) == 1
+    assert batch["accepted"][0]["target_note_id"] == "note-3"
+    current, jobs = adapt_response({"candidates": [legacy]}, descriptions=rows, profiles=profiles)
+    assert current["parked"] and not jobs
+
+
+def test_titles_bind_to_current_inputs_without_fuzzy_or_unique_title_resolution():
+    rows, profiles = inputs()
+    rows[1]["title"] = rows[0]["title"]
+    same_title = candidate(right_source_title="Work 0")
+    batch, _ = adapt_response({"candidates": [same_title]}, descriptions=rows, profiles=profiles)
+    assert batch["accepted"][0]["target_note_id"] == "note-1"
+    rows[1]["title"] = "Corrected title"
+    batch, jobs = adapt_response({"candidates": [same_title]}, descriptions=rows, profiles=profiles)
+    assert batch["parked"] and not jobs
+    exact = {**same_title, "right_source_title": "  Corrected\n title  "}
+    batch, jobs = adapt_response({"candidates": [exact]}, descriptions=rows, profiles=profiles)
+    assert len(batch["accepted"]) == len(jobs) == 1

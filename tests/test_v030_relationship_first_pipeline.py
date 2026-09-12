@@ -75,6 +75,8 @@ class _RelationshipReasoner:
         return {"candidates": [{
             "left_source_id": left["source_id"],
             "right_source_id": right["source_id"],
+            "left_source_title": left.get("title") or left.get("context", {}).get("title", ""),
+            "right_source_title": right.get("title") or right.get("context", {}).get("title", ""),
             "decision": "relationship",
             "bridge_job_id": str(((context or {}).get("bridge_jobs") or [{}])[0].get("bridge_job_id") or ""),
             "relation_type": "complements",

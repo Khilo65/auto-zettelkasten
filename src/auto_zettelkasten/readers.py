@@ -512,6 +512,8 @@ CODEX_OUTPUT_CONTRACTS: Mapping[str, Mapping[str, Any]] = {
                     {
                         "left_source_id": _CODEX_STRING,
                         "right_source_id": _CODEX_STRING,
+                        "left_source_title": _CODEX_STRING,
+                        "right_source_title": _CODEX_STRING,
                         "decision": {"type": "string", "enum": ["relationship", "no_relationship"]},
                         "relation_type": _CODEX_STRING,
                         "actor_source_id": {"anyOf": [_CODEX_STRING, {"type": "null"}]},
@@ -2228,9 +2230,18 @@ class _CapabilityAwareReader:
         """Select intellectually consequential source or cluster comparisons."""
 
         self._authorize_request()
+        user_prompt = _relationship_prompt(profiles, request, context)
+        supplied = json.loads(user_prompt)
+        source_titles = {}
+        for row in [*supplied["focus_profiles"], *supplied["context"].get("catalogue", [])]:
+            if isinstance(row, Mapping) and isinstance(row.get("source_id"), str):
+                source_id, title = row["source_id"], row.get("title")
+                if source_id in source_titles and source_titles[source_id] != title:
+                    raise ProviderError("conflicting supplied source titles")
+                source_titles[source_id] = title
         raw_response = self._literature_json_call(
             _relationship_candidate_system_prompt(),
-            _relationship_prompt(profiles, request, context),
+            user_prompt,
             label="relationship candidate selection",
             reasoning_effort="high",
             output_tokens=RELATIONSHIP_CANDIDATE_MAX_OUTPUT_TOKENS,
@@ -2238,9 +2249,16 @@ class _CapabilityAwareReader:
             contract_id="relationship_candidate_selection",
         )
         try:
-            return _validate_relationship_response(
+            result = _validate_relationship_response(
                 raw_response, kind="candidate_selection"
             )
+            from .relationships import relationship_source_identity_error
+
+            for row in result["candidates"]:
+                if isinstance(row, Mapping) and (error := relationship_source_identity_error(row, source_titles)):
+                    row["_candidate_disposition"] = "parked_contract_failure"
+                    row["_source_identity_error"] = error
+            return result
         except ProviderError as exc:
             exc.raw_response = raw_response
             completion = current_literature_completion()
@@ -5622,7 +5640,7 @@ def _relationship_bridge_shard_system_prompt() -> str:
 
 def _relationship_candidate_system_prompt() -> str:
     return (
-        "Auto-Zettelkasten ordinary relationship prompt v22, contract relationship-decision-v11. "
+        "Auto-Zettelkasten ordinary relationship prompt v23, contract relationship-decision-v11. "
         "Identify intellectually meaningful relationships across works, disciplines, and levels of abstraction. "
         "Reason from substantive contributions rather than shared vocabulary alone. Recognize connections "
         "that broaden understanding or bring different ideas into productive relation. Distinguish useful "
@@ -5632,8 +5650,9 @@ def _relationship_candidate_system_prompt() -> str:
         "Keep explanations as specific as the supplied content supports, without inventing detailed findings, "
         "causal claims, or author engagement. These are final ordinary link decisions; no later model adds an explanation. "
         "Return one JSON object with candidates and job_outcomes arrays. Each candidate contains only "
-        "left_source_id, right_source_id, decision, relation_type, actor_source_id, reference_source_id, "
-        "reason, bridge_job_id, and rank. Use exact supplied IDs in canonical lexicographic pair order; "
+        "left_source_id, right_source_id, left_source_title, right_source_title, decision, relation_type, actor_source_id, reference_source_id, "
+        "reason, bridge_job_id, and rank. Copy each selected work's exact supplied title alongside its ID. "
+        "Use exact supplied IDs in canonical lexicographic pair order; "
         "never repeat a pair. For a useful link, decision is relationship and reason is a short explanation "
         "of why the works are worth reading together. Choose the strongest supported existing type: "
         "supports, undermines, qualifies, extends, complements, contrasts, rival_explanation, boundary_contrast, "

@@ -2926,6 +2926,7 @@ def source_ids(value):
     return sorted(set(re.findall(r"source-zotero-[A-Za-z0-9_-]+", json.dumps(value))))
 
 ids = source_ids(user)
+titles = {{row["source_id"]: row["title"] for row in user.get("context", {{}}).get("catalogue", [])}}
 if contract == "source_bundle":
     payload = {{
         "analysis_sections": {{key: "Source-grounded analysis; see p. 1." for key in schema["properties"]["analysis_sections"]["properties"]}},
@@ -2980,6 +2981,8 @@ elif contract == "relationship_candidate_selection":
         candidates.append({{
             "left_source_id": pair[0],
             "right_source_id": pair[1],
+            "left_source_title": titles[pair[0]],
+            "right_source_title": titles[pair[1]],
             "decision": "relationship",
             "relation_type": "complements",
             "actor_source_id": None,
@@ -2992,6 +2995,8 @@ elif contract == "relationship_candidate_selection":
         candidates.append({{
             "left_source_id": ids[0],
             "right_source_id": ids[1],
+            "left_source_title": titles[ids[0]],
+            "right_source_title": titles[ids[1]],
             "decision": "relationship",
             "relation_type": "complements",
             "actor_source_id": None,

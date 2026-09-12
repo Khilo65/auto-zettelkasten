@@ -151,6 +151,7 @@ from .relationships import (
     profile_hash_aliases,
     projected_related_links,
     relationship_decision_key,
+    relationship_source_identity_error,
     RELATIONSHIP_ENVELOPE_CONTRACTS,
     RELATIONSHIP_DECISION_NORMALIZATION_VERSION,
     RELATIONSHIP_DISCOVERY_PROMPT_VERSION,
@@ -10731,6 +10732,7 @@ def _run_relationship_reasoning(
             return None
         allowed_fields = {
             "left_source_id", "right_source_id", "decision", "relation_type",
+            "left_source_title", "right_source_title",
             "actor_source_id", "reference_source_id", "reason", "bridge_job_id", "rank",
             "comparison_proposition",
             # Deterministic discovery provenance is retained in the immutable job.
@@ -10740,6 +10742,16 @@ def _run_relationship_reasoning(
         if any(set(row) - allowed_fields for row in judgments):
             return {"pair_job_id": job.pair_job_id,
                     "decision": "invalid_ordinary_decision_fields"}
+        if any(
+            ("left_source_title" in row or "right_source_title" in row)
+            and relationship_source_identity_error(
+                row, {source_id: entry_by_source[source_id].get("title")
+                      for source_id in (job.left_source_id, job.right_source_id)}
+            )
+            for row in judgments
+        ):
+            return {"pair_job_id": job.pair_job_id,
+                    "decision": "ordinary_decision_source_title_mismatch"}
         if any(
             not {"actor_source_id", "reference_source_id"} <= row.keys()
             or any(not isinstance(row.get(key), str) for key in (
@@ -11486,6 +11498,7 @@ def _ranked_relationship_candidates(
     seen: dict[tuple[str, str], dict[str, Any]] = {}
     within: list[dict[str, Any]] = []
     bridges: list[dict[str, Any]] = []
+    source_titles = {source_id: entry.get("title") for source_id, entry in entry_by_source.items()}
     for index, raw in enumerate(response.get("candidates", []) or []):
         if not isinstance(raw, Mapping):
             continue
@@ -11501,6 +11514,9 @@ def _ranked_relationship_candidates(
         )
         pair = canonical_pair(source_id, target_id)
         forced_disposition = str(row.get("_candidate_disposition") or "")
+        # Archived candidates without title echoes remain readable; v23 provider responses require both.
+        if ("left_source_title" in row or "right_source_title" in row) and relationship_source_identity_error(row, source_titles):
+            forced_disposition = "parked_contract_failure"
         if forced_disposition:
             if dispositions is not None:
                 dispositions.append(

@@ -12,12 +12,13 @@ from auto_zettelkasten.relationships import (
     ORDINARY_RELATIONSHIP_DECISION_CONTRACT,
     RELATIONSHIP_DISCOVERY_PROMPT_VERSION,
     canonical_pair,
+    relationship_source_identity_error,
     stable_hash,
     validate_relationship_decision_rows,
 )
 
 BUCKETS = ("accepted", "no_relationship", "needs_more_context", "parked")
-FIELDS = {"left_source_id", "right_source_id", "decision", "relation_type",
+FIELDS = {"left_source_id", "right_source_id", "left_source_title", "right_source_title", "decision", "relation_type",
           "actor_source_id", "reference_source_id", "reason"}
 
 
@@ -48,7 +49,8 @@ def partition_descriptions(descriptions: Sequence[Mapping[str, Any]], *,
 
 def adapt_response(response: Mapping[str, Any], *, descriptions: Sequence[Mapping[str, Any]],
                    profiles: Sequence[Any], excluded_pairs: Sequence[Sequence[str]] = (),
-                   provider: str = "", model: str = "") -> tuple[dict[str, list], list[RelationshipPairJob]]:
+                   provider: str = "", model: str = "",
+                   require_source_titles: bool = True) -> tuple[dict[str, list], list[RelationshipPairJob]]:
     """Translate compact records without rejudging or introducing evidence requirements."""
     if not isinstance(response, Mapping) or set(response) != {"candidates"} or not isinstance(response["candidates"], list):
         raise ValueError("malformed direct response envelope")
@@ -59,10 +61,13 @@ def adapt_response(response: Mapping[str, Any], *, descriptions: Sequence[Mappin
     excluded = {canonical_pair(*pair) for pair in excluded_pairs}
     result = {key: [] for key in BUCKETS}
     by_pair: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    source_titles = {source_id: row.get("title") for source_id, row in descriptions_by_id.items()}
+    # Explicit compatibility for archived v4 responses; current execution always requires titles.
+    fields = FIELDS if require_source_titles else FIELDS - {"left_source_title", "right_source_title"}
     for index, raw in enumerate(response["candidates"]):
-        valid = isinstance(raw, Mapping) and set(raw) == FIELDS
+        valid = isinstance(raw, Mapping) and set(raw) == fields
         if valid:
-            valid = all(isinstance(raw[key], str) for key in FIELDS - {"actor_source_id", "reference_source_id"})
+            valid = all(isinstance(raw[key], str) for key in fields - {"actor_source_id", "reference_source_id"})
             valid &= all(raw[key] is None or isinstance(raw[key], str) for key in ("actor_source_id", "reference_source_id"))
         if not valid:
             result["parked"].append({"row_index": index, "reason": "invalid_direct_record_shape", "raw": raw})
@@ -72,11 +77,13 @@ def adapt_response(response: Mapping[str, Any], *, descriptions: Sequence[Mappin
             result["parked"].append({"row_index": index, "reason": "pair_not_in_supplied_notes", "raw": raw})
         elif pair in excluded:
             result["parked"].append({"row_index": index, "reason": "excluded_pair_returned", "raw": raw})
+        elif require_source_titles and (error := relationship_source_identity_error(raw, source_titles)):
+            result["parked"].append({"row_index": index, "reason": error, "raw": raw})
         else:
             by_pair.setdefault(pair, []).append(dict(raw))
     jobs, decisions = [], []
     for pair, candidates in by_pair.items():
-        meanings = {stable_hash({key: row[key] for key in FIELDS - {"left_source_id", "right_source_id"}}) for row in candidates}
+        meanings = {stable_hash({key: row[key] for key in fields - {"left_source_id", "right_source_id", "left_source_title", "right_source_title"}}) for row in candidates}
         if len(meanings) != 1:
             result["parked"].append({"reason": "conflicting_duplicate_pair", "pair": list(pair), "raw": candidates})
             continue
