@@ -268,6 +268,7 @@ def accounting(calls: Any, guard: Any) -> dict[str, Any]:
         raise ValueError("source call or automatic retry appeared in campaign ledger")
     return {"graph_calls": len(reservations), "source_calls": 0, "stages": stages,
             "logical_attempts": calls.provider_calls,
+            "reused_initial_planner_responses": getattr(calls, "recovered_initial_calls", 0),
             "token_cost_note": "Measured provider tokens; not measured subscription deductions."}
 
 
@@ -295,7 +296,17 @@ def run_campaign(manifest_path: Path, authorization_path: Path, *, replay: bool 
     if offline.get("helper_sha256") != manifest["helper_sha256"]:
         raise ValueError("offline helper verification does not match the pinned executable")
     diagnostic = manifest.get("single_call_diagnostic") is True
-    call_limit = 1 if diagnostic else 24
+    recovered_checkpoint = None
+    if manifest.get("recovered_initial_checkpoint"):
+        if diagnostic or manifest.get("approach") != "planner":
+            raise ValueError("recovered initial checkpoint requires a planner continuation")
+        plan_path = Path(manifest["recovered_initial_checkpoint"])
+        if digest(plan_path.read_bytes()) != manifest["recovered_initial_checkpoint_sha256"]:
+            raise ValueError("frozen recovered initial checkpoint changed")
+        recovered_checkpoint = read_yaml(plan_path, {})
+        if not isinstance(recovered_checkpoint, dict) or not recovered_checkpoint:
+            raise ValueError("recovered initial checkpoint is empty or invalid")
+    call_limit = 23 if recovered_checkpoint is not None else 1 if diagnostic else 24
     if (manifest["source_attempt_limit"] != 0 or manifest["relationship_attempt_limit"] != call_limit
             or (diagnostic and (manifest.get("approach") != "direct"
                                or manifest.get("model") != "gpt-5.6-luna"))):
@@ -334,7 +345,8 @@ def run_campaign(manifest_path: Path, authorization_path: Path, *, replay: bool 
     )
     calls = ExperimentReasonerCalls(workspace, manifest["run_id"], reader, request,
                                     experiment_identity=manifest["experiment_identity"],
-                                    input_char_budget=750_000 * 3)
+                                    input_char_budget=750_000 * 3,
+                                    recovered_initial_checkpoint=recovered_checkpoint)
     settings = base.GateSettings(stage=manifest["stage"], case_count=len(cohort["records"]),
                                  source_attempt_limit=0, relationship_attempt_limit=call_limit,
                                  total_attempt_limit=call_limit, stage_deadline_seconds=14_400)

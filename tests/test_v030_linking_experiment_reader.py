@@ -75,6 +75,7 @@ def install_fake_transport(monkeypatch, item, output_tokens):
         assert 0 < deadline <= 14400
         return r._ProviderText('{"candidates": []}', {
             **self._codex_execution_identity(LINK_CONTRACT, "max", "0.152.1"),
+            "finish_reason": "turn.completed",
             "usage": {"output_tokens": output_tokens, "reasoning_output_tokens": 123},
         })
 
@@ -110,10 +111,31 @@ def test_child_uses_remaining_campaign_time_and_expiry_prevents_dispatch(monkeyp
 def test_allowance_overrun_preserves_completed_result_without_retry(monkeypatch):
     item = reader()
     install_fake_transport(monkeypatch, item, 65537)
-    with pytest.raises(r.ProviderError, match="allowance") as caught:
+    assert item.select_direct_links([{"source_id": "a"}]) == {"candidates": []}
+    assert item.last_literature_completion["output_reservation_overrun_tokens"] == 1
+    assert item.last_literature_completion["usage"]["output_tokens"] == 65537
+
+
+@pytest.mark.parametrize("output", [None, -1, True, 100])
+def test_invalid_usage_still_fails_after_overrun_acceptance(monkeypatch, output):
+    item = reader()
+    install_fake_transport(monkeypatch, item, output)
+    with pytest.raises(r.ProviderError, match="usage"):
         item.select_direct_links([{"source_id": "a"}])
-    assert caught.value.raw_response == '{"candidates": []}'
-    assert caught.value.provider_completion["usage"]["output_tokens"] == 65537
+
+
+def test_incomplete_overrun_and_malformed_completed_response_still_fail(monkeypatch):
+    item = reader()
+    install_fake_transport(monkeypatch, item, 65537)
+    original = r.CodexReader._generate_text
+    for completed in (False, True):
+        def transport(self, *args):
+            raw = original(self, *args)
+            return r._ProviderText('not json' if completed else str(raw),
+                                  {**raw.completion, "finish_reason": "turn.completed" if completed else "incomplete"})
+        monkeypatch.setattr(r.CodexReader, "_generate_text", transport)
+        with pytest.raises(r.ProviderError):
+            item.select_direct_links([{"source_id": "a"}])
 
 
 def test_api_adapter_retains_lower_context_and_real_output_cap(monkeypatch):

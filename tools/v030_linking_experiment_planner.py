@@ -7,7 +7,10 @@ from types import FunctionType
 from typing import Any, Mapping, Sequence
 
 from auto_zettelkasten import pipeline
-from auto_zettelkasten.literature import _CheckpointedReasonerCalls
+from auto_zettelkasten.literature import (
+    _CheckpointedReasonerCalls, _checkpoint_dependency_context, _profile_dependency_rows,
+    _revalidate_raw_synthesis_response, _stable_hash, _synthesis_stage_prompt_version,
+)
 from auto_zettelkasten.models import LiteratureMapRequest
 
 
@@ -29,7 +32,8 @@ class ExperimentReasonerCalls(_CheckpointedReasonerCalls):
     """Production checkpoints with experiment-only capacity and no prefix recovery."""
 
     def __init__(self, workspace: Path, run_id: str, reader: Any, request: Any,
-                 *, experiment_identity: Mapping[str, Any], input_char_budget: int) -> None:
+                 *, experiment_identity: Mapping[str, Any], input_char_budget: int,
+                 recovered_initial_checkpoint: Mapping[str, Any] | None = None) -> None:
         if reader.name != "codex" or request.provider != "codex":
             raise ValueError("live comparison calls require the subscription adapter")
         if request.reasoning_effort != "max" or reader.reasoning_effort != "max":
@@ -40,6 +44,8 @@ class ExperimentReasonerCalls(_CheckpointedReasonerCalls):
             raise ValueError("experiment identity and input allowance are required")
         super().__init__(workspace, run_id, reader, request, retry_terminal_failures=False)
         self.experiment_identity = dict(experiment_identity)
+        self.recovered_initial_checkpoint = recovered_initial_checkpoint
+        self.recovered_initial_calls = 0
         original = _CheckpointedReasonerCalls.__call__
         self._experiment_call = FunctionType(
             original.__code__,
@@ -54,6 +60,32 @@ class ExperimentReasonerCalls(_CheckpointedReasonerCalls):
                  profiles: Sequence[Any], context: Mapping[str, Any]) -> Mapping[str, Any]:
         if method_name not in {"plan_literature_families", "select_relationship_candidates", "select_direct_candidates"}:
             raise ValueError("comparison permits only family planning and linking calls")
+        if self.recovered_initial_checkpoint is not None and context.get("planning_mode") == "initial_global":
+            saved = self.recovered_initial_checkpoint
+            completion = saved.get("provider_completion", {})
+            components = {
+                "stage": stage, "key": key, "method": method_name,
+                "provider": self.reasoner.name, "model": self.reasoner.model,
+                "profile_dependencies": _profile_dependency_rows(profiles),
+                "prompt_version": _synthesis_stage_prompt_version(stage),
+            }
+            hashes = {k: _stable_hash(v) for k, v in components.items()}
+            context_hashes = {k: _stable_hash(v) for k, v in
+                              _checkpoint_dependency_context(context).items()}
+            original_context = {k: v for k, v in saved.get("dependency_context_hashes", {}).items()
+                                if k != "linking_experiment_identity"}
+            if (stage != "literature_family_plan" or method_name != "plan_literature_families"
+                    or completion.get("finish_reason") != "turn.completed"
+                    or completion.get("reasoning_effort") != "max"
+                    or any(saved.get("dependency_component_hashes", {}).get(k) != v
+                           for k, v in hashes.items())
+                    or context_hashes != original_context):
+                raise ValueError("saved initial plan does not match the frozen request")
+            response = _revalidate_raw_synthesis_response(stage, saved.get("raw_response"))
+            if response is None:
+                raise ValueError("saved initial plan is malformed")
+            self.recovered_initial_calls += 1
+            return response
         return self._experiment_call(self, stage, key, method_name, profiles, {
             **context, "linking_experiment_identity": self.experiment_identity,
         })

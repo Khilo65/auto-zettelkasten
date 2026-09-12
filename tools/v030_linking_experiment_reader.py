@@ -11,7 +11,7 @@ from auto_zettelkasten import readers as r
 
 INPUT_CEILING = 750_000
 LINKING_OUTPUT_ALLOWANCE = 65_536
-EXPERIMENT_ID = "v030-linking-comparison-v5-source-titles"
+EXPERIMENT_ID = "v030-linking-comparison-v6-completed-output"
 CAMPAIGN_SECONDS = 14_400
 LINK_CONTRACT = "relationship_candidate_selection"
 PLAN_CONTRACT = "literature_family_plan"
@@ -78,7 +78,7 @@ class ExperimentCodexReader(r.CodexReader):
                       linking_output_allowance=LINKING_OUTPUT_ALLOWANCE,
                       reasoning_effort="max", max_records=self.max_records,
                       service_output_cap_supported=False,
-                      output_allowance_enforcement="reservation_and_observed_overrun")
+                      output_allowance_enforcement="reservation_and_disclosed_overrun")
         result["capability_identity"] = _digest(result)
         return result
 
@@ -102,7 +102,7 @@ class ExperimentCodexReader(r.CodexReader):
                       model_context_window=self.context_window_tokens,
                       effective_context_window_percent=int(self.direct_read_fraction * 100),
                       max_records=self.max_records, service_output_cap_supported=False,
-                      output_allowance_enforcement="reservation_and_observed_overrun",
+                      output_allowance_enforcement="reservation_and_disclosed_overrun",
                       capability_identity=self.capabilities["capability_identity"])
         return result
 
@@ -188,12 +188,20 @@ class ExperimentCodexReader(r.CodexReader):
         usage = completion.get("usage") or {}
         total = usage.get("output_tokens")  # Codex output_tokens already includes reasoning_output_tokens.
         reasoning = usage.get("reasoning_output_tokens")
-        if (not isinstance(total, int) or isinstance(total, bool) or total < 0 or total > output
+        if (not isinstance(total, int) or isinstance(total, bool) or total < 0
                 or not isinstance(reasoning, int) or isinstance(reasoning, bool)
                 or not 0 <= reasoning <= total):
-            failure = r.ProviderError("experimental output allowance exceeded or output usage unavailable")
+            failure = r.ProviderError("experimental output usage unavailable or invalid")
             r._preserve_provider_failure(failure, result)
             raise failure
+        # The subscription service does not enforce this reservation. Preserve a
+        # completed response and disclose actual usage; parsing still must pass.
+        completion["output_reservation_overrun_tokens"] = max(0, total - output)
+        if total > output and completion.get("finish_reason") != "turn.completed":
+            failure = r.ProviderError("over-reservation response did not complete")
+            r._preserve_provider_failure(failure, result)
+            raise failure
+        result = r._ProviderText(str(raw), completion)
         return result
 
     def direct_request(self, descriptions: Sequence[Mapping[str, Any]], *,

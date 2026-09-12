@@ -159,3 +159,51 @@ def test_experiment_uses_actual_cli_configuration_with_fake_helper(tmp_path, mon
                                           "reasoning_output_tokens": 5}
     assert result.completion["reasoning_effort"] == "max"
     assert result.completion["max_output_tokens"] == 65536
+
+
+def test_saved_initial_plan_recovery_binds_inputs_and_keeps_followup_calls(tmp_path):
+    from copy import deepcopy
+    from auto_zettelkasten.literature import (
+        _checkpoint_dependency_context, _profile_dependency_rows, _stable_hash,
+        _synthesis_stage_prompt_version,
+    )
+
+    request = experiment_request(tmp_path, model="gpt-5.6-terra", run_id="recovery")
+    reader = SimpleNamespace(name="codex", model=request.model, reasoning_effort="max")
+    stage, key, method = "literature_family_plan", "initial_global-test", "plan_literature_families"
+    profiles = [{"source_id": "A", "note_id": "note-A", "context": {"title": "Work A"}}]
+    context = {"planning_mode": "initial_global", "required_source_ids": ["A"]}
+    components = {"stage": stage, "key": key, "method": method, "provider": "codex",
+                  "model": reader.model, "profile_dependencies": _profile_dependency_rows(profiles),
+                  "prompt_version": _synthesis_stage_prompt_version(stage)}
+    saved = {
+        "provider_completion": {"finish_reason": "turn.completed", "reasoning_effort": "max"},
+        "dependency_component_hashes": {k: _stable_hash(v) for k, v in components.items()},
+        "dependency_context_hashes": {k: _stable_hash(v) for k, v in
+                                      _checkpoint_dependency_context(context).items()},
+        "raw_response": json.dumps({"literature_families": [], "discovery_jobs": [],
+                                    "neighboring_families": []}),
+    }
+    saved["dependency_context_hashes"]["linking_experiment_identity"] = "historical-identity"
+    original = deepcopy(saved)
+    calls = ExperimentReasonerCalls(tmp_path, "recovery", reader, request,
+                                    experiment_identity={"version": "new"}, input_char_budget=100000,
+                                    recovered_initial_checkpoint=saved)
+    delegated = []
+    calls._experiment_call = lambda *args: delegated.append(args) or {"followup": True}
+    assert calls(stage, key, method, profiles, context)["literature_families"] == []
+    assert calls.recovered_initial_calls == 1 and not delegated
+    for changed in (
+        (stage, key + "-other", method, profiles, context),
+        (stage, key, method, [{**profiles[0], "context": {"title": "Wrong work"}}], context),
+        (stage, key, method, profiles, {**context, "required_source_ids": ["B"]}),
+    ):
+        with pytest.raises(ValueError, match="does not match"):
+            calls(*changed)
+    saved["raw_response"] = "broken JSON"
+    with pytest.raises(ValueError, match="malformed"):
+        calls(stage, key, method, profiles, context)
+    saved["raw_response"] = original["raw_response"]
+    assert calls(stage, "reconcile", method, profiles, {"planning_mode": "family_card_reconciliation"}) == {"followup": True}
+    assert len(delegated) == 1
+    assert saved == original
