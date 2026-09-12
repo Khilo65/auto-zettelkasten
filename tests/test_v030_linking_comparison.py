@@ -318,3 +318,67 @@ def test_single_call_campaign_preserves_saturated_result_and_replays(tmp_path, m
     assert _gate_snapshot(tmp_path / "original") == originals
     with pytest.raises(ValueError, match="one campaign per arm"):
         comparison.run_campaign(manifest_path, authorization)
+
+
+def test_planner_mapping_replay_preserves_first_plan_and_protected_outputs(tmp_path):
+    from auto_zettelkasten.codex_attempt_guard import deny_codex_attempts
+    from auto_zettelkasten.models import LiteratureMappingPolicy
+
+    cohort = cohort_at(tmp_path / "original")
+    originals = _gate_snapshot(tmp_path / "original")
+    workspace, evidence = tmp_path / "mapping", tmp_path / "evidence"
+    prepared = comparison.prepare_workspace(workspace, cohort)
+    cohort["common_descriptions"] = prepared["descriptions"]
+    for profile in prepared["profiles"]:
+        profile["context"]["note_status"] = "analytical_atomic_note"
+    request = experiment_request(workspace, model="gpt-5.6-terra", run_id="planner-replay", source_set_id="frozen-two",
+                                 literature_policy=LiteratureMappingPolicy(cluster_generation_enabled=False))
+    dispatches = []
+
+    def plan(*args, **kwargs):
+        dispatches.append("plan")
+        return {"literature_families": [{"family_id": "one", "label": "Comparison", "organizing_problem": "A shared problem",
+                    "source_ids": ["source-0", "source-1"], "proposed_roles": {"source-0": "core", "source-1": "core"},
+                    "candidate_cluster": True}],
+                "discovery_jobs": [{"job_id": "ab", "family": "one", "left_source_ids": ["source-0"],
+                                    "right_source_ids": ["source-1"], "candidate_quota": 1}], "neighboring_families": []}
+
+    def select(*args, **kwargs):
+        dispatches.append("link")
+        return {"candidates": [{"left_source_id": "source-0", "right_source_id": "source-1",
+                    "left_source_title": "Distinct work 0", "right_source_title": "Distinct work 1",
+                    "decision": "relationship", "relation_type": "contextual_connection",
+                    "actor_source_id": None, "reference_source_id": None,
+                    "reason": "The works connect institutional explanations across scales."}],
+                "job_outcomes": [{"bridge_job_id": job["bridge_job_id"], "status": "completed"}
+                                 for job in kwargs["context"]["bridge_jobs"]]}
+
+    reader = SimpleNamespace(approach="planner", name="codex", model=request.model, reasoning_effort="max",
+        max_records=163, context_window_tokens=872000, prompt_reserve_tokens=0, capabilities={},
+        ordinary_relationship_decision_contract="relationship-decision-v11", plan_literature_families=plan,
+        select_relationship_candidates=select, literature_family_plan_fits=lambda *args, **kwargs: True)
+
+    def calls():
+        return ExperimentReasonerCalls(workspace, request.run_id, reader, request,
+                                       experiment_identity={"version": "planner-replay"}, input_char_budget=2250000)
+
+    with deny_codex_attempts():
+        first = comparison.execute_mapping(workspace, cohort, prepared, reader=reader, calls=calls(),
+                                           request=request, evidence=evidence)
+    assert len(first["accepted"]) == 1 and dispatches == ["plan", "link"]
+    protected, evidence_before = _gate_snapshot(workspace), _gate_snapshot(evidence)
+    original_plan = (evidence / "FAMILY_PLAN.json").read_bytes()
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("provider calls forbidden during planner replay")
+
+    reader.plan_literature_families = reader.select_relationship_candidates = forbidden
+    replay_calls = calls()
+    with deny_codex_attempts():
+        second = comparison.execute_mapping(workspace, cohort, prepared, reader=reader, calls=replay_calls,
+                                            request=request, evidence=evidence, replay=True)
+    assert second["relationship_stage_complete"]
+    assert replay_calls.provider_calls == 0 and dispatches == ["plan", "link"]
+    assert (evidence / "FAMILY_PLAN.json").read_bytes() == original_plan
+    assert _gate_snapshot(workspace) == protected and _gate_snapshot(evidence) == evidence_before
+    assert _gate_snapshot(tmp_path / "original") == originals

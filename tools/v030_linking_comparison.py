@@ -188,7 +188,7 @@ def verify_projection(workspace: Path, prepared: Mapping[str, Any], registry: Ma
 
 def execute_mapping(workspace: Path, cohort: Mapping[str, Any], prepared: Mapping[str, Any],
                     *, reader: Any, calls: Any, request: Any, evidence: Path,
-                    max_calls: int = 24) -> dict[str, Any]:
+                    max_calls: int = 24, replay: bool = False) -> dict[str, Any]:
     from auto_zettelkasten.profiles import profile_from_dict
     from v030_linking_experiment_direct import run_direct
     from v030_linking_experiment_planner import run_planner
@@ -206,7 +206,8 @@ def execute_mapping(workspace: Path, cohort: Mapping[str, Any], prepared: Mappin
             max_records=reader.max_records, input_char_budget=750_000 * 3,
         )
         result = outcome["relationships"]
-        save(evidence / "FAMILY_PLAN.json", outcome["family_plan"])
+        if not replay:
+            save(evidence / "FAMILY_PLAN.json", outcome["family_plan"])
     else:
         accumulated = {k: [] for k in ("accepted", "no_relationship", "parked")}
 
@@ -363,7 +364,7 @@ def run_campaign(manifest_path: Path, authorization_path: Path, *, replay: bool 
         reader.campaign_expires_at = time.monotonic() + settings.stage_deadline_seconds
         with (deny_codex_attempts() if replay else guard.activate()), base._stage_deadline(settings):
             result = execute_mapping(workspace, cohort, prepared, reader=reader, calls=calls,
-                                     request=request, evidence=evidence, max_calls=call_limit)
+                                     request=request, evidence=evidence, max_calls=call_limit, replay=replay)
         if not replay:
             save(evidence / "RESULT.json", result)
         successful = (result.get("status") == "completed_paging" if manifest["approach"] == "direct"
