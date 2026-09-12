@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from copy import deepcopy
 from typing import Any, Mapping, Sequence
 
@@ -10,7 +11,8 @@ from auto_zettelkasten import readers as r
 
 INPUT_CEILING = 750_000
 LINKING_OUTPUT_ALLOWANCE = 65_536
-EXPERIMENT_ID = "v030-linking-comparison-v3-helper-idle600"
+EXPERIMENT_ID = "v030-linking-comparison-v4-campaign-deadline"
+CAMPAIGN_SECONDS = 14_400
 LINK_CONTRACT = "relationship_candidate_selection"
 PLAN_CONTRACT = "literature_family_plan"
 ROUTING_CONTRACTS = {PLAN_CONTRACT, "relationship_shard_selection", "bridge_shard_selection"}
@@ -52,15 +54,16 @@ class ExperimentCodexReader(r.CodexReader):
         percent = int(capability.get("effective_context_window_percent") or 0)
         if not 0 < context <= 872_000 or not 0 < percent <= 100:
             raise ValueError("invalid or unreviewed model context capability")
-        for name in ("reasoning_effort", "context_window_tokens", "direct_read_fraction"):
+        for name in ("reasoning_effort", "context_window_tokens", "direct_read_fraction", "request_deadline"):
             if name in kwargs:
                 raise ValueError(f"experiment fixes {name}")
         super().__init__(model=model, reasoning_effort="max", context_window_tokens=context,
-                         direct_read_fraction=percent / 100, **kwargs)
+                         direct_read_fraction=percent / 100, request_deadline=CAMPAIGN_SECONDS, **kwargs)
         self.approach = approach
         self.max_records = max_records
         self.catalog_capability = dict(capability)
         self._experiment_contract: str | None = None
+        self.campaign_expires_at: float | None = None
 
     @property
     def input_token_ceiling(self) -> int:
@@ -105,7 +108,7 @@ class ExperimentCodexReader(r.CodexReader):
 
     def _codex_configuration_arguments(self) -> tuple[str, ...]:
         return ("-c", f"model_context_window={self.context_window_tokens}",
-                "-c", "model_providers.openai.stream_idle_timeout_ms=600000")
+                "-c", f"model_providers.openai.stream_idle_timeout_ms={CAMPAIGN_SECONDS * 1000}")
 
     def _reserved_output_tokens(self, contract_id: str, requested: int) -> int:
         if contract_id == LINK_CONTRACT:
@@ -165,15 +168,20 @@ class ExperimentCodexReader(r.CodexReader):
         self._reserved_output_tokens(contract, 0)
         if not self.request_fits(system, user, contract, output):
             raise r.ProviderError("experimental complete request exceeds admitted capacity")
-        if deadline > 600:
-            raise r.ProviderError("experimental child deadline exceeds 600 seconds")
+        if not 0 < deadline <= CAMPAIGN_SECONDS:
+            raise r.ProviderError("experimental child deadline exceeds campaign allowance")
         self._ensure_codex_preflight()
         actual = r._codex_model_catalog(self._preflight["_environment"])[self.model]
         fields = ("slug", "max_context_window", "effective_context_window_percent", "supported_reasoning_levels")
         if any(actual.get(key) != self.catalog_capability.get(key) for key in fields):
             raise r.ProviderError("model capability changed after experiment preparation")
+        if self.campaign_expires_at is not None:
+            deadline = min(deadline, self.campaign_expires_at - time.monotonic())
+            if deadline <= 0:
+                raise r.ProviderTimeout("experimental campaign deadline reached")
         raw = super()._generate_text(system, user, output, deadline)
         completion = dict(raw.completion)
+        completion["effective_child_deadline_seconds"] = deadline
         completion["estimated_complete_input_tokens"] = self.estimate_request_input(system, user, contract)
         completion["configuration_arguments"] = list(self._codex_configuration_arguments())
         result = r._ProviderText(str(raw), completion)

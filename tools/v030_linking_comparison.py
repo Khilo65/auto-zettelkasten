@@ -348,6 +348,7 @@ def run_campaign(manifest_path: Path, authorization_path: Path, *, replay: bool 
     )
     reader.attempt_guard = guard
     try:
+        reader.campaign_expires_at = time.monotonic() + settings.stage_deadline_seconds
         with (deny_codex_attempts() if replay else guard.activate()), base._stage_deadline(settings):
             result = execute_mapping(workspace, cohort, prepared, reader=reader, calls=calls,
                                      request=request, evidence=evidence, max_calls=call_limit)

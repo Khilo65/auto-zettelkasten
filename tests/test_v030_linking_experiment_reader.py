@@ -1,5 +1,6 @@
 """Provider-blocked checks for the private comparison transport."""
 import json
+import time
 
 import pytest
 
@@ -24,6 +25,7 @@ def reader(approach="direct", **kwargs):
 
 def test_default_transport_unchanged_and_private_contract_identity():
     normal = r.CodexReader("gpt-5.6-terra")
+    assert normal._request_deadline_seconds() == 600
     assert normal._codex_configuration_arguments() == ()
     assert normal._codex_request_schema(LINK_CONTRACT) == r._codex_json_schema(LINK_CONTRACT)
     assert normal._codex_execution_identity(LINK_CONTRACT, "max", "0.152.1") == r.codex_contract_identity(
@@ -41,7 +43,8 @@ def test_default_transport_unchanged_and_private_contract_identity():
     assert identity["schema_hash"] != normal._codex_execution_identity(LINK_CONTRACT, "max", "0.152.1")["schema_hash"]
     assert identity["service_output_cap_supported"] is False
     assert direct._codex_configuration_arguments() == (
-        "-c", "model_context_window=872000", "-c", "model_providers.openai.stream_idle_timeout_ms=600000")
+        "-c", "model_context_window=872000", "-c", "model_providers.openai.stream_idle_timeout_ms=14400000")
+    assert direct._request_deadline_seconds() == 14400
 
 
 def test_exact_wire_budget_counts_schema_exclusions_and_utf8():
@@ -69,7 +72,7 @@ def install_fake_transport(monkeypatch, item, output_tokens):
     def fake(self, system, user, output, deadline):
         assert r._REASONING_EFFORT.get() == "max"
         assert output == LINKING_OUTPUT_ALLOWANCE
-        assert deadline <= 600
+        assert 0 < deadline <= 14400
         return r._ProviderText('{"candidates": []}', {
             **self._codex_execution_identity(LINK_CONTRACT, "max", "0.152.1"),
             "usage": {"output_tokens": output_tokens, "reasoning_output_tokens": 123},
@@ -87,8 +90,21 @@ def test_max_effort_reservation_and_receipt_without_provider(monkeypatch):
     assert completion["output_reservation"] == 65536
     assert completion["estimated_complete_input_tokens"] > 2048
     assert completion["configuration_arguments"] == [
-        "-c", "model_context_window=872000", "-c", "model_providers.openai.stream_idle_timeout_ms=600000"]
+        "-c", "model_context_window=872000", "-c", "model_providers.openai.stream_idle_timeout_ms=14400000"]
+    assert completion["effective_child_deadline_seconds"] == 14400
     assert r._REASONING_EFFORT.get() is None
+
+
+def test_child_uses_remaining_campaign_time_and_expiry_prevents_dispatch(monkeypatch):
+    item = reader()
+    install_fake_transport(monkeypatch, item, 500)
+    item.campaign_expires_at = time.monotonic() + 1800
+    item.select_direct_links([{"source_id": "a"}])
+    assert 1790 < item.last_literature_completion["effective_child_deadline_seconds"] <= 1800
+    item.campaign_expires_at = time.monotonic() - 1
+    monkeypatch.setattr(r.CodexReader, "_generate_text", lambda *a: pytest.fail("expired dispatch"))
+    with pytest.raises(r.ProviderTimeout, match="campaign deadline"):
+        item.select_direct_links([{"source_id": "a"}])
 
 
 def test_allowance_overrun_preserves_completed_result_without_retry(monkeypatch):

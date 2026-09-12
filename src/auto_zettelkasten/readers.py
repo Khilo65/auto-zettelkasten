@@ -4859,6 +4859,8 @@ class CodexReader(_CapabilityAwareReader):
         ).hexdigest()
         executable = Path(str(self._preflight["executable"]))
         events: list[dict[str, Any]] = []
+        started = time.monotonic()
+        event_timing: dict[str, float] = {}
         stdout_bytes = bytearray()
         stderr_bytes = bytearray()
         stream_failure: list[ProviderError] = []
@@ -5059,6 +5061,9 @@ class CodexReader(_CapabilityAwareReader):
                             _terminate_codex_process(process)
                             return
                     events.append(event)
+                    elapsed = time.monotonic() - started
+                    event_timing.setdefault("first_event_elapsed_seconds", elapsed)
+                    event_timing["last_event_elapsed_seconds"] = elapsed
 
             def read_stderr() -> None:
                 assert process.stderr is not None
@@ -5086,6 +5091,9 @@ class CodexReader(_CapabilityAwareReader):
                 _terminate_codex_process(process)
                 request_failure = ProviderTimeout("Codex request timed out")
                 request_failure_cause = exc
+            except ProviderTimeout as exc:
+                _terminate_codex_process(process)
+                request_failure = exc
             except (KeyboardInterrupt, InterruptedError) as exc:
                 _terminate_codex_process(process)
                 request_failure = ProviderInterrupted("Codex request interrupted")
@@ -5117,6 +5125,30 @@ class CodexReader(_CapabilityAwareReader):
                     "Codex changed isolated authentication state"
                 )
             if request_failure is not None:
+                event_counts: dict[str, int] = {}
+                for event in events:
+                    kind = str(event.get("type") or "unknown")
+                    event_counts[kind] = event_counts.get(kind, 0) + 1
+                partial = "\n".join(
+                    str(event["item"].get("text") or "") for event in events
+                    if event.get("type") == "item.completed"
+                    and isinstance(event.get("item"), Mapping)
+                    and event["item"].get("type") == "agent_message"
+                )
+                completion = {
+                    **identity, "provider": "codex", "model": self.model,
+                    "finish_reason": type(request_failure).__name__,
+                    "transport_progress": {
+                        **event_timing, "event_counts": event_counts,
+                        "elapsed_seconds": time.monotonic() - started,
+                        "stdout_bytes": len(stdout_bytes), "stderr_bytes": len(stderr_bytes),
+                        "child_deadline_seconds": deadline_seconds,
+                    },
+                }
+                completed = [event for event in events if event.get("type") == "turn.completed"]
+                if completed:
+                    completion["usage"] = dict(completed[-1].get("usage") or {})
+                _preserve_provider_failure(request_failure, _ProviderText(partial, completion))
                 raise request_failure from request_failure_cause
             if stream_failure:
                 failure = stream_failure[0]

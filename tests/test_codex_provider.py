@@ -2736,23 +2736,53 @@ def test_codex_unknown_contract_fails_before_process_spawn(
         )
 
 
+@pytest.mark.parametrize("campaign_timeout", [False, True])
 def test_codex_timeout_is_typed_and_not_immediately_retried(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, campaign_timeout: bool,
 ) -> None:
     executable = tmp_path / "codex"
     capture = tmp_path / "capture.json"
     _fake_codex(executable, capture, sleep_seconds=1)
+    executable.write_text(executable.read_text().replace(
+        "time.sleep(1)",
+        'print(json.dumps({"type": "turn.started"}), flush=True)\n'
+        'print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", '
+        '"text": "partial output"}}), flush=True)\ntime.sleep(1)',
+    ))
+    original_wait = subprocess.Popen.wait
+    processes = []
+
+    def wait(process, timeout=None):
+        if not processes:
+            processes.append(process)
+            ready_deadline = time.monotonic() + 5
+            while not capture.exists() and time.monotonic() < ready_deadline:
+                time.sleep(0.01)
+        if campaign_timeout and timeout == 10:
+            time.sleep(0.2)
+            raise ProviderTimeout("campaign deadline reached")
+        return original_wait(process, timeout=timeout)
+
+    monkeypatch.setattr(subprocess.Popen, "wait", wait)
     reader = CodexReader("gpt-5.6-luna", allow_cloud=True)
     reader._preflight = fake_codex_preflight(tmp_path, executable)
-    with pytest.raises(ProviderTimeout):
+    with pytest.raises(ProviderTimeout) as caught:
         reader._generate_with_reasoning(
             "system",
             "user",
             2_048,
-            0.05,
+            10 if campaign_timeout else 0.2,
             reasoning_effort="medium",
             output_contract="chunk_evidence",
         )
+    assert len(processes) == 1 and processes[0].poll() is not None
+    assert cancel_active_provider_responses() == 0
+    assert caught.value.raw_response == "partial output"
+    completion = caught.value.provider_completion
+    assert "usage" not in completion
+    assert completion["transport_progress"]["event_counts"] == {"turn.started": 1, "item.completed": 1}
+    assert completion["transport_progress"]["last_event_elapsed_seconds"] >= 0
+    assert "partial output" not in json.dumps(completion)
 
 
 def test_codex_external_cancellation_is_typed(tmp_path: Path) -> None:
