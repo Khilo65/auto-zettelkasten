@@ -4950,9 +4950,9 @@ class CodexReader(_CapabilityAwareReader):
                 "-c",
                 "agents.enabled=false",
             ])
+            command.extend(_codex_retry_arguments(version))
             command.extend(self._codex_configuration_arguments())
             command.extend(_CODEX_SKILL_ARGUMENTS)
-            command.extend(_codex_retry_arguments(version))
             command.extend(_codex_tool_feature_arguments(version))
             reserve_codex_attempt(
                 self.attempt_guard,

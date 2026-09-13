@@ -1,8 +1,10 @@
 """Provider-blocked checks for the private comparison transport."""
 import json
 import time
+import tomllib
 
 import pytest
+from conftest import fake_codex_preflight
 
 from auto_zettelkasten import readers as r
 from v030_linking_experiment_reader import (
@@ -45,6 +47,58 @@ def test_default_transport_unchanged_and_private_contract_identity():
     assert direct._codex_configuration_arguments() == (
         "-c", "model_context_window=872000", "-c", "model_providers.openai.stream_idle_timeout_ms=14400000")
     assert direct._request_deadline_seconds() == 14400
+
+
+@pytest.mark.parametrize("transport", ["websocket", "http_sse"])
+def test_explicit_transport_reaches_final_argv_with_subscription_isolation(monkeypatch, tmp_path, transport):
+    item = reader(response_transport=transport)
+    item._preflight = {**fake_codex_preflight(tmp_path, tmp_path / "blocked-helper"), "version": "0.152.1"}
+    monkeypatch.setattr(r, "_codex_model_catalog", lambda env: {item.model: item.catalog_capability})
+    commands = []
+
+    def blocked(command, **kwargs):
+        commands.append(command)
+        assert "OPENAI_API_KEY" not in kwargs["env"]
+        raise OSError("provider blocked")
+
+    monkeypatch.setattr(r.subprocess, "Popen", blocked)
+    with pytest.raises(r.ProviderTransportError, match="could not start"):
+        item._generate_with_reasoning("system", "user", 65536, 5,
+                                      reasoning_effort="max", output_contract=LINK_CONTRACT)
+    assert len(commands) == 1
+    command = commands[0]
+    # Resolve the last CLI override for each key, as the helper does.
+    config = {}
+    for index, argument in enumerate(command[:-1]):
+        if argument == "-c":
+            key, value = command[index + 1].split("=", 1)
+            config[key] = tomllib.loads("value=" + value)["value"]
+    assert {"--ignore-user-config", "--ignore-rules", "--strict-config", "--ephemeral"} <= set(command)
+    assert config["forced_login_method"] == "chatgpt"
+    assert config["model_reasoning_effort"] == "max"
+    assert config["skills.bundled.enabled"] is False
+    assert config["agents.enabled"] is False
+    provider = "openai-sse" if transport == "http_sse" else "openai"
+    assert config["model_provider"] == provider
+    prefix = f"model_providers.{provider}."
+    assert config[prefix + "request_max_retries"] == config[prefix + "stream_max_retries"] == 0
+    assert config[prefix + "stream_idle_timeout_ms"] == 14400000
+    if transport == "http_sse":
+        assert config[prefix + "name"] == "OpenAI"
+        assert config[prefix + "base_url"] == "https://chatgpt.com/backend-api/codex"
+        assert config[prefix + "wire_api"] == "responses"
+        assert config[prefix + "requires_openai_auth"] is True
+        assert config[prefix + "supports_websockets"] is False
+        identity = item._codex_execution_identity(LINK_CONTRACT, "max", "0.152.1")
+        assert identity["response_transport"] == "http_sse"
+        assert identity["configuration_arguments"] == list(item._codex_configuration_arguments())
+        with pytest.raises(r.ProviderError, match="0.152.1"):
+            item._codex_execution_identity(LINK_CONTRACT, "max", "0.145.0")
+
+
+def test_invalid_transport_rejected_before_dispatch():
+    with pytest.raises(ValueError, match="response_transport"):
+        reader(response_transport="auto_retry")
 
 
 def test_exact_wire_budget_counts_schema_exclusions_and_utf8():

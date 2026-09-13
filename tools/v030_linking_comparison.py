@@ -338,6 +338,7 @@ def run_campaign(manifest_path: Path, authorization_path: Path, *, replay: bool 
     reader = ExperimentCodexReader(
         manifest["model"], approach=manifest["approach"], max_records=capacity["max_records"],
         capability=manifest["capability"], allow_cloud=True, attempt_guard=None,
+        response_transport=manifest.get("response_transport", "websocket"),
         credential_forbidden_roots=(workspace, repository),
     )
     request = experiment_request(

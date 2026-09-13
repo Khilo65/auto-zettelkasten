@@ -40,7 +40,9 @@ class ExperimentCodexReader(r.CodexReader):
     """Use verified catalog capacity and max reasoning without changing production defaults."""
 
     def __init__(self, model: str, *, approach: str, max_records: int,
-                 capability: Mapping[str, Any], **kwargs: Any):
+                 capability: Mapping[str, Any], response_transport: str = "websocket", **kwargs: Any):
+        if response_transport not in {"websocket", "http_sse"}:
+            raise ValueError("response_transport must be websocket or http_sse")
         if approach not in {"planner", "direct"}:
             raise ValueError("approach must be planner or direct")
         if not isinstance(max_records, int) or isinstance(max_records, bool) or max_records <= 0:
@@ -60,6 +62,7 @@ class ExperimentCodexReader(r.CodexReader):
         super().__init__(model=model, reasoning_effort="max", context_window_tokens=context,
                          direct_read_fraction=percent / 100, request_deadline=CAMPAIGN_SECONDS, **kwargs)
         self.approach = approach
+        self.response_transport = response_transport
         self.max_records = max_records
         self.catalog_capability = dict(capability)
         self._experiment_contract: str | None = None
@@ -104,11 +107,30 @@ class ExperimentCodexReader(r.CodexReader):
                       max_records=self.max_records, service_output_cap_supported=False,
                       output_allowance_enforcement="reservation_and_disclosed_overrun",
                       capability_identity=self.capabilities["capability_identity"])
+        if self.response_transport == "http_sse":
+            if version != "0.152.1":
+                raise r.ProviderError("experimental HTTP streaming requires the verified 0.152.1 helper")
+            result.update(response_transport="http_sse",
+                          configuration_arguments=list(self._codex_configuration_arguments()))
         return result
 
     def _codex_configuration_arguments(self) -> tuple[str, ...]:
-        return ("-c", f"model_context_window={self.context_window_tokens}",
-                "-c", f"model_providers.openai.stream_idle_timeout_ms={CAMPAIGN_SECONDS * 1000}")
+        arguments = ("-c", f"model_context_window={self.context_window_tokens}",
+                     "-c", f"model_providers.openai.stream_idle_timeout_ms={CAMPAIGN_SECONDS * 1000}")
+        if self.response_transport == "websocket":
+            return arguments
+        # The helper reserves the built-in provider; a configured provider uses
+        # its existing HTTP path. The exact OpenAI name preserves zero-retry policy.
+        provider = {
+            "name": "OpenAI", "base_url": "https://chatgpt.com/backend-api/codex",
+            "wire_api": "responses", "requires_openai_auth": True,
+            "supports_websockets": False, "request_max_retries": 0, "stream_max_retries": 0,
+            "stream_idle_timeout_ms": CAMPAIGN_SECONDS * 1000,
+        }
+        return arguments + ("-c", 'model_provider="openai-sse"') + tuple(
+            part for key, value in provider.items()
+            for part in ("-c", f"model_providers.openai-sse.{key}={json.dumps(value)}")
+        )
 
     def _reserved_output_tokens(self, contract_id: str, requested: int) -> int:
         if contract_id == LINK_CONTRACT:

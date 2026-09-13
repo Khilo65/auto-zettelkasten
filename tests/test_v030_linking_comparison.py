@@ -244,7 +244,9 @@ def test_accounting_distinguishes_reservations_reasoning_and_missing_usage(tmp_p
 
 
 @pytest.mark.parametrize("verified_helper", [False, True])
-def test_single_call_campaign_preserves_saturated_result_and_replays(tmp_path, monkeypatch, verified_helper):
+@pytest.mark.parametrize("response_transport", [None, "http_sse"])
+def test_single_call_campaign_preserves_saturated_result_and_replays(tmp_path, monkeypatch, verified_helper,
+                                                                   response_transport):
     import v030_codex_pdf_eval as base
     import v030_linking_experiment_reader as transport
     from v030_codex_campaign_guard import CodexCampaignGuard
@@ -271,6 +273,7 @@ def test_single_call_campaign_preserves_saturated_result_and_replays(tmp_path, m
         return guard
 
     def make_reader(model, *, max_records, **kwargs):
+        assert kwargs["response_transport"] == (response_transport or "websocket")
         reader = OfflineReader()
         reader.model, reader.max_records = model, max_records
 
@@ -299,6 +302,8 @@ def test_single_call_campaign_preserves_saturated_result_and_replays(tmp_path, m
                 "source_set_id": "frozen-two", "stage": "linking_comparison_212",
                 "experiment_identity": {"version": "single-call-test"},
                 "prepared_inventory": _gate_snapshot(workspace)}
+    if response_transport is not None:
+        manifest["response_transport"] = response_transport
     for field, data in {"cohort": cohort, "prepared": prepared, "capacity": {"max_records": 1},
                         "helper": {"offline": True}, "offline_acceptance": {
                             "status": "passed", "code_commit": "frozen-commit"}}.items():
