@@ -326,14 +326,14 @@ consent.
 | OpenRouter | `OPENROUTER_API_KEY` | yes | alternate/model experiment |
 | Gemini | `GEMINI_API_KEY` | yes | text and document vision |
 | Ollama | none | no | local text reader |
-| Codex CLI | ChatGPT login | yes | subscription source/relationship reader with bounded source-bundle page images |
+| Codex CLI | ChatGPT login | yes | subscription source/relationship reader; native PDFs with the verified companion |
 
 ### Codex CLI provider
 
 Codex support uses a local `codex` CLI process authenticated through an
-existing ChatGPT subscription. It is a cloud provider, not a local model. V1
-supports Codex CLI 0.145.0 only and requires explicit source and literature
-models:
+existing ChatGPT subscription. It is a cloud provider, not a local model.
+Supported pinned CLI profiles are 0.145.0 and 0.152.1; source and literature
+models must be explicit:
 
 ```bash
 codex login
@@ -367,6 +367,16 @@ before a new call to verify the CLI version, ChatGPT login, requested model,
 context, effort, and pinned feature manifest. Doctor makes no model call and
 does not estimate remaining subscription quota.
 
+Native PDF input requires the verified Auto-Zettelkasten companion for
+Codex 0.152.1 on macOS arm64, with its matching adjacent manifest. Set
+`AUTO_ZETTELKASTEN_CODEX` to that installed executable and run `doctor` to
+verify the pairing. A stock CLI version alone does not establish PDF capability.
+For the verified companion, ordinary graph calls use HTTP streaming with
+automatic transport retries disabled. Source and native-PDF calls retain their
+separate routes. Configured request deadlines also apply to cluster planning
+and synthesis; the HTTP stream idle allowance follows that deadline up to the
+helper's four-hour ceiling.
+
 The Codex profile uses four concurrent provider calls for source and literature
 work when concurrency is `auto`. An explicit Codex concurrency must be between
 1 and 8; values above four are intended only for an otherwise idle subscription.
@@ -381,8 +391,8 @@ remain checkpointed. Subscription usage has no dollar-spend estimate.
 The adapter disables every tool-capable surface known to the pinned CLI and
 rejects any JSONL tool event. Tool execution is therefore fail-closed, but zero
 tool visibility is not promised because the supported models are code-mode
-models. Ordered PNGs are permitted only on the source-bundle contract; all
-literature contracts and attachment-free frozen hashes remain unchanged.
+models. Ordered PNGs and admitted native PDFs are restricted to source
+generation; graph calls use saved note content, without reopening source PDFs.
 Evidence-profile generation remains deterministic in production; its Codex
 contract is available only for direct evaluation.
 
@@ -483,6 +493,9 @@ Every inventoried item ends a mapping run as either:
 - `parked_for_review`, with a route-level attempt record and reason.
 
 During resumable work, an item can instead be `partial` or `pending`.
+Relationship jobs that cannot start because the local call budget is exhausted
+remain pending; completed decisions are preserved. This does not increase the
+run's allowance or automatically start another campaign.
 
 The run invariant is therefore:
 
@@ -491,18 +504,19 @@ inventory_count == validated_note_count + limited_note_count
                  + parked_for_review_count + partial_count + pending_count
 ```
 
-Notes and checkpoints are fingerprinted by Zotero item key, inspected-content
+Source notes and their checkpoints are fingerprinted by Zotero item key, inspected-content
 hash, source scope, source-shaping document type, classifier and chunking
 versions, prompt version, and effective provider and model. Display metadata,
 run IDs, timeouts, registry revisions, and Markdown projections do not enter
-semantic identities. Harmless Zotero metadata corrections therefore update the
+source semantic identities. Harmless Zotero metadata corrections therefore update the
 projection without another source call.
-Source prompt version 14 and source-bundle prompt version 9 keep technical
-figures in `Detailed Findings`, require a separate interpretation for
-non-specialists, and make optional source definitions and document structure
-explicit. Remapping an older prompt-version note invalidates its old
-fingerprint and replaces it in place; completed prompt/bundle 12/7 and 13/8
-checkpoints remain exactly reusable.
+Current source prompts retain detailed findings, evidence, definitions and
+source structure, and request author-date/page citations. Current profiles
+contain compact discovery context, without a separate anchor inventory.
+Cluster synthesis uses full atomic notes and structured source contributions;
+legacy evidence matrices are no longer generated. Historical formats remain
+readable through explicit compatibility paths. Unchanged completed source
+checkpoints are reused only when their compatibility and identity checks pass.
 `status` reads live `progress.yml`; it exposes the active literature stage,
 profile, proposition, subject-tag, typed-relation, topic-neighborhood, singleton-facet, and unclustered counts, clusters,
 debates, gaps, packet checkpoints,
