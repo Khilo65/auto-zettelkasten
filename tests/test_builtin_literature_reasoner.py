@@ -1898,3 +1898,24 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
         "full-note cluster writer",
         "collection-gap",
     ]
+
+
+@pytest.mark.parametrize("provider", ["codex", "deepseek"])
+@pytest.mark.parametrize("deadline", [180, 600, 14400])
+def test_cluster_calls_honor_configured_deadline(monkeypatch, tmp_path, provider, deadline):
+    from auto_zettelkasten.literature import _cluster_plan_call_settings
+
+    reader = (reader_module.CodexReader("gpt-5.6-terra", allow_cloud=True, request_deadline=deadline)
+              if provider == "codex" else DeepSeekReader(allow_cloud=True, request_deadline=deadline))
+    request = LiteratureMapRequest(tmp_path, allow_cloud=True)
+    assert _cluster_plan_call_settings(reader, request, card_count=31)["deadline_seconds"] == deadline
+    captured = {}
+
+    def blocked(self, *args, **kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("provider blocked")
+
+    monkeypatch.setattr(reader_module._CapabilityAwareReader, "_literature_json_call", blocked)
+    with pytest.raises(RuntimeError, match="provider blocked"):
+        reader.synthesize_cluster([], request)
+    assert captured["deadline_seconds"] == deadline

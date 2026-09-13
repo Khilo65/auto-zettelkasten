@@ -126,11 +126,11 @@ def test_graph_http_selection_preserves_source_and_unverified_transport(
     assert codex_contract_identity(contract, reader.model, "high", version) == original_identity
     if expected_http:
         assert completion["response_transport"] == "http_sse"
-        assert completion["configuration_arguments"] == list(readers_module._codex_http_configuration_arguments())
+        assert completion["configuration_arguments"] == list(readers_module._codex_http_configuration_arguments(600_000))
         assert configs["model_providers.openai-sse.request_max_retries"] == "0"
         assert configs["model_providers.openai-sse.stream_max_retries"] == "0"
         assert configs["model_providers.openai-sse.supports_websockets"] == "false"
-        assert "model_providers.openai-sse.stream_idle_timeout_ms" not in configs
+        assert configs["model_providers.openai-sse.stream_idle_timeout_ms"] == "600000"
     else:
         assert "response_transport" not in completion
     assert reader._request_deadline_seconds() == 600
@@ -3351,3 +3351,15 @@ def test_public_codex_map_runs_relationships_and_replays_without_calls_or_semant
         f"{path}: {before[1] if before else None} -> {after[1] if after else None}"
         for path, before, after in changed
     )
+
+
+@pytest.mark.parametrize("deadline,expected_ms", [(180, 180000), (600, 600000), (14400, 14400000), (28800, 14400000)])
+def test_http_idle_tracks_caller_within_helper_ceiling(deadline, expected_ms):
+    reader = CodexReader("gpt-5.6-terra", request_deadline=deadline)
+    reader._preflight = {"version": "0.152.1", "helper_manifest_valid": True,
+                         "_helper_manifest_identity": {"binary_sha256": "verified"}}
+    token = _OUTPUT_CONTRACT.set("cluster_synthesis")
+    try:
+        assert reader._codex_configuration_arguments() == readers_module._codex_http_configuration_arguments(expected_ms)
+    finally:
+        _OUTPUT_CONTRACT.reset(token)

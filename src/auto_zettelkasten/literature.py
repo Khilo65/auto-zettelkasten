@@ -18822,7 +18822,7 @@ def _cluster_plan_call_settings(
     )
     return {
         "output_tokens": desired_output,
-        "deadline_seconds": min(600.0, configured_deadline),
+        "deadline_seconds": configured_deadline,
         "input_char_budget": int(usable_input_tokens * chars_per_token),
         "context_window_tokens": context_tokens,
         "input_context_fraction": 0.75,

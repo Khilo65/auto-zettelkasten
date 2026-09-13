@@ -2704,7 +2704,7 @@ class _CapabilityAwareReader:
             label="cluster synthesis",
             reasoning_effort=reasoning_effort,
             output_tokens=desired_output,
-            deadline_seconds=min(600.0, self._request_deadline_seconds()),
+            deadline_seconds=self._request_deadline_seconds(),
             contract_id="cluster_synthesis",
         )
         try:
@@ -4827,7 +4827,11 @@ class CodexReader(_CapabilityAwareReader):
             and contract in CODEX_OUTPUT_CONTRACTS
             and contract not in {"source_bundle", "chunk_evidence", "evidence_profile"}
         ):
-            return _codex_http_configuration_arguments()
+            # Keep the stream alive for the caller's budget, within the reviewed
+            # helper's four-hour idle ceiling. The child/campaign deadline still wins.
+            return _codex_http_configuration_arguments(
+                max(1, min(14_400_000, int(self._request_deadline_seconds() * 1000)))
+            )
         return ()
 
     def _generate_text(
