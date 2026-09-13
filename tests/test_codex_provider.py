@@ -100,6 +100,42 @@ def test_codex_0152_no_retry_config_uses_guarded_builtin_overrides() -> None:
     assert "model_providers.openai.stream_max_retries=0" in arguments
 
 
+@pytest.mark.parametrize("contract", ["literature_family_plan", "relationship_candidate_selection",
+                                     "source_bundle", "chunk_evidence", "evidence_profile"])
+@pytest.mark.parametrize("verified,version", [(True, "0.152.1"), (False, "0.152.1"), (True, "0.145.0")])
+def test_graph_http_selection_preserves_source_and_unverified_transport(
+    monkeypatch, tmp_path, contract, verified, version,
+):
+    executable = tmp_path / "fake-codex"
+    capture = tmp_path / "capture.json"
+    _fake_codex(executable, capture)
+    reader = CodexReader("gpt-5.6-terra", allow_cloud=True, reasoning_effort="high")
+    reader._preflight = fake_codex_preflight(tmp_path, executable)
+    reader._preflight.update(version=version, helper_manifest_valid=verified,
+                             _helper_manifest_identity={"binary_sha256": "verified-by-preflight"} if verified else {})
+    original_identity = codex_contract_identity(contract, reader.model, "high", version)
+    value = reader._generate_with_reasoning("system", "user", 2048, 5,
+                                            reasoning_effort="high", output_contract=contract)
+    argv = json.loads(capture.read_text())["argv"]
+    configs = dict(argv[i + 1].split("=", 1) for i, arg in enumerate(argv[:-1]) if arg == "-c")
+    expected_http = verified and version == "0.152.1" and contract not in {
+        "source_bundle", "chunk_evidence", "evidence_profile"}
+    completion = value.completion
+    assert configs.get("model_provider", '"openai"') == ('"openai-sse"' if expected_http else '"openai"')
+    assert {key: completion[key] for key in original_identity} == original_identity
+    assert codex_contract_identity(contract, reader.model, "high", version) == original_identity
+    if expected_http:
+        assert completion["response_transport"] == "http_sse"
+        assert completion["configuration_arguments"] == list(readers_module._codex_http_configuration_arguments())
+        assert configs["model_providers.openai-sse.request_max_retries"] == "0"
+        assert configs["model_providers.openai-sse.stream_max_retries"] == "0"
+        assert configs["model_providers.openai-sse.supports_websockets"] == "false"
+        assert "model_providers.openai-sse.stream_idle_timeout_ms" not in configs
+    else:
+        assert "response_transport" not in completion
+    assert reader._request_deadline_seconds() == 600
+
+
 def test_codex_executable_prefers_override_then_companion_then_stock(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -1295,10 +1295,30 @@ _CODEX_PDF_HELPER_TRUST: Mapping[str, frozenset[tuple[str, str]]] = {
             (
                 "0bce6029e189dd21acd31492278c4377694a5012a2ddff14bbc8aef3a9fafcad",
                 "2f3bffb94ed05de1d32b285d638747d92bc6f2104eb8f551492c9db2d6b78547",
+            ),
+            (
+                "c58ce152a8d6cbc082b8205f438cee0e0bf1894d894c2b704153c352b9b2cbbc",
+                "2294a19ee55b5db8bce89a9aba3feabc71906fabe1a363bd11ca78a81481d652",
             )
         }
     )
 }
+
+
+def _codex_http_configuration_arguments(idle_timeout_ms: int | None = None) -> tuple[str, ...]:
+    # A configured provider uses the helper's HTTP path. The exact OpenAI name
+    # preserves its zero-retry policy; this is selection, never a fallback.
+    provider = {
+        "name": "OpenAI", "base_url": "https://chatgpt.com/backend-api/codex",
+        "wire_api": "responses", "requires_openai_auth": True,
+        "supports_websockets": False, "request_max_retries": 0, "stream_max_retries": 0,
+    }
+    if idle_timeout_ms is not None:
+        provider["stream_idle_timeout_ms"] = idle_timeout_ms
+    return ("-c", 'model_provider="openai-sse"') + tuple(
+        part for key, value in provider.items()
+        for part in ("-c", f"model_providers.openai-sse.{key}={json.dumps(value)}")
+    )
 
 
 def codex_contract_identity(
@@ -4790,9 +4810,24 @@ class CodexReader(_CapabilityAwareReader):
     def _codex_execution_identity(
         self, contract_id: str, effort: str, version: str,
     ) -> dict[str, Any]:
-        return codex_contract_identity(contract_id, self.model, effort, version)
+        identity = codex_contract_identity(contract_id, self.model, effort, version)
+        arguments = self._codex_configuration_arguments()
+        if 'model_provider="openai-sse"' in arguments:
+            identity.update(response_transport="http_sse",
+                            configuration_arguments=list(arguments))
+        return identity
 
     def _codex_configuration_arguments(self) -> tuple[str, ...]:
+        preflight = self._preflight or {}
+        contract = _OUTPUT_CONTRACT.get()
+        if (
+            preflight.get("version") == "0.152.1"
+            and preflight.get("helper_manifest_valid") is True
+            and preflight.get("_helper_manifest_identity")
+            and contract in CODEX_OUTPUT_CONTRACTS
+            and contract not in {"source_bundle", "chunk_evidence", "evidence_profile"}
+        ):
+            return _codex_http_configuration_arguments()
         return ()
 
     def _generate_text(

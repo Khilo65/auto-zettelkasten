@@ -119,18 +119,7 @@ class ExperimentCodexReader(r.CodexReader):
                      "-c", f"model_providers.openai.stream_idle_timeout_ms={CAMPAIGN_SECONDS * 1000}")
         if self.response_transport == "websocket":
             return arguments
-        # The helper reserves the built-in provider; a configured provider uses
-        # its existing HTTP path. The exact OpenAI name preserves zero-retry policy.
-        provider = {
-            "name": "OpenAI", "base_url": "https://chatgpt.com/backend-api/codex",
-            "wire_api": "responses", "requires_openai_auth": True,
-            "supports_websockets": False, "request_max_retries": 0, "stream_max_retries": 0,
-            "stream_idle_timeout_ms": CAMPAIGN_SECONDS * 1000,
-        }
-        return arguments + ("-c", 'model_provider="openai-sse"') + tuple(
-            part for key, value in provider.items()
-            for part in ("-c", f"model_providers.openai-sse.{key}={json.dumps(value)}")
-        )
+        return arguments + r._codex_http_configuration_arguments(CAMPAIGN_SECONDS * 1000)
 
     def _reserved_output_tokens(self, contract_id: str, requested: int) -> int:
         if contract_id == LINK_CONTRACT:
