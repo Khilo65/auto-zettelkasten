@@ -163,6 +163,11 @@ def test_incomplete_refresh_retains_completed_direct_links(tmp_path, call_limit,
       "approach": "direct", "model": "gpt-5.6-terra"}, "allowance"),
     ({"reasoning_effort": "medium"}, "reasoning"),
     ({"deadline_seconds": 15000}, "deadline"),
+    ({"recovered_initial_checkpoint": True, "relationship_attempt_limit": 11}, "offline boundary reached"),
+    ({"recovered_initial_checkpoint": True, "relationship_attempt_limit": 23}, "offline boundary reached"),
+    ({"recovered_initial_checkpoint": True, "relationship_attempt_limit": 0}, "allowance"),
+    ({"recovered_initial_checkpoint": True, "relationship_attempt_limit": 24}, "allowance"),
+    ({"recovered_initial_checkpoint": True, "relationship_attempt_limit": True}, "allowance"),
 ])
 def test_manifest_limits_rejected_before_campaign_start(tmp_path, monkeypatch, changed, message):
     import v030_codex_pdf_eval as base
@@ -176,9 +181,20 @@ def test_manifest_limits_rejected_before_campaign_start(tmp_path, monkeypatch, c
         raise AssertionError("invalid manifest must not start campaign")
 
     monkeypatch.setattr(CodexCampaignGuard, "start", forbidden)
+    def stop_before_preparation(*args):
+        raise ValueError("offline boundary reached")
+
+    monkeypatch.setattr(comparison, "verify_cohort", stop_before_preparation)
     manifest = {"code_commit": "frozen-commit", "source_attempt_limit": 0,
                 "relationship_attempt_limit": 24, "reasoning_effort": "max", "deadline_seconds": 14400,
                 **changed}
+    if manifest.get("recovered_initial_checkpoint") is True:
+        from auto_zettelkasten.files import write_yaml
+
+        checkpoint = tmp_path / "initial-plan.yml"
+        write_yaml(checkpoint, {"checkpoint_schema_version": "1"})
+        manifest.update(approach="planner", recovered_initial_checkpoint=str(checkpoint),
+                        recovered_initial_checkpoint_sha256=comparison.digest(checkpoint.read_bytes()))
     for field in ("cohort", "capacity", "prepared", "helper", "offline_acceptance"):
         path = tmp_path / f"{field}.json"
         comparison.save(path, {"status": "passed", "code_commit": "frozen-commit",

@@ -307,8 +307,11 @@ def run_campaign(manifest_path: Path, authorization_path: Path, *, replay: bool 
         recovered_checkpoint = read_yaml(plan_path, {})
         if not isinstance(recovered_checkpoint, dict) or not recovered_checkpoint:
             raise ValueError("recovered initial checkpoint is empty or invalid")
-    call_limit = 23 if recovered_checkpoint is not None else 1 if diagnostic else 24
+    call_limit = (manifest["relationship_attempt_limit"] if recovered_checkpoint is not None
+                  else 1 if diagnostic else 24)
     if (manifest["source_attempt_limit"] != 0 or manifest["relationship_attempt_limit"] != call_limit
+            or type(call_limit) is not int or not 1 <= call_limit <= 24
+            or (recovered_checkpoint is not None and call_limit > 23)
             or (diagnostic and (manifest.get("approach") != "direct"
                                or manifest.get("model") != "gpt-5.6-luna"))):
         raise ValueError("campaign allowance differs from approved plan")
