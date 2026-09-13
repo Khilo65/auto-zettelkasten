@@ -59,6 +59,7 @@ from .indexes import (
 )
 from .navigation import build_typed_source_relations
 from .literature import (
+    LiteratureSynthesisPartialError,
     LITERATURE_FAMILY_PLAN_PROMPT_VERSION,
     _CheckpointedReasonerCalls,
     _bounded_provider_futures,
@@ -11216,7 +11217,12 @@ def _run_relationship_reasoning(
             )
         except Exception as exc:
             failure_class = _synthesis_failure_class(exc)
-            retry_on_resume = failure_class in {"transport", "quota", "timeout", "interruption"}
+            budget_deferred = (
+                isinstance(exc, LiteratureSynthesisPartialError)
+                and str(exc) == "literature_synthesis_call_budget_reached"
+            )
+            retry_on_resume = budget_deferred or failure_class in {"transport", "quota", "timeout", "interruption"}
+            reason = "provider_call_budget_exhausted" if budget_deferred else "provider_batch_failed"
             write_yaml(
                 batch_root / "batch.yml",
                 {
@@ -11239,7 +11245,7 @@ def _run_relationship_reasoning(
                             if retry_on_resume
                             else "parked_for_review"
                         ),
-                        "reason": "provider_batch_failed",
+                        "reason": reason,
                         "retry_on_resume": retry_on_resume,
                     }
                 )
@@ -11252,7 +11258,7 @@ def _run_relationship_reasoning(
                             if retry_on_resume
                             else "parked_for_review"
                         ),
-                        "reason": "provider_batch_failed",
+                        "reason": reason,
                         "decision_identity": decision_identity,
                         "retry_on_resume": retry_on_resume,
                     },

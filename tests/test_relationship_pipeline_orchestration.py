@@ -3952,8 +3952,9 @@ def test_failed_batch_preserves_sibling_batches_and_job_status(
     assert completed + parked == 13
 
 
+@pytest.mark.parametrize("budget_stop", [False, True])
 def test_transport_failed_batch_resumes_without_losing_completed_decisions(
-    tmp_path: Path,
+    tmp_path: Path, budget_stop: bool,
 ) -> None:
     profiles = [_profile("A"), *[_profile(f"S{index:02d}") for index in range(13)]]
     selection_state = (
@@ -3993,11 +3994,17 @@ def test_transport_failed_batch_resumes_without_losing_completed_decisions(
             }
         first_batch_number += 1
         if first_batch_number == 2:
+            if budget_stop:
+                from auto_zettelkasten.literature import LiteratureSynthesisPartialError
+                raise LiteratureSynthesisPartialError("literature_synthesis_call_budget_reached")
             raise TimeoutError("provider timed out")
         return {"decisions": [_decision(job) for job in context["pair_jobs"]]}
 
     first = _run(tmp_path, profiles, _Calls(first_handler))
 
+    if budget_stop:
+        assert all(row["status"] == "pending" and row["reason"] == "provider_call_budget_exhausted"
+                   for row in first["parked"])
     assert first["relationship_stage_complete"] is False
     assert first["selected_profile_hashes"] == {}
     assert len(first["accepted"]) in {5, 8}
