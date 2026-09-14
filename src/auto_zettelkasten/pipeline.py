@@ -157,6 +157,7 @@ from .relationships import (
     RELATIONSHIP_DECISION_NORMALIZATION_VERSION,
     RELATIONSHIP_DISCOVERY_PROMPT_VERSION,
     RELATIONSHIP_PROMPT_VERSION,
+    SUBSTANTIVE_RELATION_TYPES,
     SYMMETRIC_RELATION_TYPES,
     stable_hash,
     validate_relationship_decision_rows,
@@ -10774,14 +10775,15 @@ def _run_relationship_reasoning(
         }
         selected = [judgments[0]]
         if len(meanings) != 1:
-            if len(judgments) != 2 or len(meanings) != 2 or any(
-                decision != "relationship" or relation_type not in SYMMETRIC_RELATION_TYPES
-                or actor or reference
+            if len(judgments) != 2 or len({meaning[1] for meaning in meanings}) != 2 or any(
+                decision != "relationship" or relation_type not in SUBSTANTIVE_RELATION_TYPES
+                or (bool(actor or reference) if relation_type in SYMMETRIC_RELATION_TYPES
+                    else {actor, reference} != {job.left_source_id, job.right_source_id})
                 for decision, relation_type, actor, reference in meanings
             ):
                 return {"pair_job_id": job.pair_job_id,
                         "decision": "conflicting_ordinary_decisions"}
-            # Existing pair envelopes retain two independent symmetric readings.
+            # Existing pair envelopes retain two distinct, individually valid readings.
             selected = [next(row for row in judgments if row["relation_type"].strip() == kind)
                         for kind in sorted({meaning[1] for meaning in meanings})]
         connections = [{
@@ -11055,10 +11057,11 @@ def _run_relationship_reasoning(
             - downstream_call_reserve,
         )
         if len(runnable_packets) > available_adjudication_calls:
-            raise RuntimeError(
-                "relationship adjudication packet budget conflicts with "
-                "required cluster/gap call reserve"
-            )
+            for packet in runnable_packets:
+                concurrent_batch_results[tuple(job.pair_job_id for job in packet)] = (
+                    LiteratureSynthesisPartialError("relationship_cluster_call_reserve")
+                )
+            runnable_packets = []
     if runnable_packets:
         relationship_started = time.monotonic()
         workers = _provider_worker_count(request, len(runnable_packets))
@@ -11217,12 +11220,19 @@ def _run_relationship_reasoning(
             )
         except Exception as exc:
             failure_class = _synthesis_failure_class(exc)
+            budget_reserved = (
+                isinstance(exc, LiteratureSynthesisPartialError)
+                and str(exc) == "relationship_cluster_call_reserve"
+            )
             budget_deferred = (
                 isinstance(exc, LiteratureSynthesisPartialError)
                 and str(exc) == "literature_synthesis_call_budget_reached"
-            )
+            ) or budget_reserved
             retry_on_resume = budget_deferred or failure_class in {"transport", "quota", "timeout", "interruption"}
-            reason = "provider_call_budget_exhausted" if budget_deferred else "provider_batch_failed"
+            reason = (
+                "provider_call_budget_reserved_for_clusters" if budget_reserved
+                else "provider_call_budget_exhausted" if budget_deferred else "provider_batch_failed"
+            )
             write_yaml(
                 batch_root / "batch.yml",
                 {

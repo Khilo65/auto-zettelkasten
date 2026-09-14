@@ -3682,7 +3682,7 @@ def test_shared_plan_reserves_cluster_and_gap_calls_before_adjudication(
     assert calls.cumulative_provider_calls == 3
 
 
-def test_shared_plan_fails_before_mandatory_pairs_consume_cluster_budget(
+def test_shared_plan_defers_mandatory_pairs_to_preserve_cluster_budget(
     tmp_path: Path,
 ) -> None:
     source_ids = ["A", *[f"S{index:02d}" for index in range(17)]]
@@ -3743,26 +3743,27 @@ def test_shared_plan_fails_before_mandatory_pairs_consume_cluster_budget(
     calls = _Calls(handler)
     calls.max_calls = 4
     calls.cumulative_provider_calls = 0
-    with pytest.raises(
-        RuntimeError,
-        match="relationship adjudication packet budget conflicts",
-    ):
-        _run(
-            tmp_path,
-            profiles,
-            calls,
-            reasoner=_V8Reasoner(),
-            shared_family_plan=shared_plan,
-            request=LiteratureMapRequest(
-                workspace=tmp_path,
-                provider="test-provider",
-                model="test-model",
-                provider_concurrency=1,
-                literature_policy=LiteratureMappingPolicy(
-                    cluster_generation_enabled=True
-                ),
+    result = _run(
+        tmp_path,
+        profiles,
+        calls,
+        reasoner=_V8Reasoner(),
+        shared_family_plan=shared_plan,
+        request=LiteratureMapRequest(
+            workspace=tmp_path,
+            provider="test-provider",
+            model="test-model",
+            provider_concurrency=1,
+            literature_policy=LiteratureMappingPolicy(
+                cluster_generation_enabled=True
             ),
-        )
+        ),
+    )
+    assert result["relationship_stage_complete"] is False
+    assert result["relationship_retry_on_resume"] is True
+    assert result["parked"]
+    assert all(row["status"] == "pending" and row["reason"] == "provider_call_budget_reserved_for_clusters"
+               for row in result["parked"])
 
     assert [stage for stage, _profiles, _context in calls.seen] == [
         "relationship_candidate_selection"
@@ -3838,26 +3839,27 @@ def test_shared_plan_uses_actual_packet_count_for_cluster_budget(
     calls.cumulative_provider_calls = 0
     reasoner = _V8Reasoner()
     reasoner.context_window_tokens = 10_000
-    with pytest.raises(
-        RuntimeError,
-        match="relationship adjudication packet budget conflicts",
-    ):
-        _run(
-            tmp_path,
-            profiles,
-            calls,
-            reasoner=reasoner,
-            shared_family_plan=shared_plan,
-            request=LiteratureMapRequest(
-                workspace=tmp_path,
-                provider="test-provider",
-                model="test-model",
-                provider_concurrency=1,
-                literature_policy=LiteratureMappingPolicy(
-                    cluster_generation_enabled=True
-                ),
+    result = _run(
+        tmp_path,
+        profiles,
+        calls,
+        reasoner=reasoner,
+        shared_family_plan=shared_plan,
+        request=LiteratureMapRequest(
+            workspace=tmp_path,
+            provider="test-provider",
+            model="test-model",
+            provider_concurrency=1,
+            literature_policy=LiteratureMappingPolicy(
+                cluster_generation_enabled=True
             ),
-        )
+        ),
+    )
+    assert result["relationship_stage_complete"] is False
+    assert result["relationship_retry_on_resume"] is True
+    assert result["parked"]
+    assert all(row["status"] == "pending" and row["reason"] == "provider_call_budget_reserved_for_clusters"
+               for row in result["parked"])
 
     assert [stage for stage, _profiles, _context in calls.seen] == [
         "relationship_candidate_selection",
@@ -5342,13 +5344,17 @@ class _OrdinaryReasoner(_Reasoner):
 
 @pytest.mark.parametrize("provider", ["codex", "deepseek"])
 @pytest.mark.parametrize("reverse", [False, True])
-def test_ordinary_distinct_symmetric_connections_persist_and_replay(tmp_path: Path, provider: str, reverse: bool) -> None:
+@pytest.mark.parametrize("mixed_direction", [False, True])
+def test_ordinary_distinct_connections_persist_and_replay(tmp_path: Path, provider: str, reverse: bool, mixed_direction: bool) -> None:
     profiles = [_profile(source_id) for source_id in "AB"]
     rows = [{**_ordinary_candidate("A", "B"), "relation_type": kind, "reason": reason}
             for kind, reason in (
                 ("complements", "The accounts supply complementary measures of reputation."),
                 ("methodological_fault_line", "The surveys differ in sampling and measurement scope."),
             )]
+    if mixed_direction:
+        rows[0].update(relation_type="supports", actor_source_id="B", reference_source_id="A")
+        rows[1]["relation_type"] = "contextual_connection"
     if reverse:
         rows.reverse()
     calls = _Calls(lambda stage, *_args: {"candidates": rows}
@@ -5380,7 +5386,7 @@ def test_ordinary_partial_connection_envelope_cannot_complete_pair(tmp_path: Pat
     assert len(calls.seen) == 1
 
 
-@pytest.mark.parametrize("kind", ["third_role", "duplicate_bad_member", "negative", "directed"])
+@pytest.mark.parametrize("kind", ["third_role", "duplicate_bad_member", "negative", "directed", "missing_direction"])
 def test_ordinary_multiple_roles_keep_conflicts_and_overflow_blocking(tmp_path: Path, kind: str) -> None:
     rows = [{**_ordinary_candidate("A", "B"), "relation_type": "complements"},
             {**_ordinary_candidate("A", "B"), "relation_type": "methodological_fault_line"}]
@@ -5390,6 +5396,8 @@ def test_ordinary_multiple_roles_keep_conflicts_and_overflow_blocking(tmp_path: 
         rows.append({**rows[1], "reason": ""})
     elif kind == "negative":
         rows[1] = _ordinary_candidate("A", "B", "no_relationship")
+    elif kind == "missing_direction":
+        rows[0].update(relation_type="supports", actor_source_id="A")
     else:
         rows = [{**rows[0], "relation_type": "supports", "actor_source_id": actor,
                  "reference_source_id": reference} for actor, reference in [("A", "B"), ("B", "A")]]
@@ -5520,6 +5528,38 @@ def test_ordinary_acceptance_does_not_require_an_unused_second_call_budget(tmp_p
     assert len(result["accepted"]) == 1
     assert calls.cumulative_provider_calls == 1
     assert result["candidate_dispositions"][0]["disposition"] == "accepted"
+
+
+def test_cluster_reserve_preserves_completed_ordinary_links(tmp_path: Path) -> None:
+    write_yaml(tmp_path / "02_source_memory/indexes/literature_positions.yml", {
+        "positions": [{"current_source_id": "A", "matched_source_id": "C",
+                       "engagement": "Explicit citation.", "literature_position_id": "ac"}],
+    })
+
+    def handler(stage, _profiles, context):
+        assert stage == "relationship_candidate_selection"
+        assert "required_pairs" not in context
+        job_id = context["bridge_jobs"][0]["bridge_job_id"]
+        return {"candidates": [{**_ordinary_candidate("A", "B"), "bridge_job_id": job_id}],
+                "job_outcomes": [{"bridge_job_id": job_id, "status": "no_more_candidates"}]}
+
+    calls = _Calls(handler)
+    calls.max_calls = 2
+    calls.cumulative_provider_calls = 0
+    result = _run(tmp_path, [_profile(s) for s in "ABC"], calls, reasoner=_OrdinaryReasoner(),
+        request=LiteratureMapRequest(tmp_path, provider="test-provider", model="test-model",
+            literature_policy=LiteratureMappingPolicy(cluster_generation_enabled=True)),
+        shared_family_plan={"lean_index_hash": "lean",
+            "literature_families": [{"family_id": "one", "source_ids": ["A", "B"]}],
+            "discovery_jobs": [{"job_id": "one", "family": "one",
+                "left_source_ids": ["A"], "right_source_ids": ["B"], "candidate_quota": 1}]})
+    assert len(result["accepted"]) == 1
+    assert result["relationship_stage_complete"] is False
+    assert result["relationship_retry_on_resume"] is True
+    assert calls.cumulative_provider_calls == 2
+    assert len(result["parked"]) == 1
+    assert result["parked"][0]["status"] == "pending"
+    assert result["parked"][0]["reason"] == "provider_call_budget_reserved_for_clusters"
 
 
 def test_ordinary_negative_remains_current_when_another_source_arrives(tmp_path: Path) -> None:
