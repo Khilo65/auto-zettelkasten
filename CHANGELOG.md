@@ -10,7 +10,8 @@
 - Supported Codex CLI profiles 0.145.0 and 0.152.1 use separate Luna source
   and Terra relationship roles,
   fail-closed tools and credentials, resumable quota/timeout/interruption
-  handling, a four-call automatic concurrency limit, a 1–8 explicit boundary,
+  handling, automatic concurrency of up to four source calls and one literature
+  call, a 1–8 explicit boundary,
   and a fail-fast lock against overlapping local Auto-Zettelkasten Codex runs.
 - With `ocr=auto`, the verified macOS arm64 Codex 0.152.1 companion can send
   the selected original PDF in one source request. Existing file, custody and
@@ -29,5 +30,4 @@
 Artifact schema 1.20 is retained; current profiles use schema 1.4. Historical
 formats remain readable through explicit compatibility paths. The existing
 family planner remains the mapping approach. Incremental retrieval, larger
-scaling comparisons and batching adoption remain deferred. Release validation
-is still in progress.
+scaling comparisons and batching adoption remain deferred.

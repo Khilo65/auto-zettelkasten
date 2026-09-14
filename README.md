@@ -8,7 +8,7 @@ It is a standalone, file-first Python package. It does not require Research OS,
 does not read `zotero.sqlite`, and never writes to Zotero.
 
 > **Release status:** v0.30.0 is a relationship-first alpha release candidate using artifact
-> schema 1.20 and evidence-profile schema 1.3. Mapped gaps are claims about the
+> schema 1.20 and evidence-profile schema 1.4. Mapped gaps are claims about the
 > frozen collection only, never literature-wide novelty claims.
 
 ## What it produces
@@ -65,7 +65,7 @@ workspace/
 ```
 
 One source-reading call produces a source-owned bundle containing the atomic
-analysis, compact profile, evidence anchors, important literature positions,
+analysis, compact profile, important literature positions,
 and missing-source recommendations. Deterministic projectors then write the
 note, profile, indexes, and managed links without asking a model to rewrite
 atomic prose.
@@ -137,8 +137,9 @@ status or note type remain YAML properties and are not written as subject tags.
 
 The source catalogue provides compact title, author, thesis, method, and facet
 entries for model-led relationship discovery without loading every full note.
-Substantive links are adjudicated from two-sided evidence anchors and stored in
-the canonical typed-link registry. Models return relationship records only;
+Models select substantive links from that discovery context; accepted links
+are stored in the canonical typed-link registry. Models return relationship
+records only;
 local code projects reciprocal, explained links into explicit managed graph
 blocks in both atomic notes. Graph projection is committed before any enabled
 cluster synthesis, leaves the source-analysis semantic hash unchanged, and is
@@ -163,9 +164,12 @@ exclude a member from the synthesis.
 Subject tags are projected into Obsidian's native `tags` property. Gap tags
 come only from the originating proposition and finalized related clusters.
 Navigation changes therefore alter a separate `graph_projection_hash`; they do
-not change cluster, proposition, gap, evidence-anchor, or source semantic IDs.
+not change source and analytical artifact identities.
 
-Typed graph relations distinguish `cites`, `cited_by`, `zotero_related`,
+Substantive relationships include support, qualification, complements, contrasts,
+contextual connections and methodological differences, with direction where
+meaningful and a concise rationale. Structural navigation separately includes
+`cites`, `cited_by`, `zotero_related`,
 `same_proposition`, `shared_concept`, `same_case`, `same_method`,
 `same_outcome`, and `semantic_similarity`. Inferred related-note links are
 bounded and include a plain-language reason. Broad shared tags do not create an
@@ -179,17 +183,16 @@ without weakening deterministic agent references.
 
 Debate, agreement, qualification, and contradiction are model judgments made
 from the complete member notes and must remain traceable to those members.
-Publication count remains distinct from effective evidence-base count so
-reprints, overlapping samples, shared datasets, and within-program reports do
-not inflate support. Gap discovery is no longer part of the default map build;
+Historical lineage records retain publication and effective evidence-base counts.
+Gap discovery is no longer part of the default map build;
 existing gap memory remains readable for an explicit downstream workflow.
 
 The generated **Literature Map** is the main human entry point. It reports
 frozen-collection and relationship coverage and points to the source index.
 When clusters are enabled, it also explains unclustered analytical sources and
 catalogs admitted clusters and their verdicts. Preserved historical cluster/gap
-outputs remain linked without being refreshed. Topic neighborhoods and complete
-audit matrices remain machine-readable sidecars.
+outputs remain linked without being refreshed. Topic neighborhoods remain
+machine-readable sidecars.
 
 With `--clusters`, the planner reads compact catalogue entries. Each cluster then receives every
 complete, projection-free atomic note for its proposed members in one
@@ -197,10 +200,10 @@ checkpointed call. The writer may refine the organizing problem, drop a
 decorative member, and arrange specific findings into lines of inquiry. Local
 code validates schemas, source IDs, evidence ownership, and reciprocal
 projection; it does not replace rejected model prose with generic verdicts.
-Independent cluster jobs run concurrently and an unchanged semantic cluster is
+Independent cluster jobs can run concurrently and an unchanged semantic cluster is
 reused across run IDs.
 
-Atomic-note generation uses the complete page-preserving source text and asks
+Atomic-note generation uses the admitted source PDF or recovered source text and asks
 the reader to adapt to the actual source type, including academic studies,
 books, reports, legal or policy documents, archival records, conference notes,
 meeting records, speeches, practitioner guidance, and web publications. The
@@ -377,8 +380,8 @@ separate routes. Configured request deadlines also apply to cluster planning
 and synthesis; the HTTP stream idle allowance follows that deadline up to the
 helper's four-hour ceiling.
 
-The Codex profile uses four concurrent provider calls for source and literature
-work when concurrency is `auto`. An explicit Codex concurrency must be between
+The Codex profile allows up to four concurrent source calls and one literature
+call when concurrency is `auto`. An explicit Codex concurrency must be between
 1 and 8; values above four are intended only for an otherwise idle subscription.
 Overlapping Codex-backed Auto-Zettelkasten runs by the same local user fail
 before launch. This does not coordinate active ChatGPT or Codex work elsewhere.
@@ -544,12 +547,12 @@ notes, evidence profiles, cluster/gap identities, or the underlying collection
 map. Research OS may use the lens for downstream ranking without mutating the
 base map.
 
-Artifact schemas 1.0-1.20 and evidence-profile schemas 1.0-1.3 remain readable.
+Artifact schemas 1.0-1.20 and evidence-profile schemas 1.0-1.4 remain readable.
 The idempotent schema-1.9 migration retires the standalone Literature Neighborhoods Markdown projection, archives superseded current cluster and gap
 projections, preserves historical maps, profiles, analytical identities, and
-atomic-note bytes, and makes no model or Zotero call. Existing schema-1.5
-proposition anchors remain valid; unsupported legacy anchors cannot establish
-strong synthesis until they are lazily reprofiled.
+atomic-note bytes, and makes no model or Zotero call. Historical schema-1.5
+proposition anchors remain readable; current profile generation does not rebuild
+anchor inventories.
 The schema-1.12 migration creates provider-free legacy source bundles where
 safe, retains conflicting variants for review, and moves old machine
 relationships into schema-4 review state without rewriting notes.
