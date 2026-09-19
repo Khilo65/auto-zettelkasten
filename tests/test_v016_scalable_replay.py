@@ -44,7 +44,7 @@ def test_v016_migration_upgrades_previous_prompt_version(tmp_path: Path) -> None
 
     migrate_v016_metadata(tmp_path)
 
-    assert read_yaml(config_path)["prompt_version"] == "15"
+    assert read_yaml(config_path)["prompt_version"] == "16"
 
 
 def test_unchanged_cluster_does_not_append_a_lifecycle_event() -> None:

@@ -19,7 +19,7 @@ def test_map_request_is_versioned_serializable_and_validated(tmp_path: Path) -> 
     )
     assert MapRequest.from_dict(request.to_dict()) == request
     assert request.processing.max_calls_per_document_run == 7
-    assert request.prompt_version == "15"
+    assert request.prompt_version == "16"
     assert request.extraction_version == "2"
     assert request.extraction_policy.ocr == "auto"
     assert "cluster_generation_enabled" not in request.to_dict()["literature_policy"]
@@ -30,7 +30,7 @@ def test_map_request_is_versioned_serializable_and_validated(tmp_path: Path) -> 
     assert MapRequest.from_dict({"workspace": str(tmp_path), "allow_cloud": "false"}).allow_cloud is False
     assert MapRequest.from_dict(
         {"workspace": str(tmp_path), "prompt_version": "11"}
-    ).prompt_version == "15"
+    ).prompt_version == "16"
     with pytest.raises(ValueError, match="allow_cloud must be a boolean"):
         MapRequest(tmp_path, allow_cloud="false")  # type: ignore[arg-type]
     assert MapRequest(tmp_path, allow_cloud=False).allow_cloud is False
@@ -77,7 +77,7 @@ def test_initialize_creates_compatible_file_first_workspace(tmp_path: Path) -> N
     assert config["engine_version"] == "0.30.0"
     assert config["artifact_schema_version"] == "1.20"
     assert config["privacy"]["allow_cloud"] is False
-    assert config["prompt_version"] == "15"
+    assert config["prompt_version"] == "16"
     assert config["extraction"]["version"] == "2"
     assert config["extraction"]["ocr"] == "auto"
     assert config["literature_mapping"]["synthesis_enabled"] is True

@@ -67,6 +67,10 @@ _STRATEGIC_TEMPLATE_MANIFEST_SHA256 = (
 )
 _STRATEGIC_QUESTION = "How do the frozen sources relate?"
 _RAW_CONFIG_SHA256 = (
+    "da0610a09859fff4e6c0f4550a7e9368d4329dc90ab6417f00273badf9a21e50"
+)
+# Preserve the accepted v0.30 prompt-15 config alongside older manifests.
+_PRE_CHAPTER_RAW_CONFIG_SHA256 = (
     "fdf3f6e37af27c660d510b4cda96ad2421554057d10227f31ab9e4f1e3c7acf0"
 )
 # Preserve the exact initialized prompt-14 config for historical manifests.
@@ -1347,7 +1351,7 @@ def _manifest_settings(
         )
         if (
             base.sha256_file(workspace / "auto-zettelkasten.yml")
-            not in {_RAW_CONFIG_SHA256, _LEGACY_RAW_CONFIG_SHA256}
+            not in {_RAW_CONFIG_SHA256, _PRE_CHAPTER_RAW_CONFIG_SHA256, _LEGACY_RAW_CONFIG_SHA256}
             or not _workspace_manifest_is_bound(workspace)
         ):
             raise ValueError("raw E2E workspace identity is not frozen")

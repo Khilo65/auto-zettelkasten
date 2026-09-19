@@ -1,5 +1,14 @@
 # Release notes
 
+## Unreleased
+
+- Book notes request a concise whole-book analysis followed by chapter-by-chapter
+  theses, arguments, evidence/data and qualifications in the existing structure
+  section. Edited-volume authors and partial coverage stay explicit. Shared
+  subscription/API prompts and chunk memos retain chapter attribution without
+  adding model calls or changing article structure. Prompt identities advance to
+  atomic 16 / source bundle 42; historical artifacts remain readable.
+
 ## 0.30.0 — relationship-first release candidate
 
 - New workspaces generate reciprocal typed relationships with clusters and gaps

@@ -24,7 +24,7 @@ from auto_zettelkasten.literature import (
     _cluster_synthesis_profile_projection,
     normalize_evidence_profiles,
 )
-from auto_zettelkasten.notes import read_note
+from auto_zettelkasten.notes import read_note, render_atomic_note
 from auto_zettelkasten.pipeline import (
     SourceBundleQuantitativeProvenanceError,
     _ProfileProviderBudget,
@@ -41,6 +41,7 @@ from auto_zettelkasten.pipeline import (
 )
 from auto_zettelkasten.relationships import stable_hash
 from auto_zettelkasten.readers import (
+    CodexReader,
     DeepSeekReader,
     ProviderError,
     _parse_source_bundle_response,
@@ -155,6 +156,50 @@ def _bundle_payload() -> dict:
         "missing_source_recommendations": [],
         "self_review": {"passed": True},
     }
+
+
+@pytest.mark.parametrize("reader_type", [DeepSeekReader, CodexReader])
+@pytest.mark.parametrize("hierarchical", [False, True])
+def test_book_chapters_survive_shared_reader_and_note_rendering(
+    monkeypatch, reader_type, hierarchical,
+):
+    chapters = (
+        "### 1. Institutions — A. Author\n"
+        "**Thesis and argument:** Monitoring supports implementation.\n"
+        "**Evidence and data:** Two comparative cases (Author, 2024, pp. 12–18).\n\n"
+        "### 2. Limits — B. Contributor\n"
+        "**Argument and qualifications:** Domestic resistance limits monitoring.\n"
+        "**Evidence:** Interview accounts (Contributor, 2024, pp. 30–35)."
+    )
+    payload = _bundle_payload()
+    payload["analysis_sections"]["source_structure_and_organization"] = chapters
+    calls = []
+
+    def generate(self, system, user, *args, **kwargs):
+        calls.append((system, user, kwargs))
+        return json.dumps(payload)
+
+    monkeypatch.setattr(reader_type, "_authorize_request", lambda self: None)
+    monkeypatch.setattr(reader_type, "_generate_with_reasoning", generate)
+    reader = reader_type(model="gpt-5.6-luna" if reader_type is CodexReader else "deepseek-chat")
+    metadata = {"title": "Collected Studies", "_source_context": {
+        "source_id": "source-zotero-A1", "zotero_key": "A1",
+    }}
+    with deny_codex_attempts():
+        result = (
+            reader.synthesize_document_bundle([{"claims_and_findings": chapters}], metadata)
+            if hierarchical else reader.read_source_bundle(chapters, metadata)
+        )
+    assert len(calls) == 1
+    assert "Cover every substantive chapter supplied" in calls[0][0]
+    assert "whole-book account" in calls[0][0]
+    sections = result["analysis_sections"]
+    assert sections["thesis"] == payload["analysis_sections"]["thesis"]
+    assert sections["source_structure_and_organization"] == chapters
+    note = render_atomic_note({"title": "Collected Studies"}, sections)
+    assert chapters in note
+    assert note.count("## Source Structure and Organization\n") == 1
+    assert note.index("## Thesis\n") < note.index("### 1. Institutions") < note.index("### 2. Limits")
 
 
 def test_bundle_is_source_owned_and_optional_rows_are_isolated() -> None:
@@ -1537,7 +1582,7 @@ def test_ordinary_bundle_source_uses_one_call_and_no_profile_or_fidelity_call(
     ]
     assert profile["coverage"]["status"] == "partial"
     note = read_note(tmp_path / report.items[0]["note_path"])
-    assert note["frontmatter"]["source_bundle_prompt_version"] == "41"
+    assert note["frontmatter"]["source_bundle_prompt_version"] == "42"
 
 
 @pytest.mark.parametrize("observed_date", ["", "Published 2019; updated 2024"])

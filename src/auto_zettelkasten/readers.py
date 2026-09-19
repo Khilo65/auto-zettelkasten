@@ -239,7 +239,7 @@ DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
-SOURCE_BUNDLE_PROMPT_VERSION = "41"
+SOURCE_BUNDLE_PROMPT_VERSION = "42"
 SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v3"
 SOURCE_BUNDLE_ROW_LIMITS = {"literature_positions": 8}
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
@@ -5411,6 +5411,24 @@ ATOMIC_CITATION_INSTRUCTION = (
 )
 
 
+BOOK_ANALYSIS_INSTRUCTION = (
+    "For a whole book, use two levels of analysis in this same note. Keep the standard sections a concise "
+    "whole-book account of the central thesis, overall argument, most important detailed findings, evidence, "
+    "data, contributions and limitations. In source_structure_and_organization, add a chapter-by-chapter "
+    "analysis in the book's actual order, using each chapter's number and title as a Markdown subheading. "
+    "Cover every substantive chapter supplied, including the introduction and conclusion when present. "
+    "For each chapter, explain its thesis, argument and reasoning, methods or knowledge basis, supporting "
+    "evidence, data and examples, findings, important qualifications, and contribution to the book. Make each "
+    "chapter summary useful independently; adapt its internal headings to its content and avoid repeated "
+    "whole-book commentary or empty template sections. For edited volumes, name each chapter's author(s) "
+    "when recoverable and distinguish contributors' arguments from editors' framing. Attach the requested "
+    "author-date-page citations to chapter findings, quotations, evidence and definitions too. For partial "
+    "books, summarize only chapters or portions actually supplied and state the missing coverage; a contents "
+    "entry alone is not chapter evidence. Do not invent missing titles or chapter content. For a standalone "
+    "article or individual chapter, retain the standard integrated analysis and concise navigation outline. "
+)
+
+
 def _system_prompt() -> str:
     keys = ", ".join(REQUIRED_SECTION_KEYS)
     return (
@@ -5428,13 +5446,13 @@ def _system_prompt() -> str:
         "a section, heading, or explicit text anchor. Clearly label a source-grounded paraphrase as a paraphrase, never present it "
         "as a quotation, and never invent a page number. Use concise Markdown bullets such as '**Term** — “source wording” (Author, Date, p. 12).' "
         "If no qualifying definition exists, omit key_concepts_and_definitions entirely; do not return a placeholder. "
-        "The optional source_structure_and_organization field is a short source-native navigation outline, not an argument map. "
+        "For sources other than whole books, the optional source_structure_and_organization field is a short source-native navigation outline, not an argument map. "
         "Include it only when headings are recoverable. Preserve the source's actual order and titles: for an article or chapter, "
-        "include major headings and only consequential first-level subheadings; for a book, include chapters and only essential "
-        "subchapters; for an edited volume, include recoverable chapter titles and authors. Add brief page ranges or other supplied "
+        "include major headings and only consequential first-level subheadings. Add brief page ranges or other supplied "
         "locators when available. For a partial source, label the outline partial and include only visible structure. Use concise nested "
         "Markdown bullets. Do not infer missing headings, invent a table of contents, reproduce minor subheadings, or encode links among "
         "claims. Omit source_structure_and_organization entirely when reliable structure is unavailable. "
+        f"{BOOK_ANALYSIS_INSTRUCTION}"
         "Always preserve source-reported numbers, their original scale, comparison, reference group, denominator, and uncertainty. "
         "A simple derived explanation is allowed only when every required input is explicit in the source; label it as derived, retain "
         "the original statistic beside it, and never invent a missing baseline, denominator, model quantity, or uncertainty measure. "
@@ -5496,9 +5514,8 @@ def _source_bundle_system_prompt() -> str:
         "between people interviewed and those merely contacted. Attribute claims to the correct author or speaker, and preserve the scope of table labels "
         "and marked footnotes. Explain the important results in plain English alongside their technical meaning. "
         "Adapt to the source: retain case selection and chronology in qualitative work, assumptions and logical "
-        "steps in theoretical work, and the evidence behind practical recommendations. For books, distinguish "
-        "the author's argument from editors' framing and individual contributors' arguments. Summarize consequential "
-        "chapters with their authors, theses, evidence or methods and contributions when recoverable. "
+        "steps in theoretical work, and the evidence behind practical recommendations. "
+        f"{BOOK_ANALYSIS_INSTRUCTION}"
         "Use useful page, chapter, heading or table references when supplied. Keep exact quotations faithful to "
         "the source wording and distinguish them from paraphrases. Stay within the recovered content. "
         "key_concepts_and_definitions is optional: include consequential definitions or operationalizations "
@@ -6722,6 +6739,9 @@ def _chunk_system_prompt() -> str:
         "Return only one JSON object and do not infer facts absent from the chunk. "
         f"Every returned value must be a non-empty string. Required keys: {keys}. "
         "Preserve concrete claims, methods, data, qualifications, and contradictions, but avoid prose repetition. "
+        "For book content, keep each visible chapter's thesis, argument, evidence, data, examples and qualifications "
+        "associated with its title, author and locators in the existing memo fields, so final synthesis can "
+        "summarize chapters separately. Mark partial chapters; do not infer unseen chapter content. "
         "In methods_and_data, prioritize substantively engaged works supporting the chunk’s principal "
         "arguments and case studies. Retain their explicit authors, publication years, and titles. For each "
         "retained work, distinguish its own methods from methods it reports from others, retain any "

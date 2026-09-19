@@ -1130,21 +1130,21 @@ def test_raw_workspace_config_hash_matches_current_initialized_config(
     )
 
 
-@pytest.mark.parametrize("prompt_version", ["14", "15"])
+@pytest.mark.parametrize("prompt_version", ["14", "15", "16"])
 def test_raw_workspace_binds_exact_current_and_legacy_config(
     tmp_path: Path, prompt_version: str,
 ) -> None:
     manifest = _manifest(tmp_path / "private")
     config = manifest.parent / "auto-zettelkasten.yml"
     config.write_text(
-        config.read_text().replace("prompt_version: '15'", f"prompt_version: '{prompt_version}'"),
+        config.read_text().replace("prompt_version: '16'", f"prompt_version: '{prompt_version}'"),
         encoding="utf-8",
     )
-    assert sha256_file(config) == (
-        runner._LEGACY_RAW_CONFIG_SHA256
-        if prompt_version == "14"
-        else runner._RAW_CONFIG_SHA256
-    )
+    assert sha256_file(config) == {
+        "14": runner._LEGACY_RAW_CONFIG_SHA256,
+        "15": runner._PRE_CHAPTER_RAW_CONFIG_SHA256,
+        "16": runner._RAW_CONFIG_SHA256,
+    }[prompt_version]
     _, settings = runner._manifest_settings(manifest, sha256_file(manifest))
     assert settings.kind == "raw_e2e"
 
