@@ -1566,7 +1566,11 @@ def lean_discovery_projection(
         method = (
             context.get("method_or_knowledge_basis")
             or profile.get("method")
-            or next(iter(profile.get("methods", []) or []), "")
+            or "; ".join(dict.fromkeys(
+                _normalized_discovery_text(value)
+                for value in profile.get("methods", []) or []
+                if _normalized_discovery_text(value)
+            ))
             or entry.get("method")
         )
         facets = {

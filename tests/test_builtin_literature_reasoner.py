@@ -575,7 +575,7 @@ class _ExplicitReasoner:
         context: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
         self.profile_calls += 1
-        assert context and context["profile_prompt_version"] == "7"
+        assert context and context["profile_prompt_version"] == "8"
         return _profile_response(str(note["committed_note"]), "explicit-profile")
 
     def propose_clusters(
@@ -1226,7 +1226,7 @@ def test_stale_mechanical_profile_refresh_preserves_inspected_source_content_wit
     )
     profile.validity.update(
         {
-            "profile_prompt_version": "7",
+            "profile_prompt_version": "8",
             "classifier_version": "3",
             "algorithm_version": "10",
             "legacy_profile_upgraded_mechanically": True,
@@ -1537,7 +1537,7 @@ def test_builtin_profile_prompt_requests_compact_note_based_discovery(
 
     profile = reader.profile_source(
         {"profile_prompt": "committed note only"},
-        context={"profile_prompt_version": "7"},
+        context={"profile_prompt_version": "8"},
     )
     assert profile["profile_schema_version"] == "1.4"
     assert "evidence_anchors" not in profile

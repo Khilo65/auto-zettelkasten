@@ -53,7 +53,7 @@ from auto_zettelkasten.profiles import (
 
 def test_profile_versions_are_explicit() -> None:
     assert PROFILE_SCHEMA_VERSION == "1.4"
-    assert PROFILE_PROMPT_VERSION == profiles.profile_prompt_version == "7"
+    assert PROFILE_PROMPT_VERSION == profiles.profile_prompt_version == "8"
     assert PROFILE_CLASSIFIER_VERSION == profiles.profile_classifier_version == "3"
     assert PROFILE_ALGORITHM_VERSION == profiles.profile_algorithm_version == "10"
     assert ANCHOR_ALGORITHM_VERSION == "4"
@@ -402,7 +402,7 @@ def test_analytical_note_is_extracted_and_validated_from_committed_markdown() ->
         "coverage_gate": "passed",
         "full_document": True,
     }
-    assert profile.validity["profile_prompt_version"] == "7"
+    assert profile.validity["profile_prompt_version"] == "8"
     assert profile.validity["classifier_version"] == "3"
     assert profile.validity["algorithm_version"] == "10"
     assert profile.research_questions
@@ -675,7 +675,7 @@ def test_profile_fingerprint_includes_every_declared_dependency() -> None:
     payload = profile_dependency_payload(note, **kwargs)
 
     assert payload["note_semantic_hash"] == shared_semantic_note_hash(note)
-    assert payload["profile_prompt_version"] == "7"
+    assert payload["profile_prompt_version"] == "8"
     assert payload["classifier_version"] == "3"
     assert payload["algorithm_version"] == "10"
     assert payload["profile_schema_version"] == "1.4"
@@ -700,7 +700,7 @@ def test_profile_fingerprint_includes_every_declared_dependency() -> None:
         note, **{**kwargs, "policy": {"max_profile_calls": 21}}
     )
     assert baseline != profile_dependency_fingerprint(
-        note, **kwargs, profile_prompt_version="8"
+        note, **kwargs, profile_prompt_version="9"
     )
     assert baseline != profile_dependency_fingerprint(
         note, **kwargs, profile_classifier_version="4"

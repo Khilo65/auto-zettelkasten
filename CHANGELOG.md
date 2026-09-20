@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Preserve applicable variable roles in atomic notes and compact descriptions, and
+  recognize useful cross-role relationships without inferring effects from controls.
+  Discovery retains all standalone method entries. Shared subscription/API prompts
+  advance to atomic 17, source bundle 43, profile 8, family 15 and discovery 24.
+
 - Book notes request a concise whole-book analysis followed by chapter-by-chapter
   theses, arguments, evidence/data and qualifications in the existing structure
   section. Edited-volume authors and partial coverage stay explicit. Shared

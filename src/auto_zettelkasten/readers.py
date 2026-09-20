@@ -239,7 +239,7 @@ DEFAULT_CHUNK_OUTPUT_TOKENS = 1_024
 SOURCE_CHUNK_MAX_OUTPUT_TOKENS = 8_000
 PROFILE_MAX_OUTPUT_TOKENS = 16_000
 SOURCE_BUNDLE_MAX_OUTPUT_TOKENS = 64_000
-SOURCE_BUNDLE_PROMPT_VERSION = "42"
+SOURCE_BUNDLE_PROMPT_VERSION = "43"
 SOURCE_BUNDLE_ENVELOPE_CONTRACT = "source-bundle-envelope-v3"
 SOURCE_BUNDLE_ROW_LIMITS = {"literature_positions": 8}
 LITERATURE_MAX_OUTPUT_TOKENS = 8_000
@@ -2105,14 +2105,14 @@ class _CapabilityAwareReader:
         question: str | None = None,
         context: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
-        """Generate profile-prompt-v7 JSON from committed note text only."""
+        """Generate profile-prompt-v8 JSON from committed note text only."""
 
         del (
             question
         )  # A question is a projection lens, not part of the base evidence profile.
         self._authorize_request()
-        prompt_version = str((context or {}).get("profile_prompt_version") or "7")
-        if prompt_version != "7":
+        prompt_version = str((context or {}).get("profile_prompt_version") or "8")
+        if prompt_version != "8":
             raise ProviderError(f"unsupported profile prompt version: {prompt_version}")
         user_prompt = str(note.get("profile_prompt") or "").strip()
         if not user_prompt:
@@ -5411,6 +5411,31 @@ ATOMIC_CITATION_INSTRUCTION = (
 )
 
 
+VARIABLE_ROLE_INSTRUCTION = (
+    "Where applicable, describe dependent outcomes, explanatory variables or treatments, mediators, "
+    "moderators, controls and rival explanations, preserving their roles and important definitions or "
+    "measurements in the existing methods and evidence sections with source citations. Distinguish "
+    "inclusion in a study design from findings established about a variable; inclusion as a control "
+    "does not establish an effect. For qualitative work, retain explanatory factors, mechanisms, case "
+    "comparisons and alternative explanations in the source's own terms. Interpretive and nonacademic "
+    "sources should retain their appropriate conceptual structure, without a compulsory variable checklist. "
+)
+
+
+COMPACT_VARIABLE_ROLE_INSTRUCTION = (
+    "Preserve important variable-role distinctions in the existing method, mechanism and outcome fields. "
+    "Keep controls and design roles in the method description; do not recast controls as outcomes or "
+    "causal mechanisms to fit a field. Retain only distinctions supplied by the source or note. "
+)
+
+
+VARIABLE_ROLE_LINKING_INSTRUCTION = (
+    "Meaningful connections may involve a construct playing different analytical roles across works "
+    "and different outcomes. Shared variables are opportunities for judgment, not automatic links; "
+    "explain the specific joint-reading value without treating a control's inclusion as evidence of an effect. "
+)
+
+
 BOOK_ANALYSIS_INSTRUCTION = (
     "For a whole book, use two levels of analysis in this same note. Keep the standard sections a concise "
     "whole-book account of the central thesis, overall argument, most important detailed findings, evidence, "
@@ -5453,6 +5478,7 @@ def _system_prompt() -> str:
         "Markdown bullets. Do not infer missing headings, invent a table of contents, reproduce minor subheadings, or encode links among "
         "claims. Omit source_structure_and_organization entirely when reliable structure is unavailable. "
         f"{BOOK_ANALYSIS_INSTRUCTION}"
+        f"{VARIABLE_ROLE_INSTRUCTION}"
         "Always preserve source-reported numbers, their original scale, comparison, reference group, denominator, and uncertainty. "
         "A simple derived explanation is allowed only when every required input is explicit in the source; label it as derived, retain "
         "the original statistic beside it, and never invent a missing baseline, denominator, model quantity, or uncertainty measure. "
@@ -5516,6 +5542,7 @@ def _source_bundle_system_prompt() -> str:
         "Adapt to the source: retain case selection and chronology in qualitative work, assumptions and logical "
         "steps in theoretical work, and the evidence behind practical recommendations. "
         f"{BOOK_ANALYSIS_INSTRUCTION}"
+        f"{VARIABLE_ROLE_INSTRUCTION}"
         "Use useful page, chapter, heading or table references when supplied. Keep exact quotations faithful to "
         "the source wording and distinguish them from paraphrases. Stay within the recovered content. "
         "key_concepts_and_definitions is optional: include consequential definitions or operationalizations "
@@ -5528,6 +5555,7 @@ def _source_bundle_system_prompt() -> str:
         "For an inapplicable required section, state briefly why it does not apply to this source. "
         "compact_profile contains thesis, method_or_knowledge_basis, source_genre, inferential_design, "
         "and bounded arrays for mechanisms, outcomes, cases, populations, periods and datasets. "
+        f"{COMPACT_VARIABLE_ROLE_INSTRUCTION}"
         "Use recoverable dataset identities. literature_positions contains up to eight distinct important "
         "substantively engaged works, or an empty array. Each row uses raw_citation, author, year, title, "
         "identifiers, engagement, relation_label and locator; retain one work per row and leave unknown metadata "
@@ -5665,6 +5693,7 @@ def _profile_system_prompt() -> str:
         "Create a compact discovery profile from the supplied committed atomic note. "
         "Use the note's research questions, concepts, methods, mechanisms, cases, populations, "
         "outcomes and scope to make its contribution discoverable across literatures. "
+        f"{COMPACT_VARIABLE_ROLE_INSTRUCTION}"
         "Preserve source attribution and limitations. Return only the requested JSON shape; "
         "the engine supplies identity, coverage and persistence metadata."
     )
@@ -5696,13 +5725,14 @@ def _relationship_bridge_shard_system_prompt() -> str:
 
 def _relationship_candidate_system_prompt() -> str:
     return (
-        "Auto-Zettelkasten ordinary relationship prompt v23, contract relationship-decision-v11. "
+        "Auto-Zettelkasten ordinary relationship prompt v24, contract relationship-decision-v11. "
         "Identify intellectually meaningful relationships across works, disciplines, and levels of abstraction. "
         "Reason from substantive contributions rather than shared vocabulary alone. Recognize connections "
         "that broaden understanding or bring different ideas into productive relation. Distinguish useful "
         "connections from arbitrary associations, and do not attribute claims to a work that it does not make. "
         "Use the supplied compact note content; navigation goals and family labels are hypotheses, not evidence. "
         "A contextual or analytical bridge need not share a research question, method, population, or period. "
+        f"{VARIABLE_ROLE_LINKING_INSTRUCTION}"
         "Keep explanations as specific as the supplied content supports, without inventing detailed findings, "
         "causal claims, or author engagement. These are final ordinary link decisions; no later model adds an explanation. "
         "Return one JSON object with candidates and job_outcomes arrays. Each candidate contains only "
@@ -5870,7 +5900,7 @@ def _cluster_proposal_system_prompt() -> str:
 def _literature_family_plan_system_prompt() -> str:
     return (
         "You are the shared literature-family planner for Auto-Zettelkasten "
-        "cluster plan prompt v14. Read the supplied labeled source-index shard jobs. Return one "
+        "cluster plan prompt v15. Read the supplied labeled source-index shard jobs. Return one "
         "JSON object with literature_families, discovery_jobs, neighboring_families, and "
         "source_dispositions arrays. A family has family_id, label, "
         "organizing_problem, source_ids, proposed_roles, and candidate_cluster. "
@@ -5891,6 +5921,7 @@ def _literature_family_plan_system_prompt() -> str:
         "Include a source only when its supplied content supports a plausible contribution to the organizing problem. "
         "A currently unclustered source still needs discovery jobs for plausible comparisons. "
         "Consider a source's full supplied thesis and method, not only one outcome. "
+        f"{VARIABLE_ROLE_LINKING_INSTRUCTION}"
         "Direct contributions to a bounded comparison may use different constructs, instruments, "
         "populations, or periods; explain those differences rather than requiring identical measures. "
         "Inspect the whole inventory and identify specific research problems, "
@@ -6739,6 +6770,8 @@ def _chunk_system_prompt() -> str:
         "Return only one JSON object and do not infer facts absent from the chunk. "
         f"Every returned value must be a non-empty string. Required keys: {keys}. "
         "Preserve concrete claims, methods, data, qualifications, and contradictions, but avoid prose repetition. "
+        "In the existing memo fields, preserve supplied variable roles, measurements and distinctions between "
+        "design choices and established findings, including controls and qualitative rival explanations. "
         "For book content, keep each visible chapter's thesis, argument, evidence, data, examples and qualifications "
         "associated with its title, author and locators in the existing memo fields, so final synthesis can "
         "summarize chapters separately. Mark partial chapters; do not infer unseen chapter content. "

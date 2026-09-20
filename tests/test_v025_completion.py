@@ -29,7 +29,7 @@ from auto_zettelkasten.relationships import (
 def test_v29_4_relationship_packet_and_family_plan_limits() -> None:
     prompt = _relationship_adjudication_system_prompt()
     assert RELATIONSHIP_PROMPT_VERSION == "35"
-    assert RELATIONSHIP_DISCOVERY_PROMPT_VERSION == "23"
+    assert RELATIONSHIP_DISCOVERY_PROMPT_VERSION == "24"
     assert "relationship prompt v35" in prompt
     assert "Use contextual_connection" in prompt
     assert "different operationalizations, instruments, samples, or periods" in prompt
@@ -37,9 +37,9 @@ def test_v29_4_relationship_packet_and_family_plan_limits() -> None:
     assert "every ID appears exactly once" in prompt
     assert _RELATIONSHIP_BATCH_MAX_JOBS == 8
     assert LITERATURE_FAMILY_PLAN_MAX_OUTPUT_TOKENS == 128_000
-    assert LITERATURE_FAMILY_PLAN_PROMPT_VERSION == "14"
+    assert LITERATURE_FAMILY_PLAN_PROMPT_VERSION == "15"
     family_prompt = _literature_family_plan_system_prompt()
-    assert "cluster plan prompt v14" in family_prompt
+    assert "cluster plan prompt v15" in family_prompt
     assert "candidate_cluster=true" in family_prompt
     assert "candidate_cluster=false" in family_prompt
     assert "routing-only grouping" in family_prompt
