@@ -13,6 +13,7 @@ from test_v030_linking_experiment_direct import adapt_response, candidate, input
 @pytest.mark.parametrize("provider", ["codex", "deepseek"])
 @pytest.mark.parametrize("failure", ["wrong_valid_id", "swapped_titles", "missing_title"])
 def test_provider_guard_preserves_bad_row_and_ordinary_ingestion_excludes_it(monkeypatch, provider, failure):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     rows, _ = inputs()
     good = candidate()
     bad = candidate("source-2", "source-3")

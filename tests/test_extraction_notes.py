@@ -39,11 +39,25 @@ def test_text_and_html_extraction_are_source_only() -> None:
     assert "Synthetic source" in html.text
 
 
-def test_blank_pdf_is_classified_for_vision_or_review_parking() -> None:
+@pytest.mark.parametrize(
+    ("ocr_available", "expected_reason"),
+    [(False, "unresolved_textual_pages"), (True, "empty_or_scanned_pdf")],
+)
+def test_blank_pdf_is_classified_for_vision_or_review_parking(
+    monkeypatch, ocr_available: bool, expected_reason: str,
+) -> None:
+    from auto_zettelkasten import extraction
+
+    monkeypatch.setattr(
+        extraction, "_ocr_pdf_page",
+        lambda *args, **kwargs: extraction._OCRPageResult(
+            available=ocr_available, nonprose_or_blank=ocr_available,
+        ),
+    )
     result = extract_bytes(_minimal_pdf(""), media_type="application/pdf", filename="scan.pdf")
     assert result.status == "failed"
     assert result.route == "pypdf_text"
-    assert result.reason in {"empty_or_scanned_pdf", "pdf_error:PdfStreamError"}
+    assert result.reason == expected_reason
 
 
 def test_pdf_heading_candidates_do_not_promote_author_initials() -> None:

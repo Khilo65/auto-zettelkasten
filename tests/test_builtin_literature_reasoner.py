@@ -1905,6 +1905,7 @@ def test_builtin_reader_executes_typed_collection_reasoning_calls(
 def test_cluster_calls_honor_configured_deadline(monkeypatch, tmp_path, provider, deadline):
     from auto_zettelkasten.literature import _cluster_plan_call_settings
 
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     reader = (reader_module.CodexReader("gpt-5.6-terra", allow_cloud=True, request_deadline=deadline)
               if provider == "codex" else DeepSeekReader(allow_cloud=True, request_deadline=deadline))
     request = LiteratureMapRequest(tmp_path, allow_cloud=True)

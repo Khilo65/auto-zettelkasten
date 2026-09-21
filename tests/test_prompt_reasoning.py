@@ -390,6 +390,7 @@ def test_gap_prompt_rejects_invented_resolution_details() -> None:
 def test_ordinary_relationship_request_defines_sequence_direction(
     monkeypatch: pytest.MonkeyPatch, provider: str,
 ) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     reader = (
         CodexReader(model="gpt-5.6-terra", allow_cloud=True)
         if provider == "codex" else DeepSeekReader(allow_cloud=True)

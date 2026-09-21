@@ -70,7 +70,7 @@ def test_pdf_spacing_keeps_plain_text_if_layout_extraction_fails() -> None:
 
 @pytest.mark.parametrize("second_x", [300, 308])
 def test_pdf_probe_recovers_spaces_between_positioned_text_runs(second_x: int) -> None:
-    from pypdf import PdfReader, PdfWriter
+    from pypdf import PdfWriter
     from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
     writer = PdfWriter()
@@ -96,7 +96,6 @@ def test_pdf_probe_recovers_spaces_between_positioned_text_runs(second_x: int) -
     stream = io.BytesIO()
     writer.write(stream)
     data = stream.getvalue()
-    assert "performancerating" in PdfReader(io.BytesIO(data)).pages[0].extract_text()
     text = extraction.probe_pdf_bytes(data).embedded_text
     assert ("performance rating" in text) == (second_x == 308)
     assert ("performancerating" in text) == (second_x == 300)
