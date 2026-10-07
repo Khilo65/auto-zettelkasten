@@ -31,7 +31,9 @@ from .literature import (
 )
 from .migration import finalize_v029_lean_state, migrate_workspace
 from .models import (
+    CODEX_SOURCE_MODELS,
     CURRENT_ATOMIC_PROMPT_VERSION,
+    DEFAULT_CODEX_SOURCE_MODEL,
     ArtifactManifest,
     ExtractionPolicy,
     LiteratureMapReport,
@@ -2535,7 +2537,7 @@ def build_map(
     map_request = MapRequest(
         workspace=root,
         provider=provider,
-        model="gpt-5.6-luna" if provider == "codex" else model,
+        model=DEFAULT_CODEX_SOURCE_MODEL if provider == "codex" else model,
         literature_model=(
             model if provider == "codex" and policy.synthesis_enabled else None
         ),
@@ -2939,8 +2941,8 @@ def _provider_check(
             literature_config.get("synthesis_enabled", True)
         )
         role_error = ""
-        if model not in {"gpt-5.6-luna", "gpt-5.6-sol"}:
-            role_error = "Codex source model must be gpt-5.6-luna or gpt-5.6-sol"
+        if model not in CODEX_SOURCE_MODELS:
+            role_error = "Codex source model must be gpt-6-luna, gpt-5.6-luna, or gpt-5.6-sol"
         elif synthesis_enabled and not literature_model:
             role_error = "Codex synthesis requires literature_model"
         elif literature_model and literature_model not in {

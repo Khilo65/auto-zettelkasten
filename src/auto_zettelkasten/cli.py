@@ -21,6 +21,7 @@ from .api import (
 )
 from .models import (
     CURRENT_ATOMIC_PROMPT_VERSION,
+    DEFAULT_CODEX_SOURCE_MODEL,
     ExtractionPolicy,
     LiteratureMappingPolicy,
     MapRequest,
@@ -31,6 +32,7 @@ from .migration import migrate_workspace
 from .workspace import load_config
 
 DEFAULT_MODELS = {
+    "codex": DEFAULT_CODEX_SOURCE_MODEL,
     "deepseek": "deepseek-v4-flash",
     "gemini": "gemini-2.5-flash",
     "ollama": "llama3.2",

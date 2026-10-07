@@ -333,6 +333,12 @@ consent.
 
 ### Codex CLI provider
 
+New `map` and `sync` runs default to `gpt-6-luna` for Codex source workers when
+no source model is explicitly configured. Saved configurations and resumed runs
+retain their recorded model. Source-worker upgrades follow the latest verified
+cheapest compatible GPT tier; each upgrade requires capability and regression
+checks before updating the default. Literature models are configured separately.
+
 Codex support uses a local `codex` CLI process authenticated through an
 existing ChatGPT subscription. It is a cloud provider, not a local model.
 Supported pinned CLI profiles are 0.145.0 and 0.152.1; source and literature
@@ -345,7 +351,7 @@ auto-zettelkasten map \
   --scope collection \
   --collection COLLECTION_KEY \
   --provider codex \
-  --model gpt-5.6-luna \
+  --model gpt-6-luna \
   --literature-model gpt-5.6-terra \
   --reasoning-effort medium \
   --provider-concurrency auto \
@@ -359,7 +365,7 @@ The equivalent workspace configuration is:
 
 ```yaml
 provider: codex
-model: gpt-5.6-luna
+model: gpt-6-luna
 literature_model: gpt-5.6-terra
 reasoning_effort: medium
 ```

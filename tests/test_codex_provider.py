@@ -1361,8 +1361,10 @@ def test_codex_diagnostics_redact_credentials_and_account_identity(
     assert "data:application/pdf;base64,[REDACTED]" in str(failure)
 
 
+@pytest.mark.parametrize("source_model", ["gpt-5.6-luna", "gpt-6-luna"])
 def test_codex_doctor_checks_both_requested_model_roles(
     monkeypatch: pytest.MonkeyPatch,
+    source_model: str,
 ) -> None:
     captured: dict[str, object] = {}
 
@@ -1391,7 +1393,7 @@ def test_codex_doctor_checks_both_requested_model_roles(
     monkeypatch.setattr("auto_zettelkasten.api.codex_preflight_status", preflight)
     status = _provider_check(
         "codex",
-        "gpt-5.6-luna",
+        source_model,
         {
             "literature_model": "gpt-5.6-terra",
             "reasoning_effort": "high",
@@ -1409,13 +1411,13 @@ def test_codex_doctor_checks_both_requested_model_roles(
     assert "credential" not in json.dumps(status)
     assert "synthetic-person" not in json.dumps(status)
     assert captured == {
-        "model": "gpt-5.6-luna",
+        "model": source_model,
         "effort": "high",
         "additional_models": ("gpt-5.6-terra",),
     }
     assert _provider_check(
         "codex",
-        "gpt-5.6-luna",
+        source_model,
         {"literature_mapping": {"synthesis_enabled": False}},
     )["status"] == "configured"
 
@@ -1786,7 +1788,7 @@ for line in sys.stdin:
     elif method == "thread/start":
         provider = "other" if mode == "wrong_provider" else "openai"
         print(json.dumps({"id": request_id, "result": {
-            "model": "gpt-5.6-luna",
+            "model": message["params"]["model"],
             "modelProvider": provider,
             "thread": {
                 "id": "thread-1",
@@ -1922,9 +1924,11 @@ def _fake_pdf_preflight(
     return status
 
 
+@pytest.mark.parametrize("source_model", ["gpt-5.6-luna", "gpt-6-luna"])
 def test_codex_pdf_app_server_sends_exact_ordered_file_text_and_contract(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    source_model: str,
 ) -> None:
     executable = tmp_path / "auto-zettelkasten-codex"
     capture = tmp_path / "capture.json"
@@ -1932,7 +1936,7 @@ def test_codex_pdf_app_server_sends_exact_ordered_file_text_and_contract(
     pdf = tmp_path / "source.pdf"
     pdf_bytes = b"%PDF-1.7\nprivate-pdf-sentinel\n%%EOF\n"
     pdf.write_bytes(pdf_bytes)
-    reader = CodexReader("gpt-5.6-luna", allow_cloud=True)
+    reader = CodexReader(source_model, allow_cloud=True)
     reader._preflight = _fake_pdf_preflight(tmp_path, executable, monkeypatch)
 
     result = reader.read_source_bundle(
@@ -1963,7 +1967,7 @@ def test_codex_pdf_app_server_sends_exact_ordered_file_text_and_contract(
         "turn/start",
     ]
     thread = requests[1]["params"]
-    assert thread["model"] == "gpt-5.6-luna"
+    assert thread["model"] == source_model
     assert thread["ephemeral"] is True
     injected = requests[2]["params"]["items"]
     assert len(injected) == 1
@@ -1986,7 +1990,7 @@ def test_codex_pdf_app_server_sends_exact_ordered_file_text_and_contract(
     )
     turn = requests[3]["params"]
     assert turn["input"] == []
-    assert turn["model"] == "gpt-5.6-luna"
+    assert turn["model"] == source_model
     assert turn["effort"] == "medium"
     assert turn["approvalPolicy"] == "never"
     assert turn["sandboxPolicy"] == {
@@ -3146,10 +3150,12 @@ def _synthetic_blank_pdf(title: str) -> bytes:
     return stream.getvalue()
 
 
+@pytest.mark.parametrize("source_model", ["gpt-5.6-luna", "gpt-6-luna"])
 def test_public_codex_map_runs_relationships_and_replays_without_calls_or_semantic_changes(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     sample_items: list[dict[str, object]],
+    source_model: str,
 ) -> None:
     provider_root = tmp_path / "provider"
     provider_root.mkdir()
@@ -3209,7 +3215,7 @@ def test_public_codex_map_runs_relationships_and_replays_without_calls_or_semant
     request = MapRequest(
         workspace,
         provider="codex",
-        model="gpt-5.6-luna",
+        model=source_model,
         literature_model="gpt-5.6-terra",
         reasoning_effort="medium",
         allow_cloud=True,
@@ -3229,7 +3235,7 @@ def test_public_codex_map_runs_relationships_and_replays_without_calls_or_semant
 
     assert first.status == "completed"
     assert first.validated_note_count == 2
-    assert preflight_calls == [("gpt-5.6-luna", ("gpt-5.6-terra",))]
+    assert preflight_calls == [(source_model, ("gpt-5.6-terra",))]
     calls = [json.loads(line) for line in calls_path.read_text().splitlines()]
     assert {
         contract: sum(row["contract"] == contract for row in calls)
@@ -3240,7 +3246,7 @@ def test_public_codex_map_runs_relationships_and_replays_without_calls_or_semant
         "literature_family_plan": 1,
         "cluster_synthesis": 1,
     }
-    assert {row["model"] for row in calls if row["contract"] == "source_bundle"} == {"gpt-5.6-luna"}
+    assert {row["model"] for row in calls if row["contract"] == "source_bundle"} == {source_model}
     assert any(row["contract"] == "literature_family_plan" for row in calls)
     assert any(row["contract"] == "relationship_candidate_selection" for row in calls)
     assert not any(row["contract"] == "relationship_adjudication" for row in calls)
@@ -3253,7 +3259,7 @@ def test_public_codex_map_runs_relationships_and_replays_without_calls_or_semant
         "thread/inject_items",
         "turn/start",
     ]
-    assert requests[1]["params"]["model"] == "gpt-5.6-luna"
+    assert requests[1]["params"]["model"] == source_model
     input_file = requests[2]["params"]["items"][0]["content"][0]
     assert input_file["type"] == "input_file"
     assert input_file["filename"] == "ITEMAPDF.pdf"
@@ -3338,7 +3344,7 @@ def test_public_codex_map_runs_relationships_and_replays_without_calls_or_semant
     assert replay.status == "completed"
     assert replay.source_set["source_set_id"] == first.source_set["source_set_id"]
     assert replay.source_set["dependency_hash"] == first.source_set["dependency_hash"]
-    assert preflight_calls == [("gpt-5.6-luna", ("gpt-5.6-terra",))]
+    assert preflight_calls == [(source_model, ("gpt-5.6-terra",))]
     assert calls_path.read_bytes() == before_calls
     assert app_server_capture.read_bytes() == before_app_server_capture
     after_files = semantic_snapshot()

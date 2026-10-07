@@ -12,6 +12,10 @@ CURRENT_ENGINE_VERSION = "0.30.0"
 CURRENT_ARTIFACT_SCHEMA_VERSION = "1.20"
 CURRENT_PROFILE_SCHEMA_VERSION = "1.4"
 CURRENT_ATOMIC_PROMPT_VERSION = "17"
+DEFAULT_CODEX_SOURCE_MODEL = "gpt-6-luna"
+CODEX_SOURCE_MODELS = frozenset(
+    {DEFAULT_CODEX_SOURCE_MODEL, "gpt-5.6-luna", "gpt-5.6-sol"}
+)
 
 
 FAMILY_RELATION_TYPES = frozenset(
@@ -722,8 +726,8 @@ class MapRequest:
         if self.provider == "codex":
             if self.provider_concurrency is None:
                 object.__setattr__(self, "provider_concurrency", "auto")
-            if self.model not in {"gpt-5.6-luna", "gpt-5.6-sol"}:
-                raise ValueError("Codex source model must be gpt-5.6-luna or gpt-5.6-sol")
+            if self.model not in CODEX_SOURCE_MODELS:
+                raise ValueError("Codex source model must be gpt-6-luna, gpt-5.6-luna, or gpt-5.6-sol")
             if self.literature_policy.synthesis_enabled and not self.literature_model:
                 raise ValueError("Codex synthesis requires literature_model")
             if self.literature_model and self.literature_model not in {

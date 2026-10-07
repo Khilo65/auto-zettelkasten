@@ -256,6 +256,7 @@ MODEL_CONTEXT_WINDOWS: Mapping[tuple[str, str], int] = {
     ("deepseek", "deepseek-v4-flash"): 1_000_000,
     ("gemini", "gemini-2.5-flash"): 1_000_000,
     ("codex", "gpt-5.6-luna"): 272_000,
+    ("codex", "gpt-6-luna"): 272_000,
     ("codex", "gpt-5.6-terra"): 272_000,
     ("codex", "gpt-5.6-sol"): 272_000,
 }
@@ -1207,7 +1208,7 @@ CODEX_CLI_PROFILES: Mapping[str, Mapping[str, Any]] = {
                 "tool_mode": "code_mode_only",
                 "reasoning_efforts": ("medium", "high", "max"),
             }
-            for model in ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol")
+            for model in ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-luna")
         },
         "features": {
             line.split("|", 1)[0]: {
@@ -1246,7 +1247,7 @@ CODEX_CLI_PROFILES: Mapping[str, Mapping[str, Any]] = {
                 "tool_mode": "code_mode_only",
                 "reasoning_efforts": ("medium", "high", "max"),
             }
-            for model in ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol")
+            for model in ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-luna")
         },
         "features": {
             line.split("|", 1)[0]: {
