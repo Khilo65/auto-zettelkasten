@@ -15,6 +15,7 @@ import signal
 import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -3278,7 +3279,7 @@ def _nearest_git_root(path: Path) -> Path | None:
 
 def _codex_credential_root(environment: Mapping[str, str]) -> Path:
     configured = environment.get("CODEX_HOME")
-    home = environment.get("HOME")
+    home = environment.get("HOME") or (environment.get("USERPROFILE") if sys.platform == "win32" else None)
     if not configured and not home:
         raise ProviderIsolationFailure("Codex credential root is unavailable")
     return Path(configured or str(Path(str(home)) / ".codex")).expanduser().resolve(
@@ -3368,16 +3369,31 @@ def _validate_codex_child_auth(
         )
 
 
+def _secure_codex_directory(path: Path) -> None:
+    if sys.platform == "win32":
+        from .windows_platform import secure_directory
+
+        try:
+            secure_directory(path)
+        except OSError as exc:
+            raise ProviderIsolationFailure("Codex temporary directory could not be secured") from exc
+    else:
+        path.chmod(0o700)
+
+
 def _isolated_codex_environment(
     environment: Mapping[str, str],
     credential_root: Path | str,
     call_root: Path,
     deadline_seconds: float,
 ) -> dict[str, str]:
+    _secure_codex_directory(call_root)
     child_home = call_root / "home"
     child_home.mkdir(mode=0o700)
+    _secure_codex_directory(child_home)
     child_codex_home = child_home / ".codex"
     child_codex_home.mkdir(mode=0o700)
+    _secure_codex_directory(child_codex_home)
     source_root = Path(credential_root).expanduser().resolve(strict=False)
     for name in ("auth.json", "models_cache.json"):
         _copy_codex_child_state(source_root / name, child_codex_home / name)
@@ -3388,6 +3404,16 @@ def _isolated_codex_environment(
     child_environment = dict(environment)
     child_environment["HOME"] = str(child_home)
     child_environment["CODEX_HOME"] = str(child_codex_home)
+    if sys.platform == "win32":
+        child_environment["USERPROFILE"] = str(child_home)
+        for key in ("HOMEDRIVE", "HOMEPATH"):
+            child_environment.pop(key, None)
+        for key, name in (("APPDATA", "Roaming"), ("LOCALAPPDATA", "Local"), ("TEMP", "Temp")):
+            directory = child_home / name
+            directory.mkdir(mode=0o700)
+            _secure_codex_directory(directory)
+            child_environment[key] = str(directory)
+        child_environment["TMP"] = child_environment["TEMP"]
     return child_environment
 
 
@@ -3473,9 +3499,14 @@ def _codex_environment(
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
     }
+    if sys.platform == "win32":
+        allowed.update({"SYSTEMROOT", "WINDIR", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP", "PATHEXT"})
     environment = {
-        key: value for key, value in os.environ.items() if key in allowed
+        key: value for key, value in os.environ.items()
+        if (key.upper() in allowed if sys.platform == "win32" else key in allowed)
     }
+    if sys.platform == "win32":
+        environment = {key.upper() if key.upper() != "SYSTEMROOT" else "SystemRoot": value for key, value in environment.items()}
     _validate_codex_credential_root(environment, forbidden_roots)
     return environment
 
@@ -3501,6 +3532,8 @@ def _codex_executable(environment: Mapping[str, str] | None = None) -> Path:
         path = Path(executable).expanduser().resolve(strict=True)
     except OSError as exc:
         raise ProviderError("Codex CLI is not executable") from exc
+    if sys.platform == "win32" and path.suffix.casefold() != ".exe":
+        raise ProviderError("Windows Codex requires a native .exe; set AUTO_ZETTELKASTEN_CODEX to the compatible Codex executable")
     if not path.is_file() or not os.access(path, os.X_OK):
         raise ProviderError("Codex CLI is not executable")
     return path
@@ -3763,11 +3796,37 @@ def codex_preflight_status(
     }
 
 
+def _attach_codex_process_job(process: subprocess.Popen[bytes]) -> None:
+    if sys.platform != "win32":
+        return
+    from .windows_platform import ProcessJob
+
+    try:
+        process._auto_zettelkasten_job = ProcessJob(process)
+    except OSError:
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None and not stream.closed:
+                stream.close()
+        raise
+
+
+def _close_codex_process_job(process: subprocess.Popen[bytes]) -> None:
+    job = getattr(process, "_auto_zettelkasten_job", None)
+    if job is not None:
+        job.close()
+
+
 def _terminate_codex_process(process: subprocess.Popen[bytes]) -> None:
+    job = getattr(process, "_auto_zettelkasten_job", None)
+    if job is not None:
+        job.terminate()
     if process.poll() is not None:
         return
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        if sys.platform == "win32":
+            process.terminate()
+        else:
+            os.killpg(process.pid, signal.SIGTERM)
     except OSError:
         try:
             process.terminate()
@@ -3777,7 +3836,10 @@ def _terminate_codex_process(process: subprocess.Popen[bytes]) -> None:
         process.wait(timeout=2)
     except subprocess.TimeoutExpired:
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            if sys.platform == "win32":
+                process.kill()
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
         except OSError:
             try:
                 process.kill()
@@ -4170,8 +4232,10 @@ class CodexReader(_CapabilityAwareReader):
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    start_new_session=True,
+                    start_new_session=sys.platform != "win32",
+                    creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0) | 0x00000004) if sys.platform == "win32" else 0,
                 )
+                _attach_codex_process_job(process)
             except OSError as exc:
                 raise ProviderTransportError(
                     "Codex app-server process could not start",
@@ -4739,7 +4803,10 @@ class CodexReader(_CapabilityAwareReader):
                 )
                 request_failure_cause = exc
             finally:
-                _terminate_codex_process(process)
+                try:
+                    _terminate_codex_process(process)
+                finally:
+                    _close_codex_process_job(process)
                 for stream in (process.stdin, process.stdout, process.stderr):
                     if stream is not None and not stream.closed:
                         try:
@@ -5007,8 +5074,10 @@ class CodexReader(_CapabilityAwareReader):
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    start_new_session=True,
+                    start_new_session=sys.platform != "win32",
+                    creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0) | 0x00000004) if sys.platform == "win32" else 0,
                 )
+                _attach_codex_process_job(process)
             except OSError as exc:
                 raise ProviderTransportError(
                     "Codex CLI process could not start",
@@ -5136,11 +5205,11 @@ class CodexReader(_CapabilityAwareReader):
 
             stdout_thread = threading.Thread(target=read_stdout, daemon=True)
             stderr_thread = threading.Thread(target=read_stderr, daemon=True)
-            stdout_thread.start()
-            stderr_thread.start()
             request_failure: ProviderError | None = None
             request_failure_cause: BaseException | None = None
             try:
+                stdout_thread.start()
+                stderr_thread.start()
                 assert process.stdin is not None
                 process.stdin.write(prompt)
                 process.stdin.close()
@@ -5165,8 +5234,13 @@ class CodexReader(_CapabilityAwareReader):
                 )
                 request_failure_cause = exc
             finally:
-                stdout_thread.join(timeout=2)
-                stderr_thread.join(timeout=2)
+                try:
+                    _terminate_codex_process(process)
+                finally:
+                    _close_codex_process_job(process)
+                for worker in (stdout_thread, stderr_thread):
+                    if worker.ident is not None:
+                        worker.join(timeout=2)
                 for stream in (process.stdin, process.stdout, process.stderr):
                     if stream is not None and not stream.closed:
                         stream.close()

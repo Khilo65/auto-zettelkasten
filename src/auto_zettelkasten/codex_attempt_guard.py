@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
+
 import re
 import stat
 import subprocess
@@ -16,6 +16,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Iterator, Literal, Mapping
+
+if os.name != "nt":
+    import fcntl
 
 
 TOTAL_ATTEMPT_LIMIT = 134
@@ -35,6 +38,8 @@ _LEDGER_LIMIT = 8_000_000
 _CODEX_SUBSCRIPTION_RUN_LOCK_PATH = (
     Path(tempfile.gettempdir())
     / f"auto-zettelkasten-codex-subscription-{os.getuid()}.lock"
+    if os.name != "nt"
+    else None
 )
 
 
@@ -85,6 +90,40 @@ def codex_subscription_run_lock(provider: str) -> Iterator[None]:
 
     if provider.casefold() != "codex":
         yield
+        return
+    if os.name == "nt":
+        from .windows_platform import lock_descriptor, subscription_lock_path, verify_private_path
+
+        descriptor = -1
+        locked = False
+        try:
+            path = subscription_lock_path()
+            descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_BINARY, 0o600)
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise OSError("Codex subscription run lock is unsafe")
+            verify_private_path(path)
+            try:
+                lock_descriptor(descriptor)
+                locked = True
+            except BlockingIOError as exc:
+                raise CodexAttemptStateError(
+                    "another Auto-Zettelkasten Codex subscription run is already active"
+                ) from exc
+        except (OSError, CodexAttemptStateError) as exc:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if isinstance(exc, CodexAttemptStateError):
+                raise
+            raise CodexAttemptStateError("Codex subscription run lock is unavailable") from exc
+        try:
+            yield
+        finally:
+            try:
+                if locked:
+                    lock_descriptor(descriptor, unlock=True)
+            finally:
+                os.close(descriptor)
         return
     # ponytail: one host-local run lock; add account-wide coordination only if
     # cross-host Auto-Zettelkasten concurrency becomes a measured requirement.
@@ -275,6 +314,11 @@ def _authorization(
 
 
 def _open_ledger(path: Path, flags: int) -> int:
+    if os.name == "nt":
+        raise CodexAttemptStateError(
+            "frozen Codex live-gate ledgers require Unix file locking and durability; "
+            "ordinary Windows subscription mapping remains supported"
+        )
     descriptor = os.open(path, flags | getattr(os, "O_NOFOLLOW", 0), 0o600)
     if not stat.S_ISREG(os.fstat(descriptor).st_mode):
         os.close(descriptor)

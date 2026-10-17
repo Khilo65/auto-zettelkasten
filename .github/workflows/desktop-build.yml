@@ -1,0 +1,75 @@
+name: Desktop builds
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "src/**"
+      - "tests/test_desktop.py"
+      - "tests/test_webapp.py"
+      - "tests/test_frontend_cli.py"
+      - "tests/test_frontend_flow.py"
+      - "tests/test_windows_platform.py"
+      - "tests/test_windows_readers.py"
+      - "tools/desktop_entry.py"
+      - "tools/build_desktop.py"
+      - "pyproject.toml"
+      - ".github/workflows/desktop-build.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            architecture: arm64
+            artifact: macos-arm64
+          - os: macos-15-intel
+            architecture: x64
+            artifact: macos-x64
+          - os: windows-latest
+            architecture: x64
+            artifact: windows-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: ${{ matrix.architecture }}
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[test,desktop,desktop-build]"
+      - name: Offline desktop and frontend tests
+        run: python -m pytest tests/test_desktop.py tests/test_webapp.py tests/test_frontend_cli.py tests/test_frontend_flow.py tests/test_windows_platform.py tests/test_windows_readers.py
+      - name: Build native bundle
+        run: python tools/build_desktop.py
+      - name: Frozen offline smoke test
+        shell: python
+        run: |
+          import json, pathlib, subprocess, sys
+          root = pathlib.Path.cwd()
+          executable = (root / "dist/Auto-Zettelkasten.app/Contents/MacOS/Auto-Zettelkasten"
+                        if sys.platform == "darwin" else root / "dist/Auto-Zettelkasten/Auto-Zettelkasten.exe")
+          report = root / "build/desktop-smoke.json"
+          subprocess.run([str(executable), "--smoke-test", "--smoke-report", str(report)], check=True, timeout=60)
+          print(report.read_text())
+      - name: Archive macOS app preserving executable bits and symlinks
+        if: runner.os == 'macOS'
+        run: ditto -c -k --sequesterRsrc --keepParent dist/Auto-Zettelkasten.app dist/Auto-Zettelkasten-${{ matrix.artifact }}.zip
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'macOS'
+        with:
+          name: Auto-Zettelkasten-${{ matrix.artifact }}
+          path: dist/Auto-Zettelkasten-${{ matrix.artifact }}.zip
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: Auto-Zettelkasten-${{ matrix.artifact }}
+          path: dist/Auto-Zettelkasten/
+          if-no-files-found: error

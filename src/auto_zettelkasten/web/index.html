@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="session-token" content="__SESSION_TOKEN__">
+  <title>Auto-Zettelkasten · Map a collection</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to mapping setup</a>
+  <header class="app-header">
+    <span class="brand"><svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true"><path d="M3 4.5h6l3 2 3-2h6v15h-6l-3 2-3-2H3zM12 6.5v15"/></svg>Auto-Zettelkasten</span>
+    <span class="local-label">Local app</span>
+  </header>
+  <main id="main">
+    <div class="page-intro">
+      <p class="eyebrow">Zotero → your knowledge base</p>
+      <h1>Map a collection</h1>
+      <p>Turn your reading into atomic notes and connected ideas.</p>
+    </div>
+    <div id="notice" class="notice" role="alert" hidden></div>
+    <form id="mapping-form">
+      <fieldset id="setup">
+        <legend class="sr-only">Mapping setup</legend>
+        <section class="step" aria-labelledby="connect-title">
+          <span class="step-number" aria-hidden="true">1</span>
+          <div class="step-body">
+            <div class="section-heading"><h2 id="connect-title">Connect</h2><span id="auth-badge" class="badge">Not connected</span></div>
+            <p class="helper">Choose how to generate your notes.</p>
+            <fieldset class="choice-group">
+              <legend class="sr-only">Connection method</legend>
+              <label class="choice"><input type="radio" name="method" value="codex" checked><span>ChatGPT account<small>Use your subscription through your local Codex login.</small></span></label>
+              <label class="choice"><input type="radio" name="method" value="deepseek"><span>API key<small>Pay for usage with a DeepSeek API key.</small></span></label>
+            </fieldset>
+            <div id="codex-fields" class="connection-fields">
+              <div class="actions"><button type="button" id="connect-codex">Use existing login</button><button type="button" id="login-codex" class="text-button">Sign in with ChatGPT ↗</button></div>
+              <p class="helper">Requires a compatible local Codex installation.</p>
+              <details class="codex-settings"><summary>Choose a Codex installation</summary>
+                <label for="codex-executable">Codex executable</label>
+                <div class="input-row"><input id="codex-executable" type="text" spellcheck="false" placeholder="Automatic detection"><button id="pick-codex" type="button">Browse…</button></div>
+                <p class="helper">Choose the compatible native CLI binary. Windows requires codex.exe. This path is remembered, without storing login credentials.</p>
+              </details>
+            </div>
+            <div id="key-fields" class="connection-fields" hidden>
+              <label for="api-key">DeepSeek API key</label>
+              <div class="input-row"><input id="api-key" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your API key"><button type="button" id="connect-key">Use key</button></div>
+              <p class="helper">Kept only for this app session. The key is checked on the first mapping call.</p>
+            </div>
+            <p id="auth-message" class="field-status" role="status"></p>
+          </div>
+        </section>
+        <section class="step" aria-labelledby="collection-title">
+          <span class="step-number" aria-hidden="true">2</span>
+          <div class="step-body">
+            <div class="section-heading"><h2 id="collection-title">Zotero collection</h2><button id="find-zotero" type="button" class="text-button">Find Zotero</button></div>
+            <label class="sr-only" for="collection">Collection to map</label>
+            <select id="collection" required disabled><option value="">Finding your collections…</option></select>
+            <p id="zotero-message" class="field-status" role="status">Looking for Zotero Desktop on this computer.</p>
+          </div>
+        </section>
+        <section class="step" aria-labelledby="destination-title">
+          <span class="step-number" aria-hidden="true">3</span>
+          <div class="step-body">
+            <h2 id="destination-title">Save destination</h2>
+            <p class="helper">Choose where your generated notes will live.</p>
+            <fieldset class="choice-group">
+              <legend class="sr-only">Destination type</legend>
+              <label class="choice"><input type="radio" name="destination" value="folder" checked><span>Save to a folder<small>Keep notes, indexes, and relationships in a local workspace.</small></span></label>
+              <label class="choice"><input type="radio" name="destination" value="obsidian"><span>Add to Obsidian<small>Add linked atomic notes and a collection index to your vault.</small></span></label>
+            </fieldset>
+            <div id="folder-fields">
+              <label for="output-folder">Output folder</label>
+              <div class="input-row"><input id="output-folder" type="text" spellcheck="false" placeholder="Choose a folder"><button id="pick-output" type="button">Browse…</button></div>
+              <p class="helper">A dedicated workspace for this collection will be created inside.</p>
+            </div>
+            <div id="vault-fields" hidden>
+              <label for="vault">Obsidian vault</label>
+              <div class="input-row"><input id="vault" type="text" spellcheck="false" placeholder="Choose an existing vault"><button id="pick-vault" type="button">Browse…</button></div>
+              <div class="remember-row"><label class="check"><input id="remember-vault" type="checkbox" checked><span>Remember this vault</span></label><button id="forget-vault" type="button" class="text-button" hidden>Forget saved vault</button></div>
+              <p class="helper">Notes and links go in a collection folder under Auto-Zettelkasten. Your other notes stay in place.</p>
+            </div>
+            <p id="destination-message" class="field-status" role="status"></p>
+          </div>
+        </section>
+      </fieldset>
+      <section class="step review-step" aria-labelledby="review-title">
+        <span class="step-number" aria-hidden="true">4</span>
+        <div class="step-body">
+          <h2 id="review-title">Review mapping</h2>
+          <div id="review-empty"><p class="helper">See the estimated work and exact destination before you start.</p><button id="estimate" class="primary" type="submit" disabled>Review estimate <span aria-hidden="true">→</span></button><p class="helper fine-print">Estimation makes no model calls.</p></div>
+          <div id="estimate-loading" class="loading" role="status" hidden><p>Estimating sources and relationships…</p><div class="skeleton"></div><div class="skeleton short"></div></div>
+          <div id="review" hidden>
+            <dl class="review-list">
+              <div><dt>Collection</dt><dd id="review-collection"></dd></div>
+              <div><dt>Sources</dt><dd id="review-sources"></dd></div>
+              <div><dt>Connection</dt><dd id="review-provider"></dd></div>
+              <div><dt id="cost-label">Estimated cost</dt><dd id="review-cost"></dd></div>
+              <div id="calls-row"><dt>Expected calls</dt><dd id="review-calls"></dd></div>
+              <div><dt>Workspace</dt><dd id="review-workspace" class="path"></dd></div>
+              <div id="obsidian-path-row" hidden><dt>Obsidian folder</dt><dd id="review-obsidian" class="path"></dd></div>
+            </dl>
+            <p id="cost-note" class="helper"></p>
+            <label class="check consent"><input id="cloud-consent" type="checkbox"><span>I approve sending this collection’s documents to the selected provider for mapping.</span></label>
+            <div class="actions"><button id="approve" class="primary" type="button" disabled>Approve and map</button><button id="cancel-estimate" type="button">Cancel</button></div>
+          </div>
+          <div id="run-panel" hidden>
+            <p id="run-title" class="run-title" role="status">Mapping your collection…</p>
+            <progress id="run-progress" aria-label="Mapping progress"></progress>
+            <p id="run-detail" class="helper"></p>
+            <p id="run-message" class="field-status"></p>
+            <dl id="run-paths" class="review-list"></dl>
+            <button id="new-map" type="button" hidden>Map another collection</button>
+          </div>
+        </div>
+      </section>
+    </form>
+    <footer>Zotero is read-only. Mapping starts only after your approval.</footer>
+  </main>
+</body>
+</html>

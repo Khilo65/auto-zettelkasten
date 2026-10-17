@@ -44,6 +44,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="auto-zettelkasten", description="Map Zotero libraries into atomic notes and literature graphs.")
     commands = parser.add_subparsers(dest="command", required=True)
 
+    serve_parser = commands.add_parser("serve", help="Open the local mapping interface.")
+    serve_parser.add_argument("--port", type=int, default=8765)
+    serve_parser.add_argument("--no-browser", action="store_true", help="Start without opening a browser.")
+
+    commands.add_parser("desktop", help="Open the native macOS or Windows app.")
+
     init_parser = commands.add_parser("init", help="Initialize a standalone workspace.")
     init_parser.add_argument("workspace", type=Path)
     init_parser.add_argument("--overwrite", action="store_true")
@@ -248,7 +254,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        if args.command == "init":
+        if args.command == "desktop":
+            from .desktop import main as desktop_main
+
+            return desktop_main([])
+        elif args.command == "serve":
+            from .webapp import serve
+
+            if not 0 <= args.port <= 65535:
+                raise ValueError("port must be between 0 and 65535")
+            serve(port=args.port, open_browser=not args.no_browser)
+            return 0
+        elif args.command == "init":
             result = initialize_workspace(args.workspace, overwrite=args.overwrite).to_dict()
         elif args.command == "doctor":
             result = doctor(args.workspace).to_dict()

@@ -11,6 +11,57 @@ does not read `zotero.sqlite`, and never writes to Zotero.
 > schema 1.20 and evidence-profile schema 1.4. Mapped gaps are claims about the
 > frozen collection only, never literature-wide novelty claims.
 
+## Local interface
+
+For a native macOS or Windows window, install the desktop extra and launch:
+
+```bash
+python -m pip install -e ".[desktop]"
+auto-zettelkasten-desktop
+```
+
+The desktop app bundles this interface with native folder dialogs and an
+automatically managed local server. Both API-key and ChatGPT connections use
+the same approval flow. See [desktop setup and packaging](docs/DESKTOP.md) for
+standalone `.app` and Windows `.exe` builds and platform prerequisites.
+
+After installing the package, start the local browser interface:
+
+```bash
+auto-zettelkasten serve
+```
+
+It opens `http://127.0.0.1:8765`. Use `--port PORT` to change the port or
+`--no-browser` to start without opening a browser. Keep the process running
+while mapping; press Ctrl+C to close it. No frontend build or extra dependencies
+are required.
+
+1. Connect with a DeepSeek API key or a compatible Codex installation signed
+   into ChatGPT. The ChatGPT sign-in button starts the local Codex login flow.
+   Preparing a key makes no provider call; its validity is checked when mapping
+   starts. Keys stay in process memory and are not saved in the browser or files.
+2. The app finds Zotero Desktop through its read-only local API. Choose a
+   collection. Zotero must be open with its local API enabled.
+3. Choose an output folder, or select an existing Obsidian vault. Folder mode
+   creates a dedicated collection workspace. Obsidian mode keeps the canonical
+   workspace separately and exports linked notes and indexes into a fresh
+   `Auto-Zettelkasten/<collection>-<key>-<run>/` folder inside the vault.
+   Each export uses a fresh folder to preserve prior exports and personal edits.
+4. Review the source counts, estimate, and exact destinations. Check the cloud
+   consent box, then select **Approve and map**, or cancel. Estimation makes
+   no model calls and writes no mapping or vault files. Approval freezes the
+   chosen collection membership; changes to setup require another estimate.
+
+DeepSeek shows an estimated USD range, not a hard spending cap. ChatGPT shows
+expected calls rather than a dollar price or remaining subscription quota.
+This interface generates atomic notes and relationships with clusters off.
+
+**Remember this vault** saves the vault preference in
+`~/.config/auto-zettelkasten/frontend.json` and selects Obsidian on the next
+launch. **Forget saved vault** removes the preference without changing any
+vault files. Native folder browsing is available on macOS; full paths can be
+entered manually on other platforms.
+
 ## What it produces
 
 ```text
