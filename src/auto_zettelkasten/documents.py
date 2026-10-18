@@ -3,7 +3,7 @@
 Writes use directory handles, exclusive temporary files and revision checks.
 These checks detect ordinary concurrent edits and path replacement; they are not
 a cross-process transaction against a writer ignoring our lock. Generated
-workspaces remain read-only until their engine ownership has an editing contract.
+source files remain read-only; optional private overrides store body edits elsewhere.
 """
 from __future__ import annotations
 
@@ -229,7 +229,7 @@ class DocumentService:
     stable identifiers for UI recovery storage, not on-disk backup locations.
     """
 
-    def __init__(self, *, journal_root: Path | None = None) -> None:
+    def __init__(self, *, journal_root: Path | None = None, override_root: Path | None = None) -> None:
         self._root: Path | None = None
         self._root_identity: tuple[int, int, int] | None = None
         self._workspace_id = ""
@@ -239,6 +239,10 @@ class DocumentService:
         self._relocator = None
         self._index_run = None
         self._completed_index = None
+        self._overrides = None
+        if override_root is not None:
+            from .document_overrides import Overrides
+            self._overrides = Overrides(override_root)
 
     def _relocations(self):
         if self._relocator is None:
@@ -353,7 +357,76 @@ class DocumentService:
                 return True
         return False
 
-    def _document(self, relative: str, directory: _Directory) -> dict[str, Any]:
+    @staticmethod
+    def _override_parts(text: str):
+        text = text.replace("\r\n", "\n")
+        if text.startswith("\ufeff"):
+            return None
+        if not text.startswith("---\n"):
+            return "", text
+        closing = re.search(r"(?m)^(?:---|\.\.\.)[ \t]*(?:\n|$)", text[4:])
+        if closing is None or closing.start() > 65536:
+            return None
+        header_end = 4 + closing.end()
+        try:
+            header = text[4:4 + closing.start()]
+            depth = 0
+            for event in yaml.parse(header, Loader=_YAML_LOADER):
+                if isinstance(event, yaml.AliasEvent):
+                    return None
+                if isinstance(event, (yaml.MappingStartEvent, yaml.SequenceStartEvent)):
+                    depth += 1
+                    if depth > 32:
+                        return None
+                elif isinstance(event, (yaml.MappingEndEvent, yaml.SequenceEndEvent)):
+                    depth -= 1
+            if not isinstance(yaml.load(header, Loader=_YAML_LOADER), dict):
+                return None
+        except (yaml.YAMLError, RecursionError, ValueError):
+            return None
+        return text[:header_end], text[header_end:]
+
+    def _override_location(self):
+        return bool(self._overrides and _SAFE_WRITES and self._root
+                    and not self._overrides.root.is_relative_to(self._root)
+                    and not self._root.is_relative_to(self._overrides.root))
+
+    def _override_generation(self):
+        return self._overrides.generation(self._root, self._root_identity) if self._override_location() else None
+
+    def _override_document(self, document, view=None, *, guarded=False, protected=None):
+        if self._overrides is None:
+            return document
+        result = {**document, "override_available": False, "override_saved": False,
+                  "source_changed": False, "source_revision": document["revision"]}
+        if (not self._override_location() or document.get("reason") != _ENGINE_REASON
+                or document.get("newline") == "mixed"):
+            return result
+        parts = protected if protected is not None else self._override_parts(document["text"])
+        if parts is None:
+            return result
+        if not guarded:
+            try:
+                with self._overrides.guard(self._root, self._root_identity) as opened:
+                    return self._override_document(document, opened, guarded=True, protected=parts)
+            except DocumentError as exc:
+                if str(exc) == "Override storage is read-only.":
+                    return result
+                raise
+        record, digest, info = view.read(document["path"]) if view else (None, None, None)
+        result["override_available"] = view.writable() if view else True
+        if info is not None and not info.st_mode & 0o222:
+            result["override_available"] = False
+        if record:
+            text = parts[0] + record["body"]
+            if len(text.encode("utf-8")) > MAX_FILE_BYTES:
+                raise DocumentError("The regenerated properties and saved override exceed the document limit.")
+            result.update(text=text, newline="lf", override_saved=True,
+                          source_changed=record["source_revision"] != document["revision"],
+                          revision=hashlib.sha256(f"override-v1\0{document['revision']}\0{digest}".encode()).hexdigest())
+        return result
+
+    def _document(self, relative: str, directory: _Directory, *, effective=True) -> dict[str, Any]:
         data, info = self._read_bytes(directory, Path(relative).name)
         text, bom, newline = _decode(data)
         reason = self._reason(directory, text, newline)
@@ -362,12 +435,13 @@ class DocumentService:
         document_id = self._document_ids.setdefault(relative, secrets.token_urlsafe(24))
         self._documents[document_id] = relative, _identity(info)
         recovery_key = hashlib.sha256(f"{self._root}\0{relative}".encode("utf-8")).hexdigest()
-        return {
+        document = {
             "id": document_id, "path": relative, "name": Path(relative).name,
             "text": text, "revision": hashlib.sha256(data).hexdigest(),
             "editable": not reason, "reason": reason, "bom": bom,
             "newline": newline, "recovery_key": recovery_key,
         }
+        return self._override_document(document) if effective else document
 
     def open(self, path: str | Path) -> dict[str, Any]:
         with _LOCK, self._errors():
@@ -520,8 +594,9 @@ class DocumentService:
                         markers.append(_stamp(info))
                     except FileNotFoundError:
                         markers.append(None)
-            return (self._root_identity, directory.engine_owned(), self._published_indexes(directory),
-                    self._reason(directory), self._index_registry_stamp(), tuple(markers))
+            stamp = (self._root_identity, directory.engine_owned(), self._published_indexes(directory),
+                     self._reason(directory), self._index_registry_stamp(), tuple(markers))
+            return (*stamp, self._override_generation()) if self._overrides is not None else stamp
 
     def _index_inventory(self, run, inventory, expected=None):
         pending = deque([()])
@@ -828,6 +903,9 @@ class DocumentService:
                     self._close_index_run()
                     raise DocumentError("The index cursor is invalid or expired. Restart indexing.")
                 if cursor == run["last_cursor"]:
+                    if self._overrides is not None and self._index_root_stamp() != run["root_stamp"]:
+                        self._close_index_run()
+                        raise DocumentIndexChanged()
                     return copy.deepcopy(run["last_page"])
                 if cursor != run["cursor"]:
                     raise DocumentError("The index cursor is invalid or expired. Restart indexing.")
@@ -885,11 +963,18 @@ class DocumentService:
                             if not current.st_mode & 0o222 and not reason:
                                 reason = "The note is read-only."
                             row.update(editable=not reason, reason=reason)
-                            documents.append({"path": path, "text": text, "revision": hashlib.sha256(data).hexdigest(), "editable": not reason})
+                            document = {"path": path, "text": text, "revision": hashlib.sha256(data).hexdigest(), "editable": not reason}
+                            if self._overrides is not None:
+                                document = self._override_document({**document, "reason": reason, "newline": newline})
+                            effective_bytes = len(document["text"].encode("utf-8")) if self._overrides is not None else len(data)
+                            if page_bytes and page_bytes + effective_bytes > INDEX_PAGE_BYTES:
+                                run["pending"] = item
+                                break
                             self._index_note_ids(run, path, text)
-                            page_bytes += len(data)
+                            documents.append(document)
+                            page_bytes += effective_bytes
                             run["progress"]["documents"] += 1
-                            run["progress"]["bytes"] += len(data)
+                            run["progress"]["bytes"] += effective_bytes
                         except DocumentIndexChanged:
                             raise
                         except (DocumentError, OSError):
@@ -927,6 +1012,8 @@ class DocumentService:
         with _LOCK, self._errors():
             self._workspace(workspace_id)
             documents: list[dict[str, Any]] = []
+            canonical_documents = []
+            override_generation = self._override_generation()
             pending = deque([()])
             scanned = entries = inspected_bytes = 0
             truncated = skipped = False
@@ -972,11 +1059,21 @@ class DocumentService:
                                         break
                                     text, _, newline = _decode(data)
                                     reason = self._reason(directory, text, newline)
-                                    documents.append({
+                                    document = {
                                         "path": "/".join(child), "text": text,
                                         "revision": hashlib.sha256(data).hexdigest(),
                                         "editable": not reason and bool(info.st_mode & 0o222),
-                                    })
+                                    }
+                                    if self._overrides is not None:
+                                        effective = self._override_document({**document, "reason": reason, "newline": newline})
+                                        inspected_bytes += len(effective["text"].encode("utf-8")) - len(data)
+                                        if inspected_bytes > MAX_TREE_BYTES:
+                                            truncated = True
+                                            break
+                                    else:
+                                        effective = document
+                                    canonical_documents.append(document)
+                                    documents.append(effective)
                                 else:
                                     continue
                                 entries += 1
@@ -992,13 +1089,15 @@ class DocumentService:
             # a mixture of two workspaces. Child failures produce a partial index.
             with self._directory():
                 pass
+            if self._override_generation() != override_generation:
+                raise DocumentIndexChanged()
             warnings = []
             if truncated:
                 warnings.append("Workspace index is partial because its scan or size limit was reached.")
             if skipped:
                 warnings.append("Some notes could not be indexed because they changed, were unreadable, or exceeded the document limit.")
             documents.sort(key=lambda row: row["path"].casefold())
-            relations, relation_warning = self._typed_relations(documents, engine_owned)
+            relations, relation_warning = self._typed_relations(canonical_documents, engine_owned)
             if relation_warning:
                 warnings.append(relation_warning)
             return {"documents": documents, "relations": relations, "truncated": truncated, "warnings": warnings}
@@ -1145,6 +1244,51 @@ class DocumentService:
                             os.unlink(temporary, dir_fd=directory.fd)
                     except FileNotFoundError:
                         pass
+
+    def save_override(self, workspace_id: str, document_id: str, revision: str, text: str) -> dict[str, Any]:
+        with _LOCK, self._errors():
+            self._workspace(workspace_id)
+            if not isinstance(document_id, str) or document_id not in self._documents:
+                raise DocumentError("Open the document before saving an override.")
+            if not isinstance(revision, str) or not re.fullmatch(r"[a-f0-9]{64}", revision):
+                raise DocumentError("A document revision is required.")
+            if not isinstance(text, str) or len(text) > MAX_FILE_BYTES or "\x00" in text or _newline(text) == "mixed":
+                raise DocumentError("Override saves require bounded UTF-8 Markdown with consistent line endings.")
+            try:
+                if len(text.encode("utf-8")) > MAX_FILE_BYTES:
+                    raise DocumentError("The note exceeds the 1 MiB document limit.")
+            except UnicodeError as exc:
+                raise DocumentError("The text cannot be encoded as UTF-8.") from exc
+            if not self._override_location():
+                raise DocumentError("Private override storage is unavailable or inside the workspace.")
+            relative = self._documents[document_id][0]
+            with self._directory() as root_directory:
+                published = self._published_indexes(root_directory)
+            parts = _parts(relative, published=published)
+            with self._directory(parts[:-1]) as directory, self._overrides.guard(self._root, self._root_identity, create=True) as view:
+                canonical = self._document(relative, directory, effective=False)
+                current = self._override_document(canonical, view, guarded=True)
+                if current["revision"] != revision:
+                    raise DocumentConflict(current)
+                if not current["override_available"]:
+                    raise DocumentError("This note does not support a private body override.")
+                original = self._override_parts(canonical["text"])
+                proposed = self._override_parts(text)
+                if proposed is None or proposed[0] != original[0]:
+                    raise DocumentError("Generated properties and identity fields cannot be changed. Edit only the Markdown body.")
+                record, _, _ = view.read(relative)
+                if record and record["body"] == proposed[1] and record["source_revision"] == canonical["revision"]:
+                    return current
+
+                def verify():
+                    latest = self._override_document(self._document(relative, directory, effective=False), view, guarded=True)
+                    if latest["revision"] != revision:
+                        raise DocumentConflict(latest)
+                    if not latest["override_available"]:
+                        raise DocumentError("This note no longer supports a private body override.")
+
+                view.write(relative, proposed[1], canonical["revision"], verify)
+                return self._override_document(self._document(relative, directory, effective=False), view, guarded=True)
 
     def create(self, workspace_id: str, parent: str, name: str, kind: str) -> dict[str, Any]:
         with _LOCK, self._errors(), self._relocations().guard(workspace_id):

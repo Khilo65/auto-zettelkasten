@@ -35,6 +35,60 @@ async function api(path, body) {
   return result;
 }
 
+if (document.querySelector('meta[name="desktop-shell"]')?.content === "true") {
+  let desiredZoom = 1, appliedZoom = 1, zoomRevision = 0;
+  let changingZoom = false, resetZoom = false, zoomError = null;
+
+  async function applyViewZoom() {
+    if (changingZoom) return;
+    changingZoom = true;
+    try {
+      while (desiredZoom !== appliedZoom || resetZoom) {
+        const level = desiredZoom, revision = zoomRevision;
+        resetZoom = false;
+        try {
+          const result = await api("view-zoom", { level });
+          if (!Number.isFinite(result?.level) || result.level !== level) throw new Error("The desktop view size could not be confirmed. Try again.");
+          appliedZoom = level;
+          if (zoomError && zoomError.target.textContent === zoomError.message) {
+            zoomError.target.textContent = "";
+            zoomError.target.hidden = true;
+            zoomError.target.classList.remove("is-error");
+          }
+          zoomError = null;
+        } catch (error) {
+          // Only a failure for the latest key intent may roll that intent back.
+          if (revision === zoomRevision) { desiredZoom = appliedZoom; resetZoom = false; }
+          const target = $("workspace-screen").hidden ? $("notice") : $("workspace-message");
+          const message = `Could not change view size. ${error.message}`;
+          target.textContent = message;
+          target.hidden = false;
+          if (target.id === "workspace-message") target.classList.add("is-error");
+          zoomError = { target, message };
+        }
+      }
+    } finally {
+      changingZoom = false;
+    }
+  }
+
+  document.addEventListener("keydown", (event) => {
+    if (!(event.metaKey || event.ctrlKey) || event.altKey || event.isComposing) return;
+    const add = event.key === "+" || event.key === "=" || event.code === "NumpadAdd";
+    const subtract = event.key === "-" || event.code === "NumpadSubtract";
+    const reset = event.key === "0";
+    if (!add && !subtract && !reset) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const level = reset ? 1 : Math.max(0.5, Math.min(2, Math.round((desiredZoom + (add ? 0.1 : -0.1)) * 10) / 10));
+    if (level === desiredZoom && !reset) return;
+    desiredZoom = level;
+    zoomRevision += 1;
+    if (reset) resetZoom = true;
+    applyViewZoom();
+  }, true);
+}
+
 function status(id, message, error = false) {
   $(id).textContent = message;
   $(id).classList.toggle("error", error);

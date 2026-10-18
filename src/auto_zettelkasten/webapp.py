@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import re
 import secrets
@@ -149,6 +150,7 @@ class LocalApp:
         self.token = secrets.token_urlsafe(32)
         self.client = client or ZoteroLocalClient()
         self.folder_picker = folder_picker or pick_folder
+        self.view_zoom = None
         self.preferences_path = preferences_path or Path.home() / ".config" / "auto-zettelkasten" / "frontend.json"
         self.preferences = {"vault": "", "remember_vault": False}
         self.codex_executable = ""
@@ -166,7 +168,10 @@ class LocalApp:
         self.ticket: dict | None = None
         self.run: dict = {"status": "idle"}
         self.login_process = None
-        self.documents = DocumentService(journal_root=self.preferences_path.parent / "workspace-operations")
+        self.documents = DocumentService(
+            journal_root=self.preferences_path.parent / "workspace-operations",
+            override_root=self.preferences_path.parent / "workspace-overrides",
+        )
 
     def _editable(self):
         if self.run["status"] == "running" or self.auth["status"] == "pending":
@@ -274,6 +279,19 @@ class LocalApp:
                         raise RequestError("Zotero is unavailable. Open Zotero and enable its local API in Settings → Advanced.") from exc
                     return {"collections": [{"key": row.get("key") or row.get("data", {}).get("key", ""), "name": row.get("data", row).get("name", ""), "path": " / ".join(_api_collection_path(row, rows)), "parent_key": parents[row.get("key") or row["data"]["key"]]} for row in rows]}
                 raise RequestError("Unknown endpoint.")
+            if route == "/api/view-zoom":
+                level = data.get("level")
+                if type(level) not in (int, float) or not math.isfinite(level) or not .5 <= level <= 2:
+                    raise RequestError("View zoom must be between 50% and 200%.")
+                if self.view_zoom is None:
+                    raise RequestError("View zoom is available in the desktop app.")
+                try:
+                    self.view_zoom(level)
+                except RequestError:
+                    raise
+                except Exception as exc:
+                    raise RequestError("The desktop view could not change size. Restart the app and try again.") from exc
+                return {"level": level}
             self._editable()
             if route == "/api/connect":
                 self.ticket = None
@@ -350,6 +368,9 @@ class LocalApp:
             if route == "/api/workspace/save":
                 self._editable()
                 return {"document": self.documents.save(workspace_id, data.get("document_id"), data.get("revision"), data.get("text"))}
+            if route == "/api/workspace/save-override":
+                self._editable()
+                return {"document": self.documents.save_override(workspace_id, data.get("document_id"), data.get("revision"), data.get("text"))}
             if route == "/api/workspace/create":
                 self._editable()
                 return self.documents.create(workspace_id, data.get("parent", ""), data.get("name"), data.get("kind"))
@@ -588,7 +609,7 @@ class Handler(BaseHTTPRequestHandler):
                         length = int(self.headers.get("Content-Length", "0"))
                     except ValueError:
                         raise RequestError("Invalid request length.")
-                    limit = 6 * 1024 * 1024 + 16384 if route in {"/api/workspace/save", "/api/workspace/relocate"} else 16384
+                    limit = 6 * 1024 * 1024 + 16384 if route in {"/api/workspace/save", "/api/workspace/save-override", "/api/workspace/relocate"} else 16384
                     if not 0 < length <= limit:
                         raise RequestError("Request too large or empty.")
                     try:
@@ -617,6 +638,7 @@ class Handler(BaseHTTPRequestHandler):
             body = (Path(__file__).parent / "web" / filename).read_bytes()
             if filename == "index.html":
                 body = body.replace(b"__SESSION_TOKEN__", self.server.app.token.encode())
+                body = body.replace(b"__DESKTOP_SHELL__", b"true" if self.server.app.view_zoom else b"false")
             self._reply(200, body, content_type)
         except DocumentConflict as exc:
             self._reply(409, {"error": str(exc), "code": "conflict", "current": exc.current})

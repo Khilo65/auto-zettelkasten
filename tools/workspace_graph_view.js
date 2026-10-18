@@ -65,7 +65,7 @@ export function createGraphView(graph, { container, labels = true } = {}) {
   let topologyDirty = true, metadataDirty = true, positionsDirty = new Set();
   const nodes = [], edges = [], records = new Map(), edgeRecords = new Map(), pointers = new Map(), grid = new Map();
   let cellSize = 32, gridDirty = true, gesture = null, hover = null, fadingHover = null, hoverMix = 0;
-  let latestPointer = null, pointerDirty = false, inertia = null, zoomAnchor = null;
+  let latestPointer = null, pointerDirty = false, inertia = null, zoomAnchor = null, hoverLabel = null;
   const media = win.matchMedia?.("(prefers-reduced-motion: reduce)");
   let reducedMotion = Boolean(media?.matches);
   const now = () => win.performance.now();
@@ -135,8 +135,8 @@ export function createGraphView(graph, { container, labels = true } = {}) {
 
   function metadata(node) {
     const data = node.model.data();
-    node.label = String(data.label ?? data.path ?? node.id);
-    node.shortLabel = node.label.length > 50 ? node.label.slice(0, 49) + "…" : node.label;
+    const label = String(data.label ?? data.path ?? node.id);
+    if (node.label !== label) { node.label = label; node.shortLabel = undefined; }
     node.current = data.current === "yes"; node.missing = Boolean(data.missing) || node.model.hasClass("missing");
     node.selected = node.model.selected(); node.dimmed = node.model.hasClass("dimmed");
     node.neighbor = node.model.hasClass("neighbor"); node.modelHovered = node.model.hasClass("hovered");
@@ -231,6 +231,22 @@ export function createGraphView(graph, { container, labels = true } = {}) {
     return related ? 1 : (node.dimmed && !fadingHover ? .2 : 1 - .8 * hoverMix);
   }
 
+  function fitLabel(text, maxWidth, limit = 200) {
+    const characters = [];
+    for (const character of text) { if (characters.length === limit) break; characters.push(character); }
+    const candidate = characters.join(""), measured = context.measureText(candidate).width;
+    if (candidate.length === text.length && measured <= maxWidth) return { text: candidate, width: measured };
+    if (context.measureText("…").width > maxWidth) return { text: "", width: 0 };
+    let from = 0, to = characters.length;
+    while (from < to) {
+      const middle = Math.ceil((from + to) / 2);
+      if (context.measureText(characters.slice(0, middle).join("") + "…").width <= maxWidth) from = middle;
+      else to = middle - 1;
+    }
+    const fitted = characters.slice(0, from).join("") + "…";
+    return { text: fitted, width: context.measureText(fitted).width };
+  }
+
   function paint() {
     context.setTransform(ratio, 0, 0, ratio, 0, 0); context.clearRect(0, 0, width, height);
     const growth = Math.sqrt(camera.zoom);
@@ -281,19 +297,27 @@ export function createGraphView(graph, { container, labels = true } = {}) {
       }
       if (labels && labelOpacity > .01 && !hovered) {
         context.globalAlpha = nodeAlpha(node) * labelOpacity; context.fillStyle = "#57535f";
+        if (node.shortLabel === undefined) {
+          // Measure once at the base size; zoom scales glyphs and label width together.
+          context.font = "12px -apple-system, BlinkMacSystemFont, sans-serif";
+          node.shortLabel = fitLabel(node.label, 220, 50).text;
+        }
         context.font = `${normalFont}px -apple-system, BlinkMacSystemFont, sans-serif`;
-        context.fillText(node.shortLabel, x, y + radius + 5, 220);
+        context.fillText(node.shortLabel, x, y + radius + 5);
       }
     }
     if (hover && records.has(hover.id)) {
       const point = projectPoint(hover, camera), radius = graphNodeRadius(hover.degree, camera.zoom), font = Math.max(15, 12 * Math.sqrt(camera.zoom));
       context.globalAlpha = 1; context.font = `${font}px -apple-system, BlinkMacSystemFont, sans-serif`;
       const maxWidth = Math.max(1, Math.min(340, width - 8));
-      const labelWidth = Math.min(maxWidth, context.measureText?.(hover.label).width ?? hover.label.length * font * .55);
+      if (!hoverLabel || hoverLabel.source !== hover.label || hoverLabel.font !== font || hoverLabel.maxWidth !== maxWidth) {
+        hoverLabel = { source: hover.label, font, maxWidth, ...fitLabel(hover.label, maxWidth) };
+      }
+      const labelWidth = hoverLabel.width;
       const x = clamp(point.x, labelWidth / 2 + 4, Math.max(labelWidth / 2 + 4, width - labelWidth / 2 - 4));
       const y = clamp(point.y + radius + 15, 2, Math.max(2, height - font - 2));
-      context.lineWidth = 4; context.strokeStyle = "#ffffff"; context.strokeText(hover.label, x, y, maxWidth);
-      context.fillStyle = "#684297"; context.fillText(hover.label, x, y, maxWidth);
+      context.lineWidth = 4; context.strokeStyle = "#ffffff"; context.strokeText(hoverLabel.text, x, y);
+      context.fillStyle = "#684297"; context.fillText(hoverLabel.text, x, y);
     }
     context.globalAlpha = 1;
   }
@@ -413,6 +437,7 @@ export function createGraphView(graph, { container, labels = true } = {}) {
     zoomBy(1.5 ** clamp(-event.deltaY * unit / 120, -4, 4), eventPoint(event));
   }
   function keydown(event) {
+    if (event.metaKey || event.ctrlKey || event.altKey || event.isComposing) return;
     const shifts = { ArrowLeft: [40, 0], ArrowRight: [-40, 0], ArrowUp: [0, 40], ArrowDown: [0, -40] };
     if (shifts[event.key]) {
       event.preventDefault(); inertia = null; const [x, y] = shifts[event.key];

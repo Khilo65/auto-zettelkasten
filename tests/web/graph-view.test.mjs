@@ -17,10 +17,11 @@ function harness(t, elements, { reducedMotion = false, width = 400, height = 300
   w.matchMedia = () => media;
   container.getBoundingClientRect = () => bounds;
   w.CanvasRenderingContext2D = class {};
+  const measurements = [], textWidth = (text, font) => Array.from(text).reduce((width, character) => width + Number.parseFloat(font) * (/[MW]/.test(character) ? .9 : /[il ]/.test(character) ? .3 : .55), 0);
   const paintings = [], context = {
     globalAlpha: 1, path: [],
     setTransform() {},
-    clearRect() { paintings.push({ circles: [], strokes: [], texts: [] }); },
+    clearRect() { paintings.push({ circles: [], strokes: [], texts: [], outlinedTexts: [] }); },
     beginPath() { this.path = []; },
     moveTo(x, y) { this.previous = { x, y }; },
     lineTo(x, y) { this.path.push({ from: this.previous, to: { x, y } }); this.previous = { x, y }; },
@@ -29,8 +30,9 @@ function harness(t, elements, { reducedMotion = false, width = 400, height = 300
     fill() { for (const circle of this.path.filter((item) => "radius" in item)) paintings.at(-1).circles.push({ ...circle, color: this.fillStyle, alpha: this.globalAlpha }); },
     stroke() { paintings.at(-1).strokes.push({ path: [...this.path], dash: [...this.dash], color: this.strokeStyle, alpha: this.globalAlpha, width: this.lineWidth }); },
     setLineDash(dash) { this.dash = dash; },
-    fillText(text, x, y) { paintings.at(-1).texts.push({ text, x, y, font: this.font, alpha: this.globalAlpha }); },
-    strokeText() {},
+    measureText(text) { measurements.push({ text, font: this.font }); return { width: textWidth(text, this.font) }; },
+    fillText(text, x, y, maxWidth) { paintings.at(-1).texts.push({ text, x, y, font: this.font, alpha: this.globalAlpha, maxWidth, width: textWidth(text, this.font) }); },
+    strokeText(text, x, y, maxWidth) { paintings.at(-1).outlinedTexts.push({ text, x, y, maxWidth, width: textWidth(text, this.font) }); },
   };
   w.HTMLCanvasElement.prototype.getContext = () => context;
   const captures = new Set();
@@ -57,7 +59,7 @@ function harness(t, elements, { reducedMotion = false, width = 400, height = 300
     canvas.dispatchEvent(event); return event;
   };
   t.after(() => { view?.destroy(); graph.destroy(); w.close(); assert.deepEqual(errors, []); });
-  return { w, graph, view, canvas, frame, settle, pointer, wheel, paintings, captures, callbacks,
+  return { w, graph, view, canvas, frame, settle, pointer, wheel, paintings, captures, callbacks, measurements,
     resize(nextWidth, nextHeight) { bounds = { ...bounds, width: nextWidth, height: nextHeight, right: nextWidth, bottom: nextHeight }; view.resize(); },
     motion(value) { media.matches = value; motionListeners.forEach((listener) => listener()); },
   };
@@ -215,6 +217,23 @@ test("Wheel units normalize consistently and full detents use predictable zoom i
   pixels.settle(); lines.settle(); pages.settle();
 });
 
+test("Modified and composing keys pass through while plain graph navigation still works", (t) => {
+  const app = harness(t, [], { reducedMotion: true }); app.settle();
+  const keydown = (key, options = {}) => {
+    const event = new app.w.KeyboardEvent("keydown", { key, bubbles: true, cancelable: true, ...options });
+    app.canvas.dispatchEvent(event); return event;
+  };
+  for (const modifier of ["metaKey", "ctrlKey", "altKey", "isComposing"]) for (const key of ["+", "=", "-", "0", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"]) {
+    assert.equal(keydown(key, { [modifier]: true }).defaultPrevented, false, `${modifier} ${key} belongs to the app or browser`);
+    close(app.graph.zoom(), 1); assert.deepEqual({ ...app.graph.pan() }, { x: 0, y: 0 });
+  }
+  assert.equal(keydown("+", { shiftKey: true }).defaultPrevented, true); close(app.graph.zoom(), 1.25); app.settle();
+  assert.equal(keydown("-").defaultPrevented, true); close(app.graph.zoom(), 1); app.settle();
+  const before = { ...app.graph.pan() };
+  assert.equal(keydown("ArrowLeft").defaultPrevented, true); close(app.graph.pan("x"), before.x + 40);
+  assert.equal(keydown("ArrowUp").defaultPrevented, true); close(app.graph.pan("y"), before.y + 40); app.settle();
+});
+
 test("A static pointer is rechecked when reduced-motion targets move, and an outlier does not change label visibility", (t) => {
   const cohort = Array.from({ length: 51 }, (_, at) => node(`near${at}`, 110 + at % 8 * 6, 120 + Math.floor(at / 8) * 6));
   const app = harness(t, [node("A", 100, 100), ...cohort, node("Outlier", 1000000, 1000000)], { reducedMotion: true }); app.settle();
@@ -262,4 +281,39 @@ test("Zoom immediately after Fit uses the fitted camera instead of an offscreen 
   app.view.zoomBy(2, { x: 200, y: 150 }); app.settle();
   assert.equal(app.paintings.at(-1).circles.length, 2);
   close(app.paintings.at(-1).circles[0].x, 100); close(app.paintings.at(-1).circles[1].x, 300);
+});
+
+test("Long normal titles keep natural glyph proportions and reuse their measured ellipsis while zooming", (t) => {
+  const title = "Wide WWW titles should remain naturally proportioned while zooming through a large graph";
+  const app = harness(t, [node("A", 100, 100, { label: title })], { reducedMotion: true }); app.settle();
+  const normal = app.paintings.at(-1).texts[0];
+  assert.equal(normal.maxWidth, undefined, "Canvas must never horizontally compress a title");
+  assert.ok(normal.text.endsWith("…")); assert.ok(normal.width <= 220);
+  const measured = app.measurements.length;
+  app.graph.viewport({ zoom: 8, pan: { x: -600, y: -700 } }); app.settle();
+  const enlarged = app.paintings.at(-1).texts[0];
+  assert.equal(enlarged.maxWidth, undefined); assert.equal(enlarged.text, normal.text);
+  close(enlarged.width / normal.width, Math.sqrt(8));
+  app.graph.panBy({ x: 5, y: 5 }); app.graph.$id("A").data("current", "yes"); app.settle();
+  assert.equal(app.measurements.length, measured, "Camera and unrelated metadata changes do not remeasure normal titles");
+  app.graph.$id("A").data("label", "Renamed title"); app.settle();
+  assert.equal(app.paintings.at(-1).texts[0].text, "Renamed title");
+});
+
+test("Long hover titles use measured ellipsis without compressing either fill or halo", (t) => {
+  const title = "A long readable title with supplementary characters 🧪🧪🧪 and additional words ".repeat(4);
+  const app = harness(t, [node("A", 100, 100, { label: title })], { reducedMotion: true }); app.settle();
+  app.graph.viewport({ zoom: 8, pan: { x: -600, y: -650 } }); app.settle();
+  app.pointer("pointermove", 200, 150); app.settle();
+  const hovered = app.paintings.at(-1).texts[0], halo = app.paintings.at(-1).outlinedTexts[0];
+  assert.equal(hovered.maxWidth, undefined); assert.equal(halo.maxWidth, undefined);
+  assert.equal(halo.text, hovered.text); assert.ok(hovered.text.endsWith("…"));
+  assert.ok(hovered.width <= 340); assert.ok(Number.parseFloat(hovered.font) >= 15);
+  assert.doesNotMatch(hovered.text, /[\uD800-\uDBFF]…$/);
+  const measured = app.measurements.length;
+  app.pointer("pointermove", 200, 150); app.settle();
+  assert.equal(app.measurements.length, measured, "An unchanged hover reuses its bounded text layout");
+  app.resize(200, 300); app.settle(); app.pointer("pointermove", 100, 150); app.settle();
+  const narrowed = app.paintings.at(-1).texts[0];
+  assert.ok(narrowed.width <= 192); assert.equal(narrowed.maxWidth, undefined);
 });

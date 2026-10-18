@@ -214,3 +214,49 @@ def test_workspace_relocation_preview_apply_large_repairs_and_session_guards(loc
     assert request("/api/workspace/relocate", apply_body)[1] == result
     app.run = {"status": "running"}
     assert request("/api/workspace/relocate-preview", {**preview_body, "source": "Renamed.md", "destination": "Later.md"})[0] == 400
+
+
+def test_native_view_zoom_is_session_protected_validated_and_available_during_mapping(local_editor):
+    app, request = local_editor
+    assert b'name="desktop-shell" content="false"' in request("/")[1]
+    assert request("/api/view-zoom", {"level": 1.1})[0] == 400
+    levels = []
+    app.view_zoom = levels.append
+    assert b'name="desktop-shell" content="true"' in request("/")[1]
+    app.run = {"status": "running"}
+    assert request("/api/view-zoom", {"level": 1.2})[:2] == (200, {"level": 1.2})
+    for level in [True, None, "1.2", 0, .49, 2.01, float("nan"), float("inf")]:
+        assert request("/api/view-zoom", {"level": level})[0] == 400
+    assert request("/api/view-zoom", {"level": 1}, authenticated=False)[0] == 403
+    assert request("/api/view-zoom", {"level": 1}, origin="https://other.example")[0] == 403
+    assert levels == [1.2]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Safe override writes require descriptor-relative support")
+def test_personal_override_http_keeps_generated_file_and_requires_session(local_editor, tmp_path):
+    app, request = local_editor
+    root = tmp_path / "generated"
+    root.mkdir()
+    (root / "auto-zettelkasten.yml").write_text("workspace: generated\n")
+    note = root / "Atomic.md"
+    original = b"---\nnote_id: atomic-1\n---\n# Atomic\n\nGenerated body.\n"
+    note.write_bytes(original)
+    before = note.stat().st_mtime_ns
+    _, opened, _ = request("/api/workspace/open", {"path": str(root)})
+    workspace_id = opened["workspace"]["id"]
+    _, loaded, _ = request("/api/workspace/read", {"workspace_id": workspace_id, "path": "Atomic.md"})
+    doc = loaded["document"]
+    assert not doc["editable"] and doc["override_available"]
+    body = {"workspace_id": workspace_id, "document_id": doc["id"], "revision": doc["revision"], "text": doc["text"] + "Personal observation.\n" * 1000}
+    assert request("/api/workspace/save", body)[0] == 400
+    assert request("/api/workspace/save-override", body, authenticated=False)[0] == 403
+    assert request("/api/workspace/save-override", body, origin="https://other.example")[0] == 403
+    status, saved, _ = request("/api/workspace/save-override", body)
+    assert status == 200 and saved["document"]["override_saved"]
+    assert request("/api/workspace/save-override", body)[0] == 409
+    _, indexed, _ = request("/api/workspace/index", {"workspace_id": workspace_id})
+    assert "Personal observation" in indexed["documents"][0]["text"]
+    assert note.read_bytes() == original and note.stat().st_mtime_ns == before
+    app.run = {"status": "running"}
+    body["revision"] = saved["document"]["revision"]
+    assert request("/api/workspace/save-override", body)[0] == 400

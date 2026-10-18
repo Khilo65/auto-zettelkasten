@@ -21,6 +21,50 @@ def _configure_tls() -> None:
         os.environ["SSL_CERT_FILE"] = certifi.where()
 
 
+def _set_view_zoom(window, level: float) -> float:
+    if type(level) not in (int, float) or not 0.5 <= level <= 2:
+        raise ValueError("View zoom must be a number between 0.5 and 2.")
+    if sys.platform not in {"darwin", "win32"}:
+        raise RuntimeError("Native view zoom is not supported on this platform.")
+
+    completed = threading.Event()
+    cancelled = threading.Event()
+    errors = []
+
+    def apply():
+        try:
+            if cancelled.is_set():
+                return
+            if sys.platform == "darwin":
+                window.native.contentView().setPageZoom_(level)
+            else:
+                window.native.webview.ZoomFactor = level
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            completed.set()
+
+    try:
+        if sys.platform == "darwin" and threading.current_thread() is not threading.main_thread():
+            from PyObjCTools import AppHelper
+
+            AppHelper.callAfter(apply)
+        elif sys.platform == "win32" and window.native.InvokeRequired:
+            from System import Action
+
+            window.native.BeginInvoke(Action(apply))
+        else:
+            apply()
+    except Exception as exc:
+        raise RuntimeError(f"Could not change the native view size: {exc}") from exc
+    if not completed.wait(5):
+        cancelled.set()
+        raise RuntimeError("The native view did not respond to the size change.")
+    if errors:
+        raise RuntimeError(f"Could not change the native view size: {errors[0]}") from errors[0]
+    return level
+
+
 def launch() -> None:
     try:
         import webview
@@ -40,6 +84,7 @@ def launch() -> None:
             zoomable=True,
             background_color="#fcfbf9",
         )
+        app.view_zoom = lambda level: _set_view_zoom(window, level)
 
         def pick(kind: str) -> str:
             if kind == "codex":

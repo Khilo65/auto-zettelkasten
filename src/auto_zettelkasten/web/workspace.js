@@ -35,6 +35,7 @@
 
   const active = () => state.documents.get(state.active);
   const textOf = (doc) => doc.editorState.doc.toString();
+  const canEdit = (doc) => Boolean(doc && (doc.editable || doc.override_available));
   const dirty = (doc) => Boolean(doc && (doc.external || textOf(doc) !== doc.savedText));
   const parentPath = (path) => path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
   const basename = (path) => path.slice(path.lastIndexOf("/") + 1);
@@ -485,7 +486,7 @@
   }
 
   function wikiCompletion(context, doc) {
-    if (!doc.editable || doc.recovery) return null;
+    if (!canEdit(doc) || doc.recovery) return null;
     const match = context.matchBefore(/\[\[[^\]\n]*$/);
     if (!match) return null;
     const prefix = context.state.doc.sliceString(0, match.from), escapes = /\\+$/.exec(prefix)?.[0].length || 0;
@@ -916,8 +917,8 @@
         kit.autocompletion({ override: [(context) => wikiCompletion(context, doc)], interactionDelay: 0 }),
         kit.EditorView.cspNonce.of(token),
         doc.editability.of([
-          kit.EditorState.readOnly.of(!doc.editable || Boolean(doc.recovery)),
-          kit.EditorView.editable.of(doc.editable && !doc.recovery),
+          kit.EditorState.readOnly.of(!canEdit(doc) || Boolean(doc.recovery)),
+          kit.EditorView.editable.of(canEdit(doc) && !doc.recovery),
         ]),
         doc.identityAttributes.of(kit.EditorView.contentAttributes.of({ "aria-label": `Edit ${doc.name}`, spellcheck: "true" })),
         kit.Prec.highest(kit.keymap.of([
@@ -947,7 +948,7 @@
 
   function formatSelection(view, marker) {
     const doc = active();
-    if (state.organization || state.requiresReopen || !doc?.editable || doc.recovery || doc.mode === "reading") return false;
+    if (state.organization || state.requiresReopen || !canEdit(doc) || doc.recovery || doc.mode === "reading") return false;
     const selection = view.state.selection.main;
     const selected = view.state.doc.sliceString(selection.from, selection.to);
     view.dispatch({ changes: { from: selection.from, to: selection.to, insert: `${marker}${selected}${marker}` }, selection: { anchor: selection.from + marker.length, head: selection.to + marker.length }, userEvent: "input" });
@@ -955,7 +956,7 @@
   }
 
   function newDocument(value) {
-    const doc = { ...value, mode: value.editable ? "live" : "reading", savedText: normalizeText(value.text), identityAttributes: new kit.Compartment(), editability: new kit.Compartment(), recovery: null, external: null, saving: false, ignoreChanges: false };
+    const doc = { ...value, mode: canEdit(value) ? "live" : "reading", savedText: normalizeText(value.text), identityAttributes: new kit.Compartment(), editability: new kit.Compartment(), recovery: null, external: null, saving: false, ignoreChanges: false };
     try {
       const raw = localStorage.getItem(recoveryKey(doc));
       if (raw) {
@@ -1111,8 +1112,7 @@
     el("workspace-file-title").textContent = withoutExtension(doc.name);
     el("workspace-breadcrumbs").textContent = doc.path.split("/").map(withoutExtension).join(" / ");
     el("workspace-breadcrumbs").title = doc.path;
-    el("workspace-policy").hidden = doc.editable && !state.requiresReopen;
-    el("workspace-policy").textContent = state.requiresReopen ? "Reopen this folder before editing. The last file operation could not be verified." : doc.reason || "This generated note is read-only. Its metadata and generated content are managed by the research engine.";
+    renderDocumentPolicy(doc);
     for (const button of document.querySelectorAll("[data-mode]")) {
       button.setAttribute("aria-pressed", String(button.dataset.mode === doc.mode));
     }
@@ -1125,16 +1125,24 @@
     renderDocumentStatus(); renderOutline(); renderTree(); renderContext();
   }
 
+  function renderDocumentPolicy(doc) {
+    el("workspace-policy").hidden = state.graphActive || canEdit(doc) && !doc.override_available && !state.requiresReopen;
+    el("workspace-policy").textContent = state.requiresReopen ? "Reopen this folder before editing. The last file operation could not be verified." : doc.override_available
+      ? `${doc.source_changed ? "The generated note changed. Your personal edits are preserved." : "Personal edits are saved separately from the generated note."} Only the note body can be saved.${doc.mode === "reading" ? " Choose Source or Live Preview to edit." : ""}`
+      : doc.reason || "This generated note is read-only. Its metadata and generated content are managed by the research engine.";
+  }
+
   function renderDocumentStatus() {
     const doc = active(); if (!doc) return;
+    renderDocumentPolicy(doc);
     el("workspace-recovery").hidden = !doc.recovery;
-    el("workspace-restore").disabled = !doc.editable;
+    el("workspace-restore").disabled = !canEdit(doc);
     el("workspace-conflict").hidden = !doc.external;
     if (!doc.external) el("workspace-disk-panel").hidden = true;
     if (!el("workspace-disk-panel").hidden && doc.external) renderDiskReview(doc);
-    el("workspace-save-draft").disabled = !doc.editable || !doc.external?.editable || doc.saving;
-    el("workspace-save").disabled = state.requiresReopen || !doc.editable || Boolean(doc.recovery) || doc.saving || !dirty(doc);
-    el("workspace-save-state").textContent = state.requiresReopen ? "Reopen required" : doc.saving ? "Saving…" : doc.recovery ? "Recovery available" : doc.external ? "Disk changed · draft preserved" : !doc.editable ? "Read-only" : dirty(doc) ? "Unsaved changes" : "Saved";
+    el("workspace-save-draft").disabled = !canEdit(doc) || !canEdit(doc.external) || doc.saving;
+    el("workspace-save").disabled = state.requiresReopen || !canEdit(doc) || Boolean(doc.recovery) || doc.saving || !dirty(doc);
+    el("workspace-save-state").textContent = state.requiresReopen ? "Reopen required" : doc.saving ? "Saving…" : doc.recovery ? "Recovery available" : doc.external ? "Disk changed · draft preserved" : !canEdit(doc) ? "Read-only" : dirty(doc) ? "Unsaved changes" : doc.override_saved ? "Personal edit saved" : "Saved";
     const text = textOf(doc), words = text.trim() ? text.trim().split(/\s+/u).length : 0;
     el("workspace-counts").textContent = `${words.toLocaleString()} words · ${text.length.toLocaleString()} characters`;
     el("workspace-back").disabled = state.historyIndex <= 0;
@@ -1223,13 +1231,15 @@
   }
 
   function applyDocumentPolicy(doc, value) {
-    const changed = doc.editable !== value.editable || doc.reason !== value.reason;
+    const changed = doc.editable !== value.editable || doc.reason !== value.reason
+      || ["override_available", "override_saved", "source_changed"].some((key) => Boolean(doc[key]) !== Boolean(value[key]));
     doc.editable = value.editable; doc.reason = value.reason;
+    for (const key of ["override_available", "override_saved", "source_changed", "source_revision"]) doc[key] = value[key];
     doc.bom = value.bom; doc.newline = value.newline;
     if (changed) {
       const effects = doc.editability.reconfigure([
-        kit.EditorState.readOnly.of(!doc.editable || Boolean(doc.recovery)),
-        kit.EditorView.editable.of(doc.editable && !doc.recovery),
+        kit.EditorState.readOnly.of(!canEdit(doc) || Boolean(doc.recovery)),
+        kit.EditorView.editable.of(canEdit(doc) && !doc.recovery),
       ]);
       if (active() === doc && state.view) state.view.dispatch({ effects });
       else doc.editorState = doc.editorState.update({ effects }).state;
@@ -1238,13 +1248,13 @@
   }
 
   async function saveDocument(doc = active(), options = {}) {
-    if (state.organization || state.requiresReopen || !doc || !doc.editable || doc.recovery || doc.saving || state.opening || (!options.force && !dirty(doc))) return;
+    if (state.organization || state.requiresReopen || !doc || !canEdit(doc) || doc.recovery || doc.saving || state.opening || (!options.force && !dirty(doc))) return;
     const epoch = state.epoch, workspaceId = state.workspace.id;
     const text = textOf(doc), revision = options.revision ?? doc.revision;
     persistDraft(doc); doc.saving = true;
     if (active() === doc) renderDocumentStatus();
     try {
-      const { document: saved } = await api("workspace/save", { workspace_id: workspaceId, document_id: doc.id, revision, text });
+      const { document: saved } = await api(doc.override_available ? "workspace/save-override" : "workspace/save", { workspace_id: workspaceId, document_id: doc.id, revision, text });
       if (epoch !== state.epoch || state.documents.get(doc.path) !== doc) return;
       const policyChanged = applyDocumentPolicy(doc, saved);
       doc.savedText = normalizeText(saved.text); doc.revision = saved.revision; doc.external = null;
@@ -1275,7 +1285,7 @@
   }
 
   function restoreRecovery() {
-    const doc = active(); if (!doc?.recovery || !doc.editable) return;
+    const doc = active(); if (!doc?.recovery || !canEdit(doc)) return;
     const saved = doc.recovery; doc.recovery = null;
     if (saved.revision !== doc.revision) doc.external = { ...doc, text: doc.savedText };
     doc.revision = saved.revision;
@@ -1313,17 +1323,22 @@
 
   async function saveEditedDraft() {
     const doc = active(), panel = el("workspace-disk-panel");
-    if (!doc?.external || !doc.editable || !doc.external.editable || doc.saving || panel.hidden) return;
+    if (!doc?.external || !canEdit(doc) || !canEdit(doc.external) || doc.saving || panel.hidden) return;
     if (panel.dataset.revision !== doc.external.revision || panel.dataset.path !== doc.path) {
       renderDiskReview(doc);
       return message("The disk version changed again. Review the updated comparison before saving.", true);
     }
     const epoch = state.epoch, revision = panel.dataset.revision, draft = textOf(doc);
     const accepted = await confirmAction("Save edited draft?", "Replace the disk version shown in this comparison with your edited draft. Further disk changes will still stop the save.", "Save edited draft");
-    if (!accepted || epoch !== state.epoch || active() !== doc || doc.saving || !doc.editable || !doc.external?.editable) return;
+    if (!accepted || epoch !== state.epoch || active() !== doc || doc.saving || !canEdit(doc) || !canEdit(doc.external)) return;
     if (doc.external.revision !== revision || textOf(doc) !== draft) {
       renderDiskReview(doc);
       return message("A version changed while you were reviewing. Review the updated comparison before saving.", true);
+    }
+    if (doc.override_available) {
+      const prefix = (text) => /^---\n[\s\S]*?\n(?:---|\.\.\.)[ \t]*(?:\n|$)/.exec(normalizeText(text))?.[0] || "";
+      const previous = prefix(doc.savedText), latest = prefix(doc.external.text);
+      if (prefix(draft) === previous && previous !== latest) replaceDocumentText(doc, latest + draft.slice(previous.length));
     }
     await saveDocument(doc, { force: true, revision });
   }
@@ -1695,7 +1710,7 @@
         doc.editorState = doc.editorState.update({ selection: relocateSelection(selection, repaired.get(path) || [], text.length) }).state;
       } else {
         doc.editorState = doc.editorState.update({ effects: [
-          doc.editability.reconfigure([kit.EditorState.readOnly.of(!doc.editable), kit.EditorView.editable.of(doc.editable)]),
+          doc.editability.reconfigure([kit.EditorState.readOnly.of(!canEdit(doc)), kit.EditorView.editable.of(canEdit(doc))]),
           doc.identityAttributes.reconfigure(kit.EditorView.contentAttributes.of({ "aria-label": `Edit ${doc.name}`, spellcheck: "true" })),
         ] }).state;
       }

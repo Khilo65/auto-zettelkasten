@@ -71,7 +71,7 @@ function harness(t, options = {}) {
     if (url === "/api/workspace/open" || url === "/api/workspace/tree") result = { workspace };
     else if (url === "/api/workspace/index") result = { documents: [{ ...data.disk }], relations: [], warnings: [], truncated: false };
     else if (url === "/api/workspace/read") result = { document: { ...data.disk } };
-    else if (url === "/api/workspace/save") {
+    else if (url === "/api/workspace/save" || url === "/api/workspace/save-override") {
       data.saves += 1;
       await data.beforeSave?.(body);
       if (body.revision !== data.disk.revision) {
@@ -82,6 +82,7 @@ function harness(t, options = {}) {
           ...data.disk,
           text: data.disk.newline === "crlf" ? body.text.replaceAll("\n", "\r\n") : body.text,
           revision: `saved-${data.saves}`,
+          ...(url.endsWith("save-override") ? { override_saved: true } : {}),
         };
         data.afterSave?.(data.disk);
         result = { document: { ...data.disk } };
@@ -318,4 +319,51 @@ test("discarding a recovered draft uses the app dialog and only changes it after
   assert.equal(reloaded.getView().state.readOnly, false);
   assert.equal(reloaded.window.workspaceHasUnsavedChanges(), false);
   assert.equal(reloaded.window.localStorage.length, 0);
+});
+
+
+test("Generated notes edit and save personal overrides in Source and Live Preview while reading stays a preview", async (t) => {
+  const app = harness(t, { text: "# Generated\n\nOriginal body.\n", document: { editable: false, override_available: true, reason: "Generated note is protected." } });
+  const view = await app.open();
+  assert.equal(view.state.readOnly, false);
+  assert.equal(app.window.document.querySelector('[data-mode="live"]').getAttribute("aria-pressed"), "true");
+  assert.match(app.element("workspace-policy").textContent, /saved separately/);
+  app.mode("source"); app.append("Personal addition.\n"); await app.save();
+  assert.equal(app.data.disk.editable, false, "Canonical ownership must remain protected");
+  assert.equal(app.requests.filter(({ url }) => url === "/api/workspace/save").length, 0);
+  assert.equal(app.requests.filter(({ url }) => url === "/api/workspace/save-override").length, 1);
+  assert.equal(app.element("workspace-save-state").textContent, "Personal edit saved");
+  app.mode("reading"); assert.match(app.element("workspace-reader").textContent, /Personal addition/);
+  assert.match(app.element("workspace-policy").textContent, /Choose Source or Live Preview to edit/);
+  app.mode("live"); app.append("Another addition.\n"); await app.save();
+  assert.equal(app.window.workspaceHasUnsavedChanges(), false);
+  assert.equal(app.getView().state.readOnly, false);
+});
+
+test("Override conflicts keep drafts writable and allow the existing reviewed save flow", async (t) => {
+  const app = harness(t, { text: "Generated body.\n", document: { editable: false, override_available: true } });
+  await app.open(); app.append("Personal draft.\n");
+  app.data.beforeSave = () => { app.data.beforeSave = null; app.data.disk.revision = "other-override"; app.data.disk.text = "Other personal edit.\n"; app.data.disk.override_saved = true; };
+  await app.save();
+  assert.equal(app.element("workspace-conflict").hidden, false);
+  assert.equal(app.getView().state.readOnly, false);
+  app.click("workspace-review-disk");
+  assert.equal(app.element("workspace-save-draft").disabled, false);
+  app.click("workspace-save-draft"); await app.confirm();
+  await until(() => app.element("workspace-conflict").hidden, "reviewed personal override save");
+  assert.match(app.data.disk.text, /Personal draft/);
+  assert.equal(app.requests.filter(({ url }) => url === "/api/workspace/save").length, 0);
+});
+
+test("Reviewed override saves retain regenerated properties while preserving the unsaved body", async (t) => {
+  const header = "---\nnote_id: atomic-one\nengine_version: old\n---\n";
+  const latest = header.replace("old", "new");
+  const app = harness(t, { text: header + "Generated body.\n", document: { editable: false, override_available: true } });
+  await app.open(); app.append("Personal draft.\n");
+  app.data.beforeSave = () => { app.data.beforeSave = null; app.data.disk.revision = "regenerated"; app.data.disk.text = latest + "New generated body.\n"; app.data.disk.source_changed = true; };
+  await app.save(); app.click("workspace-review-disk"); app.click("workspace-save-draft"); await app.confirm();
+  await until(() => app.element("workspace-conflict").hidden, "rebased personal override save");
+  assert.ok(app.data.disk.text.startsWith(latest)); assert.match(app.data.disk.text, /Personal draft/);
+  assert.equal(app.getView().state.doc.toString(), app.data.disk.text);
+  assert.equal(app.data.disk.editable, false);
 });
