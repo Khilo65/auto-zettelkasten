@@ -4,28 +4,107 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="session-token" content="__SESSION_TOKEN__">
-  <title>Auto-Zettelkasten · Map a collection</title>
+  <title>Auto-Zettelkasten</title>
   <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/workspace.css">
   <script src="/app.js" defer></script>
+  <script src="/workspace-vendor.js" defer></script>
+  <script src="/workspace.js" defer></script>
 </head>
-<body>
-  <a class="skip-link" href="#main">Skip to mapping setup</a>
+<body class="workspace-active">
+  <a class="skip-link" href="#workspace-content">Skip to document</a>
+  <nav class="workspace-rail" aria-label="App navigation">
+    <button id="show-workspace" class="rail-button selected" type="button" title="Markdown workspace" aria-label="Markdown workspace" aria-pressed="true" data-icon="NotebookPen"></button>
+    <button id="workspace-quick-open" class="rail-button" type="button" title="Quick open (⌘/Ctrl+O)" aria-label="Quick open" data-icon="Search"></button>
+    <button id="workspace-graph-open" class="rail-button" type="button" title="Graph view" aria-label="Graph view" data-icon="Network" aria-pressed="false"></button>
+    <button id="show-mapping" class="rail-button mapper-button" type="button" title="Auto-Zettelkasten mapper" aria-label="Auto-Zettelkasten mapper" aria-pressed="false"><span data-icon="Workflow"></span><span class="rail-label">Mapper</span></button>
+    <span class="rail-spacer"></span>
+    <button id="rail-open-folder" class="rail-button" type="button" title="Open folder" aria-label="Open folder" data-icon="FolderOpen"></button>
+  </nav>
+  <section id="workspace-screen" class="workspace-screen" aria-label="Markdown workspace">
+    <aside id="workspace-sidebar" class="workspace-sidebar" aria-label="Files">
+      <div class="workspace-sidebar-heading"><span>Files</span><button id="workspace-sidebar-close" class="icon-button" type="button" title="Hide file panel" aria-label="Hide file panel" data-icon="PanelLeftClose"></button></div>
+      <div class="file-toolbar" role="toolbar" aria-label="File actions">
+        <button id="workspace-new-note" class="icon-button" type="button" title="New note" aria-label="New note" data-icon="FilePlus" disabled></button>
+        <button id="workspace-new-folder" class="icon-button" type="button" title="New folder" aria-label="New folder" data-icon="FolderPlus" disabled></button>
+        <button id="workspace-sort" class="icon-button" type="button" title="Sort descending" aria-label="Sort descending" data-icon="ChevronsUpDown" disabled></button>
+        <button id="workspace-reveal" class="icon-button" type="button" title="Reveal active file" aria-label="Reveal active file" data-icon="FileText" disabled></button>
+        <button id="workspace-file-actions" class="icon-button" type="button" title="File actions" aria-label="File actions" data-icon="Ellipsis" disabled></button>
+        <button id="workspace-collapse" class="icon-button" type="button" title="Collapse folders" aria-label="Collapse folders" data-icon="ChevronsUpDown" disabled></button>
+      </div>
+      <div id="workspace-tree" class="workspace-tree" role="tree" aria-label="Workspace files"><p class="sidebar-empty">Open a folder to see your Markdown files.</p></div>
+      <p id="workspace-tree-note" class="tree-note" hidden></p>
+      <button id="workspace-root" class="workspace-root" type="button" title="Open another folder"><span data-icon="FolderOpen"></span><span id="workspace-root-name">Open folder</span></button>
+    </aside>
+    <div id="workspace-resizer" class="workspace-resizer" role="separator" aria-label="Resize file panel" aria-orientation="vertical" aria-valuemin="200" aria-valuemax="420" aria-valuenow="260" tabindex="0"></div>
+    <div class="workspace-main">
+      <div class="workspace-topline"><button id="workspace-sidebar-open" class="icon-button" type="button" title="Show file panel" aria-label="Show file panel" data-icon="PanelLeftOpen" hidden></button><div id="workspace-tabs" class="workspace-tabs" role="tablist" aria-label="Open documents"></div><button id="workspace-open-folder" class="icon-button" type="button" title="Open folder" aria-label="Open folder" data-icon="FolderOpen"></button></div>
+      <div id="workspace-document-header" class="document-header" hidden>
+        <button id="workspace-back" class="icon-button" type="button" title="Back" aria-label="Back" data-icon="ArrowLeft" disabled></button><button id="workspace-forward" class="icon-button" type="button" title="Forward" aria-label="Forward" data-icon="ArrowRight" disabled></button>
+        <div id="workspace-breadcrumbs" class="document-breadcrumbs"></div>
+        <div class="document-modes" role="group" aria-label="Document mode"><button data-mode="source" type="button">Source</button><button data-mode="live" type="button">Live Preview</button><button data-mode="reading" type="button">Reading</button></div>
+        <button id="workspace-save" class="icon-button" type="button" title="Save (⌘/Ctrl+S)" aria-label="Save" data-icon="Save"></button><button id="workspace-backlinks-toggle" class="icon-button" type="button" title="Backlinks" aria-label="Show backlinks" data-icon="Link2" aria-expanded="false"></button><button id="workspace-local-toggle" class="icon-button" type="button" title="Local graph" aria-label="Show local graph" data-icon="Network" aria-expanded="false"></button><button id="workspace-outline-toggle" class="icon-button" type="button" title="Outline" aria-label="Show outline" aria-expanded="false" data-icon="ListTree"></button>
+      </div>
+      <div id="workspace-message" class="workspace-message" role="status" hidden></div>
+      <div id="workspace-policy" class="workspace-policy" role="note" hidden></div>
+      <div id="workspace-recovery" class="document-banner" hidden><p>A recovery copy is available for this note.</p><button id="workspace-restore" type="button">Restore draft</button><button id="workspace-discard-recovery" type="button">Discard recovery</button></div>
+      <div id="workspace-conflict" class="document-banner conflict-banner" hidden><p id="workspace-conflict-message">This file changed on disk. Your draft is still open.</p><button id="workspace-review-disk" type="button">Review disk version</button><button id="workspace-use-disk" type="button">Use disk version</button></div>
+      <div id="workspace-document-area" class="workspace-document-area">
+        <main id="workspace-content" class="workspace-content" tabindex="-1">
+          <div id="workspace-welcome" class="workspace-welcome"><span class="welcome-icon" data-icon="NotebookPen"></span><h1>Your notes, in one place.</h1><p>Open a local folder to read and write Markdown.</p><button id="workspace-welcome-open" class="workspace-primary" type="button">Open folder</button><p class="welcome-hint">Files stay on this computer. No connection needed.</p></div>
+          <div id="workspace-empty" class="workspace-welcome" hidden><span class="welcome-icon" data-icon="FileText"></span><h1 id="workspace-empty-title">Choose a note</h1><p>Select a file in the sidebar, or use <kbd>⌘ / Ctrl O</kbd>.</p><button id="workspace-empty-create" class="workspace-primary" type="button">New note</button></div>
+          <div id="workspace-file-title" class="workspace-file-title" hidden></div>
+          <div id="workspace-editor" class="workspace-editor" hidden></div><article id="workspace-reader" class="workspace-reader" tabindex="0" aria-label="Reading view" hidden></article>
+          <section id="workspace-disk-panel" class="workspace-disk-panel" aria-label="Current disk version" hidden><div><h2>Current disk version</h2><button id="workspace-hide-disk" class="icon-button" type="button" aria-label="Close disk review" data-icon="X"></button></div><p>Your draft remains in the editor. Review this disk version before replacing it.</p><button id="workspace-save-draft" class="workspace-primary" type="button">Save edited draft</button><div class="conflict-comparison"><section><h3>Your draft</h3><pre id="workspace-draft-text"></pre></section><section><h3>Disk version</h3><pre id="workspace-disk-text"></pre></section></div></section>
+        </main>
+        <aside id="workspace-context" class="workspace-context" aria-label="Note connections" hidden>
+          <div class="context-heading"><div role="group" aria-label="Context view"><button type="button" data-context="backlinks" aria-label="Backlinks" title="Backlinks" data-icon="Link2"></button><button type="button" data-context="outgoing" aria-label="Outgoing links" title="Outgoing links" data-icon="Link"></button><button type="button" data-context="outline" aria-label="Outline" title="Outline" data-icon="ListTree"></button><button type="button" data-context="local" aria-label="Local graph" title="Local graph" data-icon="Network"></button></div><button id="workspace-context-close" type="button" class="icon-button" aria-label="Close context panel" title="Close context panel" data-icon="PanelLeftClose"></button></div>
+          <div id="workspace-index-status" class="index-status" role="status"></div>
+          <section id="workspace-backlinks" aria-label="Backlinks"><h2 id="workspace-backlinks-title">Linked mentions</h2><div id="workspace-backlink-items"></div></section>
+          <section id="workspace-outgoing" aria-label="Outgoing links" hidden><h2>Outgoing links</h2><div id="workspace-outgoing-items"></div></section>
+          <section id="workspace-outline" aria-label="Document outline" hidden><h2>Outline</h2><div id="workspace-outline-items"></div></section>
+          <section id="workspace-local-graph" class="local-graph-panel" aria-label="Local graph" hidden></section>
+        </aside>
+      </div>
+      <section id="workspace-global-graph" class="global-graph-panel" aria-label="Global graph" hidden></section>
+      <div class="workspace-statusbar"><span id="workspace-save-state">Markdown workspace</span><span id="workspace-counts"></span></div>
+    </div>
+  </section>
+  <div id="mapping-screen" class="mapping-screen" hidden>
   <header class="app-header">
-    <span class="brand"><svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true"><path d="M3 4.5h6l3 2 3-2h6v15h-6l-3 2-3-2H3zM12 6.5v15"/></svg>Auto-Zettelkasten</span>
+    <span class="brand"><span data-icon="NotebookPen"></span>Auto-Zettelkasten</span>
     <span class="local-label">Local app</span>
   </header>
   <main id="main">
     <div class="page-intro">
-      <p class="eyebrow">Zotero → your knowledge base</p>
-      <h1>Map a collection</h1>
-      <p>Turn your reading into atomic notes and connected ideas.</p>
+      <p class="eyebrow">Auto-Zettelkasten mapper</p>
+      <h1 id="mapper-title" tabindex="-1">Build your research memory</h1>
+      <p>Turn your Zotero reading into linked atomic notes and indexes that you and your agents can navigate.</p>
     </div>
     <div id="notice" class="notice" role="alert" hidden></div>
     <form id="mapping-form">
       <fieldset id="setup">
         <legend class="sr-only">Mapping setup</legend>
-        <section class="step" aria-labelledby="connect-title">
+        <section class="step" aria-labelledby="collection-title">
           <span class="step-number" aria-hidden="true">1</span>
+          <div class="step-body">
+            <div class="section-heading"><h2 id="collection-title">Choose sources</h2><button id="find-zotero" type="button" class="text-button">Find Zotero</button></div>
+            <fieldset class="choice-group">
+              <legend class="sr-only">Zotero source scope</legend>
+              <label class="choice"><input type="radio" name="source-scope" value="library"><span>Entire Zotero library<small>Map sources across your library.</small></span></label>
+              <label class="choice"><input type="radio" name="source-scope" value="collection" checked><span>Collection or subcollection<small>Choose a specific Zotero folder.</small></span></label>
+            </fieldset>
+            <div id="collection-fields">
+              <label for="collection">Collection to map</label>
+              <select id="collection" required disabled><option value="">Choose Find Zotero</option></select>
+              <label class="check"><input id="include-subcollections" type="checkbox"><span>Include subcollections</span></label>
+            </div>
+            <p id="zotero-message" class="field-status" role="status">Choose Find Zotero to load your collections.</p>
+            <p class="helper">Sources come from Zotero. The output folder below stores the generated memory.</p>
+          </div>
+        </section>
+        <section class="step" aria-labelledby="connect-title">
+          <span class="step-number" aria-hidden="true">2</span>
           <div class="step-body">
             <div class="section-heading"><h2 id="connect-title">Connect</h2><span id="auth-badge" class="badge">Not connected</span></div>
             <p class="helper">Choose how to generate your notes.</p>
@@ -51,15 +130,6 @@
             <p id="auth-message" class="field-status" role="status"></p>
           </div>
         </section>
-        <section class="step" aria-labelledby="collection-title">
-          <span class="step-number" aria-hidden="true">2</span>
-          <div class="step-body">
-            <div class="section-heading"><h2 id="collection-title">Zotero collection</h2><button id="find-zotero" type="button" class="text-button">Find Zotero</button></div>
-            <label class="sr-only" for="collection">Collection to map</label>
-            <select id="collection" required disabled><option value="">Finding your collections…</option></select>
-            <p id="zotero-message" class="field-status" role="status">Looking for Zotero Desktop on this computer.</p>
-          </div>
-        </section>
         <section class="step" aria-labelledby="destination-title">
           <span class="step-number" aria-hidden="true">3</span>
           <div class="step-body">
@@ -67,13 +137,13 @@
             <p class="helper">Choose where your generated notes will live.</p>
             <fieldset class="choice-group">
               <legend class="sr-only">Destination type</legend>
-              <label class="choice"><input type="radio" name="destination" value="folder" checked><span>Save to a folder<small>Keep notes, indexes, and relationships in a local workspace.</small></span></label>
+              <label class="choice"><input type="radio" name="destination" value="folder" checked><span>Open in this app<small>Create a local memory workspace with linked notes, indexes, and structured records for agents.</small></span></label>
               <label class="choice"><input type="radio" name="destination" value="obsidian"><span>Add to Obsidian<small>Add linked atomic notes and a collection index to your vault.</small></span></label>
             </fieldset>
             <div id="folder-fields">
               <label for="output-folder">Output folder</label>
               <div class="input-row"><input id="output-folder" type="text" spellcheck="false" placeholder="Choose a folder"><button id="pick-output" type="button">Browse…</button></div>
-              <p class="helper">A dedicated workspace for this collection will be created inside.</p>
+              <p class="helper">A dedicated memory workspace will be created inside. Open it here after mapping.</p>
             </div>
             <div id="vault-fields" hidden>
               <label for="vault">Obsidian vault</label>
@@ -93,7 +163,7 @@
           <div id="estimate-loading" class="loading" role="status" hidden><p>Estimating sources and relationships…</p><div class="skeleton"></div><div class="skeleton short"></div></div>
           <div id="review" hidden>
             <dl class="review-list">
-              <div><dt>Collection</dt><dd id="review-collection"></dd></div>
+              <div><dt>Source selection</dt><dd id="review-collection"></dd></div>
               <div><dt>Sources</dt><dd id="review-sources"></dd></div>
               <div><dt>Connection</dt><dd id="review-provider"></dd></div>
               <div><dt id="cost-label">Estimated cost</dt><dd id="review-cost"></dd></div>
@@ -102,21 +172,29 @@
               <div id="obsidian-path-row" hidden><dt>Obsidian folder</dt><dd id="review-obsidian" class="path"></dd></div>
             </dl>
             <p id="cost-note" class="helper"></p>
-            <label class="check consent"><input id="cloud-consent" type="checkbox"><span>I approve sending this collection’s documents to the selected provider for mapping.</span></label>
+            <label class="check consent"><input id="cloud-consent" type="checkbox"><span id="cloud-consent-text">I approve sending the selected sources to the chosen provider for mapping.</span></label>
             <div class="actions"><button id="approve" class="primary" type="button" disabled>Approve and map</button><button id="cancel-estimate" type="button">Cancel</button></div>
           </div>
           <div id="run-panel" hidden>
-            <p id="run-title" class="run-title" role="status">Mapping your collection…</p>
+            <p id="run-title" class="run-title" role="status">Building your research memory…</p>
             <progress id="run-progress" aria-label="Mapping progress"></progress>
             <p id="run-detail" class="helper"></p>
             <p id="run-message" class="field-status"></p>
             <dl id="run-paths" class="review-list"></dl>
-            <button id="new-map" type="button" hidden>Map another collection</button>
+            <div class="actions"><button id="open-mapped-workspace" class="primary" type="button" hidden>Open memory workspace</button><button id="new-map" type="button" hidden>Map more sources</button></div>
           </div>
         </div>
       </section>
     </form>
     <footer>Zotero is read-only. Mapping starts only after your approval.</footer>
   </main>
+  </div>
+  <dialog id="workspace-folder-dialog" class="workspace-dialog" aria-labelledby="workspace-folder-title"><form id="workspace-folder-form"><h2 id="workspace-folder-title">Open a Markdown folder</h2><p>Choose a local folder containing your notes.</p><label for="workspace-folder-path">Folder path</label><div class="dialog-input-row"><input id="workspace-folder-path" type="text" spellcheck="false" autocomplete="off" required placeholder="Full folder path"><button id="workspace-folder-browse" type="button">Browse…</button></div><p id="workspace-folder-error" class="dialog-error" role="alert"></p><div class="dialog-actions"><button type="button" data-close-dialog="workspace-folder-dialog">Cancel</button><button id="workspace-folder-submit" class="workspace-primary" type="submit">Open folder</button></div></form></dialog>
+  <dialog id="workspace-create-dialog" class="workspace-dialog" aria-labelledby="workspace-create-title"><form id="workspace-create-form"><h2 id="workspace-create-title">New note</h2><p id="workspace-create-location"></p><label for="workspace-create-name">Name</label><input id="workspace-create-name" type="text" spellcheck="false" autocomplete="off" required><p id="workspace-create-error" class="dialog-error" role="alert"></p><div class="dialog-actions"><button type="button" data-close-dialog="workspace-create-dialog">Cancel</button><button id="workspace-create-submit" class="workspace-primary" type="submit">Create</button></div></form></dialog>
+  <dialog id="workspace-quick-dialog" class="workspace-dialog quick-dialog" aria-label="Quick open"><label for="workspace-quick-query" class="sr-only">Find a Markdown note</label><input id="workspace-quick-query" type="text" placeholder="Find a note…" spellcheck="false" autocomplete="off" role="combobox" aria-controls="workspace-quick-results" aria-expanded="true" aria-autocomplete="list"><div id="workspace-quick-results" role="listbox" aria-label="Matching notes"></div><p class="quick-hint">↑ ↓ to select · Enter to open · Esc to close</p></dialog>
+  <dialog id="workspace-confirm-dialog" class="workspace-dialog" aria-labelledby="workspace-confirm-title" aria-describedby="workspace-confirm-message"><h2 id="workspace-confirm-title">Review change</h2><p id="workspace-confirm-message"></p><div class="dialog-actions"><button id="workspace-confirm-cancel" type="button" autofocus>Cancel</button><button id="workspace-confirm-accept" class="workspace-primary" type="button">Continue</button></div></dialog>
+  <dialog id="workspace-file-menu" class="workspace-dialog file-action-dialog" aria-labelledby="workspace-file-menu-title"><h2 id="workspace-file-menu-title">File actions</h2><p id="workspace-file-menu-path"></p><p id="workspace-file-menu-reason" role="status" hidden></p><div role="menu" aria-label="File actions"><button id="workspace-file-rename" type="button" role="menuitem">Rename</button><button id="workspace-file-move" type="button" role="menuitem">Move to…</button></div><div class="dialog-actions"><button id="workspace-file-menu-close" type="button">Close</button></div></dialog>
+  <dialog id="workspace-organization-dialog" class="workspace-dialog" aria-labelledby="workspace-organization-title"><form id="workspace-organization-form"><h2 id="workspace-organization-title">Rename</h2><p id="workspace-organization-source"></p><div id="workspace-rename-field"><label id="workspace-rename-label" for="workspace-rename-name">Name</label><input id="workspace-rename-name" type="text" spellcheck="false" autocomplete="off" required></div><div id="workspace-move-field" hidden><label for="workspace-move-search">Destination folder</label><input id="workspace-move-search" type="text" placeholder="Find a folder…" spellcheck="false" autocomplete="off" role="combobox" aria-autocomplete="list" aria-controls="workspace-move-folders" aria-expanded="true"><div id="workspace-move-folders" role="listbox" aria-label="Destination folders"></div><p id="workspace-move-selected" class="move-selected">Choose a destination folder.</p></div><p id="workspace-organization-error" class="dialog-error" role="alert"></p><div class="dialog-actions"><button id="workspace-organization-cancel" type="button">Cancel</button><button id="workspace-organization-preview" class="workspace-primary" type="submit">Review rename</button></div></form></dialog>
+  <dialog id="workspace-organization-review" class="workspace-dialog organization-review" aria-labelledby="workspace-organization-review-title"><h2 id="workspace-organization-review-title">Review rename</h2><dl class="organization-paths"><div><dt>From</dt><dd id="workspace-organization-from"></dd></div><div><dt>To</dt><dd id="workspace-organization-to"></dd></div></dl><p id="workspace-organization-counts" class="organization-counts"></p><div id="workspace-organization-warnings" class="organization-warnings" role="status"></div><div id="workspace-organization-edits" class="organization-edits"></div><p id="workspace-organization-review-error" class="dialog-error" role="alert"></p><p class="organization-decline-note">Without link updates, existing reference text stays unchanged and may stop resolving.</p><div class="dialog-actions organization-actions"><button id="workspace-organization-review-cancel" type="button" autofocus>Cancel</button><button id="workspace-organization-decline" type="button">Rename without updating links</button><button id="workspace-organization-repair" class="workspace-primary" type="button">Update links and rename</button></div></dialog>
 </body>
 </html>

@@ -54,6 +54,11 @@ include = [
   "/src",
   "/tools/desktop_entry.py",
   "/tools/build_desktop.py",
+  "/tools/build_web.mjs",
+  "/tools/web_entry.js",
+  "/tools/workspace_links.js",
+  "/package.json",
+  "/package-lock.json",
   "/docs/DESKTOP.md",
 ]
 

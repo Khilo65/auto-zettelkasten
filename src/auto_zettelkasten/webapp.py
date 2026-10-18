@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -17,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import api
+from .documents import DocumentConflict, DocumentError, DocumentIndexChanged, DocumentService
 from .files import slugify
 from .models import DEFAULT_CODEX_SOURCE_MODEL, LiteratureMappingPolicy, MapRequest
 from .readers import (ProviderError, _codex_environment, _codex_executable,
@@ -31,22 +33,89 @@ class RequestError(ValueError):
     pass
 
 
-class FrozenCollection:
+class FrozenSource:
     """Keep approved source membership fixed while delegating attachment reads."""
-    def __init__(self, client: Any, key: str, items: list[dict], collections: list[dict]):
-        self.client, self.key = client, key
-        self.items, self.rows = copy.deepcopy(items), copy.deepcopy(collections)
+    def __init__(self, client: Any, scope: str, key: str | None, items: list[dict], collections: list[dict], library_items: list[dict]):
+        self.client, self.scope, self.key = client, scope, key
+        self.items, self.rows, self.library_items = copy.deepcopy((items, collections, library_items))
 
     def inventory(self, scope: str, collection_key: str | None = None):
-        if scope == "collection" and collection_key == self.key:
+        if scope == self.scope and (collection_key or None) == self.key:
             return copy.deepcopy(self.items)
-        return self.client.inventory(scope, collection_key)
+        if scope == "library" and not collection_key:
+            return copy.deepcopy(self.library_items)
+        raise RequestError("The requested inventory differs from the approved source. Review a new estimate.")
 
     def collections(self):
         return copy.deepcopy(self.rows)
 
     def __getattr__(self, name):
         return getattr(self.client, name)
+
+
+def _source_key(value):
+    return isinstance(value, str) and bool(re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value))
+
+
+def _collection_tree(rows):
+    if not isinstance(rows, list) or len(rows) > 10000:
+        raise RequestError("The Zotero collection hierarchy exceeds the supported inventory limit.")
+    by_key, parents, identities = {}, {}, {}
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("data", row), dict):
+            raise RequestError("Zotero returned an invalid collection. Refresh its inventory.")
+        data = row.get("data", row)
+        key = row.get("key") or data.get("key")
+        parent = data.get("parentCollection")
+        if parent is False or parent is None:
+            parent = ""
+        if (not _source_key(key) or (parent != "" and not _source_key(parent))
+                or (data.get("key") and data["key"] != key)
+                or not isinstance(data.get("name", ""), str)):
+            raise RequestError("Zotero returned an invalid collection hierarchy. Refresh its inventory.")
+        if key in by_key and (parents[key] != parent or by_key[key].get("data", by_key[key]).get("name") != data.get("name")):
+            raise RequestError("Zotero returned conflicting collection identities. Refresh its inventory.")
+        if key.casefold() in identities and identities[key.casefold()] != key:
+            raise RequestError("Zotero returned conflicting collection identities. Refresh its inventory.")
+        identities[key.casefold()] = key
+        by_key[key], parents[key] = row, parent
+    for key, parent in parents.items():
+        if parent and parent not in by_key:
+            raise RequestError("A Zotero parent collection is missing. Refresh its complete inventory.")
+    depths = {}
+    for key in by_key:
+        path, seen, current = [], set(), key
+        while current and current not in depths:
+            if current in seen or len(path) >= 256:
+                raise RequestError("The Zotero collection hierarchy contains a cycle or exceeds the depth limit.")
+            path.append(current); seen.add(current)
+            current = parents[current]
+        depth = depths.get(current, 0)
+        for child in reversed(path):
+            depth += 1
+            if depth > 256:
+                raise RequestError("The Zotero collection hierarchy exceeds the depth limit.")
+            depths[child] = depth
+    return list(by_key.values()), by_key, parents
+
+
+def _source_items(values):
+    if not isinstance(values, list) or len(values) > 100000:
+        raise RequestError("The Zotero source inventory exceeds the supported limit.")
+    by_key = {}
+    for row in values:
+        if not isinstance(row, dict) or not isinstance(row.get("data", row), dict):
+            raise RequestError("Zotero returned an invalid source item. Refresh its inventory.")
+        data = row.get("data", row)
+        key = row.get("key") or data.get("key")
+        if not _source_key(key) or (data.get("key") and data["key"] != key):
+            raise RequestError("Zotero returned an invalid source identity. Refresh its inventory.")
+        canonical = key.casefold()
+        if canonical in by_key and (by_key[canonical].get("data", by_key[canonical]) != data
+                                   or by_key[canonical].get("version") != row.get("version")):
+            raise RequestError("A Zotero item changed during inventory. Review a fresh estimate.")
+        by_key.setdefault(canonical, row)
+    return list(by_key.values())
 
 
 def _directory(value: Any, *, vault: bool = False) -> Path:
@@ -97,6 +166,7 @@ class LocalApp:
         self.ticket: dict | None = None
         self.run: dict = {"status": "idle"}
         self.login_process = None
+        self.documents = DocumentService(journal_root=self.preferences_path.parent / "workspace-operations")
 
     def _editable(self):
         if self.run["status"] == "running" or self.auth["status"] == "pending":
@@ -188,6 +258,8 @@ class LocalApp:
     def handle(self, method: str, route: str, data: dict | None = None):
         data = data or {}
         with self.lock:
+            if method == "POST" and route.startswith("/api/workspace/"):
+                return self._document_request(route, data)
             if method == "GET":
                 if route == "/api/state":
                     return {"preferences": dict(self.preferences), "auth": dict(self.auth), "run": self._run_state(), "codex_executable": self.codex_executable, "default_output_folder": str(Path.home() / "Documents" / "Auto-Zettelkasten Maps")}
@@ -195,10 +267,12 @@ class LocalApp:
                     return self._run_state()
                 if route == "/api/collections":
                     try:
-                        rows = api.list_collections(client=self.client)
+                        rows, _, parents = _collection_tree(api.list_collections(client=self.client))
+                    except RequestError:
+                        raise
                     except Exception as exc:
                         raise RequestError("Zotero is unavailable. Open Zotero and enable its local API in Settings → Advanced.") from exc
-                    return {"collections": [{"key": row.get("key", ""), "name": (row.get("data") or {}).get("name", row.get("name", "")), "path": " / ".join(_api_collection_path(row, rows))} for row in rows]}
+                    return {"collections": [{"key": row.get("key") or row.get("data", {}).get("key", ""), "name": row.get("data", row).get("name", ""), "path": " / ".join(_api_collection_path(row, rows)), "parent_key": parents[row.get("key") or row["data"]["key"]]} for row in rows]}
                 raise RequestError("Unknown endpoint.")
             self._editable()
             if route == "/api/connect":
@@ -246,10 +320,44 @@ class LocalApp:
                 self._check_workspace(ticket["request"].workspace)
                 self._check_export(ticket)
                 self.ticket = None
-                self.run = {"status": "running", "run_id": ticket["run_id"], "workspace": str(ticket["request"].workspace), "message": "Mapping the approved collection."}
+                self.run = {"status": "running", "run_id": ticket["run_id"], "workspace": str(ticket["request"].workspace),
+                            "memory_workspace": str(ticket["request"].workspace), "source": copy.deepcopy(ticket["public"]["source"]),
+                            "obsidian_path": str(ticket["export"]) if ticket["export"] else "",
+                            "message": "Mapping the approved Zotero source."}
                 threading.Thread(target=self._map, args=(ticket,), daemon=True).start()
                 return dict(self.run)
             raise RequestError("Unknown endpoint.")
+
+    def _document_request(self, route: str, data: dict):
+        try:
+            if route == "/api/workspace/open":
+                return {"workspace": self.documents.open(data.get("path"))}
+            workspace_id = data.get("workspace_id")
+            if route == "/api/workspace/tree":
+                return {"workspace": self.documents.tree(workspace_id)}
+            if route == "/api/workspace/index":
+                if data.get("paged") is True:
+                    return self.documents.index_page(workspace_id, cursor=data.get("cursor"), known_generation=data.get("known_generation"))
+                return self.documents.index(workspace_id)
+            if route == "/api/workspace/relocate-preview":
+                self._editable()
+                return self.documents.prepare_relocation(workspace_id, data.get("source"), data.get("destination"))
+            if route == "/api/workspace/relocate":
+                self._editable()
+                return self.documents.apply_relocation(workspace_id, data.get("token"), data.get("repair"), data.get("patches"))
+            if route == "/api/workspace/read":
+                return {"document": self.documents.read(workspace_id, data.get("path"))}
+            if route == "/api/workspace/save":
+                self._editable()
+                return {"document": self.documents.save(workspace_id, data.get("document_id"), data.get("revision"), data.get("text"))}
+            if route == "/api/workspace/create":
+                self._editable()
+                return self.documents.create(workspace_id, data.get("parent", ""), data.get("name"), data.get("kind"))
+            raise RequestError("Unknown endpoint.")
+        except (DocumentConflict, DocumentIndexChanged):
+            raise
+        except DocumentError as exc:
+            raise RequestError(str(exc)) from exc
 
     @staticmethod
     def _check_workspace(workspace):
@@ -269,15 +377,64 @@ class LocalApp:
         self.ticket = None
         if not self.auth["ready"]:
             raise RequestError("Connect a provider first.")
+        scope = data.get("scope", "collection")
+        descendants = data.get("include_subcollections", False)
+        if not isinstance(scope, str) or scope not in {"library", "collection"}:
+            raise RequestError("Choose the entire Zotero library or one collection.")
+        if type(descendants) is not bool or ("remember_vault" in data and type(data["remember_vault"]) is not bool):
+            raise RequestError("Subcollections and remember vault choices must be true or false.")
         key = data.get("collection_key")
-        rows = api.list_collections(client=self.client)
-        collection = next((row for row in rows if row.get("key") == key), None)
-        if not collection:
+        if scope == "library" and (key not in (None, "") or descendants):
+            raise RequestError("Library scope cannot include a collection selection or subcollection option.")
+        if scope == "collection" and not _source_key(key):
             raise RequestError("Choose a Zotero collection.")
-        name = (collection.get("data") or {}).get("name", collection.get("name", "Collection"))
-        folder_name = f"{slugify(str(name))[:80] or 'collection'}-{slugify(str(key))}"
+        if str(getattr(self.client, "library_id", "0")) != "0":
+            raise RequestError("This mapper currently supports the personal Zotero Desktop library only.")
+        try:
+            rows, by_key, parents = _collection_tree(api.list_collections(client=self.client))
+            if scope == "collection" and key not in by_key:
+                raise RequestError("Choose a Zotero collection from the current inventory.")
+            library_items = copy.deepcopy(_source_items(list(self.client.inventory("library"))))
+            if scope == "library":
+                key, collection_keys = None, []
+                items = library_items
+                name = path = "Entire Zotero library"
+                folder_name = "zotero-library"
+            else:
+                collection = by_key[key]
+                name = collection.get("data", collection).get("name") or "Collection"
+                path = " / ".join(_api_collection_path(collection, rows))
+                collection_keys = [key]
+                if descendants:
+                    wanted = {key}
+                    children = {}
+                    for child, parent in parents.items():
+                        children.setdefault(parent, []).append(child)
+                    for parent in collection_keys:
+                        for child in sorted(children.get(parent, [])):
+                            if child not in wanted:
+                                wanted.add(child); collection_keys.append(child)
+                raw_items = []
+                for collection_key in collection_keys:
+                    raw_items.extend(_source_items(list(self.client.inventory("collection", collection_key))))
+                    if len(raw_items) > 100000:
+                        raise RequestError("The selected collections exceed the supported source inventory limit.")
+                items = _source_items(raw_items)
+                library_by_key = {str(row.get("key") or row.get("data", {}).get("key")).casefold(): row for row in library_items}
+                for row in items:
+                    frozen = library_by_key.get(str(row.get("key") or row.get("data", {}).get("key")).casefold())
+                    if (frozen is None or frozen.get("data", frozen) != row.get("data", row)
+                            or frozen.get("version") != row.get("version")):
+                        raise RequestError("Zotero source metadata or membership changed during inventory. Review a fresh estimate.")
+                folder_name = f"{slugify(str(name))[:80] or 'collection'}-{slugify(str(key))}"
+        except RequestError:
+            raise
+        except Exception as exc:
+            raise RequestError("Zotero inventory is unavailable. Open Zotero, enable its local API, and refresh the source list.") from exc
+        source = {"scope": scope, "key": key or "", "name": name, "path": path,
+                  "include_subcollections": descendants, "collection_keys": collection_keys, "item_count": len(items), "library_id": "0"}
         destination = data.get("destination", "folder")
-        if destination not in {"folder", "obsidian"}:
+        if not isinstance(destination, str) or destination not in {"folder", "obsidian"}:
             raise RequestError("Choose folder or Obsidian.")
         base = _directory(data.get("output_folder") or str(Path.home() / "Documents" / "Auto-Zettelkasten Maps"))
         workspace = base / folder_name
@@ -285,12 +442,12 @@ class LocalApp:
         vault = _directory(data.get("vault"), vault=True) if destination == "obsidian" else None
         run_id = f"web-{secrets.token_hex(8)}"
         export = vault / "Auto-Zettelkasten" / f"{folder_name}-{run_id}" if vault else None
-        client = FrozenCollection(self.client, key, list(self.client.inventory("collection", key)), rows)
+        client = FrozenSource(self.client, scope, key, items, rows, library_items)
         if not client.items:
-            raise RequestError("This collection contains no documents to map.")
+            raise RequestError("The selected Zotero source contains no documents to map.")
         provider = self.auth["method"]
         model = DEFAULT_CODEX_SOURCE_MODEL if provider == "codex" else "deepseek-v4-flash"
-        request = MapRequest(workspace=workspace, scope="collection", collection_key=key, provider=provider, model=model, literature_model="gpt-5.6-terra" if provider == "codex" else None, reasoning_effort="medium" if provider == "codex" else None, allow_cloud=True, literature_policy=_POLICY)
+        request = MapRequest(workspace=workspace, scope=scope, collection_key=key, provider=provider, model=model, literature_model="gpt-5.6-terra" if provider == "codex" else None, reasoning_effort="medium" if provider == "codex" else None, allow_cloud=True, literature_policy=_POLICY)
         with tempfile.TemporaryDirectory(prefix="az-estimate-") as temporary:
             scratch = Path(temporary)
             if workspace.exists():
@@ -303,14 +460,14 @@ class LocalApp:
                     ("11_state/runs", "*/literature/synthesis/cluster_synthesis/*.yml"),
                 ]:
                     inputs.extend((workspace / relative).glob(pattern))
-                for source in inputs:
-                    if source.is_file():
-                        target = scratch / source.relative_to(workspace)
+                for source_path in inputs:
+                    if source_path.is_file():
+                        target = scratch / source_path.relative_to(workspace)
                         target.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copyfile(source, target)
-            estimate = api.estimate_cost(scratch, scope="collection", collection_key=key, provider=provider, model=model, literature_policy=_POLICY, zotero_client=client)
+                        shutil.copyfile(source_path, target)
+            estimate = api.estimate_cost(scratch, scope=scope, collection_key=key or "", provider=provider, model=model, literature_policy=_POLICY, zotero_client=client)
             estimate.pop("path", None)
-        public = {"estimate_id": secrets.token_urlsafe(24), "collection": {"key": key, "name": name, "path": " / ".join(_api_collection_path(collection, rows))}, "workspace": str(workspace), "obsidian_path": str(export) if export else "", "destination": destination, "estimate": estimate}
+        public = {"estimate_id": secrets.token_urlsafe(24), "source": source, "collection": {"key": key or "", "name": name, "path": path}, "workspace": str(workspace), "memory_workspace": str(workspace), "obsidian_path": str(export) if export else "", "destination": destination, "estimate": estimate}
         ticket = {"public": public, "request": request, "client": client, "created": time.monotonic(), "run_id": run_id, "export": export, "vault": vault, "api_key": self.api_key}
         self._check_export(ticket)
         if destination == "obsidian" and "remember_vault" in data:
@@ -320,6 +477,10 @@ class LocalApp:
 
     def _run_state(self):
         result = self._redact(dict(self.run))
+        workspace = result.get("workspace")
+        if workspace:
+            result["memory_workspace"] = workspace
+            result["workspace_available"] = Path(workspace).is_dir() and (Path(workspace) / "auto-zettelkasten.yml").is_file()
         if result["status"] == "running":
             try:
                 status = api.get_status(result["workspace"], result["run_id"]).to_dict()
@@ -347,13 +508,18 @@ class LocalApp:
                 os.environ["DEEPSEEK_API_KEY"] = ticket["api_key"]
             report = api.run_map(ticket["request"], client=ticket["client"], run_id=ticket["run_id"]).to_dict()
             terminal = "failed" if report["status"] in {"blocked", "failed"} else "partial" if report.get("errors") or report.get("pending_count") or report.get("partial_count") or report.get("parked_for_review_count") or report.get("literature_failure_count") or report["status"] == "partial" else "completed"
-            obsidian = None
+            obsidian, export_error = None, ""
             if ticket["export"] and terminal != "failed":
-                self._check_export(ticket)
-                obsidian = api.export_to_obsidian(ticket["request"].workspace, ticket["vault"], project_folder=ticket["export"].name).to_dict()
-                if obsidian["status"] == "blocked":
+                try:
+                    self._check_export(ticket)
+                    obsidian = api.export_to_obsidian(ticket["request"].workspace, ticket["vault"], project_folder=ticket["export"].name).to_dict()
+                    if obsidian["status"] == "blocked":
+                        terminal = "partial"
+                except Exception:
                     terminal = "partial"
-            outcome = dict(status=terminal, report=report, obsidian=obsidian, message="Mapping finished." if terminal == "completed" else "Mapping needs review.")
+                    export_error = "The memory workspace was mapped, but export did not finish. Review the local export destination before retrying."
+            outcome = dict(status=terminal, report=report, obsidian=obsidian, export_error=export_error,
+                           message="Mapping finished." if terminal == "completed" else "Mapping needs review.")
         except Exception:
             outcome = dict(status="failed", error="Mapping or export failed. Review the local run files, connection, and destination before retrying.")
         finally:
@@ -363,6 +529,10 @@ class LocalApp:
                         os.environ.pop("DEEPSEEK_API_KEY", None)
                     else:
                         os.environ["DEEPSEEK_API_KEY"] = previous_key
+                outcome["workspace"] = str(ticket["request"].workspace)
+                outcome["memory_workspace"] = str(ticket["request"].workspace)
+                outcome["source"] = copy.deepcopy(ticket["public"]["source"])
+                outcome["workspace_available"] = ticket["request"].workspace.is_dir() and (ticket["request"].workspace / "auto-zettelkasten.yml").is_file()
                 self.run.update(outcome)
 
 
@@ -373,6 +543,12 @@ class LocalServer(ThreadingHTTPServer):
             raise ValueError("The frontend must bind to loopback.")
         self.app = app or LocalApp()
         super().__init__(address, Handler)
+
+    def server_close(self):
+        try:
+            super().server_close()
+        finally:
+            self.app.documents.close()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -387,7 +563,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+        self.send_header("Content-Security-Policy", f"default-src 'self'; style-src 'self' 'nonce-{self.server.app.token}'; script-src 'self'; connect-src 'self'; img-src 'none'; object-src 'none'; frame-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
         self.end_headers()
         self.wfile.write(body)
 
@@ -412,7 +588,8 @@ class Handler(BaseHTTPRequestHandler):
                         length = int(self.headers.get("Content-Length", "0"))
                     except ValueError:
                         raise RequestError("Invalid request length.")
-                    if not 0 < length <= 16384:
+                    limit = 6 * 1024 * 1024 + 16384 if route in {"/api/workspace/save", "/api/workspace/relocate"} else 16384
+                    if not 0 < length <= limit:
                         raise RequestError("Request too large or empty.")
                     try:
                         data = json.loads(self.rfile.read(length))
@@ -422,7 +599,17 @@ class Handler(BaseHTTPRequestHandler):
                         raise RequestError("Expected a JSON object.")
                 self._reply(200, self.server.app.handle(self.command, route, data))
                 return
-            assets = {"/": ("index.html", "text/html; charset=utf-8"), "/styles.css": ("styles.css", "text/css; charset=utf-8"), "/app.js": ("app.js", "text/javascript; charset=utf-8")}
+            assets = {
+                "/": ("index.html", "text/html; charset=utf-8"),
+                "/styles.css": ("styles.css", "text/css; charset=utf-8"),
+                "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+                "/workspace.js": ("workspace.js", "text/javascript; charset=utf-8"),
+                "/workspace.css": ("workspace.css", "text/css; charset=utf-8"),
+                "/workspace-vendor.js": ("workspace-vendor.js", "text/javascript; charset=utf-8"),
+                "/workspace-index-worker.js": ("workspace-index-worker.js", "text/javascript; charset=utf-8"),
+                "/workspace-graph-worker.js": ("workspace-graph-worker.js", "text/javascript; charset=utf-8"),
+                "/workspace-licenses.txt": ("workspace-licenses.txt", "text/plain; charset=utf-8"),
+            }
             if self.command != "GET" or route not in assets:
                 self._reply(404, {"error": "Not found."})
                 return
@@ -431,6 +618,10 @@ class Handler(BaseHTTPRequestHandler):
             if filename == "index.html":
                 body = body.replace(b"__SESSION_TOKEN__", self.server.app.token.encode())
             self._reply(200, body, content_type)
+        except DocumentConflict as exc:
+            self._reply(409, {"error": str(exc), "code": "conflict", "current": exc.current})
+        except DocumentIndexChanged as exc:
+            self._reply(409, {"error": str(exc), "code": "index_changed"})
         except RequestError as exc:
             self._reply(400, {"error": str(exc)})
         except Exception:

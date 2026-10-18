@@ -9,6 +9,9 @@ let running = false;
 let loginPending = false;
 let savedVault = "";
 let pollTimer = null;
+let collectionsAvailable = false;
+let mappedWorkspace = "";
+let openingMemory = false;
 
 function choice(name) {
   return document.querySelector(`input[name="${name}"]:checked`).value;
@@ -22,7 +25,13 @@ async function api(path, body) {
     cache: "no-store",
   });
   const result = await response.json();
-  if (!response.ok) throw new Error(result.error || result.message || "The local app could not complete this request.");
+  if (!response.ok) {
+    const error = new Error(result.error || result.message || "The local app could not complete this request.");
+    error.status = response.status;
+    error.code = result.code;
+    error.current = result.current;
+    throw error;
+  }
   return result;
 }
 
@@ -40,13 +49,15 @@ function controls() {
   $("setup").disabled = busy || running || loginPending;
   const destinationReady = choice("destination") === "obsidian" ? $("vault").value.trim() : $("output-folder").value.trim();
   const connected = auth.ready && auth.method === choice("method");
-  $("estimate").disabled = busy || running || loginPending || !connected || !$("collection").value || !destinationReady;
+  const sourceReady = choice("source-scope") === "library" || $("collection").value;
+  $("estimate").disabled = busy || running || loginPending || !connected || !sourceReady || !destinationReady;
   $("approve").disabled = busy || running || !ticket || !$("cloud-consent").checked;
   $("cancel-estimate").disabled = busy || running;
   $("connect-codex").disabled = busy || running || loginPending;
   $("login-codex").disabled = busy || running || loginPending;
   $("auth-badge").textContent = connected ? (auth.method === "deepseek" ? "Key ready" : "Connected") : "Not connected";
   $("auth-badge").classList.toggle("ready", connected);
+  $("open-mapped-workspace").disabled = openingMemory || running;
 }
 
 function updateChoices() {
@@ -54,6 +65,11 @@ function updateChoices() {
   $("key-fields").hidden = choice("method") !== "deepseek";
   $("folder-fields").hidden = choice("destination") !== "folder";
   $("vault-fields").hidden = choice("destination") !== "obsidian";
+  const library = choice("source-scope") === "library";
+  $("collection-fields").hidden = library;
+  $("collection").required = !library;
+  $("collection").disabled = library || !collectionsAvailable;
+  $("include-subcollections").disabled = library;
   controls();
 }
 
@@ -105,15 +121,16 @@ async function findZotero() {
       if (key) $("collection").add(new Option(row.path || data.name || row.name || key, key));
     }
     $("collection").value = previous;
-    $("collection").disabled = !collections.length;
-    status("zotero-message", collections.length ? `${collections.length} ${collections.length === 1 ? "collection" : "collections"} found. Zotero is read-only.` : "Create a collection in Zotero, then select Find Zotero again.");
+    collectionsAvailable = collections.length > 0;
+    status("zotero-message", collections.length ? `${collections.length} ${collections.length === 1 ? "collection" : "collections"} found. Nested collections show their full path. Zotero is read-only.` : "Zotero is connected, with no collections. Choose Entire Zotero library, or create a collection in Zotero and try again.");
   } catch (error) {
+    collectionsAvailable = false;
     $("collection").replaceChildren(new Option("Zotero is unavailable", ""));
     $("collection").disabled = true;
     status("zotero-message", `${error.message} Open Zotero Desktop and enable its local API, then try Find Zotero.`, true);
   } finally {
     $("find-zotero").disabled = false;
-    controls();
+    updateChoices();
   }
 }
 
@@ -158,7 +175,10 @@ const usd = (amount) => new Intl.NumberFormat("en-US", { style: "currency", curr
 function renderEstimate(result) {
   ticket = result;
   const estimate = result.estimate;
-  $("review-collection").textContent = result.collection.path || result.collection.name;
+  const source = result.source || result.collection;
+  const selection = source.path || source.name;
+  $("review-collection").textContent = selection + (source.include_subcollections ? " (including subcollections)" : "");
+  $("cloud-consent-text").textContent = `I approve sending the sources from ${selection}${source.include_subcollections ? " and its subcollections" : ""} to the selected provider for mapping.`;
   $("review-sources").textContent = `${estimate.inventory_count} total · ${estimate.new_source_jobs} to read · ${estimate.reusable_or_existing_records} reusable`;
   $("review-provider").textContent = estimate.provider === "codex" ? "ChatGPT subscription" : "DeepSeek API key";
   const costs = estimate.total_cost_usd || {};
@@ -189,7 +209,9 @@ async function estimate(event) {
   $("estimate-loading").hidden = false;
   try {
     renderEstimate(await api("estimate", {
-      collection_key: $("collection").value,
+      scope: choice("source-scope"),
+      collection_key: choice("source-scope") === "collection" ? $("collection").value : "",
+      include_subcollections: choice("source-scope") === "collection" && $("include-subcollections").checked,
       output_folder: $("output-folder").value.trim(),
       destination: choice("destination"),
       vault: $("vault").value.trim(),
@@ -213,8 +235,8 @@ function renderRun(value) {
   $("review-empty").hidden = true;
   $("review").hidden = true;
   $("run-panel").hidden = false;
-  const titles = { completed: "Your collection is mapped.", partial: "Mapping needs review.", failed: "Mapping could not finish.", exporting: "Adding your notes to Obsidian…" };
-  $("run-title").textContent = titles[run.status] || "Mapping your collection…";
+  const titles = { completed: "Your research memory is ready.", partial: "Mapping needs review.", failed: "Mapping could not finish.", exporting: "Adding your notes to Obsidian…" };
+  $("run-title").textContent = titles[run.status] || "Building your research memory…";
   const report = run.report || {};
   const counts = run.counts || report;
   const total = counts.inventory_count || 0;
@@ -224,8 +246,10 @@ function renderRun(value) {
     $("run-progress").value = Math.min(total, done);
   } else $("run-progress").removeAttribute("value");
   $("run-progress").hidden = !running;
-  $("run-detail").textContent = total ? `${done} of ${total} sources processed · ${counts.validated_note_count || 0} atomic notes · ${counts.typed_relation_count || 0} relationships` : "Preparing the collection and checking saved work.";
-  status("run-message", run.error || run.message || (running ? "Keep this local app running. Completed work is checkpointed." : ""), run.status === "failed");
+  $("run-detail").textContent = total ? `${done} of ${total} sources processed · ${counts.validated_note_count || 0} atomic notes · ${counts.typed_relation_count || 0} relationships` : "Preparing your sources and checking saved work.";
+  status("run-message", run.error || run.export_error || run.message || (running ? "Keep this local app running. Completed work is checkpointed." : ""), run.status === "failed" || Boolean(run.export_error));
+  mappedWorkspace = run.memory_workspace || run.workspace || "";
+  $("open-mapped-workspace").hidden = running || !run.workspace_available || !mappedWorkspace;
   $("run-paths").replaceChildren();
   const exportRoot = run.obsidian?.metadata?.export_root || run.obsidian?.export_root || run.obsidian_path;
   for (const [label, path] of [["Workspace", run.workspace], ["Obsidian folder", exportRoot]]) {
@@ -302,9 +326,21 @@ $("approve").addEventListener("click", async () => {
 });
 $("new-map").addEventListener("click", () => {
   running = false;
+  mappedWorkspace = "";
+  $("open-mapped-workspace").hidden = true;
   $("run-panel").hidden = true;
   invalidate();
-  $("collection").focus();
+  document.querySelector('input[name="source-scope"]:checked').focus();
+});
+$("open-mapped-workspace").addEventListener("click", async () => {
+  if (!mappedWorkspace || openingMemory || running) return;
+  const path = mappedWorkspace;
+  openingMemory = true; controls();
+  try {
+    if (!window.openMemoryWorkspace) throw new Error("The note workspace could not load. Restart the app and try again.");
+    await window.openMemoryWorkspace(path, "02_source_memory/indexes/INDEX.md");
+  } catch (error) { status("run-message", error.message, true); }
+  finally { openingMemory = false; controls(); }
 });
 
 async function initialize() {
@@ -323,7 +359,12 @@ async function initialize() {
     updateChoices();
     renderRun(state.run);
     if (running || loginPending) startPolling();
-    await findZotero();
   } catch (error) { notice(error.message); }
 }
-initialize();
+let mappingInitialized = false;
+window.initializeMapping = async () => {
+  if (mappingInitialized) return;
+  mappingInitialized = true;
+  await initialize();
+  await findZotero();
+};

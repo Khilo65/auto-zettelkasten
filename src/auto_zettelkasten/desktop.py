@@ -33,7 +33,7 @@ def launch() -> None:
         window = webview.create_window(
             "Auto-Zettelkasten",
             f"http://127.0.0.1:{server.server_port}",
-            width=960,
+            width=1240,
             height=860,
             min_size=(560, 640),
             text_select=True,
@@ -50,12 +50,47 @@ def launch() -> None:
             selection = window.create_file_dialog(webview.FileDialog.FOLDER, directory=directory, allow_multiple=False)
             return str(selection[0]) if selection else ""
 
+        close_ready = threading.Event()
+        close_pending = threading.Lock()
+
+        def operation_in_progress():
+            return app.run["status"] == "running" or app.auth["status"] == "pending"
+
+        def check_close():
+            try:
+                if operation_in_progress():
+                    window.create_confirmation_dialog("Operation in progress", "Keep this window open until mapping or sign-in finishes. You can minimize it while you wait.")
+                    return
+                try:
+                    # evaluate_js wraps eval, which the local app's script policy forbids.
+                    result = window.run_js("window.workspaceHasUnsavedChanges ? (window.workspaceHasUnsavedChanges() ? 'dirty' : 'clean') : 'unavailable'")
+                    if result not in ("dirty", "clean") and isinstance(result, str):
+                        result = json.loads(result)
+                    if result not in ("dirty", "clean"):
+                        raise ValueError("Editor state is unavailable")
+                    dirty = result == "dirty"
+                except Exception:
+                    window.create_confirmation_dialog("Unable to check unsaved notes", "Return to the editor and save your notes before closing.")
+                    return
+                if dirty and not window.create_confirmation_dialog("Unsaved notes", "Some notes have unsaved changes. Close without saving?"):
+                    return
+                if not operation_in_progress():
+                    close_ready.set()
+                    try:
+                        window.destroy()
+                    except Exception:
+                        close_ready.clear()
+            finally:
+                close_pending.release()
+
         def closing():
-            # Do not terminate a model call or leave an OAuth process running silently.
-            if app.run["status"] == "running" or app.auth["status"] == "pending":
-                window.create_confirmation_dialog("Operation in progress", "Keep this window open until mapping or sign-in finishes. You can minimize it while you wait.")
-                return False
-            return True
+            if close_ready.is_set() and not operation_in_progress():
+                return True
+            close_ready.clear()
+            # Cocoa must return from this event before evaluating JS or showing dialogs.
+            if close_pending.acquire(blocking=False):
+                threading.Thread(target=check_close, name="desktop-close-check", daemon=True).start()
+            return False
 
         app.folder_picker = pick
         window.events.closing += closing
@@ -64,6 +99,7 @@ def launch() -> None:
         try:
             webview.start(
                 gui="edgechromium" if sys.platform == "win32" else "cocoa",
+                icon=str(Path(__file__).with_name("web") / "app-icon.png"),
                 private_mode=False,
                 storage_path=str(app.preferences_path.parent / "webview"),
             )
@@ -106,7 +142,9 @@ def smoke_test() -> dict:
             worker.start()
             connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=10)
             try:
-                for route in ("/", "/styles.css", "/app.js"):
+                for route in ("/", "/styles.css", "/app.js", "/workspace.js", "/workspace.css",
+                              "/workspace-vendor.js", "/workspace-index-worker.js", "/workspace-graph-worker.js",
+                              "/workspace-licenses.txt"):
                     connection.request("GET", route)
                     response = connection.getresponse()
                     body = response.read()

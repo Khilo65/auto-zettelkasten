@@ -809,6 +809,30 @@ def classify_metadata_only(metadata: Mapping[str, Any] | None = None) -> Content
     )
 
 
+def classify_metadata_abstract(metadata: Mapping[str, Any]) -> ContentAdequacy | None:
+    value = metadata.get("abstractNote")
+    if not isinstance(value, str):
+        return None
+    try:
+        abstract = _clean_text(html.unescape(" ".join(_parse_html(value).parts)))
+    except (AssertionError, ValueError):
+        return None
+    if not any(char.isalpha() for char in abstract) or abstract.casefold() in {
+        "null", "none", "n/a", "na", "not available", "no abstract available",
+    }:
+        return None
+    metrics = _coverage_metrics(abstract)
+    metrics["metadata_field"] = "abstractNote"
+    return ContentAdequacy(
+        classification=ContentAdequacyClass.ABSTRACT_OR_PAYWALL_HTML,
+        source_scope="abstract_only",
+        coverage_gate="limited",
+        reason="zotero_metadata_abstract",
+        abstract=abstract,
+        metrics=metrics,
+    )
+
+
 def classify_plain_text(text: str, *, coverage_metadata: Mapping[str, Any] | None = None) -> ContentAdequacy:
     cleaned = _clean_text(text)
     metrics = _coverage_metrics(cleaned, coverage_metadata=coverage_metadata)

@@ -34,6 +34,7 @@ def build_command() -> list[str]:
     ]
     if sys.platform == "darwin":
         command += [
+            "--icon", str(ROOT / "src" / "auto_zettelkasten" / "web" / "app-icon.icns"),
             "--hidden-import", "webview.platforms.cocoa",
             "--osx-bundle-identifier", "org.auto-zettelkasten.desktop",
             "--target-architecture", platform.machine(),
@@ -41,6 +42,7 @@ def build_command() -> list[str]:
         excluded += ["webview.platforms.winforms", "webview.platforms.edgechromium", "clr", "pythonnet"]
     else:
         command += [
+            "--icon", str(ROOT / "src" / "auto_zettelkasten" / "web" / "app-icon.ico"),
             "--hidden-import", "webview.platforms.winforms",
             "--hidden-import", "webview.platforms.edgechromium",
         ]

@@ -26,6 +26,7 @@ from .extraction import (
     ExtractionResult,
     _pdf_text_has_damaged_numeral,
     classify_content_adequacy,
+    classify_metadata_abstract,
     classify_metadata_only,
     extract_bytes,
     extract_pdf_from_probe,
@@ -19964,7 +19965,7 @@ def _normalized_missing_source_recommendation(
 
 def _write_frozen_content(checkpoint_root: Path, content: Mapping[str, Any]) -> None:
     text = str(content.get("text") or "")
-    atomic_write_text(checkpoint_root / "source.txt", text)
+    atomic_write_bytes(checkpoint_root / "source.txt", text.encode("utf-8"))
     allowed = {
         "content_hash",
         "source_file",
@@ -20009,7 +20010,8 @@ def _load_frozen_content(checkpoint_root: Path) -> dict[str, Any] | None:
     source_path = checkpoint_root / "source.txt"
     if not source_path.exists():
         raise ValueError("frozen source text is missing")
-    text = source_path.read_text(encoding="utf-8")
+    # The manifest hashes exact UTF-8 bytes, including original newlines.
+    text = source_path.read_bytes().decode("utf-8")
     if str(payload.get("text_hash") or "") != sha256_text(text):
         raise ValueError("frozen source text hash mismatch")
     content = {
@@ -20449,7 +20451,10 @@ def _acquire_content(
     if cancelled is not None and cancelled():
         raise ExtractionCancelled("extraction_cancelled")
     try:
-        children = client.children(key)
+        children = [
+            child for child in client.children(key)
+            if item_data(child).get("itemType") == "attachment"
+        ]
         targets.extend(children)
         if not children:
             base["attempts"].append(
@@ -20562,6 +20567,8 @@ def _acquire_content(
                     f"{target_key}:indexed_fulltext_empty",
                 )
             )
+        if data.get("itemType") != "attachment" or data.get("linkMode") == "linked_url":
+            continue
         local = _local_attachment_path(data)
         if local:
             extraction_path = local
@@ -20629,8 +20636,6 @@ def _acquire_content(
                     content_hash=local_hash,
                     source_file=str(extraction_path),
                 ), target)
-        if target is item and str(data.get("itemType", "")) != "attachment":
-            continue
         try:
             file_result = client.file(target_key)
         except Exception as exc:
@@ -20722,6 +20727,28 @@ def _acquire_content(
                 content_hash=document_hash,
                 source_file=str(custody_path),
             ), target)
+    metadata_hash = sha256_text(
+        json.dumps(parent_data, sort_keys=True, ensure_ascii=False, default=str)
+    )
+    abstract_adequacy = classify_metadata_abstract(parent_data)
+    if abstract_adequacy is not None and not any(
+        row.get("source_scope") == "abstract_only" and str(row.get("text") or "").strip()
+        for row in candidates
+    ):
+        candidate = _content_candidate(
+            abstract_adequacy,
+            text=abstract_adequacy.abstract,
+            content_hash=metadata_hash,
+            source_file=f"zotero://select/library/items/{key}",
+            content_route="zotero_metadata_abstract",
+            media_type="application/json",
+        )
+        # Metadata abstracts remain below usable full, partial and indexed abstract text.
+        candidate["rank"] = 30
+        candidates.append(_with_source_navigation(candidate, item))
+        base["attempts"].append(
+            _attempt(base, "zotero_metadata", "limited", abstract_adequacy.reason, input_hash=metadata_hash)
+        )
     if primary_pdf_attempted:
         actual_primary = [
             row for row in candidates if row.get("actual_primary_pdf") is True
@@ -20739,6 +20766,27 @@ def _acquire_content(
                 best_abstract = max(
                     abstract_candidates, key=lambda row: len(str(row.get("text") or ""))
                 )
+                if best_abstract.get("content_route") == "zotero_metadata_abstract":
+                    metrics = dict(best_abstract["coverage_metrics"])
+                    metrics["primary_pdf_failure"] = {
+                        field: failed_primary_pdf[field]
+                        for field in ("coverage_reason", "content_hash", "source_file", "content_route")
+                    }
+                    return {
+                        **best_abstract,
+                        **{
+                            field: failed_primary_pdf[field]
+                            for field in ("attachment_key", "source_pdf_uri")
+                            if field in failed_primary_pdf
+                        },
+                        "coverage_reason": "primary_pdf_unreadable_abstract_available",
+                        "coverage_metrics": metrics,
+                        "source_coverage": {
+                            **best_abstract["source_coverage"],
+                            "reason": "primary_pdf_unreadable_abstract_available",
+                            "metrics": metrics,
+                        },
+                    }
                 abstract_text = str(best_abstract.get("text") or "").strip()
                 failed_primary_pdf.update(
                     {
@@ -20774,11 +20822,7 @@ def _acquire_content(
                 str(row.get("source_file") or ""),
             ),
         )
-    metadata = item_data(item)
-    adequacy = classify_metadata_only(metadata)
-    metadata_hash = sha256_text(
-        json.dumps(metadata, sort_keys=True, ensure_ascii=False, default=str)
-    )
+    adequacy = classify_metadata_only(parent_data)
     base["attempts"].append(
         _attempt(
             base,
