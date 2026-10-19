@@ -883,11 +883,16 @@ export function graphData(index, options = {}) {
   }
   for (const node of nodes.values()) node.pathAliases.sort((a, b) => Number(b === node.path) - Number(a === node.path) || a.localeCompare(b));
   const edges = new Map();
+  const addCitation = (source, target, provenance) => {
+    const id = `citation:${JSON.stringify([source, target])}`;
+    if (!edges.has(id)) edges.set(id, { id, source, target, type: "cites", layer: "citation", count: 1, provenance: [] });
+    edges.get(id).provenance.push(provenance);
+  };
   const projected = new Set(index.relations.flatMap((relation) => [JSON.stringify([relation.id, canonical(relation.source), canonical(relation.target)]), JSON.stringify([relation.id, canonical(relation.target), canonical(relation.source)])]));
   const enabled = (layer) => ({ reference: options.showReferences, relation: options.showRelations, citation: options.showCitations, navigation: showNavigation, discovery: options.showDiscovery })[layer] !== false;
   for (const ref of index.references) {
     const source = canonical(ref.sourcePath);
-    if (!nodes.has(source) || source !== ref.sourcePath) continue;
+    if (!nodes.has(source)) continue;
     const resolution = ref.resolution;
     let target = resolution.status === "resolved" ? canonical(resolution.path) : null;
     if (resolution.status === "invalid") continue;
@@ -899,6 +904,10 @@ export function graphData(index, options = {}) {
       const statusLabel = { missing: "missing note", ambiguous: "ambiguous target", "missing-fragment": "missing heading or block" }[resolution.status] || resolution.status;
       if (!nodes.has(target)) nodes.set(target, { id: target, label: `${ref.destination} · ${statusLabel}`, missing: true, status: resolution.status, candidates: resolution.candidates || [], tags: [], folder: "", pathAliases: [], aliases: [] });
     }
+    if (layer === "citation") {
+      addCitation(source, target, { kind: "managed_markdown", source: ref.sourcePath, line: ref.line, destination: ref.destination, from: ref.from, to: ref.to });
+      continue;
+    }
     const id = `${layer}:${JSON.stringify([source, target])}`;
     if (edges.has(id)) edges.get(id).count += 1;
     else edges.set(id, { id, source, target, layer, count: 1 });
@@ -909,6 +918,11 @@ export function graphData(index, options = {}) {
     const layer = navigation(source) || navigation(target) || navigationRelationTypes.has(relation.type) ? "navigation"
       : citationRelationTypes.has(relation.type) ? "citation" : researchRelationTypes.has(relation.type) ? "relation" : "discovery";
     if (!enabled(layer) || source === target && relation.source !== relation.target) continue;
+    if (layer === "citation") {
+      const [citing, cited] = relation.type === "cited_by" ? [target, source] : [source, target];
+      addCitation(citing, cited, { kind: "typed_relation", ...relation });
+      continue;
+    }
     const id = `${layer}:${JSON.stringify([source, target, relation.type])}`;
     if (!edges.has(id)) edges.set(id, { ...relation, id, source, target, layer, count: 1 });
   }

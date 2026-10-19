@@ -32,6 +32,48 @@ test("Research, citation, Markdown, discovery and navigation layers remain indep
   assert.equal(searchNotes(index, "Literature map")[0].path, "Literature map.md");
 });
 
+test("Managed citations and reciprocal typed rows display one directed fact with all provenance", () => {
+  const documents = [
+    note("A.md", "Ordinary [[B]].\n\n<!-- auto-zettelkasten:literature:start -->\n- **[[B|Cited work]]** — cited at p. 12\n<!-- auto-zettelkasten:literature:end -->"),
+    note("B.md"),
+  ];
+  const relations = [
+    { id: "forward", source: "A.md", target: "B.md", type: "cites" },
+    { id: "inverse", source: "B.md", target: "A.md", type: "cited_by" },
+  ];
+  for (const index of [buildLinkIndex(documents, relations), buildLibraryIndex(documents.map(parseLibraryDocument), relations)]) {
+    const options = { ...research, showRelations: false, showCitations: true };
+    const citation = graphData(index, options);
+    assert.equal(citation.edges.length, 1);
+    assert.deepEqual(citation.nodes.map((node) => node.degree), [1, 1]);
+    const [edge] = citation.edges;
+    assert.deepEqual([edge.source, edge.target, edge.type, edge.count], ["A.md", "B.md", "cites", 1]);
+    assert.deepEqual(edge.provenance, [
+      { kind: "managed_markdown", source: "A.md", line: 4, destination: "B", from: index.references[1].from, to: index.references[1].to },
+      { kind: "typed_relation", ...relations[0] },
+      { kind: "typed_relation", ...relations[1] },
+    ]);
+    assert.equal(index.references.length, 2, "Raw Markdown occurrences remain indexed");
+    assert.deepEqual(index.relations, relations, "Typed registry directions remain unchanged");
+    const both = graphData(index, { ...options, showReferences: true });
+    assert.deepEqual(both.edges.map((entry) => entry.layer), ["reference", "citation"]);
+    assert.deepEqual(both.nodes.map((node) => node.degree), [2, 2]);
+    assert.deepEqual(graphData(index, { ...options, showReferences: true, showCitations: false }).edges.map((entry) => entry.layer), ["reference"]);
+    assert.equal(graphData(index, { ...options, local: { path: "B.md", incoming: false } }).edges.length, 0, "The inverse registry row does not add an outgoing citation from B");
+    assert.equal(graphData(index, { ...options, local: { path: "B.md", outgoing: false } }).edges.length, 1);
+  }
+});
+
+test("Inverse-only citations normalize direction while genuine reciprocal citations stay distinct", () => {
+  const index = buildLinkIndex([note("A.md"), note("B.md")], [
+    { id: "inverse-only", source: "B.md", target: "A.md", type: "cited_by" },
+    { id: "opposite", source: "B.md", target: "A.md", type: "cites" },
+  ]);
+  const graph = graphData(index, { ...research, showRelations: false, showCitations: true });
+  assert.deepEqual(graph.edges.map((edge) => [edge.source, edge.target, edge.type]), [["A.md", "B.md", "cites"], ["B.md", "A.md", "cites"]]);
+  assert.deepEqual(graph.nodes.map((node) => node.degree), [2, 2]);
+});
+
 test("Only verified generated path aliases collapse and ordinary note identities never do", () => {
   const documents = [
     note("02_source_memory/notes/source-a.md", "# Source"),
@@ -54,6 +96,41 @@ test("Only verified generated path aliases collapse and ordinary note identities
   assert.equal(graphData(index, { search: "Source copy" }).nodes[0].path, identity.canonical_path);
   assert.equal(graphData(buildLinkIndex(documents, [], null, { document_identities: [{ ...identity, verified: false }] })).nodes.filter((node) => node.path).length, 5);
   assert.equal(searchNotes(index, "Source copy")[0].path, "Source copy.md");
+});
+
+test("Generated alias references deduplicate equivalent targets and retain their citation provenance", () => {
+  const canonical = "03_literature_synthesis/maps/map-one/clusters/Cluster.md";
+  const compatibility = "03_literature_synthesis/clusters/Cluster.md";
+  const text = "[[Shared]]\n<!-- auto-zettelkasten:literature:start -->\n[[Shared]]\n<!-- auto-zettelkasten:literature:end -->";
+  const documents = [note(canonical, text), note(compatibility, text), note("Shared.md")];
+  const metadata = { document_identities: [{ canonical_path: canonical, path_aliases: [compatibility], verified: true }] };
+  for (const index of [buildLinkIndex(documents, [], null, metadata), buildLibraryIndex(documents.map(parseLibraryDocument), [], null, metadata)]) {
+    const graph = graphData(index);
+    assert.equal(graph.nodes.length, 2);
+    assert.equal(graph.edges.length, 2, "One ordinary link and one citation fact survive alias collapse");
+    assert.deepEqual(graph.nodes.map((node) => node.degree), [2, 2]);
+    assert.equal(graph.edges.find((edge) => edge.layer === "reference").count, 2, "Both raw occurrences remain represented on one edge");
+    const citation = graph.edges.find((edge) => edge.layer === "citation");
+    assert.equal(citation.count, 1);
+    assert.deepEqual(citation.provenance.map((row) => row.source), [canonical, compatibility]);
+    assert.equal(graph.partial, false);
+  }
+});
+
+test("A missing destination from a generated compatibility path remains visible", () => {
+  const canonical = "03_literature_synthesis/maps/map-one/clusters/Cluster.md";
+  const compatibility = "03_literature_synthesis/clusters/Cluster.md";
+  const documents = [note(canonical, "[Context](./Context.md)"), note(compatibility, "[Context](./Context.md)"), note(canonical.replace("Cluster.md", "Context.md"))];
+  const metadata = { document_identities: [{ canonical_path: canonical, path_aliases: [compatibility], verified: true }] };
+  for (const index of [buildLinkIndex(documents, [], null, metadata), buildLibraryIndex(documents.map(parseLibraryDocument), [], null, metadata)]) {
+    const graph = graphData(index);
+    assert.equal(graph.edges.length, 2);
+    assert.equal(graph.nodes.find((node) => node.path === canonical).degree, 2);
+    assert.equal(graph.nodes.filter((node) => node.missing).length, 1);
+    assert.equal(graph.unresolved.missing, 1);
+    assert.equal(graph.partial, false, "All references were indexed; the missing destination is explicit");
+    assert.equal(graphData(index, { existingOnly: true }).unresolved.hidden, 1);
+  }
 });
 
 test("Unresolved graph destinations name missing notes, ambiguous matches and missing fragments explicitly", () => {
