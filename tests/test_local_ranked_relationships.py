@@ -70,6 +70,59 @@ def commit(workspace: Path, result: dict[str, Any]) -> None:
         catalogue_revision=result["reconciled_catalogue_revision"])
 
 
+@pytest.mark.parametrize("route", ["local", "mandatory"])
+@pytest.mark.parametrize("title_length,echo,valid", [
+    (40, "exact", True), (300, "exact", True),
+    (300, "truncated", False), (300, "wrong", False),
+])
+def test_ordinary_batches_validate_the_full_prompt_title(
+    tmp_path: Path, route: str, title_length: int, echo: str, valid: bool,
+) -> None:
+    profiles = [_profile(source_id) for source_id in "AB"]
+    title = "L" * title_length
+    catalogue = _catalogue(tmp_path, profiles)
+    catalogue_path = Path(catalogue["catalogue_path"])
+    payload = read_yaml(catalogue_path)
+    payload["sources"][0]["title"] = title
+    write_yaml(catalogue_path, payload)
+    if route == "mandatory":
+        write_yaml(tmp_path / "02_source_memory/indexes/literature_positions.yml", {
+            "positions": [{"current_source_id": "A", "matched_source_id": "B",
+                           "engagement": "Explicit source citation."}],
+        })
+
+    def handler(stage: str, provider_profiles: Any, context: Any) -> dict[str, Any]:
+        assert stage == "relationship_candidate_selection"
+        assert provider_profiles == []
+        assert context["required_pairs"] == [["A", "B"]]
+        titles = {row["source_id"]: row["title"] for row in context["catalogue"]}
+        assert titles == {"A": title, "B": "Source B"}
+        row = {**_ordinary_candidate("A", "B"),
+               "left_source_title": titles["A"], "right_source_title": titles["B"],
+               "bridge_job_id": context["bridge_jobs"][0]["bridge_job_id"]}
+        if echo == "truncated":
+            row["left_source_title"] = title[:240]
+        elif echo == "wrong":
+            row["left_source_title"] = title[:-1] + "W"
+        return {"candidates": [row]}
+
+    calls = _Calls(handler)
+    result = pipeline._run_relationship_reasoning(
+        tmp_path, profiles=profiles, source_set={"source_set_type": "collection"},
+        catalogue=catalogue, reasoner=_OrdinaryReasoner(), reasoner_calls=calls,
+        request=LiteratureMapRequest(tmp_path, provider="test-provider", model="test-model",
+            literature_policy=LiteratureMappingPolicy(cluster_generation_enabled=False)),
+        ranked_candidates=[candidate("A", "B", left_source_title=title)] if route == "local" else None,
+    )
+    assert len(calls.seen) == result["provider_batch_count"] == 1
+    assert result["relationship_stage_complete"] is valid, result["parked"]
+    assert len(result["accepted"]) == int(valid)
+    if not valid:
+        assert result["parked"][0]["reason"] == "invalid_decision_v4_contract"
+    job_input = json.loads(next(Path(result["job_root"]).glob("*/input.json")).read_text())
+    assert job_input["graph_context"]["pair_context"]["endpoint_profiles"]["A"]["title"] == title[:240]
+
+
 def test_deduplicates_reverse_pairs_and_reuses_rank_only_changes(tmp_path: Path) -> None:
     profiles = [_profile(source_id) for source_id in "AB"]
     rows = [candidate("A", "B"), candidate("B", "A", rank=7)]

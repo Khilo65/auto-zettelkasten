@@ -10924,6 +10924,7 @@ def _run_relationship_reasoning(
 
     def ordinary_row(
         job: RelationshipPairJob, rows: Sequence[Mapping[str, Any]],
+        *, source_titles: Mapping[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         # Routing hypotheses and deterministic completion are not model decisions.
         judgments = [row for row in rows if (
@@ -10948,8 +10949,10 @@ def _run_relationship_reasoning(
         if any(
             ("left_source_title" in row or "right_source_title" in row)
             and relationship_source_identity_error(
-                row, {source_id: entry_by_source[source_id].get("title")
-                      for source_id in (job.left_source_id, job.right_source_id)}
+                row, source_titles if source_titles is not None else {
+                    source_id: entry_by_source[source_id].get("title")
+                    for source_id in (job.left_source_id, job.right_source_id)
+                }
             )
             for row in judgments
         ):
@@ -11256,8 +11259,10 @@ def _run_relationship_reasoning(
         if local_ranked_mode:
             for pair in invalid_pairs:
                 by_pair[pair] = [{"decision": "ordinary_decision_outside_required_pair_scope"}]
+        source_titles = {str(row["source_id"]): row["title"] for row in packet_context["catalogue"]}
         return {"decisions": [row for job in packet
-            if (row := ordinary_row(job, by_pair.get((job.left_source_id, job.right_source_id), []))) is not None]}
+            if (row := ordinary_row(job, by_pair.get((job.left_source_id, job.right_source_id), []),
+                                    source_titles=source_titles)) is not None]}
 
 
     runnable_packets = []
