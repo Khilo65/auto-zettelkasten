@@ -17,3 +17,4 @@ credentials*.json
 *.key
 auto-zettelkasten.yml
 .DS_Store
+.auto-zettelkasten/
