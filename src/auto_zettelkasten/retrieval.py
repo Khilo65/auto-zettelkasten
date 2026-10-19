@@ -288,6 +288,8 @@ class LocalRetrievalIndex:
         relation_count = 0
         if isinstance(relations, Mapping):
             for predicate in islice(sorted(relations), self.max_discovery_signals_per_source):
+                if predicate != "dc:relation":
+                    continue
                 values = relations[predicate] if isinstance(relations[predicate], list) else [relations[predicate]]
                 for value in values[:self.max_discovery_signals_per_source]:
                     relation_count += 1

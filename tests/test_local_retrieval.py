@@ -174,6 +174,31 @@ def test_related_uri_checks_library_and_does_not_claim_citation():
     assert "direct_reference" not in json.dumps(result)
 
 
+@pytest.mark.parametrize("predicate", ["dc:replaces", "dc:isReplacedBy", "owl:sameAs", "dc:relation"])
+def test_only_zotero_related_predicate_shortlists_otherwise_unrelated_sources(predicate):
+    rows = [_row("A", title="Taxation"), _row("B", title="Butterflies")]
+    records = [_record("A", "AAAA0001", relations={predicate: ["http://zotero.org/users/42/items/BBBB0002"]}), _record("B", "BBBB0002")]
+    result = LocalRetrievalIndex(rows, records).candidate_pairs()
+    if predicate == "dc:relation":
+        assert set(_pairs(result)) == {("A", "B")}
+        related = [row for row in result[0]["discovery_provenance"] if row["signal"] == "zotero_related"]
+        assert len(related) == 1
+        assert related[0]["predicate"] == "dc:relation"
+    else:
+        assert result == []
+
+
+def test_administrative_relation_does_not_remove_independent_text_or_reference_signals():
+    rows = [_row("A", "institutional capacity", title="Taxation"), _row("B", "institutional capacity", title="Butterflies")]
+    refs = [{"work_id": "work:shared", "match_status": "unresolved"}]
+    records = [_record("A", "AAAA0001", references=refs), _record("B", "BBBB0002", references=refs)]
+    expected = LocalRetrievalIndex(rows, records).candidate_pairs()
+    records[0]["metadata"]["relations"] = {"dc:replaces": ["http://zotero.org/users/42/items/BBBB0002"]}
+    result = LocalRetrievalIndex(rows, records).candidate_pairs()
+    assert result == expected
+    assert {"shared_terms", "shared_reference"} <= {row["signal"] for row in result[0]["discovery_provenance"]}
+
+
 @pytest.mark.parametrize("change", ["source", "identity", "key", "duplicate_binding"])
 def test_conflicting_scanner_binding_is_rejected(change):
     rows = [_row("A", zotero_key="KEY"), _row("B")]

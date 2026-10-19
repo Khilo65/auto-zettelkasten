@@ -124,6 +124,144 @@ def test_partial_pdf_cache_falls_through_local_file_without_ocr(tmp_path: Path, 
     assert record["source_id"] is None and record["note_id"] is None
 
 
+@pytest.mark.parametrize("secondary_title", ["Supporting information", "Response to reviewers"])
+def test_scan_prefers_primary_pdf_over_complete_secondary_first(tmp_path: Path, secondary_title: str) -> None:
+    client = LocalClient([_item("A")])
+    client.children = lambda *_args, **_kwargs: [
+        {"key": "SECONDARY", "data": {"itemType": "attachment", "title": secondary_title, "contentType": "application/pdf"}},
+        {"key": "MAIN", "data": {"itemType": "attachment", "title": "Full text PDF", "contentType": "application/pdf"}},
+    ]
+
+    def fulltext(key, *, max_bytes):
+        client.calls.append(("fulltext", key, max_bytes))
+        return {"content": f"References\ndoi:10.1000/{key.lower()}\n", "indexedPages": 1, "totalPages": 1}
+
+    client.fulltext = fulltext
+    record = scan_local_collection(tmp_path, instance_id="desktop-one", item_keys=["A"], client=client)["documents"][0]
+    assert [call[1] for call in client.calls if call[0] == "fulltext"] == ["MAIN"]
+    assert record["text_hash"] == hashlib.sha256(b"References\ndoi:10.1000/main\n").hexdigest()
+    assert record["coverage"]["sufficient"] is True
+
+
+@pytest.mark.parametrize("secondary_title", ["Supporting information", "Response to reviewers"])
+@pytest.mark.parametrize("route", ["cached", "file"])
+def test_secondary_pdf_fallback_has_limited_parent_coverage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, secondary_title: str, route: str,
+) -> None:
+    client = LocalClient([_item("A")])
+    client.children = lambda *_args, **_kwargs: [
+        {"key": "SECONDARY", "data": {"itemType": "attachment", "title": secondary_title, "contentType": "application/pdf"}},
+        {"key": "MAIN", "data": {"itemType": "attachment", "title": "Full text PDF", "contentType": "application/pdf"}},
+    ]
+    client.fulltext = lambda key, **_kwargs: {"content": TEXT, "indexedPages": 1, "totalPages": 1} if key == "SECONDARY" and route == "cached" else None
+    client.file = lambda key, **_kwargs: (b"synthetic bytes", "application/pdf") if key == "SECONDARY" and route == "file" else None
+    monkeypatch.setattr("auto_zettelkasten.local_tools.extract_bytes", lambda *_args, **_kwargs: ExtractionResult(
+        "succeeded", text=TEXT, route="pdf_text", reason="synthetic_pdf", page_count=1,
+        adequacy=ContentAdequacy(ContentAdequacyClass.FULL_PDF_TEXT, "full_document", "passed", "synthetic_pdf")))
+    record = scan_local_collection(tmp_path, instance_id="desktop-one", item_keys=["A"], client=client)["documents"][0]
+    assert record["text_hash"] == hashlib.sha256(TEXT.encode()).hexdigest()
+    assert record["references"]
+    assert record["coverage"]["status"] == "partial"
+    assert record["coverage"]["source_scope"] == "partial_document"
+    assert record["coverage"]["coverage_gate"] == "limited"
+    assert record["coverage"]["sufficient"] is False
+    assert record["coverage"]["reason"] == "secondary_attachment_only"
+
+
+@pytest.mark.parametrize("secondary_title", ["Supporting information", "Response to reviewers"])
+def test_partial_primary_is_preferred_over_longer_complete_secondary(tmp_path: Path, secondary_title: str) -> None:
+    client = LocalClient([_item("A")])
+    client.children = lambda *_args, **_kwargs: [
+        {"key": "SECONDARY", "data": {"itemType": "attachment", "title": secondary_title, "contentType": "application/pdf"}},
+        {"key": "MAIN", "data": {"itemType": "attachment", "title": "Full text PDF", "contentType": "application/pdf"}},
+    ]
+    main_text = "References\ndoi:10.1000/main\n"
+    client.fulltext = lambda key, **_kwargs: {
+        "content": main_text if key == "MAIN" else TEXT * 10,
+        "indexedPages": 1, "totalPages": 3 if key == "MAIN" else 1,
+    }
+    record = scan_local_collection(tmp_path, instance_id="desktop-one", item_keys=["A"], client=client)["documents"][0]
+    assert record["text_hash"] == hashlib.sha256(main_text.encode()).hexdigest()
+    assert record["coverage"]["status"] == "partial"
+    assert record["coverage"]["sufficient"] is False
+
+
+def test_primary_ranking_precedes_bounded_attachment_selection(tmp_path: Path) -> None:
+    client = LocalClient([_item("A", itemType="book")])
+    client.children = lambda *_args, **_kwargs: [
+        *[{"key": f"SUPP{i}", "data": {"itemType": "attachment", "title": "Supporting information", "contentType": "application/pdf"}} for i in range(8)],
+        {"key": "MAIN", "data": {"itemType": "attachment", "title": "Full text PDF", "contentType": "application/pdf"}},
+    ]
+    record = scan_local_collection(tmp_path, instance_id="desktop-one", item_keys=["A"], client=client)["documents"][0]
+    assert [call[1] for call in client.calls if call[0] == "fulltext"] == ["MAIN"]
+    assert record["coverage"]["sufficient"] is True
+
+
+@pytest.mark.parametrize("label,primary", [("Supporting information", False), ("Response to reviewers", False), ("Full text PDF", True)])
+@pytest.mark.parametrize("metadata_type", [None, "application/octet-stream"])
+@pytest.mark.parametrize("route", ["cached", "file"])
+@pytest.mark.parametrize("pdf_label_field", ["filename", "title"])
+def test_unknown_attachment_media_uses_pdf_filename_for_parent_coverage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, label: str, primary: bool, metadata_type: str | None, route: str, pdf_label_field: str,
+) -> None:
+    client = LocalClient([_item("A")])
+    attachment = {"itemType": "attachment", "filename": "opaque-download", pdf_label_field: f"{label}.pdf"}
+    if metadata_type is not None:
+        attachment["contentType"] = metadata_type
+    client.children = lambda *_args, **_kwargs: [{"key": "PDF", "data": attachment}]
+    client.fulltext = lambda *_args, **_kwargs: {"content": TEXT, "indexedPages": 1, "totalPages": 1} if route == "cached" else None
+    client.file = lambda *_args, **_kwargs: (b"synthetic bytes", "application/pdf") if route == "file" else None
+    monkeypatch.setattr("auto_zettelkasten.local_tools.extract_bytes", lambda *_args, **_kwargs: ExtractionResult(
+        "succeeded", text=TEXT, route="pdf_text", reason="synthetic_pdf", page_count=1,
+        adequacy=ContentAdequacy(ContentAdequacyClass.FULL_PDF_TEXT, "full_document", "passed", "synthetic_pdf")))
+    record = scan_local_collection(tmp_path, instance_id="desktop-one", item_keys=["A"], client=client)["documents"][0]
+    assert record["coverage"]["sufficient"] is primary
+    assert record["coverage"]["source_scope"] == ("full_document" if primary else "partial_document")
+    assert record["coverage"]["coverage_gate"] == ("passed" if primary else "limited")
+    assert record["references"]
+
+
+@pytest.mark.parametrize("label,primary", [("Supporting information", False), ("Response to reviewers", False), ("Full text PDF", True)])
+@pytest.mark.parametrize("metadata_type", [None, "application/octet-stream"])
+def test_actual_pdf_media_type_classifies_opaque_attachment_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, label: str, primary: bool, metadata_type: str | None,
+) -> None:
+    client = LocalClient([_item("A")], document=b"synthetic bytes")
+    attachment = {"itemType": "attachment", "title": label, "filename": "opaque-download"}
+    if metadata_type is not None:
+        attachment["contentType"] = metadata_type
+    client.children = lambda *_args, **_kwargs: [{"key": "PDF", "data": attachment}]
+    client.fulltext = lambda *_args, **_kwargs: None
+    monkeypatch.setattr("auto_zettelkasten.local_tools.extract_bytes", lambda *_args, **_kwargs: ExtractionResult(
+        "succeeded", text=TEXT, route="pdf_text", reason="synthetic_pdf", page_count=1,
+        adequacy=ContentAdequacy(ContentAdequacyClass.FULL_PDF_TEXT, "full_document", "passed", "synthetic_pdf")))
+    record = scan_local_collection(tmp_path, instance_id="desktop-one", item_keys=["A"], client=client)["documents"][0]
+    assert record["coverage"]["sufficient"] is primary
+    assert record["coverage"]["source_scope"] == ("full_document" if primary else "partial_document")
+    assert record["coverage"]["coverage_gate"] == ("passed" if primary else "limited")
+
+
+@pytest.mark.parametrize("label,primary", [("Supporting information", False), ("Response to reviewers", False), ("Full text PDF", True)])
+@pytest.mark.parametrize("metadata_type", [None, "application/octet-stream", "text/html"])
+def test_secondary_character_cache_is_limited_without_known_media(
+    tmp_path: Path, label: str, primary: bool, metadata_type: str | None,
+) -> None:
+    client = LocalClient([_item("A")])
+    attachment = {"itemType": "attachment", "title": label, "filename": "opaque-download"}
+    if metadata_type is not None:
+        attachment["contentType"] = metadata_type
+    client.children = lambda *_args, **_kwargs: [{"key": "DOC", "data": attachment}]
+    client.fulltext = lambda *_args, **_kwargs: {"content": TEXT, "indexedChars": len(TEXT), "totalChars": len(TEXT)}
+    record = scan_local_collection(tmp_path, instance_id="desktop-one", item_keys=["A"], client=client)["documents"][0]
+    assert record["coverage"]["sufficient"] is primary
+    assert record["coverage"]["status"] == ("succeeded" if primary else "partial")
+    assert record["coverage"]["source_scope"] == ("full_document" if primary else "partial_document")
+    assert record["coverage"]["coverage_gate"] == ("passed" if primary else "limited")
+    if not primary:
+        assert record["coverage"]["reason"] == "secondary_attachment_only"
+    assert record["references"]
+
+
 def test_unreadable_or_missing_document_is_unknown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("auto_zettelkasten.local_tools.extract_bytes", lambda *_args, **_kwargs: ExtractionResult("failed", reason="scanned_pdf_without_text"))
     client = LocalClient([_item("A"), _item("B")], partial=True, document=b"scanned fixture")
@@ -173,6 +311,76 @@ def test_cache_instance_isolation_and_read_only_loading(tmp_path: Path) -> None:
     assert loaded["status"]["cached_document_count"] == 1
     assert loaded["status"]["reference_coverage"] == "cached_unverified"
     assert cache.read_bytes() == before
+
+
+@pytest.mark.parametrize("container", ["row", "identity"])
+@pytest.mark.parametrize("field,value", [("instance_id", "desktop-two"), ("library_id", "9"), ("library_type", "group")])
+def test_explicit_catalogue_scope_conflicts_stay_unbound(
+    tmp_path: Path, container: str, field: str, value: str,
+) -> None:
+    initial = scan_local_collection(tmp_path, instance_id="desktop-one", item_keys=["A"], client=LocalClient([_item("A")]))
+    assert initial["documents"][0]["source_id"] is None
+    _workspace(tmp_path)
+    path = tmp_path / "02_source_memory/indexes/source_catalogue.yml"
+    catalogue = read_yaml(path)
+    for row in catalogue["sources"]:
+        row["identity"] = {"canonical_zotero_key": row["zotero_key"], "zotero_item_keys": [row["zotero_key"]]}
+        (row if container == "row" else row["identity"])[field] = value
+    catalogue["sources"][1]["identity"]["doi"] = "10.1000/example"
+    write_yaml(path, catalogue)
+    before = _hashes(tmp_path)
+    cache = tmp_path / CACHE_RELATIVE_PATH
+    cached_before = cache.read_bytes()
+
+    loaded = load_local_retrieval(tmp_path, instance_id="desktop-one")
+    assert loaded["status"]["cached_document_count"] == 0
+    assert all("identity" not in row for row in loaded["rows"])
+    assert not loaded["index"].references["source-a"]
+    assert cache.read_bytes() == cached_before
+
+    record = scan_local_collection(tmp_path, instance_id="desktop-one", item_keys=["A"], client=LocalClient([_item("A")]))["documents"][0]
+    assert record["source_id"] is None and record["note_id"] is None
+    assert record["identity"] == initial["documents"][0]["identity"]
+    assert record["references"][0]["matched_item_keys"] == []
+    assert record["references"][0]["match_status"] == "external"
+    assert load_local_retrieval(tmp_path, instance_id="desktop-one")["status"]["cached_document_count"] == 0
+    assert _hashes(tmp_path) == before
+
+
+@pytest.mark.parametrize("explicit_scope", [False, True])
+def test_matching_and_legacy_unscoped_catalogues_still_bind(tmp_path: Path, explicit_scope: bool) -> None:
+    _workspace(tmp_path)
+    if explicit_scope:
+        path = tmp_path / "02_source_memory/indexes/source_catalogue.yml"
+        catalogue = read_yaml(path)
+        for row in catalogue["sources"]:
+            row["identity"] = {"instance_id": "desktop-one", "library_type": "user", "library_id": "0"}
+        write_yaml(path, catalogue)
+    result = scan_local_collection(tmp_path, instance_id="desktop-one", item_keys=["A"], client=LocalClient([_item("A")]))
+    assert result["documents"][0]["source_id"] == "source-a"
+    loaded = load_local_retrieval(tmp_path, instance_id="desktop-one")
+    assert loaded["status"]["cached_document_count"] == 1
+    assert loaded["index"].references["source-a"]
+    assert loaded["rows"][0]["identity"] == {"instance_id": "desktop-one", "library_type": "user", "library_id": "0", "item_key": "A"}
+
+
+def test_same_item_key_in_other_scope_does_not_hide_current_owner(tmp_path: Path) -> None:
+    scan_local_collection(tmp_path, instance_id="desktop-one", item_keys=["A"], client=LocalClient([_item("A")]))
+    _workspace(tmp_path)
+    path = tmp_path / "02_source_memory/indexes/source_catalogue.yml"
+    catalogue = read_yaml(path)
+    catalogue["sources"][0]["identity"] = {"instance_id": "desktop-two", "library_type": "user", "library_id": "0"}
+    catalogue["sources"][1]["zotero_key"] = "A"
+    catalogue["sources"][1]["identity"] = {"instance_id": "desktop-one", "library_type": "user", "library_id": "0"}
+    write_yaml(path, catalogue)
+    loaded = load_local_retrieval(tmp_path, instance_id="desktop-one")
+    assert loaded["status"]["cached_document_count"] == 1
+    assert not loaded["index"].references["source-a"]
+    assert loaded["index"].references["source-b"]
+    assert "source-a" not in loaded["index"].identities
+    assert loaded["index"].identities["source-b"] == ("desktop-one", "user", "0", "A")
+    record = scan_local_collection(tmp_path, instance_id="desktop-one", item_keys=["A"], client=LocalClient([_item("A")]))["documents"][0]
+    assert record["source_id"] == "source-b"
 
 
 @pytest.mark.parametrize("bounds", [{"max_files": 1}, {"max_file_bytes": 10}, {"max_total_bytes": 20}])

@@ -135,8 +135,20 @@ def _catalogue(root: Path) -> dict[str, Any]:
     return budget.read(path)
 
 
-def _binding(catalogue: Mapping[str, Any], key: str) -> dict[str, Any] | None:
-    matches = [row for row in catalogue.get("sources", []) if isinstance(row, dict) and key in _catalogue_keys(row) and row.get("source_id")]
+def _catalogue_scope_matches(row: Mapping[str, Any], instance_id: str, library_id: str) -> bool:
+    """Legacy unscoped rows are compatible; every explicit scope field must match."""
+    identity = row.get("identity", {})
+    if not isinstance(identity, Mapping):
+        return False
+    return all(field not in container or container[field] == expected
+               for container in (row, identity)
+               for field, expected in (("instance_id", instance_id), ("library_type", "user"), ("library_id", library_id)))
+
+
+def _binding(catalogue: Mapping[str, Any], identity: Mapping[str, str]) -> dict[str, Any] | None:
+    matches = [row for row in catalogue.get("sources", []) if isinstance(row, dict)
+               and _catalogue_scope_matches(row, identity["instance_id"], identity["library_id"])
+               and identity["item_key"] in _catalogue_keys(row) and row.get("source_id")]
     return dict(matches[0]) if len(matches) == 1 else None
 
 
@@ -167,6 +179,8 @@ def _coverage_counts(value: Mapping[str, Any]) -> dict[str, int]:
 
 
 def _source_text(item: Mapping[str, Any], client: Any) -> tuple[str, dict[str, Any]]:
+    from .pipeline import _attachment_candidate_rank, _target_media_type
+
     data = _data(item)
     key = str(item.get("key") or data.get("key") or "")
     coverage: dict[str, Any] = {"status": "not_examined", "reason": "local_document_unavailable", "source_scope": "metadata_only"}
@@ -177,14 +191,28 @@ def _source_text(item: Mapping[str, Any], client: Any) -> tuple[str, dict[str, A
         coverage.update(status="failed", reason=f"attachment_metadata_failed:{type(exc).__name__}")
     targets = [item] if data.get("itemType") == "attachment" else children
     attachments = [target for target in targets if isinstance(target, Mapping) and _data(target).get("itemType") == "attachment" and _data(target).get("linkMode") not in ("linked_url", 3)]
-    attachments.sort(key=lambda target: _data(target).get("contentType") != "application/pdf")
-    best_text = ""
-    for target in attachments[:MAX_ATTACHMENTS]:
+    ranked_attachments = []
+    for target in attachments:
         target_data = _data(target)
+        media_type = _target_media_type(target_data)
+        if media_type == "application/octet-stream":
+            media_type = _target_media_type({**target_data, "contentType": ""})
+        if media_type == "application/octet-stream":
+            media_type = _target_media_type({**target_data, "contentType": "", "filename": ""})
+        ranked_attachments.append((_attachment_candidate_rank(
+            target_data, data, media_type=media_type, actual_file=True,
+        ) or 0, target, media_type))
+    ranked_attachments.sort(key=lambda candidate: candidate[0], reverse=True)
+    best_text = ""
+    best_rank = -1
+    for attachment_rank, target, media_type in ranked_attachments[:MAX_ATTACHMENTS]:
+        target_data = _data(target)
+        # A supported type lets existing label heuristics classify secondary files even when MIME is unknown.
+        label_rank = _attachment_candidate_rank(target_data, data, media_type="application/pdf", actual_file=True)
+        secondary = data.get("itemType") != "attachment" and label_rank is not None and label_rank < 90
         attachment_key = str(target.get("key") or target_data.get("key") or "")
         if not attachment_key:
             continue
-        media_type = str(target_data.get("contentType") or "application/octet-stream").split(";", 1)[0]
         try:
             fulltext = client.fulltext(attachment_key, max_bytes=MAX_TEXT_CHARS * 4)
         except Exception:
@@ -193,12 +221,13 @@ def _source_text(item: Mapping[str, Any], client: Any) -> tuple[str, dict[str, A
             cached_text = next((fulltext[field] for field in ("content", "text", "fulltext") if isinstance(fulltext.get(field), str) and fulltext[field].strip()), "")
             cached_coverage = {"status": "partial", "reason": "incomplete_cached_fulltext", "source_scope": "partial_document", "coverage_gate": "limited", "route": "zotero_fulltext", **_coverage_counts(fulltext)}
             if _complete_fulltext(fulltext, media_type):
-                text = next((fulltext[field] for field in ("content", "text", "fulltext") if isinstance(fulltext.get(field), str) and fulltext[field].strip()), "")
-                if text:
-                    text, result = _bounded_text(text, {**cached_coverage, "status": "succeeded", "reason": "complete_cached_fulltext", "source_scope": "full_document", "coverage_gate": "passed"})
-                    return text, result
-            if cached_text and len(cached_text) > len(best_text):
+                if secondary:
+                    cached_coverage["reason"] = "secondary_attachment_only"
+                elif cached_text:
+                    return _bounded_text(cached_text, {**cached_coverage, "status": "succeeded", "reason": "complete_cached_fulltext", "source_scope": "full_document", "coverage_gate": "passed"})
+            if cached_text and (attachment_rank > best_rank or (attachment_rank == best_rank and len(cached_text) > len(best_text))):
                 best_text, coverage = _bounded_text(cached_text, cached_coverage)
+                best_rank = attachment_rank
         try:
             document = client.file(attachment_key, max_bytes=MAX_ATTACHMENT_BYTES)
             if document is None:
@@ -206,16 +235,24 @@ def _source_text(item: Mapping[str, Any], client: Any) -> tuple[str, dict[str, A
             raw, actual_type = document
             if not isinstance(raw, bytes) or len(raw) > MAX_ATTACHMENT_BYTES:
                 raise ValueError("attachment_byte_limit")
-            extracted = extract_bytes(raw, media_type=actual_type or media_type, filename=str(target_data.get("filename") or ""), ocr_mode="off")
+            actual_type = str(actual_type or "").split(";", 1)[0].strip().casefold()
+            if actual_type and actual_type != "application/octet-stream":
+                media_type = actual_type
+                attachment_rank = _attachment_candidate_rank(target_data, data, media_type=media_type, actual_file=True) or attachment_rank
+            extracted = extract_bytes(raw, media_type=media_type, filename=str(target_data.get("filename") or ""), ocr_mode="off")
             scope = extracted.source_scope or "metadata_only"
             complete = scope == "full_document" and extracted.source_coverage == "passed"
             result = {"status": "succeeded" if complete else "partial" if extracted.text else "failed", "reason": extracted.reason or "unreadable_local_document", "source_scope": scope, "coverage_gate": extracted.source_coverage or "failed", "route": extracted.route}
             if extracted.page_count:
                 result.update(total_pages=extracted.page_count, indexed_pages=extracted.page_count if complete else None)
+            if secondary and extracted.text:
+                complete = False
+                result.update(status="partial", reason="secondary_attachment_only", source_scope="partial_document", coverage_gate="limited")
             if complete:
                 return _bounded_text(extracted.text, result)
-            if extracted.text and len(extracted.text) > len(best_text):
+            if extracted.text and (attachment_rank > best_rank or (attachment_rank == best_rank and len(extracted.text) > len(best_text))):
                 best_text, coverage = extracted.text, result
+                best_rank = attachment_rank
             elif not best_text:
                 coverage = result
         except Exception as exc:
@@ -291,7 +328,7 @@ def scan_local_collection(
         if _data(item).get("itemType") == "note":
             continue
         text, coverage = _source_text(item, client)
-        record = scan_document(item, identity=identity, text=text, coverage=coverage, source_binding=_binding(catalogue, identity["item_key"]), matcher=matcher, cache=cache)
+        record = scan_document(item, identity=identity, text=text, coverage=coverage, source_binding=_binding(catalogue, identity), matcher=matcher, cache=cache)
         records.append(record)
     return {"documents": records, "errors": errors, "page": {key: value for key, value in page.items() if key != "records"}, "cache_path": str(root / CACHE_RELATIVE_PATH), "instance_id": instance_id, "library_id": library_id, "matching_scope": "provided scoped current index; library presence outside this index is unexamined"}
 
@@ -375,10 +412,12 @@ def load_local_retrieval(
             raise ValueError("canonical source projection did not preserve identity")
         rows.extend(compact)
         del wrapper, profile, row, metadata, frontmatter, context
-    key_counts = Counter(row.get("zotero_key") for row in rows)
+    scoped_sources = {source_id for source_id, entry in entries.items()
+                      if instance_id is not None and _catalogue_scope_matches(entry, instance_id, library_id)}
+    key_counts = Counter(row.get("zotero_key") for row in rows if row["source_id"] in scoped_sources)
     for row in rows:
         row["profile_hash"], row["profile_hash_aliases"] = hashes[row["source_id"]]
-        if instance_id is not None and row.get("zotero_key") and key_counts[row["zotero_key"]] == 1:
+        if row["source_id"] in scoped_sources and row.get("zotero_key") and key_counts[row["zotero_key"]] == 1:
             row["identity"] = {"instance_id": instance_id, "library_type": "user", "library_id": library_id, "item_key": row["zotero_key"]}
     registry = budget.read(registry_path)
     relationships = _accepted_relationships(registry, hashes)
@@ -404,7 +443,7 @@ def _cached_records(root: Path, rows: Sequence[Mapping[str, Any]], catalogue_row
     by_source = {row["source_id"]: row for row in rows}
     owners: dict[str, set[str]] = {}
     for row in catalogue_rows:
-        if row.get("source_id") in by_source:
+        if row.get("source_id") in by_source and _catalogue_scope_matches(row, instance_id, library_id):
             for key in _catalogue_keys(row):
                 owners.setdefault(key, set()).add(row["source_id"])
     by_key = {key: by_source[next(iter(source_ids))] for key, source_ids in owners.items() if len(source_ids) == 1}
@@ -476,8 +515,7 @@ def _matcher_items(items: Sequence[Mapping[str, Any]], catalogue_rows: Sequence[
         key = row.get("zotero_key")
         if not isinstance(key, str) or not re.fullmatch(r"[A-Z0-9]{1,32}", key):
             continue
-        identity = row.get("identity") or {}
-        if any(identity.get(field, expected) != expected for field, expected in (("instance_id", instance_id), ("library_id", library_id), ("library_type", "user"))):
+        if not _catalogue_scope_matches(row, instance_id, library_id):
             continue
         scoped_rows.append(row)
         if row.get("source_id"):
