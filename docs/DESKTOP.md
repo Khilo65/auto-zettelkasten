@@ -18,6 +18,25 @@ The desktop window starts its own loopback server on an available port. You do
 not need to start `serve` separately. Native folder dialogs select the output
 folder or an existing Obsidian vault. Mapping still requires explicit approval.
 
+## Graph views
+
+The graph opens with accepted research relations selected and navigation
+documents hidden. Graph settings separately enable citations, ordinary Markdown
+links, discovery links, and navigation documents. Node size follows the visible
+connections. A source with no visible connections has not necessarily been
+examined for relationships.
+
+Indexes and literature maps remain available in the file panel and quick open.
+Verified generated canonical and compatibility copies share a graph node while
+retaining their file paths. Ordinary notes, different versions, and copies with
+different personal edits remain separate.
+
+Missing and ambiguous Markdown destinations are labeled explicitly. The optional
+**Existing files only** filter hides these graph nodes and reports their counts.
+Markdown indexing, recorded source coverage, and research comparison coverage
+are separate: a complete file index does not establish complete source reading
+or relationship discovery.
+
 ## Build for macOS or Windows
 
 Build on the target operating system, using a clean Python 3.12 virtual

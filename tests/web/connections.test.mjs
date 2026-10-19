@@ -196,12 +196,14 @@ test("Global and linked local graph controls preserve orphans, expose missing no
   const app = harness(t, { "Start.md": "# Start\n\n[[B]] [[Missing]]", "B.md": "# B\n\n[[C]]", "C.md": "# C", "Orphan.md": "# Orphan" });
   await app.root(); app.click("workspace-graph-open");
   const global = app.graphs[0]; assert.deepEqual([...global.nodes().map((node) => node.id())].sort(), ["B.md", "C.md", "Orphan.md", "Start.md"]);
+  app.change("global-graph-references", true);
   app.change("global-graph-existing", false); assert.equal(global.nodes().length, 5);
   app.input("global-graph-search", "Orphan"); assert.equal(global.nodes().length, 1); assert.equal(global.nodes()[0].id(), "Orphan.md");
   app.input("global-graph-search", ""); app.click("global-graph-show-list");
   [...app.el("global-graph-list").querySelectorAll("button")].find((button) => button.textContent === "B").click();
   await until(() => app.el("workspace-breadcrumbs").title === "B.md" && app.el("workspace-global-graph").hidden, "graph navigation");
   app.click("workspace-local-toggle"); const local = app.graphs.at(-1);
+  app.change("local-graph-references", true);
   assert.deepEqual([...local.nodes().map((node) => node.id())].sort(), ["B.md", "C.md", "Start.md"]);
   app.click("local-graph-pin"); await app.open("C.md"); assert.equal(app.el("local-graph-title").textContent, "Graph of B");
   app.click("workspace-graph-open");
@@ -215,6 +217,7 @@ test("Global and linked local graph controls preserve orphans, expose missing no
 test("Graph refreshes and label changes retain node positions, viewport, and neighbor highlighting", async (t) => {
   const app = harness(t, { "Start.md": "# Start\n[[B]]", "B.md": "# B", "Orphan.md": "# Orphan" });
   await app.root(); app.click("workspace-graph-open");
+  app.change("global-graph-references", true);
   const graph = app.graphs[0], node = graph.getElementById("Start.md");
   graph.emit("grab");
   const point = (x, y) => app.w.Object.assign(new app.w.Object(), { x, y });
@@ -238,12 +241,17 @@ test("Graph refreshes and label changes retain node positions, viewport, and nei
   graph.zoom(1); await until(() => node.style("text-opacity") === "1", "zoomed-in labels");
 });
 
-test("Global and local index-note toggles filter the view while preserving notes, backlinks and direct relations", async (t) => {
+test("Global and local graph defaults emphasize research while optional navigation preserves notes and backlinks", async (t) => {
   const indexPath = "02_source_memory/indexes/by_topic/topic-one.md";
   const app = harness(t, { "Start.md": "# Start\n[[B]]", "B.md": "# B", [indexPath]: "# Topic\n[[Start]] [[B]]" }, [{ id: "accepted", source: "Start.md", target: "B.md", type: "supports" }]);
   await app.root(); app.click("workspace-graph-open");
   const global = app.graphs[0], start = global.getElementById("Start.md")[0];
-  assert.equal(app.el("global-graph-indexes").checked, true);
+  assert.equal(app.el("global-graph-indexes").checked, false);
+  assert.equal(app.el("global-graph-references").checked, false);
+  assert.equal(app.el("global-graph-citations").checked, false);
+  assert.equal(app.el("global-graph-discovery").checked, false);
+  assert.equal(global.nodes().length, 2); assert.equal(global.edges().length, 1);
+  app.change("global-graph-references", true); app.change("global-graph-indexes", true);
   assert.equal(global.nodes().length, 3); assert.equal(global.edges().length, 4);
   app.click("global-graph-show-list");
   app.change("global-graph-indexes", false);
@@ -252,20 +260,34 @@ test("Global and local index-note toggles filter the view while preserving notes
   assert.equal(global.edges(".relation").length, 1);
   assert.equal(global.getElementById("Start.md")[0], start);
   assert.equal(app.el("global-graph-list").textContent.includes("topic-one"), false);
-  assert.match(app.el("global-graph-counts").textContent, /^2 notes · 2 connections · indexes hidden$/);
+  assert.match(app.el("global-graph-counts").textContent, /^2 notes · 2 connections · navigation hidden$/);
   await app.open("B.md"); app.click("workspace-backlinks-toggle");
   assert.match(app.el("workspace-backlinks").textContent, /Linked mentions · 2/);
   app.click("workspace-local-toggle"); const local = app.graphs.at(-1);
-  assert.equal(app.el("local-graph-indexes").checked, true, "Local and global view filters are independent");
+  assert.equal(app.el("local-graph-indexes").checked, false, "Local and global view filters are independent");
+  assert.equal(local.nodes().length, 2); assert.equal(local.edges().length, 1);
+  app.change("local-graph-references", true); app.change("local-graph-indexes", true);
   assert.equal(local.nodes().length, 3);
   app.change("local-graph-indexes", false);
   assert.equal(local.nodes().length, 2); assert.equal(local.edges().length, 2);
-  assert.match(app.el("local-graph-counts").textContent, /indexes hidden/);
+  assert.match(app.el("local-graph-counts").textContent, /navigation hidden/);
   app.click("workspace-graph-open"); app.change("global-graph-indexes", true);
   assert.equal(global.nodes().length, 3); assert.equal(global.edges().length, 4);
-  assert.doesNotMatch(app.el("global-graph-counts").textContent, /indexes hidden/);
+  assert.doesNotMatch(app.el("global-graph-counts").textContent, /navigation hidden/);
   assert.equal(app.notes.has(indexPath), true);
   assert.equal(app.requests.some((request) => request.url.endsWith("/save")), false);
+});
+
+test("Graph lists and counts distinguish ambiguous, missing and missing-fragment targets", async (t) => {
+  const app = harness(t, { "Start.md": "[[Missing]] [[Same]] [[B#Gone]]", "B.md": "# B", "One/Same.md": "# One", "Two/Same.md": "# Two" });
+  await app.root(); app.click("workspace-graph-open");
+  app.change("global-graph-references", true);
+  app.change("global-graph-existing", true);
+  assert.match(app.el("global-graph-counts").textContent, /1 missing, 1 ambiguous, 1 missing heading\/block \(3 hidden\)/);
+  app.change("global-graph-existing", false); app.click("global-graph-show-list");
+  const unresolved = [...app.el("global-graph-list").querySelectorAll("button:disabled")];
+  assert.deepEqual(unresolved.map((button) => button.textContent).sort(), ["B#Gone · missing heading or block", "Missing · missing note", "Same · ambiguous target"]);
+  assert.match(unresolved.find((button) => /ambiguous/.test(button.textContent)).title, /One\/Same.md.*Two\/Same.md/);
 });
 
 test("Partial connection warnings stay available in one compact local-graph disclosure", async (t) => {
@@ -318,6 +340,7 @@ test("A successful layout retry clears its warning and busy state", async (t) =>
 test("Large graph zoom retains topology without querying or rewriting every node on each input", async (t) => {
   const texts = { "Start.md": "# Start\n[[Target]]", "Target.md": "# Target", ...Object.fromEntries(Array.from({ length: 1000 }, (_, index) => [`Note ${index}.md`, `# Note ${index}`])) };
   const app = harness(t, texts); await app.root(); app.click("workspace-graph-open");
+  app.change("global-graph-references", true);
   const graph = app.graphs[0]; graph.emit("grab");
   const nextPaint = () => new Promise((resolve) => app.w.requestAnimationFrame(() => app.w.requestAnimationFrame(resolve)));
   graph.zoom(.01); await nextPaint();

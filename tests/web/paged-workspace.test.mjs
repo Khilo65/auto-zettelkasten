@@ -83,6 +83,8 @@ test("paged library commits every note and relation only after verification, the
   await until(() => /^6001 notes/.test(app.el("global-graph-counts").textContent), "all notes committed");
   assert.equal(complete, true);
   assert.equal(app.graphs.at(-1).nodes().length, count);
+  assert.equal(app.graphs.at(-1).edges().length, 1, "Research starts with accepted substantive decisions only");
+  app.el("global-graph-references").click();
   assert.equal(app.graphs.at(-1).edges().length, count + 1);
   assert.doesNotMatch(app.el("global-graph-counts").textContent, /partial/);
   assert.equal(app.el("workspace-tree-note").hidden, true);
@@ -165,4 +167,37 @@ test("interrupted embed hydration retries on return and rejects a stale generati
   second.resolve(); await tick(); await tick();
   assert.doesNotMatch(app.el("workspace-reader").textContent, /Stale embedded body/);
   assert.match(app.el("workspace-reader").textContent, /New embedded body/);
+});
+
+test("final-page identity and coverage metadata survive compact indexing, opening aliases and personal drafts", async (t) => {
+  const coverage = { status: "partial", label: "Partial document recorded" };
+  const notes = new Map([
+    { ...note("Canonical.md", "# Source\n[[B]]"), source_coverage: coverage },
+    note("Compatibility.md", "# Source\n[[B]]"), note("B.md", "# B"),
+    { ...note("Map.md", "# Map\n[[Canonical]] [[B]]"), navigation: true },
+  ].map((value) => [value.path, value]));
+  const identity = { canonical_path: "Canonical.md", path_aliases: ["Compatibility.md"], verified: true };
+  const app = harness(t, async (body) => body.cursor ? {
+    generation: "g1", complete: true, documents: [], entries: [],
+    relations: [{ id: "accepted", source: "Canonical.md", target: "B.md", type: "supports" }],
+    document_identities: [identity], index_coverage: { status: "complete", label: "Index complete; selected-comparison coverage unknown." },
+    relation_resolution: { missing: 0, ambiguous: 0 }, warnings: [],
+  } : { ...page("g1", notes), complete: false, next_cursor: "final" }, async ({ path }) => ({ ...notes.get(path), editable: true }));
+  await app.root(); await until(() => app.el("workspace-tree-note").hidden, "metadata index complete");
+  app.click("workspace-graph-open");
+  const graph = app.graphs.at(-1);
+  assert.equal(graph.nodes().length, 2); assert.equal(graph.edges().length, 1);
+  assert.match(app.el("workspace-index-status").textContent, /selected-comparison coverage unknown/);
+  assert.match(app.el("workspace-tree").textContent, /Compatibility/);
+  await app.open("Compatibility.md"); app.click("workspace-graph-open");
+  assert.equal(graph.getElementById("Canonical.md").data("current"), "yes");
+  await app.open("Canonical.md");
+  assert.match(app.el("workspace-counts").textContent, /Source: Partial document recorded/);
+  const view = app.w.WorkspaceKit.EditorView.findFromDOM(app.el("workspace-editor").querySelector(".cm-editor"));
+  view.dispatch({ changes: { from: view.state.doc.length, insert: "\nPersonal draft" } });
+  app.click("workspace-graph-open");
+  await until(() => graph.nodes().length === 3, "dirty-note index refresh");
+  assert.equal(graph.nodes().length, 3, "Dirty aliases stay separate until backend verification is renewed");
+  assert.ok(graph.getElementById("Compatibility.md").length);
+  assert.equal(app.w.workspaceHasUnsavedChanges(), true);
 });

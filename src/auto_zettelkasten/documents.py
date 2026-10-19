@@ -170,6 +170,110 @@ def _decode(data: bytes) -> tuple[str, bool, str]:
     return text, bom, _newline(text)
 
 
+def _frontmatter(text: str) -> dict[str, Any]:
+    text = text.replace("\r\n", "\n")
+    if not text.startswith("---\n"):
+        return {}
+    match = re.search(r"(?m)^---[ \t]*$", text[4:65544])
+    if match is None or match.start() > 65536:
+        return {}
+    try:
+        header = text[4:4 + match.start()]
+        depth = 0
+        for event in yaml.parse(header, Loader=_YAML_LOADER):
+            if isinstance(event, yaml.AliasEvent):
+                return {}
+            if isinstance(event, (yaml.MappingStartEvent, yaml.SequenceStartEvent)):
+                depth += 1
+                if depth > 32:
+                    return {}
+            elif isinstance(event, (yaml.MappingEndEvent, yaml.SequenceEndEvent)):
+                depth -= 1
+        fields = yaml.load(header, Loader=_YAML_LOADER)
+        return fields if isinstance(fields, dict) else {}
+    except (yaml.YAMLError, RecursionError, ValueError):
+        return {}
+
+
+def _document_metadata(path: str, fields: dict[str, Any]) -> dict[str, Any]:
+    kind = fields.get("type")
+    parts = path.split("/")
+    navigation = Path(path).name.casefold() == "index.md" or _published_index_path(tuple(parts)) or kind in (
+        "literature_map", "literature_map_index", "literature_map_pointer", "literature_cluster_index",
+        "literature_gap_index", "coverage_index", "source_index",
+    )
+    coverage = {"status": "unknown", "label": "Source coverage unknown"}
+    recorded = fields.get("coverage")
+    legacy = fields.get("source_scope")
+    status = fields.get("note_status")
+    choices = (
+        ("metadata_only", "Metadata only", "metadata only", "metadata_only_source_note"),
+        ("abstract_only", "Abstract only", "abstract only", "abstract_only_atomic_note"),
+        ("partial_document", "Partial document", "partial document", "partial_document_atomic_note"),
+        ("analysis_pending", "Full text available; analysis pending", "full text available; analysis pending", "fulltext_available"),
+        ("full_document", "Full text recorded", "full text", "analytical_atomic_note"),
+    )
+    for value, label, public, note_status in choices:
+        if recorded == public or legacy == value or status == note_status or value == "full_document" and status == "verified_atomic_note":
+            coverage = {"status": value, "label": label}
+            break
+    return {"navigation": bool(navigation), "source_coverage": coverage}
+
+
+def _generated_identity(path: str, fields: dict[str, Any], revision: str, effective_text: str):
+    """Recognize the writer's explicit projections, never title or source-note lookalikes."""
+    parts = path.split("/")
+    if parts[0] != "03_literature_synthesis":
+        return None
+    canonical = len(parts) >= 4 and parts[1] == "maps"
+    relative = parts[3:] if canonical else parts[1:]
+    kind = fields.get("type")
+    if not isinstance(kind, str):
+        return None
+    identity_field = {"literature_map": "map_id", "literature_map_index": "map_id",
+                      "literature_cluster": "cluster_id", "literature_gap": "gap_id"}.get(kind)
+    identity = fields.get(identity_field) if identity_field else None
+    if not isinstance(identity, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", identity):
+        return None
+    if kind in {"literature_map", "literature_map_index"}:
+        if len(relative) != 1 or canonical and parts[2] != identity:
+            return None
+    elif kind == "literature_cluster":
+        if len(relative) != 2 or relative[0] != "clusters":
+            return None
+    elif canonical:
+        if len(relative) != 2 or relative[0] != "gaps":
+            return None
+    elif len(relative) != 3 or relative[:2] != ["gaps", "candidates"]:
+        return None
+    key = (kind, identity, parts[-1], revision, hashlib.sha256(effective_text.encode("utf-8")).hexdigest())
+    return key, canonical, path
+
+
+def _document_identities(candidates):
+    groups = {}
+    for key, canonical, path in candidates:
+        groups.setdefault(key[:3], {True: [], False: []})[canonical].append((key, path))
+    # A compatibility projection can belong to only one historical map.
+    identities = []
+    for _, values in sorted(groups.items()):
+        if len(values[True]) != 1:
+            continue
+        key, canonical_path = values[True][0]
+        aliases = sorted(path for candidate, path in values[False] if candidate == key)
+        if aliases:
+            identities.append({"canonical_path": canonical_path, "path_aliases": aliases, "verified": True})
+    return identities
+
+
+def _index_coverage(partial: bool, *, complete: bool = True):
+    if not complete:
+        return {"status": "indexing", "label": "Indexing Markdown; source and comparison coverage unknown"}
+    return {"status": "partial" if partial else "complete", "label": (
+        "Markdown index is partial; source and comparison coverage unknown" if partial else
+        "Markdown indexing complete; source and comparison coverage unknown")}
+
+
 @dataclass
 class _Anchor:
     path: Path
@@ -440,6 +544,7 @@ class DocumentService:
             "text": text, "revision": hashlib.sha256(data).hexdigest(),
             "editable": not reason, "reason": reason, "bom": bom,
             "newline": newline, "recovery_key": recovery_key,
+            **_document_metadata(relative, _frontmatter(text)),
         }
         return self._override_document(document) if effective else document
 
@@ -667,21 +772,7 @@ class DocumentService:
             mapping[identity] = (priority, None)
 
     def _index_note_ids(self, run, path, text):
-        text = text.replace("\r\n", "\n")
-        if not text.startswith("---\n"):
-            return
-        match = re.search(r"(?m)^---[ \t]*$", text[4:])
-        if match is None or match.start() > 65536:
-            return
-        try:
-            header = text[4:4 + match.start()]
-            if any(isinstance(event, yaml.AliasEvent) for event in yaml.parse(header, Loader=_YAML_LOADER)):
-                return
-            fields = yaml.load(header, Loader=_YAML_LOADER)
-        except (yaml.YAMLError, RecursionError, ValueError):
-            return
-        if not isinstance(fields, dict):
-            return
+        fields = _frontmatter(text)
         parts = path.split("/")
         self._index_identity(run["note_ids"], fields.get("note_id"), path,
                              2 if parts[:2] == ["02_source_memory", "notes"] else 1)
@@ -692,6 +783,7 @@ class DocumentService:
             cluster_priority = 1
         if cluster_priority:
             self._index_identity(run["cluster_ids"], fields.get("cluster_id"), path, cluster_priority)
+        return fields
 
     def _index_project_relation(self, run, row):
         if (row.get("active", True) is not True or row.get("decision_status", "accepted") != "accepted"
@@ -706,17 +798,26 @@ class DocumentService:
         if relation_type in SUBSTANTIVE_RELATION_TYPES and row.get("decision_status") != "accepted":
             return
 
-        def resolve(mapping, identity):
-            return mapping.get(identity, (0, None))[1] if isinstance(identity, str) else None
+        unresolved = set()
 
-        source = resolve(run["note_ids"], row.get("source_note_id"))
-        target = resolve(run["note_ids"], row.get("target_note_id"))
+        def resolve(mapping, identity):
+            entry = mapping.get(identity) if isinstance(identity, str) else None
+            if not entry or not entry[1]:
+                unresolved.add("ambiguous" if entry else "missing")
+            return entry[1] if entry else None
+
         if relation_type == "has_member":
             source = resolve(run["cluster_ids"], row.get("source_cluster_id") or (row.get("source_id") if row.get("source_kind") == "cluster" else None))
-        elif relation_type == "cluster_member":
+        else:
+            source = resolve(run["note_ids"], row.get("source_note_id"))
+        if relation_type == "cluster_member":
             target = resolve(run["cluster_ids"], row.get("target_cluster_id"))
+        else:
+            target = resolve(run["note_ids"], row.get("target_note_id"))
         if not source or not target:
-            self._index_warning(run, "Some typed relations have unavailable or ambiguous note identities.")
+            run["unresolved"][relation_id] = unresolved
+            for status in sorted(unresolved):
+                self._index_warning(run, f"Some typed relations have {status} note destinations.")
             return
         value = {"id": relation_id, "source": source, "target": target, "type": relation_type}
         previous = run["projected"].get(relation_id)
@@ -868,6 +969,7 @@ class DocumentService:
                 self._index_warning(run, unavailable)
         except (DocumentError, OSError, UnicodeError, yaml.YAMLError, RecursionError, ValueError):
             run["projected"].clear()
+            run["unresolved"].clear()
             self._index_warning(run, unavailable)
 
     def index_page(self, workspace_id: str, cursor=None, known_generation=None) -> dict[str, Any]:
@@ -888,6 +990,7 @@ class DocumentService:
                     raise DocumentIndexChanged() from None
                 run = {"generation": checking["generation"] if checking else secrets.token_urlsafe(24),
                        "root_stamp": root_stamp, "inventory": {}, "note_ids": {}, "cluster_ids": {},
+                       "identity_candidates": [], "unresolved": {}, "documents_partial": False,
                        "projected": {}, "warnings": [], "truncated": False, "phase": "check" if checking else "documents",
                        "progress": {"documents": 0, "bytes": 0, "scanned": 0, "relations": 0},
                        "checking": checking, "pending": None, "iterator": None, "last_cursor": None,
@@ -970,7 +1073,11 @@ class DocumentService:
                             if page_bytes and page_bytes + effective_bytes > INDEX_PAGE_BYTES:
                                 run["pending"] = item
                                 break
-                            self._index_note_ids(run, path, text)
+                            fields = self._index_note_ids(run, path, text)
+                            document.update(_document_metadata(path, fields))
+                            identity = _generated_identity(path, fields, hashlib.sha256(data).hexdigest(), document["text"])
+                            if identity and run["root_stamp"][2]:
+                                run["identity_candidates"].append(identity)
                             documents.append(document)
                             page_bytes += effective_bytes
                             run["progress"]["documents"] += 1
@@ -982,6 +1089,7 @@ class DocumentService:
                             if _stamp(directory.stat(Path(path).name)) != _stamp(info):
                                 raise DocumentIndexChanged()
                             row.update(editable=False, reason="This note could not be indexed. Open it to review its format or size.")
+                            run["documents_partial"] = True
                             self._index_warning(run, "Some notes could not be indexed because they were unreadable or exceeded the document format or size limits.")
                     entries.append(row)
                     if len(documents) >= INDEX_PAGE_DOCUMENTS or page_bytes >= INDEX_PAGE_BYTES:
@@ -991,12 +1099,19 @@ class DocumentService:
                 result = {"generation": run["generation"], "next_cursor": run["cursor"], "complete": complete,
                           "documents": documents, "entries": entries, "relations": relations,
                           "warnings": list(run["warnings"]), "truncated": run["truncated"], "progress": dict(run["progress"])}
+                result["index_coverage"] = _index_coverage(run["documents_partial"], complete=complete)
                 if complete:
+                    result["document_identities"] = [] if run["documents_partial"] else _document_identities(run["identity_candidates"])
+                    result["relation_resolution"] = {status: sum(status in values for values in run["unresolved"].values())
+                                                     for status in ("missing", "ambiguous")}
                     if run["checking"]:
                         result["not_modified"] = True
                         result["progress"] = dict(run["checking"]["progress"])
+                        for key in ("document_identities", "relation_resolution", "index_coverage"):
+                            result[key] = copy.deepcopy(run["checking"][key])
                     elif not run["truncated"]:
                         self._completed_index = {key: run[key] for key in ("generation", "root_stamp", "inventory", "progress")}
+                        self._completed_index.update({key: result[key] for key in ("document_identities", "relation_resolution", "index_coverage")})
                     run["iterator"] = None
                 run["last_cursor"], run["last_page"] = cursor, copy.deepcopy(result)
                 return result
@@ -1013,6 +1128,7 @@ class DocumentService:
             self._workspace(workspace_id)
             documents: list[dict[str, Any]] = []
             canonical_documents = []
+            identity_candidates = []
             override_generation = self._override_generation()
             pending = deque([()])
             scanned = entries = inspected_bytes = 0
@@ -1072,6 +1188,11 @@ class DocumentService:
                                             break
                                     else:
                                         effective = document
+                                    fields = _frontmatter(text)
+                                    effective.update(_document_metadata(document["path"], fields))
+                                    identity = _generated_identity(document["path"], fields, document["revision"], effective["text"])
+                                    if identity and published:
+                                        identity_candidates.append(identity)
                                     canonical_documents.append(document)
                                     documents.append(effective)
                                 else:
@@ -1097,12 +1218,13 @@ class DocumentService:
             if skipped:
                 warnings.append("Some notes could not be indexed because they changed, were unreadable, or exceeded the document limit.")
             documents.sort(key=lambda row: row["path"].casefold())
-            relations, relation_warning = self._typed_relations(canonical_documents, engine_owned)
-            if relation_warning:
-                warnings.append(relation_warning)
-            return {"documents": documents, "relations": relations, "truncated": truncated, "warnings": warnings}
+            relations, relation_warnings, resolution = self._typed_relations(canonical_documents, engine_owned)
+            warnings.extend(relation_warnings)
+            return {"documents": documents, "relations": relations, "truncated": truncated, "warnings": warnings,
+                    "document_identities": [] if truncated or skipped else _document_identities(identity_candidates),
+                    "index_coverage": _index_coverage(truncated or skipped), "relation_resolution": resolution}
 
-    def _typed_relations(self, documents: list[dict[str, Any]], engine_owned: bool) -> tuple[list[dict[str, str]], str]:
+    def _typed_relations(self, documents: list[dict[str, Any]], engine_owned: bool):
         """Project only the published registry inside the explicitly selected root."""
         unavailable = "Typed relations are unavailable. Select the generated workspace root containing a readable supported relation registry."
         try:
@@ -1114,54 +1236,24 @@ class DocumentService:
             if (not isinstance(registry, dict)
                     or str(registry.get("registry_schema_version")) != RELATIONSHIP_REGISTRY_SCHEMA_VERSION
                     or not isinstance(registry.get("links"), list)):
-                return [], unavailable
+                return [], [unavailable], {"missing": 0, "ambiguous": 0}
         except FileNotFoundError:
-            return [], unavailable if engine_owned else ""
+            return [], [unavailable] if engine_owned else [], {"missing": 0, "ambiguous": 0}
         except (DocumentError, OSError, UnicodeError, yaml.YAMLError, RecursionError, ValueError):
-            return [], unavailable
-        paths: dict[str, str | None] = {}
+            return [], [unavailable], {"missing": 0, "ambiguous": 0}
+        run = {"note_ids": {}, "cluster_ids": {}, "projected": {}, "unresolved": {}, "warnings": [], "truncated": False}
         for document in documents:
-            text = document["text"].replace("\r\n", "\n")
-            if not text.startswith("---\n"):
-                continue
-            match = re.search(r"(?m)^---[ \t]*$", text[4:])
-            if match is None:
-                continue
-            try:
-                frontmatter = yaml.safe_load(text[4:4 + match.start()])
-            except (yaml.YAMLError, RecursionError, ValueError):
-                continue
-            note_id = frontmatter.get("note_id") if isinstance(frontmatter, dict) else None
-            if isinstance(note_id, str) and note_id:
-                paths[note_id] = document["path"] if note_id not in paths else None
-        allowed_types = TYPED_SOURCE_RELATIONS | SUBSTANTIVE_RELATION_TYPES | {"cluster_member", "has_member"}
-        relations: dict[str, dict[str, str]] = {}
-        malformed = False
+            self._index_note_ids(run, document["path"], document["text"])
         for row in registry["links"]:
             if not isinstance(row, dict):
-                malformed = True
+                self._index_warning(run, "Some typed relations were omitted because their registry records were invalid.")
                 continue
-            if (row.get("active", True) is not True
-                    or row.get("decision_status", "accepted") != "accepted"
-                    or row.get("reconciliation_pending") or row.get("refresh_pending")):
-                continue
-            relation_id, relation_type = row.get("relation_id"), row.get("relation_type")
-            source_id, target_id = row.get("source_note_id"), row.get("target_note_id")
-            if (not isinstance(relation_id, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", relation_id)
-                    or not isinstance(relation_type, str) or relation_type not in allowed_types
-                    or not isinstance(source_id, str) or not isinstance(target_id, str)):
-                malformed = True
-                continue
-            if relation_type in SUBSTANTIVE_RELATION_TYPES and row.get("decision_status") != "accepted":
-                continue
-            source, target = paths.get(source_id), paths.get(target_id)
-            if source and target:
-                projected = {"id": relation_id, "source": source, "target": target, "type": relation_type}
-                if relation_id in relations and relations[relation_id] != projected:
-                    return [], "Typed relations are unavailable because the registry contains conflicting relation identities."
-                relations[relation_id] = projected
-        warning = "Some typed relations were omitted because their registry records were invalid." if malformed else ""
-        return [relations[key] for key in sorted(relations)], warning
+            try:
+                self._index_project_relation(run, row)
+            except ValueError:
+                return [], ["Typed relations are unavailable because the registry contains conflicting relation identities."], {"missing": 0, "ambiguous": 0}
+        resolution = {status: sum(status in values for values in run["unresolved"].values()) for status in ("missing", "ambiguous")}
+        return [run["projected"][key] for key in sorted(run["projected"])], run["warnings"], resolution
 
     def _writable(self, directory: _Directory) -> None:
         directory.verify()

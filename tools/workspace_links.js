@@ -38,6 +38,17 @@ const privateParts = new Set(["node_modules", "venv", "__pycache__", "credential
 const privateNames = new Set(["credential", "credentials", "secret", "secrets", "password", "passwords", "api_key", "api_keys", "tokens"]);
 const externalLink = (value) => /^(?:https?:|mailto:)/i.test(value);
 const syntaxCharacters = new Set("[]()*_~`<>!#|\\=-^\n\r");
+const researchRelationTypes = new Set(["supports", "undermines", "qualifies", "extends", "complements", "contrasts", "rival_explanation", "boundary_contrast", "methodological_fault_line", "sequential_relationship", "interpretive_or_normative_disagreement", "contextual_connection"]);
+const citationRelationTypes = new Set(["cites", "cited_by"]);
+const navigationRelationTypes = new Set(["cluster_member", "has_member", "alias_of"]);
+
+function documentMetadata(input) {
+  const coverage = input?.source_coverage;
+  return {
+    ...(typeof input?.navigation === "boolean" ? { navigation: input.navigation } : {}),
+    ...(coverage && typeof coverage.status === "string" && typeof coverage.label === "string" ? { source_coverage: { status: coverage.status, label: coverage.label } } : {}),
+  };
+}
 
 function syntaxCost(text, limit) {
   let cost = 0;
@@ -368,6 +379,11 @@ function parseNote(path, text, budgets, limits) {
     }
   }
   result.references = env.referencesFound.sort((left, right) => left.from - right.from);
+  const literature = result.tokens.filter((token) => token.type === "html_block" && /^<!-- auto-zettelkasten:literature:(?:start|end) -->\s*$/.test(token.content) && text.slice(originalStarts[token.map[0]], originalStarts[token.map[0] + 1] ?? text.length).trimEnd() === token.content.trim());
+  if (literature.length === 2 && literature[0].content.trim() === "<!-- auto-zettelkasten:literature:start -->" && literature[1].content.trim() === "<!-- auto-zettelkasten:literature:end -->") {
+    const from = originalStarts[literature[0].map[1]], to = originalStarts[literature[1].map[0]];
+    for (const ref of result.references) if (ref.from >= from && ref.to <= to) ref.layer = "citation";
+  }
   const markers = result.tokens.filter((token) => token.type === "html_block" && /^<!-- auto-zettelkasten:graph:(?:start|end) -->\s*$/.test(token.content) && text.slice(originalStarts[token.map[0]], originalStarts[token.map[0] + 1] ?? text.length).trimEnd() === token.content.trim());
   if (markers.length === 2 && markers[0].content.trim() === "<!-- auto-zettelkasten:graph:start -->" && markers[1].content.trim() === "<!-- auto-zettelkasten:graph:end -->") {
     const from = originalStarts[markers[0].map[1]];
@@ -447,7 +463,7 @@ function addLookup(map, key, path) {
   map.get(key).add(path);
 }
 
-export function buildLinkIndex(documents, typedRelations = [], previousIndex = null) {
+export function buildLinkIndex(documents, typedRelations = [], previousIndex = null, metadata = {}) {
   const index = { documents: new Map(), references: [], relations: [], warnings: [], paths: new Map(), basenames: new Map(), aliases: new Map(), partial: false };
   let characters = 0;
   let remainingReferences = LIMITS.workspaceReferences;
@@ -466,7 +482,7 @@ export function buildLinkIndex(documents, typedRelations = [], previousIndex = n
       && (cached.syntaxLimited ? cached.syntaxBudget === syntaxBudget : cached.syntaxCost <= syntaxBudget)
       && (!cached.referenceLimited || cached.referenceBudget >= referenceBudget);
     const parsed = reusable ? cached : parseDocument(path, text, { syntaxBudget, referenceBudget });
-    const document = { ...parsed, revision: input.revision, editable: publishedIndexPath(path) ? false : input.editable, warnings: [...parsed.warnings], references: parsed.references.slice(0, referenceBudget).map((ref) => ({ ...ref, sourcePath: path, resolution: undefined })) };
+    const document = { ...parsed, ...documentMetadata(input), revision: input.revision, editable: publishedIndexPath(path) ? false : input.editable, warnings: [...parsed.warnings], references: parsed.references.slice(0, referenceBudget).map((ref) => ({ ...ref, sourcePath: path, resolution: undefined })) };
     if (parsed.references.length > referenceBudget) {
       document.referenceLimited = true;
       document.referenceBudget = referenceBudget;
@@ -481,10 +497,21 @@ export function buildLinkIndex(documents, typedRelations = [], previousIndex = n
     for (const alias of document.aliases) addLookup(index.aliases, alias, path);
     for (const reason of document.warnings) index.warnings.push({ path, reason });
   }
-  return finishIndex(index, typedRelations, LIMITS.relations);
+  return finishIndex(index, typedRelations, LIMITS.relations, metadata);
 }
 
-function finishIndex(index, typedRelations, relationLimit) {
+function finishIndex(index, typedRelations, relationLimit, metadata) {
+  index.canonicalPaths = new Map();
+  const identities = (Array.isArray(metadata?.document_identities) ? metadata.document_identities : []).filter((identity) => identity?.verified === true
+    && index.documents.has(identity.canonical_path) && Array.isArray(identity.path_aliases)
+    && identity.path_aliases.every((path) => typeof path === "string" && index.documents.has(path)));
+  const owners = new Map();
+  for (const identity of identities) for (const path of new Set([identity.canonical_path, ...identity.path_aliases])) owners.set(path, (owners.get(path) || 0) + 1);
+  for (const identity of identities) {
+    const paths = [identity.canonical_path, ...identity.path_aliases];
+    if (paths.some((path) => owners.get(path) !== 1)) continue;
+    for (const path of paths) index.canonicalPaths.set(path, identity.canonical_path);
+  }
   for (const document of index.documents.values()) {
     for (const ref of document.references) { ref.resolution = resolveLink(index, document.path, ref.destination, ref.kind); index.references.push(ref); }
   }
@@ -509,10 +536,10 @@ export function parseLibraryDocument(input) {
   if (typeof path !== "string" || safePath(path) !== path || !/\.md$/i.test(path)) { parsed.unsupported = true; parsed.warnings.push("Unsupported note path"); }
   const { text, tokens, frontmatter, ...projection } = parsed;
   // Copy sliced strings too, so a short snippet cannot retain a whole note body.
-  return JSON.parse(JSON.stringify({ ...projection, compact: true, textLength: source.length, revision: input?.revision, editable: publishedIndexPath(path || "") ? false : input?.editable }));
+  return JSON.parse(JSON.stringify({ ...projection, ...documentMetadata(input), compact: true, textLength: source.length, revision: input?.revision, editable: publishedIndexPath(path || "") ? false : input?.editable }));
 }
 
-export function buildLibraryIndex(records, typedRelations = [], previousIndex = null) {
+export function buildLibraryIndex(records, typedRelations = [], previousIndex = null, metadata = {}) {
   const index = { documents: new Map(), references: [], relations: [], warnings: [], paths: new Map(), basenames: new Map(), aliases: new Map(), partial: false, library: true };
   let remainingReferences = LIBRARY_LIMITS.workspaceReferences;
   let openCharacters = 0;
@@ -531,7 +558,7 @@ export function buildLibraryIndex(records, typedRelations = [], previousIndex = 
       } else parsed = parseLibraryDocument(input);
     } else if (input.compact === true && Number.isInteger(input.textLength) && input.textLength >= 0 && ["aliases", "tags", "headings", "blocks", "references", "warnings"].every((key) => Array.isArray(input[key]))) parsed = input;
     else parsed = parseLibraryDocument(input);
-    const document = { ...parsed, revision: input.revision, editable: publishedIndexPath(path) ? false : input.editable, warnings: [...parsed.warnings], references: parsed.references.slice(0, remainingReferences).map((ref) => ({ ...ref, sourcePath: path, resolution: undefined })) };
+    const document = { ...parsed, ...documentMetadata(input), revision: input.revision, editable: publishedIndexPath(path) ? false : input.editable, warnings: [...parsed.warnings], references: parsed.references.slice(0, remainingReferences).map((ref) => ({ ...ref, sourcePath: path, resolution: undefined })) };
     if (parsed.references.length > remainingReferences) {
       document.referenceLimited = true;
       document.truncated = true;
@@ -544,7 +571,7 @@ export function buildLibraryIndex(records, typedRelations = [], previousIndex = 
     for (const alias of document.aliases) addLookup(index.aliases, alias, path);
     for (const reason of document.warnings) index.warnings.push({ path, reason });
   }
-  return finishIndex(index, typedRelations, LIBRARY_LIMITS.relations);
+  return finishIndex(index, typedRelations, LIBRARY_LIMITS.relations, metadata);
 }
 
 export function resolveLink(index, sourcePath, destination, kind = "wiki") {
@@ -573,6 +600,10 @@ export function resolveLink(index, sourcePath, destination, kind = "wiki") {
     if (!candidates.length) return { status: "missing", target: normalized, fragment: fragment || undefined };
   }
   if (!candidates.length) return { status: "missing", target: name, fragment: fragment || undefined };
+  if (candidates.length > 1 && candidates.every((path) => index.canonicalPaths?.has(path))) {
+    const canonical = [...new Set(candidates.map((path) => index.canonicalPaths.get(path)))];
+    if (canonical.length === 1) candidates = canonical;
+  }
   if (candidates.length > 1) return { status: "ambiguous", candidates: candidates.sort(), fragment: fragment || undefined };
   const path = candidates[0];
   const document = index.documents.get(path);
@@ -835,45 +866,64 @@ export function searchNotes(index, query = "") {
 }
 
 export function graphData(index, options = {}) {
-  const documents = [...index.documents.values()].filter((document) => options.showIndexes !== false
-    || !publishedIndexPath(document.path) && !(document.path.startsWith("03_literature_synthesis/") && document.path.endsWith("/INDEX.md")));
-  const nodes = new Map(documents.map((document) => [document.path, { id: document.path, path: document.path, label: basename(document.path), tags: document.tags, folder: document.path.split("/").slice(0, -1).join("/") }]));
-  const edges = new Map();
-  const projected = new Set(index.relations.map((relation) => JSON.stringify([relation.id, relation.source, relation.target])));
-  if (options.showReferences !== false) for (const ref of index.references) {
-    if (!nodes.has(ref.sourcePath)) continue;
-    const resolution = ref.resolution;
-    let target = resolution.path;
-    if (resolution.status === "invalid") continue;
-    if (ref.relationId && target && projected.has(JSON.stringify([ref.relationId, ref.sourcePath, target]))) continue;
-    if (!target) {
-      if (options.existingOnly) continue;
-      target = `unresolved:${JSON.stringify([resolution.status, fold(resolution.target || ref.destination), resolution.candidates || []])}`;
-      if (!nodes.has(target)) nodes.set(target, { id: target, label: ref.destination, missing: true, status: resolution.status, tags: [], folder: "" });
-    }
-    const id = `reference:${JSON.stringify([ref.sourcePath, target])}`;
-    if (edges.has(id)) edges.get(id).count += 1;
-    else edges.set(id, { id, source: ref.sourcePath, target, layer: "reference", count: 1 });
+  // Callers without layer options retain the complete legacy graph; the UI selects research first.
+  const showNavigation = options.showNavigation ?? options.showIndexes !== false;
+  const canonical = (path) => index.canonicalPaths?.get(path) || path;
+  const navigation = (path) => index.documents.get(path)?.navigation === true || publishedIndexPath(path)
+    || path.startsWith("03_literature_synthesis/") && path.endsWith("/INDEX.md");
+  const nodes = new Map();
+  for (const document of index.documents.values()) {
+    if (!showNavigation && navigation(document.path)) continue;
+    const path = canonical(document.path), primary = index.documents.get(path);
+    if (!nodes.has(path)) nodes.set(path, { id: path, path, label: basename(path), pathAliases: [], aliases: [], tags: [], folder: path.split("/").slice(0, -1).join("/"), navigation: navigation(path), source_coverage: primary.source_coverage });
+    const node = nodes.get(path);
+    node.pathAliases.push(document.path);
+    node.aliases.push(...document.aliases);
+    node.tags = [...new Set([...node.tags, ...document.tags])];
   }
-  if (options.showRelations !== false) for (const relation of index.relations) {
+  for (const node of nodes.values()) node.pathAliases.sort((a, b) => Number(b === node.path) - Number(a === node.path) || a.localeCompare(b));
+  const edges = new Map();
+  const projected = new Set(index.relations.flatMap((relation) => [JSON.stringify([relation.id, canonical(relation.source), canonical(relation.target)]), JSON.stringify([relation.id, canonical(relation.target), canonical(relation.source)])]));
+  const enabled = (layer) => ({ reference: options.showReferences, relation: options.showRelations, citation: options.showCitations, navigation: showNavigation, discovery: options.showDiscovery })[layer] !== false;
+  for (const ref of index.references) {
+    const source = canonical(ref.sourcePath);
+    if (!nodes.has(source) || source !== ref.sourcePath) continue;
+    const resolution = ref.resolution;
+    let target = resolution.status === "resolved" ? canonical(resolution.path) : null;
+    if (resolution.status === "invalid") continue;
+    if (ref.relationId && target && projected.has(JSON.stringify([ref.relationId, source, target]))) continue;
+    const layer = navigation(ref.sourcePath) || target && navigation(target) ? "navigation" : ref.layer === "citation" ? "citation" : "reference";
+    if (!enabled(layer)) continue;
+    if (!target) {
+      target = `unresolved:${JSON.stringify([resolution.status, fold(resolution.path || resolution.target || ref.destination), resolution.fragment || "", resolution.candidates || []])}`;
+      const statusLabel = { missing: "missing note", ambiguous: "ambiguous target", "missing-fragment": "missing heading or block" }[resolution.status] || resolution.status;
+      if (!nodes.has(target)) nodes.set(target, { id: target, label: `${ref.destination} · ${statusLabel}`, missing: true, status: resolution.status, candidates: resolution.candidates || [], tags: [], folder: "", pathAliases: [], aliases: [] });
+    }
+    const id = `${layer}:${JSON.stringify([source, target])}`;
+    if (edges.has(id)) edges.get(id).count += 1;
+    else edges.set(id, { id, source, target, layer, count: 1 });
+  }
+  for (const relation of index.relations) {
     if (options.relationType && relation.type !== options.relationType) continue;
-    const id = `relation:${JSON.stringify([relation.source, relation.target, relation.type])}`;
-    if (!edges.has(id)) edges.set(id, { ...relation, id, layer: "relation", count: 1 });
+    const source = canonical(relation.source), target = canonical(relation.target);
+    const layer = navigation(source) || navigation(target) || navigationRelationTypes.has(relation.type) ? "navigation"
+      : citationRelationTypes.has(relation.type) ? "citation" : researchRelationTypes.has(relation.type) ? "relation" : "discovery";
+    if (!enabled(layer) || source === target && relation.source !== relation.target) continue;
+    const id = `${layer}:${JSON.stringify([source, target, relation.type])}`;
+    if (!edges.has(id)) edges.set(id, { ...relation, id, source, target, layer, count: 1 });
   }
   let allowed = new Set(nodes.keys());
   const search = fold(options.search || "").trim();
   const folder = String(options.folder || "").replace(/\/+$/, "");
   const tags = (Array.isArray(options.tag) ? options.tag : options.tag ? [options.tag] : []).map((tag) => fold(String(tag).replace(/^#/, "")));
-  if (search || folder || tags.length) allowed = new Set([...nodes.values()].filter((node) => {
-    const document = index.documents.get(node.path);
-    return (!search || fold([node.label, node.path || "", ...(document?.aliases || [])].join(" ")).includes(search))
-      && (!folder || node.path?.startsWith(`${folder}/`))
-      && tags.every((tag) => node.tags.some((value) => fold(value) === tag));
-  }).map((node) => node.id));
+  allowed = new Set([...nodes.values()].filter((node) => (!options.existingOnly || !node.missing)
+    && (!search || fold([node.label, ...node.pathAliases, ...node.aliases].join(" ")).includes(search))
+    && (!folder || node.pathAliases.some((path) => path.startsWith(`${folder}/`)))
+    && tags.every((tag) => node.tags.some((value) => fold(value) === tag))).map((node) => node.id));
   let filteredEdges = [...edges.values()].filter((edge) => allowed.has(edge.source) && allowed.has(edge.target));
   const local = options.local || (options.path ? options : null);
   if (local) {
-    const center = local.path;
+    const center = canonical(local.path);
     const included = new Set(allowed.has(center) ? [center] : []);
     let frontier = new Set(included);
     const depth = Math.max(1, Math.min(3, Number(local.depth) || 1));
@@ -895,7 +945,18 @@ export function graphData(index, options = {}) {
       return local.neighbors !== false;
     });
   }
-  return { nodes: [...nodes.values()].filter((node) => allowed.has(node.id)), edges: filteredEdges, partial: index.partial };
+  const visibleNodes = [...nodes.values()].filter((node) => allowed.has(node.id));
+  for (const node of visibleNodes) node.degree = 0;
+  for (const edge of filteredEdges) { nodes.get(edge.source).degree += 1; nodes.get(edge.target).degree += 1; }
+  const unresolved = { missing: 0, ambiguous: 0, fragments: 0, hidden: 0 };
+  const destinations = new Set([...edges.values()].filter((edge) => allowed.has(edge.source) && (!local || local.outgoing !== false || edge.source !== canonical(local.path))).map((edge) => edge.target));
+  for (const target of destinations) {
+    const node = nodes.get(target);
+    if (!node?.missing) continue;
+    unresolved[node.status === "missing-fragment" ? "fragments" : node.status] += 1;
+    if (!allowed.has(target)) unresolved.hidden += 1;
+  }
+  return { nodes: visibleNodes, edges: filteredEdges, unresolved, partial: index.partial };
 }
 
 function linkMarkup(index, sourcePath, ref) {

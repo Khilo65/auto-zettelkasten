@@ -128,7 +128,7 @@ test("Global graph has independent reference/relation layers, filter sets, orpha
     note("C.md"), note("Orphan.md"),
   ], [{ id: "accepted", source: "Notes/A.md", target: "C.md", type: "supports" }, { id: "projection-duplicate", source: "Notes/A.md", target: "C.md", type: "supports" }]);
   const all = graphData(index);
-  assert.deepEqual(paths(all), ["C.md", "Missing", "Notes/A.md", "Notes/B.md", "Orphan.md"]);
+  assert.deepEqual(paths(all), ["C.md", "Missing · missing note", "Notes/A.md", "Notes/B.md", "Orphan.md"]);
   assert.equal(all.edges.find((edge) => edge.source === "Notes/A.md" && edge.target === "Notes/B.md").count, 2);
   assert.equal(all.edges.filter((edge) => edge.layer === "relation").length, 1);
   assert.ok(all.nodes.find((node) => node.missing).id.startsWith("unresolved:"));
@@ -187,7 +187,7 @@ test("Graphs can hide generated indexes without hiding atomic links or using ind
   assert.deepEqual(paths(local), ["A.md", "B.md", "C.md"]);
   assert.deepEqual(graphData(index, { showIndexes: false, local: { path: indexes[0] } }).nodes, []);
   const missing = graphData(index, { showIndexes: false }).nodes.filter((node) => node.missing);
-  assert.deepEqual(missing.map((node) => node.label), ["Atomic missing"], "Hidden indexes cannot leave phantom unresolved nodes behind");
+  assert.deepEqual(missing.map((node) => node.label), ["Atomic missing · missing note"], "Hidden indexes cannot leave phantom unresolved nodes behind");
   assert.deepEqual(paths(graphData(index, { showIndexes: false, existingOnly: true, search: "Price index" })), ["Price index.md"]);
   assert.deepEqual(paths(graphData(index, { showIndexes: false, existingOnly: true, folder: "02_source_memory/indexes" })), []);
   assert.equal(backlinks(index, "A.md").length, indexes.length, "Index backlinks remain available outside the graph");

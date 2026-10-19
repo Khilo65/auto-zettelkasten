@@ -324,8 +324,10 @@
 
   function rememberDocument(value) {
     if (!state.snapshot) state.snapshot = { documents: [], relations: [], warnings: [] };
+    const previous = state.snapshot.documents.find((doc) => doc.path === value.path);
     state.snapshot.documents = state.snapshot.documents.filter((doc) => doc.path !== value.path);
-    const record = { ...value, text: normalizeText(value.text) };
+    const record = { ...previous, ...value, text: normalizeText(value.text) };
+    if (previous && previous.revision !== value.revision) state.snapshot.document_identities = (state.snapshot.document_identities || []).filter((identity) => ![identity.canonical_path, ...identity.path_aliases].includes(value.path));
     state.snapshot.documents.push(state.snapshot.library ? kit.parseLibraryDocument(record) : record);
     rebuildLinks();
   }
@@ -338,10 +340,14 @@
   function rebuildLinks(force = false) {
     if ((state.organization && !force) || !state.workspace || !kit.buildLinkIndex) return;
     const documents = new Map((state.snapshot?.documents || []).map((doc) => [doc.path, doc]));
-    for (const [path, value] of state.previewDocuments) if (documents.has(path)) documents.set(path, value);
-    for (const doc of state.documents.values()) documents.set(doc.path, { path: doc.path, text: textOf(doc), revision: doc.revision, editable: doc.editable });
+    const verifiedIdentities = (state.snapshot?.document_identities || []).filter((identity) => [identity.canonical_path, ...identity.path_aliases].every((path) => {
+      const doc = state.documents.get(path);
+      return !doc || !dirty(doc) && doc.revision === documents.get(path)?.revision;
+    }));
+    for (const [path, value] of state.previewDocuments) if (documents.has(path)) documents.set(path, { ...documents.get(path), ...value });
+    for (const doc of state.documents.values()) documents.set(doc.path, { ...documents.get(doc.path), path: doc.path, text: textOf(doc), revision: doc.revision, editable: doc.editable });
     const ordered = [...documents.values()].sort((a, b) => Number(b.path === state.active) - Number(a.path === state.active) || a.path.localeCompare(b.path));
-    state.linkIndex = (state.snapshot?.library ? kit.buildLibraryIndex : kit.buildLinkIndex)(ordered, state.snapshot?.relations || [], state.linkIndex);
+    state.linkIndex = (state.snapshot?.library ? kit.buildLibraryIndex : kit.buildLinkIndex)(ordered, state.snapshot?.relations || [], state.linkIndex, { document_identities: verifiedIdentities });
     state.indexVersion = (state.indexVersion || 0) + 1;
     state.view?.dispatch({});
     if (active()?.mode === "reading") renderReading(active());
@@ -362,7 +368,7 @@
       let snapshot;
       for (let attempt = 0; attempt < 2; attempt += 1) {
         const documents = new Map(), entries = new Map(), relations = new Map(), warnings = new Set();
-        let cursor, generation, truncated = false, hasEntries = false;
+        let cursor, generation, truncated = false, hasEntries = false, metadata = {};
         try {
           for (let pageNumber = 0; ; pageNumber += 1) {
             if (pageNumber > 100000) throw new Error("The index returned too many pages.");
@@ -385,6 +391,7 @@
             for (const relation of page.relations) relations.set(relation.id, relation);
             for (const warning of page.warnings || []) warnings.add(warning);
             truncated ||= Boolean(page.truncated);
+            if (page.complete !== false) metadata = { document_identities: (Array.isArray(page.document_identities) ? page.document_identities : []).filter((identity) => identity?.verified === true && typeof identity.canonical_path === "string" && Array.isArray(identity.path_aliases) && identity.path_aliases.every((path) => typeof path === "string")), index_coverage: page.index_coverage, relation_resolution: page.relation_resolution };
             if (documents.size > 100000 || relations.size > 1000000 || entries.size > 200000) throw new Error("The library exceeds the supported index size.");
             state.indexProgress = `${page.phase === "validate" ? "Verifying" : "Indexing"} ${page.progress?.documents ?? documents.size} notes…`;
             renderIndexStatus();
@@ -392,7 +399,7 @@
             if (typeof page.next_cursor !== "string" || !page.next_cursor || page.next_cursor === cursor) throw new Error("Invalid note index continuation.");
             cursor = page.next_cursor;
           }
-          snapshot = { documents: [...documents.values()], relations: [...relations.values()], warnings: [...warnings], truncated, generation, library: true, complete: true, ...(hasEntries ? { entries: [...entries.values()] } : {}) };
+          snapshot = { documents: [...documents.values()], relations: [...relations.values()], warnings: [...warnings], truncated, generation, library: true, complete: true, ...metadata, ...(hasEntries ? { entries: [...entries.values()] } : {}) };
           break;
         } catch (error) {
           if (error.code !== "index_changed" || attempt || !current()) throw error;
@@ -433,6 +440,7 @@
 
   function renderIndexStatus() {
     const warnings = [...(state.snapshot?.warnings || []), ...(state.linkIndex?.warnings || []).map((warning) => typeof warning === "string" ? warning : warning.reason)];
+    if (state.snapshot?.index_coverage?.label) warnings.push(state.snapshot.index_coverage.label);
     if (state.linkIndex?.partial || state.snapshot?.truncated) warnings.unshift("Connections are partial. Counts and graphs include indexed content only.");
     const showProgress = state.indexing && !state.snapshot?.complete;
     const text = state.indexError || (showProgress ? state.indexProgress || "Indexing notes…" : warnings.length ? [...new Set(warnings)].join(" ") : "");
@@ -620,15 +628,17 @@
           <label for="${mode}-graph-search">Filter notes</label><input id="${mode}-graph-search" type="text" placeholder="Name or path…" autocomplete="off">
           <label for="${mode}-graph-folder">Folder</label><select id="${mode}-graph-folder"><option value="">All folders</option></select>
           <label for="${mode}-graph-tag">Tag</label><select id="${mode}-graph-tag"><option value="">All tags</option></select>
-          <label class="graph-check"><input id="${mode}-graph-existing" type="checkbox" checked> Existing files only</label>
-          <label class="graph-check"><input id="${mode}-graph-indexes" type="checkbox" checked> Show index notes</label>
+          <label class="graph-check"><input id="${mode}-graph-existing" type="checkbox"> Existing files only</label>
+          <label class="graph-check"><input id="${mode}-graph-indexes" type="checkbox"> Navigation documents and links</label>
           <label class="graph-check"><input id="${mode}-graph-orphans" type="checkbox" checked> Show orphans</label>
-          <label class="graph-check"><input id="${mode}-graph-references" type="checkbox" checked> Markdown links</label>
+          <label class="graph-check"><input id="${mode}-graph-references" type="checkbox"> Markdown links</label>
+          <label class="graph-check"><input id="${mode}-graph-citations" type="checkbox"> Citations</label>
+          <label class="graph-check"><input id="${mode}-graph-discovery" type="checkbox"> Discovery links</label>
           <label class="graph-check"><input id="${mode}-graph-relations" type="checkbox" checked> Accepted research relations</label>
           <label for="${mode}-graph-type">Relation type</label><select id="${mode}-graph-type"><option value="">All types</option></select>
           <label class="graph-check"><input id="${mode}-graph-labels" type="checkbox" checked> Show labels</label>
         </div></details>
-      </div><div class="graph-footer"><span id="${mode}-graph-counts" role="status"></span><span id="${mode}-graph-progress" role="status" hidden>Arranging graph…</span><span class="graph-legend"><span>— Links</span><span class="relation-legend">╴ Research relations</span></span></div><div id="${mode}-graph-list" class="graph-note-list" aria-label="${local ? "Local" : "Global"} graph notes" hidden></div>`;
+      </div><div class="graph-footer"><span id="${mode}-graph-counts" role="status"></span><span id="${mode}-graph-progress" role="status" hidden>Arranging graph…</span><span class="graph-legend"><span>— Other links</span><span class="relation-legend">╴ Research relations</span></span><span>Saved relationships only. Unconnected does not mean unrelated.</span></div><div id="${mode}-graph-list" class="graph-note-list" aria-label="${local ? "Local" : "Global"} graph notes" hidden></div>`;
     fillIcons(container);
     container.querySelectorAll("input,select").forEach((control) => control.addEventListener(control.type === "text" ? "input" : "change", () => renderGraph(mode, true)));
     graphControl(mode, "fit").addEventListener("click", () => fitGraph(state.graphs.get(mode)));
@@ -705,18 +715,21 @@
     const options = {
       search: graphControl(mode, "search").value, folder: graphControl(mode, "folder").value, tag: graphControl(mode, "tag").value,
       existingOnly: graphControl(mode, "existing").checked, showReferences: graphControl(mode, "references").checked,
-      showIndexes: graphControl(mode, "indexes").checked,
+      showNavigation: graphControl(mode, "indexes").checked,
+      showCitations: graphControl(mode, "citations").checked, showDiscovery: graphControl(mode, "discovery").checked,
       showRelations: graphControl(mode, "relations").checked, relationType: graphControl(mode, "type").value,
     };
     if (local) options.local = { path, depth: Number(graphControl(mode, "depth").value), incoming: graphControl(mode, "incoming").checked, outgoing: graphControl(mode, "outgoing").checked, neighbors: graphControl(mode, "neighbors").checked };
     let data = state.linkIndex ? kit.graphData(state.linkIndex, options) : { nodes: [], edges: [] };
     if (!graphControl(mode, "orphans").checked) {
       const connected = new Set(data.edges.flatMap((edge) => [edge.source, edge.target]));
-      data = { ...data, nodes: data.nodes.filter((node) => connected.has(node.id) || local && node.path === path) };
+      data = { ...data, nodes: data.nodes.filter((node) => connected.has(node.id) || local && node.pathAliases?.includes(path)) };
     }
     const empty = graphControl(mode, "empty"); empty.hidden = Boolean(data.nodes.length);
     empty.textContent = !state.linkIndex && state.indexing ? "Indexing notes…" : local && !path ? "Open a note to see its connections." : "No notes match these filters.";
-    graphControl(mode, "counts").textContent = `${data.nodes.length} ${data.nodes.length === 1 ? "note" : "notes"} · ${data.edges.length} ${data.edges.length === 1 ? "connection" : "connections"}${options.showIndexes ? "" : " · indexes hidden"}${data.partial || state.snapshot?.truncated ? " · partial" : ""}`;
+    const unresolved = data.unresolved || {}, hidden = unresolved.hidden || 0;
+    const resolutionCounts = [["missing", "missing"], ["ambiguous", "ambiguous"], ["fragments", "missing heading/block"]].filter(([key]) => unresolved[key]).map(([key, label]) => `${unresolved[key]} ${label}`);
+    graphControl(mode, "counts").textContent = `${data.nodes.length} ${data.nodes.length === 1 ? "note" : "notes"} · ${data.edges.length} ${data.edges.length === 1 ? "connection" : "connections"}${options.showNavigation ? "" : " · navigation hidden"}${resolutionCounts.length ? ` · ${resolutionCounts.join(", ")}${hidden ? ` (${hidden} hidden)` : ""}` : ""}${data.partial || state.snapshot?.truncated ? " · partial" : ""}`;
     if (!local) { el("workspace-save-state").textContent = "Graph view"; el("workspace-counts").textContent = graphControl(mode, "counts").textContent; }
     const signature = JSON.stringify(data);
     let graph = state.graphs.get(mode);
@@ -727,8 +740,8 @@
       const appendPage = () => {
         list.querySelector(".graph-list-more")?.remove();
         for (const node of data.nodes.slice(shown, shown + 200)) {
-          const button = document.createElement("button"); button.type = "button"; button.textContent = `${node.label}${node.missing ? " · missing" : ""}`;
-          button.title = node.path || node.label; button.disabled = !node.path || node.missing;
+          const button = document.createElement("button"); button.type = "button"; button.textContent = node.label;
+          button.title = [node.path || node.label, ...(node.pathAliases?.filter((alias) => alias !== node.path) || []), node.source_coverage?.label, ...(node.candidates || [])].filter(Boolean).join(" · "); button.disabled = !node.path || node.missing;
           button.addEventListener("click", () => openDocument(node.path, { refresh: true })); list.append(button);
         }
         shown += 200;
@@ -740,7 +753,7 @@
       appendPage();
     }
     const elements = [
-      ...data.nodes.map((node) => ({ data: { ...node, labelOpacity: 1, current: node.path === path ? "yes" : "no" }, classes: node.missing ? "missing" : "" })),
+      ...data.nodes.map((node) => ({ data: { ...node, labelOpacity: 1, current: node.pathAliases?.includes(path) ? "yes" : "no" }, classes: node.missing ? "missing" : "" })),
       ...data.edges.map((edge) => ({ data: edge, classes: edge.layer === "relation" ? "relation" : "reference" })),
     ];
     const hadNodes = Boolean(graph?.nodes().length);
@@ -831,7 +844,7 @@
         });
       });
     }
-    graph.nodes().forEach((node) => node.data("current", node.data("path") === path ? "yes" : "no"));
+    graph.nodes().forEach((node) => node.data("current", node.data("pathAliases")?.includes(path) ? "yes" : "no"));
     updateGraphLabels(mode, graph, true);
     resizeGraph(graph);
     startGraphLayout(mode, graph, { randomize: !hadNodes });
@@ -1144,7 +1157,8 @@
     el("workspace-save").disabled = state.requiresReopen || !canEdit(doc) || Boolean(doc.recovery) || doc.saving || !dirty(doc);
     el("workspace-save-state").textContent = state.requiresReopen ? "Reopen required" : doc.saving ? "Saving…" : doc.recovery ? "Recovery available" : doc.external ? "Disk changed · draft preserved" : !canEdit(doc) ? "Read-only" : dirty(doc) ? "Unsaved changes" : doc.override_saved ? "Personal edit saved" : "Saved";
     const text = textOf(doc), words = text.trim() ? text.trim().split(/\s+/u).length : 0;
-    el("workspace-counts").textContent = `${words.toLocaleString()} words · ${text.length.toLocaleString()} characters`;
+    const coverage = state.linkIndex?.documents.get(doc.path)?.source_coverage || doc.source_coverage;
+    el("workspace-counts").textContent = `${words.toLocaleString()} words · ${text.length.toLocaleString()} characters${coverage?.label ? ` · Source: ${coverage.label}` : ""}`;
     el("workspace-back").disabled = state.historyIndex <= 0;
     el("workspace-forward").disabled = state.historyIndex >= state.history.length - 1;
   }

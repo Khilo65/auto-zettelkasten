@@ -376,3 +376,169 @@ def test_aliases_cannot_supply_relation_fields_or_arbitrary_link_collections(cat
     pages, result = collect(service, workspace["id"])
     assert result["relations"] == [] and pages[-1]["truncated"]
     assert pages[-1]["warnings"]
+
+
+@pytest.mark.parametrize("kind,identity,canonical,compatibility", [
+    ("literature_map", "map_id: map-one", "maps/map-one/Map.md", "Map.md"),
+    ("literature_map_index", "map_id: map-one", "maps/map-one/Map.md", "Map.md"),
+    ("literature_cluster", "cluster_id: cluster-one", "maps/map-one/clusters/Cluster.md", "clusters/Cluster.md"),
+    ("literature_gap", "gap_id: gap-one", "maps/map-one/gaps/Gap.md", "gaps/candidates/Gap.md"),
+])
+def test_verified_generated_aliases_are_metadata_only_and_survive_generation_refresh(catalogue, monkeypatch, kind, identity, canonical, compatibility):
+    root, service = catalogue
+    generated(root, [])
+    monkeypatch.setattr(documents, "INDEX_PAGE_DOCUMENTS", 1)
+    canonical = "03_literature_synthesis/" + canonical
+    compatibility = "03_literature_synthesis/" + compatibility
+    text = f"---\ntype: {kind}\n{identity}\naliases: [Readable alias]\n---\n# Generated\n[[One]]\n"
+    write(root, canonical, text)
+    write(root, compatibility, text)
+    workspace = service.open(root)
+    pages, result = collect(service, workspace["id"])
+    expected = [{"canonical_path": canonical, "path_aliases": [compatibility], "verified": True}]
+    assert all("document_identities" not in page for page in pages[:-1])
+    assert pages[-1]["document_identities"] == expected
+    assert {row["path"] for row in result["documents"]} >= {canonical, compatibility}
+    assert all(row["text"] == text for row in result["documents"] if row["path"] in {canonical, compatibility})
+    assert service.index(workspace["id"])["document_identities"] == expected
+    refreshed, _ = collect(service, workspace["id"], known_generation=pages[-1]["generation"])
+    assert refreshed[-1]["not_modified"] and refreshed[-1]["document_identities"] == expected
+    assert (root / canonical).read_text() == (root / compatibility).read_text() == text
+
+
+@pytest.mark.parametrize("difference", ["body", "map_id", "filename", "ambiguous", "historical_version", "ordinary", "source", "malformed_type", "alias_header"])
+def test_identity_proof_never_guesses_from_titles_ids_or_generated_looking_paths(catalogue, difference):
+    root, service = catalogue
+    generated(root, [])
+    canonical = "03_literature_synthesis/maps/map-one/Map.md"
+    compatibility = "03_literature_synthesis/Map.md"
+    text = "---\ntype: literature_map\nmap_id: map-one\ntitle: Same title\n---\n# Map\n"
+    other = text
+    if difference == "body":
+        other += "Different content\n"
+    elif difference == "map_id":
+        text = other = text.replace("map-one", "map-other")
+    elif difference == "filename":
+        compatibility = "03_literature_synthesis/Same title.md"
+    elif difference in {"ambiguous", "historical_version"}:
+        text = other = text.replace("literature_map", "literature_cluster").replace("map_id", "cluster_id")
+        canonical = "03_literature_synthesis/maps/map-one/clusters/Cluster.md"
+        compatibility = "03_literature_synthesis/clusters/Cluster.md"
+        write(root, "03_literature_synthesis/maps/map-two/clusters/Cluster.md", text + ("Historical content\n" if difference == "historical_version" else ""))
+    elif difference == "ordinary":
+        canonical, compatibility = "Notes/Map.md", "Copies/Map.md"
+    elif difference == "source":
+        text = other = "---\nnote_id: note-one\ntype: atomic-note\ntitle: Same title\n---\n# Source\n"
+        canonical, compatibility = "02_source_memory/notes/Source.md", "Copies/Source.md"
+    elif difference == "malformed_type":
+        text = other = text.replace("type: literature_map", "type: [literature_map]")
+    else:
+        text = other = text.replace("map_id: map-one", "alias: &id map-one\nmap_id: *id")
+    write(root, canonical, text)
+    write(root, compatibility, other)
+    workspace = service.open(root)
+    pages, result = collect(service, workspace["id"])
+    assert pages[-1]["document_identities"] == service.index(workspace["id"])["document_identities"] == []
+    assert {row["path"] for row in result["documents"]} >= {canonical, compatibility}
+
+
+def test_divergent_personal_override_stays_visible_and_prevents_alias_collapse(catalogue):
+    root, _ = catalogue
+    if not documents._SAFE_WRITES:
+        pytest.skip("Safe override writes are unavailable")
+    generated(root, [])
+    canonical, compatibility = "03_literature_synthesis/maps/map-one/Map.md", "03_literature_synthesis/Map.md"
+    text = "---\ntype: literature_map\nmap_id: map-one\n---\n# Generated\n"
+    write(root, canonical, text)
+    write(root, compatibility, text)
+    service = DocumentService(journal_root=root.parent / (root.name + "-journal"), override_root=root.parent / (root.name + "-overrides"))
+    try:
+        workspace = service.open(root)
+        note = service.read(workspace["id"], compatibility)
+        service.save_override(workspace["id"], note["id"], note["revision"], text + "My personal interpretation\n")
+        pages, result = collect(service, workspace["id"])
+        assert pages[-1]["document_identities"] == service.index(workspace["id"])["document_identities"] == []
+        by_path = {row["path"]: row for row in result["documents"]}
+        assert "My personal interpretation" in by_path[compatibility]["text"]
+        assert by_path[canonical]["text"] == text
+        assert (root / canonical).read_text() == (root / compatibility).read_text() == text
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("header,expected", [
+    ("type: atomic-note\ncoverage: full text", "full_document"),
+    ("coverage: partial document", "partial_document"),
+    ("coverage: abstract only", "abstract_only"),
+    ("coverage: metadata only", "metadata_only"),
+    ("coverage: full text available; analysis pending", "analysis_pending"),
+    ("note_status: partial_document_atomic_note\nsource_scope: partial_document", "partial_document"),
+    ("type: literature_map\nstatus: complete", "unknown"),
+    ("clusters: []\nstatus: unrelated", "unknown"),
+])
+def test_index_completeness_and_source_coverage_are_separate_recorded_facts(catalogue, header, expected):
+    root, service = catalogue
+    text = f"---\n{header}\n---\n# Source\n"
+    write(root, "Source.md", text)
+    workspace = service.open(root)
+    pages, result = collect(service, workspace["id"])
+    snapshot = service.index(workspace["id"])
+    assert pages[-1]["index_coverage"]["status"] == snapshot["index_coverage"]["status"] == "complete"
+    assert "source and comparison coverage unknown" in pages[-1]["index_coverage"]["label"]
+    for document in [result["documents"][0], snapshot["documents"][0], service.read(workspace["id"], "Source.md")]:
+        assert document["source_coverage"]["status"] == expected
+        assert document["text"] == text
+
+
+def test_missing_and_ambiguous_relation_destinations_do_not_change_markdown_index_completeness(catalogue):
+    root, service = catalogue
+    generated(root, [relation("missing", target_note_id="absent"), relation("ambiguous"), relation("valid", source_note_id="note-two", target_note_id="note-two")])
+    write(root, "02_source_memory/notes/Duplicate.md", "---\nnote_id: note-one\n---\n# Different edition\n")
+    workspace = service.open(root)
+    pages, result = collect(service, workspace["id"])
+    snapshot = service.index(workspace["id"])
+    for value in (pages[-1], snapshot):
+        assert value["relation_resolution"] == {"missing": 1, "ambiguous": 2}
+        assert value["index_coverage"]["status"] == "complete"
+        assert any("missing note destinations" in warning for warning in value["warnings"])
+        assert any("ambiguous note destinations" in warning for warning in value["warnings"])
+    assert [row["id"] for row in result["relations"]] == [row["id"] for row in snapshot["relations"]] == ["valid"]
+
+
+def test_unreadable_markdown_reports_partial_inventory_and_disables_identity_verification(catalogue):
+    root, service = catalogue
+    generated(root, [])
+    text = "---\ntype: literature_map\nmap_id: map-one\n---\n# Map\n"
+    write(root, "03_literature_synthesis/maps/map-one/Map.md", text)
+    write(root, "03_literature_synthesis/Map.md", text)
+    write(root, "Invalid.md", "invalid").write_bytes(b"\xff")
+    workspace = service.open(root)
+    pages, _ = collect(service, workspace["id"])
+    for value in (pages[-1], service.index(workspace["id"])):
+        assert value["index_coverage"]["status"] == "partial"
+        assert value["document_identities"] == []
+
+
+def test_navigation_metadata_keeps_maps_and_published_directories_accessible(catalogue):
+    root, service = catalogue
+    generated(root, [])
+    write(root, "02_source_memory/indexes/collections/SYNTHETIC/sources-001.md", "# Sources\n")
+    write(root, "03_literature_synthesis/Map.md", "---\ntype: literature_map\nmap_id: map-one\n---\n# Map\n")
+    write(root, "03_literature_synthesis/clusters/INDEX.md", "# Cluster directory\n")
+    write(root, "Normal.md", "# Source links are not a navigation document\n[[One]] [[Two]]\n")
+    workspace = service.open(root)
+    _, result = collect(service, workspace["id"])
+    by_path = {row["path"]: row for row in result["documents"]}
+    for path in ("02_source_memory/indexes/collections/SYNTHETIC/sources-001.md", "03_literature_synthesis/Map.md", "03_literature_synthesis/clusters/INDEX.md"):
+        assert by_path[path]["navigation"] and service.read(workspace["id"], path)["navigation"]
+    assert not by_path["Normal.md"]["navigation"] and not by_path["02_source_memory/notes/One.md"]["navigation"]
+
+
+def test_unmarked_workspace_does_not_verify_generated_looking_copies(catalogue):
+    root, service = catalogue
+    text = "---\ntype: literature_map\nmap_id: map-one\n---\n# Map\n"
+    write(root, "03_literature_synthesis/maps/map-one/Map.md", text)
+    write(root, "03_literature_synthesis/Map.md", text)
+    workspace = service.open(root)
+    pages, _ = collect(service, workspace["id"])
+    assert pages[-1]["document_identities"] == service.index(workspace["id"])["document_identities"] == []

@@ -485,8 +485,11 @@ def test_index_is_confined_and_does_not_expose_private_names(tmp_path, service):
     assert snapshot == {
         "documents": [{"path": "Keep.md", "text": "# Keep\r\n",
                        "revision": hashlib.sha256((tmp_path / "Keep.md").read_bytes()).hexdigest(),
-                       "editable": documents._SAFE_WRITES}],
+                       "editable": documents._SAFE_WRITES, "navigation": False,
+                       "source_coverage": {"status": "unknown", "label": "Source coverage unknown"}}],
         "relations": [], "truncated": False, "warnings": [],
+        "document_identities": [], "relation_resolution": {"missing": 0, "ambiguous": 0},
+        "index_coverage": {"status": "complete", "label": "Markdown indexing complete; source and comparison coverage unknown"},
     }
     assert "Research details" not in json.dumps(snapshot)
     assert "Private findings" not in json.dumps(snapshot)
@@ -724,7 +727,9 @@ def test_index_projects_only_active_accepted_published_typed_relations(tmp_path,
         {"id": "relation-1", "source": "02_source_memory/notes/One.md", "target": "02_source_memory/notes/Two.md", "type": "supports"},
     ]
     assert all(not row["editable"] for row in snapshot["documents"])
-    assert snapshot["warnings"] == []
+    assert snapshot["relation_resolution"] == {"missing": 1, "ambiguous": 0}
+    assert snapshot["warnings"] == ["Some typed relations have missing note destinations."]
+    assert snapshot["index_coverage"]["status"] == "complete"
     assert "private rationale" not in json.dumps(snapshot)
     assert "metadata" not in json.dumps(snapshot)
     assert registry.read_bytes() == original
