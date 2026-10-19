@@ -1644,6 +1644,61 @@ def _normalized_discovery_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
+def local_retrieval_projection(
+    profiles: Sequence[Any] | Mapping[str, Any], catalogue: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Add supplied roles and locators locally without changing historical model packets."""
+    profile_rows = _catalogue_profile_rows(profiles)
+    by_source = {str(row.get("source_id") or ""): row for row in profile_rows}
+    entries = {str(row.get("source_id") or ""): row for row in catalogue.get("sources", []) if isinstance(row, Mapping)}
+    rows = lean_discovery_projection(profile_rows, catalogue)
+    role_names = (
+        "independent_variables", "dependent_variables", "treatments", "controls",
+        "mediators", "moderators", "control_variables",
+    )
+    reference_fields = ("locator", "page", "pages", "section", "text", "source_file", "source_pdf_uri", "url")
+    for row in rows:
+        profile = by_source[row["source_id"]]
+        entry = entries[row["source_id"]]
+        identity = entry.get("identity") if isinstance(entry.get("identity"), Mapping) else {}
+        aliases = identity.get("zotero_item_keys", [])
+        aliases = aliases if isinstance(aliases, (list, tuple)) else []
+        row["zotero_item_keys"] = sorted({key for key in [row["zotero_key"], *aliases] if isinstance(key, str) and key})
+        context = profile.get("context") if isinstance(profile.get("context"), Mapping) else {}
+        metadata = context.get("metadata") if isinstance(context.get("metadata"), Mapping) else {}
+        roles: dict[str, list[str]] = {}
+        for container in (profile, context):
+            supplied = container.get("variable_roles")
+            supplied = supplied if isinstance(supplied, Mapping) else {}
+            for role in role_names:
+                values = supplied.get(role, container.get(role, []))
+                if isinstance(values, str):
+                    values = [values]
+                if not isinstance(values, (list, tuple)):
+                    continue
+                normalized = [_normalized_discovery_text(value)[:240] for value in values[:32] if isinstance(value, str)]
+                roles[role] = list(dict.fromkeys([*roles.get(role, []), *(value for value in normalized if value)]))[:32]
+        if any(roles.values()):
+            row["variable_roles"] = {role: values for role, values in roles.items() if values}
+        references = []
+        supplied_references = context.get("source_references", profile.get("source_references", []))
+        if isinstance(supplied_references, (list, tuple)):
+            for reference in supplied_references[:31]:
+                if not isinstance(reference, Mapping):
+                    continue
+                bounded = {key: _normalized_discovery_text(reference[key])[:500] for key in reference_fields
+                           if isinstance(reference.get(key), (str, int)) and not isinstance(reference.get(key), bool)}
+                if bounded:
+                    references.append(bounded)
+        source = {key: _normalized_discovery_text(metadata[key])[:500] for key in ("source_file", "source_pdf_uri", "url")
+                  if isinstance(metadata.get(key), str) and metadata[key]}
+        if source:
+            references.append(source)
+        row.update(note_id=str(profile.get("note_id") or ""), note_hash=str(profile.get("note_hash") or ""),
+                   note_path=str(context.get("note_path") or ""), source_references=references)
+    return rows
+
+
 def _catalogue_relationship_rows(workspace: Path) -> list[dict[str, Any]]:
     payload = read_yaml(
         workspace / "02_source_memory" / "indexes" / "typed_links.yml", {}

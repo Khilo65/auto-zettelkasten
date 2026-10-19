@@ -53,7 +53,9 @@ from .pipeline import (
     _analytical_profile_source_ids,
     _apply_reader_policy,
     _cluster_preservation_snapshot,
+    _local_ranked_candidate_basis,
     _relationship_discovery_identity,
+    _selected_candidate_rows,
     all_workspace_note_rows,
     rebuild_map,
     run_pipeline,
@@ -1817,6 +1819,7 @@ def _build_map_semantic_fingerprint(
     navigation: NavigationPolicy,
     comparison_collection_keys: Sequence[str] = (),
     codex_cli_profile: str = "0.145.0",
+    ranked_candidates: Sequence[Mapping[str, Any]] | None = None,
 ) -> str:
     """Hash only upstream semantic inputs to a global map build."""
 
@@ -1932,6 +1935,8 @@ def _build_map_semantic_fingerprint(
             {str(value) for value in comparison_collection_keys if str(value)}
         ),
     }
+    if ranked_candidates is not None:
+        payload["local_ranked_candidates"] = _selected_candidate_rows(_local_ranked_candidate_basis(ranked_candidates))
     if policy.synthesis_enabled and policy.cluster_generation_enabled is not False:
         payload["relationship_discovery_identity"] = _relationship_discovery_identity(
             provider, model, reasoning_effort, cli_profile=codex_cli_profile,
@@ -2002,6 +2007,7 @@ def _build_map_receipt_identity(
     comparison_collection_keys: Sequence[str],
     source_set: Mapping[str, Any] | Path | str | None,
     codex_cli_profile: str = "0.145.0",
+    ranked_candidates: Sequence[Mapping[str, Any]] | None = None,
 ) -> str:
     if isinstance(source_set, Mapping):
         source_set_identity: Any = dict(source_set)
@@ -2023,6 +2029,8 @@ def _build_map_receipt_identity(
                 "comparison_collection_keys": sorted(comparison_collection_keys),
                 "source_set": source_set_identity,
             }
+    if ranked_candidates is not None:
+        payload["local_ranked_candidates"] = _selected_candidate_rows(_local_ranked_candidate_basis(ranked_candidates))
     if policy.synthesis_enabled and policy.cluster_generation_enabled is not False:
         payload["relationship_discovery_identity"] = _relationship_discovery_identity(
             provider, model, reasoning_effort, cli_profile=codex_cli_profile,
@@ -2400,10 +2408,13 @@ def build_map(
     external_discovery: ExternalDiscoveryProvider | None = None,
     resume: bool = False,
     retry_terminal_failures: bool = False,
+    ranked_candidates: Sequence[Mapping[str, Any]] | None = None,
 ) -> ArtifactManifest:
     del controller  # synthesis consumes validated notes and accepted typed-link evidence only
     if not isinstance(allow_cloud, bool):
         raise ValueError("allow_cloud must be a boolean")
+    if ranked_candidates is not None:
+        _local_ranked_candidate_basis(ranked_candidates)
     comparison_collection_keys = tuple(
         sorted(
             {
@@ -2471,6 +2482,7 @@ def build_map(
             comparison_collection_keys=comparison_collection_keys,
             source_set=source_set,
             codex_cli_profile=cli_profile,
+            ranked_candidates=ranked_candidates,
         )
         for cli_profile in (
             tuple(CODEX_CLI_PROFILES)
@@ -2603,6 +2615,7 @@ def build_map(
                 external_discovery=external_discovery,
                 progress=progress,
                 resume=resume,
+                **({"ranked_candidates": ranked_candidates} if ranked_candidates is not None else {}),
             )
     except Exception:
         progress.finish("partial")
@@ -2627,6 +2640,7 @@ def build_map(
         comparison_collection_keys=comparison_collection_keys,
         source_set=source_set,
         codex_cli_profile=codex_cli_profile,
+        ranked_candidates=ranked_candidates,
     )
     semantic_fingerprint = _build_map_semantic_fingerprint(
         root,
@@ -2640,6 +2654,7 @@ def build_map(
         navigation=navigation,
         comparison_collection_keys=comparison_collection_keys,
         codex_cli_profile=codex_cli_profile,
+        ranked_candidates=ranked_candidates,
     )
     analytical_source_ids = _analytical_profile_source_ids(
         result.get("profiles", []) or []

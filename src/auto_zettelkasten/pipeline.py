@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import mimetypes
 import os
 import queue
@@ -214,6 +215,7 @@ CONTENT_CLASSIFIER_VERSION = "7"
 _RELATIONSHIP_BATCH_MAX_JOBS = 8
 _LEGACY_RELATIONSHIP_BATCH_MAX_JOBS = 8
 _RELATIONSHIP_DISCOVERY_PAGE_SIZE = 64
+_LOCAL_RANKED_RELATIONSHIP_MAX_PAIRS = 256
 _RELATIONSHIP_SELECTION_STATE_SCHEMA_VERSION = "4"
 _RELATIONSHIP_DISCOVERY_POLICY_VERSION = "ordinary-family-scope-v304"
 _RELATIONSHIP_SEMANTIC_POLICY_VERSION = "source-owned-bases-v26"
@@ -6967,6 +6969,132 @@ def _legacy_selection_identity_matches(
     )
 
 
+def _local_ranked_candidate_basis(
+    candidates: Sequence[Mapping[str, Any]],
+) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    """Validate the explicit shortlist and keep only identity-bearing evidence."""
+    if isinstance(candidates, (str, bytes, Mapping)) or len(candidates) > _LOCAL_RANKED_RELATIONSHIP_MAX_PAIRS:
+        raise ValueError("local ranked shortlist must contain at most 256 candidate rows")
+    allowed = {
+        "left_source_id", "right_source_id", "left_source_title", "right_source_title",
+        "rank", "score", "why_compare", "discovery_route", "discovery_provenance",
+        "input_profile_hashes", "left_profile_hash", "right_profile_hash",
+    }
+    material_nodes = material_chars = 0
+
+    def validate_size(value: Any) -> None:
+        nonlocal material_nodes, material_chars
+        active: set[int] = set()
+        stack = [(iter([value]), 0, None)]
+        while stack:
+            values, depth, identity = stack[-1]
+            try:
+                item = next(values)
+            except StopIteration:
+                stack.pop()
+                if identity is not None:
+                    active.remove(identity)
+                continue
+            material_nodes += 1
+            if material_nodes > 65_536 or depth > 12:
+                raise ValueError("local ranked candidate exceeds material node/depth budget")
+            if isinstance(item, str):
+                material_chars += len(item)
+            elif isinstance(item, (Mapping, list)):
+                if id(item) in active:
+                    raise ValueError("local ranked candidate contains cyclic material")
+                if isinstance(item, Mapping):
+                    for key in item:
+                        if not isinstance(key, str) or len(key) > 256:
+                            raise ValueError("local ranked candidate has invalid material keys")
+                        material_chars += len(key)
+                        if material_chars > 1_048_576:
+                            raise ValueError("local ranked shortlist exceeds material character budget")
+                active.add(id(item))
+                stack.append((iter(item.values() if isinstance(item, Mapping) else item), depth + 1, id(item)))
+            elif item is not None and (not isinstance(item, (bool, int, float)) or
+                                       isinstance(item, float) and not math.isfinite(item)):
+                raise ValueError("local ranked candidate material must be finite JSON values")
+            elif isinstance(item, (int, float)):
+                if isinstance(item, int) and item.bit_length() > 256:
+                    raise ValueError("local ranked candidate material number exceeds size budget")
+                material_chars += len(str(item))
+            if material_chars > 1_048_576:
+                raise ValueError("local ranked shortlist exceeds material character budget")
+
+    def material(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {key: material(item) for key, item in value.items()
+                    if key not in {"rank", "score", "why_compare", "selection_reason", "selection_score"}}
+        if isinstance(value, list):
+            return [material(item) for item in value]
+        return value
+
+    by_pair: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for raw in candidates:
+        validate_size(raw)
+        if not isinstance(raw, Mapping) or set(raw) - allowed:
+            raise ValueError("local ranked candidate contains invalid fields")
+        if raw.get("discovery_route") != "deterministic_local_ranked":
+            raise ValueError("local ranked candidate requires deterministic_local_ranked route")
+        left, right = raw.get("left_source_id"), raw.get("right_source_id")
+        if (not isinstance(left, str) or not left.strip() or left != left.strip() or len(left) > 256
+                or not isinstance(right, str) or not right.strip() or right != right.strip() or len(right) > 256 or left == right):
+            raise ValueError("local ranked candidate requires two distinct exact source IDs")
+        titles = {source_id: raw.get(f"{side}_source_title") for side, source_id in (("left", left), ("right", right))}
+        if any(not isinstance(title, str) or not title.strip() or len(title) > 2_000 for title in titles.values()):
+            raise ValueError("local ranked candidate requires exact source titles")
+        titles = {source_id: " ".join(title.split()) for source_id, title in titles.items()}
+        rank, score = raw.get("rank"), raw.get("score")
+        if (isinstance(rank, bool) or not isinstance(rank, int) or rank < 1
+                or isinstance(score, bool) or not isinstance(score, (int, float))
+                or not math.isfinite(score) or not isinstance(raw.get("why_compare"), str)
+                or len(raw["why_compare"]) > 4_000):
+            raise ValueError("local ranked candidate has invalid selection metadata")
+        provenance = raw.get("discovery_provenance")
+        if not isinstance(provenance, list) or not provenance or not all(isinstance(row, Mapping) for row in provenance):
+            raise ValueError("local ranked candidate requires material discovery provenance")
+        supplied_hashes = raw.get("input_profile_hashes", {})
+        if (not isinstance(supplied_hashes, Mapping) or set(supplied_hashes) - {left, right}
+                or any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
+                       for value in supplied_hashes.values())):
+            raise ValueError("local ranked candidate has invalid endpoint hashes")
+        endpoint_hashes = dict(supplied_hashes)
+        for side, source_id in (("left", left), ("right", right)):
+            for supplied in (supplied_hashes.get(source_id), raw.get(f"{side}_profile_hash")):
+                if supplied is not None:
+                    if not isinstance(supplied, str) or not re.fullmatch(r"[0-9a-f]{64}", supplied):
+                        raise ValueError("local ranked candidate has invalid endpoint hash: " + source_id)
+                    if source_id in endpoint_hashes and endpoint_hashes[source_id] != supplied:
+                        raise ValueError("local ranked candidate has conflicting endpoint hashes")
+                    endpoint_hashes[source_id] = supplied
+        pair = canonical_pair(left, right)
+        evidence = sorted({stable_hash(material(row)): material(row) for row in provenance}.values(), key=stable_hash)
+        if not any(evidence):
+            raise ValueError("local ranked candidate requires material discovery provenance")
+        basis = {
+            "left_source_id": pair[0], "right_source_id": pair[1],
+            "left_source_title": titles[pair[0]], "right_source_title": titles[pair[1]],
+            "discovery_route": "deterministic_local_ranked",
+            "discovery_provenance": evidence,
+            **({"input_profile_hashes": dict(sorted(endpoint_hashes.items()))} if endpoint_hashes else {}),
+        }
+        if pair in by_pair:
+            previous = by_pair[pair][0]
+            if any(previous[key] != basis[key] for key in ("left_source_title", "right_source_title")):
+                raise ValueError("local ranked candidate has conflicting source titles")
+            combined_hashes = dict(previous.get("input_profile_hashes", {}))
+            if any(key in combined_hashes and combined_hashes[key] != value for key, value in endpoint_hashes.items()):
+                raise ValueError("local ranked candidate has conflicting endpoint hashes")
+            combined_hashes.update(endpoint_hashes)
+            if combined_hashes:
+                basis["input_profile_hashes"] = dict(sorted(combined_hashes.items()))
+            combined = [*previous["discovery_provenance"], *evidence]
+            basis["discovery_provenance"] = sorted({stable_hash(row): row for row in combined}.values(), key=stable_hash)
+        by_pair[pair] = [basis]
+    return by_pair
+
+
 def _run_relationship_reasoning(
     workspace: Path,
     *,
@@ -6981,9 +7109,11 @@ def _run_relationship_reasoning(
     frozen_pair_jobs: Sequence[RelationshipPairJob] | None = None,
     require_reused_discovery: bool = False,
     verify_reuse_only: bool = False,
+    ranked_candidates: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Run global discovery and one complete decision per immutable pair job."""
 
+    local_ranked_mode = ranked_candidates is not None
     profile_by_source = {
         str(row.get("source_id") or ""): profile
         for profile in profiles
@@ -7004,6 +7134,26 @@ def _run_relationship_reasoning(
         for source_id, profile in profile_by_source.items()
         if source_id in available_catalogue_ids
     }
+    local_candidate_basis = _local_ranked_candidate_basis(ranked_candidates) if ranked_candidates is not None else {}
+    if local_ranked_mode:
+        source_titles = {str(row.get("source_id") or ""): row.get("title")
+                         for row in catalogue_payload.get("sources", []) or [] if isinstance(row, Mapping)}
+        source_hashes = {str(profile_to_dict(profile).get("source_id") or ""): set(profile_hash_aliases(profile))
+                         for profile in profiles}
+        for basis in local_candidate_basis.values():
+            identity_error = relationship_source_identity_error(basis[0], source_titles)
+            if identity_error:
+                raise ValueError("local ranked candidate identity error: " + identity_error)
+            for source_id, supplied in basis[0].pop("input_profile_hashes", {}).items():
+                if supplied not in source_hashes.get(source_id, set()):
+                    raise ValueError("local ranked candidate has stale endpoint hash: " + source_id)
+    local_ineligible = [
+        {"source_id": pair[0], "target_source_id": pair[1],
+         "status": "insufficient_evidence", "reason": "local_ranked_endpoint_not_substantive",
+         "retry_on_resume": False}
+        for pair in local_candidate_basis
+        if any(source_id not in profile_by_source for source_id in pair)
+    ]
     empty_result = {
         "accepted": [],
         "no_relationship": [],
@@ -7016,7 +7166,7 @@ def _run_relationship_reasoning(
         "relationship_retry_on_resume": False,
         "provider_batch_count": 0,
     }
-    if len(profile_by_source) < 2:
+    if len(profile_by_source) < 2 and not local_ranked_mode:
         return {
             **empty_result,
             "relationship_stage_complete": True,
@@ -7030,18 +7180,20 @@ def _run_relationship_reasoning(
             job.output_contract == "relationship-decision-v11" for job in frozen_pair_jobs
         ))
     )
+    if local_ranked_mode and not ordinary_decisions and local_candidate_basis:
+        raise ValueError("local ranked candidates require the ordinary relationship-decision-v11 contract")
     decision_prompt_version = (
         RELATIONSHIP_DISCOVERY_PROMPT_VERSION if ordinary_decisions
         else RELATIONSHIP_PROMPT_VERSION
     )
     selector = getattr(reasoner, "select_relationship_candidates", None)
     adjudicator = getattr(reasoner, "adjudicate_relationships", None)
-    if (
+    if (not local_ranked_mode or local_candidate_basis) and (
         reasoner_calls is None
         or not callable(selector)
         or (not ordinary_decisions and not callable(adjudicator))
     ):
-        if request.literature_policy.cluster_generation_enabled is not False:
+        if not local_ranked_mode and request.literature_policy.cluster_generation_enabled is not False:
             return {
                 **empty_result,
                 "relationship_stage_complete": True,
@@ -7057,9 +7209,9 @@ def _run_relationship_reasoning(
                     "retry_on_resume": False,
                 }
             ],
-            "pair_job_count": len(profile_by_source)
-            * (len(profile_by_source) - 1)
-            // 2,
+            "pair_job_count": len(local_candidate_basis) if local_ranked_mode else (
+                len(profile_by_source) * (len(profile_by_source) - 1) // 2
+            ),
             "relationship_stage_complete": False,
             "relationship_discovery_status": "blocked",
             "relationship_discovery_incomplete_jobs": [
@@ -7162,7 +7314,8 @@ def _run_relationship_reasoning(
         ],
     }
     shared_plan_active = bool(
-        shared_family_plan
+        not local_ranked_mode
+        and shared_family_plan
         and shared_family_plan.get("literature_families")
     )
     catalogue_revision = stable_hash(
@@ -7283,6 +7436,11 @@ def _run_relationship_reasoning(
         )
         for cli_profile in identity_profiles
     }
+    if local_ranked_mode:
+        discovery_identities = {
+            cli_profile: stable_hash({"discovery_route": "deterministic_local_ranked", "provider_identity": identity})
+            for cli_profile, identity in discovery_identities.items()
+        }
     adjudication_identities = {
         cli_profile: _relationship_adjudication_identity(
             relationship_provider,
@@ -7371,7 +7529,8 @@ def _run_relationship_reasoning(
         != catalogue_revision
     )
     discovery_changed = bool(
-        discovery_identity_changed
+        local_ranked_mode
+        or discovery_identity_changed
         or focus_source_ids
         or catalogue_changed
         or prior_selected_candidates is None
@@ -7701,6 +7860,31 @@ def _run_relationship_reasoning(
             negative_pairs.add(pair)
     for pair in negative_pairs:
         mandatory_basis.pop(pair, None)
+    if local_ranked_mode:
+        # The shortlist is the entire paid comparison scope, including refreshes.
+        mandatory_basis.clear()
+        current_jobs = {
+            canonical_pair(str(row["source_ids"][0]), str(row["source_ids"][1])): str(row.get("pair_job_id") or "")
+            for row in registry.get("current_pair_decisions", []) or []
+            if isinstance(row, Mapping) and isinstance(row.get("source_ids"), list) and len(row["source_ids"]) == 2
+        }
+        for pair, basis in local_candidate_basis.items():
+            previous = (prior_selected_candidates or {}).get(pair, [])
+            previous_basis_hash = stable_hash(previous) if previous and all(
+                row.get("discovery_route") == "deterministic_local_ranked" for row in previous
+            ) else ""
+            previous_job = current_jobs.get(pair, "")
+            if re.fullmatch(r"relationship-job-[0-9a-f]{20}", previous_job):
+                status = read_yaml(workspace / "11_state/relationship_jobs" / previous_job / "status.yml", {}) or {}
+                previous_basis_hash = str(status.get("candidate_basis_hash") or previous_basis_hash)
+            if previous_basis_hash and previous_basis_hash != stable_hash(basis):
+                visible_pairs.discard(pair)
+                negative_pairs.discard(pair)
+    out_of_scope_refresh_rows = [
+        {"source_id": pair[0], "target_source_id": pair[1], "status": "not_examined",
+         "reason": "local_ranked_refresh_outside_shortlist", "refresh_pending": True}
+        for pair in sorted(stale_accepted_pairs - set(local_candidate_basis))
+    ] if local_ranked_mode else []
     configured_max_calls = getattr(reasoner_calls, "max_calls", None)
     remaining_calls = (
         None
@@ -7741,7 +7925,7 @@ def _run_relationship_reasoning(
             "provider_batch_count": 0,
         }
     catalogue_char_budget = _relationship_context_char_budget(reasoner, request)
-    discovery_profiles = [
+    discovery_profiles = [] if local_ranked_mode else [
         _relationship_evidence_projection(
             profile_by_source[source_id],
             entry_by_source.get(source_id, {}),
@@ -7896,13 +8080,13 @@ def _run_relationship_reasoning(
         **discovery_memory(set(profile_by_source)),
     }
     requires_routing = (
-        _reasoner_packet_chars(
+        not local_ranked_mode and _reasoner_packet_chars(
             [profile_to_dict(profile) for profile in discovery_profiles],
             full_discovery_context,
         )
         > catalogue_char_budget
     )
-    can_discover = not reuse_selected_pool and (
+    can_discover = not local_ranked_mode and not reuse_selected_pool and (
         remaining_calls is None or remaining_calls > 0
     )
     possible_pair_count = max(
@@ -10419,8 +10603,23 @@ def _run_relationship_reasoning(
             pair: [dict(row) for row in basis]
             for pair, basis in sorted(prior_selected_candidates.items())
         }
+    if local_ranked_mode:
+        candidate_by_pair = {}
+        candidate_dispositions = []
+        for pair, basis in sorted(local_candidate_basis.items()):
+            disposition = (
+                "insufficient_evidence" if any(source_id not in profile_by_source for source_id in pair)
+                else "already_visible" if pair in visible_pairs
+                else "current_no_relationship" if pair in negative_pairs
+                else "selected_for_adjudication"
+            )
+            candidate_dispositions.append({"pair": list(pair), "disposition": disposition})
+            if disposition == "selected_for_adjudication":
+                candidate_by_pair[pair] = basis
 
-    selected_candidates = _selected_candidate_rows(candidate_by_pair)
+    selected_candidates = _selected_candidate_rows(
+        local_candidate_basis if local_ranked_mode else candidate_by_pair
+    )
     selected_candidate_pool_hash = stable_hash(selected_candidates)
     if frozen_pair_jobs is None and not ordinary_decisions:
         selected_source_ids = {
@@ -10720,7 +10919,8 @@ def _run_relationship_reasoning(
 
     responses: list[dict[str, Any]] = []
     unresolved: list[RelationshipPairJob] = []
-    preparked: list[dict[str, Any]] = list(discovery_parked)
+    preparked: list[dict[str, Any]] = [*discovery_parked, *local_ineligible]
+    local_retry_attempts: dict[str, int] = {}
 
     def ordinary_row(
         job: RelationshipPairJob, rows: Sequence[Mapping[str, Any]],
@@ -10804,8 +11004,12 @@ def _run_relationship_reasoning(
         row = {**dict(row), "reasoner_backend": reasoner_backend,
                "provider": provider_name, "model": model_name}
         paths = (job_root / job.pair_job_id, global_job_root / job.pair_job_id)
+        local_result_bytes = (json.dumps(row, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8") if local_ranked_mode else b""
         for path in paths:
-            write_json(path / "provider_result.json", row)
+            if local_ranked_mode:
+                atomic_write_bytes(path / "provider_result.json", local_result_bytes)
+            else:
+                write_json(path / "provider_result.json", row)
         valid, validation = validate_cached_job(job, row)
         if not valid:
             reason = ",".join(sorted({str(value.get("reason") or "")
@@ -10813,24 +11017,33 @@ def _run_relationship_reasoning(
                 if value.get("reason")})) or "relationship_decision_needs_review"
             preparked.append({"pair_job_id": job.pair_job_id,
                 "source_id": job.left_source_id, "target_source_id": job.right_source_id,
-                "status": "parked_for_review", "reason": reason})
+                "status": "pending" if local_ranked_mode else "parked_for_review", "reason": reason,
+                **({"retry_on_resume": True} if local_ranked_mode else {})})
             write_yaml(paths[0] / "status.yml", {
-                "pair_job_id": job.pair_job_id, "status": "parked_for_review",
-                "reason": reason, "decision_identity": decision_identity})
+                "pair_job_id": job.pair_job_id, "status": "pending" if local_ranked_mode else "parked_for_review",
+                "reason": reason, "decision_identity": decision_identity,
+                **({"retry_on_resume": True, "provider_attempt_count": local_retry_attempts.get(job.pair_job_id, 0) + 1}
+                   if local_ranked_mode else {})})
             return
         for path in paths:
-            write_json(path / "result.json", row)
+            if local_ranked_mode:
+                atomic_write_bytes(path / "result.json", local_result_bytes)
+            else:
+                write_json(path / "result.json", row)
             write_yaml(path / "status.yml", {
                 "pair_job_id": job.pair_job_id, "status": "completed",
                 **({"batch_id": batch_id} if batch_id and path == paths[0] else {}),
                 "decision_identity": decision_identity,
                 "reasoner_backend": reasoner_backend,
-                "provider": provider_name, "model": model_name})
+                "provider": provider_name, "model": model_name,
+                **({"candidate_basis_hash": stable_hash(job.candidate_basis)} if local_ranked_mode else {})})
         responses.append(row)
     for job in jobs:
         job_path = job_root / job.pair_job_id
         result_path = job_path / "result.json"
         status = read_yaml(job_path / "status.yml", {}) or {}
+        if local_ranked_mode:
+            local_retry_attempts[job.pair_job_id] = int(status.get("provider_attempt_count", 0) or 0)
         cached_path = global_job_root / job.pair_job_id
         cached_status = read_yaml(cached_path / "status.yml", {}) or {}
         cached_result_path = cached_path / "result.json"
@@ -10844,6 +11057,7 @@ def _run_relationship_reasoning(
         if (
             str(status.get("status") or "") == "parked_for_review"
             and same_identity
+            and not local_ranked_mode
             and not bool(getattr(request, "retry_terminal_failures", False))
         ):
             preparked.append(
@@ -10867,8 +11081,13 @@ def _run_relationship_reasoning(
                 payload = json.loads(
                     reusable_result_path.read_text(encoding="utf-8")
                 )
+            except UnicodeError:
+                if not local_ranked_mode:
+                    raise
+                unresolved.append(job)
+                continue
             except (OSError, json.JSONDecodeError):
-                if ordinary_decisions:
+                if ordinary_decisions and not local_ranked_mode:
                     preparked.append({"pair_job_id": job.pair_job_id,
                         "source_id": job.left_source_id, "target_source_id": job.right_source_id,
                         "reason": "ordinary_decision_cache_unreadable"})
@@ -10878,6 +11097,9 @@ def _run_relationship_reasoning(
             if isinstance(payload, Mapping):
                 valid, validation = validate_cached_job(job, payload)
                 if not valid:
+                    if local_ranked_mode:
+                        unresolved.append(job)
+                        continue
                     preparked.extend(
                         {
                             **dict(row),
@@ -10925,6 +11147,8 @@ def _run_relationship_reasoning(
                         "checkpoint_hit": True,
                     },
                 )
+            elif local_ranked_mode:
+                unresolved.append(job)
         else:
             direct = ordinary_row(job, job.candidate_basis) if ordinary_decisions else None
             if direct is not None:
@@ -10932,9 +11156,11 @@ def _run_relationship_reasoning(
             else:
                 unresolved.append(job)
     provider_batch_count = 0
+    local_packet_source_ids = {source_id for job in unresolved for source_id in (job.left_source_id, job.right_source_id)}
     ordinary_catalogue = {
         str(row["source_id"]): row for row in lean_discovery_projection(
-            list(profile_by_source.values()), catalogue_payload,
+            [profile for source_id, profile in profile_by_source.items()
+             if not local_ranked_mode or source_id in local_packet_source_ids], catalogue_payload,
         )
     } if ordinary_decisions else {}
 
@@ -10950,7 +11176,12 @@ def _run_relationship_reasoning(
                 "left_source_ids": [job.left_source_id],
                 "right_source_ids": [job.right_source_id],
                 "target_candidate_count": 1,
+                **({"discovery_provenance": job.candidate_basis[0]["discovery_provenance"]}
+                   if local_ranked_mode else {}),
             } for job in packet],
+            **({"discovery_mode": "local_ranked_shortlist", "max_inferred_pairs": len(packet),
+                "comparison_retry_attempts": {job.pair_job_id: local_retry_attempts[job.pair_job_id] for job in packet}}
+               if local_ranked_mode else {}),
         }
     job_packets = _pack_relationship_rows(
         unresolved,
@@ -11006,14 +11237,25 @@ def _run_relationship_reasoning(
             return response
         by_pair: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
         expected = {(job.left_source_id, job.right_source_id): job for job in packet}
+        invalid_pairs: set[tuple[str, str]] = set()
         for raw in response.get("candidates", []) or []:
             if not isinstance(raw, Mapping):
                 continue
             pair = canonical_pair(str(raw.get("left_source_id") or ""),
                                   str(raw.get("right_source_id") or ""))
             if pair not in expected or str(raw.get("bridge_job_id") or "") != expected[pair].pair_job_id:
+                if local_ranked_mode:
+                    if pair in expected:
+                        invalid_pairs.add(pair)
+                    else:
+                        invalid_pairs.update(pair for pair, job in expected.items()
+                                             if job.pair_job_id == str(raw.get("bridge_job_id") or ""))
+                    continue
                 raise ValueError("ordinary_decision_outside_required_pair_scope")
             by_pair[pair].append(dict(raw))
+        if local_ranked_mode:
+            for pair in invalid_pairs:
+                by_pair[pair] = [{"decision": "ordinary_decision_outside_required_pair_scope"}]
         return {"decisions": [row for job in packet
             if (row := ordinary_row(job, by_pair.get((job.left_source_id, job.right_source_id), []))) is not None]}
 
@@ -11200,17 +11442,20 @@ def _run_relationship_reasoning(
                             "pair_job_id": job.pair_job_id,
                             "source_id": job.left_source_id,
                             "target_source_id": job.right_source_id,
-                            "status": "parked_for_review",
+                            "status": "pending" if local_ranked_mode else "parked_for_review",
                             "reason": reason,
+                            **({"retry_on_resume": True} if local_ranked_mode else {}),
                         }
                     )
                     write_yaml(
                         status_path,
                         {
                             "pair_job_id": job.pair_job_id,
-                            "status": "parked_for_review",
+                            "status": "pending" if local_ranked_mode else "parked_for_review",
                             "reason": reason,
                             "decision_identity": decision_identity,
+                            **({"retry_on_resume": True, "provider_attempt_count": local_retry_attempts.get(job.pair_job_id, 0) + 1}
+                               if local_ranked_mode else {}),
                         },
                     )
                     continue
@@ -11272,6 +11517,8 @@ def _run_relationship_reasoning(
                         "reason": reason,
                         "decision_identity": decision_identity,
                         "retry_on_resume": retry_on_resume,
+                        **({"provider_attempt_count": local_retry_attempts.get(job.pair_job_id, 0) + 1}
+                           if local_ranked_mode else {}),
                     },
                 )
     validated = validate_relationship_decision_rows(
@@ -11443,16 +11690,33 @@ def _run_relationship_reasoning(
                 "dispositions", {}
             )
             counts[disposition] = int(counts.get(disposition, 0) or 0) + 1
+    selected_source_ids = {source_id for pair in local_candidate_basis for source_id in pair}
+    if local_ranked_mode:
+        local_job_id = "local-ranked-shortlist-" + selected_candidate_pool_hash[:16]
+        discovery_job_accounting = {local_job_id: {
+            "bridge_job_id": local_job_id, "discovery_route": "deterministic_local_ranked",
+            "status": "completed", "scope": "selected_pairs_only",
+            "shortlist_status": "selected_candidates" if local_candidate_basis else "examined_no_candidates",
+            "selected_candidate_count": len(local_candidate_basis),
+            "source_dispositions": [
+                {"source_id": source_id,
+                 "status": "selected_for_comparison" if source_id in selected_source_ids else "not_examined"}
+                for source_id in sorted(available_catalogue_ids)
+            ],
+            "unexamined_refresh_pairs": [list(pair) for pair in sorted(stale_accepted_pairs - set(local_candidate_basis))],
+        }}
     return {
         "accepted": validated["accepted"],
         "no_relationship": validated["no_relationship"],
         "parked": [*preparked, *terminal_rows],
         "cluster_candidates": [],
         "selected_profile_hashes": (
-            current_hashes if selection_settled else {}
+            {key: value for key, value in current_hashes.items()
+             if not local_ranked_mode or key in selected_source_ids} if selection_settled else {}
         ),
         "selected_relationship_memory_hashes": (
-            current_memory_hashes if selection_settled else {}
+            {key: value for key, value in current_memory_hashes.items()
+             if not local_ranked_mode or key in selected_source_ids} if selection_settled else {}
         ),
         "reconciled_catalogue_revision": (
             catalogue_revision if selection_settled else ""
@@ -11495,6 +11759,8 @@ def _run_relationship_reasoning(
             state_path
         ),
         "job_root": str(job_root),
+        **({"relationship_scope": "selected_local_ranked_pairs", "refresh_pending": out_of_scope_refresh_rows}
+           if local_ranked_mode else {}),
     }
 
 
@@ -12993,6 +13259,7 @@ def rebuild_map(
     profile_budget: _ProfileProviderBudget | None = None,
     collection_snapshot: Mapping[str, Any] | None = None,
     migration: Mapping[str, Any] | None = None,
+    ranked_candidates: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     del (
         external_discovery
@@ -13459,6 +13726,7 @@ def rebuild_map(
             request=base_literature_request,
             shared_family_plan=shared_family_plan,
             note_rows=full_workspace_note_rows,
+            ranked_candidates=ranked_candidates,
         )
     except Exception as exc:
         retry_on_resume = _synthesis_retry_on_resume(
@@ -13517,7 +13785,8 @@ def rebuild_map(
             "no_relationship", []
         )
         or [],
-        parked_rows=relationship_result.get("parked", []) or [],
+        parked_rows=[*(relationship_result.get("parked", []) or []),
+                     *(relationship_result.get("refresh_pending", []) or [])],
         preserve_unmentioned_structural=False,
         orphaned_source_ids=orphaned_source_ids,
         protected_structural_relations=prior_cluster_state[

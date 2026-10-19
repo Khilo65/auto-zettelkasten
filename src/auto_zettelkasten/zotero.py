@@ -117,16 +117,66 @@ class ZoteroLocalClient:
             raise ValueError("scope must be library, collection, or selected")
         return self._paginate(f"users/{self.library_id}/items/top")
 
-    def children(self, item_key: str) -> list[dict[str, Any]]:
+    def children(self, item_key: str, *, limit: int | None = None, max_bytes: int | None = None) -> list[dict[str, Any]]:
         quoted = urllib.parse.quote(item_key, safe="")
+        if max_bytes is not None and limit is None:
+            raise ValueError("bounded children requires an explicit page limit")
+        if limit is not None:
+            if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 64:
+                raise ValueError("child limit must be an integer between 1 and 64")
+            payload, _ = self._request(f"users/{self.library_id}/items/{quoted}/children?limit={limit}&start=0",
+                                       max_bytes=max_bytes if max_bytes is not None else 2 * 1024 * 1024)
+            try:
+                rows = json.loads(payload.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise ZoteroError("invalid child page JSON") from exc
+            if not isinstance(rows, list) or len(rows) > limit or any(not isinstance(row, dict) for row in rows):
+                raise ZoteroError("invalid child page records")
+            return rows
         return self._paginate(f"users/{self.library_id}/items/{quoted}/children")
 
-    def item(self, item_key: str) -> Mapping[str, Any] | None:
+    def inventory_page(
+        self, scope: str = "collection", collection_key: str | None = None,
+        *, start: int = 0, limit: int = 32,
+    ) -> dict[str, Any]:
+        """Read exactly one bounded user-library page, without widening its scope."""
+        if isinstance(start, bool) or not isinstance(start, int) or start < 0:
+            raise ValueError("start must be a nonnegative integer")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 64:
+            raise ValueError("limit must be an integer between 1 and 64")
+        if scope == "collection":
+            if not isinstance(collection_key, str) or not collection_key.strip():
+                raise ValueError("collection scope requires collection_key")
+            quoted = urllib.parse.quote(collection_key, safe="")
+            endpoint = f"users/{self.library_id}/collections/{quoted}/items/top"
+        elif scope == "library" and not collection_key:
+            endpoint = f"users/{self.library_id}/items/top"
+        else:
+            raise ValueError("page scope must be collection or library")
+        payload, headers = self._request(f"{endpoint}?limit={limit}&start={start}", max_bytes=2 * 1024 * 1024)
+        if len(payload) > 2 * 1024 * 1024:
+            raise ZoteroError("inventory page exceeds byte limit")
+        try:
+            rows = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ZoteroError("invalid inventory page JSON") from exc
+        if not isinstance(rows, list) or len(rows) > limit or any(not isinstance(row, dict) for row in rows):
+            raise ZoteroError("invalid inventory page records")
+        total = _integer_header(headers, "Total-Results")
+        if total is not None and (total < 0 or (rows and total < start + len(rows))):
+            raise ZoteroError("invalid inventory page total")
+        next_start = start + len(rows)
+        more = bool(rows) and (next_start < total if total is not None else len(rows) == limit)
+        return {"records": rows, "start": start, "limit": limit, "total": total,
+                "next_start": next_start if more else None}
+
+    def item(self, item_key: str, *, max_bytes: int | None = None) -> Mapping[str, Any] | None:
         """Return one Zotero item without making the client port stricter."""
 
         quoted = urllib.parse.quote(item_key, safe="")
         try:
-            payload, _ = self._request(f"users/{self.library_id}/items/{quoted}")
+            options = {"max_bytes": max_bytes} if max_bytes is not None else {}
+            payload, _ = self._request(f"users/{self.library_id}/items/{quoted}", **options)
         except ZoteroError as exc:
             if "HTTP 404" in str(exc):
                 return None
@@ -136,10 +186,11 @@ class ZoteroLocalClient:
             raise ZoteroError(f"expected an item object for {item_key}")
         return value
 
-    def fulltext(self, item_key: str) -> Mapping[str, Any] | None:
+    def fulltext(self, item_key: str, *, max_bytes: int | None = None) -> Mapping[str, Any] | None:
         quoted = urllib.parse.quote(item_key, safe="")
         try:
-            payload, _ = self._request(f"users/{self.library_id}/items/{quoted}/fulltext")
+            options = {"max_bytes": max_bytes} if max_bytes is not None else {}
+            payload, _ = self._request(f"users/{self.library_id}/items/{quoted}/fulltext", **options)
         except ZoteroError as exc:
             if "HTTP 404" in str(exc):
                 return None
@@ -147,27 +198,44 @@ class ZoteroLocalClient:
         value = json.loads(payload.decode("utf-8") or "{}")
         return value if isinstance(value, dict) else None
 
-    def file(self, item_key: str) -> tuple[bytes, str] | None:
+    def file(self, item_key: str, *, max_bytes: int | None = None) -> tuple[bytes, str] | None:
+        if max_bytes is not None and (isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 1):
+            raise ValueError("max_bytes must be a positive integer")
         quoted = urllib.parse.quote(item_key, safe="")
         direct_error: ZoteroError | None = None
         try:
-            payload, headers = self._request(f"users/{self.library_id}/items/{quoted}/file")
+            options = {"max_bytes": max_bytes} if max_bytes is not None else {}
+            payload, headers = self._request(f"users/{self.library_id}/items/{quoted}/file", **options)
         except ZoteroError as exc:
+            if "byte limit" in str(exc):
+                raise
             direct_error = exc
         else:
+            if max_bytes is not None and len(payload) > max_bytes:
+                raise ZoteroError("attachment exceeds byte limit")
             return payload, str(headers.get("Content-Type") or "application/octet-stream").split(";", 1)[0]
 
         # Zotero may return a redirect that urllib refuses because its target is
         # file://. The view/url route exposes that local URI without requiring
         # direct database access or a Zotero write.
         try:
-            location_payload, _ = self._request(f"users/{self.library_id}/items/{quoted}/file/view/url")
+            options = {"max_bytes": 65_536} if max_bytes is not None else {}
+            location_payload, _ = self._request(f"users/{self.library_id}/items/{quoted}/file/view/url", **options)
             location = _file_location(location_payload)
             if location:
                 path = _local_file_uri(location)
                 if path and path.exists() and path.is_file():
-                    return path.read_bytes(), mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-        except (OSError, ZoteroError, ValueError):
+                    if max_bytes is not None and path.stat().st_size > max_bytes:
+                        raise ZoteroError("attachment exceeds byte limit")
+                    with path.open("rb") as source:
+                        data = source.read(max_bytes + 1) if max_bytes is not None else source.read()
+                    if max_bytes is not None and len(data) > max_bytes:
+                        raise ZoteroError("attachment exceeds byte limit")
+                    return data, mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        except ZoteroError as exc:
+            if "byte limit" in str(exc):
+                raise
+        except (OSError, ValueError):
             pass
         if direct_error and "HTTP 404" not in str(direct_error):
             raise direct_error
@@ -198,7 +266,10 @@ class ZoteroLocalClient:
         method: str = "GET",
         body: bytes | None = None,
         api: bool = True,
+        max_bytes: int | None = None,
     ) -> tuple[bytes, Mapping[str, str]]:
+        if max_bytes is not None and (isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 1):
+            raise ValueError("max_bytes must be a positive integer")
         prefix = "/api/" if api else "/"
         url = f"{self.base_url.rstrip('/')}{prefix}{endpoint.lstrip('/')}"
         request = urllib.request.Request(
@@ -214,7 +285,15 @@ class ZoteroLocalClient:
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                return response.read(), dict(response.headers.items())
+                headers = dict(response.headers.items())
+                if max_bytes is not None:
+                    length = _integer_header(headers, "Content-Length")
+                    if length is not None and length > max_bytes:
+                        raise ZoteroError("attachment exceeds byte limit")
+                payload = response.read(max_bytes + 1) if max_bytes is not None else response.read()
+                if max_bytes is not None and len(payload) > max_bytes:
+                    raise ZoteroError("attachment exceeds byte limit")
+                return payload, headers
         except urllib.error.HTTPError as exc:
             try:
                 detail = exc.read(512).decode("utf-8", errors="replace")

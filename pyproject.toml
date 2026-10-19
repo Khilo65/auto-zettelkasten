@@ -60,6 +60,7 @@ include = [
   "/package.json",
   "/package-lock.json",
   "/docs/DESKTOP.md",
+  "/docs/LOCAL_DISCOVERY.md",
 ]
 
 [tool.pytest.ini_options]

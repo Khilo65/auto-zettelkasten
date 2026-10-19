@@ -228,8 +228,32 @@ def build_parser() -> argparse.ArgumentParser:
     build_parser_command.add_argument("--max-provider-spend-usd", default=None)
     build_parser_command.add_argument("--resume", action="store_true")
     build_parser_command.add_argument("--retry-terminal-literature", action="store_true")
+    build_parser_command.add_argument("--local-candidates", type=Path, help="Use a prepared local shortlist instead of provider discovery.")
     _add_literature_policy_arguments(build_parser_command)
     _add_navigation_policy_arguments(build_parser_command)
+
+    scan_parser = commands.add_parser("local-discovery", help="Inspect a bounded Zotero selection locally without provider calls.")
+    scan_parser.add_argument("--workspace", type=Path, required=True)
+    scan_parser.add_argument("--instance-id", required=True, help="Stable identity for this Zotero installation.")
+    selection = scan_parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--item", action="append", dest="item_keys", default=[])
+    selection.add_argument("--collection", default="")
+    scan_parser.add_argument("--start", type=int, default=0)
+    scan_parser.add_argument("--limit", type=int, default=32)
+
+    for name, help_text in (("candidates", "Prepare a bounded local relationship shortlist without provider calls."),
+                            ("recall", "Retrieve bounded source context locally without provider calls.")):
+        local_parser = commands.add_parser(name, help=help_text)
+        local_parser.add_argument("--workspace", type=Path, required=True)
+        local_parser.add_argument("--instance-id", default=None)
+        local_parser.add_argument("--library-id", default="0")
+        if name == "candidates":
+            local_parser.add_argument("--max-pairs", type=int, default=256)
+            local_parser.add_argument("--per-source-cap", type=int, default=8)
+        else:
+            local_parser.add_argument("--query", required=True)
+            local_parser.add_argument("--max-notes", type=int, default=8)
+            local_parser.add_argument("--max-chars", type=int, default=12000)
 
     migrate_parser = commands.add_parser("migrate", help="Archive legacy generated maps for the current artifact schema.")
     migrate_parser.add_argument("--workspace", type=Path, required=True)
@@ -273,6 +297,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = {"status": "ok", "collections": list_collections()}
         elif args.command == "zotero" and args.zotero_command == "inventory":
             result = inventory(args.workspace, args.run_id, args.scope, args.collection, args.limit)
+        elif args.command == "local-discovery":
+            from .local_tools import scan_local_collection
+
+            result = scan_local_collection(args.workspace, instance_id=args.instance_id, item_keys=args.item_keys,
+                                           collection_key=args.collection, start=args.start, limit=args.limit)
+        elif args.command in {"candidates", "recall"}:
+            from .local_tools import load_local_retrieval
+
+            loaded = load_local_retrieval(args.workspace, instance_id=args.instance_id, library_id=args.library_id)
+            if args.command == "candidates":
+                result = {"status": "prepared", "candidates": loaded["index"].candidate_pairs(
+                    per_source_cap=args.per_source_cap, max_pairs=args.max_pairs), "coverage": loaded["status"], "provider_calls": 0}
+            else:
+                result = {"status": "retrieved", **loaded["index"].recall(args.query, relationships=loaded["relationships"],
+                          max_notes=args.max_notes, max_chars=args.max_chars), "coverage": loaded["status"], "provider_calls": 0}
         elif args.command == "map":
             config = load_config(args.workspace)
             configured_provider = str(config.get("provider") or "deepseek")
@@ -455,6 +494,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 navigation_policy=_navigation_policy(args, config),
                 resume=args.resume,
                 retry_terminal_failures=args.retry_terminal_literature,
+                **({"ranked_candidates": _read_local_candidates(args.local_candidates)} if args.local_candidates else {}),
             )
             result = manifest.to_dict()
             result["artifact_count"] = len(result.pop("artifacts", []) or [])
@@ -503,6 +543,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     print(json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False))
     return _exit_code(result)
+
+
+def _read_local_candidates(path: Path) -> list[dict[str, Any]]:
+    with path.open("rb") as stream:
+        data = stream.read(4 * 1024 * 1024 + 1)
+    if len(data) > 4 * 1024 * 1024:
+        raise ValueError("local shortlist exceeds the 4 MiB input limit")
+    try:
+        payload = json.loads(data.decode("utf-8-sig"))
+    except (UnicodeError, RecursionError) as exc:
+        raise ValueError("local shortlist must be bounded UTF-8 JSON") from exc
+    rows = payload.get("candidates") if isinstance(payload, dict) else payload
+    if not isinstance(rows, list) or len(rows) > 256 or not all(isinstance(row, dict) for row in rows):
+        raise ValueError("local shortlist requires at most 256 candidate records")
+    return rows
 
 
 def _status_text(payload: dict[str, Any]) -> str:

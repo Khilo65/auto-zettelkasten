@@ -25,6 +25,9 @@ automatically managed local server. Both API-key and ChatGPT connections use
 the same approval flow. See [desktop setup and packaging](docs/DESKTOP.md) for
 standalone `.app` and Windows `.exe` builds and platform prerequisites.
 
+For bounded citation/tag scanning, candidate preparation, and research recall
+without provider calls, see [local discovery and recall](docs/LOCAL_DISCOVERY.md).
+
 After installing the package, start the local browser interface:
 
 ```bash
