@@ -14,6 +14,12 @@ python -m pip install 'auto-zettelkasten[local-mapping]'
 Model loading is offline. Supply an existing MiniLM model directory with
 `--embedding-model-path` or `local_mapping.model_path`. An existing Hugging Face
 cache snapshot directory is suitable; model discovery is not automatic.
+In the app's mapper, use **MiniLM model folder → Browse…** to select the cached
+directory. The selected folder is checked before an approval ticket is created
+and remembered locally after a successful estimate. An explicit selection takes
+precedence over the workspace setting; otherwise the workspace setting is kept.
+The remembered folder is a default only for workspaces without a model setting.
+The estimate review shows the effective model folder before approval.
 Missing model files or dependencies produce an
 actionable error; the mapper never downloads weights or falls back to paid
 embedding or LLM clustering calls.

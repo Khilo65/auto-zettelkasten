@@ -55,13 +55,15 @@ function harness(t, options = {}) {
   w.fetch = async (url, request) => {
     const body = JSON.parse(request.body || "{}"); requests.push({ url, body });
     let result;
-    if (url === "/api/state") result = { auth: { ready: true, method: "codex", status: "ready" }, run: options.run || { status: "idle" }, preferences: {}, default_output_folder: "/output" };
+    if (url === "/api/state") result = { auth: { ready: true, method: "codex", status: "ready" }, run: options.run || { status: "idle" }, preferences: {}, embedding_model_path: options.modelPath || "", default_output_folder: "/output" };
+    else if (url === "/api/pick-folder") result = { path: options.pickedModelPath || "" };
     else if (url === "/api/collections") result = { collections: options.collections || collections };
     else if (url === "/api/cancel") result = { status: "cancelled" };
     else if (url === "/api/estimate") {
       const selected = collections.find((row) => row.key === body.collection_key);
       const source = body.scope === "library" ? { scope: "library", name: "Entire Zotero library", path: "Entire Zotero library", include_subcollections: false } : { ...selected, scope: "collection", include_subcollections: body.include_subcollections };
-      result = { estimate_id: "estimate-1", source, collection: source, workspace: "/memory", estimate: { provider: "codex", inventory_count: 2, new_source_jobs: 2, reusable_or_existing_records: 0, source_calls: { expected: 2 }, graph_calls: { expected: 1 } } };
+      const modelPath = body.embedding_model_path || options.workspaceModelPath || (Object.hasOwn(body, "embedding_model_path") ? "" : options.modelPath || "");
+      result = { estimate_id: "estimate-1", source, collection: source, workspace: "/memory", mapping_backend: "local", embedding_model_path: modelPath, estimate: { provider: "codex", inventory_count: 2, new_source_jobs: 2, reusable_or_existing_records: 0, source_calls: { expected: 2 }, graph_calls: { expected: 1 } } };
     } else if (url === "/api/approve") result = { status: "running", workspace: "/memory" };
     else if (url === "/api/run") result = completed;
     else if (url === "/api/workspace/open") { opened = body.path; result = { workspace: workspace() }; }
@@ -135,6 +137,53 @@ test("nested collection choice and subcollection consent survive review and chan
   app.scope("library");
   assert.equal(app.el("review").hidden, true); assert.equal(app.el("cloud-consent").checked, false);
   assert.ok(app.requests.some((request) => request.url === "/api/cancel"));
+});
+
+test("restored model is a default and explicit edits invalidate the reviewed mapping request", async (t) => {
+  const app = harness(t, { modelPath: "/cached/minilm", workspaceModelPath: "/workspace/minilm" });
+  await app.mapper(); app.scope("library");
+  assert.equal(app.el("embedding-model-path").value, "/cached/minilm");
+  await app.estimate();
+  assert.equal(Object.hasOwn(app.requests.find(({ url }) => url === "/api/estimate").body, "embedding_model_path"), false);
+  assert.equal(app.el("review-embedding-model").textContent, "/workspace/minilm");
+  app.change("cloud-consent", true);
+  app.change("embedding-model-path", "/cached/another-minilm");
+  assert.equal(app.el("review").hidden, true);
+  assert.equal(app.el("cloud-consent").checked, false);
+  assert.ok(app.requests.some(({ url }) => url === "/api/cancel"));
+  await app.estimate();
+  assert.equal(app.requests.filter(({ url }) => url === "/api/estimate").at(-1).body.embedding_model_path, "/cached/another-minilm");
+  assert.equal(app.el("review-embedding-model").textContent, "/cached/another-minilm");
+  app.change("output-folder", "/another-output");
+  await app.estimate();
+  assert.equal(app.requests.filter(({ url }) => url === "/api/estimate").at(-1).body.embedding_model_path, "/cached/another-minilm");
+  assert.equal(app.el("review-embedding-model").textContent, "/cached/another-minilm");
+});
+
+test("model browse chooses an existing folder without approving or starting mapping", async (t) => {
+  const app = harness(t, { pickedModelPath: "/cached/minilm" });
+  await app.mapper(); app.click("pick-embedding-model");
+  await until(() => app.el("embedding-model-path").value === "/cached/minilm", "model folder selection");
+  assert.ok(app.requests.some(({ url, body }) => url === "/api/pick-folder" && body.kind === "embedding-model"));
+  assert.ok(!app.requests.some(({ url }) => url === "/api/approve"));
+  app.scope("library"); await app.estimate();
+  assert.equal(app.requests.find(({ url }) => url === "/api/estimate").body.embedding_model_path, "/cached/minilm");
+});
+
+test("clearing the remembered model is an explicit selection", async (t) => {
+  const app = harness(t, { modelPath: "/cached/minilm" });
+  await app.mapper(); app.scope("library");
+  app.change("embedding-model-path", ""); await app.estimate();
+  assert.equal(app.requests.find(({ url }) => url === "/api/estimate").body.embedding_model_path, "");
+  await app.estimate();
+  assert.equal(app.requests.filter(({ url }) => url === "/api/estimate").at(-1).body.embedding_model_path, "");
+});
+
+test("cancelling model browse preserves the previous selection", async (t) => {
+  const app = harness(t, { modelPath: "/cached/minilm" });
+  await app.mapper(); app.click("pick-embedding-model");
+  await until(() => /canceled/i.test(app.el("embedding-model-message").textContent), "model picker cancellation");
+  assert.equal(app.el("embedding-model-path").value, "/cached/minilm");
 });
 
 test("approved mapping hands off to the read-only Source Index and its atomic-note links", async (t) => {

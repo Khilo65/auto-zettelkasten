@@ -12,8 +12,9 @@ pytest.importorskip("leidenalg")
 from auto_zettelkasten import api, local_mapping
 from auto_zettelkasten.files import write_yaml
 from auto_zettelkasten.mapping import refresh_local_map
-from auto_zettelkasten.models import MapRequest
+from auto_zettelkasten.models import EvidenceProfile, MapRequest
 from auto_zettelkasten.pipeline import _source_replay_request_hash, all_workspace_note_rows, rebuild_map
+from auto_zettelkasten.profiles import save_profile
 from auto_zettelkasten.workspace import initialize
 
 
@@ -71,6 +72,34 @@ def test_public_default_build_has_no_provider_calls_or_note_projection(workspace
     assert len(derived['sources']) == 3
     assert all(row['coverage']['input']['source_scope'] == 'note_only' for row in derived['sources'])
     assert (workspace / '.auto-zettelkasten/mapping/result.json').is_file()
+    assert all(Path(path).read_bytes() == payload for path, payload in before.items())
+
+
+def test_catalogue_only_refresh_and_explicit_api_rows_share_cache_without_inventing_scope(workspace, monkeypatch):
+    entries = []
+    for label in 'abc':
+        sid, nid, key = f'source-{label}', f'note-{label}', label.upper()
+        note_path = f'02_source_memory/notes/{label}.md'
+        save_profile(workspace / '02_source_memory/profiles', EvidenceProfile(
+            source_id=sid, note_id=nid, context={'note_path': note_path}, concepts=['synthetic institutions']))
+        entries.append({'source_id': sid, 'note_id': nid, 'title': f'Synthetic {label}', 'zotero_key': key,
+                        'identity': {'canonical_zotero_key': key, 'zotero_item_keys': [key, f'{key}ALIAS'],
+                                     'doi': f'10.1000/synthetic-{label}'}})
+        write_yaml(workspace / '11_state/note_metadata' / f'{nid}.yml', {
+            'note_path': note_path, 'frontmatter': {'source_id': sid, 'note_id': nid}})
+    write_yaml(workspace / '02_source_memory/indexes/source_catalogue.yml', {'sources': entries})
+    before = {str(path): path.read_bytes() for path in workspace.rglob('*') if path.is_file()}
+    monkeypatch.setattr(api, 'provider_from_name', lambda *args, **kwargs: pytest.fail('provider called'))
+    direct = refresh_local_map(workspace, encoder_factory=lambda _: Encoder())
+    assert len(direct['result']['sources']) == 3
+    assert all(row['identity']['scope'] == 'workspace' for row in direct['result']['sources'])
+    assert all('library_id' not in row['identity'] for row in direct['result']['sources'])
+    assert direct['inputs']['projection_rows'][0]['catalogue_identity'] == entries[0]['identity']
+    monkeypatch.setattr(local_mapping, '_LocalMiniLM', Encoder)
+    explicit = api.build_map(workspace).metadata['local_mapping']
+    assert explicit['stats']['encoded_chunks'] == 0
+    assert explicit['stats']['reused_chunks'] == direct['result']['stats']['chunks']
+    assert explicit['communities'] == direct['result']['communities']
     assert all(Path(path).read_bytes() == payload for path, payload in before.items())
 
 

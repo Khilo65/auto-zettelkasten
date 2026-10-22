@@ -6,6 +6,7 @@ on:
     paths:
       - "src/**"
       - "tests/test_desktop.py"
+      - "tests/test_desktop_packaging.py"
       - "tests/test_webapp.py"
       - "tests/test_frontend_cli.py"
       - "tests/test_frontend_flow.py"
@@ -21,7 +22,7 @@ permissions:
 
 jobs:
   build:
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -43,9 +44,9 @@ jobs:
           python-version: "3.12"
           architecture: ${{ matrix.architecture }}
       - run: python -m pip install --upgrade pip
-      - run: python -m pip install -e ".[test,desktop,desktop-build]"
+      - run: python -m pip install -e ".[test,desktop,desktop-build,local-mapping]"
       - name: Offline desktop and frontend tests
-        run: python -m pytest tests/test_desktop.py tests/test_webapp.py tests/test_frontend_cli.py tests/test_frontend_flow.py tests/test_windows_platform.py tests/test_windows_readers.py
+        run: python -m pytest tests/test_desktop.py tests/test_desktop_packaging.py tests/test_webapp.py tests/test_frontend_cli.py tests/test_frontend_flow.py tests/test_windows_platform.py tests/test_windows_readers.py
       - name: Build native bundle
         run: python tools/build_desktop.py
       - name: Frozen offline smoke test
@@ -55,9 +56,12 @@ jobs:
           root = pathlib.Path.cwd()
           executable = (root / "dist/Auto-Zettelkasten.app/Contents/MacOS/Auto-Zettelkasten"
                         if sys.platform == "darwin" else root / "dist/Auto-Zettelkasten/Auto-Zettelkasten.exe")
-          report = root / "build/desktop-smoke.json"
-          subprocess.run([str(executable), "--smoke-test", "--smoke-report", str(report)], check=True, timeout=60)
-          print(report.read_text())
+          for flag, name in [("--smoke-test", "desktop"), ("--local-mapping-smoke-test", "local-mapping")]:
+              report = root / f"build/{name}-smoke.json"
+              subprocess.run([str(executable), flag, "--smoke-report", str(report)], check=True, timeout=180)
+              result = json.loads(report.read_text())
+              assert result["status"] == "passed", result
+              print(json.dumps(result))
       - name: Archive macOS app preserving executable bits and symlinks
         if: runner.os == 'macOS'
         run: ditto -c -k --sequesterRsrc --keepParent dist/Auto-Zettelkasten.app dist/Auto-Zettelkasten-${{ matrix.artifact }}.zip

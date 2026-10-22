@@ -132,11 +132,11 @@ def _directory(value: Any, *, vault: bool = False) -> Path:
 
 
 def pick_folder(kind: str) -> str:
-    if kind not in {"folder", "vault", "codex"}:
+    if kind not in {"folder", "vault", "codex", "embedding-model"}:
         raise RequestError("Unknown folder selection.")
     if sys.platform == "darwin":
         result = subprocess.run(
-            ["osascript", "-e", 'POSIX path of (choose file with prompt "Choose a Codex executable")' if kind == "codex" else 'POSIX path of (choose folder with prompt "Choose a destination folder")'],
+            ["osascript", "-e", 'POSIX path of (choose file with prompt "Choose a Codex executable")' if kind == "codex" else 'POSIX path of (choose folder with prompt "Choose a cached MiniLM model folder")' if kind == "embedding-model" else 'POSIX path of (choose folder with prompt "Choose a destination folder")'],
             capture_output=True, text=True, timeout=180, check=False,
         )
         return result.stdout.strip() if result.returncode == 0 else ""
@@ -154,12 +154,16 @@ class LocalApp:
         self.preferences_path = preferences_path or Path.home() / ".config" / "auto-zettelkasten" / "frontend.json"
         self.preferences = {"vault": "", "remember_vault": False}
         self.codex_executable = ""
+        self.embedding_model_path = ""
         try:
             saved = json.loads(self.preferences_path.read_text())
             if saved.get("remember_vault") is True and isinstance(saved.get("vault"), str):
                 self.preferences = {"vault": saved["vault"], "remember_vault": True}
             if isinstance(saved.get("codex_executable"), str):
                 self.codex_executable = saved["codex_executable"]
+            model_path = saved.get("embedding_model_path")
+            if isinstance(model_path, str) and len(model_path) <= 4096 and "\x00" not in model_path:
+                self.embedding_model_path = model_path
         except (OSError, ValueError, AttributeError):
             pass
         self.auth = {"method": "", "ready": False, "status": "disconnected", "message": "Choose a connection."}
@@ -193,6 +197,8 @@ class LocalApp:
             saved = dict(preferences)
             if self.codex_executable:
                 saved["codex_executable"] = self.codex_executable
+            if self.embedding_model_path:
+                saved["embedding_model_path"] = self.embedding_model_path
             json.dump(saved, handle)
             temporary = Path(handle.name)
         try:
@@ -267,7 +273,7 @@ class LocalApp:
                 return self._document_request(route, data)
             if method == "GET":
                 if route == "/api/state":
-                    return {"preferences": dict(self.preferences), "auth": dict(self.auth), "run": self._run_state(), "codex_executable": self.codex_executable, "default_output_folder": str(Path.home() / "Documents" / "Auto-Zettelkasten Maps")}
+                    return {"preferences": dict(self.preferences), "auth": dict(self.auth), "run": self._run_state(), "codex_executable": self.codex_executable, "embedding_model_path": self.embedding_model_path, "default_output_folder": str(Path.home() / "Documents" / "Auto-Zettelkasten Maps")}
                 if route == "/api/run":
                     return self._run_state()
                 if route == "/api/collections":
@@ -318,7 +324,7 @@ class LocalApp:
                 return {"auth": dict(self.auth)}
             if route == "/api/pick-folder":
                 kind = data.get("kind", "folder")
-                if kind not in {"folder", "vault", "codex"}:
+                if kind not in {"folder", "vault", "codex", "embedding-model"}:
                     raise RequestError("Unknown folder selection.")
                 return {"path": self.folder_picker(kind)}
             if route == "/api/preferences":
@@ -471,8 +477,27 @@ class LocalApp:
         mapping_config = read_yaml(workspace / "auto-zettelkasten.yml", {})
         if not isinstance(mapping_config, Mapping):
             raise RequestError("Workspace configuration must be a mapping.")
+        mapping_backend = mapping_config.get("mapping_backend", "local")
+        local_mapping = mapping_config.get("local_mapping", {})
+        if not isinstance(local_mapping, Mapping):
+            raise RequestError("Local mapping settings must be a mapping.")
+        local_mapping = dict(local_mapping)
+        selected_model = data.get("embedding_model_path")
+        if selected_model is not None and (not isinstance(selected_model, str) or len(selected_model) > 4096 or "\x00" in selected_model):
+            raise RequestError("Choose an existing MiniLM model folder.")
+        selected_model = selected_model.strip() if selected_model is not None else None
+        model_path = selected_model if selected_model is not None else (self.embedding_model_path if not local_mapping.get("model_path") else "")
+        if mapping_backend == "local" and model_path:
+            from .local_mapping import LocalMappingError
+            from .mapping import check_local_mapping_availability
+
+            try:
+                local_mapping["model_path"] = str(Path(model_path).expanduser().resolve())
+                check_local_mapping_availability(local_mapping)
+            except (LocalMappingError, OSError, ValueError) as exc:
+                raise RequestError(str(exc)) from exc
         request = MapRequest(workspace=workspace, scope=scope, collection_key=key, provider=provider, model=model, literature_model="gpt-5.6-terra" if provider == "codex" else None, reasoning_effort="medium" if provider == "codex" else None, allow_cloud=True, literature_policy=_POLICY,
-                             mapping_backend=mapping_config.get("mapping_backend", "local"), local_mapping=mapping_config.get("local_mapping", {}))
+                             mapping_backend=mapping_backend, local_mapping=local_mapping)
         with tempfile.TemporaryDirectory(prefix="az-estimate-") as temporary:
             scratch = Path(temporary)
             if workspace.exists():
@@ -493,8 +518,12 @@ class LocalApp:
             estimate = api.estimate_cost(scratch, scope=scope, collection_key=key or "", provider=provider, model=model, literature_policy=_POLICY, zotero_client=client, mapping_backend=request.mapping_backend, local_mapping=request.local_mapping)
             estimate.pop("path", None)
         public = {"estimate_id": secrets.token_urlsafe(24), "source": source, "collection": {"key": key or "", "name": name, "path": path}, "workspace": str(workspace), "memory_workspace": str(workspace), "obsidian_path": str(export) if export else "", "destination": destination, "estimate": estimate}
+        public.update(mapping_backend=request.mapping_backend, embedding_model_path=request.local_mapping["model_path"] if request.mapping_backend == "local" else None)
         ticket = {"public": public, "request": request, "client": client, "created": time.monotonic(), "run_id": run_id, "export": export, "vault": vault, "api_key": self.api_key}
         self._check_export(ticket)
+        if selected_model is not None and mapping_backend == "local":
+            self.embedding_model_path = local_mapping["model_path"] if selected_model else ""
+            self._write_preferences(self.preferences)
         if destination == "obsidian" and "remember_vault" in data:
             self._preferences({"vault": str(vault) if vault else "", "remember_vault": data["remember_vault"]})
         self.ticket = ticket

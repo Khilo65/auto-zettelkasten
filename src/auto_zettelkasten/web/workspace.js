@@ -347,10 +347,16 @@
     for (const [path, value] of state.previewDocuments) if (documents.has(path)) documents.set(path, { ...documents.get(path), ...value });
     for (const doc of state.documents.values()) documents.set(doc.path, { ...documents.get(doc.path), path: doc.path, text: textOf(doc), revision: doc.revision, editable: doc.editable });
     const ordered = [...documents.values()].sort((a, b) => Number(b.path === state.active) - Number(a.path === state.active) || a.path.localeCompare(b.path));
-    const semantic = state.snapshot?.semantic_map;
-    const semanticDirty = state.previewDocuments.size > 0 || [...state.documents.values()].some((doc) => dirty(doc) || doc.external || doc.recovery);
-    const derivedRelations = semanticDirty ? (state.snapshot?.relations || []).filter((relation) => !relation.derived) : state.snapshot?.relations || [];
-    state.linkIndex = (state.snapshot?.library ? kit.buildLibraryIndex : kit.buildLinkIndex)(ordered, derivedRelations, state.linkIndex, { document_identities: verifiedIdentities, semantic_map: semanticDirty ? undefined : semantic });
+    let semantic = state.snapshot?.semantic_map;
+    const editedSources = new Set();
+    for (const doc of state.documents.values()) {
+      if (semantic?.note_revisions?.[doc.path] && (dirty(doc) || doc.external || doc.recovery)) editedSources.add(doc.path);
+    }
+    // Read-only embed hydration keeps its revision. Exclude only mapped drafts;
+    // the shared index checks saved/preview revisions before projecting edges.
+    if (editedSources.size) semantic = { ...semantic, status: semantic.status === "unavailable" ? "unavailable" : "partial",
+      note_revisions: Object.fromEntries(Object.entries(semantic.note_revisions).filter(([path]) => !editedSources.has(path))) };
+    state.linkIndex = (state.snapshot?.library ? kit.buildLibraryIndex : kit.buildLinkIndex)(ordered, state.snapshot?.relations || [], state.linkIndex, { document_identities: verifiedIdentities, semantic_map: semantic });
     state.indexVersion = (state.indexVersion || 0) + 1;
     state.view?.dispatch({});
     if (active()?.mode === "reading") renderReading(active());
@@ -761,7 +767,7 @@
       appendPage();
     }
     const elements = [
-      ...data.nodes.map((node) => ({ data: { ...node, labelOpacity: 1, current: node.pathAliases?.includes(path) ? "yes" : "no" }, classes: node.missing ? "missing" : "" })),
+      ...data.nodes.map((node) => ({ data: { ...node, semantic_communities: node.semantic_communities || [], labelOpacity: 1, current: node.pathAliases?.includes(path) ? "yes" : "no" }, classes: node.missing ? "missing" : "" })),
       ...data.edges.map((edge) => ({ data: edge, classes: edge.layer === "relation" ? "relation" : "reference" })),
     ];
     const hadNodes = Boolean(graph?.nodes().length);

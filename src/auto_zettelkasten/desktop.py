@@ -90,7 +90,7 @@ def launch() -> None:
             if kind == "codex":
                 selection = window.create_file_dialog(webview.FileDialog.OPEN, directory=str(Path.home()), allow_multiple=False)
                 return str(selection[0]) if selection else ""
-            previous = app.preferences.get("vault", "") if kind == "vault" else ""
+            previous = app.embedding_model_path if kind == "embedding-model" else app.preferences.get("vault", "") if kind == "vault" else ""
             directory = previous if previous and Path(previous).is_dir() else str(Path.home())
             selection = window.create_file_dialog(webview.FileDialog.FOLDER, directory=directory, allow_multiple=False)
             return str(selection[0]) if selection else ""

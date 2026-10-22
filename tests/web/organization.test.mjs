@@ -104,7 +104,7 @@ function harness(t, options = {}) {
     click("workspace-welcome-open"); input("workspace-folder-path", "/notes");
     el("workspace-folder-form").dispatchEvent(new w.Event("submit", { bubbles: true, cancelable: true }));
     await until(() => requests.some(({ url }) => url.endsWith("/index")), "workspace index");
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await until(() => el("workspace-index-status").hidden, "workspace index complete");
   };
   const open = async (path) => {
     click("workspace-quick-open"); input("workspace-quick-query", path);

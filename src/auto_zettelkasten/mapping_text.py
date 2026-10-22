@@ -22,7 +22,7 @@ from .profiles import profile_from_dict, profile_sidecar_path, profile_to_dict
 from .relationships import profile_content_hash, profile_hash_aliases
 
 
-CLEANING_VERSION = "local-map-spans-v2"
+CLEANING_VERSION = "local-map-spans-v3"
 MAX_TEXT_BYTES = 32 * 1024 * 1024
 MAX_TOTAL_BYTES = 384 * 1024 * 1024
 MAX_FILES = 20_000
@@ -85,23 +85,26 @@ class _MappingReadBudget(_ReadBudget):
         return result
 
 
-def _heading(line: str) -> tuple[str, bool]:
+def _heading(line: str) -> tuple[str, int]:
     value = line.strip().strip("\ufeff")
-    markdown = bool(re.match(r"^#{1,6}\s+", value))
+    markdown = re.match(r"^(#{1,6})\s+", value)
+    level = len(markdown[1]) if markdown else 0
     value = re.sub(r"^#{1,6}\s+", "", value).strip().rstrip("#").strip().rstrip(":").casefold()
-    if len(value) > 140 or re.search(r"\.{3,}\s*\d+\s*$", value):
-        return "", False
+    if re.search(r"\.{3,}\s*\d+\s*$", value):
+        return "", 0
+    if len(value) > 140:
+        return "", level
     if value in _NONBODY:
-        return _NONBODY[value], True
+        return _NONBODY[value], level
     if re.fullmatch(r"(?:(?:author|editor)(?:'s|s')?\s+)?preface(?:\s+to\s+.{1,65}|\s+\d{4})?", value) or re.fullmatch(r"editors?(?:'s|s')?\s+introduction", value):
-        return "authored_preface", True
+        return "authored_preface", level
     if re.fullmatch(r"foreword(?:\s+by\s+.{1,80})?", value):
-        return "foreword", True
+        return "foreword", level
     if value == "abstract":
-        return "abstract", True
+        return "abstract", level
     if value in _BODY_NAMES or _BODY_HEADING.match(value):
-        return "body", True
-    return "", markdown
+        return "body", level
+    return "", level
 
 
 def _ownership(text: str, spans: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -141,6 +144,7 @@ def prepare_embedding_spans(text: str, ownership_spans: Sequence[Mapping[str, An
     boundaries = {0, len(text)}
     segments = []
     state, position, managed_end = "unknown", 0, ""
+    excluded_level = 0
     # Public note YAML is metadata, not substantive embedding content.
     yaml_open = re.match(r"\A\ufeff?---[ \t]*\r?\n", text)
     yaml_close = re.compile(r"^---[ \t]*(?:\r?\n|\Z)", re.M).search(text, yaml_open.end()) if yaml_open else None
@@ -157,11 +161,17 @@ def prepare_embedding_spans(text: str, ownership_spans: Sequence[Mapping[str, An
         elif position < yaml_end:
             kind = "frontmatter"
         else:
-            heading_kind, markdown = _heading(line)
-            if heading_kind:
-                state = heading_kind
-            elif markdown and state in {"acknowledgments", "funding", "authored_preface", "abstract", "unknown", "body"}:
-                state = "body"
+            heading_kind, level = _heading(line)
+            # Nested headings still belong to the excluded section; a peer or
+            # higher heading starts a new section whose content may be unknown.
+            nested_excluded = state in _EXCLUDED and excluded_level and level > excluded_level
+            if not nested_excluded:
+                if heading_kind:
+                    state = heading_kind
+                elif level:
+                    state = "unknown" if state in _EXCLUDED else "body"
+                if heading_kind or level:
+                    excluded_level = level if state in _EXCLUDED else 0
             kind = state
         if segments and segments[-1][2] == kind:
             segments[-1] = (segments[-1][0], end, kind)
@@ -347,6 +357,16 @@ def load_mapping_inputs(workspace: Path | str, note_rows: Sequence[Mapping[str, 
             raise ValueError("duplicate mapping source identity")
         seen.add(sid)
         row = {**dict(supplied_row), **projection.get(sid, {})}
+        identity = row.pop("identity", entries.get(sid, {}).get("identity"))
+        if identity is not None:
+            if not isinstance(identity, Mapping):
+                raise ValueError("mapping catalogue identity must be a mapping")
+            row["catalogue_identity"] = dict(identity)
+            fields = ("instance_id", "library_type", "library_id", "item_key")
+            if all(isinstance(identity.get(key), str) and identity[key].strip() for key in fields):
+                row["identity"] = {key: identity[key] for key in fields}
+            if "zotero_item_keys" not in row and isinstance(identity.get("zotero_item_keys"), (list, tuple)):
+                row["zotero_item_keys"] = list(identity["zotero_item_keys"])
         if row.get("note_id") != nid:
             raise ValueError("mapping source/note identity conflicts with canonical profile")
         metadata_path = root / "11_state/note_metadata" / f"{nid}.yml"

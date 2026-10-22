@@ -47,6 +47,35 @@ def test_numbered_reference_entries_cannot_be_mistaken_for_new_body_sections():
     assert "Substantive argument" in clean and "New chapter methods" in clean
 
 
+@pytest.mark.parametrize("next_heading", ["# Political bargaining", "## Political bargaining", "# " + "Political bargaining " * 8])
+def test_bibliography_ends_at_peer_or_higher_heading_without_reattributing_text(next_heading):
+    text = ("# Chapter one\r\nFirst substantive argument.\r\n## References\r\n"
+            "A cited paper.\r\n### Methods\r\nNested reference commentary.\r\n"
+            f"{next_heading}\r\nSecond substantive chapter argument.\r\n")
+    cut = text.index(next_heading)
+    owners = [{"start": 0, "end": cut, "owner": "First author"},
+              {"start": cut, "end": len(text), "owner": "Second author"}]
+    result = prepare_embedding_spans(text, owners)
+    clean = "".join(row["text"] for row in result["spans"])
+    assert "First substantive argument" in clean and "Second substantive chapter argument" in clean
+    assert "A cited paper" not in clean and "Nested reference commentary" not in clean
+    assert "### Methods" not in clean
+    second = next(row for row in result["spans"] if "Second substantive chapter argument" in row["text"])
+    assert second["owner"] == "Second author" and second["section_kind"] == "unknown"
+    assert result["coverage"]["boundary_status"] == "heuristic_unresolved"
+    assert all(text[row["start"]:row["end"]] == row["text"] for row in result["spans"])
+    for row in result["coverage"]["excluded_spans"]:
+        assert row["section_kind"] == "bibliography" and row["end"] <= cut
+
+
+def test_plain_bibliography_then_unclassified_markdown_heading_preserves_unknown_tail():
+    text = "Introduction\nFirst argument.\nReferences\nA cited work.\n# Political bargaining\nFurther analysis.\n"
+    result = prepare_embedding_spans(text)
+    clean = "".join(row["text"] for row in result["spans"])
+    assert "A cited work" not in clean and "Further analysis" in clean
+    assert result["spans"][-1]["section_kind"] == "unknown"
+
+
 def test_explicit_nonbody_sections_do_not_remove_next_substantive_body():
     text = "Contents\nChapter 1 .... 7\nChapter 1\nActual analysis.\nAcknowledgments\nThanks to helpers.\n## Discussion\nA substantive discussion.\nFunding\nGrant ABC.\nConclusion\nLast finding.\n"
     clean = "".join(row["text"] for row in prepare_embedding_spans(text)["spans"])
@@ -199,6 +228,35 @@ def test_canonical_profile_projection_retains_semantic_hash_and_records_actual_f
     assert projected["profile_file_sha256"] == _sha(profile_path.read_text())
     assert projected["profile_path"] == str(profile_path.relative_to(tmp_path))
     assert projected["zotero_item_keys"] == ["ALIAS001", "ITEM0001"]
+
+
+@pytest.mark.parametrize("scope_mode", ["none", "partial", "complete"])
+@pytest.mark.parametrize("explicit_rows", [False, True])
+def test_catalogue_alias_metadata_is_separate_from_actual_scoped_identity(tmp_path, scope_mode, explicit_rows):
+    from auto_zettelkasten.retrieval import LocalRetrievalIndex
+
+    row = _note(tmp_path)
+    save_profile(tmp_path / "02_source_memory/profiles", EvidenceProfile(source_id="source-a", note_id="note-a"))
+    identity = {"canonical_zotero_key": "ITEM0001", "zotero_item_keys": ["ITEM0001", "ALIAS001"], "doi": "10.1000/synthetic"}
+    scope = {"instance_id": "synthetic-desktop", "library_type": "user", "library_id": "42", "item_key": "ITEM0001"}
+    if scope_mode == "complete":
+        identity.update(scope)
+    elif scope_mode == "partial":
+        identity.update({key: value for key, value in scope.items() if key != "item_key"})
+    _write(tmp_path / "02_source_memory/indexes/source_catalogue.yml", {"sources": [
+        {"source_id": "source-a", "note_id": "note-a", "zotero_key": "ITEM0001", "identity": identity}]})
+    _write(tmp_path / "11_state/note_metadata/note-a.yml", {"note_path": row["note_path"], "frontmatter": {
+        "source_id": "source-a", "note_id": "note-a"}})
+    loaded = load_mapping_inputs(tmp_path, [row] if explicit_rows else None)
+    projected = loaded["projection_rows"][0]
+    assert projected["catalogue_identity"] == identity
+    assert projected["zotero_item_keys"] == ["ALIAS001", "ITEM0001"]
+    if scope_mode == "complete":
+        assert projected["identity"] == scope
+    else:
+        assert "identity" not in projected
+    index = LocalRetrievalIndex(loaded["projection_rows"])
+    assert bool(index.identities) is (scope_mode == "complete")
 
 
 def test_catalogue_sources_missing_profiles_or_text_are_reported_not_silently_sampled(tmp_path):

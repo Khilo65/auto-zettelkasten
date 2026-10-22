@@ -12,6 +12,7 @@ let pollTimer = null;
 let collectionsAvailable = false;
 let mappedWorkspace = "";
 let openingMemory = false;
+let embeddingModelChanged = false;
 
 function choice(name) {
   return document.querySelector(`input[name="${name}"]:checked`).value;
@@ -205,19 +206,22 @@ async function saveVault() {
 }
 
 async function pickFolder(kind) {
+  const model = kind === "embedding-model";
+  const message = model ? "embedding-model-message" : "destination-message";
   busy = true;
   controls();
-  status("destination-message", "Choose a folder in the system dialog.");
+  status(message, "Choose a folder in the system dialog.");
   try {
     const result = await api("pick-folder", { kind });
     if (result.path) {
-      $(kind === "codex" ? "codex-executable" : kind === "vault" ? "vault" : "output-folder").value = result.path;
+      $(model ? "embedding-model-path" : kind === "codex" ? "codex-executable" : kind === "vault" ? "vault" : "output-folder").value = result.path;
+      if (model) embeddingModelChanged = true;
       invalidate();
-      status("destination-message", "");
+      status(message, "");
       if (kind === "vault") await saveVault();
-    } else status("destination-message", "Folder selection canceled. You can also enter a path above.");
+    } else status(message, "Folder selection canceled. You can also enter a path above.");
   } catch (error) {
-    status("destination-message", `${error.message} You can enter the full folder path above.`, true);
+    status(message, `${error.message} You can enter the full folder path above.`, true);
   } finally {
     busy = false;
     controls();
@@ -235,6 +239,8 @@ function renderEstimate(result) {
   $("cloud-consent-text").textContent = `I approve sending the sources from ${selection}${source.include_subcollections ? " and its subcollections" : ""} to the selected provider for mapping.`;
   $("review-sources").textContent = `${estimate.inventory_count} total · ${estimate.new_source_jobs} to read · ${estimate.reusable_or_existing_records} reusable`;
   $("review-provider").textContent = estimate.provider === "codex" ? "ChatGPT subscription" : "DeepSeek API key";
+  $("embedding-model-row").hidden = result.mapping_backend !== "local";
+  $("review-embedding-model").textContent = result.embedding_model_path || "Choose a MiniLM model folder before mapping.";
   const costs = estimate.total_cost_usd || {};
   const priced = costs.expected_usd !== null && costs.expected_usd !== undefined;
   $("cost-label").textContent = estimate.provider === "codex" ? "Subscription usage" : "Estimated cost";
@@ -270,6 +276,7 @@ async function estimate(event) {
       destination: choice("destination"),
       vault: $("vault").value.trim(),
       remember_vault: $("remember-vault").checked,
+      ...(embeddingModelChanged ? { embedding_model_path: $("embedding-model-path").value.trim() } : {}),
     }));
   } catch (error) {
     notice(error.message);
@@ -347,6 +354,7 @@ $("find-zotero").addEventListener("click", () => { invalidate(); findZotero(); }
 $("pick-output").addEventListener("click", () => pickFolder("folder"));
 $("pick-vault").addEventListener("click", () => pickFolder("vault"));
 $("pick-codex").addEventListener("click", () => pickFolder("codex"));
+$("pick-embedding-model").addEventListener("click", () => pickFolder("embedding-model"));
 $("vault").addEventListener("change", saveVault);
 $("remember-vault").addEventListener("change", saveVault);
 $("forget-vault").addEventListener("click", async () => {
@@ -360,8 +368,12 @@ $("forget-vault").addEventListener("click", async () => {
   } catch (error) { status("destination-message", error.message, true); }
 });
 for (const input of $("setup").querySelectorAll("input, select")) {
-  input.addEventListener("input", () => { invalidate(); updateChoices(); });
-  input.addEventListener("change", () => { invalidate(); updateChoices(); });
+  const changed = () => {
+    if (input.id === "embedding-model-path") embeddingModelChanged = true;
+    invalidate(); updateChoices();
+  };
+  input.addEventListener("input", changed);
+  input.addEventListener("change", changed);
 }
 $("mapping-form").addEventListener("submit", estimate);
 $("cloud-consent").addEventListener("change", controls);
@@ -402,6 +414,7 @@ async function initialize() {
     const state = await api("state");
     $("output-folder").value = state.default_output_folder || "";
     $("codex-executable").value = state.codex_executable || "";
+    $("embedding-model-path").value = state.embedding_model_path || "";
     savedVault = state.preferences?.vault || "";
     if (savedVault) {
       $("vault").value = savedVault;

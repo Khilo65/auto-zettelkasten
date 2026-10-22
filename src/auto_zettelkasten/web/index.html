@@ -129,6 +129,13 @@
               <p class="helper">Kept only for this app session. The key is checked on the first mapping call.</p>
             </div>
             <p id="auth-message" class="field-status" role="status"></p>
+            <div class="connection-fields">
+              <h3>Local relationship map</h3>
+              <label for="embedding-model-path">MiniLM model folder</label>
+              <div class="input-row"><input id="embedding-model-path" type="text" spellcheck="false" autocomplete="off" placeholder="Use workspace setting or choose a cached model"><button id="pick-embedding-model" type="button">Browse…</button></div>
+              <p class="helper">Choose an existing all-MiniLM-L6-v2 model folder for local communities and suggestions. The remembered folder is a default; an existing workspace keeps its setting unless you change this field. No model download is performed.</p>
+              <p id="embedding-model-message" class="field-status" role="status"></p>
+            </div>
           </div>
         </section>
         <section class="step" aria-labelledby="destination-title">
@@ -167,6 +174,7 @@
               <div><dt>Source selection</dt><dd id="review-collection"></dd></div>
               <div><dt>Sources</dt><dd id="review-sources"></dd></div>
               <div><dt>Connection</dt><dd id="review-provider"></dd></div>
+              <div id="embedding-model-row" hidden><dt>Local map model</dt><dd id="review-embedding-model" class="path"></dd></div>
               <div><dt id="cost-label">Estimated cost</dt><dd id="review-cost"></dd></div>
               <div id="calls-row"><dt>Expected calls</dt><dd id="review-calls"></dd></div>
               <div><dt>Workspace</dt><dd id="review-workspace" class="path"></dd></div>

@@ -10,13 +10,17 @@ local to the user. API keys are not bundled into the application.
 Use Python 3.12 on macOS or Windows in a virtual environment:
 
 ```sh
-python -m pip install -e ".[desktop]"
+python -m pip install -e ".[desktop,local-mapping]"
 auto-zettelkasten-desktop
 ```
 
 The desktop window starts its own loopback server on an available port. You do
 not need to start `serve` separately. Native folder dialogs select the output
 folder or an existing Obsidian vault. Mapping still requires explicit approval.
+Local MiniLM + Leiden is the default mapping backend. Select an existing cached
+`all-MiniLM-L6-v2` model directory before mapping; the app does not download model
+weights. HDBSCAN remains optional and requires the separate
+`local-mapping-hdbscan` extra when running from source.
 
 ## Graph views
 
@@ -44,10 +48,18 @@ environment. The bundles include Python and mapper dependencies; end users do
 not install Python.
 
 ```sh
-python -m pip install -e ".[test,desktop,desktop-build]"
-python -m pytest tests/test_desktop.py tests/test_webapp.py
+python -m pip install -e ".[test,desktop,desktop-build,local-mapping]"
+python -m pytest tests/test_desktop.py tests/test_desktop_packaging.py tests/test_webapp.py
 python tools/build_desktop.py
 ```
+
+The normal bundle includes the local MiniLM/Leiden runtime and is substantially
+larger than the viewer alone. The build fails early if required dependencies or
+their package metadata are missing. Use a clean environment: the build collects
+installed package code, native libraries, and package data, not Hugging Face
+caches, model directories, workspaces, or credentials. Model weights remain
+external and must be selected on the user's machine. HDBSCAN is not required;
+install `local-mapping-hdbscan` in the build environment only to include it.
 
 On macOS, the result is `dist/Auto-Zettelkasten.app`. Double-click it or copy it
 to Applications. Build separately for Apple Silicon and Intel Macs. These are
@@ -86,13 +98,22 @@ providers, signing in, or mapping user documents:
 ```sh
 # macOS
 dist/Auto-Zettelkasten.app/Contents/MacOS/Auto-Zettelkasten --smoke-test
+dist/Auto-Zettelkasten.app/Contents/MacOS/Auto-Zettelkasten --local-mapping-smoke-test
 ```
 
 ```powershell
 # Windows: wait for the windowed executable and check its exit code
 $process = Start-Process -FilePath .\dist\Auto-Zettelkasten\Auto-Zettelkasten.exe -ArgumentList '--smoke-test' -Wait -PassThru
 if ($process.ExitCode -ne 0) { throw 'Desktop smoke test failed' }
+$process = Start-Process -FilePath .\dist\Auto-Zettelkasten\Auto-Zettelkasten.exe -ArgumentList '--local-mapping-smoke-test' -Wait -PassThru
+if ($process.ExitCode -ne 0) { throw 'Local mapping runtime smoke test failed' }
 ```
+
+The local runtime check imports the MiniLM modules, runs a tiny CPU tensor and
+Leiden operation, and tokenizes synthetic text using a temporary vocabulary. It
+does not open a cached model, download weights, or map user documents. This
+checks bundled dependencies; validate actual MiniLM encoding separately with an
+explicitly selected local model before distributing a release.
 
 The `Desktop builds` GitHub Actions workflow builds Apple Silicon, Intel macOS,
 and Windows x64 bundles on their own hosts, runs offline tests and frozen smoke

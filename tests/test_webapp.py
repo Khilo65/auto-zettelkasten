@@ -559,6 +559,86 @@ def test_estimate_retains_workspace_mapping_route_in_approval_ticket(app, tmp_pa
     assert not (workspace / "11_state" / "workspace_manifest.yml").exists()
 
 
+def test_selected_embedding_model_is_checked_frozen_and_remembered(app, tmp_path, monkeypatch):
+    from auto_zettelkasten import mapping
+
+    model = tmp_path / "cached-minilm"
+    model.mkdir()
+    checked = []
+    monkeypatch.setattr(mapping, "check_local_mapping_availability", lambda options: checked.append(dict(options)))
+    result = estimate(app, tmp_path, embedding_model_path=str(model))
+    selected = str(model.resolve())
+    assert checked and checked[0]["model_path"] == selected
+    assert app.ticket["request"].local_mapping["model_path"] == selected
+    assert app.handle("GET", "/api/state")["embedding_model_path"] == selected
+    assert not Path(result["workspace"]).exists()
+    app.handle("POST", "/api/preferences", {"remember_vault": False})
+    reopened = webapp.LocalApp(preferences_path=app.preferences_path, client=Client())
+    assert reopened.embedding_model_path == selected
+    assert "secret-test-key" not in app.preferences_path.read_text()
+
+
+def test_remembered_model_is_a_default_and_explicit_selection_overrides_workspace(app, tmp_path, monkeypatch):
+    from auto_zettelkasten import mapping
+    from auto_zettelkasten.files import write_yaml
+
+    first = estimate(app, tmp_path)
+    workspace = Path(first["workspace"])
+    workspace.mkdir(parents=True)
+    model = tmp_path / "chosen-minilm"
+    model.mkdir()
+    configured = tmp_path / "workspace-minilm"
+    configured.mkdir()
+    app.embedding_model_path = str(model.resolve())
+    monkeypatch.setattr(mapping, "check_local_mapping_availability", lambda options: None)
+    write_yaml(workspace / "auto-zettelkasten.yml", {
+        "mapping_backend": "local", "local_mapping": {"model_path": str(configured)},
+    })
+    before = (workspace / "auto-zettelkasten.yml").read_bytes()
+    estimate(app, tmp_path)
+    assert app.ticket["request"].local_mapping["model_path"] == str(configured)
+    estimate(app, tmp_path, embedding_model_path=str(model))
+    assert app.ticket["request"].local_mapping["model_path"] == str(model.resolve())
+    assert (workspace / "auto-zettelkasten.yml").read_bytes() == before
+
+
+def test_clearing_model_selection_forgets_it_without_reusing_the_old_path(app, tmp_path):
+    app.embedding_model_path = str(tmp_path / "old-model")
+    estimate(app, tmp_path, embedding_model_path="")
+    assert app.ticket["request"].local_mapping["model_path"] is None
+    assert webapp.LocalApp(preferences_path=app.preferences_path, client=Client()).embedding_model_path == ""
+
+
+@pytest.mark.parametrize("value", [[], 42, "bad\x00path", "x" * 4097], ids=["list", "number", "nul", "too-long"])
+def test_invalid_model_selection_cannot_create_an_approval_ticket(app, tmp_path, value):
+    with pytest.raises(webapp.RequestError, match="model folder"):
+        estimate(app, tmp_path, embedding_model_path=value)
+    assert app.ticket is None
+    assert not (tmp_path / "output").exists()
+
+
+def test_unavailable_model_is_rejected_before_approval_or_preference_write(app, tmp_path, monkeypatch):
+    from auto_zettelkasten import mapping
+    from auto_zettelkasten.local_mapping import LocalMappingError
+
+    def unavailable(options):
+        raise LocalMappingError("The selected model is incomplete.")
+
+    monkeypatch.setattr(mapping, "check_local_mapping_availability", unavailable)
+    with pytest.raises(webapp.RequestError, match="selected model is incomplete"):
+        estimate(app, tmp_path, embedding_model_path=str(tmp_path / "missing"))
+    assert app.ticket is None
+    assert not app.preferences_path.exists()
+    assert not (tmp_path / "output").exists()
+
+
+def test_model_picker_uses_native_folder_selection(app):
+    picked = []
+    app.folder_picker = lambda kind: picked.append(kind) or "/cached/minilm"
+    assert app.handle("POST", "/api/pick-folder", {"kind": "embedding-model"}) == {"path": "/cached/minilm"}
+    assert picked == ["embedding-model"]
+
+
 @pytest.mark.parametrize("change", ["membership", "metadata", "outer-version", "data-version"])
 def test_collection_estimate_rejects_same_key_changes_after_library_snapshot(app, tmp_path, monkeypatch, change):
     client = app.client = ScopedClient()
