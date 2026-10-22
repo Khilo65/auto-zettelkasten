@@ -111,6 +111,7 @@ def test_schema_two_receipt_returns_before_note_parsing_or_provider_creation(
         provider="ollama",
         model="fake-1",
         resume=True,
+        mapping_backend="llm",
     )
 
     assert result.status == "built"
@@ -159,6 +160,7 @@ def test_codex_0152_receipt_replays_before_provider_creation_or_preflight(
         allow_cloud=True,
         literature_policy=policy,
         resume=True,
+        mapping_backend="llm",
     )
 
     assert result.status == "built"
@@ -541,6 +543,7 @@ def test_empty_source_set_still_uses_workspace_membership_guard(
         model="fake-1",
         source_set={},
         resume=True,
+        mapping_backend="llm",
     )
 
     assert result.status == "built"

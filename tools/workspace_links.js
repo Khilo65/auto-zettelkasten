@@ -512,6 +512,32 @@ function finishIndex(index, typedRelations, relationLimit, metadata) {
     if (paths.some((path) => owners.get(path) !== 1)) continue;
     for (const path of paths) index.canonicalPaths.set(path, identity.canonical_path);
   }
+  const semantic = metadata?.semantic_map;
+  const semanticPaths = new Set();
+  for (const document of index.documents.values()) delete document.semantic_communities;
+  if (semantic && ["current", "partial", "unavailable"].includes(semantic.status)) {
+    index.semantic_map = { status: semantic.status, communities: [] };
+    if (/^[a-f0-9]{64}$/.test(semantic.identity_digest || "") && semantic.note_revisions && typeof semantic.note_revisions === "object") {
+      index.semantic_map.identity_digest = semantic.identity_digest;
+      for (const [path, revision] of Object.entries(semantic.note_revisions)) {
+        if (index.documents.has(path) && /^[a-f0-9]{64}$/.test(revision) && index.documents.get(path).revision === revision) semanticPaths.add(path);
+        else if (index.semantic_map.status !== "unavailable") index.semantic_map.status = "partial";
+      }
+      for (const community of Array.isArray(semantic.communities) ? semantic.communities.slice(0, relationLimit) : []) {
+        if (!community || !/^[A-Za-z0-9._:-]{1,256}$/.test(community.community_id || "") || !["leiden", "hdbscan"].includes(community.algorithm) || !Array.isArray(community.paths)
+            || community.noise !== undefined && typeof community.noise !== "boolean") continue;
+        const paths = [...new Set(community.paths.filter((path) => semanticPaths.has(path)))];
+        if (!paths.length) continue;
+        const membership = { community_id: community.community_id, algorithm: community.algorithm,
+          ...(typeof community.noise === "boolean" ? { noise: community.noise } : {}) };
+        index.semantic_map.communities.push({ ...membership, paths });
+        for (const path of paths) {
+          const document = index.documents.get(path);
+          document.semantic_communities = [...(document.semantic_communities || []), membership];
+        }
+      }
+    }
+  }
   for (const document of index.documents.values()) {
     for (const ref of document.references) { ref.resolution = resolveLink(index, document.path, ref.destination, ref.kind); index.references.push(ref); }
   }
@@ -521,7 +547,21 @@ function finishIndex(index, typedRelations, relationLimit, metadata) {
     if (!relation || typeof relation.type !== "string" || !relation.type.trim()) continue;
     const source = index.documents.has(relation.source) ? { status: "resolved", path: relation.source } : resolveLink(index, "", String(relation.source || ""), "wiki");
     const target = index.documents.has(relation.target) ? { status: "resolved", path: relation.target } : resolveLink(index, "", String(relation.target || ""), "wiki");
-    if (source.status === "resolved" && target.status === "resolved") index.relations.push({ id: String(relation.id || `${source.path}:${relation.type}:${target.path}`), source: source.path, target: target.path, type: relation.type });
+    if (source.status === "resolved" && target.status === "resolved") {
+      const value = { id: String(relation.id || `${source.path}:${relation.type}:${target.path}`), source: source.path, target: target.path, type: relation.type };
+      if (relation.derived === true) {
+        if (relation.type !== "semantic_similarity" || relation.accepted !== false || relation.evidence_backed !== false || relation.decision_status !== "suggested"
+            || !semanticPaths.has(source.path) || !semanticPaths.has(target.path) || !Number.isFinite(relation.score) || relation.score < -1 || relation.score > 1
+            || relation.provenance?.embedding_identity !== index.semantic_map?.identity_digest) continue;
+        const chunks = (key) => Array.isArray(relation.provenance[key]) && relation.provenance[key].length <= 100000
+          && relation.provenance[key].every((value) => typeof value === "string" && value.length > 0 && value.length <= 256);
+        if (!chunks("source_chunk_ids") || !chunks("target_chunk_ids")) continue;
+        Object.assign(value, { derived: true, decision_status: "suggested", accepted: false, evidence_backed: false, score: relation.score,
+          provenance: { kind: "local_embedding_similarity", embedding_identity: index.semantic_map.identity_digest, accepted: false, evidence_backed: false,
+            source_chunk_ids: [...relation.provenance.source_chunk_ids], target_chunk_ids: [...relation.provenance.target_chunk_ids] } });
+      }
+      index.relations.push(value);
+    }
     else index.warnings.push({ path: String(relation.source || ""), reason: "A typed relation has an unavailable endpoint" });
   }
   index.partial = index.warnings.length > 0;
@@ -875,7 +915,8 @@ export function graphData(index, options = {}) {
   for (const document of index.documents.values()) {
     if (!showNavigation && navigation(document.path)) continue;
     const path = canonical(document.path), primary = index.documents.get(path);
-    if (!nodes.has(path)) nodes.set(path, { id: path, path, label: basename(path), pathAliases: [], aliases: [], tags: [], folder: path.split("/").slice(0, -1).join("/"), navigation: navigation(path), source_coverage: primary.source_coverage });
+    if (!nodes.has(path)) nodes.set(path, { id: path, path, label: basename(path), pathAliases: [], aliases: [], tags: [], folder: path.split("/").slice(0, -1).join("/"), navigation: navigation(path), source_coverage: primary.source_coverage,
+      ...(primary.semantic_communities ? { semantic_communities: primary.semantic_communities.map((row) => ({ ...row })) } : {}) });
     const node = nodes.get(path);
     node.pathAliases.push(document.path);
     node.aliases.push(...document.aliases);
@@ -970,7 +1011,8 @@ export function graphData(index, options = {}) {
     unresolved[node.status === "missing-fragment" ? "fragments" : node.status] += 1;
     if (!allowed.has(target)) unresolved.hidden += 1;
   }
-  return { nodes: visibleNodes, edges: filteredEdges, unresolved, partial: index.partial };
+  return { nodes: visibleNodes, edges: filteredEdges, unresolved, partial: index.partial,
+    ...(index.semantic_map ? { semantic_map: index.semantic_map } : {}) };
 }
 
 function linkMarkup(index, sourcePath, ref) {

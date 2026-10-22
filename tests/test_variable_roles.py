@@ -111,7 +111,7 @@ def test_bundle_roles_reach_note_profile_and_both_model_requests(
 
     item = {"key": "A1", "data": {"key": "A1", "title": "Study", "itemType": "journalArticle"}}
     with deny_codex_attempts():
-        report = run_map(MapRequest(tmp_path, provider="ollama", model="test"),
+        report = run_map(MapRequest(tmp_path, provider="ollama", model="test", mapping_backend="llm"),
                          client=FakeZotero([item]), reader=SavedReader(), run_id="roles")
     assert report.validated_note_count == 1
     note = read_note(tmp_path / report.items[0]["note_path"])

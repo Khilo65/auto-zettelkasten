@@ -39,7 +39,7 @@ def test_canonical_map_replay_is_idempotent_and_uses_profile_sidecars(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     first_report = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", mapping_backend="llm"),
         client=FakeZotero(sample_items),
         reader=FakeReader(),
         run_id="canonical-first",
@@ -57,6 +57,7 @@ def test_canonical_map_replay_is_idempotent_and_uses_profile_sidecars(
         literature_policy=LiteratureMappingPolicy(
             cluster_generation_enabled=True
         ),
+        mapping_backend="llm",
     )
 
     assert rebuilt.status == "built"
@@ -82,6 +83,7 @@ def test_canonical_map_replay_is_idempotent_and_uses_profile_sidecars(
         literature_policy=LiteratureMappingPolicy(
             cluster_generation_enabled=True
         ),
+        mapping_backend="llm",
     )
 
     assert replayed.status == "built"
@@ -120,7 +122,7 @@ def test_projection_yaml_writer_preserves_bytes_for_timestamp_only_replay(tmp_pa
 
 
 def test_resume_uses_frozen_inventory_and_source_representations(tmp_path: Path, sample_items) -> None:
-    request = MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=1)
+    request = MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=1, mapping_backend="llm")
     run_map(request, client=FakeZotero(sample_items), reader=FakeReader(), run_id="frozen-resume")
     changed_client = FakeZotero([sample_items[1]])
     reader = FakeReader()
@@ -137,7 +139,7 @@ def test_resume_uses_frozen_inventory_and_source_representations(tmp_path: Path,
 
 
 def test_corrupt_profile_checkpoint_returns_resumable_partial(tmp_path: Path, sample_items) -> None:
-    request = MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=1)
+    request = MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=1, mapping_backend="llm")
     run_map(request, client=FakeZotero(sample_items), reader=FakeReader(), run_id="corrupt-profile")
     checkpoint = next((tmp_path / "11_state" / "runs" / "corrupt-profile" / "literature" / "profile_calls").glob("*.yml"))
     checkpoint.write_text("checkpoint_schema_version: '1'\nunexpected: true\n", encoding="utf-8")
@@ -160,6 +162,7 @@ def test_external_discovery_mode_requires_an_injected_provider_before_inventory(
             provider="ollama",
             model="fake-1",
             literature_policy=LiteratureMappingPolicy(external_discovery="per_run"),
+            mapping_backend="llm",
         ),
         client=client,
         reader=FakeReader(),
@@ -173,7 +176,7 @@ def test_external_discovery_mode_requires_an_injected_provider_before_inventory(
 
 def test_completed_status_exposes_literature_stage_and_counts(tmp_path: Path, sample_items) -> None:
     run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", mapping_backend="llm"),
         client=FakeZotero(sample_items),
         reader=FakeReader(),
         run_id="literature-status",
@@ -209,7 +212,7 @@ def test_build_map_rejects_non_boolean_cloud_consent(tmp_path: Path) -> None:
 
     initialize_workspace(tmp_path)
     with pytest.raises(ValueError, match="allow_cloud must be a boolean"):
-        build_map(tmp_path, allow_cloud="false")  # type: ignore[arg-type]
+        build_map(tmp_path, allow_cloud="false", mapping_backend="llm")  # type: ignore[arg-type]
 
 
 def test_source_set_alias_keeps_one_map_and_ledger_across_dependency_revisions(tmp_path: Path) -> None:

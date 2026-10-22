@@ -194,7 +194,7 @@ def test_v25_canonical_profile_packets_remove_stale_tail(tmp_path) -> None:
         tmp_path / "literature",
         [EvidenceProfile(source_id="canonical", note_id="note-canonical")],
         source_set={"source_set_id": "canonical", "dependency_hash": "hash"},
-        request=MapRequest(workspace=tmp_path),
+        request=MapRequest(workspace=tmp_path, mapping_backend="llm"),
         reasoner=None,
         progress=None,
     )

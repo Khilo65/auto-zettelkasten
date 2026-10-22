@@ -537,6 +537,28 @@ def test_existing_workspace_estimate_keeps_source_metadata_and_only_copies_input
     assert note.read_bytes() == b"# Existing\r\n"
 
 
+@pytest.mark.parametrize("backend", ["local", "llm"])
+def test_estimate_retains_workspace_mapping_route_in_approval_ticket(app, tmp_path, backend):
+    from auto_zettelkasten.files import write_yaml
+
+    first = estimate(app, tmp_path)
+    workspace = Path(first["workspace"])
+    workspace.mkdir(parents=True)
+    config = workspace / "auto-zettelkasten.yml"
+    write_yaml(config, {
+        "mapping_backend": backend,
+        "local_mapping": {"clustering": "hdbscan", "model_path": str(tmp_path / "cached-model")},
+    })
+    before = config.read_bytes()
+    second = estimate(app, tmp_path)
+    assert app.ticket["request"].mapping_backend == backend
+    assert app.ticket["request"].local_mapping["clustering"] == "hdbscan"
+    assert app.ticket["request"].local_mapping["model_path"] == str(tmp_path / "cached-model")
+    assert second["source"] == first["source"]
+    assert config.read_bytes() == before
+    assert not (workspace / "11_state" / "workspace_manifest.yml").exists()
+
+
 @pytest.mark.parametrize("change", ["membership", "metadata", "outer-version", "data-version"])
 def test_collection_estimate_rejects_same_key_changes_after_library_snapshot(app, tmp_path, monkeypatch, change):
     client = app.client = ScopedClient()

@@ -346,12 +346,24 @@ def estimate_cost(
     graph_only: bool = False,
     literature_policy: LiteratureMappingPolicy | Mapping[str, Any] | None = None,
     zotero_client: ZoteroClient | None = None,
+    mapping_backend: str | None = None,
+    local_mapping: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Estimate paid work from a read-only inventory and existing checkpoints."""
 
     if scope not in {"library", "collection", "selected"}:
         raise ValueError("scope must be library, collection, or selected")
     root = resolve_workspace(workspace)
+    # Estimates also inspect new/partial workspaces and the UI's input-only copy;
+    # execution performs the full config/manifest compatibility check later.
+    mapping_config = read_yaml(root / "auto-zettelkasten.yml", {})
+    if not isinstance(mapping_config, Mapping):
+        raise ValueError("workspace config must be a mapping")
+    backend = mapping_config.get("mapping_backend", "local") if mapping_backend is None else mapping_backend
+    if not isinstance(backend, str) or backend not in {"local", "llm"}:
+        raise ValueError("mapping_backend must be local or llm")
+    from .local_mapping import LocalMappingOptions
+    LocalMappingOptions.from_dict(local_mapping if local_mapping is not None else mapping_config.get("local_mapping", {}))
     profile_paths = list((root / "02_source_memory" / "profiles").glob("*.yml"))
     note_rows = [] if graph_only else all_workspace_note_rows(root)
     existing_keys = {
@@ -714,7 +726,7 @@ def estimate_cost(
         },
     }
     clusters_enabled = (
-        policy.cluster_generation_enabled is not False and policy.synthesis_enabled
+        backend == "llm" and policy.cluster_generation_enabled is not False and policy.synthesis_enabled
     )
     if not clusters_enabled:
         oversized_cluster_ids = set()
@@ -746,7 +758,7 @@ def estimate_cost(
         "relationship_adjudication": relationship_calls,
         **cluster_stage_calls,
     }
-    if not policy.synthesis_enabled:
+    if backend == "local" or not policy.synthesis_enabled:
         graph_call_components = {
             stage: {bound: 0 for bound in ("low", "expected", "high")}
             for stage in graph_call_components
@@ -892,7 +904,8 @@ def estimate_cost(
             "compact_profile_tokens": compact_input_tokens,
             "complete_note_tokens": note_input_tokens,
             "token_estimator": "measured_utf8_bytes_divided_by_four",
-            "call_basis": "packed_v0296_breadth_and_cluster_completion_envelopes",
+            "call_basis": "local_derived_no_provider_calls" if backend == "local" else "packed_v0296_breadth_and_cluster_completion_envelopes",
+            "mapping_backend": backend,
             "planning_profile_count": planning_profile_count,
             "graph_neighborhood_profile_count": graph_profile_count,
             "graph_neighborhood_profile_counts": graph_profile_counts,
@@ -2409,6 +2422,8 @@ def build_map(
     resume: bool = False,
     retry_terminal_failures: bool = False,
     ranked_candidates: Sequence[Mapping[str, Any]] | None = None,
+    mapping_backend: str | None = None,
+    local_mapping: Mapping[str, Any] | None = None,
 ) -> ArtifactManifest:
     del controller  # synthesis consumes validated notes and accepted typed-link evidence only
     if not isinstance(allow_cloud, bool):
@@ -2427,6 +2442,22 @@ def build_map(
     root = resolve_workspace(workspace)
     assert_compatible(root)
     config = load_config(root)
+    backend = str(config.get("mapping_backend") or "local") if mapping_backend is None else mapping_backend
+    if not isinstance(backend, str) or backend not in {"local", "llm"}:
+        raise ValueError("mapping_backend must be local or llm")
+    if backend == "local":
+        if ranked_candidates is not None or external_discovery is not None or reasoner is not None:
+            raise ValueError("Provider relationship decisions require explicit mapping_backend='llm'; local mapping never falls back.")
+        from .mapping import local_map_manifest
+        selected = _resolve_source_set(root, source_set)
+        ids = selected.get("source_ids") if source_set is not None else None
+        rows = all_workspace_note_rows(root)
+        if source_set is not None and ids is None:
+            note_ids = set(selected.get("note_ids", []))
+            ids = [row["source_id"] for row in rows if row.get("note_id") in note_ids]
+        return local_map_manifest(root, source_ids=ids, note_rows=rows,
+                                  options=local_mapping if local_mapping is not None else config.get("local_mapping", {}),
+                                  run_id=validate_opaque_id(run_id or "local-map", field="run_id"))
     provider = provider or str(config.get("provider") or "deepseek")
     model = model or str(config.get("model") or "deepseek-v4-flash")
     configured_policy = config.get("literature_mapping", {}) if isinstance(config.get("literature_mapping", {}), Mapping) else {}
@@ -2571,6 +2602,7 @@ def build_map(
         ),
         literature_policy=policy,
         navigation_policy=navigation,
+        mapping_backend="llm",
     )
     if reasoner is not None:
         literature_request_deadline = max(
@@ -2878,6 +2910,7 @@ def run_literature_map(
         reasoner=reasoner,
         external_discovery=external_discovery,
         resume=resume,
+        mapping_backend="llm",
     )
     summary = manifest.metadata.get("literature_map", {}) if isinstance(manifest.metadata, Mapping) else {}
     source_payload = manifest.metadata.get("source_set", {}) if isinstance(manifest.metadata, Mapping) else {}
@@ -2952,8 +2985,8 @@ def _provider_check(
         effort = str((config or {}).get("reasoning_effort") or "medium")
         literature_model = str((config or {}).get("literature_model") or "")
         literature_config = (config or {}).get("literature_mapping")
-        synthesis_enabled = not isinstance(literature_config, Mapping) or bool(
-            literature_config.get("synthesis_enabled", True)
+        synthesis_enabled = (config or {}).get("mapping_backend", "local") == "llm" and (
+            not isinstance(literature_config, Mapping) or bool(literature_config.get("synthesis_enabled", True))
         )
         role_error = ""
         if model not in CODEX_SOURCE_MODELS:
@@ -2987,7 +3020,7 @@ def _provider_check(
             status = codex_preflight_status(
                 model,
                 effort,
-                (literature_model,) if literature_model else (),
+                (literature_model,) if synthesis_enabled and literature_model else (),
                 **kwargs,
             )
         except ProviderError as exc:

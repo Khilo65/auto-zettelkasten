@@ -319,7 +319,7 @@ def test_incremental_sync_returns_without_provider_calls_when_snapshot_is_unchan
     )
 
     result = sync_zotero(
-        MapRequest(tmp_path, provider="ollama", model="unused"),
+        MapRequest(tmp_path, provider="ollama", model="unused", mapping_backend="llm"),
         client=ReadOnlyClient(),  # type: ignore[arg-type]
     )
 
@@ -449,6 +449,7 @@ def test_sync_resolves_attachment_parent_metadata_from_zotero(
             collection_key="CHILD",
             provider="ollama",
             model="unused",
+            mapping_backend="llm",
         ),
         client=client,  # type: ignore[arg-type]
     )
@@ -494,6 +495,7 @@ def test_collection_sync_does_not_acknowledge_unrelated_library_change(
             collection_key="CHILD",
             provider="ollama",
             model="unused",
+            mapping_backend="llm",
         ),
         client=SyncClient(_collections(), changed_items, [changed_items[1]]),  # type: ignore[arg-type]
     )
@@ -547,6 +549,7 @@ def test_collection_rename_refreshes_indexes_without_relationship_discovery(
             collection_key="CHILD",
             provider="ollama",
             model="unused",
+            mapping_backend="llm",
         ),
         client=SyncClient(renamed, _items(), [_items()[1]]),  # type: ignore[arg-type]
     )
@@ -585,7 +588,7 @@ def test_changed_and_new_sources_are_the_only_frozen_processing_inventory(
         lambda *_args, **_kwargs: Report(),
     )
     result = sync_zotero(
-        MapRequest(tmp_path, provider="ollama", model="unused"),
+        MapRequest(tmp_path, provider="ollama", model="unused", mapping_backend="llm"),
         client=SyncClient(_collections(), current_items, []),  # type: ignore[arg-type]
         run_id="incremental-changes",
     )
@@ -624,6 +627,7 @@ def test_pending_sync_preserves_frozen_pdf_fallback(
         provider="ollama",
         model="unused",
         extraction_policy=ExtractionPolicy(pdf_fallback="images"),
+        mapping_backend="llm",
     )
     write_yaml(run_root / "request.yml", frozen_request.to_dict())
     captured: list[MapRequest] = []
@@ -646,6 +650,7 @@ def test_pending_sync_preserves_frozen_pdf_fallback(
             provider="ollama",
             model="unused",
             extraction_policy=ExtractionPolicy(pdf_fallback="ocr"),
+            mapping_backend="llm",
         ),
         client=SyncClient(_collections(), _items(), []),  # type: ignore[arg-type]
         run_id=run_id,
@@ -696,7 +701,7 @@ def test_removed_source_uses_full_snapshot_for_local_retirement_and_preserves_no
         ),
     )
     result = sync_zotero(
-        MapRequest(tmp_path, provider="ollama", model="unused"),
+        MapRequest(tmp_path, provider="ollama", model="unused", mapping_backend="llm"),
         client=SyncClient(_collections(), [_items()[0]], []),  # type: ignore[arg-type]
     )
 

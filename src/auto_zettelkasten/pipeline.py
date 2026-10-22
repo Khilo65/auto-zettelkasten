@@ -1617,6 +1617,12 @@ def run_pipeline(
     run_dir.mkdir(parents=True, exist_ok=True)
     write_yaml(run_dir / "request.yml", request.to_dict())
 
+    if request.mapping_backend == "local":
+        from .mapping import check_local_mapping_availability
+        try:
+            check_local_mapping_availability(request.local_mapping)
+        except (RuntimeError, ValueError) as exc:
+            return _blocked_report(request, run_id, f"local_mapping_configuration:{exc}", migration=workspace_migration)
     client = client or ZoteroLocalClient()
     controller = controller or LocalController()
     try:
@@ -1645,7 +1651,9 @@ def run_pipeline(
             preflight_reason,
             migration=workspace_migration,
         )
-    if literature_reasoner is None:
+    if request.mapping_backend == "local":
+        literature_reasoner = None
+    if literature_reasoner is None and request.mapping_backend == "llm":
         if request.provider == "codex" and request.literature_policy.synthesis_enabled:
             literature_reasoner = provider_from_name(
                 "codex",
@@ -1667,7 +1675,7 @@ def run_pipeline(
             )
         additional_models = (
             (str(request.literature_model),)
-            if request.literature_policy.synthesis_enabled
+            if request.mapping_backend == "llm" and request.literature_policy.synthesis_enabled
             else ()
         )
         preflight_lock = threading.Lock()
@@ -2486,7 +2494,8 @@ def run_pipeline(
             raise
     profile_budget.flush()
     clusters_enabled = (
-        request.literature_policy.cluster_generation_enabled is not False
+        request.mapping_backend == "llm"
+        and request.literature_policy.cluster_generation_enabled is not False
     )
     # The v0.4 map is already scoped to this run's frozen source set, so every
     # generated cluster and gap belongs to the run without a second heuristic filter.
@@ -2522,6 +2531,8 @@ def run_pipeline(
         if isinstance(row, Mapping)
         and str(row.get("source_id") or "") in analytical_source_ids
     )
+    if request.mapping_backend == "local":
+        unclustered_count = len(map_result["cluster_map"].get("unclustered_sources", []))
     cluster_count = len(map_result["cluster_map"].get("clusters", []) or [])
     topic_neighborhood_count = int(
         map_result["cluster_map"].get("topic_neighborhood_count", 0) or 0
@@ -13272,6 +13283,25 @@ def rebuild_map(
     effective_request = request or MapRequest(
         workspace=workspace, provider="ollama", model="deterministic-v1"
     )
+    if effective_request.mapping_backend == "local":
+        from .mapping import pipeline_local_map
+        # Keep the shared retrieval/catalogue current without projecting links
+        # into source notes or using the legacy synthesis/registry route.
+        workspace_rows, workspace_profiles = _workspace_graph_inputs(workspace, [])
+        snapshot = collection_snapshot or read_yaml(
+            workspace / "01_custody/zotero/collection_snapshot.yml", {})
+        catalogue = build_source_catalogue(
+            workspace, workspace_profiles, workspace_rows, _cluster_catalogue_rows(workspace),
+            collection_snapshot=snapshot, write_cluster_outputs=False,
+        )
+        mapping_scope = {**dict(source_set), "source_ids": sorted(
+            {str(row["source_id"]) for row in workspace_rows}
+            | {str(value) for value in source_set.get("source_ids", [])})}
+        result = pipeline_local_map(workspace, source_set=mapping_scope, note_rows=workspace_rows,
+                                    request=effective_request, progress=progress)
+        result["source_set"] = dict(source_set)
+        result["paths"].extend(_catalogue_artifact_paths(catalogue))
+        return result
     migration_result = (
         dict(migration) if migration is not None else migrate_workspace(workspace)
     )
@@ -22560,6 +22590,8 @@ def _source_replay_request_hash(
     payload.pop("provider_concurrency", None)
     payload.pop("max_provider_spend_usd", None)
     payload.pop("literature_model", None)
+    payload.pop("mapping_backend", None)
+    payload.pop("local_mapping", None)
     if omit_default_pdf_fallback:
         extraction = dict(payload.get("extraction_policy", {}) or {})
         if extraction.get("pdf_fallback") == "none":

@@ -491,6 +491,7 @@ def test_unchanged_source_contract_failure_is_not_retried(tmp_path) -> None:
         provider="deepseek",
         model="bundle-v1",
         allow_cloud=True,
+        mapping_backend="llm",
     )
 
     first = run_map(
@@ -1546,7 +1547,7 @@ def test_ordinary_bundle_source_uses_one_call_and_no_profile_or_fidelity_call(
     reader = BundleReader()
 
     report = run_map(
-        MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1),
+        MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1, mapping_backend="llm"),
         client=FakeZotero([item]),
         reader=reader,
         run_id="bundle-run",
@@ -1596,7 +1597,7 @@ def test_observed_document_date_reaches_writer_without_replacing_canonical_date(
             return payload
 
     report = run_map(
-        MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1),
+        MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1, mapping_backend="llm"),
         client=FakeZotero([{"key": "ITEMA", "data": {
             "key": "ITEMA", "itemType": "journalArticle", "title": "A dated source", "date": "2019",
         }}]),
@@ -1630,7 +1631,7 @@ def test_current_atomic_note_keeps_original_quantities_without_anchor_append(tmp
 
     reader = CurrentReader()
     client = FakeZotero([{"key": "ITEMA", "data": {"key": "ITEMA", "itemType": "journalArticle", "title": "A source"}}])
-    report = run_map(MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1),
+    report = run_map(MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1, mapping_backend="llm"),
                      client=client, reader=reader, run_id="source2-original-evidence")
     assert report.validated_note_count == 1
     note_path = tmp_path / report.items[0]["note_path"]
@@ -1650,7 +1651,7 @@ def test_source_calls_share_the_cumulative_profile_budget_and_replay_is_free(
     tmp_path,
 ) -> None:
     reader = BundleReader()
-    request = MapRequest(tmp_path, provider="ollama", model="bundle-v1")
+    request = MapRequest(tmp_path, provider="ollama", model="bundle-v1", mapping_backend="llm")
     budget_path = tmp_path / "provider_usage.yml"
     budget = _ProfileProviderBudget(budget_path, 1)
     metadata = {
@@ -1718,7 +1719,8 @@ def test_source_bundle_prompt_change_invalidates_committed_note_reuse(
     }
     reader = BundleReader()
     request = MapRequest(
-        tmp_path, provider="ollama", model="bundle-v1", parallel=1
+        tmp_path, provider="ollama", model="bundle-v1", parallel=1,
+        mapping_backend="llm",
     )
     with monkeypatch.context() as previous:
         previous.setattr(pipeline_module, "SOURCE_BUNDLE_PROMPT_VERSION", "38")
@@ -1762,7 +1764,8 @@ def test_unchanged_source_bundle_reuses_committed_note(tmp_path) -> None:
     }
     reader = BundleReader()
     request = MapRequest(
-        tmp_path, provider="ollama", model="bundle-v1", parallel=1
+        tmp_path, provider="ollama", model="bundle-v1", parallel=1,
+        mapping_backend="llm",
     )
 
     run_map(
@@ -1805,7 +1808,7 @@ def test_stale_bundle_profile_is_refreshed_under_the_current_fingerprint(tmp_pat
             return payload
 
     reader = EvidenceSurveyBundleReader()
-    request = MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1)
+    request = MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1, mapping_backend="llm")
     run_map(
         request,
         client=FakeZotero([item]),
@@ -1863,7 +1866,7 @@ def test_current_bundle_profile_refresh_retires_legacy_inventory_without_a_call(
         },
     }
     reader = BundleReader()
-    request = MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1)
+    request = MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1, mapping_backend="llm")
     report = run_map(
         request,
         client=FakeZotero([item]),
@@ -1980,7 +1983,7 @@ def test_image_route_does_not_relabel_a_prior_bundle_as_reused(tmp_path) -> None
             "creators": [{"creatorType": "author", "lastName": "One"}],
         },
     }
-    request = MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1)
+    request = MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1, mapping_backend="llm")
     report = run_map(
         request,
         client=FakeZotero([item]),
@@ -2031,7 +2034,8 @@ def test_legacy_source_contract_pairs_are_reused_fail_closed(
         },
     }
     request = MapRequest(
-        tmp_path, provider="ollama", model="bundle-v1", parallel=1
+        tmp_path, provider="ollama", model="bundle-v1", parallel=1,
+        mapping_backend="llm",
     )
     first_reader = BundleReader()
     first = run_map(
@@ -2135,7 +2139,8 @@ def test_old_bundle_diagnostics_migrate_locally_without_rewriting_note(
     }
     reader = BundleReader()
     request = MapRequest(
-        tmp_path, provider="ollama", model="bundle-v1", parallel=1
+        tmp_path, provider="ollama", model="bundle-v1", parallel=1,
+        mapping_backend="llm",
     )
     first = run_map(
         request,
@@ -2218,6 +2223,7 @@ def test_auto_provider_concurrency_runs_all_ready_source_calls(
             provider="ollama",
             model="bundle-v1",
             provider_concurrency="auto",
+            mapping_backend="llm",
         ),
         client=FakeZotero(items),
         reader=reader,
@@ -2265,6 +2271,7 @@ def test_auto_source_concurrency_is_bounded_for_local_extraction_safety(
             model="bundle-v1",
             allow_cloud=True,
             provider_concurrency="auto",
+            mapping_backend="llm",
         ),
         client=FakeZotero(items),
         reader=CloudBundleReader(),
@@ -2299,7 +2306,7 @@ def test_truncated_direct_bundle_does_not_start_hierarchical_calls(tmp_path) -> 
                 }
             },
             None,
-            request=MapRequest(tmp_path, provider="ollama", model="bundle-v1"),
+            request=MapRequest(tmp_path, provider="ollama", model="bundle-v1", mapping_backend="llm"),
             checkpoint_root=tmp_path / "checkpoint",
         )
 
@@ -2345,7 +2352,7 @@ def test_bundle_preflight_routes_directly_to_one_chunk_and_bundle_synthesis(
             }
         },
         None,
-        request=MapRequest(tmp_path, provider="ollama", model="bundle-v1"),
+        request=MapRequest(tmp_path, provider="ollama", model="bundle-v1", mapping_backend="llm"),
         checkpoint_root=tmp_path / "checkpoint",
     )
 
@@ -2382,7 +2389,7 @@ def test_context_budget_admission_error_falls_back_to_hierarchical_reading(
             }
         },
         None,
-        request=MapRequest(tmp_path, provider="ollama", model="bundle-v1"),
+        request=MapRequest(tmp_path, provider="ollama", model="bundle-v1", mapping_backend="llm"),
         checkpoint_root=tmp_path / "checkpoint",
     )
 
@@ -2445,7 +2452,7 @@ def test_wrong_source_bundle_is_parked_without_publishing_a_note(tmp_path) -> No
         },
     }
     report = run_map(
-        MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1),
+        MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1, mapping_backend="llm"),
         client=FakeZotero([item]),
         reader=WrongSourceBundleReader(),
         run_id="wrong-source-bundle",
@@ -2550,7 +2557,7 @@ def test_quantitative_provenance_failure_parks_without_publishing(
     reader = QuantitativeBundleReader()
 
     report = run_map(
-        MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1),
+        MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1, mapping_backend="llm"),
         client=SourceZotero([item]),
         reader=reader,
         run_id=f"invalid-quantitative-{reason}",
@@ -6348,7 +6355,8 @@ def test_explicit_retry_replaces_invalid_quantitative_checkpoint(tmp_path) -> No
     }
     reader = RetriableBundleReader()
     request = MapRequest(
-        tmp_path, provider="ollama", model="bundle-v1", parallel=1
+        tmp_path, provider="ollama", model="bundle-v1", parallel=1,
+        mapping_backend="llm",
     )
 
     first = run_map(
@@ -6399,7 +6407,7 @@ def test_reader_failure_checkpoint_preserves_raw_response_and_completion(
         },
     }
     report = run_map(
-        MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1),
+        MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1, mapping_backend="llm"),
         client=FakeZotero([item]),
         reader=RawFailureReader(),
         run_id="raw-failure",
@@ -6565,14 +6573,14 @@ def test_new_source_resolves_prior_literature_position_without_rereading_old_sou
     }
     reader = BundleReader()
     first = run_map(
-        MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1),
+        MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1, mapping_backend="llm"),
         client=FakeZotero([citing]),
         reader=reader,
         run_id="literature-match-one",
     )
 
     run_map(
-        MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1),
+        MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1, mapping_backend="llm"),
         client=FakeZotero([citing, cited]),
         reader=reader,
         run_id="literature-match-two",
@@ -6710,13 +6718,13 @@ def test_zotero_document_type_change_invalidates_source_bundle(tmp_path) -> None
     }
     reader = BundleReader()
     run_map(
-        MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1),
+        MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1, mapping_backend="llm"),
         client=FakeZotero([original]),
         reader=reader,
         run_id="type-one",
     )
     second = run_map(
-        MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1),
+        MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1, mapping_backend="llm"),
         client=FakeZotero([corrected]),
         reader=reader,
         run_id="type-two",
@@ -6738,7 +6746,7 @@ def test_reprocessing_source_replaces_its_stale_literature_memory(tmp_path) -> N
         },
     }
     first = run_map(
-        MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1),
+        MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1, mapping_backend="llm"),
         client=FakeZotero([item]),
         reader=BundleReader(),
         run_id="literature-stale-one",
@@ -6811,6 +6819,7 @@ def test_hierarchical_source_synthesis_returns_the_canonical_bundle(tmp_path) ->
             max_total_chunks=20,
             max_calls_per_document_run=20,
         ),
+        mapping_backend="llm",
     )
     result, route, _reason = _read_document(
         HierarchicalReader(),
@@ -7017,7 +7026,7 @@ def test_public_source_bundle_row_caps_preserve_raw_without_retry(
 @pytest.mark.parametrize("field,limit", [("evidence_anchors", 24), ("literature_positions", 8)])
 def test_source_bundle_checkpoint_rejects_overflow_without_reread(tmp_path, field, limit) -> None:
     reader = BundleReader()
-    request = MapRequest(tmp_path, provider="ollama", model="bundle-v1")
+    request = MapRequest(tmp_path, provider="ollama", model="bundle-v1", mapping_backend="llm")
     metadata = {"_source_context": {"source_id": "source-zotero-A1", "zotero_key": "A1"}}
     checkpoint = tmp_path / "checkpoint"
     _read_document(reader, "Supplied source.", metadata, None, request=request, checkpoint_root=checkpoint)
@@ -7367,7 +7376,7 @@ def test_unresolved_page_contract_parks_instead_of_salvaging_note(tmp_path, monk
 
     item = {"key": "ITEMA", "data": {"key": "ITEMA", "itemType": "report", "title": "Service access pilot", "date": "2024"}}
     client, reader = SourceZotero([item]), PageReader()
-    report = run_map(MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1),
+    report = run_map(MapRequest(tmp_path, provider="ollama", model="bundle-v1", parallel=1, mapping_backend="llm"),
                      client=client, reader=reader, run_id="unresolved-page-contract")
     assert report.validated_note_count == 0 and report.parked_for_review_count == 1
     assert report.items[0]["reason"] == "source_bundle_quantitative_provenance_invalid:quantitative_page_locator_unresolved"

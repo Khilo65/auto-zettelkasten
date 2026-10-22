@@ -36,6 +36,14 @@ auto-zettelkasten-desktop = "auto_zettelkasten.desktop:main"
 test = ["pytest>=8.0", "build>=1.2"]
 desktop = ["pywebview>=6.0,<7", "certifi>=2024.8.30"]
 desktop-build = ["pyinstaller>=6.0,<7"]
+local-mapping = [
+  "numpy>=1.26,<3",
+  "sentence-transformers>=3.0,<6",
+  "torch>=2.2,<3",
+  "igraph>=0.11,<2",
+  "leidenalg>=0.10,<1",
+]
+local-mapping-hdbscan = ["hdbscan>=0.8.33,<1"]
 
 [project.urls]
 Homepage = "https://github.com/Khilo65/auto-zettelkasten"
@@ -61,6 +69,7 @@ include = [
   "/package-lock.json",
   "/docs/DESKTOP.md",
   "/docs/LOCAL_DISCOVERY.md",
+  "/docs/LOCAL_MAPPING.md",
 ]
 
 [tool.pytest.ini_options]

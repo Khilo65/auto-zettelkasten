@@ -19,7 +19,8 @@ def test_approved_mapping_exports_real_notes_and_preserves_vault(tmp_path, sampl
 
     def offline_map(request, **kwargs):
         return real_run_map(
-            replace(request, provider="ollama", model="fake-1", literature_model=None, reasoning_effort=None),
+            replace(request, provider="ollama", model="fake-1", literature_model=None, reasoning_effort=None,
+                    mapping_backend="llm"),
             reader=FakeReader(),
             **kwargs,
         )
@@ -59,7 +60,8 @@ def test_mapper_builds_real_agent_memory_and_opens_published_index(tmp_path, sam
 
     def offline_map(request, **kwargs):
         return real_run_map(
-            replace(request, provider="ollama", model="fake-1", literature_model=None, reasoning_effort=None),
+            replace(request, provider="ollama", model="fake-1", literature_model=None, reasoning_effort=None,
+                    mapping_backend="llm"),
             reader=FakeReader(), **kwargs,
         )
 

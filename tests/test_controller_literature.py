@@ -29,7 +29,7 @@ def test_parked_tag_proposals_do_not_block_independent_semantic_clustering(tmp_p
             return [{**dict(row), "decision": "parked", "decision_reason": "integration_review_required"} for row in proposals]
 
     report = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", mapping_backend="llm"),
         client=FakeZotero(sample_items),
         reader=FakeReader(),
         controller=ParkingController(),
@@ -44,7 +44,7 @@ def test_parked_tag_proposals_do_not_block_independent_semantic_clustering(tmp_p
 
 def test_singleton_cluster_is_rejected(tmp_path: Path, sample_items) -> None:
     report = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", mapping_backend="llm"),
         client=FakeZotero(sample_items[:1]),
         reader=FakeReader(),
         run_id="singleton",
@@ -73,7 +73,7 @@ def test_controller_cannot_tamper_with_immutable_tag_proposal_fields(tmp_path: P
             ]
 
     report = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", mapping_backend="llm"),
         client=FakeZotero(sample_items[:1]),
         reader=FakeReader(),
         controller=TamperingController(),

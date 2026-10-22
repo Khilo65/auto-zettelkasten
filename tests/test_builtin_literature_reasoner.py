@@ -741,7 +741,8 @@ def test_configured_builtin_reader_profiles_by_default_and_totals_live_calls(
 
     monkeypatch.setattr(DeepSeekReader, "_generate_text", generate)
     request = MapRequest(
-        tmp_path, provider="deepseek", model="deepseek-v4-flash", allow_cloud=True
+        tmp_path, provider="deepseek", model="deepseek-v4-flash", allow_cloud=True,
+        mapping_backend="llm",
     )
 
     report = run_map(
@@ -770,7 +771,7 @@ def test_build_map_constructs_configured_builtin_reasoner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source_report = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", mapping_backend="llm"),
         client=FakeZotero(sample_items),
         reader=FakeReader(),
         run_id="build-map-source",
@@ -790,6 +791,7 @@ def test_build_map_constructs_configured_builtin_reasoner(
         provider="deepseek",
         model="deepseek-v4-flash",
         allow_cloud=True,
+        mapping_backend="llm",
     )
 
     assert result.status == "built"
@@ -825,7 +827,7 @@ def test_cluster_failure_keeps_committed_reciprocal_atomic_relationships(
     sample_items,
 ) -> None:
     report = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", mapping_backend="llm"),
         client=FakeZotero(sample_items),
         reader=FakeReader(),
         literature_reasoner=_RelationshipThenClusterFailureReasoner(),
@@ -865,7 +867,7 @@ def test_unchanged_workspace_replay_makes_no_new_relationship_or_cluster_calls(
     sample_items,
 ) -> None:
     source_report = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", mapping_backend="llm"),
         client=FakeZotero(sample_items),
         reader=FakeReader(),
         run_id="relationship-replay-sources",
@@ -878,6 +880,7 @@ def test_unchanged_workspace_replay_makes_no_new_relationship_or_cluster_calls(
         model="fake-1",
         reasoner=reasoner,
         comparison_collection_keys=("C1", "C2"),
+        mapping_backend="llm",
     )
     assert first.status == "built"
     before_calls = (
@@ -904,6 +907,7 @@ def test_unchanged_workspace_replay_makes_no_new_relationship_or_cluster_calls(
         reasoner=reasoner,
         comparison_collection_keys=("C1", "C2"),
         resume=True,
+        mapping_backend="llm",
     )
 
     assert replay.status == "built"
@@ -929,7 +933,7 @@ def test_reasoner_replay_reuses_same_provider_profiles_created_by_deterministic_
     sample_items,
 ) -> None:
     source_report = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", mapping_backend="llm"),
         client=FakeZotero(sample_items),
         reader=FakeReader(),
         run_id="route-aware-source",
@@ -942,6 +946,7 @@ def test_reasoner_replay_reuses_same_provider_profiles_created_by_deterministic_
         model="deepseek-v4-flash",
         allow_cloud=False,
         literature_policy=LiteratureMappingPolicy(max_synthesis_calls=2),
+        mapping_backend="llm",
     )
     reasoner = _ExplicitReasoner()
 
@@ -954,6 +959,7 @@ def test_reasoner_replay_reuses_same_provider_profiles_created_by_deterministic_
         allow_cloud=True,
         reasoner=reasoner,
         resume=True,
+        mapping_backend="llm",
     )
 
     profile_result = replay.metadata["literature_map"]["profile_result"]
@@ -981,6 +987,7 @@ def test_primary_run_honors_synthesis_disabled_without_profile_or_map_artifacts(
             model="deepseek-v4-flash",
             allow_cloud=True,
             literature_policy=LiteratureMappingPolicy(synthesis_enabled=False),
+            mapping_backend="llm",
         ),
         client=FakeZotero(sample_items[:1]),
         reader=reader,
@@ -1006,6 +1013,7 @@ def test_legacy_profile_reasoner_is_not_called_after_source_generation(
             provider="ollama",
             model="fake-1",
             literature_policy=LiteratureMappingPolicy(profile_workers=2),
+            mapping_backend="llm",
         ),
         client=FakeZotero(sample_items),
         reader=FakeReader(),
@@ -1033,6 +1041,7 @@ def test_profile_call_budget_caps_source_generation_without_profile_calls(
             literature_policy=LiteratureMappingPolicy(
                 max_profile_calls=1, profile_workers=2
             ),
+            mapping_backend="llm",
         ),
         client=FakeZotero(sample_items),
         reader=FakeReader(),
@@ -1052,7 +1061,7 @@ def test_legacy_profile_failure_cannot_park_source_results(
     tmp_path: Path,
     sample_items,
 ) -> None:
-    request = MapRequest(tmp_path, provider="ollama", model="fake-1")
+    request = MapRequest(tmp_path, provider="ollama", model="fake-1", mapping_backend="llm")
     first_reasoner = _RecoveringReasoner({"ITEMA"})
 
     first = run_map(
@@ -1101,7 +1110,7 @@ def test_contract_invalid_legacy_profile_method_is_not_used(
 ) -> None:
     reasoner = _ContractInvalidReasoner()
     first = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", mapping_backend="llm"),
         client=FakeZotero(sample_items[:1]),
         reader=FakeReader(),
         literature_reasoner=reasoner,
@@ -1126,6 +1135,7 @@ def test_contract_invalid_legacy_profile_method_is_not_used(
         provider="ollama",
         model="fake-1",
         reasoner=replay_reasoner,
+        mapping_backend="llm",
     )
 
     assert replay.status == "built"
@@ -1139,7 +1149,7 @@ def test_resume_keeps_frozen_source_set_identity_when_a_parked_source_recovers(
     tmp_path: Path,
     sample_items,
 ) -> None:
-    request = MapRequest(tmp_path, provider="ollama", model="fake-1")
+    request = MapRequest(tmp_path, provider="ollama", model="fake-1", mapping_backend="llm")
     first_reasoner = _RecoveringReasoner()
     first = run_map(
         request,
@@ -1175,7 +1185,7 @@ def test_profile_content_remains_source_owned_across_collection_maps(
 ) -> None:
     first_reasoner = _RecoveringReasoner()
     first = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", mapping_backend="llm"),
         client=FakeZotero(sample_items[:1]),
         reader=FakeReader(),
         literature_reasoner=first_reasoner,
@@ -1195,6 +1205,7 @@ def test_profile_content_remains_source_owned_across_collection_maps(
         provider="ollama",
         model="fake-1",
         reasoner=rebased_reasoner,
+        mapping_backend="llm",
     )
 
     assert manifest.status == "built"
@@ -1209,7 +1220,7 @@ def test_stale_mechanical_profile_refresh_preserves_inspected_source_content_wit
 ) -> None:
     first_reasoner = _RecoveringReasoner()
     first = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", mapping_backend="llm"),
         client=FakeZotero(sample_items[:1]),
         reader=FakeReader(),
         literature_reasoner=first_reasoner,
@@ -1244,6 +1255,7 @@ def test_stale_mechanical_profile_refresh_preserves_inspected_source_content_wit
         provider="ollama",
         model="fake-1",
         reasoner=replay_reasoner,
+        mapping_backend="llm",
     )
 
     assert manifest.status == "built"
@@ -1263,7 +1275,7 @@ def test_stale_deterministic_profile_refreshes_methods_and_dependency_without_a_
 ) -> None:
     first_reasoner = _RecoveringReasoner()
     first = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", mapping_backend="llm"),
         client=FakeZotero(sample_items[:1]),
         reader=FakeReader(),
         literature_reasoner=first_reasoner,
@@ -1284,6 +1296,7 @@ def test_stale_deterministic_profile_refreshes_methods_and_dependency_without_a_
         provider="ollama",
         model="fake-1",
         reasoner=replay_reasoner,
+        mapping_backend="llm",
     )
 
     refreshed = _only_profile(tmp_path)
@@ -1327,7 +1340,8 @@ def test_explicit_reasoner_takes_precedence_over_builtin_reader(
     reasoner = _ExplicitReasoner()
     report = run_map(
         MapRequest(
-            tmp_path, provider="deepseek", model="deepseek-v4-flash", allow_cloud=True
+            tmp_path, provider="deepseek", model="deepseek-v4-flash", allow_cloud=True,
+            mapping_backend="llm",
         ),
         client=FakeZotero(sample_items[:1]),
         reader=DeepSeekReader(allow_cloud=True),
@@ -1358,7 +1372,8 @@ def test_limited_note_uses_deterministic_profile_without_builtin_call(
     monkeypatch.setattr(DeepSeekReader, "_generate_text", unexpected_generate)
     report = run_map(
         MapRequest(
-            tmp_path, provider="deepseek", model="deepseek-v4-flash", allow_cloud=True
+            tmp_path, provider="deepseek", model="deepseek-v4-flash", allow_cloud=True,
+            mapping_backend="llm",
         ),
         client=FakeZotero(sample_items[:1], missing={"ITEMA"}),
         run_id="limited-profile",
@@ -1383,6 +1398,7 @@ def test_limited_note_uses_deterministic_profile_without_builtin_call(
         provider="deepseek",
         model="deepseek-v4-flash",
         allow_cloud=True,
+        mapping_backend="llm",
     )
     refreshed = _only_profile(tmp_path)
     checkpoint = yaml.safe_load(
@@ -1409,7 +1425,8 @@ def test_builtin_route_reuses_current_deterministic_profile_then_replay_is_zero_
 ) -> None:
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     request = MapRequest(
-        tmp_path, provider="deepseek", model="deepseek-v4-flash", allow_cloud=True
+        tmp_path, provider="deepseek", model="deepseek-v4-flash", allow_cloud=True,
+        mapping_backend="llm",
     )
     source_reader = _SourceOnlyDeepSeek()
     first = run_map(

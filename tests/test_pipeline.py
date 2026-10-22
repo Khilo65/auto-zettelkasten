@@ -50,6 +50,7 @@ def test_vertical_slice_matches_golden_and_builds_obsidian_graph(
             provider="ollama",
             model="fake-1",
             parallel=2,
+            mapping_backend="llm",
         ),
         client=FakeZotero(sample_items),
         reader=reader,
@@ -150,7 +151,7 @@ def test_missing_attachment_becomes_limited_and_duplicate_becomes_alias(
     items = [sample_items[0], sample_items[0], sample_items[1]]
     reader = FakeReader()
     report = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=1),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=1, mapping_backend="llm"),
         client=FakeZotero(items, missing={"ITEMB"}),
         reader=reader,
         run_id="coverage-run",
@@ -183,7 +184,7 @@ def test_cloud_reader_is_never_called_without_explicit_consent(
 
     spy = CloudSpy()
     report = run_map(
-        MapRequest(tmp_path, provider="deepseek", model="spy", allow_cloud=False),
+        MapRequest(tmp_path, provider="deepseek", model="spy", allow_cloud=False, mapping_backend="llm"),
         client=FakeZotero(sample_items[:1]),
         reader=spy,
         run_id="private-run",
@@ -199,7 +200,7 @@ def test_fingerprint_rerun_and_same_run_resume_skip_reader(
 ) -> None:
     client = FakeZotero(sample_items)
     first_reader = FakeReader()
-    request = MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=1)
+    request = MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=1, mapping_backend="llm")
     run_map(request, client=client, reader=first_reader, run_id="first")
     assert first_reader.calls == 2
 
@@ -231,6 +232,7 @@ def test_processing_budget_change_reuses_current_schema_committed_note(
         model="fake-1",
         parallel=1,
         processing=ProcessingPolicy(request_deadline_seconds=120),
+        mapping_backend="llm",
     )
     run_map(
         first_request,
@@ -255,6 +257,7 @@ def test_processing_budget_change_reuses_current_schema_committed_note(
         model="fake-1",
         parallel=1,
         processing=ProcessingPolicy(request_deadline_seconds=240),
+        mapping_backend="llm",
     )
     second = run_map(
         second_request,
@@ -273,7 +276,7 @@ def test_processing_budget_change_reuses_current_schema_committed_note(
 def test_resume_revalidates_item_identity_and_content_fingerprint(
     tmp_path: Path, sample_items
 ) -> None:
-    request = MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=1)
+    request = MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=1, mapping_backend="llm")
     run_map(
         request,
         client=FakeZotero(sample_items),
@@ -308,7 +311,7 @@ def test_resume_revalidates_item_identity_and_content_fingerprint(
 def test_interrupted_run_reuses_direct_checkpoint_for_missing_note(
     tmp_path: Path, sample_items
 ) -> None:
-    request = MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=1)
+    request = MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=1, mapping_backend="llm")
     completed = run_map(
         request,
         client=FakeZotero(sample_items),
@@ -336,7 +339,7 @@ def test_untagged_source_can_commit_without_creating_cluster(
 ) -> None:
     sample_items[0]["data"]["tags"] = []
     report = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", mapping_backend="llm"),
         client=FakeZotero(sample_items[:1]),
         reader=FakeReader(),
         run_id="untagged",
@@ -356,7 +359,7 @@ def test_duplicate_work_identity_reuses_one_canonical_note(
         "data": {**sample_items[0]["data"], "key": "OTHER"},
     }
     report = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=2),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=2, mapping_backend="llm"),
         client=FakeZotero([sample_items[0], collision]),
         reader=FakeReader(),
         run_id="collision",
@@ -398,7 +401,7 @@ def test_shared_container_doi_does_not_merge_distinct_chapters(
     reader = FakeReader()
 
     report = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=2),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=2, mapping_backend="llm"),
         client=FakeZotero([first, second]),
         reader=reader,
         run_id="shared-container-doi",
@@ -432,7 +435,7 @@ def test_shared_container_doi_does_not_merge_incremental_chapter(
         },
     }
     run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", mapping_backend="llm"),
         client=FakeZotero([first]),
         reader=FakeReader(),
         run_id="first-chapter",
@@ -440,7 +443,7 @@ def test_shared_container_doi_does_not_merge_incremental_chapter(
     reader = FakeReader()
 
     report = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", mapping_backend="llm"),
         client=FakeZotero([second]),
         reader=reader,
         run_id="second-chapter",
@@ -478,7 +481,7 @@ def test_explicit_same_work_relation_merges_duplicate_records(
     reader = FakeReader()
 
     report = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", mapping_backend="llm"),
         client=FakeZotero([first, second]),
         reader=reader,
         run_id="same-work-relation",
@@ -509,7 +512,7 @@ def test_unique_same_as_does_not_hide_duplicate_work_identity(
     reader = FakeReader()
 
     report = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", mapping_backend="llm"),
         client=FakeZotero([first, second]),
         reader=reader,
         run_id="unique-same-as",
@@ -524,7 +527,7 @@ def test_alias_only_collection_source_set_includes_canonical_note(
     tmp_path: Path, sample_items
 ) -> None:
     canonical = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", mapping_backend="llm"),
         client=FakeZotero(sample_items[:1]),
         reader=FakeReader(),
         run_id="canonical",
@@ -543,6 +546,7 @@ def test_alias_only_collection_source_set_includes_canonical_note(
             collection_key="ALIASES",
             provider="ollama",
             model="fake-1",
+            mapping_backend="llm",
         ),
         client=FakeZotero([alias]),
         reader=reader,
@@ -580,7 +584,8 @@ def test_question_is_only_a_projection_lens_but_metadata_and_reader_remain_in_fi
     first_reader = QuestionReader()
     first = run_map(
         MapRequest(
-            tmp_path, provider="ollama", model="requested-model", question="FIRST"
+            tmp_path, provider="ollama", model="requested-model", question="FIRST",
+            mapping_backend="llm",
         ),
         client=FakeZotero(sample_items[:1]),
         reader=first_reader,
@@ -596,7 +601,8 @@ def test_question_is_only_a_projection_lens_but_metadata_and_reader_remain_in_fi
     second_reader = QuestionReader()
     second = run_map(
         MapRequest(
-            tmp_path, provider="ollama", model="requested-model", question="SECOND"
+            tmp_path, provider="ollama", model="requested-model", question="SECOND",
+            mapping_backend="llm",
         ),
         client=FakeZotero(changed),
         reader=second_reader,
@@ -615,6 +621,7 @@ def test_question_is_only_a_projection_lens_but_metadata_and_reader_remain_in_fi
             provider="ollama",
             model="requested-model",
             question="A DIFFERENT LENS",
+            mapping_backend="llm",
         ),
         client=FakeZotero(changed),
         reader=third_reader,
@@ -629,7 +636,7 @@ def test_current_prompt_replaces_prompt_v1_note_instead_of_reusing_it(
 ) -> None:
     first_reader = FakeReader()
     first = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", mapping_backend="llm"),
         client=FakeZotero(sample_items[:1]),
         reader=first_reader,
         run_id="prompt-v1",
@@ -645,7 +652,7 @@ def test_current_prompt_replaces_prompt_v1_note_instead_of_reusing_it(
 
     second_reader = FakeReader()
     second = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", mapping_backend="llm"),
         client=FakeZotero(sample_items[:1]),
         reader=second_reader,
         run_id="prompt-v2",
@@ -677,7 +684,7 @@ def test_legacy_reader_without_new_fields_uses_disclosed_compatibility_fallback(
             }
 
     report = run_map(
-        MapRequest(tmp_path, provider="ollama", model="legacy-reader"),
+        MapRequest(tmp_path, provider="ollama", model="legacy-reader", mapping_backend="llm"),
         client=FakeZotero(sample_items[:1]),
         reader=LegacyReader(),
         run_id="legacy-reader-v2",
@@ -702,7 +709,7 @@ def test_long_document_uses_bounded_chunk_reader_route(
 
     reader = FakeReader()
     report = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=1),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=1, mapping_backend="llm"),
         client=LongZotero(sample_items[:1]),
         reader=reader,
         run_id="long-source",
@@ -731,7 +738,7 @@ def test_partial_zotero_fulltext_is_not_treated_as_exhaustive(
     client = PartialZotero(sample_items[:1])
     reader = FakeReader()
     report = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", mapping_backend="llm"),
         client=client,
         reader=reader,
         run_id="partial-fulltext",
@@ -788,7 +795,7 @@ def test_synthetic_library_covers_readable_scanned_and_missing_sources(
             return None
 
     report = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=1),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=1, mapping_backend="llm"),
         client=ReleaseGateZotero(items),
         reader=FakeReader(),
         run_id="synthetic-release-gate",
@@ -808,7 +815,7 @@ def test_synthetic_library_covers_readable_scanned_and_missing_sources(
 def test_workspace_map_remains_coherent_across_collection_runs(
     tmp_path: Path, sample_items
 ) -> None:
-    request = MapRequest(tmp_path, provider="ollama", model="fake-1")
+    request = MapRequest(tmp_path, provider="ollama", model="fake-1", mapping_backend="llm")
     run_map(
         request,
         client=FakeZotero(sample_items),
@@ -822,7 +829,7 @@ def test_workspace_map_remains_coherent_across_collection_runs(
         run_id="workspace-two",
     )
     assert second.cluster_map["clusters"] == []
-    rebuilt = build_map(tmp_path, run_id="workspace-rebuild")
+    rebuilt = build_map(tmp_path, run_id="workspace-rebuild", mapping_backend="llm")
     assert rebuilt.metadata["cluster_map"]["clusters"] == []
     assert (
         list((tmp_path / "03_literature_synthesis" / "clusters").glob("Cluster - *.md"))
@@ -844,7 +851,7 @@ def test_collection_build_clears_stale_cluster_projection_across_workspace(
     tmp_path: Path, sample_items
 ) -> None:
     report = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", mapping_backend="llm"),
         client=FakeZotero(sample_items),
         reader=FakeReader(),
         run_id="global-projection-source",
@@ -878,6 +885,7 @@ def test_collection_build_clears_stale_cluster_projection_across_workspace(
         literature_policy=LiteratureMappingPolicy(
             cluster_generation_enabled=True
         ),
+        mapping_backend="llm",
     )
 
     frontmatter = read_note(stale_path)["frontmatter"]
@@ -894,7 +902,7 @@ def test_existing_custody_relations_feed_compatible_typed_note_links(
         item["data"]["tags"] = []
         item["data"]["relations"] = {}
     report = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", mapping_backend="llm"),
         client=FakeZotero(sample_items),
         reader=FakeReader(),
         run_id="custody-relations",
@@ -931,7 +939,7 @@ def test_existing_custody_relations_feed_compatible_typed_note_links(
             "note_status: analytical_atomic_note", "note_status: fulltext_available", 1
         )
     )
-    build_map(tmp_path, run_id="custody-rebuild")
+    build_map(tmp_path, run_id="custody-rebuild", mapping_backend="llm")
     compatibility = yaml.safe_load(
         (tmp_path / "02_source_memory" / "indexes" / "typed_note_links.yml").read_text()
     )
@@ -946,7 +954,7 @@ def test_status_uses_run_snapshot_and_reports_missing_run(
     tmp_path: Path, sample_items
 ) -> None:
     run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", mapping_backend="llm"),
         client=FakeZotero(sample_items),
         reader=FakeReader(),
         run_id="snapshot-run",
@@ -966,7 +974,8 @@ def test_selected_collection_key_and_limit_are_preserved(
     client = FakeZotero(sample_items, selected_key="ACTUALSELECTED")
     report = run_map(
         MapRequest(
-            tmp_path, scope="selected", provider="ollama", model="fake-1", limit=1
+            tmp_path, scope="selected", provider="ollama", model="fake-1", limit=1,
+            mapping_backend="llm",
         ),
         client=client,
         reader=FakeReader(),
@@ -985,7 +994,7 @@ def test_status_reports_terminal_and_literature_counts(
     tmp_path: Path, sample_items
 ) -> None:
     report = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", mapping_backend="llm"),
         client=FakeZotero(sample_items),
         reader=FakeReader(),
         run_id="status-run",
@@ -997,7 +1006,8 @@ def test_status_reports_terminal_and_literature_counts(
     assert status.counts["gap_candidate_count"] == 0
 
     manifest = build_map(
-        tmp_path, run_id="status-run", source_set=report.source_set, resume=True
+        tmp_path, run_id="status-run", source_set=report.source_set, resume=True,
+        mapping_backend="llm",
     )
     rebuilt_status = get_status(tmp_path, "status-run")
     assert rebuilt_status.counts["inventory_count"] == 2
@@ -1013,7 +1023,7 @@ def test_build_map_reconstructs_progress_for_legacy_source_set_without_rows(
     tmp_path: Path, sample_items
 ) -> None:
     report = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1"),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", mapping_backend="llm"),
         client=FakeZotero(sample_items),
         reader=FakeReader(),
         run_id="legacy-source-run",
@@ -1025,6 +1035,7 @@ def test_build_map_reconstructs_progress_for_legacy_source_set_without_rows(
         tmp_path,
         run_id="legacy-build-run",
         source_set=legacy_source_set,
+        mapping_backend="llm",
     )
 
     progress = yaml.safe_load(
@@ -1172,7 +1183,8 @@ def test_large_document_checkpoints_and_resume_avoid_repeated_calls(
         document_deadline_seconds=120,
     )
     request = MapRequest(
-        tmp_path, provider="ollama", model="fake-1", parallel=1, processing=policy
+        tmp_path, provider="ollama", model="fake-1", parallel=1, processing=policy,
+        mapping_backend="llm",
     )
     reader = HierarchicalReader()
     client = LongTextZotero(sample_items[:1])
@@ -1218,7 +1230,7 @@ def test_completed_item_is_committed_while_another_worker_is_slow(
     def execute() -> None:
         result.append(
             run_map(
-                MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=2),
+                MapRequest(tmp_path, provider="ollama", model="fake-1", parallel=2, mapping_backend="llm"),
                 client=FakeZotero(sample_items),
                 reader=SlowReader(),
                 run_id="visible-progress",
@@ -1267,7 +1279,7 @@ def test_hard_chunk_limit_creates_fulltext_available_limited_note(
         document_deadline_seconds=120,
     )
     report = run_map(
-        MapRequest(tmp_path, provider="ollama", model="fake-1", processing=policy),
+        MapRequest(tmp_path, provider="ollama", model="fake-1", processing=policy, mapping_backend="llm"),
         client=HugeTextZotero(sample_items[:1]),
         reader=FakeReader(),
         run_id="hard-limit",
@@ -1299,7 +1311,8 @@ def test_million_context_reader_handles_tested_book_size_in_one_call(
     reader = MillionContextReader()
     report = run_map(
         MapRequest(
-            tmp_path, provider="deepseek", model="deepseek-v4-flash", allow_cloud=True
+            tmp_path, provider="deepseek", model="deepseek-v4-flash", allow_cloud=True,
+            mapping_backend="llm",
         ),
         client=BookZotero(sample_items[:1]),
         reader=reader,

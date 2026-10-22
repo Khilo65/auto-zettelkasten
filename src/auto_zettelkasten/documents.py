@@ -12,6 +12,8 @@ from contextlib import contextmanager
 import copy
 from dataclasses import dataclass
 import hashlib
+import json
+import math
 import os
 from pathlib import Path
 import re
@@ -38,6 +40,9 @@ INDEX_PAGE_BYTES = MAX_FILE_BYTES
 INDEX_PAGE_OPERATIONS = 1024
 MAX_INDEX_PATHS = 200000
 MAX_REGISTRY_BYTES = 32 * 1024 * 1024
+_SEMANTIC_MAP_PARTS = (".auto-zettelkasten", "mapping")
+_SEMANTIC_MAP_SCHEMA = "local-semantic-map-v1"
+_SEMANTIC_DEPENDENCY_BYTES = 32 * 1024 * 1024
 _INDEX_TTL = 600
 _YAML_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 _LOCK = threading.RLock()
@@ -688,6 +693,261 @@ class DocumentService:
         except (DocumentError, OSError):
             return ("unavailable",)
 
+    def _index_semantic_stamp(self):
+        try:
+            with self._directory(_SEMANTIC_MAP_PARTS) as directory:
+                info = directory.stat("result.json")
+                if _linked(info) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    return ("unavailable",)
+                return _stamp(info)
+        except FileNotFoundError:
+            return None
+        except (DocumentError, OSError):
+            return ("unavailable",)
+
+    def _read_semantic_map(self):
+        """Read only the fixed derived result; never follow result-supplied paths."""
+        try:
+            with self._directory(_SEMANTIC_MAP_PARTS) as directory:
+                data, _ = self._read_derived_bytes(directory, "result.json")
+            value = json.loads(data)
+            if (not isinstance(value, dict) or value.get("schema_version") != _SEMANTIC_MAP_SCHEMA
+                    or not isinstance(value.get("identity"), dict)
+                    or not isinstance(value["identity"].get("digest"), str)
+                    or not re.fullmatch(r"[a-f0-9]{64}", value["identity"]["digest"])
+                    or any(not isinstance(value.get(key), list) or len(value[key]) > 100000
+                           for key in ("sources", "communities", "neighbors"))):
+                raise ValueError("Unsupported semantic map")
+            return value
+        except FileNotFoundError:
+            return None
+        except (DocumentError, OSError, UnicodeError, ValueError, RecursionError):
+            return {"unavailable": True}
+
+    def _read_derived_bytes(self, directory, name, *, max_bytes=None):
+        limit = MAX_REGISTRY_BYTES if max_bytes is None else min(max_bytes, MAX_REGISTRY_BYTES)
+        before = directory.stat(name)
+        if (_linked(before) or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                or before.st_size > limit):
+            raise DocumentError("The derived map is unavailable.")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(name if directory.fd is not None else directory.path / name, flags, dir_fd=directory.fd)
+        try:
+            if _stamp(os.fstat(fd)) != _stamp(before):
+                raise DocumentIndexChanged()
+            data = bytearray()
+            while len(data) <= limit:
+                chunk = os.read(fd, min(65536, limit + 1 - len(data)))
+                if not chunk:
+                    break
+                data.extend(chunk)
+            directory.verify()
+            if (len(data) > limit or _stamp(os.fstat(fd)) != _stamp(before)
+                    or _stamp(directory.stat(name)) != _stamp(before)):
+                raise DocumentIndexChanged()
+            return bytes(data), before
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _semantic_dependency_files(mapping):
+        if not mapping or mapping.get("unavailable"):
+            return []
+        from .profiles import profile_sidecar_path
+        result = set()
+        for row in mapping["sources"]:
+            if (not isinstance(row, dict) or not isinstance(row.get("note_id"), str)
+                    or not re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", row["note_id"])):
+                continue
+            result.add((("02_source_memory", "profiles"), profile_sidecar_path(Path(), row["note_id"]).name))
+            result.add((("11_state", "note_metadata"), f"{row['note_id']}.yml"))
+        return sorted(result)
+
+    def _semantic_dependency_stamp(self, parts, name):
+        try:
+            with self._directory(parts) as directory:
+                return _stamp(directory.stat(name))
+        except FileNotFoundError:
+            return None
+        except (DocumentError, OSError):
+            return "unavailable"
+
+    @staticmethod
+    def _semantic_document(path, text, effective, canonical_revision):
+        fields = _frontmatter(text)
+        return {"path": path, "source_id": fields.get("source_id"), "note_id": fields.get("note_id"),
+                "declared_ids": {key: fields[key] for key in ("source_id", "note_id") if key in fields},
+                "revision": effective["revision"],
+                "projection_hash": canonical_revision,
+                "effective_unchanged": effective["text"] == text}
+
+    def _project_semantic_map(self, mapping, documents):
+        """Project suggestions onto owned source notes without promoting evidence links."""
+        if mapping is None:
+            return [], None, []
+        warning = "Some local semantic map results are unavailable or stale. Refresh the local map to update suggestions."
+        if mapping.get("unavailable"):
+            return [], {"status": "unavailable", "communities": [], "note_revisions": {}}, [warning]
+        from .profiles import profile_sidecar_path
+        by_path = {row["path"]: row for row in documents}
+        source_owners = {}
+        for row in documents:
+            if (row["path"].startswith("02_source_memory/notes/")
+                    and isinstance(row["source_id"], str) and isinstance(row["note_id"], str)):
+                source_owners.setdefault(row["source_id"], set()).add(row["note_id"])
+        sources, revisions, seen = {}, {}, set()
+        dependency_budget = _SEMANTIC_DEPENDENCY_BYTES
+        dependency_limited = False
+
+        def read_dependency(parts, name):
+            nonlocal dependency_budget, dependency_limited
+            try:
+                with self._directory(parts) as directory:
+                    if directory.stat(name).st_size > dependency_budget:
+                        dependency_limited = True
+                        raise DocumentError("The local semantic map dependency byte budget was reached.")
+                    data, _ = self._read_derived_bytes(directory, name, max_bytes=dependency_budget)
+                dependency_budget -= len(data)
+                return data
+            except FileNotFoundError:
+                return b""
+        coverage = {"included": 0, "unavailable": 0, "stale": 0, "unresolved": 0}
+        digest = mapping["identity"]["digest"]
+        invalid = False
+        for row in mapping["sources"]:
+            if (not isinstance(row, dict) or not isinstance(row.get("source_id"), str)
+                    or not 0 < len(row["source_id"]) <= 256 or not isinstance(row.get("note_id"), str)
+                    or not re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", row["note_id"])):
+                invalid = True
+                continue
+            source_id = row["source_id"]
+            if source_id in seen:
+                return [], {"status": "unavailable", "communities": [], "note_revisions": {}}, [warning]
+            seen.add(source_id)
+            if not isinstance(row.get("coverage"), dict) or row["coverage"].get("status") != "included":
+                coverage["unavailable"] += 1
+                continue
+            path = row.get("note_path")
+            try:
+                parts = _parts(path)
+                if Path(parts[-1]).suffix.casefold() != ".md":
+                    raise DocumentError("Invalid source note path")
+            except DocumentError:
+                coverage["unresolved"] += 1
+                continue
+            document = by_path.get(path)
+            if (document is None or any(key in document["declared_ids"] and document["declared_ids"][key] != expected
+                                        for key, expected in (("source_id", source_id), ("note_id", row["note_id"])))
+                    or len(source_owners.get(source_id, ())) > 1):
+                coverage["unresolved"] += 1
+                continue
+            if not document["effective_unchanged"] or row.get("projection_hash") != document["projection_hash"]:
+                coverage["stale"] += 1
+                continue
+            profile_name = profile_sidecar_path(Path(), row["note_id"]).name
+            try:
+                metadata_bytes = read_dependency(("11_state", "note_metadata"), f"{row['note_id']}.yml")
+                metadata_hash = hashlib.sha256(metadata_bytes).hexdigest() if metadata_bytes else ""
+                if row.get("metadata_file_sha256", "") != metadata_hash:
+                    coverage["stale"] += 1
+                    continue
+                if any(key not in document["declared_ids"] for key in ("source_id", "note_id")):
+                    from .notes import NOTE_METADATA_SCHEMA_VERSION
+                    metadata = yaml.load(metadata_bytes, Loader=_YAML_LOADER) if metadata_bytes else {}
+                    stored = metadata.get("frontmatter") if isinstance(metadata, dict) else None
+                    if (not isinstance(metadata, dict) or metadata.get("metadata_schema_version") != NOTE_METADATA_SCHEMA_VERSION
+                            or not isinstance(stored, dict) or stored.get("source_id") != source_id or stored.get("note_id") != row["note_id"]
+                            or metadata.get("note_path") != path):
+                        coverage["unresolved"] += 1
+                        continue
+                profile_bytes = read_dependency(("02_source_memory", "profiles"), profile_name)
+                profile_hash = hashlib.sha256(profile_bytes).hexdigest() if profile_bytes else ""
+            except (DocumentError, OSError, UnicodeError, yaml.YAMLError, RecursionError, ValueError):
+                coverage["stale"] += 1
+                continue
+            expected_profile_hash = row.get("profile_file_sha256", "")
+            if (expected_profile_hash != profile_hash
+                    or row.get("profile_hash") and "profile_file_sha256" not in row):
+                coverage["stale"] += 1
+                continue
+            chunks = row.get("chunk_ids", [])
+            if (not isinstance(chunks, list) or len(chunks) > 100000
+                    or any(not isinstance(value, str) or not value or len(value) > 256 for value in chunks)):
+                invalid = True
+                continue
+            sources[source_id] = {"path": path, "chunk_ids": set(chunks)}
+            revisions[path] = document["revision"]
+            coverage["included"] += 1
+        communities = []
+        community_ids = set()
+        memberships = set()
+        for row in mapping["communities"]:
+            if (not isinstance(row, dict) or not isinstance(row.get("community_id"), str)
+                    or not re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", row["community_id"])
+                    or row["community_id"] in community_ids or row.get("algorithm") not in {"leiden", "hdbscan"}
+                    or "noise" in row and type(row["noise"]) is not bool
+                    or not isinstance(row.get("source_ids"), list)
+                    or any(not isinstance(value, str) for value in row["source_ids"])):
+                invalid = True
+                continue
+            community_ids.add(row["community_id"])
+            membership = {(row["algorithm"], value) for value in row["source_ids"] if value in sources}
+            if membership & memberships:
+                invalid = True
+                continue
+            memberships.update(membership)
+            paths = sorted({sources[value]["path"] for value in row["source_ids"] if value in sources})
+            if paths:
+                communities.append({"community_id": row["community_id"], "algorithm": row["algorithm"], "paths": paths,
+                                    **({"noise": row["noise"]} if "noise" in row else {})})
+        relations, pairs = [], set()
+        for row in mapping["neighbors"]:
+            if not isinstance(row, dict):
+                invalid = True
+                continue
+            source, target, score = row.get("source_id"), row.get("target_source_id"), row.get("score")
+            if not isinstance(source, str) or not isinstance(target, str):
+                invalid = True
+                continue
+            if source not in sources or target not in sources or source == target:
+                continue
+            if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score) or not -1 <= score <= 1:
+                invalid = True
+                continue
+            pair = tuple(sorted((source, target)))
+            if pair in pairs:
+                continue
+            pairs.add(pair)
+            provenance = row.get("provenance", {})
+            safe_provenance = {"kind": "local_embedding_similarity", "embedding_identity": digest,
+                               "evidence_backed": False, "accepted": False}
+            if not isinstance(provenance, dict):
+                invalid = True
+                continue
+            for key, owner in (("source_chunk_ids", source), ("target_chunk_ids", target)):
+                chunks = provenance.get(key, [])
+                if (not isinstance(chunks, list) or any(not isinstance(value, str) or value not in sources[owner]["chunk_ids"] for value in chunks)):
+                    invalid = True
+                    break
+                safe_provenance[key] = list(dict.fromkeys(chunks))
+            else:
+                relation_id = hashlib.sha256(json.dumps([digest, *pair]).encode()).hexdigest()[:24]
+                relations.append({"id": f"semantic:{relation_id}", "source": sources[source]["path"],
+                                  "target": sources[target]["path"], "type": "semantic_similarity", "derived": True,
+                                  "decision_status": "suggested", "accepted": False, "evidence_backed": False,
+                                  "score": float(score), "provenance": safe_provenance})
+        partial = invalid or any(coverage[key] for key in ("unavailable", "stale", "unresolved"))
+        metadata = {"status": "partial" if partial else "current", "identity_digest": digest,
+                    "communities": sorted(communities, key=lambda row: row["community_id"]),
+                    "note_revisions": revisions, "coverage": {**coverage,
+                        "dependency_bytes_read": _SEMANTIC_DEPENDENCY_BYTES - dependency_budget,
+                        "dependency_byte_limit": _SEMANTIC_DEPENDENCY_BYTES,
+                        "dependency_budget_reached": dependency_limited}}
+        warnings = [warning] if partial else []
+        if dependency_limited:
+            warnings.append("Local semantic map projection is partial because its protected metadata/profile byte budget was reached.")
+        return relations, metadata, warnings
+
     def _index_root_stamp(self):
         with self._directory() as directory:
             markers = []
@@ -700,7 +960,7 @@ class DocumentService:
                     except FileNotFoundError:
                         markers.append(None)
             stamp = (self._root_identity, directory.engine_owned(), self._published_indexes(directory),
-                     self._reason(directory), self._index_registry_stamp(), tuple(markers))
+                     self._reason(directory), self._index_registry_stamp(), tuple(markers), self._index_semantic_stamp())
             return (*stamp, self._override_generation()) if self._overrides is not None else stamp
 
     def _index_inventory(self, run, inventory, expected=None):
@@ -752,6 +1012,10 @@ class DocumentService:
                 after = os.fstat(directory.fd) if directory.fd is not None else directory.path.lstat()
                 if _stamp(after) != _stamp(before):
                     raise DocumentIndexChanged()
+        for parts, name in self._semantic_dependency_files(run.get("semantic_mapping")):
+            path = "/".join((*parts, name))
+            record(path, ("semantic_dependency", self._semantic_dependency_stamp(parts, name)))
+            yield None
         if expected is not None and inventory != expected:
             raise DocumentIndexChanged()
 
@@ -992,6 +1256,7 @@ class DocumentService:
                        "root_stamp": root_stamp, "inventory": {}, "note_ids": {}, "cluster_ids": {},
                        "identity_candidates": [], "unresolved": {}, "documents_partial": False,
                        "projected": {}, "warnings": [], "truncated": False, "phase": "check" if checking else "documents",
+                       "semantic_mapping": self._read_semantic_map(), "semantic_documents": [], "semantic_map": None,
                        "progress": {"documents": 0, "bytes": 0, "scanned": 0, "relations": 0},
                        "checking": checking, "pending": None, "iterator": None, "last_cursor": None,
                        "last_page": None, "cursor": None, "expires": time.monotonic() + _INDEX_TTL}
@@ -1032,6 +1297,12 @@ class DocumentService:
                             run["phase"] = "registry"
                             run["iterator"] = self._index_registry(run)
                         elif run["phase"] == "registry":
+                            derived, run["semantic_map"], derived_warnings = self._project_semantic_map(
+                                run["semantic_mapping"], run["semantic_documents"])
+                            for relation in derived:
+                                if relation["id"] not in run["projected"]:
+                                    run["projected"][relation["id"]] = relation
+                            run["warnings"].extend(warning for warning in derived_warnings if warning not in run["warnings"])
                             run["phase"] = "relations"
                             run["iterator"] = iter(sorted(run["projected"].values(), key=lambda row: row["id"]))
                         else:
@@ -1074,6 +1345,9 @@ class DocumentService:
                                 run["pending"] = item
                                 break
                             fields = self._index_note_ids(run, path, text)
+                            if run["semantic_mapping"] and not run["semantic_mapping"].get("unavailable"):
+                                run["semantic_documents"].append(self._semantic_document(
+                                    path, text, document, hashlib.sha256(data).hexdigest()))
                             document.update(_document_metadata(path, fields))
                             identity = _generated_identity(path, fields, hashlib.sha256(data).hexdigest(), document["text"])
                             if identity and run["root_stamp"][2]:
@@ -1101,6 +1375,8 @@ class DocumentService:
                           "warnings": list(run["warnings"]), "truncated": run["truncated"], "progress": dict(run["progress"])}
                 result["index_coverage"] = _index_coverage(run["documents_partial"], complete=complete)
                 if complete:
+                    if run["semantic_map"] is not None:
+                        result["semantic_map"] = run["semantic_map"]
                     result["document_identities"] = [] if run["documents_partial"] else _document_identities(run["identity_candidates"])
                     result["relation_resolution"] = {status: sum(status in values for values in run["unresolved"].values())
                                                      for status in ("missing", "ambiguous")}
@@ -1109,9 +1385,13 @@ class DocumentService:
                         result["progress"] = dict(run["checking"]["progress"])
                         for key in ("document_identities", "relation_resolution", "index_coverage"):
                             result[key] = copy.deepcopy(run["checking"][key])
+                        if "semantic_map" in run["checking"]:
+                            result["semantic_map"] = copy.deepcopy(run["checking"]["semantic_map"])
                     elif not run["truncated"]:
                         self._completed_index = {key: run[key] for key in ("generation", "root_stamp", "inventory", "progress")}
                         self._completed_index.update({key: result[key] for key in ("document_identities", "relation_resolution", "index_coverage")})
+                        if "semantic_map" in result:
+                            self._completed_index["semantic_map"] = copy.deepcopy(result["semantic_map"])
                     run["iterator"] = None
                 run["last_cursor"], run["last_page"] = cursor, copy.deepcopy(result)
                 return result
@@ -1128,6 +1408,11 @@ class DocumentService:
             self._workspace(workspace_id)
             documents: list[dict[str, Any]] = []
             canonical_documents = []
+            semantic_documents = []
+            semantic_stamp = self._index_semantic_stamp()
+            semantic_mapping = self._read_semantic_map()
+            semantic_dependencies = {(parts, name): self._semantic_dependency_stamp(parts, name)
+                                     for parts, name in self._semantic_dependency_files(semantic_mapping)}
             identity_candidates = []
             override_generation = self._override_generation()
             pending = deque([()])
@@ -1194,6 +1479,9 @@ class DocumentService:
                                     if identity and published:
                                         identity_candidates.append(identity)
                                     canonical_documents.append(document)
+                                    if semantic_mapping and not semantic_mapping.get("unavailable"):
+                                        semantic_documents.append(self._semantic_document(
+                                            document["path"], text, effective, document["revision"]))
                                     documents.append(effective)
                                 else:
                                     continue
@@ -1220,7 +1508,14 @@ class DocumentService:
             documents.sort(key=lambda row: row["path"].casefold())
             relations, relation_warnings, resolution = self._typed_relations(canonical_documents, engine_owned)
             warnings.extend(relation_warnings)
+            derived, semantic_map, derived_warnings = self._project_semantic_map(semantic_mapping, semantic_documents)
+            if (semantic_stamp != self._index_semantic_stamp()
+                    or any(self._semantic_dependency_stamp(*file) != stamp for file, stamp in semantic_dependencies.items())):
+                raise DocumentIndexChanged()
+            relations.extend(derived)
+            warnings.extend(derived_warnings)
             return {"documents": documents, "relations": relations, "truncated": truncated, "warnings": warnings,
+                    **({"semantic_map": semantic_map} if semantic_map is not None else {}),
                     "document_identities": [] if truncated or skipped else _document_identities(identity_candidates),
                     "index_coverage": _index_coverage(truncated or skipped), "relation_resolution": resolution}
 

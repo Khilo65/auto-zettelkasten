@@ -295,6 +295,7 @@ def test_cost_estimate_prices_graph_when_every_source_is_reusable(tmp_path: Path
         tmp_path,
         graph_only=True,
         zotero_client=Zotero(),  # type: ignore[arg-type]
+        mapping_backend="llm",
     )
 
     assert result["new_source_jobs"] == 0

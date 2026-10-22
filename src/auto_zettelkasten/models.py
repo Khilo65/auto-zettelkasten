@@ -656,6 +656,8 @@ class MapRequest:
         default_factory=LiteratureMappingPolicy
     )
     navigation_policy: NavigationPolicy = field(default_factory=NavigationPolicy)
+    mapping_backend: Literal["local", "llm"] = "local"
+    local_mapping: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "workspace", Path(self.workspace).expanduser())
@@ -665,6 +667,17 @@ class MapRequest:
         _require_bool(self.allow_cloud, field="allow_cloud")
         _require_bool(
             self.retry_terminal_failures, field="retry_terminal_failures"
+        )
+        if not isinstance(self.mapping_backend, str) or self.mapping_backend not in {
+            "local", "llm"
+        }:
+            raise ValueError("mapping_backend must be local or llm")
+        from .local_mapping import LocalMappingOptions
+
+        object.__setattr__(
+            self,
+            "local_mapping",
+            LocalMappingOptions.from_dict(self.local_mapping).to_dict(),
         )
         if self.model == "deepseek-v4-flash" and self.provider in {"ollama", "gemini"}:
             object.__setattr__(
@@ -728,7 +741,11 @@ class MapRequest:
                 object.__setattr__(self, "provider_concurrency", "auto")
             if self.model not in CODEX_SOURCE_MODELS:
                 raise ValueError("Codex source model must be gpt-6-luna, gpt-5.6-luna, or gpt-5.6-sol")
-            if self.literature_policy.synthesis_enabled and not self.literature_model:
+            if (
+                self.mapping_backend == "llm"
+                and self.literature_policy.synthesis_enabled
+                and not self.literature_model
+            ):
                 raise ValueError("Codex synthesis requires literature_model")
             if self.literature_model and self.literature_model not in {
                 "gpt-5.6-terra",
@@ -833,6 +850,10 @@ class MapRequest:
                 "literature_policy", LiteratureMappingPolicy()
             ),
             navigation_policy=payload.get("navigation_policy", NavigationPolicy()),
+            # Requests saved before backend selection existed used LLM mapping.
+            # Preserve that route when resuming; new requests default to local.
+            mapping_backend=payload.get("mapping_backend", "llm"),
+            local_mapping=payload.get("local_mapping", {}),
         )
 
 

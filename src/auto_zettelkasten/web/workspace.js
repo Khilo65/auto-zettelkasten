@@ -347,7 +347,10 @@
     for (const [path, value] of state.previewDocuments) if (documents.has(path)) documents.set(path, { ...documents.get(path), ...value });
     for (const doc of state.documents.values()) documents.set(doc.path, { ...documents.get(doc.path), path: doc.path, text: textOf(doc), revision: doc.revision, editable: doc.editable });
     const ordered = [...documents.values()].sort((a, b) => Number(b.path === state.active) - Number(a.path === state.active) || a.path.localeCompare(b.path));
-    state.linkIndex = (state.snapshot?.library ? kit.buildLibraryIndex : kit.buildLinkIndex)(ordered, state.snapshot?.relations || [], state.linkIndex, { document_identities: verifiedIdentities });
+    const semantic = state.snapshot?.semantic_map;
+    const semanticDirty = state.previewDocuments.size > 0 || [...state.documents.values()].some((doc) => dirty(doc) || doc.external || doc.recovery);
+    const derivedRelations = semanticDirty ? (state.snapshot?.relations || []).filter((relation) => !relation.derived) : state.snapshot?.relations || [];
+    state.linkIndex = (state.snapshot?.library ? kit.buildLibraryIndex : kit.buildLinkIndex)(ordered, derivedRelations, state.linkIndex, { document_identities: verifiedIdentities, semantic_map: semanticDirty ? undefined : semantic });
     state.indexVersion = (state.indexVersion || 0) + 1;
     state.view?.dispatch({});
     if (active()?.mode === "reading") renderReading(active());
@@ -391,7 +394,7 @@
             for (const relation of page.relations) relations.set(relation.id, relation);
             for (const warning of page.warnings || []) warnings.add(warning);
             truncated ||= Boolean(page.truncated);
-            if (page.complete !== false) metadata = { document_identities: (Array.isArray(page.document_identities) ? page.document_identities : []).filter((identity) => identity?.verified === true && typeof identity.canonical_path === "string" && Array.isArray(identity.path_aliases) && identity.path_aliases.every((path) => typeof path === "string")), index_coverage: page.index_coverage, relation_resolution: page.relation_resolution };
+            if (page.complete !== false) metadata = { document_identities: (Array.isArray(page.document_identities) ? page.document_identities : []).filter((identity) => identity?.verified === true && typeof identity.canonical_path === "string" && Array.isArray(identity.path_aliases) && identity.path_aliases.every((path) => typeof path === "string")), index_coverage: page.index_coverage, relation_resolution: page.relation_resolution, semantic_map: page.semantic_map };
             if (documents.size > 100000 || relations.size > 1000000 || entries.size > 200000) throw new Error("The library exceeds the supported index size.");
             state.indexProgress = `${page.phase === "validate" ? "Verifying" : "Indexing"} ${page.progress?.documents ?? documents.size} notes…`;
             renderIndexStatus();
@@ -638,7 +641,7 @@
           <label for="${mode}-graph-type">Relation type</label><select id="${mode}-graph-type"><option value="">All types</option></select>
           <label class="graph-check"><input id="${mode}-graph-labels" type="checkbox" checked> Show labels</label>
         </div></details>
-      </div><div class="graph-footer"><span id="${mode}-graph-counts" role="status"></span><span id="${mode}-graph-progress" role="status" hidden>Arranging graph…</span><span class="graph-legend"><span>— Other links</span><span class="relation-legend">╴ Research relations</span></span><span>Saved relationships only. Unconnected does not mean unrelated.</span></div><div id="${mode}-graph-list" class="graph-note-list" aria-label="${local ? "Local" : "Global"} graph notes" hidden></div>`;
+      </div><div class="graph-footer"><span id="${mode}-graph-counts" role="status"></span><span id="${mode}-graph-progress" role="status" hidden>Arranging graph…</span><span class="graph-legend"><span>— Other links</span><span class="relation-legend">╴ Research relations</span></span><span>Discovery suggestions and communities are derived, not accepted research links. Unconnected does not mean unrelated.</span></div><div id="${mode}-graph-list" class="graph-note-list" aria-label="${local ? "Local" : "Global"} graph notes" hidden></div>`;
     fillIcons(container);
     container.querySelectorAll("input,select").forEach((control) => control.addEventListener(control.type === "text" ? "input" : "change", () => renderGraph(mode, true)));
     graphControl(mode, "fit").addEventListener("click", () => fitGraph(state.graphs.get(mode)));
@@ -730,6 +733,11 @@
     const unresolved = data.unresolved || {}, hidden = unresolved.hidden || 0;
     const resolutionCounts = [["missing", "missing"], ["ambiguous", "ambiguous"], ["fragments", "missing heading/block"]].filter(([key]) => unresolved[key]).map(([key, label]) => `${unresolved[key]} ${label}`);
     graphControl(mode, "counts").textContent = `${data.nodes.length} ${data.nodes.length === 1 ? "note" : "notes"} · ${data.edges.length} ${data.edges.length === 1 ? "connection" : "connections"}${options.showNavigation ? "" : " · navigation hidden"}${resolutionCounts.length ? ` · ${resolutionCounts.join(", ")}${hidden ? ` (${hidden} hidden)` : ""}` : ""}${data.partial || state.snapshot?.truncated ? " · partial" : ""}`;
+    if (data.semantic_map?.communities?.length) {
+      graphControl(mode, "counts").textContent += ` · ${data.semantic_map.communities.length} derived communities`;
+      const noiseCount = data.semantic_map.communities.filter((row) => row.noise === true).length;
+      if (noiseCount) graphControl(mode, "counts").textContent += ` · ${noiseCount} density-noise sources`;
+    }
     if (!local) { el("workspace-save-state").textContent = "Graph view"; el("workspace-counts").textContent = graphControl(mode, "counts").textContent; }
     const signature = JSON.stringify(data);
     let graph = state.graphs.get(mode);

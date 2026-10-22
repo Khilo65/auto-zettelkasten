@@ -33,7 +33,7 @@ def test_graph_estimate_does_not_treat_zero_validated_count_as_empty(
     _frozen_profiles(tmp_path, 425)
     _source_set(tmp_path, inventory=425, validated=0)
 
-    result = estimate_cost(tmp_path, graph_only=True)
+    result = estimate_cost(tmp_path, graph_only=True, mapping_backend="llm")
 
     assert result["new_source_jobs"] == 0
     assert result["graph_calls"]["expected"] == 127
@@ -64,7 +64,7 @@ def test_incremental_estimate_prices_delta_and_bounded_neighborhood(
         {"activated": True, "source_count": 25},
     )
 
-    result = estimate_cost(tmp_path, graph_only=True)
+    result = estimate_cost(tmp_path, graph_only=True, mapping_backend="llm")
     provenance = result["graph_estimate_provenance"]
 
     assert provenance["incremental_profile_count"] == 25
@@ -155,7 +155,7 @@ def test_graph_estimate_prices_known_cluster_completion_work(
         },
     )
 
-    result = estimate_cost(tmp_path, graph_only=True)
+    result = estimate_cost(tmp_path, graph_only=True, mapping_backend="llm")
     components = result["graph_call_components"]
     provenance = result["graph_estimate_provenance"]
 
@@ -196,6 +196,7 @@ def test_graph_estimate_prices_known_cluster_completion_work(
         literature_policy=LiteratureMappingPolicy(
             cluster_generation_enabled=False
         ),
+        mapping_backend="llm",
     )["graph_estimate_provenance"]
     assert relationship_first["oversized_cluster_parent_count"] == 0
     assert relationship_first["oversized_cluster_ids"] == []
@@ -215,13 +216,14 @@ def test_relationship_first_estimate_zeros_every_cluster_and_gap_stage(
     _frozen_profiles(tmp_path, 12)
     _source_set(tmp_path, inventory=12, validated=12)
 
-    enabled = estimate_cost(tmp_path, graph_only=True)
+    enabled = estimate_cost(tmp_path, graph_only=True, mapping_backend="llm")
     disabled = estimate_cost(
         tmp_path,
         graph_only=True,
         literature_policy=LiteratureMappingPolicy(
             cluster_generation_enabled=False
         ),
+        mapping_backend="llm",
     )
 
     retained_stages = {
@@ -274,6 +276,7 @@ def test_relationship_first_estimate_zeros_every_cluster_and_gap_stage(
             synthesis_enabled=False,
             cluster_generation_enabled=False,
         ),
+        mapping_backend="llm",
     )
     assert all(
         calls == {"low": 0, "expected": 0, "high": 0}

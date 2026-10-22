@@ -16,11 +16,11 @@ import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from . import api
 from .documents import DocumentConflict, DocumentError, DocumentIndexChanged, DocumentService
-from .files import slugify
+from .files import read_yaml, slugify
 from .models import DEFAULT_CODEX_SOURCE_MODEL, LiteratureMappingPolicy, MapRequest
 from .readers import (ProviderError, _codex_environment, _codex_executable,
                       _attach_codex_process_job, _close_codex_process_job,
@@ -468,7 +468,11 @@ class LocalApp:
             raise RequestError("The selected Zotero source contains no documents to map.")
         provider = self.auth["method"]
         model = DEFAULT_CODEX_SOURCE_MODEL if provider == "codex" else "deepseek-v4-flash"
-        request = MapRequest(workspace=workspace, scope=scope, collection_key=key, provider=provider, model=model, literature_model="gpt-5.6-terra" if provider == "codex" else None, reasoning_effort="medium" if provider == "codex" else None, allow_cloud=True, literature_policy=_POLICY)
+        mapping_config = read_yaml(workspace / "auto-zettelkasten.yml", {})
+        if not isinstance(mapping_config, Mapping):
+            raise RequestError("Workspace configuration must be a mapping.")
+        request = MapRequest(workspace=workspace, scope=scope, collection_key=key, provider=provider, model=model, literature_model="gpt-5.6-terra" if provider == "codex" else None, reasoning_effort="medium" if provider == "codex" else None, allow_cloud=True, literature_policy=_POLICY,
+                             mapping_backend=mapping_config.get("mapping_backend", "local"), local_mapping=mapping_config.get("local_mapping", {}))
         with tempfile.TemporaryDirectory(prefix="az-estimate-") as temporary:
             scratch = Path(temporary)
             if workspace.exists():
@@ -486,7 +490,7 @@ class LocalApp:
                         target = scratch / source_path.relative_to(workspace)
                         target.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copyfile(source_path, target)
-            estimate = api.estimate_cost(scratch, scope=scope, collection_key=key or "", provider=provider, model=model, literature_policy=_POLICY, zotero_client=client)
+            estimate = api.estimate_cost(scratch, scope=scope, collection_key=key or "", provider=provider, model=model, literature_policy=_POLICY, zotero_client=client, mapping_backend=request.mapping_backend, local_mapping=request.local_mapping)
             estimate.pop("path", None)
         public = {"estimate_id": secrets.token_urlsafe(24), "source": source, "collection": {"key": key or "", "name": name, "path": path}, "workspace": str(workspace), "memory_workspace": str(workspace), "obsidian_path": str(export) if export else "", "destination": destination, "estimate": estimate}
         ticket = {"public": public, "request": request, "client": client, "created": time.monotonic(), "run_id": run_id, "export": export, "vault": vault, "api_key": self.api_key}

@@ -52,15 +52,15 @@ def test_public_build_map_receipt_does_not_skip_changed_local_selection(tmp_path
     args = dict(run_id="local-build", provider="ollama", model="fake-1", reasoner=reasoner,
                 literature_policy=LiteratureMappingPolicy(cluster_generation_enabled=False))
     source_hashes = {row["note_path"]: semantic_note_hash((tmp_path / row["note_path"]).read_text()) for row in note_rows}
-    assert build_map(tmp_path, ranked_candidates=[], **args).status == "built"
+    assert build_map(tmp_path, ranked_candidates=[], **args, mapping_backend="llm").status == "built"
     assert reasoner.candidate_calls == 0
-    assert build_map(tmp_path, ranked_candidates=[pair], **args).status == "built"
+    assert build_map(tmp_path, ranked_candidates=[pair], **args, mapping_backend="llm").status == "built"
     assert reasoner.candidate_calls == 1
-    assert build_map(tmp_path, ranked_candidates=[{**pair, "rank": 5, "score": 99.0, "why_compare": "Reordered."}], **args).status == "built"
+    assert build_map(tmp_path, ranked_candidates=[{**pair, "rank": 5, "score": 99.0, "why_compare": "Reordered."}], **args, mapping_backend="llm").status == "built"
     assert reasoner.candidate_calls == 1
     changed = deepcopy(pair)
     changed["discovery_provenance"][0]["work_id"] = "doi:10.1234/changed"
-    assert build_map(tmp_path, ranked_candidates=[changed], **args).status == "built"
+    assert build_map(tmp_path, ranked_candidates=[changed], **args, mapping_backend="llm").status == "built"
     assert reasoner.candidate_calls == 2
     assert _cluster_preservation_snapshot(tmp_path) == protected
     assert {path: semantic_note_hash((tmp_path / path).read_text()) for path in source_hashes} == source_hashes

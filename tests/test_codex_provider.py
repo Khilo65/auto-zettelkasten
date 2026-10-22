@@ -182,7 +182,7 @@ def test_codex_request_roles_and_existing_provider_serialization(tmp_path: Path)
     )
     assert request.to_dict()["literature_model"] == "gpt-5.6-terra"
     with pytest.raises(ValueError, match="requires literature_model"):
-        MapRequest(tmp_path, provider="codex", model="gpt-5.6-luna")
+        MapRequest(tmp_path, provider="codex", model="gpt-5.6-luna", mapping_backend="llm")
     MapRequest(
         tmp_path,
         provider="codex",
@@ -331,6 +331,7 @@ def test_codex_evidence_profile_contract_remains_dormant_in_production(
         provider="codex",
         model="gpt-5.6-luna",
         literature_model="gpt-5.6-terra",
+        mapping_backend="llm",
     )
     _policy, route, identity = _profile_dependency_policy(
         request, CodexReader("gpt-5.6-terra"), analytical=True
@@ -440,6 +441,7 @@ def test_codex_source_pause_resumes_from_frozen_content_without_terminal_checkpo
         parallel=1,
         provider_concurrency=1,
         literature_policy=LiteratureMappingPolicy(synthesis_enabled=False),
+        mapping_backend="llm",
     )
     reader = PauseOnceReader()
 
@@ -518,6 +520,7 @@ def test_codex_source_transport_failure_stops_queue_and_is_terminal(
         parallel=1,
         provider_concurrency=1,
         literature_policy=LiteratureMappingPolicy(synthesis_enabled=False),
+        mapping_backend="llm",
     )
     reader = TransportFailureReader()
     monkeypatch.setattr(
@@ -590,6 +593,7 @@ def test_codex_source_transport_failure_stops_queue_and_is_terminal(
             parallel=1,
             provider_concurrency=1,
             literature_policy=LiteratureMappingPolicy(synthesis_enabled=False),
+            mapping_backend="llm",
         ),
         client=FakeZotero(sample_items[:1]),
         reader=single_reader,
@@ -1395,6 +1399,7 @@ def test_codex_doctor_checks_both_requested_model_roles(
         "codex",
         source_model,
         {
+            "mapping_backend": "llm",
             "literature_model": "gpt-5.6-terra",
             "reasoning_effort": "high",
         },
@@ -1490,6 +1495,7 @@ def test_combined_codex_replay_without_new_calls_skips_live_preflight(
         model="gpt-5.6-luna",
         literature_model="gpt-5.6-terra",
         allow_cloud=True,
+        mapping_backend="llm",
     )
     source_reader = CodexReader("gpt-5.6-luna", allow_cloud=True)
     literature_reader = CodexReader("gpt-5.6-terra", allow_cloud=True)
@@ -2927,6 +2933,7 @@ def test_standalone_codex_build_map_installs_one_lazy_quota_stop_event(
             allow_cloud=True,
             provider_concurrency=2,
             reasoner=reasoner,
+            mapping_backend="llm",
         )
 
     assert submitted == [0, 1]
@@ -3224,6 +3231,7 @@ def test_public_codex_map_runs_relationships_and_replays_without_calls_or_semant
         literature_policy=LiteratureMappingPolicy(
             cluster_generation_enabled=True
         ),
+        mapping_backend="llm",
     )
     items = json.loads(json.dumps(sample_items))
     items[0]["data"].pop("relations", None)

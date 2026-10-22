@@ -306,7 +306,7 @@ def test_completed_resume_is_zero_call_and_zero_write(tmp_path, monkeypatch) -> 
     run_root = run_directory(tmp_path, run_id)
     request_path = run_root / "request.yml"
     report_path = run_root / "run_report.yml"
-    write_yaml(request_path, MapRequest(tmp_path).to_dict())
+    write_yaml(request_path, MapRequest(tmp_path, mapping_backend="llm").to_dict())
     report = RunReport(
         status="completed_with_parked_items",
         workspace=tmp_path,
@@ -318,7 +318,7 @@ def test_completed_resume_is_zero_call_and_zero_write(tmp_path, monkeypatch) -> 
     _write_source_replay_receipt(
         tmp_path,
         run_root,
-        MapRequest(tmp_path),
+        MapRequest(tmp_path, mapping_backend="llm"),
         report,
     )
     before = {

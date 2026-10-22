@@ -141,6 +141,7 @@ def _seed_workspace(
             provider="ollama",
             model="fake-1",
             literature_policy=LiteratureMappingPolicy(cluster_generation_enabled=False),
+            mapping_backend="llm",
         ),
         client=FakeZotero(items),
         reader=FakeReader(),
@@ -288,6 +289,7 @@ def test_clusters_off_preserves_history_runs_relationships_and_replays_exactly(
         model="fake-1",
         literature_policy=policy,
         reasoner=reasoner,
+        mapping_backend="llm",
     )
 
     assert first.status == "built"
@@ -378,6 +380,7 @@ def test_clusters_off_preserves_history_runs_relationships_and_replays_exactly(
         literature_policy=policy,
         reasoner=reasoner,
         resume=True,
+        mapping_backend="llm",
     )
 
     assert replay.status == "built"
@@ -409,6 +412,7 @@ def test_clusters_on_refreshes_post_adjudication_catalogue_and_progress(
         model="fake-1",
         literature_policy=LiteratureMappingPolicy(cluster_generation_enabled=True),
         reasoner=reasoner,
+        mapping_backend="llm",
     )
 
     assert result.status == "built"
@@ -481,7 +485,7 @@ def test_catalogue_projection_tamper_invalidates_receipt_replay(
         "reasoner": reasoner,
     }
 
-    first = build_map(tmp_path, **kwargs)
+    first = build_map(tmp_path, **kwargs, mapping_backend="llm")
     generated_catalogue_paths = {
         path
         for directory in (
@@ -511,7 +515,7 @@ def test_catalogue_projection_tamper_invalidates_receipt_replay(
         reasoner.cluster_calls,
     )
 
-    replay = build_map(tmp_path, resume=True, **kwargs)
+    replay = build_map(tmp_path, resume=True, **kwargs, mapping_backend="llm")
 
     assert replay.status == "built"
     assert target.read_text(encoding="utf-8") != "tampered\n"
@@ -536,6 +540,7 @@ def test_clusters_off_receipt_replay_rejects_changed_protected_state(
         model="fake-1",
         literature_policy=policy,
         reasoner=reasoner,
+        mapping_backend="llm",
     )
     calls = (reasoner.candidate_calls, reasoner.adjudication_calls)
     gap_path = (
@@ -561,6 +566,7 @@ def test_clusters_off_receipt_replay_rejects_changed_protected_state(
             literature_policy=policy,
             reasoner=reasoner,
             resume=True,
+            mapping_backend="llm",
         )
 
     assert (reasoner.candidate_calls, reasoner.adjudication_calls) == calls
@@ -583,6 +589,7 @@ def test_fresh_map_family_timeout_preserves_absent_cluster_outputs(
             provider="ollama",
             model="fake-1",
             literature_policy=LiteratureMappingPolicy(cluster_generation_enabled=True),
+            mapping_backend="llm",
         ),
         client=FakeZotero(sample_items),
         reader=FakeReader(),
@@ -612,6 +619,7 @@ def test_clusters_off_partial_relationship_stage_preserves_protected_state(
         model="fake-1",
         literature_policy=LiteratureMappingPolicy(cluster_generation_enabled=False),
         reasoner=reasoner,
+        mapping_backend="llm",
     )
 
     assert result.status == "partial"
@@ -671,6 +679,7 @@ def test_terminal_relationship_failure_stops_before_cluster_synthesis(
         model="fake-1",
         literature_policy=policy,
         reasoner=reasoner,
+        mapping_backend="llm",
     )
 
     assert result.status == "partial"
@@ -706,6 +715,7 @@ def test_terminal_relationship_failure_stops_before_cluster_synthesis(
         model="fake-1",
         literature_policy=policy,
         reasoner=reasoner,
+        mapping_backend="llm",
     )
 
     assert replay.status == "partial"
@@ -754,6 +764,7 @@ def test_clusters_off_profile_failure_stays_partial(
             cluster_generation_enabled=False
         ),
         reasoner=_RelationshipReasoner(),
+        mapping_backend="llm",
     )
 
     assert result.status == "partial"
@@ -779,6 +790,7 @@ def test_clusters_off_without_relationship_capability_stays_partial(
             cluster_generation_enabled=False
         ),
         reasoner=None,
+        mapping_backend="llm",
     )
 
     assert result.status == "partial"
@@ -813,6 +825,7 @@ def test_missing_legacy_cluster_toggle_keeps_no_reasoner_build_compatible(
                 synthesis_enabled=False,
                 cluster_generation_enabled=None,
             ),
+            mapping_backend="llm",
         ),
         client=FakeZotero(sample_items),
         reader=FakeReader(),
@@ -829,6 +842,7 @@ def test_missing_legacy_cluster_toggle_keeps_no_reasoner_build_compatible(
             cluster_generation_enabled=None
         ),
         reasoner=None,
+        mapping_backend="llm",
     )
 
     assert result.status == "built"
@@ -868,6 +882,7 @@ def test_run_map_migrates_once_and_passes_the_result_to_rebuild(
                 synthesis_enabled=False,
                 cluster_generation_enabled=False,
             ),
+            mapping_backend="llm",
         ),
         client=FakeZotero(sample_items[:1]),
         reader=FakeReader(),

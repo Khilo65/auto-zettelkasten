@@ -51,6 +51,21 @@ SPEC.loader.exec_module(runner)
 CODE_COMMIT = "a" * 40
 
 
+def _initialize_historical_raw_workspace(root: Path) -> None:
+    """Retain the exact synthetic config accepted by the frozen raw gate.
+
+    New workspace defaults include local mapping settings. These historical
+    campaign fixtures predate backend selection; keep their original bytes
+    without changing the gate's accepted hashes or model/resource controls.
+    """
+    initialize_workspace(root)
+    config_path = root / "auto-zettelkasten.yml"
+    config = read_yaml(config_path)
+    config.pop("mapping_backend")
+    config.pop("local_mapping")
+    write_yaml(config_path, config)
+
+
 class _FakeGuard:
     def __init__(self, events: list[tuple[str, str]]) -> None:
         self.events = events
@@ -77,7 +92,7 @@ class _FakeGuard:
 def _manifest(root: Path) -> Path:
     files = root / "frozen"
     files.mkdir(parents=True)
-    initialize_workspace(root)
+    _initialize_historical_raw_workspace(root)
     cases: list[dict[str, Any]] = []
     definitions = (
         ("pdf", "application/pdf", "pypdf_text", "validated_note"),
@@ -375,7 +390,7 @@ def _strategic_manifests(root: Path) -> tuple[Path, Path, Path, Path]:
 
     def live_manifest(name: str, custody_path: Path, sources: list[dict[str, Any]]) -> Path:
         live = root / f"{name}-live"
-        initialize_workspace(live)
+        _initialize_historical_raw_workspace(live)
         cases: list[dict[str, Any]] = []
         live_sources = (
             sorted(sources, key=lambda row: str(row["parent_key"]).casefold())
@@ -1120,10 +1135,10 @@ def _write_graph_run(workspace: Path, kwargs: Mapping[str, Any]) -> None:
     )
 
 
-def test_raw_workspace_config_hash_matches_current_initialized_config(
+def test_raw_workspace_config_hash_matches_frozen_historical_config(
     tmp_path: Path,
 ) -> None:
-    initialize_workspace(tmp_path)
+    _initialize_historical_raw_workspace(tmp_path)
 
     assert sha256_file(tmp_path / "auto-zettelkasten.yml") == (
         runner._RAW_CONFIG_SHA256

@@ -33,6 +33,8 @@ CONFIG_FIELDS = {
     "processing",
     "literature_mapping",
     "navigation",
+    "mapping_backend",
+    "local_mapping",
     "obsidian",
 }
 
@@ -96,6 +98,8 @@ def initialize(workspace: Path | str, *, overwrite: bool = False) -> ArtifactMan
         ensure_dir(root / relative)
 
     if overwrite or not config_path.exists():
+        from .local_mapping import LocalMappingOptions
+
         write_yaml(
             config_path,
             {
@@ -104,6 +108,8 @@ def initialize(workspace: Path | str, *, overwrite: bool = False) -> ArtifactMan
                 "scope": "library",
                 "provider": "deepseek",
                 "model": "deepseek-v4-flash",
+                "mapping_backend": "local",
+                "local_mapping": LocalMappingOptions().to_dict(),
                 "privacy": {"allow_cloud": False},
                 "extraction": {
                     "version": "2",
@@ -218,6 +224,14 @@ def load_config(workspace: Path | str) -> dict[str, Any]:
     unknown = sorted(set(config) - CONFIG_FIELDS)
     if unknown:
         raise ValueError(f"unknown workspace config fields: {', '.join(unknown)}")
+    backend = config.get("mapping_backend", "local")
+    if not isinstance(backend, str) or backend not in {"local", "llm"}:
+        raise ValueError("mapping_backend must be local or llm")
+    from .local_mapping import LocalMappingOptions
+
+    local_options = LocalMappingOptions.from_dict(config.get("local_mapping", {}))
+    config.setdefault("mapping_backend", "local")
+    config["local_mapping"] = local_options.to_dict()
     provider = str(config.get("provider") or "deepseek")
     if provider != "codex" and any(
         config.get(field_name) is not None

@@ -125,6 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
     map_parser.add_argument("--context-window-fraction", type=float, default=None)
     map_parser.add_argument("--estimated-chars-per-token", type=float, default=None)
     _add_literature_policy_arguments(map_parser)
+    _add_local_mapping_arguments(map_parser)
     _add_navigation_policy_arguments(map_parser)
 
     sync_parser = commands.add_parser(
@@ -164,6 +165,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--pdf-fallback", choices=("none", "images", "ocr"), default=None
     )
     _add_literature_policy_arguments(sync_parser)
+    _add_local_mapping_arguments(sync_parser)
     _add_navigation_policy_arguments(sync_parser)
 
     resume_parser = commands.add_parser("resume", help="Resume an interrupted or partially terminal run.")
@@ -200,6 +202,7 @@ def build_parser() -> argparse.ArgumentParser:
     estimate_parser.add_argument(
         "--clusters", action=argparse.BooleanOptionalAction, default=None
     )
+    _add_local_mapping_arguments(estimate_parser)
 
     build_parser_command = commands.add_parser("build-map", help="Rebuild typed links, clusters, gaps, and indexes from validated notes.")
     build_parser_command.add_argument("--workspace", type=Path, required=True)
@@ -230,6 +233,7 @@ def build_parser() -> argparse.ArgumentParser:
     build_parser_command.add_argument("--retry-terminal-literature", action="store_true")
     build_parser_command.add_argument("--local-candidates", type=Path, help="Use a prepared local shortlist instead of provider discovery.")
     _add_literature_policy_arguments(build_parser_command)
+    _add_local_mapping_arguments(build_parser_command)
     _add_navigation_policy_arguments(build_parser_command)
 
     scan_parser = commands.add_parser("local-discovery", help="Inspect a bounded Zotero selection locally without provider calls.")
@@ -360,6 +364,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 processing=_processing_policy(args, config),
                 literature_policy=_literature_policy(args, config),
                 navigation_policy=_navigation_policy(args, config),
+                mapping_backend=_mapping_backend(args, config),
+                local_mapping=_local_mapping_options(args, config),
             )
             result = run_map(request, run_id=args.run_id or None).to_dict()
         elif args.command == "sync":
@@ -418,6 +424,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 extraction_policy=_extraction_policy(args, config),
                 literature_policy=_literature_policy(args, config),
                 navigation_policy=_navigation_policy(args, config),
+                mapping_backend=_mapping_backend(args, config),
+                local_mapping=_local_mapping_options(args, config),
             )
             result = sync_zotero(
                 request,
@@ -448,6 +456,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 model=model,
                 graph_only=args.graph_only,
                 literature_policy=_literature_policy(args, config),
+                mapping_backend=_mapping_backend(args, config),
+                local_mapping=_local_mapping_options(args, config),
             )
         elif args.command == "build-map":
             config = load_config(args.workspace)
@@ -492,6 +502,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 comparison_collection_keys=args.comparison_collection_keys,
                 literature_policy=_literature_policy(args, config),
                 navigation_policy=_navigation_policy(args, config),
+                mapping_backend=_mapping_backend(args, config),
+                local_mapping=_local_mapping_options(args, config),
                 resume=args.resume,
                 retry_terminal_failures=args.retry_terminal_literature,
                 **({"ranked_candidates": _read_local_candidates(args.local_candidates)} if args.local_candidates else {}),
@@ -660,6 +672,55 @@ def _extraction_policy(
             else defaults.pdf_fallback
         ),
     )
+
+
+def _add_local_mapping_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--mapping-backend",
+        choices=("local", "llm"),
+        default=None,
+        help="Local MiniLM mapping (default), or explicitly selected LLM mapping.",
+    )
+    parser.add_argument(
+        "--local-encoder",
+        choices=("minilm",),
+        default=None,
+        help="Local sentence-transformers/all-MiniLM-L6-v2 encoder.",
+    )
+    parser.add_argument(
+        "--local-clustering",
+        choices=("leiden", "hdbscan"),
+        default=None,
+        help="Leiden communities (default), or optional HDBSCAN density/noise view.",
+    )
+    parser.add_argument(
+        "--embedding-model-path",
+        default=None,
+        help="Existing local MiniLM model directory; model downloads are disabled.",
+    )
+
+
+def _mapping_backend(args: argparse.Namespace, config: dict[str, Any]) -> str:
+    return getattr(args, "mapping_backend", None) or str(
+        config.get("mapping_backend", "local")
+    )
+
+
+def _local_mapping_options(
+    args: argparse.Namespace, config: dict[str, Any]
+) -> dict[str, Any]:
+    from .local_mapping import LocalMappingOptions
+
+    configured = config.get("local_mapping", {})
+    defaults = LocalMappingOptions.from_dict(configured)
+    payload = defaults.to_dict()
+    overrides = {
+        "encoder": getattr(args, "local_encoder", None),
+        "clustering": getattr(args, "local_clustering", None),
+        "model_path": getattr(args, "embedding_model_path", None),
+    }
+    payload.update({key: value for key, value in overrides.items() if value is not None})
+    return LocalMappingOptions.from_dict(payload).to_dict()
 
 
 def _add_literature_policy_arguments(parser: argparse.ArgumentParser) -> None:
