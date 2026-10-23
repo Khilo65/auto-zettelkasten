@@ -13,6 +13,7 @@ import copy
 from dataclasses import dataclass
 import hashlib
 import json
+from itertools import chain
 import math
 import os
 from pathlib import Path
@@ -43,6 +44,9 @@ MAX_REGISTRY_BYTES = 32 * 1024 * 1024
 _SEMANTIC_MAP_PARTS = (".auto-zettelkasten", "mapping")
 _SEMANTIC_MAP_SCHEMA = "local-semantic-map-v1"
 _SEMANTIC_DEPENDENCY_BYTES = 32 * 1024 * 1024
+_ORIGIN_METADATA_PARTS = ("11_state", "note_metadata")
+_ORIGIN_METADATA_BYTES = 16 * MAX_FILE_BYTES
+_ORIGIN_RECORD_BYTES = 65536
 _INDEX_TTL = 600
 _YAML_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 _LOCK = threading.RLock()
@@ -200,6 +204,102 @@ def _frontmatter(text: str) -> dict[str, Any]:
         return {}
 
 
+def _origin_identity(data: bytes) -> dict[str, Any]:
+    """Project four scalar identity claims without constructing private YAML graphs.
+
+    Writer metadata can share unrelated coverage structures through aliases. Their
+    events are checked and skipped, never expanded into objects or identity values.
+    """
+    if len(data) > _ORIGIN_RECORD_BYTES:
+        return {}
+    wanted = {("metadata_schema_version",), ("note_path",),
+              ("frontmatter", "note_id"), ("frontmatter", "source_id")}
+    identity_maps = {(), ("frontmatter",)}
+    values = {}
+    anchors, active_anchors = set(), set()
+    try:
+        events = iter(yaml.parse(data.decode("utf-8-sig"), Loader=_YAML_LOADER))
+        event_count = 0
+        resolver = yaml.resolver.Resolver()
+
+        def advance():
+            nonlocal event_count
+            event_count += 1
+            if event_count > 32768:
+                raise ValueError("Origin metadata event limit")
+            return next(events)
+
+        def string(event):
+            if not isinstance(event, yaml.ScalarEvent):
+                raise ValueError("Origin identity requires scalar strings")
+            tag = event.tag or resolver.resolve(yaml.ScalarNode, event.value, event.implicit)
+            if tag != "tag:yaml.org,2002:str":
+                raise ValueError("Origin identity requires string tags")
+            return event.value
+
+        def walk(event, depth, path=None):
+            anchor = getattr(event, "anchor", None)
+            if isinstance(event, yaml.AliasEvent):
+                if path in wanted or path in identity_maps or anchor not in anchors or anchor in active_anchors:
+                    raise ValueError("Invalid origin metadata alias")
+                return
+            if anchor:
+                if anchor in anchors:
+                    raise ValueError("Duplicate origin metadata anchor")
+                anchors.add(anchor)
+            if path in wanted:
+                values[path] = string(event)
+                return
+            if path in identity_maps and (not isinstance(event, yaml.MappingStartEvent)
+                    or event.tag not in (None, "tag:yaml.org,2002:map")):
+                raise ValueError("Origin identity requires direct mappings")
+            if isinstance(event, yaml.ScalarEvent):
+                return
+            if depth > 32:
+                raise ValueError("Origin metadata depth limit")
+            if anchor:
+                active_anchors.add(anchor)
+            if isinstance(event, yaml.MappingStartEvent):
+                seen = set()
+                key = advance()
+                while not isinstance(key, yaml.MappingEndEvent):
+                    key_name = string(key) if path in identity_maps else None
+                    walk(key, depth + 1)
+                    child_path = (*path, key_name) if path in identity_maps else None
+                    selected = child_path in wanted or child_path == ("frontmatter",)
+                    if path in identity_maps and key_name == "<<":
+                        raise ValueError("Origin identity cannot use merged mappings")
+                    if selected and key_name in seen:
+                        raise ValueError("Duplicate origin identity claim")
+                    if selected:
+                        seen.add(key_name)
+                    walk(advance(), depth + 1, child_path if selected else None)
+                    key = advance()
+            elif isinstance(event, yaml.SequenceStartEvent):
+                item = advance()
+                while not isinstance(item, yaml.SequenceEndEvent):
+                    walk(item, depth + 1)
+                    item = advance()
+            else:
+                raise ValueError("Unexpected origin metadata event")
+            if anchor:
+                active_anchors.remove(anchor)
+
+        if not isinstance(advance(), yaml.StreamStartEvent) or not isinstance(advance(), yaml.DocumentStartEvent):
+            return {}
+        walk(advance(), 1, ())
+        if not isinstance(advance(), yaml.DocumentEndEvent) or not isinstance(advance(), yaml.StreamEndEvent):
+            return {}
+        if set(values) != wanted:
+            return {}
+        return {"metadata_schema_version": values[("metadata_schema_version",)],
+                "note_path": values[("note_path",)],
+                "frontmatter": {"note_id": values[("frontmatter", "note_id")],
+                                "source_id": values[("frontmatter", "source_id")]}}
+    except (yaml.YAMLError, UnicodeError, RecursionError, ValueError, StopIteration):
+        return {}
+
+
 def _document_metadata(path: str, fields: dict[str, Any]) -> dict[str, Any]:
     kind = fields.get("type")
     parts = path.split("/")
@@ -329,6 +429,118 @@ class _Directory:
         return False
 
 
+def _registry_display_value(start, events, anchors):
+    """Read one small public metadata field without loading private YAML trees."""
+    stack = []
+    safe = True
+    count = 0
+    result = None
+    for at, event in enumerate(chain((start,), events)):
+        count += 1
+        if count > 8192 or len(stack) > 12:
+            raise ValueError("Relation display metadata exceeds its structure limit")
+        anchor = getattr(event, "anchor", None)
+        if anchor and not isinstance(event, yaml.AliasEvent):
+            if at and anchor in anchors:
+                raise ValueError("Duplicate registry anchor")
+            anchors.add(anchor)
+            safe = False
+        if getattr(event, "tag", None) not in {None, "tag:yaml.org,2002:map", "tag:yaml.org,2002:seq",
+                                                "tag:yaml.org,2002:str", "tag:yaml.org,2002:bool", "tag:yaml.org,2002:int",
+                                                "tag:yaml.org,2002:float", "tag:yaml.org,2002:null"}:
+            safe = False
+        if isinstance(event, yaml.AliasEvent):
+            safe = False
+        elif isinstance(event, (yaml.MappingStartEvent, yaml.SequenceStartEvent)):
+            stack.append({"value": {} if isinstance(event, yaml.MappingStartEvent) else [], "key": None})
+        elif isinstance(event, (yaml.MappingEndEvent, yaml.SequenceEndEvent)):
+            value = stack.pop()["value"]
+            if not stack:
+                return value if safe else None, count
+            parent = stack[-1]
+            if isinstance(parent["value"], list):
+                parent["value"].append(value)
+            elif parent["key"] is not None:
+                parent["value"][parent["key"]] = value
+                parent["key"] = None
+            else:
+                safe = False
+        elif isinstance(event, yaml.ScalarEvent):
+            parent = stack[-1]
+            excerpt = isinstance(parent["value"], dict) and parent["key"] == "text"
+            if len(event.value) > (24000 if excerpt else 8192) or event.tag not in {None, "tag:yaml.org,2002:str", "tag:yaml.org,2002:bool", "tag:yaml.org,2002:int", "tag:yaml.org,2002:float", "tag:yaml.org,2002:null"}:
+                safe = False
+            # Keep scalars as strings; projection validates just the fields it uses.
+            value = event.value[:24000 if excerpt else 8192]
+            if isinstance(parent["value"], list):
+                parent["value"].append(value)
+            elif parent["key"] is None:
+                if value in parent["value"]:
+                    safe = False
+                parent["key"] = value
+            else:
+                parent["value"][parent["key"]] = value
+                parent["key"] = None
+    raise ValueError("Incomplete relation display metadata")
+
+
+def _relation_display_metadata(row, note_ids, source, target):
+    """Publish bounded decision metadata and existing note destinations only."""
+    result = {}
+    for key in ("provider", "model", "template_version", "policy_version", "output_contract", "verification_status"):
+        value = row.get(key)
+        if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", value):
+            result[key] = value
+    for key in ("confidence", "top_probability", "probability_margin"):
+        value = row.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and 0 <= value <= 1:
+            result[key] = value
+    if row.get("evidence_basis") in {"note_summary", "supplied_passages"}:
+        result["evidence_basis"] = row["evidence_basis"]
+    probabilities = row.get("probabilities")
+    if isinstance(probabilities, dict) and len(probabilities) <= 255:
+        values = {}
+        for key, raw in probabilities.items():
+            try:
+                value = float(raw) if not isinstance(raw, bool) else math.nan
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if isinstance(key, str) and re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", key) and math.isfinite(value) and 0 <= value <= 1:
+                values[key] = value
+        if values:
+            result["probabilities"] = values
+    evidence = []
+    rows = row.get("selected_evidence")
+    for passage in rows[:2] if isinstance(rows, list) else ():
+        if not isinstance(passage, dict):
+            continue
+        entry = note_ids.get(passage.get("note_id")) if isinstance(passage.get("note_id"), str) else None
+        if not entry or entry[1] not in {source, target} or not isinstance(passage.get("text"), str):
+            continue
+        value = {"path": entry[1], "text": passage["text"][:1600]}
+        for key in ("passage_id", "attribution"):
+            if isinstance(passage.get(key), str):
+                value[key] = passage[key][:256]
+        locator = passage.get("locator")
+        if isinstance(locator, dict):
+            projected = {}
+            for key in ("kind", "heading"):
+                if isinstance(locator.get(key), str):
+                    projected[key] = locator[key][:256]
+            for key in ("line_start", "line_end"):
+                raw = locator.get(key)
+                if isinstance(raw, str) and raw.isascii() and raw.isdecimal() and len(raw) < 8:
+                    raw = int(raw)
+                if type(raw) is int and 1 <= raw <= 10_000_000:
+                    projected[key] = raw
+            if projected:
+                value["locator"] = projected
+        evidence.append(value)
+    if evidence:
+        result["selected_evidence"] = evidence
+    return result
+
+
 class DocumentService:
     """One explicitly selected root; opening another root invalidates old IDs.
 
@@ -382,6 +594,56 @@ class DocumentService:
     def _workspace(self, workspace_id: str) -> None:
         if not self._root or not workspace_id or workspace_id != self._workspace_id:
             raise DocumentError("Open a workspace before accessing its documents.")
+
+    def workspace_key(self, workspace_id: str) -> str:
+        """Stable private preference identity; session IDs deliberately change on open."""
+        with _LOCK, self._errors():
+            self._workspace(workspace_id)
+            with self._directory():
+                return hashlib.sha256(str(self._root.resolve()).encode("utf-8")).hexdigest()
+
+    def _note_origin(self, path, fields, *, dependencies=None, budget=None):
+        """Only protected writer metadata establishes managed source provenance.
+
+        Read-only status, folders, titles and public frontmatter are not authorship
+        evidence. Existing notes without an origin receipt remain unknown.
+        """
+        note_id = fields.get("note_id")
+        if not isinstance(note_id, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", note_id):
+            return "unknown"
+        name = f"{note_id}.yml"
+        stamp = self._semantic_dependency_stamp(_ORIGIN_METADATA_PARTS, name)
+        if dependencies is not None:
+            if name in dependencies and dependencies[name] != stamp:
+                raise DocumentIndexChanged()
+            dependencies[name] = stamp
+        if stamp is None or stamp == "unavailable":
+            return "unknown"
+        try:
+            with self._directory(_ORIGIN_METADATA_PARTS) as directory:
+                size = directory.stat(name).st_size
+                if size > _ORIGIN_RECORD_BYTES or budget is not None and size > budget[0]:
+                    return "unknown"
+                data, info = self._read_derived_bytes(directory, name, max_bytes=_ORIGIN_RECORD_BYTES)
+                if _stamp(info) != stamp:
+                    raise DocumentIndexChanged()
+            if budget is not None:
+                budget[0] -= len(data)
+            metadata = _origin_identity(data)
+            from .notes import NOTE_METADATA_SCHEMA_VERSION
+            stored = metadata.get("frontmatter")
+            source_id = stored.get("source_id") if isinstance(stored, dict) else None
+            if (metadata.get("metadata_schema_version") == NOTE_METADATA_SCHEMA_VERSION
+                    and metadata.get("note_path") == path and isinstance(stored, dict)
+                    and stored.get("note_id") == note_id
+                    and isinstance(source_id, str) and 0 < len(source_id) <= 256
+                    and ("source_id" not in fields or fields["source_id"] == source_id)):
+                return "managed"
+        except DocumentIndexChanged:
+            raise
+        except (DocumentError, OSError, UnicodeError, ValueError, RecursionError):
+            pass
+        return "unknown"
 
     @contextmanager
     def _directory(self, parts: tuple[str, ...] = ()) -> Iterator[_Directory]:
@@ -544,12 +806,14 @@ class DocumentService:
         document_id = self._document_ids.setdefault(relative, secrets.token_urlsafe(24))
         self._documents[document_id] = relative, _identity(info)
         recovery_key = hashlib.sha256(f"{self._root}\0{relative}".encode("utf-8")).hexdigest()
+        fields = _frontmatter(text)
         document = {
             "id": document_id, "path": relative, "name": Path(relative).name,
             "text": text, "revision": hashlib.sha256(data).hexdigest(),
             "editable": not reason, "reason": reason, "bom": bom,
             "newline": newline, "recovery_key": recovery_key,
-            **_document_metadata(relative, _frontmatter(text)),
+            **_document_metadata(relative, fields),
+            "note_origin": self._note_origin(relative, fields),
         }
         return self._override_document(document) if effective else document
 
@@ -900,6 +1164,59 @@ class DocumentService:
             if paths:
                 communities.append({"community_id": row["community_id"], "algorithm": row["algorithm"], "paths": paths,
                                     **({"noise": row["noise"]} if "noise" in row else {})})
+                # A title describes the recorded membership, so do not carry it
+                # onto a partial community after one of its sources changes.
+                label = row.get("display_label")
+                if (len(paths) == len(set(row["source_ids"])) and isinstance(label, str)
+                        and 0 < len(label.strip()) <= 160 and not any(ord(char) < 32 for char in label)):
+                    communities[-1]["display_label"] = label.strip()
+                if row.get("scale") == "default":
+                    communities[-1]["scale"] = "default"
+        community_scales = []
+        scales = mapping.get("community_scales", [])
+        if not isinstance(scales, list) or len(scales) > 3:
+            invalid = True
+            scales = []
+        seen_scales = set()
+        for scale in scales:
+            if (not isinstance(scale, dict) or scale.get("scale") not in {"broad", "default", "fine"}
+                    or scale["scale"] in seen_scales
+                    or isinstance(scale.get("resolution"), bool)
+                    or not isinstance(scale.get("resolution"), (int, float))
+                    or not math.isfinite(scale["resolution"]) or scale["resolution"] <= 0
+                    or not isinstance(scale.get("communities"), list) or len(scale["communities"]) > 100000):
+                invalid = True
+                continue
+            seen_scales.add(scale["scale"])
+            projected, scale_ids, scale_members = [], set(), set()
+            for row in scale["communities"]:
+                if (not isinstance(row, dict) or not isinstance(row.get("community_id"), str)
+                        or not re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", row["community_id"])
+                        or row["community_id"] in scale_ids or row.get("algorithm") not in {"leiden", "hdbscan"}
+                        or "noise" in row and type(row["noise"]) is not bool
+                        or not isinstance(row.get("source_ids"), list)
+                        or any(not isinstance(value, str) for value in row["source_ids"])):
+                    invalid = True
+                    continue
+                members = set(row["source_ids"])
+                if members & scale_members:
+                    invalid = True
+                    continue
+                scale_ids.add(row["community_id"])
+                scale_members.update(members)
+                paths = sorted({sources[sid]["path"] for sid in members if sid in sources})
+                if not paths:
+                    continue
+                item = {"community_id": row["community_id"], "algorithm": row["algorithm"],
+                        "paths": paths, "scale": scale["scale"],
+                        **({"noise": row["noise"]} if "noise" in row else {})}
+                label = row.get("display_label")
+                if (len(paths) == len(members) and isinstance(label, str) and 0 < len(label.strip()) <= 160
+                        and not any(ord(char) < 32 for char in label)):
+                    item["display_label"] = label.strip()
+                projected.append(item)
+            community_scales.append({"scale": scale["scale"], "resolution": scale["resolution"],
+                                     "communities": sorted(projected, key=lambda row: row["community_id"])})
         relations, pairs = [], set()
         for row in mapping["neighbors"]:
             if not isinstance(row, dict):
@@ -939,6 +1256,7 @@ class DocumentService:
         partial = invalid or any(coverage[key] for key in ("unavailable", "stale", "unresolved"))
         metadata = {"status": "partial" if partial else "current", "identity_digest": digest,
                     "communities": sorted(communities, key=lambda row: row["community_id"]),
+                    "community_scales": community_scales,
                     "note_revisions": revisions, "coverage": {**coverage,
                         "dependency_bytes_read": _SEMANTIC_DEPENDENCY_BYTES - dependency_budget,
                         "dependency_byte_limit": _SEMANTIC_DEPENDENCY_BYTES,
@@ -1016,6 +1334,11 @@ class DocumentService:
             path = "/".join((*parts, name))
             record(path, ("semantic_dependency", self._semantic_dependency_stamp(parts, name)))
             yield None
+        for name, stamp in sorted(run.get("origin_dependencies", {}).items()):
+            if self._semantic_dependency_stamp(_ORIGIN_METADATA_PARTS, name) != stamp:
+                raise DocumentIndexChanged()
+            record("origin:" + "/".join((*_ORIGIN_METADATA_PARTS, name)), ("origin_dependency", stamp))
+            yield None
         if expected is not None and inventory != expected:
             raise DocumentIndexChanged()
 
@@ -1061,6 +1384,13 @@ class DocumentService:
             return
         if relation_type in SUBSTANTIVE_RELATION_TYPES and row.get("decision_status") != "accepted":
             return
+        if row.get("output_contract") == "jev-relationship-policy-v1":
+            from .jev_relationships import jev_relationship_is_fresh
+            if not jev_relationship_is_fresh(self._root, row, memo=run.setdefault("jev_freshness", {})):
+                warning = "Some Jev relationships were omitted because their source evidence changed or is unavailable."
+                if warning not in run["warnings"]:
+                    run["warnings"].append(warning)
+                return
 
         unresolved = set()
 
@@ -1083,7 +1413,8 @@ class DocumentService:
             for status in sorted(unresolved):
                 self._index_warning(run, f"Some typed relations have {status} note destinations.")
             return
-        value = {"id": relation_id, "source": source, "target": target, "type": relation_type}
+        value = {"id": relation_id, "source": source, "target": target, "type": relation_type,
+                 **_relation_display_metadata(row, run["note_ids"], source, target)}
         previous = run["projected"].get(relation_id)
         if previous is not None and previous != value:
             raise ValueError("Conflicting relation identities")
@@ -1121,10 +1452,15 @@ class DocumentService:
             stack, schema, links_seen, documents, events = [], None, False, 0, 0
             root_keys, anchors, row_anchors = set(), set(), {}
             fields = {"relation_id", "relation_type", "source_note_id", "target_note_id", "source_cluster_id",
-                      "target_cluster_id", "source_id", "source_kind", "active", "decision_status", "reconciliation_pending", "refresh_pending"}
+                      "target_cluster_id", "source_id", "target_source_id", "source_kind", "active", "decision_status", "reconciliation_pending", "refresh_pending",
+                      "provider", "model", "template_version", "policy_version", "output_contract", "verification_status",
+                      "confidence", "top_probability", "probability_margin", "evidence_basis", "decision_schema_version",
+                      "prompt_version", "source_template_version", "source_profile_hash", "target_profile_hash"}
+            public_structures = {"probabilities", "selected_evidence", "bindings"}
             scalar_loader = _YAML_LOADER("")
             try:
-                for event in yaml.parse(bytes(data), Loader=_YAML_LOADER):
+                event_stream = iter(yaml.parse(bytes(data), Loader=_YAML_LOADER))
+                for event in event_stream:
                     events += 1
                     if events > 4000000 or len(stack) > 64:
                         raise ValueError("Unsupported registry structure")
@@ -1159,6 +1495,16 @@ class DocumentService:
                         kind = "map" if isinstance(event, yaml.MappingStartEvent) else "sequence"
                         parent = stack[-1] if stack else None
                         key = parent.get("key") if parent else None
+                        if parent and parent["role"] in {"row", "candidate"} and key in public_structures:
+                            if key in parent["row"]:
+                                raise ValueError("Duplicate relation field")
+                            value, consumed = _registry_display_value(event, event_stream, anchors)
+                            events += consumed - 1
+                            if value is not None:
+                                parent["row"][key] = value
+                            parent["key"] = None
+                            yield None
+                            continue
                         role = "skip"
                         if parent is None:
                             if kind != "map":
@@ -1260,6 +1606,8 @@ class DocumentService:
                        "progress": {"documents": 0, "bytes": 0, "scanned": 0, "relations": 0},
                        "checking": checking, "pending": None, "iterator": None, "last_cursor": None,
                        "last_page": None, "cursor": None, "expires": time.monotonic() + _INDEX_TTL}
+                run["origin_dependencies"] = dict(checking.get("origin_dependencies", {})) if checking else {}
+                run["origin_budget"] = [_ORIGIN_METADATA_BYTES]
                 self._index_run = run
                 if checking and run["root_stamp"] != checking["root_stamp"]:
                     self._close_index_run()
@@ -1271,7 +1619,9 @@ class DocumentService:
                     self._close_index_run()
                     raise DocumentError("The index cursor is invalid or expired. Restart indexing.")
                 if cursor == run["last_cursor"]:
-                    if self._overrides is not None and self._index_root_stamp() != run["root_stamp"]:
+                    if ((self._overrides is not None and self._index_root_stamp() != run["root_stamp"])
+                            or any(self._semantic_dependency_stamp(_ORIGIN_METADATA_PARTS, name) != stamp
+                                   for name, stamp in run["origin_dependencies"].items())):
                         self._close_index_run()
                         raise DocumentIndexChanged()
                     return copy.deepcopy(run["last_page"])
@@ -1345,6 +1695,8 @@ class DocumentService:
                                 run["pending"] = item
                                 break
                             fields = self._index_note_ids(run, path, text)
+                            document["note_origin"] = self._note_origin(
+                                path, fields, dependencies=run["origin_dependencies"], budget=run["origin_budget"])
                             if run["semantic_mapping"] and not run["semantic_mapping"].get("unavailable"):
                                 run["semantic_documents"].append(self._semantic_document(
                                     path, text, document, hashlib.sha256(data).hexdigest()))
@@ -1388,7 +1740,7 @@ class DocumentService:
                         if "semantic_map" in run["checking"]:
                             result["semantic_map"] = copy.deepcopy(run["checking"]["semantic_map"])
                     elif not run["truncated"]:
-                        self._completed_index = {key: run[key] for key in ("generation", "root_stamp", "inventory", "progress")}
+                        self._completed_index = {key: run[key] for key in ("generation", "root_stamp", "inventory", "progress", "origin_dependencies")}
                         self._completed_index.update({key: result[key] for key in ("document_identities", "relation_resolution", "index_coverage")})
                         if "semantic_map" in result:
                             self._completed_index["semantic_map"] = copy.deepcopy(result["semantic_map"])
@@ -1414,6 +1766,8 @@ class DocumentService:
             semantic_dependencies = {(parts, name): self._semantic_dependency_stamp(parts, name)
                                      for parts, name in self._semantic_dependency_files(semantic_mapping)}
             identity_candidates = []
+            origin_dependencies = {}
+            origin_budget = [_ORIGIN_METADATA_BYTES]
             override_generation = self._override_generation()
             pending = deque([()])
             scanned = entries = inspected_bytes = 0
@@ -1474,6 +1828,8 @@ class DocumentService:
                                     else:
                                         effective = document
                                     fields = _frontmatter(text)
+                                    effective["note_origin"] = self._note_origin(
+                                        document["path"], fields, dependencies=origin_dependencies, budget=origin_budget)
                                     effective.update(_document_metadata(document["path"], fields))
                                     identity = _generated_identity(document["path"], fields, document["revision"], effective["text"])
                                     if identity and published:
@@ -1510,7 +1866,9 @@ class DocumentService:
             warnings.extend(relation_warnings)
             derived, semantic_map, derived_warnings = self._project_semantic_map(semantic_mapping, semantic_documents)
             if (semantic_stamp != self._index_semantic_stamp()
-                    or any(self._semantic_dependency_stamp(*file) != stamp for file, stamp in semantic_dependencies.items())):
+                    or any(self._semantic_dependency_stamp(*file) != stamp for file, stamp in semantic_dependencies.items())
+                    or any(self._semantic_dependency_stamp(_ORIGIN_METADATA_PARTS, name) != stamp
+                           for name, stamp in origin_dependencies.items())):
                 raise DocumentIndexChanged()
             relations.extend(derived)
             warnings.extend(derived_warnings)

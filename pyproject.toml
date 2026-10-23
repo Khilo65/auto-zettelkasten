@@ -68,6 +68,7 @@ include = [
   "/package.json",
   "/package-lock.json",
   "/docs/DESKTOP.md",
+  "/docs/JEV_RELATIONSHIPS.md",
   "/docs/LOCAL_DISCOVERY.md",
   "/docs/LOCAL_MAPPING.md",
 ]

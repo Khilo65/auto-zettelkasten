@@ -2424,6 +2424,7 @@ def build_map(
     ranked_candidates: Sequence[Mapping[str, Any]] | None = None,
     mapping_backend: str | None = None,
     local_mapping: Mapping[str, Any] | None = None,
+    relationship_decisions: Mapping[str, Any] | None = None,
 ) -> ArtifactManifest:
     del controller  # synthesis consumes validated notes and accepted typed-link evidence only
     if not isinstance(allow_cloud, bool):
@@ -2445,6 +2446,12 @@ def build_map(
     backend = str(config.get("mapping_backend") or "local") if mapping_backend is None else mapping_backend
     if not isinstance(backend, str) or backend not in {"local", "llm"}:
         raise ValueError("mapping_backend must be local or llm")
+    from .relationship_mapping import RelationshipMappingOptions
+    decision_options = RelationshipMappingOptions.from_dict(
+        relationship_decisions if relationship_decisions is not None else config.get("relationship_decisions", {})
+    )
+    if backend == "llm" and decision_options.backend != "off":
+        raise ValueError("Jev relationship decisions use local mapping; legacy LLM decisions must not run twice")
     if backend == "local":
         if ranked_candidates is not None or external_discovery is not None or reasoner is not None:
             raise ValueError("Provider relationship decisions require explicit mapping_backend='llm'; local mapping never falls back.")
@@ -2457,6 +2464,7 @@ def build_map(
             ids = [row["source_id"] for row in rows if row.get("note_id") in note_ids]
         return local_map_manifest(root, source_ids=ids, note_rows=rows,
                                   options=local_mapping if local_mapping is not None else config.get("local_mapping", {}),
+                                  relationship_decisions=decision_options.to_dict(),
                                   run_id=validate_opaque_id(run_id or "local-map", field="run_id"))
     provider = provider or str(config.get("provider") or "deepseek")
     model = model or str(config.get("model") or "deepseek-v4-flash")

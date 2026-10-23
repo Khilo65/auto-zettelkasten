@@ -12,7 +12,7 @@ import yaml
 from .extraction import extract_bytes
 from .indexes import local_retrieval_projection
 from .profiles import profile_from_dict, profile_sidecar_path, profile_to_dict
-from .relationships import profile_content_hash, profile_hash_aliases
+from .relationships import JEV_RELATIONSHIP_CONTRACT, profile_content_hash, profile_hash_aliases
 from .retrieval import LocalRetrievalIndex
 from .zotero import ZoteroLocalClient
 
@@ -334,7 +334,8 @@ def scan_local_collection(
 
 
 def load_local_retrieval(
-    workspace: Path | str, *, instance_id: str | None = None, library_id: str = "0",
+    workspace: Path | str, *, instance_id: str | None = None, library_id: str | None = "0",
+    infer_scope: bool = False,
     max_files: int = 20_000, max_file_bytes: int | None = None,
     max_index_bytes: int = MAX_INDEX_DOCUMENT_BYTES,
     max_total_bytes: int = 384 * 1024 * 1024,
@@ -349,7 +350,9 @@ def load_local_retrieval(
         raise ValueError("workspace must be an existing directory")
     if instance_id is not None:
         instance_id = _scope(instance_id, "instance_id")
-    library_id = _scope(library_id, "library_id")
+    if type(infer_scope) is not bool:
+        raise ValueError("infer_scope must be a boolean")
+    library_id = None if infer_scope and library_id is None else _scope(library_id, "library_id")
     index_limit = _integer(max_index_bytes, "max_index_bytes")
     rich_limit = MAX_RICH_DOCUMENT_BYTES
     if max_file_bytes is not None:
@@ -359,7 +362,8 @@ def load_local_retrieval(
     budget = _ReadBudget(root, max_files=max_files, max_file_bytes=rich_limit, max_total_bytes=max_total_bytes)
     catalogue_path = root / "02_source_memory/indexes/source_catalogue.yml"
     registry_path = root / "02_source_memory/indexes/typed_links.yml"
-    budget.reserve([catalogue_path, registry_path], max_file_bytes=index_limit, max_nodes=MAX_INDEX_YAML_NODES)
+    positions_path = root / "02_source_memory/indexes/literature_positions.yml"
+    budget.reserve([catalogue_path, registry_path, positions_path], max_file_bytes=index_limit, max_nodes=MAX_INDEX_YAML_NODES)
     catalogue = budget.read(catalogue_path)
     entries: dict[str, dict[str, Any]] = {}
     for entry in catalogue.get("sources", []):
@@ -368,6 +372,10 @@ def load_local_retrieval(
         entries[entry["source_id"]] = entry
         if len(entries) > max_files:
             raise ValueError("local retrieval catalogue source count limit exceeded")
+    if infer_scope:
+        instance_id, library_id, scope_status = _cached_discovery_scope(list(entries.values()), (), instance_id, library_id)
+    else:
+        scope_status = "explicit" if instance_id is not None else "unknown"
     profile_paths, missing_profiles = {}, []
     for source_id, entry in entries.items():
         note_id = entry.get("note_id")
@@ -385,7 +393,7 @@ def load_local_retrieval(
             raise ValueError("local retrieval file count limit exceeded")
         if cache_path.is_symlink() or not cache_path.resolve().is_relative_to(root):
             raise ValueError("discovery cache must remain inside the workspace")
-    rows, hashes = [], {}
+    rows, hashes, stored_tag_omissions = [], {}, 0
     for source_id, path in sorted(profile_paths.items()):
         entry = entries[source_id]
         wrapper = budget.read(path)
@@ -410,6 +418,13 @@ def load_local_retrieval(
         compact = local_retrieval_projection([row], {"sources": [entry]})
         if len(compact) != 1 or compact[0]["source_id"] != source_id:
             raise ValueError("canonical source projection did not preserve identity")
+        facets = entry.get("facets_by_type") if isinstance(entry.get("facets_by_type"), Mapping) else {}
+        tag_arrays = [row.get("normalized_tags") or [], frontmatter.get("normalized_tags") or [], facets.get("subject") or []]
+        if any(not isinstance(values, (list, tuple)) or len(values) > 256 or any(not isinstance(value, str) for value in values) for values in tag_arrays):
+            raise ValueError("canonical subject tags must be bounded text sequences")
+        tag_values = sorted({tag for values in tag_arrays for tag in values})
+        compact[0]["tags"] = tag_values[:256]
+        stored_tag_omissions += max(0, len(tag_values) - 256)
         rows.extend(compact)
         del wrapper, profile, row, metadata, frontmatter, context
     scoped_sources = {source_id for source_id, entry in entries.items()
@@ -420,13 +435,147 @@ def load_local_retrieval(
         if row["source_id"] in scoped_sources and row.get("zotero_key") and key_counts[row["zotero_key"]] == 1:
             row["identity"] = {"instance_id": instance_id, "library_type": "user", "library_id": library_id, "item_key": row["zotero_key"]}
     registry = budget.read(registry_path)
-    relationships = _accepted_relationships(registry, hashes)
+    relationships = _accepted_relationships(registry, hashes, workspace=root)
+    citation_records, citation_status = _literature_candidate_records(budget.read(positions_path), rows)
     # Cache loading is deliberately separate from acquisition and never creates a DB.
     records, cache_status = _cached_records(root, rows, catalogue.get("sources", []), instance_id, library_id, max_bytes=min(16_000_000, budget.max_total_bytes - budget.total_bytes))
     cache_bytes = cache_status.get("cache_record_bytes", 0)
-    return {"index": LocalRetrievalIndex(rows, records), "rows": rows, "relationships": relationships, "status": {"source_count": len(rows), "catalogue_source_count": len(entries), "missing_profile_count": len(missing_profiles), "missing_profile_source_ids": missing_profiles[:32], "profile_load_status": "partial" if missing_profiles else "complete", "cached_document_count": len(records), "reference_coverage": "cached_unverified" if records else "not_examined", "files_read": len(budget.sizes) + int(cache_exists), "bytes_read": budget.total_bytes + cache_bytes,
+    return {"workspace": str(root), "index": LocalRetrievalIndex(rows, records, citation_records=citation_records), "rows": rows, "relationships": relationships, "discovery_records": records, "citation_records": citation_records, "status": {"source_count": len(rows), "catalogue_source_count": len(entries), "missing_profile_count": len(missing_profiles), "missing_profile_source_ids": missing_profiles[:32], "profile_load_status": "partial" if missing_profiles else "complete", "cached_document_count": len(records), "reference_coverage": "cached_unverified" if records else "not_examined", "files_read": len(budget.sizes) + int(cache_exists), "bytes_read": budget.total_bytes + cache_bytes,
             "recorded_unverified_relationships": sum(row.get("freshness") == "recorded_unverified" for row in relationships),
-            "excluded_relationships": len(registry.get("relations", [])) - len(relationships), **cache_status}}
+            "excluded_relationships": len(registry.get("relations", [])) - len(relationships),
+            "stored_tag_omissions": stored_tag_omissions, "scope_status": scope_status,
+            "instance_id": instance_id, "library_id": library_id, **cache_status, **citation_status}}
+
+
+def _literature_candidate_records(payload: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Reuse matched source IDs as candidate hints, never semantic assertions."""
+    positions = payload.get("positions", [])
+    if not isinstance(positions, list) or len(positions) > 100_000:
+        raise ValueError("discussed-work memory must contain bounded position rows")
+    by_source = {row["source_id"]: row for row in rows}
+    selected, stale, unresolved, unverified = [], 0, 0, 0
+    per_source: Counter[str] = Counter()
+    for position in positions:
+        if not isinstance(position, Mapping):
+            raise ValueError("discussed-work position must be a mapping")
+        source, target = position.get("current_source_id"), position.get("matched_source_id")
+        if (not isinstance(source, str) or not isinstance(target, str) or source == target
+                or source not in by_source or target not in by_source
+                or position.get("match_status") not in {"mapped", "matched"}):
+            unresolved += 1
+            continue
+        checked = False
+        mismatch = False
+        for prefix, sid in (("source", source), ("target", target)):
+            row = by_source[sid]
+            aliases = row.get("profile_hash_aliases") or []
+            profile_aliases = {value for value in [row.get("profile_hash"), *(aliases if isinstance(aliases, (list, tuple)) else [])] if isinstance(value, str) and value}
+            note_hashes = {row["note_hash"]} if isinstance(row.get("note_hash"), str) and row["note_hash"] else set()
+            for field, current in ((f"{prefix}_profile_hash", profile_aliases),
+                                   (f"{prefix}_note_hash", note_hashes)):
+                declared = position.get(field)
+                if declared:
+                    checked = True
+                    if not isinstance(declared, str) or declared not in current:
+                        mismatch = True
+            supplied = position.get("input_profile_hashes")
+            if isinstance(supplied, Mapping) and supplied.get(sid):
+                checked = True
+                if not isinstance(supplied[sid], str) or supplied[sid] not in profile_aliases:
+                    mismatch = True
+        if mismatch:
+            stale += 1
+            continue
+        if per_source[source] >= 256:
+            unresolved += 1
+            continue
+        per_source[source] += 1
+        freshness = "current_declared_hashes" if checked else "recorded_unverified"
+        unverified += int(not checked)
+        selected.append({"source_id": source, "target_source_id": target,
+                         **{key: str(position.get(key) or "")[:1000] for key in ("literature_position_id", "locator", "match_status", "match_basis")},
+                         "freshness": freshness, "reference_origin": "discussed_work_memory"})
+    selected.sort(key=lambda row: (row["source_id"], row["target_source_id"], row["literature_position_id"], row["locator"]))
+    return selected, {"discussed_work_position_count": len(positions), "matched_discussed_work_count": len(selected),
+                      "stale_discussed_work_count": stale, "unresolved_discussed_work_count": unresolved,
+                      "unverified_discussed_work_count": unverified,
+                      "discussed_work_coverage": "candidate_hints_only" if positions else "not_examined"}
+
+
+def _cached_discovery_scope(
+    catalogue_rows: Sequence[Mapping[str, Any]], projection_rows: Sequence[Mapping[str, Any]],
+    instance_id: str | None, library_id: str | None,
+) -> tuple[str | None, str, str]:
+    """Infer a scope only from declared source identity, never cached contents."""
+    if instance_id is not None:
+        return _scope(instance_id, "instance_id"), _scope(library_id if library_id is not None else "0", "library_id"), "explicit"
+    if library_id is not None:
+        library_id = _scope(library_id, "library_id")
+    scopes: set[tuple[str, str]] = set()
+    for row in [*catalogue_rows, *projection_rows]:
+        for candidate in (row, row.get("identity"), row.get("catalogue_identity")):
+            if not isinstance(candidate, Mapping) or candidate.get("library_type") != "user":
+                continue
+            instance, library = candidate.get("instance_id"), candidate.get("library_id")
+            if (isinstance(instance, str) and instance.strip() and isinstance(library, str) and library.strip()
+                    and (library_id is None or library_id == library)):
+                scopes.add((_scope(instance, "instance_id"), _scope(library, "library_id")))
+    if len(scopes) == 1:
+        instance, library = next(iter(scopes))
+        return instance, library, "declared_source_identity"
+    return None, library_id or "0", "ambiguous" if scopes else "unknown"
+
+
+def load_cached_mapping_discovery(
+    workspace: Path | str, projection_rows: Sequence[Mapping[str, Any]], *,
+    instance_id: str | None = None, library_id: str | None = None,
+    max_cache_bytes: int = 16_000_000,
+) -> dict[str, Any]:
+    """Enrich a mapping job from the existing scoped cache, without acquisition.
+
+    Missing cache or source scope is unknown, not a reason to scan attachments.
+    Current catalogue ownership and conservative reference rematching are reused.
+    """
+    root = Path(workspace).expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError("workspace must be an existing directory")
+    _integer(max_cache_bytes, "max_cache_bytes", maximum=MAX_INDEX_DOCUMENT_BYTES)
+    if not isinstance(projection_rows, (list, tuple)) or len(projection_rows) > 20_000:
+        raise ValueError("mapping discovery requires bounded projection rows")
+    catalogue = _catalogue(root)
+    entries: dict[str, dict[str, Any]] = {}
+    for raw in catalogue.get("sources", []):
+        if (not isinstance(raw, dict) or not isinstance(raw.get("source_id"), str)
+                or not raw["source_id"] or raw["source_id"] in entries):
+            raise ValueError("duplicate or missing catalogue source identity")
+        entries[raw["source_id"]] = raw
+        if len(entries) > 20_000:
+            raise ValueError("mapping discovery catalogue source count limit exceeded")
+    selected, seen = [], set()
+    for row in projection_rows:
+        if (not isinstance(row, Mapping) or not isinstance(row.get("source_id"), str)
+                or not row["source_id"] or row["source_id"] in seen):
+            raise ValueError("mapping projection requires unique source IDs")
+        seen.add(row["source_id"])
+        entry = entries.get(row["source_id"])
+        if entry is None:
+            continue
+        if row.get("note_id") != entry.get("note_id"):
+            raise ValueError("mapping discovery source/note identity conflicts with catalogue")
+        selected.append(dict(row))
+    catalogue_rows = list(entries.values())
+    instance, library, scope_status = _cached_discovery_scope(
+        [row for row in catalogue_rows if row["source_id"] in seen], selected, instance_id, library_id,
+    )
+    records, status = _cached_records(root, selected, catalogue_rows, instance, library, max_bytes=max_cache_bytes)
+    position_budget = _ReadBudget(root, max_files=1, max_file_bytes=MAX_INDEX_DOCUMENT_BYTES, max_total_bytes=MAX_INDEX_DOCUMENT_BYTES)
+    positions_path = root / "02_source_memory/indexes/literature_positions.yml"
+    position_budget.reserve([positions_path], max_nodes=MAX_INDEX_YAML_NODES)
+    citation_records, citation_status = _literature_candidate_records(position_budget.read(positions_path), selected)
+    return {"records": records, "citation_records": citation_records, "status": {**status, **citation_status, "scope_status": scope_status,
+            "instance_id": instance, "library_id": library, "cached_document_count": len(records),
+            "reference_coverage": "cached_unverified" if records else "not_examined",
+            "acquisition_performed": False}}
 
 
 def _cached_records(root: Path, rows: Sequence[Mapping[str, Any]], catalogue_rows: Sequence[Mapping[str, Any]], instance_id: str | None, library_id: str, *, max_bytes: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -479,13 +628,17 @@ def _cached_records(root: Path, rows: Sequence[Mapping[str, Any]], catalogue_row
     return selected, {"cache_truncated": loaded.get("truncated", False) or alias_truncated, "cache_skipped_records": loaded.get("skipped_records", 0), "cache_record_bytes": cache_bytes, "matching_scope": "provided scoped current index; library presence outside this index is unexamined"}
 
 
-def _accepted_relationships(registry: Mapping[str, Any], hashes: Mapping[str, tuple[str, list[str]]]) -> list[dict[str, Any]]:
+def _accepted_relationships(
+    registry: Mapping[str, Any], hashes: Mapping[str, tuple[str, list[str]]], *, workspace: Path | None = None,
+) -> list[dict[str, Any]]:
+    from .jev_relationships import jev_relationship_is_fresh
+
     current = {}
     for row in registry.get("current_pair_decisions", []):
         pair = row.get("source_ids", []) if isinstance(row, Mapping) else []
         if len(pair) == 2:
             current[tuple(sorted(pair))] = row
-    accepted = []
+    accepted, freshness_memo = [], {}
     for raw in registry.get("relations", []):
         if not isinstance(raw, Mapping) or raw.get("active", True) is not True or raw.get("decision_status") != "accepted" or raw.get("refresh_pending") or raw.get("reconciliation_pending"):
             continue
@@ -502,6 +655,11 @@ def _accepted_relationships(registry: Mapping[str, Any], hashes: Mapping[str, tu
             if memory.get("relation_ids") and raw.get("relation_id") not in memory["relation_ids"]:
                 continue
         if any(raw.get(field) and raw[field] not in hashes[source_id][1] for field, source_id in zip(("source_profile_hash", "target_profile_hash"), pair)):
+            continue
+        jev = (raw.get("output_contract") == JEV_RELATIONSHIP_CONTRACT
+               or raw.get("provenance") == "probabilistic_relationship_jev"
+               or str(raw.get("model") or "").startswith("jev-"))
+        if jev and (workspace is None or not jev_relationship_is_fresh(workspace, raw, memo=freshness_memo)):
             continue
         qualified = memory is not None or all(raw.get(field) for field in ("source_profile_hash", "target_profile_hash"))
         accepted.append({**dict(raw), "freshness": "current_profile_hashes" if qualified else "recorded_unverified"})

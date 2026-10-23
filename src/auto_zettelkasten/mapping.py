@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 from typing import Any, Mapping, Sequence
 
 from .files import now_iso
@@ -63,8 +64,26 @@ def refresh_local_map(
     cache = confined_child(root, '.auto-zettelkasten', 'mapping')
     settings = LocalMappingOptions.from_dict(options)
     inputs = load_mapping_inputs(root, note_rows=note_rows, source_ids=source_ids)
+    from .local_tools import load_cached_mapping_discovery
+    discovery = load_cached_mapping_discovery(root, inputs['projection_rows'])
     paths = [Path(path) for path in inputs.get('input_paths', [])]
     stamps = inputs['input_stamps']
+    calibration = None
+    calibration_path = cache / 'calibration.json'
+    if getattr(settings, 'tuning_mode', 'manual') == 'auto' and calibration_path.exists():
+        calibration = _bounded_json(calibration_path)
+    ranking_rows = None
+    if calibration is not None:
+        # Admission must use the same canonical citation/tag/profile signals
+        # as paid selection, rather than the richer embedding-text projection.
+        from .local_tools import load_local_retrieval
+        ranked = load_local_retrieval(root, infer_scope=True)
+        selected_ids = {row['source_id'] for row in inputs['projection_rows']}
+        ranking_rows = [row for row in ranked['rows'] if row['source_id'] in selected_ids]
+        discovery = {'records': [row for row in ranked['discovery_records'] if row['source_id'] in selected_ids],
+                     'citation_records': [row for row in ranked['citation_records']
+                                          if row['source_id'] in selected_ids and row['target_source_id'] in selected_ids],
+                     'status': ranked['status']}
 
     def current_stamp(path):
         resolved = path.resolve()
@@ -80,14 +99,149 @@ def refresh_local_map(
         result['derived'] = True
         result['accepted_relationships'] = False
         result['created_at'] = now_iso()
+        result['discovery_coverage'] = discovery['status']
 
     result = build_local_map(
         inputs['projection_rows'], cache_dir=cache, options=settings,
-        text_sources=inputs['text_sources'], progress=progress, before_commit=before_commit,
+        text_sources=inputs['text_sources'], discovery_records=discovery['records'],
+        citation_records=discovery.get('citation_records', []),
+        ranking_projection_rows=ranking_rows,
+        progress=progress, before_commit=before_commit,
+        calibration_report=calibration,
         **({'encoder_factory': encoder_factory} if encoder_factory is not None else {}),
     )
     result_path = confined_child(cache, 'result.json')
     return {'result': result, 'path': result_path, 'inputs': inputs}
+
+
+def _bounded_json(path: Path | str, *, max_bytes: int = 8 * 1024 * 1024) -> dict[str, Any]:
+    path = Path(path).expanduser()
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > max_bytes:
+        raise ValueError('Expected a bounded local JSON object.')
+    with path.open('rb') as source:
+        raw = source.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise ValueError('Local JSON input exceeds its byte allowance.')
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError('Local JSON input must be an object.')
+    return value
+
+
+def calibrate_local_map(workspace: Path | str, review_input: Path | str) -> dict[str, Any]:
+    """Evaluate saved vectors and independently reviewed pairs without encoding."""
+    from .files import write_json
+    from .local_mapping import LocalMappingOptions
+    from .mapping_calibration import calibrate_mapping, load_cached_source_vectors
+    from .local_tools import load_local_retrieval
+    from .workspace import load_config
+    import shutil
+    import time
+
+    root = resolve_workspace(workspace)
+    config = load_config(root)
+    material = _bounded_json(review_input)
+    settings = LocalMappingOptions.from_dict(config.get('local_mapping', {}))
+    started = time.monotonic()
+    cache = confined_child(root, '.auto-zettelkasten', 'mapping')
+    def check_resources():
+        from .local_mapping import LocalMappingError
+        if time.monotonic() - started > settings.max_wall_seconds:
+            raise LocalMappingError('Calibration reached its configured wall-time limit.')
+        if shutil.disk_usage(cache).free < settings.min_free_disk_bytes:
+            raise LocalMappingError('Calibration stopped at its configured free-disk limit.')
+    cached = load_cached_source_vectors(cache, options=settings, check_resources=check_resources)
+    loaded = load_local_retrieval(root, infer_scope=True)
+    report = calibrate_mapping(cached['source_ids'], cached['vectors'], material.get('collections', {}),
+                               material.get('reviews', []),
+                               options=settings,
+                               embedding_identity=cached['embedding_identity'],
+                               source_fingerprint=cached['source_fingerprint'],
+                               projection_rows=[row for row in loaded['rows'] if row['source_id'] in set(cached['source_ids'])],
+                               discovery_records=[row for row in loaded['discovery_records'] if row['source_id'] in set(cached['source_ids'])],
+                               citation_records=[row for row in loaded['citation_records']
+                                                 if row['source_id'] in set(cached['source_ids']) and row['target_source_id'] in set(cached['source_ids'])],
+                               check_resources=check_resources)
+    # An incomplete attempt must not replace the last completed evaluation.
+    path = cache / ('calibration.json' if report['status'] == 'complete' else 'calibration-last-attempt.json')
+    write_json(path, report)
+    return {'status': report['status'], 'path': str(path), 'calibration': report, 'provider_calls': 0}
+
+
+def community_name_manifest(
+    workspace: Path | str, community_id: str, *, scale: str = 'default',
+    execute: bool = False, approval: Mapping[str, Any] | None = None,
+    allow_cloud: bool = False, reader: Any = None,
+    input_price_per_million: Any = None, output_price_per_million: Any = None,
+    pricing_identity: str = '',
+) -> dict[str, Any]:
+    """Preview an optional source-worker naming task, with its own approval."""
+    from .community_naming import prepare_community_name, generate_community_name
+    from .files import write_json
+    from .local_mapping import _exclusive_cache
+    from .mapping_text import load_mapping_inputs
+    from .readers import provider_from_name
+    from .relationship_mapping import _section
+    from .workspace import load_config, validate_opaque_id
+
+    validate_opaque_id(community_id, field='community_id')
+    if scale not in {'broad', 'default', 'fine'} or type(execute) is not bool or type(allow_cloud) is not bool:
+        raise ValueError('Invalid community naming options.')
+    root = resolve_workspace(workspace)
+    config = load_config(root)
+    cache = confined_child(root, '.auto-zettelkasten', 'mapping')
+    result_path = cache / 'result.json'
+    mapping = _bounded_json(result_path, max_bytes=64 * 1024 * 1024)
+    groups = mapping.get('communities', [])
+    if scale != 'default':
+        selected = [row for row in mapping.get('community_scales', []) if row.get('scale') == scale]
+        groups = selected[0].get('communities', []) if len(selected) == 1 else []
+    found = [row for row in groups if row.get('community_id') == community_id]
+    if len(found) != 1:
+        raise ValueError('Choose a current community from the saved local map.')
+    ids = found[0]['source_ids']
+    from .pipeline import all_workspace_note_rows
+    inputs = load_mapping_inputs(root, source_ids=ids, note_rows=all_workspace_note_rows(root))
+    rows = {row['source_id']: row for row in inputs['projection_rows']}
+    saved = {row['source_id']: row for row in mapping.get('sources', [])}
+    members = []
+    for sid in ids:
+        if sid not in rows or sid not in saved:
+            raise ValueError('Community membership is unavailable; refresh the local map.')
+        row, prior = rows[sid], saved[sid]
+        if any(row.get(key, '') != prior.get(key, '') for key in ('projection_hash', 'metadata_file_sha256', 'profile_file_sha256')):
+            raise ValueError('Community evidence changed; refresh the local map before naming.')
+        text = inputs['text_sources'].get(sid, {}).get('text', '')
+        section = _section(text, 'Thesis')
+        members.append({'source_id': sid, 'title': row.get('title') or row.get('note_id') or sid,
+                        'thesis': section[0] if section else ''})
+    provider, model = str(config['provider']), str(config['model'])
+    if execute and provider != 'ollama' and not allow_cloud:
+        raise ValueError('Community naming requires explicit cloud permission as well as its own approval.')
+    source_reader = reader or provider_from_name(provider, model, allow_cloud=allow_cloud,
+                                                reasoning_effort=config.get('reasoning_effort'))
+    preview = prepare_community_name(source_reader, members, source_provider=provider, source_model=model,
+                                     input_price_per_million=input_price_per_million,
+                                     output_price_per_million=output_price_per_million,
+                                     pricing_identity=pricing_identity)
+    named = generate_community_name(source_reader, preview, store_path=cache / 'community-names.sqlite3',
+                                    enabled=execute, approval=approval)
+    if execute:
+        with _exclusive_cache(cache):
+            current = _bounded_json(result_path, max_bytes=64 * 1024 * 1024)
+            if current != mapping:
+                raise ValueError('Local map changed while naming; cached title retained but not applied.')
+            # Recheck the exact underlying inputs before publishing a derived label.
+            for filename, stamp in inputs['input_stamps'].items():
+                path = Path(filename)
+                info = path.stat()
+                if path.is_symlink() or [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns] != stamp:
+                    raise ValueError('Community evidence changed while naming; cached title retained but not applied.')
+            found[0]['display_label'] = named['title']
+            found[0]['naming_identity'] = preview['request_digest']
+            write_json(result_path, mapping)
+    return {'status': named['status'], 'community_id': community_id, 'scale': scale,
+            'preview': preview, 'naming': named, 'provider_calls': int(named['status'] == 'generated')}
 
 
 def _unmapped_sources(built):
@@ -103,17 +257,24 @@ def _unmapped_sources(built):
 
 
 def local_map_manifest(workspace: Path | str, *, source_ids=None, note_rows=None, options=None,
-                       run_id: str = '', progress=None, encoder_factory=None) -> ArtifactManifest:
+                       run_id: str = '', progress=None, encoder_factory=None,
+                       relationship_decisions=None) -> ArtifactManifest:
     root = resolve_workspace(workspace)
     built = refresh_local_map(root, source_ids=source_ids, note_rows=note_rows, options=options,
                               progress=progress, encoder_factory=encoder_factory)
     result = built['result']
     stats = result.get('stats', {})
     partial = any(row['reason'] != 'density_noise_or_isolate' for row in _unmapped_sources(built))
+    from .relationship_mapping import run_relationship_mapping
+    decisions = run_relationship_mapping(root, result.get('candidate_neighbors', result.get('neighbors', [])),
+                                         options=relationship_decisions, source_ids=source_ids,
+                                         preferred_semantic_neighbors=result.get('neighbors', []))
+    partial = partial or decisions.get('status') in {'partial', 'blocked'}
     return ArtifactManifest(
         status='partial' if partial else 'built', workspace=root, run_id=run_id,
         created_at=now_iso(), artifacts=artifact_rows(root, [built['path']]),
         metadata={'mapping_backend': 'local', 'local_mapping': result,
+                  'relationship_decisions': decisions,
                   'literature_map': {'status': 'partial' if partial else 'completed',
                                      'cluster_count': len(result.get('communities', [])),
                                      'semantic_neighbor_count': len(result.get('neighbors', [])),
@@ -138,9 +299,14 @@ def pipeline_local_map(workspace, *, source_set, note_rows, request, progress=No
     built = refresh_local_map(workspace, source_ids=source_ids, note_rows=note_rows,
                               options=request.local_mapping, progress=update)
     result = built['result']
+    from .relationship_mapping import run_relationship_mapping
+    decisions = run_relationship_mapping(workspace, result.get('candidate_neighbors', result.get('neighbors', [])),
+                                         options=request.relationship_decisions, source_ids=source_ids,
+                                         preferred_semantic_neighbors=result.get('neighbors', []))
     sources = result.get('sources', [])
     unmapped = _unmapped_sources(built)
     partial = any(row['reason'] != 'density_noise_or_isolate' for row in unmapped)
+    decision_partial = decisions.get('status') in {'partial', 'blocked'}
     communities = [{**row, 'cluster_id': row['community_id'], 'derived': True}
                    for row in result.get('communities', [])]
     if progress is not None:
@@ -155,9 +321,14 @@ def pipeline_local_map(workspace, *, source_set, note_rows, request, progress=No
         'literature_packet': {'status': 'derived_local', 'synthesis_call_count': 0,
                               'synthesis_new_call_count': 0, 'synthesis_failure_count': 0,
                               'local_mapping': result},
-        'typed_links': {'links': []}, 'profiles': built['inputs']['projection_rows'],
+        'typed_links': {'links': [row for row in decisions.get('application', {}).get('records', [])
+                                  if decisions.get('application', {}).get('applied') and row.get('status') == 'accepted']},
+        'profiles': built['inputs']['projection_rows'],
+        'relationship_decisions': decisions,
         'profile_result': {'valid_count': len(sources), 'excluded_count': 0, 'provider_calls': 0,
                            'checkpoint_hits': 0, 'failure_count': 0},
         'migration': {}, 'paths': [built['path']],
-        'partial_reason': 'local_mapping_missing_or_ineligible_content' if partial else '',
+        'partial_reason': ';'.join(reason for reason, present in (
+            ('local_mapping_missing_or_ineligible_content', partial),
+            ('relationship_decisions_incomplete', decision_partial)) if present),
     }

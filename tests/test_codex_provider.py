@@ -251,6 +251,7 @@ def test_codex_contract_capabilities_and_typed_retry_policy() -> None:
     assert reader.capabilities["supported_output_tokens"] == 128_000
     assert set(CODEX_OUTPUT_CONTRACTS) == set(CODEX_CONTRACT_RESERVATIONS)
     assert CODEX_CONTRACT_RESERVATIONS == {
+        "community_name": 128,
         "source_bundle": 32_768,
         "evidence_profile": 16_384,
         "literature_family_plan": 49_152,

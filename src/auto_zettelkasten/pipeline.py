@@ -2617,6 +2617,7 @@ def run_pipeline(
     )
     literature_summary = {
         "status": "partial" if literature_partial_reason else "completed",
+        "relationship_decisions": map_result.get("relationship_decisions", {"status": "disabled", "provider_calls": 0}),
         "stage": "reporting",
         "profile_count": profile_count,
         "profile_valid_count": int(
@@ -22592,6 +22593,7 @@ def _source_replay_request_hash(
     payload.pop("literature_model", None)
     payload.pop("mapping_backend", None)
     payload.pop("local_mapping", None)
+    payload.pop("relationship_decisions", None)
     if omit_default_pdf_fallback:
         extraction = dict(payload.get("extraction_policy", {}) or {})
         if extraction.get("pdf_fallback") == "none":

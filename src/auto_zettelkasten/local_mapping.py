@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 import hashlib
 import importlib.metadata
 import json
@@ -38,6 +38,7 @@ class LocalMappingError(RuntimeError):
 
 @dataclass(frozen=True)
 class LocalMappingOptions:
+    tuning_mode: str = "manual"
     encoder: str = "minilm"
     clustering: str = "leiden"
     model_path: str | None = None
@@ -74,6 +75,8 @@ class LocalMappingOptions:
     from_dict = from_mapping
 
     def validate(self) -> None:
+        if not isinstance(self.tuning_mode, str) or self.tuning_mode not in {"auto", "manual"}:
+            raise ValueError("tuning_mode must be auto or manual")
         if self.encoder != "minilm":
             raise ValueError("This local mapper supports encoder='minilm'; experimental encoders require an explicit compatible adapter.")
         if self.clustering not in {"leiden", "hdbscan"}:
@@ -343,6 +346,26 @@ def _unit_vectors(value: Any, count: int, dimension: int):
     return result / norms[:, None]
 
 
+def _ranked_neighbors(ids, matrix, *, options, embedding_identity=""):
+    """Exact search once, reusable across display and discovery policies."""
+    neighbors = []
+    started = time.monotonic()
+    for first in range(0, len(ids), 64):
+        if time.monotonic() - started > options.max_wall_seconds:
+            raise LocalMappingError("Semantic neighbor refresh reached max_wall_seconds; no partial map was committed.")
+        scores = matrix[first:first + 64] @ matrix.T
+        for row, values in enumerate(scores):
+            index = first + row
+            ranked = sorted((other for other in range(len(ids)) if other != index and float(values[other]) > max(0.0, options.min_similarity)),
+                            key=lambda other: (-float(values[other]), ids[other]))[:options.neighbors]
+            for other in ranked:
+                score = min(1.0, float(values[other]))
+                neighbors.append({"source_id": ids[index], "target_source_id": ids[other], "score": score,
+                                  "provenance": {"kind": "semantic_similarity", "evidence_backed": False,
+                                                 "accepted": False, "embedding_identity": embedding_identity}})
+    return neighbors
+
+
 def cluster_source_vectors(source_ids: Sequence[str], vectors: Any, *, options: LocalMappingOptions | None = None,
                            embedding_identity: str = "") -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Exact bounded-memory cosine graph, followed by the selected local view."""
@@ -360,24 +383,16 @@ def cluster_source_vectors(source_ids: Sequence[str], vectors: Any, *, options: 
     order = sorted(range(len(source_ids)), key=lambda index: source_ids[index])
     ids = [source_ids[index] for index in order]
     matrix = matrix[order]
+    neighbors = _ranked_neighbors(ids, matrix, options=options, embedding_identity=embedding_identity)
+    return _communities_from_neighbors(ids, matrix, neighbors, options=options), neighbors
+
+
+def _communities_from_neighbors(ids, matrix, neighbors, *, options):
+    positions = {sid: index for index, sid in enumerate(ids)}
     edges: dict[tuple[int, int], float] = {}
-    neighbors = []
-    started = time.monotonic()
-    for first in range(0, len(ids), 64):
-        if time.monotonic() - started > options.max_wall_seconds:
-            raise LocalMappingError("Semantic neighbor refresh reached max_wall_seconds; no partial map was committed.")
-        scores = matrix[first:first + 64] @ matrix.T
-        for row, values in enumerate(scores):
-            index = first + row
-            ranked = sorted((other for other in range(len(ids)) if other != index and float(values[other]) > max(0.0, options.min_similarity)),
-                            key=lambda other: (-float(values[other]), ids[other]))[:options.neighbors]
-            for other in ranked:
-                score = min(1.0, float(values[other]))
-                edge = tuple(sorted((index, other)))
-                edges[edge] = max(edges.get(edge, 0), score)
-                neighbors.append({"source_id": ids[index], "target_source_id": ids[other], "score": score,
-                                  "provenance": {"kind": "semantic_similarity", "evidence_backed": False,
-                                                 "accepted": False, "embedding_identity": embedding_identity}})
+    for row in neighbors:
+        edge = tuple(sorted((positions[row["source_id"]], positions[row["target_source_id"]])))
+        edges[edge] = max(edges.get(edge, 0), row["score"])
     if options.clustering == "hdbscan" and len(ids) < options.min_cluster_size:
         groups = []
         noise: set[str] = set(ids)
@@ -412,8 +427,7 @@ def cluster_source_vectors(source_ids: Sequence[str], vectors: Any, *, options: 
         communities.extend({"community_id": "semantic-noise-" + _digest(source_id)[:20], "source_ids": [source_id],
                             "algorithm": "hdbscan", "noise": True} for source_id in sorted(noise))
     communities.sort(key=lambda row: row["community_id"])
-    neighbors.sort(key=lambda row: (row["source_id"], -row["score"], row["target_source_id"]))
-    return communities, neighbors
+    return communities
 
 
 def build_local_map(
@@ -421,9 +435,12 @@ def build_local_map(
     options: LocalMappingOptions | Mapping[str, Any] | None = None,
     text_sources: Mapping[str, Mapping[str, Any]] | None = None,
     discovery_records: Sequence[Mapping[str, Any]] = (),
+    citation_records: Sequence[Mapping[str, Any]] = (),
     progress: Callable[[Mapping[str, Any]], None] | None = None,
     encoder_factory: Callable[[LocalMappingOptions], Any] | None = None,
     before_commit: Callable[[dict[str, Any]], None] | None = None,
+    calibration_report: Mapping[str, Any] | None = None,
+    ranking_projection_rows: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build/refresh a private derived map without changing any source artifact.
 
@@ -437,7 +454,7 @@ def build_local_map(
     options.validate()
     if isinstance(projection_rows, (str, bytes)) or len(projection_rows) > options.max_sources:
         raise ValueError("local mapping source count exceeds max_sources; reduce the explicit scope or raise the bounded limit")
-    index = LocalRetrievalIndex(projection_rows, discovery_records, max_sources=options.max_sources)
+    index = LocalRetrievalIndex(projection_rows, discovery_records, citation_records=citation_records, max_sources=options.max_sources)
     raw_rows = {row["source_id"]: row for row in projection_rows}
     text_sources = {} if text_sources is None else text_sources
     if not isinstance(text_sources, Mapping) or set(text_sources) - set(index.rows):
@@ -608,10 +625,68 @@ def build_local_map(
                 ids.append(source["source_id"])
                 means.append(mean / norm)
         check_resources()
+        tuning = {"mode": options.tuning_mode, "status": "manual" if options.tuning_mode == "manual" else "awaiting_evaluation_gate"}
+        if options.tuning_mode == "auto" and calibration_report is not None:
+            from .mapping_calibration import admitted_parameters, source_fingerprint, ranking_fingerprint
+            active_ids = set(ids)
+            ranking_rows = projection_rows if ranking_projection_rows is None else ranking_projection_rows
+            ranking_rows = [row for row in ranking_rows if row.get("source_id") in active_ids]
+            ranking_discovery = [row for row in discovery_records if row.get("source_id") in active_ids]
+            ranking_citations = [row for row in citation_records if row.get("source_id") in active_ids and row.get("target_source_id") in active_ids]
+            selected = admitted_parameters(calibration_report, embedding_identity=embedding_digest,
+                                           source_ids=ids, source_fingerprint=source_fingerprint([source for source, _, _ in prepared]),
+                                           ranking_inputs_sha256=ranking_fingerprint(ranking_rows, ranking_discovery, ranking_citations))
+            if selected is not None:
+                options = replace(options, **selected)
+                tuning.update(status="calibrated", calibration_identity=calibration_report["calibration_identity"],
+                              selected_parameters=selected, coverage=calibration_report["coverage"],
+                              limitations=calibration_report["limitations"])
+            else:
+                tuning["status"] = "evaluation_gate_not_passed"
+        identity["clustering"].update({name: getattr(options, name) for name in ("clustering", "neighbors", "min_similarity", "seed", "resolution", "min_cluster_size")})
+        identity.pop("digest", None)
+        identity["digest"] = _digest(identity)
         emit("clustering", algorithm=options.clustering, sources=len(ids))
         cluster_started = time.monotonic()
-        communities, neighbors = cluster_source_vectors(ids, np.stack(means) if means else np.empty((0, dimension)),
-                                                        options=options, embedding_identity=embedding_digest)
+        matrix = np.stack(means) if means else np.empty((0, dimension))
+        candidate_neighbors = _ranked_neighbors(ids, matrix, options=replace(options, neighbors=64, min_similarity=0.),
+                                                embedding_identity=embedding_digest)
+        counts: dict[str, int] = defaultdict(int)
+        neighbors = []
+        for neighbor in candidate_neighbors:
+            sid = neighbor["source_id"]
+            if neighbor["score"] > options.min_similarity and counts[sid] < options.neighbors:
+                neighbors.append({**neighbor, "provenance": dict(neighbor["provenance"])})
+                counts[sid] += 1
+        # Explicit manual settings above 64 retain their historical graph policy.
+        if options.neighbors > 64:
+            neighbors = _ranked_neighbors(ids, matrix, options=options, embedding_identity=embedding_digest)
+        if tuning["status"] == "awaiting_evaluation_gate" and options.clustering == "leiden":
+            from .mapping_calibration import community_resolution_checks
+            stability = community_resolution_checks(ids, neighbors, check_resources=check_resources)
+            options = replace(options, resolution=stability["selected_resolution"], seed=stability["selected_seed"])
+            tuning.update(status="default_policy_local_stability_checked", selected_parameters={
+                "neighbors": options.neighbors, "min_similarity": options.min_similarity,
+                "resolution": options.resolution, "seed": options.seed},
+                community_checks=stability["community_scales"], limitations=stability["limitations"])
+            identity["clustering"].update(resolution=options.resolution, seed=options.seed)
+            identity.pop("digest", None)
+            identity["digest"] = _digest(identity)
+        communities = _communities_from_neighbors(ids, matrix, neighbors, options=options)
+        community_scales = []
+        if tuning["status"] in {"calibrated", "default_policy_local_stability_checked"} and options.clustering == "leiden":
+            for scale, resolution in (("broad", .5), ("default", options.resolution), ("fine", 2.)):
+                check_resources()
+                scale_communities = communities if resolution == options.resolution else _communities_from_neighbors(
+                    ids, matrix, neighbors, options=replace(options, resolution=resolution))
+                community_scales.append({"scale": scale, "resolution": resolution, "communities": scale_communities})
+        from .community_naming import deterministic_community_label
+        for group in [communities, *[view["communities"] for view in community_scales]]:
+            for community in group:
+                members = [{"source_id": sid, "title": str(index.rows[sid].get("title") or sid)[:2000]}
+                           for sid in community["source_ids"]]
+                community["display_label"] = deterministic_community_label(members)
+                community["display_label_kind"] = "deterministic_terms"
         phases["clustering_seconds"] = time.monotonic() - cluster_started
         phases["aggregation_seconds"] = cluster_started - aggregation_started
         check_resources()
@@ -621,7 +696,7 @@ def build_local_map(
                                            target_chunk_ids=by_source[neighbor["target_source_id"]]["chunk_ids"])
         result = {"schema_version": SCHEMA_VERSION, "identity": identity,
                   "sources": [source for source, _, _ in prepared], "chunks": chunks,
-                  "communities": communities, "neighbors": neighbors,
+                  "communities": communities, "neighbors": neighbors, "candidate_neighbors": candidate_neighbors, "tuning": tuning, "community_scales": community_scales,
                   "stats": {"sources": len(prepared), "included_sources": len(ids), "chunks": len(chunks),
                             "encoded_chunks": len(pending), "reused_chunks": reused,
                             "model_load_seconds": float(getattr(bundle, "model_load_seconds", 0.0)),

@@ -14,6 +14,7 @@ RELATIONSHIP_PROMPT_VERSION = "35"
 RELATIONSHIP_DISCOVERY_PROMPT_VERSION = "24"
 RELATIONSHIP_REGISTRY_SCHEMA_VERSION = "7"
 RELATIONSHIP_DECISION_SCHEMA_VERSION = "10"
+JEV_RELATIONSHIP_CONTRACT = "jev-relationship-policy-v1"
 RELATIONSHIP_DECISION_CONTRACT = "relationship-decision-v10"
 ORDINARY_RELATIONSHIP_DECISION_CONTRACT = "relationship-decision-v11"
 RELATIONSHIP_ENVELOPE_CONTRACTS = frozenset(
@@ -1344,6 +1345,9 @@ def persist_relationship_registry(
     protected_structural_relations: Sequence[Mapping[str, Any]] = (),
     orphaned_source_ids: Sequence[str] = (),
     reconcile_machine_prompt_version: str | None = None,
+    jev_pair_decisions: Sequence[Mapping[str, Any]] = (),
+    jev_retired_relation_ids: Sequence[str] = (),
+    preserve_existing_semantic_rows: bool = False,
 ) -> dict[str, Any]:
     path = workspace / "02_source_memory" / "indexes" / "typed_links.yml"
     compatibility_path = (
@@ -1379,6 +1383,9 @@ def persist_relationship_registry(
         if not isinstance(raw, Mapping):
             continue
         row = dict(raw)
+        if preserve_existing_semantic_rows:
+            migrated_rows.append(row)
+            continue
         relation_id = str(
             row.get("relation_id") or row.get("link_id") or ""
         )
@@ -1436,7 +1443,7 @@ def persist_relationship_registry(
                 retirement_reason="relationship_prompt_v2_requires_verification",
             )
         migrated_rows.append(row)
-    if existing_schema == "6":
+    if existing_schema == "6" and not preserve_existing_semantic_rows:
         provisional_by_pair: dict[tuple[str, str], list[dict[str, Any]]] = {}
         for row in migrated_rows:
             if (
@@ -1488,6 +1495,7 @@ def persist_relationship_registry(
         if isinstance(row, Mapping)
         and (
             _final_v4_relation(row)
+            or _final_jev_relation(row)
             or _verified_machine_relation(row)
             or str(row.get("provenance") or "").startswith("human")
         )
@@ -1498,6 +1506,7 @@ def persist_relationship_registry(
         if isinstance(row, Mapping)
         and (
             _final_v4_decision(row, decision="no_relationship")
+            or _final_jev_decision(row, decision="no_relationship")
             or str(row.get("verification_status") or "") == "no_relationship"
         )
     ]
@@ -1520,6 +1529,10 @@ def persist_relationship_registry(
         str(row.get("relation_id") or row.get("link_id") or stable_hash(row)): row
         for row in retained
     }
+    retired_jev_ids = set(jev_retired_relation_ids)
+    for relation_id, row in rows_by_id.items():
+        if relation_id in retired_jev_ids and row.get("output_contract") == JEV_RELATIONSHIP_CONTRACT:
+            row.update(active=False, decision_status="stale_evidence", retirement_reason="jev_evidence_changed")
     for raw in structural_relations:
         row = dict(raw)
         row.setdefault("active", True)
@@ -1731,7 +1744,7 @@ def persist_relationship_registry(
                 **(
                     dict(row)
                     if str(row.get("output_contract") or "")
-                    in RELATIONSHIP_ENVELOPE_CONTRACTS
+                    in {*RELATIONSHIP_ENVELOPE_CONTRACTS, JEV_RELATIONSHIP_CONTRACT}
                     else {}
                 ),
                 "decision_key": decision_key,
@@ -2135,6 +2148,16 @@ def persist_relationship_registry(
         "events": event_rows,
         "parked": parked,
     }
+    prior_jev = {
+        str(row.get("decision_key") or ""): dict(row)
+        for row in (existing.get("jev_pair_decisions", []) or [] if isinstance(existing, Mapping) else [])
+        if isinstance(row, Mapping) and row.get("decision_key")
+    }
+    for row in jev_pair_decisions:
+        if isinstance(row, Mapping) and row.get("decision_key"):
+            prior_jev[str(row["decision_key"])] = dict(row)
+    if prior_jev:
+        semantic["jev_pair_decisions"] = [prior_jev[key] for key in sorted(prior_jev)]
     revision_hash = stable_hash(semantic)
     if (
         isinstance(existing, Mapping)
@@ -2151,11 +2174,14 @@ def persist_relationship_registry(
             "graph_projection_hash": stable_hash(links),
             "relation_counts": _relation_counts(links),
         }
-        write_yaml(path, payload)
-        write_yaml(compatibility_path, payload)
+        # Registry projections deliberately repeat the same edge. Avoid YAML
+        # aliases in Jev evidence/probabilities consumed by bounded readers.
+        serializable = _independent_containers(payload) if prior_jev else payload
+        write_yaml(path, serializable)
+        write_yaml(compatibility_path, serializable)
     compatibility = read_yaml(compatibility_path, {}) or {}
     if compatibility != payload:
-        write_yaml(compatibility_path, payload)
+        write_yaml(compatibility_path, _independent_containers(payload) if prior_jev else payload)
     return {
         "path": str(path),
         "compatibility_path": str(compatibility_path),
@@ -2167,6 +2193,7 @@ def persist_relationship_registry(
         ),
         "events": list(payload.get("events", []) or []),
         "parked": list(payload.get("parked", []) or []),
+        "jev_pair_decisions": list(payload.get("jev_pair_decisions", []) or []),
         "link_count": len(payload.get("links", []) or []),
         "relation_counts": dict(payload.get("relation_counts", {}) or {}),
         "graph_projection_hash": str(payload.get("graph_projection_hash") or ""),
@@ -2709,9 +2736,44 @@ def _final_v4_decision(
     )
 
 
+def _independent_containers(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _independent_containers(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_independent_containers(item) for item in value]
+    return value
+
+
+def _final_jev_decision(row: Mapping[str, Any], *, decision: str) -> bool:
+    """Recognize the separate experimental policy contract, never a verifier claim."""
+    from .jev_relationships import READABLE_POLICY_VERSIONS
+
+    return bool(
+        row.get("output_contract") == JEV_RELATIONSHIP_CONTRACT
+        and row.get("decision_schema_version") == "1"
+        and row.get("provider") == "typesafe"
+        and row.get("model") == "jev-1.13.0"
+        and row.get("policy_version") in READABLE_POLICY_VERSIONS
+        and row.get("verification_status") == "policy_accepted"
+        and row.get("decision_status") == decision
+        and row.get("source_profile_hash") and row.get("target_profile_hash")
+    )
+
+
+def _final_jev_relation(row: Mapping[str, Any]) -> bool:
+    return bool(
+        _final_jev_decision(row, decision="accepted")
+        and _structurally_valid_relationship_row(row)
+        and row.get("relation_type") in {"supports", "undermines", "qualifies", "extends", "complements", "contrasts"}
+        and isinstance(row.get("selected_evidence"), list)
+        and len(row["selected_evidence"]) == 2
+    )
+
+
 def _publishable_machine_relation(row: Mapping[str, Any]) -> bool:
     return (
         _final_v4_relation(row)
+        or _final_jev_relation(row)
         or _verified_machine_relation(row)
         or (
             str(row.get("decision_status") or "") == "reconciliation_pending"

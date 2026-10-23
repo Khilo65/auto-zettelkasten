@@ -25,6 +25,10 @@ _PAIR_PROVENANCE_MAX_BYTES = 2048
 _PAIR_PROVENANCE_MAX_ROWS = 6
 
 
+class CandidateResourceError(ValueError):
+    """Discovery stopped at an explicit bound without discarding saved work."""
+
+
 def _limit(value: int, name: str, *, zero: bool = False) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < (0 if zero else 1):
         raise ValueError(f"{name} must be a {'nonnegative' if zero else 'positive'} integer")
@@ -94,7 +98,7 @@ def _pair_provenance(evidence: Sequence[Mapping[str, Any]]) -> list[dict[str, An
         digest.update(str(len(encoded)).encode("ascii") + b":" + encoded)
     summary = {"signal": "material_evidence_summary", "material_sha256": digest.hexdigest(), "signal_counts": dict(sorted(counts.items())), "sampled_signal_count": 0, "omitted_signal_count": len(evidence)}
     samples: list[dict[str, Any]] = []
-    priority = {"direct_reference": 0, "source_coverage": 1, "shared_reference": 2, "zotero_related": 3, "shared_terms": 4, "shared_tag": 5}
+    priority = {"direct_reference": 0, "semantic_similarity": 0, "source_coverage": 1, "shared_reference": 2, "zotero_related": 3, "shared_terms": 4, "shared_tag": 5}
     groups: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     for row in evidence:
         groups[row["signal"]].append(row)
@@ -103,7 +107,7 @@ def _pair_provenance(evidence: Sequence[Mapping[str, Any]]) -> list[dict[str, An
     for raw in ordered:
         signal = raw["signal"]
         if signal == "direct_reference":
-            row = {key: raw[key] for key in ("signal", "citing_source_id", "cited_source_id", "work_id", "match_status", "locator", "source_identity", "target_identity") if key in raw}
+            row = {key: raw[key] for key in ("signal", "citing_source_id", "cited_source_id", "work_id", "match_status", "locator", "source_identity", "target_identity", "literature_position_id", "freshness", "reference_origin", "match_basis") if key in raw}
         elif signal == "shared_reference":
             row = {"signal": signal, "work_id": raw["work_id"]}
             for side in ("left", "right"):
@@ -138,6 +142,7 @@ class LocalRetrievalIndex:
         projection_rows: Sequence[Mapping[str, Any]],
         discovery_records: Sequence[Mapping[str, Any]] = (),
         *,
+        citation_records: Sequence[Mapping[str, Any]] = (),
         ignored_tags: Sequence[str] = (),
         max_posting_size: int = 64,
         max_source_chars: int = 16_000,
@@ -182,12 +187,17 @@ class LocalRetrievalIndex:
             row["zotero_item_keys"] = sorted({key.strip() for key in aliases if key.strip()} | ({row["zotero_key"]} if row["zotero_key"] else set()))
             row["collection_keys"] = sorted({_text(v, 256) for v in _items(raw.get("collection_keys"))[:64] if _text(v, 256)})
             row["facets"] = _compact(raw.get("facets") or {}, max_source_chars)
+            tags = raw.get("tags") or []
+            if not isinstance(tags, (list, tuple)) or len(tags) > max_discovery_signals_per_source or any(not isinstance(value, str) for value in tags):
+                raise ValueError("source tags must be a bounded text sequence")
+            row["tags"] = sorted({_text(value).casefold() for value in tags if _text(value) and _text(value).casefold() not in self._ignored_tags})
             for key in (*_ROLE_FIELDS, "source_references", "evidence_references", "coverage"):
                 if raw.get(key):
                     row[key] = _compact(raw[key], max_source_chars)
             if sid in self.rows and self.rows[sid] != row:
                 raise ValueError(f"conflicting projection rows for source_id {sid}")
             self.rows[sid] = row
+            self.tags[sid].update(row["tags"])
             if raw.get("identity"):
                 identity = _identity(raw["identity"])
                 if sid in self.identities and self.identities[sid] != identity:
@@ -210,6 +220,26 @@ class LocalRetrievalIndex:
                 raise ValueError(f"discovery note identity conflicts with projection for {sid}")
         for record in sorted(discovery_records, key=lambda r: (r["source_id"], _text(r.get("input_fingerprint")), _json(_compact(r, max_source_chars)))):
             self._add_discovery(record, by_identity)
+        if (not isinstance(citation_records, (list, tuple))
+                or len(citation_records) > max(1, len(self.rows)) * max_discovery_signals_per_source):
+            raise ValueError("citation memory records must be a bounded sequence")
+        citation_material = []
+        for record in citation_records:
+            if not isinstance(record, Mapping):
+                raise ValueError("citation memory record must be a mapping")
+            source, target = record.get("source_id"), record.get("target_source_id")
+            if (not isinstance(source, str) or not isinstance(target, str)
+                    or source not in self.rows or target not in self.rows or source == target):
+                raise ValueError("citation memory requires distinct current catalogue source IDs")
+            material = {key: _text(record.get(key), 1000) for key in ("literature_position_id", "match_status", "locator", "freshness", "reference_origin", "match_basis")}
+            material.update(signal="direct_reference", citing_source_id=source, cited_source_id=target,
+                            work_id="source:" + target)
+            citation_material.append(material)
+        for material in sorted(citation_material, key=_json):
+            source, target = material["citing_source_id"], material["cited_source_id"]
+            self._add_direct(source, target, material)
+            if len(self.references[source]) < max_discovery_signals_per_source:
+                self.references[source].setdefault(material["work_id"], {key: value for key, value in material.items() if key != "signal"})
         self.words: dict[str, set[str]] = {}
         postings: dict[tuple[str, str], list[str]] = defaultdict(list)
         for sid, row in sorted(self.rows.items()):
@@ -337,17 +367,17 @@ class LocalRetrievalIndex:
         signals = [(kind, value) for kind, values in (("term", self.words[sid]), ("reference", self.references[sid]), ("tag", self.tags[sid])) for value in values]
         return sorted(signals, key=lambda s: (self.frequencies[s], s))[:self.max_signals_per_source]
 
-    def _targets(self, signals: Sequence[tuple[str, str]], fanout: int, sid: str = "") -> list[str]:
+    def _targets(self, signals: Sequence[tuple[str, str]], fanout: int, sid: str = "", *, excluded_targets: set[str] | frozenset[str] = frozenset()) -> list[str]:
         streams = [self.postings.get(signal, []) for signal in signals]
         if sid:
             collections = set(self.rows[sid]["collection_keys"])
             streams = [sorted(ids, key=lambda target: (bool(collections & set(self.rows[target]["collection_keys"])), target)) for ids in streams]
-            direct = sorted(self.direct_targets[sid])[:fanout]
+            direct = sorted(self.direct_targets[sid] - excluded_targets)[:fanout]
             streams.insert(0, direct)
         targets: dict[str, None] = {}
         for row in zip_longest(*streams):
             for target in row:
-                if target is not None and target != sid:
+                if target is not None and target != sid and target not in excluded_targets:
                     targets[target] = None
                     if len(targets) >= fanout:
                         return list(targets)
@@ -362,7 +392,7 @@ class LocalRetrievalIndex:
             for kind, shared in self._shared(left, right) for value in shared
         ), 6)
 
-    def _pair(self, left: str, right: str) -> dict[str, Any]:
+    def _pair_material(self, left: str, right: str) -> list[dict[str, Any]]:
         evidence = sorted(self.direct.get((left, right), []), key=_json)
         for kind, ordered in self._shared(left, right):
             if kind == "term" and ordered:
@@ -371,9 +401,13 @@ class LocalRetrievalIndex:
                 evidence.extend({"signal": "shared_tag", "tag": value} for value in ordered)
             elif kind == "reference":
                 evidence.extend({"signal": "shared_reference", "work_id": value, "left_reference": self.references[left][value], "right_reference": self.references[right][value]} for value in ordered)
-        kinds = sorted({row["signal"] for row in evidence})
         if evidence:
             evidence.append({"signal": "source_coverage", "sources": [{"source_id": sid, "source_scope": self.rows[sid]["source_scope"], "evidence_eligibility": self.rows[sid]["evidence_eligibility"], "reference_coverage": sorted(self.coverage[sid], key=_json) or [{"status": "not_examined"}]} for sid in (left, right)]})
+        return evidence
+
+    def _pair(self, left: str, right: str) -> dict[str, Any]:
+        evidence = self._pair_material(left, right)
+        kinds = sorted({row["signal"] for row in evidence if row["signal"] != "source_coverage"})
         row = {"left_source_id": left, "right_source_id": right, "left_source_title": self.rows[left]["title"], "right_source_title": self.rows[right]["title"], "score": self._score(left, right), "why_compare": "; ".join(kinds), "discovery_route": "deterministic_local_ranked", "discovery_provenance": _pair_provenance(evidence)}
         if self.rows[left]["profile_hash"] and self.rows[right]["profile_hash"]:
             row["input_profile_hashes"] = {sid: self.rows[sid]["profile_hash"] for sid in (left, right)}
@@ -424,6 +458,180 @@ class LocalRetrievalIndex:
         self.last_candidate_stats.update(scored_pairs=len(pairs), returned_pairs=len(result))
         return result
 
+    def fused_candidate_pairs(
+        self, semantic_neighbors: Sequence[Mapping[str, Any]], *, per_source_cap: int = 8,
+        max_pairs: int = 256, fanout: int = 32, source_ids: Sequence[str] | None = None,
+        resolved_pairs: Sequence[tuple[str, str]] = (), retain_pool: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Alternate semantic and local rankings, then select bounded fair pairs.
+
+        Communities are deliberately absent: a bridge across communities remains
+        eligible. Caller-supplied resolved pairs must already be freshness-checked.
+        Neither these scores nor selection establishes a substantive relationship.
+        """
+        for name, value in (("per_source_cap", per_source_cap), ("max_pairs", max_pairs), ("fanout", fanout)):
+            _limit(value, name, zero=name != "fanout")
+        if fanout > 256 or per_source_cap > 256 or max_pairs > 100_000:
+            raise ValueError("fused candidate limits exceed their supported bounds")
+        if (not isinstance(semantic_neighbors, (list, tuple))
+                or len(semantic_neighbors) > max(1, len(self.rows)) * 256):
+            raise ValueError("semantic neighbors must be a bounded sequence")
+        if source_ids is not None and (not isinstance(source_ids, (list, tuple, set, frozenset))
+                                       or any(not isinstance(sid, str) for sid in source_ids)):
+            raise ValueError("candidate source_ids must be a sequence")
+        sources = sorted(self.rows if source_ids is None else set(source_ids))
+        if any(sid not in self.rows for sid in sources):
+            raise ValueError("candidate source_ids must belong to the index")
+        if (not isinstance(resolved_pairs, (list, tuple, set, frozenset))
+                or len(resolved_pairs) > max(1, len(self.rows)) * 256):
+            raise ValueError("resolved pairs must be a bounded sequence")
+        resolved: set[tuple[str, str]] = set()
+        excluded: dict[str, set[str]] = defaultdict(set)
+        for pair in resolved_pairs:
+            if (not isinstance(pair, (list, tuple)) or len(pair) != 2
+                    or any(not isinstance(sid, str) or not sid or len(sid) > 256 for sid in pair)
+                    or pair[0] == pair[1]):
+                raise ValueError("resolved pairs require two distinct source IDs")
+            key = tuple(sorted(pair))
+            resolved.add(key)
+            excluded[key[0]].add(key[1])
+            excluded[key[1]].add(key[0])
+        stats = {"source_count": len(self.rows), "seed_source_count": len(sources), "resolved_pair_count": len(resolved),
+                 "semantic_input_count": len(semantic_neighbors), "unknown_semantic_endpoints": 0,
+                 "scored_pairs": 0, "max_source_fanout": 0, "returned_pairs": 0,
+                 "bounded_candidate_count": 0, "unexamined_candidate_pairs": 0, "selection_truncated": 0}
+        self.last_candidate_stats = stats
+        self.last_candidate_pool = []
+        if not per_source_cap or not max_pairs:
+            stats["selection_truncated"] = int(bool(semantic_neighbors or self.rows))
+            return []
+        semantic: dict[str, dict[str, tuple[float, dict[str, Any]]]] = defaultdict(dict)
+
+        def order(sid: str, target: str, score: float) -> tuple[float, bool, str]:
+            return (-score, bool(set(self.rows[sid]["collection_keys"]) & set(self.rows[target]["collection_keys"])), target)
+
+        for raw in semantic_neighbors:
+            if not isinstance(raw, Mapping):
+                raise ValueError("semantic neighbor must be a mapping")
+            left, right, score = raw.get("source_id"), raw.get("target_source_id"), raw.get("score")
+            if (not isinstance(left, str) or not isinstance(right, str) or not left or not right
+                    or len(left) > 256 or len(right) > 256 or left == right):
+                raise ValueError("semantic neighbor requires distinct bounded source IDs")
+            if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score) or not 0 <= score <= 1:
+                raise ValueError("semantic similarity must be finite and between zero and one")
+            if left not in self.rows or right not in self.rows:
+                stats["unknown_semantic_endpoints"] += 1
+                continue
+            pair = tuple(sorted((left, right)))
+            if not score or pair in resolved:
+                continue
+            provenance = raw.get("provenance") or {}
+            if not isinstance(provenance, Mapping):
+                raise ValueError("semantic provenance must be a mapping")
+            identity = provenance.get("embedding_identity", "")
+            if not isinstance(identity, str) or len(identity) > 256:
+                raise ValueError("semantic embedding identity must be bounded text")
+            material: dict[str, Any] = {"signal": "semantic_similarity", "source_id": pair[0], "target_source_id": pair[1],
+                                        "embedding_identity": identity, "evidence_backed": False, "accepted": False}
+            for side, sid in (("source", left), ("target", right)):
+                chunks = provenance.get(f"{side}_chunk_ids")
+                if chunks is not None:
+                    if (not isinstance(chunks, (list, tuple)) or len(chunks) > 100_000
+                            or any(not isinstance(value, str) or not value or len(value) > 256 for value in chunks)):
+                        raise ValueError("semantic chunk identities must be bounded text sequences")
+                    label = "source" if sid == pair[0] else "target"
+                    material[f"{label}_chunk_ids_sha256"] = hashlib.sha256(_json(sorted(chunks)).encode("utf-8")).hexdigest()
+                    material[f"{label}_chunk_count"] = len(chunks)
+            for sid, target in ((left, right), (right, left)):
+                bucket = semantic[sid]
+                prior = bucket.get(target)
+                if prior is not None and (score < prior[0] or (score == prior[0] and _json(material) >= _json(prior[1]))):
+                    continue
+                bucket[target] = (float(score), material)
+                if len(bucket) > fanout:
+                    worst = max(bucket, key=lambda other: order(sid, other, bucket[other][0]))
+                    del bucket[worst]
+                    stats["selection_truncated"] = 1
+        proposals: dict[str, list[tuple[str, str]]] = {}
+        local_pairs: set[tuple[str, str]] = set()
+        semantic_pairs: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+        candidate_keys: set[tuple[str, str]] = set()
+        for sid in sources:
+            semantic_targets = sorted(semantic[sid], key=lambda target: order(sid, target, semantic[sid][target][0]))
+            local_targets = self._targets(self._signals(sid), fanout, sid, excluded_targets=excluded[sid])
+            local_ranked = []
+            for target in local_targets:
+                key = tuple(sorted((sid, target)))
+                if self._score(*key) > 0:
+                    local_ranked.append(key)
+                    local_pairs.add(key)
+            local_ranked.sort(key=lambda key: (bool(set(self.rows[key[0]]["collection_keys"]) & set(self.rows[key[1]]["collection_keys"])), -self._score(*key), key))
+            semantic_ranked = []
+            for target in semantic_targets:
+                key = tuple(sorted((sid, target)))
+                semantic_ranked.append(key)
+                value = semantic[sid][target]
+                if key not in semantic_pairs or value[0] > semantic_pairs[key][0]:
+                    semantic_pairs[key] = value
+            merged: dict[tuple[str, str], None] = {}
+            for semantic_key, local_key in zip_longest(semantic_ranked, local_ranked):
+                for key in (semantic_key, local_key):
+                    if key is not None and key not in resolved:
+                        merged[key] = None
+                    if len(merged) >= fanout:
+                        break
+                if len(merged) >= fanout:
+                    break
+            proposals[sid] = list(merged)
+            candidate_keys.update(merged)
+            stats["max_source_fanout"] = max(stats["max_source_fanout"], len(merged))
+            if len(local_targets) >= fanout:
+                stats["selection_truncated"] = 1
+        counts: Counter[str] = Counter()
+        selected: dict[tuple[str, str], None] = {}
+        sources.sort(key=lambda sid: (min((self.collection_sizes[key] for key in self.rows[sid]["collection_keys"]), default=0), sid))
+        for _ in range(min(per_source_cap, len(self.rows))):
+            before = len(selected)
+            for sid in sources:
+                if counts[sid] >= per_source_cap:
+                    continue
+                for key in proposals[sid]:
+                    if key not in selected and all(counts[endpoint] < per_source_cap for endpoint in key):
+                        selected[key] = None
+                        counts.update(key)
+                        break
+                if len(selected) >= max_pairs:
+                    break
+            if len(selected) >= max_pairs or len(selected) == before:
+                break
+        # Retain the complete bounded discovery pool independently of this pass's
+        # endpoint/payment allocation. Round-robin proposal order stays stable.
+        ordered_pool: dict[tuple[str, str], None] = {}
+        for rank in range(fanout):
+            for sid in sources:
+                if rank < len(proposals[sid]):
+                    ordered_pool[proposals[sid][rank]] = None
+        if retain_pool and len(ordered_pool) > 100_000:
+            raise CandidateResourceError("candidate pool exceeds the bounded queue; reduce source scope")
+        materialized = {}
+        for key in ordered_pool if retain_pool else selected:
+            row = self._pair(*key)
+            row.update(rank=len(materialized) + 1, local_score=row["score"], discovery_route="deterministic_local_fused",
+                       ranking_method="alternating_semantic_local", decision_status="unexamined")
+            if key in semantic_pairs:
+                score, material = semantic_pairs[key]
+                row["semantic_score"] = score
+                row["discovery_provenance"] = _pair_provenance([*self._pair_material(*key), material])
+                row["why_compare"] = "; ".join(filter(None, ("semantic_similarity", row["why_compare"])))
+            row["candidate_routes"] = (["semantic_similarity"] if key in semantic_pairs else []) + (["local_reference_tag_profile"] if key in local_pairs else [])
+            materialized[key] = row
+        self.last_candidate_pool = list(materialized.values()) if retain_pool else []
+        result = [{**materialized[key], "rank": rank} for rank, key in enumerate(selected, 1)]
+        stats.update(scored_pairs=len(candidate_keys), bounded_candidate_count=len(candidate_keys), returned_pairs=len(result),
+                     unexamined_candidate_pairs=len(candidate_keys) - len(result),
+                     selection_truncated=int(bool(stats["selection_truncated"] or len(candidate_keys) > len(result))))
+        return result
+
     def recall(self, query: str, *, relationships: Sequence[Mapping[str, Any]] = (), max_notes: int = 8, max_chars: int = 12_000, max_query_chars: int = 2000, max_query_tokens: int = 64, fanout: int = 32, neighbor_cap: int = 2) -> dict[str, Any]:
         """Return bounded compact notes and one hop of explicitly accepted links.
 
@@ -459,7 +667,11 @@ class LocalRetrievalIndex:
             left, right = _text(raw.get("source_id"), 256), _text(raw.get("target_source_id") or raw.get("related_source_id"), 256)
             if left not in self.rows or right not in self.rows or left == right:
                 continue
-            row = {key: _compact(raw[key], 2000) for key in ("relation_id", "relation_type", "reason", "source_evidence", "target_evidence", "provenance", "freshness") if raw.get(key)}
+            row = {key: _compact(raw[key], 2000) for key in ("relation_id", "relation_type", "reason", "source_evidence", "target_evidence", "provenance", "freshness", "selected_evidence", "decision_policy", "model", "template_version", "evidence_basis") if raw.get(key)}
+            for key in ("confidence", "winning_probability", "runner_up_probability", "probability_margin"):
+                value = raw.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and 0 <= value <= 1:
+                    row[key] = value
             row.update(source_id=left, target_source_id=right, decision_status="accepted")
             for source, target in ((left, right), (right, left)):
                 if source in selected:
@@ -474,8 +686,7 @@ class LocalRetrievalIndex:
                 if target in selected:
                     links[_json(row)] = row
         selected.extend(sid for sid in ranked if sid not in selected and len(selected) < max_notes)
-        notes: list[dict[str, Any]] = []
-        chars = 0
+        note_rows: dict[str, dict[str, Any]] = {}
         for sid in selected:
             source = self.rows[sid]
             row = {key: source[key] for key in ("source_id", "note_id", "note_path", "note_hash", "profile_hash", "title", "author", "year", "source_scope", "evidence_eligibility")}
@@ -489,17 +700,45 @@ class LocalRetrievalIndex:
             if self.references[sid]:
                 row["discovery_references"] = [self.references[sid][key] for key in sorted(self.references[sid])[:4]]
             row["provenance"] = {"route": "supplied_compact_profile", "identity": dict(zip(("instance_id", "library_type", "library_id", "item_key"), self.identities[sid])) if sid in self.identities else {}}
-            remaining = max_chars - chars - len(_json({**row, "thesis": "", "method": ""}))
+            note_rows[sid] = {**row, "thesis": "", "method": ""}
+        # Reserve bounded accepted-edge records before allocating excerpts. A
+        # full-text-rich query must not crowd out the memory layer's typed links.
+        # Their endpoints need room too, otherwise the edge cannot be inspected.
+        reserved_links, required, edge_chars = [], set(), 0
+        base_sizes = {sid: len(_json(row)) for sid, row in note_rows.items()}
+        for row in sorted(links.values(), key=_json):
+            endpoints = {row["source_id"], row["target_source_id"]}
+            if not endpoints <= note_rows.keys():
+                continue
+            size = len(_json(row))
+            needed = required | endpoints
+            if edge_chars + size + sum(base_sizes[sid] for sid in needed) <= max_chars:
+                reserved_links.append(row)
+                edge_chars += size
+                required = needed
+        note_budget = max_chars - edge_chars
+        ordered = [sid for sid in selected if sid in required] + [sid for sid in selected if sid not in required]
+        notes: list[dict[str, Any]] = []
+        chars = 0
+        pending_required = set(required)
+        for sid in ordered:
+            row = note_rows[sid]
+            source = self.rows[sid]
+            pending_required.discard(sid)
+            remaining = note_budget - chars - base_sizes[sid] - sum(base_sizes[other] for other in pending_required)
             if remaining < 0:
                 continue
             row["thesis"] = source["thesis"][:min(2000, remaining // 2)]
             row["method"] = source["method"][:min(1000, remaining // 4)]
-            if chars + len(_json(row)) <= max_chars:
+            while len(_json(row)) > base_sizes[sid] + remaining and (row["thesis"] or row["method"]):
+                field = "thesis" if len(row["thesis"]) >= len(row["method"]) else "method"
+                row[field] = row[field][:len(row[field]) // 2]
+            if chars + len(_json(row)) <= note_budget:
                 notes.append(row)
                 chars += len(_json(row))
         included = {row["source_id"] for row in notes}
         kept_links = []
-        for row in sorted(links.values(), key=_json):
+        for row in reserved_links:
             if {row["source_id"], row["target_source_id"]} <= included and chars + len(_json(row)) <= max_chars:
                 kept_links.append(row)
                 chars += len(_json(row))

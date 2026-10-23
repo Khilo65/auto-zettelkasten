@@ -40,6 +40,17 @@ class ReaderProvider(Protocol):
 
 
 @runtime_checkable
+class CommunityNamingProvider(ReaderProvider, Protocol):
+    """Optional small source-worker task, independently previewed and approved."""
+
+    def community_name_input_budget(self) -> int: ...
+
+    def community_name_output_tokens(self) -> int: ...
+
+    def name_community(self, system_prompt: str, user_prompt: str) -> Mapping[str, Any]: ...
+
+
+@runtime_checkable
 class HierarchicalReaderProvider(ReaderProvider, Protocol):
     """Optional reader extension for documents that exceed a model context budget."""
 

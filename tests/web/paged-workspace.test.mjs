@@ -44,6 +44,9 @@ function harness(t, index, read) {
     LibraryParser: class { async parse(documents) { return documents.map(kit.parseLibraryDocument); } close() {} },
     cytoscape: (options) => { const config = w.Object.assign(new w.Object(), options); config.container = undefined; config.headless = true; const graph = kit.cytoscape(config); graphs.push(graph); return graph; },
     layoutGraph: () => ({ finished: Promise.resolve({ status: "complete" }), cancel() {} }),
+    // Exercise hidden-list paging with an available renderer. Canvas-unavailable
+    // behavior exposes a visible list and is covered by graph-display-controls.
+    createGraphView: () => ({ setOptions() {}, setAppearance() {}, resize() {}, zoomBy() {} }),
   };
   load("app.js"); load("workspace.js");
   const el = (id) => w.document.getElementById(id), click = (id) => el(id).click();
@@ -90,7 +93,7 @@ test("paged library commits every note and relation only after verification, the
   assert.equal(app.el("workspace-tree-note").hidden, true);
   assert.equal(app.el("global-graph-list").children.length, 0, "large hidden list is lazy");
   app.click("global-graph-show-list");
-  assert.equal(app.el("global-graph-list").children.length, 201, "keyboard list is paged without dropping graph nodes");
+  assert.equal(app.el("global-graph-list").querySelectorAll(":scope > button").length, 201, "keyboard note buttons are paged independently of relationship disclosures");
   app.click("workspace-quick-open"); app.input("workspace-quick-query", "N6000");
   const result = app.el("workspace-quick-results").querySelector("button"); assert.ok(result);
   await app.poll();

@@ -486,6 +486,7 @@ def test_index_is_confined_and_does_not_expose_private_names(tmp_path, service):
         "documents": [{"path": "Keep.md", "text": "# Keep\r\n",
                        "revision": hashlib.sha256((tmp_path / "Keep.md").read_bytes()).hexdigest(),
                        "editable": documents._SAFE_WRITES, "navigation": False,
+                       "note_origin": "unknown",
                        "source_coverage": {"status": "unknown", "label": "Source coverage unknown"}}],
         "relations": [], "truncated": False, "warnings": [],
         "document_identities": [], "relation_resolution": {"missing": 0, "ambiguous": 0},

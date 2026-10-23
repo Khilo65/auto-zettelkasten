@@ -13,7 +13,9 @@
     snapshot: null, linkIndex: null, indexing: false, indexRequest: 0, indexTimer: null, indexError: "", indexProgress: "", indexParser: null,
     previewDocuments: new Map(), previewRequests: new Map(),
     contextOpen: false, contextMode: "backlinks", graphTab: false, graphActive: false, localPinned: null,
-    graphs: new Map(), graphViews: new WeakMap(), graphLayouts: new Map(), graphSizes: new WeakMap(), graphLabels: new WeakMap(), graphSignatures: new Map(), graphLists: new Set(),
+    graphs: new Map(), graphViews: new WeakMap(), graphLayouts: new Map(), graphSizes: new WeakMap(), graphLabels: new WeakMap(), graphSignatures: new Map(), graphLists: new Set(), graphPositions: new Map(),
+    graphCommunities: new Map(),
+    graphPreferences: null, graphPreferencesError: "", graphPreferenceWrites: Promise.resolve(), graphLayoutFailures: new Set(),
     organization: null, organizationMenu: null, organizationRequest: 0, requiresReopen: false,
   };
 
@@ -157,6 +159,9 @@
     el("workspace-folder-error").textContent = "Opening folder…";
     screen.inert = true;
     try {
+      // Opening a folder replaces its document-service identity. Finish ordered display
+      // writes first so queued settings still address the outgoing workspace.
+      await state.graphPreferenceWrites;
       const result = await api("workspace/open", { path });
       for (const doc of state.documents.values()) if (!doc.recovery) persistDraft(doc);
       state.epoch += 1; state.requiresReopen = false;
@@ -167,7 +172,11 @@
       state.indexParser?.close(); state.indexParser = null; state.previewDocuments.clear(); state.previewRequests.clear();
       state.graphTab = false; state.graphActive = false; state.localPinned = null;
       for (const graph of state.graphs.values()) graph.destroy();
-      state.graphs.clear(); state.graphLayouts.clear(); state.graphSignatures.clear();
+      for (const mode of ["global", "local"]) state.graphCommunities.set(mode, { selected: "", focused: false });
+      state.graphs.clear(); state.graphLayouts.clear(); state.graphSignatures.clear(); state.graphPositions.clear(); state.graphLists.clear(); state.graphLayoutFailures.clear();
+      state.graphPreferences = kit.normalizeGraphPreferences(); state.graphPreferencesError = "";
+      await loadGraphPreferences();
+      syncGraphPreferenceControls();
       state.history = []; state.historyIndex = -1;
       state.expanded.clear(); state.treeFocus = "";
       state.view?.destroy(); state.view = null;
@@ -614,6 +623,21 @@
         button.addEventListener("click", () => navigateLink(reference.destination, reference.kind, doc.path)); container.append(button);
       }
     }
+    kit.appendRelationshipDetails(container, state.linkIndex, doc.path, {
+      direction: state.contextMode === "backlinks" ? "incoming" : "outgoing", onOpen: openRelationshipEvidence,
+    });
+  }
+
+  async function openRelationshipEvidence(path, locator) {
+    await openDocument(path, { refresh: true });
+    const doc = active();
+    if (doc?.path !== path || !locator) return;
+    if (Number.isInteger(locator.line_start) && locator.line_start >= 1 && locator.line_start <= doc.editorState.doc.lines) {
+      const line = doc.editorState.doc.line(locator.line_start); jumpTo(line.from, line.to);
+    } else if (locator.heading) {
+      const heading = state.linkIndex?.documents.get(path)?.headings?.find((entry) => entry.title === locator.heading);
+      if (heading) jumpTo(heading.from);
+    }
   }
 
   function showGlobalGraph() {
@@ -624,6 +648,72 @@
 
   function graphControl(mode, name) { return el(`${mode}-graph-${name}`); }
 
+  function graphIsDark() {
+    const theme = document.body.dataset.theme || document.documentElement.dataset.theme;
+    return theme === "dark" || theme !== "light" && Boolean(window.matchMedia?.("(prefers-color-scheme: dark)").matches);
+  }
+
+  async function loadGraphPreferences() {
+    const workspaceId = state.workspace.id, epoch = state.epoch;
+    try {
+      const result = await api("workspace/graph-preferences", { workspace_id: workspaceId });
+      if (state.epoch === epoch && state.workspace?.id === workspaceId) state.graphPreferences = kit.normalizeGraphPreferences(result.preferences);
+    } catch {
+      if (state.epoch === epoch) state.graphPreferencesError = "Graph display settings could not be loaded. Changes apply for this session.";
+    }
+  }
+
+  function saveGraphPreferences() {
+    const workspaceId = state.workspace.id, epoch = state.epoch, preferences = kit.normalizeGraphPreferences(state.graphPreferences);
+    // Preserve event order, including quick changes while the preceding write is still in flight.
+    state.graphPreferenceWrites = state.graphPreferenceWrites.then(async () => {
+      try {
+        await api("workspace/graph-preferences", { workspace_id: workspaceId, preferences });
+        if (state.epoch === epoch) state.graphPreferencesError = "";
+      } catch {
+        if (state.epoch === epoch) state.graphPreferencesError = "Graph display settings could not be saved. Changes apply for this session.";
+      }
+      if (state.epoch === epoch) renderGraphPreferenceStatus();
+    });
+  }
+
+  function renderGraphPreferenceStatus() {
+    for (const mode of ["global", "local"]) {
+      const status = graphControl(mode, "preferences-status");
+      if (status) { status.textContent = state.graphPreferencesError; status.hidden = !state.graphPreferencesError; }
+    }
+  }
+
+  function syncGraphPreferenceControls() {
+    for (const mode of ["global", "local"]) {
+      const color = graphControl(mode, "color-by");
+      if (!color) continue;
+      color.value = state.graphPreferences.colorBy;
+      for (const origin of ["managed", "personal", "unknown"]) graphControl(mode, `origin-${origin}`).checked = state.graphPreferences.origins[origin];
+    }
+    renderGraphPreferenceStatus();
+  }
+
+  function changeGraphPreferences(mode) {
+    const previousOrigins = JSON.stringify(state.graphPreferences.origins);
+    state.graphPreferences = kit.normalizeGraphPreferences({ version: 1, colorBy: graphControl(mode, "color-by").value,
+      origins: Object.fromEntries(["managed", "personal", "unknown"].map((origin) => [origin, graphControl(mode, `origin-${origin}`).checked])) });
+    syncGraphPreferenceControls();
+    const recolorOnly = previousOrigins === JSON.stringify(state.graphPreferences.origins);
+    for (const target of ["global", "local"]) if (graphControl(target, "canvas")) renderGraph(target, recolorOnly);
+    saveGraphPreferences();
+  }
+
+  function renderGraphColorLegend(mode, nodes, appearance) {
+    const legend = graphControl(mode, "color-legend"); legend.replaceChildren();
+    for (const entry of kit.graphLegend(nodes, appearance)) {
+      const item = document.createElement("span"); item.setAttribute("role", "listitem");
+      const swatch = document.createElement("span"); swatch.className = "graph-color-swatch";
+      swatch.style.backgroundColor = entry.color; swatch.setAttribute("aria-hidden", "true");
+      item.append(swatch, document.createTextNode(`${entry.label} (${entry.count})`)); legend.append(item);
+    }
+  }
+
   function ensureGraphControls(mode) {
     const container = el(`workspace-${mode}-graph`);
     if (graphControl(mode, "canvas")) return;
@@ -631,9 +721,20 @@
     container.innerHTML = `
       <div class="graph-heading"><div><h2 id="${mode}-graph-title">${local ? "Local graph" : "Graph view"}</h2>${local ? `<span id="local-graph-context"></span>` : ""}</div><div class="graph-actions">${local ? '<button id="local-graph-pin" class="icon-button" type="button" aria-label="Pin local graph" title="Pin local graph" aria-pressed="false" data-icon="Pin"></button>' : ""}<button id="${mode}-graph-fit" class="icon-button" type="button" aria-label="Fit ${mode} graph" title="Fit graph" data-icon="Maximize2"></button><button id="${mode}-graph-zoom-in" class="icon-button" type="button" aria-label="Zoom in ${mode} graph" title="Zoom in" data-icon="ZoomIn"></button><button id="${mode}-graph-zoom-out" class="icon-button" type="button" aria-label="Zoom out ${mode} graph" title="Zoom out" data-icon="ZoomOut"></button><button id="${mode}-graph-show-list" class="icon-button" type="button" aria-label="Show ${mode} graph note list" title="Note list" data-icon="List" aria-expanded="false"></button></div></div>
       ${local ? "" : '<div class="index-status" role="status" hidden></div>'}
-      <div class="graph-viewport"><div id="${mode}-graph-canvas" class="graph-canvas" role="img" aria-label="${local ? "Local note connections" : "All note connections"}. Use the note list for keyboard navigation."></div><p id="${mode}-graph-empty" class="graph-empty" hidden></p>
+      <div class="graph-viewport"><div id="${mode}-graph-canvas" class="graph-canvas" role="img" aria-label="${local ? "Local note connections" : "All note connections"}. Use the note list for keyboard navigation."></div><p id="${mode}-graph-empty" class="graph-empty" hidden></p><p id="${mode}-graph-fallback" class="graph-fallback-notice" role="status" hidden>Interactive canvas unavailable. Use the note list below to explore these notes.</p>
+        <div class="graph-community-toolbar"><label class="sr-only" for="${mode}-graph-community">Community</label><select id="${mode}-graph-community" aria-label="${local ? "Local" : "Global"} community"><option value="">All communities</option></select><button id="${mode}-graph-community-focus" type="button" aria-pressed="false" disabled>Focus</button></div>
+        <aside id="${mode}-graph-community-panel" class="graph-community-panel" aria-label="Community index" hidden></aside>
         <details class="graph-settings"><summary aria-label="${local ? "Local" : "Global"} graph settings" title="Graph settings"><span data-icon="Settings"></span><span>Settings</span></summary><div>
           ${local ? `<label for="local-graph-depth">Depth</label><select id="local-graph-depth"><option value="1">1</option><option value="2">2</option><option value="3">3</option></select><label class="graph-check"><input id="local-graph-incoming" type="checkbox" checked> Incoming links</label><label class="graph-check"><input id="local-graph-outgoing" type="checkbox" checked> Outgoing links</label><label class="graph-check"><input id="local-graph-neighbors" type="checkbox" checked> Links between neighbors</label>` : ""}
+          <fieldset class="graph-origin-options"><legend>Show notes by origin</legend>
+            <label class="graph-check"><input id="${mode}-graph-origin-managed" data-graph-preference type="checkbox" checked> Managed sources</label>
+            <label class="graph-check"><input id="${mode}-graph-origin-personal" data-graph-preference type="checkbox" checked> Verified personal notes</label>
+            <label class="graph-check"><input id="${mode}-graph-origin-unknown" data-graph-preference type="checkbox" checked> Other / unknown origin</label>
+          </fieldset>
+          <label for="${mode}-graph-color-by">Color by</label><select id="${mode}-graph-color-by" data-graph-preference><option value="none">None</option><option value="origin">Note origin</option><option value="community">Leiden community</option></select>
+          <label for="${mode}-graph-community-scale">Community scale</label><select id="${mode}-graph-community-scale"><option value="default">Default</option></select>
+          <label class="graph-check"><input id="${mode}-graph-community-regions" type="checkbox" checked> Community regions</label>
+          <p class="graph-origin-help">Origin reflects verified note provenance, separately from editability. Editing a managed source keeps its origin.</p>
           <label for="${mode}-graph-search">Filter notes</label><input id="${mode}-graph-search" type="text" placeholder="Name or path…" autocomplete="off">
           <label for="${mode}-graph-folder">Folder</label><select id="${mode}-graph-folder"><option value="">All folders</option></select>
           <label for="${mode}-graph-tag">Tag</label><select id="${mode}-graph-tag"><option value="">All tags</option></select>
@@ -643,13 +744,26 @@
           <label class="graph-check"><input id="${mode}-graph-references" type="checkbox"> Markdown links</label>
           <label class="graph-check"><input id="${mode}-graph-citations" type="checkbox"> Citations</label>
           <label class="graph-check"><input id="${mode}-graph-discovery" type="checkbox"> Discovery links</label>
+          <label for="${mode}-graph-discovery-density">Discovery density</label><select id="${mode}-graph-discovery-density"><option value="8">Up to 8 per note</option><option value="16">Up to 16 per note</option><option value="32">Up to 32 per note</option><option value="all">All saved suggestions</option></select>
+          <p class="graph-origin-help">Display only. Accepted relationships, citations and the comparison queue are unchanged.</p>
           <label class="graph-check"><input id="${mode}-graph-relations" type="checkbox" checked> Accepted research relations</label>
           <label for="${mode}-graph-type">Relation type</label><select id="${mode}-graph-type"><option value="">All types</option></select>
           <label class="graph-check"><input id="${mode}-graph-labels" type="checkbox" checked> Show labels</label>
         </div></details>
-      </div><div class="graph-footer"><span id="${mode}-graph-counts" role="status"></span><span id="${mode}-graph-progress" role="status" hidden>Arranging graph…</span><span class="graph-legend"><span>— Other links</span><span class="relation-legend">╴ Research relations</span></span><span>Discovery suggestions and communities are derived, not accepted research links. Unconnected does not mean unrelated.</span></div><div id="${mode}-graph-list" class="graph-note-list" aria-label="${local ? "Local" : "Global"} graph notes" hidden></div>`;
+      </div><div class="graph-footer"><span id="${mode}-graph-counts" role="status"></span><span id="${mode}-graph-progress" role="status" hidden>Arranging graph…</span><div id="${mode}-graph-color-legend" class="graph-color-legend" role="list" aria-label="${local ? "Local" : "Global"} graph note colors"></div><span class="graph-legend"><span>— Other links</span><span class="relation-legend">╴ Research relations</span></span><span>Discovery suggestions and communities are derived, not accepted research links. Unconnected does not mean unrelated.</span><span id="${mode}-graph-preferences-status" class="graph-preferences-status" role="status" hidden></span></div><div id="${mode}-graph-list" class="graph-note-list" aria-label="${local ? "Local" : "Global"} graph notes" hidden></div>`;
     fillIcons(container);
-    container.querySelectorAll("input,select").forEach((control) => control.addEventListener(control.type === "text" ? "input" : "change", () => renderGraph(mode, true)));
+    syncGraphPreferenceControls();
+    state.graphCommunities.set(mode, { selected: "", focused: false });
+    graphControl(mode, "community-focus").addEventListener("click", () => {
+      const current = state.graphCommunities.get(mode); current.focused = !current.focused; renderGraph(mode, true);
+    });
+    container.querySelectorAll("input,select").forEach((control) => control.addEventListener(control.type === "text" ? "input" : "change", () => {
+      if (control.id === `${mode}-graph-community`) { const current = state.graphCommunities.get(mode); current.selected = control.value; if (!control.value) current.focused = false; renderGraph(mode, true); }
+      else if (control.id === `${mode}-graph-community-scale`) { state.graphCommunities.set(mode, { selected: "", focused: false }); renderGraph(mode, true); }
+      else if (control.id === `${mode}-graph-community-regions`) renderGraph(mode, true);
+      else if (control.hasAttribute("data-graph-preference")) changeGraphPreferences(mode);
+      else renderGraph(mode);
+    }));
     graphControl(mode, "fit").addEventListener("click", () => fitGraph(state.graphs.get(mode)));
     for (const [name, factor] of [["zoom-in", 1.25], ["zoom-out", .8]]) graphControl(mode, name).addEventListener("click", () => {
       const graph = state.graphs.get(mode); if (!graph) return;
@@ -712,7 +826,78 @@
     state.graphSizes.set(graph, size);
   }
 
-  function renderGraph(mode) {
+  function renderGraphNoteList(mode, data, appearance, fallback) {
+    const list = graphControl(mode, "list");
+    if (data.nodes.length > 1000 && !fallback && !state.graphLists.has(mode)) return;
+    const listSignature = JSON.stringify([data, appearance]);
+    if (list.dataset.notes !== listSignature) {
+      list.dataset.notes = listSignature; list.replaceChildren();
+      let shown = 0;
+      const appendPage = () => {
+        list.querySelector(".graph-list-more")?.remove();
+        for (const node of data.nodes.slice(shown, shown + 200)) {
+          const color = kit.graphNodeAppearance(node, appearance);
+          const button = document.createElement("button"); button.type = "button";
+          const swatch = document.createElement("span"); swatch.className = "graph-color-swatch"; swatch.style.backgroundColor = color.color; swatch.setAttribute("aria-hidden", "true");
+          const name = document.createElement("span"); name.className = "graph-list-name"; name.textContent = node.label;
+          const category = document.createElement("span"); category.className = "graph-list-category"; category.textContent = color.label;
+          button.append(swatch, name); if (appearance.colorBy !== "none") button.append(category);
+          button.title = [node.path || node.label, ...(node.pathAliases?.filter((alias) => alias !== node.path) || []), node.source_coverage?.label, ...(node.candidates || [])].filter(Boolean).join(" · "); button.disabled = !node.path || node.missing;
+          button.addEventListener("click", () => openDocument(node.path, { refresh: true })); list.append(button);
+          if (node.path && !node.missing) kit.appendRelationshipDetails(list, state.linkIndex, node.path, {
+            relations: data.edges, onOpen: openRelationshipEvidence,
+          });
+        }
+        shown += 200;
+        if (shown < data.nodes.length) {
+          const more = document.createElement("button"); more.type = "button"; more.className = "graph-list-more";
+          more.textContent = `Show more notes (${data.nodes.length - shown} remaining)`; more.addEventListener("click", appendPage); list.append(more);
+        }
+      };
+      appendPage();
+    }
+  }
+
+  function renderCommunityControls(mode, data, scale) {
+    const current = state.graphCommunities.get(mode), select = graphControl(mode, "community"), panel = graphControl(mode, "community-panel");
+    const communities = kit.graphCommunities(data, scale), selected = communities.find((row) => row.community_id === current.selected);
+    select.replaceChildren();
+    for (const row of [{ community_id: "", label: communities.length ? "All communities" : "No saved communities" }, ...communities]) {
+      const option = document.createElement("option"); option.value = row.community_id; option.textContent = `${row.label}${row.members ? ` (${row.members.length})` : ""}`; select.append(option);
+    }
+    select.disabled = !communities.length;
+    if (!selected) { current.selected = ""; current.focused = false; }
+    select.value = current.selected;
+    graphControl(mode, "community-focus").disabled = !selected;
+    graphControl(mode, "community-focus").setAttribute("aria-pressed", String(current.focused));
+    graphControl(mode, "community-focus").textContent = current.focused ? "Show all" : "Focus";
+    panel.hidden = !selected; panel.replaceChildren();
+    graphControl(mode, "canvas").parentElement.classList.toggle("has-community", Boolean(selected));
+    if (!selected) return data;
+    const heading = document.createElement("h3"); heading.textContent = selected.label;
+    const note = document.createElement("p"); note.textContent = `${selected.members.length} visible members · ${scale} scale. Membership describes a neighborhood, not agreement.`;
+    const close = document.createElement("button"); close.type = "button"; close.className = "graph-community-close"; close.setAttribute("aria-label", "Close community index"); close.textContent = "×";
+    close.addEventListener("click", () => { current.selected = ""; current.focused = false; renderGraph(mode, true); select.focus(); });
+    panel.append(close, heading, note);
+    const memberIds = new Set(selected.members.map((node) => node.id)), bridges = new Set();
+    for (const edge of data.edges) { if (memberIds.has(edge.source) && !memberIds.has(edge.target)) bridges.add(edge.target); if (memberIds.has(edge.target) && !memberIds.has(edge.source)) bridges.add(edge.source); }
+    const bridge = document.createElement("p"); bridge.textContent = `${bridges.size} directly connected external notes${current.focused ? " remain visible" : ""}.`; panel.append(bridge);
+    kit.appendCommunityConnections(panel, selected, data, { onOpen: openRelationshipEvidence });
+    const members = document.createElement("div"); members.className = "graph-community-members"; panel.append(members);
+    let shown = 0;
+    const page = () => {
+      members.querySelector(".graph-community-more")?.remove();
+      for (const node of selected.members.slice(shown, shown + 100)) {
+        const button = document.createElement("button"); button.type = "button"; button.textContent = node.label; button.title = node.path; button.addEventListener("click", () => openDocument(node.path, { refresh: true })); members.append(button);
+      }
+      shown += 100;
+      if (shown < selected.members.length) { const more = document.createElement("button"); more.type = "button"; more.className = "graph-community-more"; more.textContent = `Show ${Math.min(100, selected.members.length - shown)} more members`; more.addEventListener("click", page); members.append(more); }
+    };
+    page();
+    return current.focused ? kit.focusGraphCommunity(data, selected.community_id, scale) : data;
+  }
+
+  function renderGraph(mode, appearanceOnly = false) {
     ensureGraphControls(mode); populateGraphChoices(mode); renderIndexStatus();
     const local = mode === "local", path = local ? state.localPinned || active()?.path : active()?.path;
     if (local) {
@@ -730,42 +915,39 @@
     };
     if (local) options.local = { path, depth: Number(graphControl(mode, "depth").value), incoming: graphControl(mode, "incoming").checked, outgoing: graphControl(mode, "outgoing").checked, neighbors: graphControl(mode, "neighbors").checked };
     let data = state.linkIndex ? kit.graphData(state.linkIndex, options) : { nodes: [], edges: [] };
+    data = kit.filterGraphOrigins(data, state.graphPreferences.origins);
+    const density = graphControl(mode, "discovery-density").value;
+    data = kit.limitGraphDiscovery(data, density === "all" ? "all" : Number(density));
+    const scaleSelect = graphControl(mode, "community-scale"), previousScale = scaleSelect.value;
+    const scales = kit.graphCommunityScales(data.semantic_map); scaleSelect.replaceChildren();
+    for (const scale of scales.length ? scales : ["default"]) { const option = document.createElement("option"); option.value = scale; option.textContent = scale[0].toUpperCase() + scale.slice(1); scaleSelect.append(option); }
+    if (scales.includes(previousScale)) scaleSelect.value = previousScale;
+    scaleSelect.disabled = scales.length < 2;
+    const communityScale = scaleSelect.value;
     if (!graphControl(mode, "orphans").checked) {
       const connected = new Set(data.edges.flatMap((edge) => [edge.source, edge.target]));
       data = { ...data, nodes: data.nodes.filter((node) => connected.has(node.id) || local && node.pathAliases?.includes(path)) };
     }
+    data = renderCommunityControls(mode, data, communityScale);
     const empty = graphControl(mode, "empty"); empty.hidden = Boolean(data.nodes.length);
     empty.textContent = !state.linkIndex && state.indexing ? "Indexing notes…" : local && !path ? "Open a note to see its connections." : "No notes match these filters.";
     const unresolved = data.unresolved || {}, hidden = unresolved.hidden || 0;
     const resolutionCounts = [["missing", "missing"], ["ambiguous", "ambiguous"], ["fragments", "missing heading/block"]].filter(([key]) => unresolved[key]).map(([key, label]) => `${unresolved[key]} ${label}`);
     graphControl(mode, "counts").textContent = `${data.nodes.length} ${data.nodes.length === 1 ? "note" : "notes"} · ${data.edges.length} ${data.edges.length === 1 ? "connection" : "connections"}${options.showNavigation ? "" : " · navigation hidden"}${resolutionCounts.length ? ` · ${resolutionCounts.join(", ")}${hidden ? ` (${hidden} hidden)` : ""}` : ""}${data.partial || state.snapshot?.truncated ? " · partial" : ""}`;
-    if (data.semantic_map?.communities?.length) {
-      graphControl(mode, "counts").textContent += ` · ${data.semantic_map.communities.length} derived communities`;
-      const noiseCount = data.semantic_map.communities.filter((row) => row.noise === true).length;
-      if (noiseCount) graphControl(mode, "counts").textContent += ` · ${noiseCount} density-noise sources`;
+    if (data.hidden_discovery_edges) graphControl(mode, "counts").textContent += ` · ${data.hidden_discovery_edges} discovery suggestions hidden by density`;
+    const scaleRows = data.semantic_map?.community_scales?.find((row) => row.scale === communityScale)?.communities || (communityScale === "default" ? data.semantic_map?.communities : []) || [];
+    if (scaleRows.length) {
+      graphControl(mode, "counts").textContent += ` · ${scaleRows.length} saved communities`;
+      const noiseCount = scaleRows.filter((row) => row.noise === true).length;
+      if (noiseCount) graphControl(mode, "counts").textContent += ` · ${noiseCount} saved density-noise sources`;
     }
     if (!local) { el("workspace-save-state").textContent = "Graph view"; el("workspace-counts").textContent = graphControl(mode, "counts").textContent; }
+    const appearance = { colorBy: state.graphPreferences.colorBy, dark: graphIsDark(), communityScale, regions: graphControl(mode, "community-regions").checked };
+    renderGraphColorLegend(mode, data.nodes, appearance);
     const signature = JSON.stringify(data);
+    const dataChanged = signature !== state.graphSignatures.get(mode);
     let graph = state.graphs.get(mode);
     const list = graphControl(mode, "list");
-    if (list.dataset.notes !== signature && (data.nodes.length <= 1000 || state.graphLists.has(mode))) {
-      list.dataset.notes = signature; list.replaceChildren();
-      let shown = 0;
-      const appendPage = () => {
-        list.querySelector(".graph-list-more")?.remove();
-        for (const node of data.nodes.slice(shown, shown + 200)) {
-          const button = document.createElement("button"); button.type = "button"; button.textContent = node.label;
-          button.title = [node.path || node.label, ...(node.pathAliases?.filter((alias) => alias !== node.path) || []), node.source_coverage?.label, ...(node.candidates || [])].filter(Boolean).join(" · "); button.disabled = !node.path || node.missing;
-          button.addEventListener("click", () => openDocument(node.path, { refresh: true })); list.append(button);
-        }
-        shown += 200;
-        if (shown < data.nodes.length) {
-          const more = document.createElement("button"); more.type = "button"; more.className = "graph-list-more";
-          more.textContent = `Show more notes (${data.nodes.length - shown} remaining)`; more.addEventListener("click", appendPage); list.append(more);
-        }
-      };
-      appendPage();
-    }
     const elements = [
       ...data.nodes.map((node) => ({ data: { ...node, semantic_communities: node.semantic_communities || [], labelOpacity: 1, current: node.pathAliases?.includes(path) ? "yes" : "no" }, classes: node.missing ? "missing" : "" })),
       ...data.edges.map((edge) => ({ data: edge, classes: edge.layer === "relation" ? "relation" : "reference" })),
@@ -776,17 +958,17 @@
         container: graphControl(mode, "canvas"), elements: [], layout: { name: "preset" }, minZoom: .005, maxZoom: 8,
         headless: true, styleEnabled: false, textureOnViewport: false,
         style: [
-          { selector: "node", style: { "background-color": "#626167", width: 12, height: 12, label: "data(label)", "text-opacity": "data(labelOpacity)", "min-zoomed-font-size": 8, "font-size": 11, "font-family": "-apple-system, BlinkMacSystemFont, sans-serif", color: "#47454b", "text-valign": "bottom", "text-margin-y": 5, "text-max-width": 160, "text-wrap": "ellipsis" } },
+          { selector: "node", style: { "background-color": "data(graph_color)", width: 12, height: 12, label: "data(label)", "text-opacity": "data(labelOpacity)", "min-zoomed-font-size": 8, "font-size": 11, "font-family": "-apple-system, BlinkMacSystemFont, sans-serif", color: "#47454b", "text-valign": "bottom", "text-margin-y": 5, "text-max-width": 160, "text-wrap": "ellipsis" } },
           { selector: "node.labels-hidden", style: { label: "" } },
-          { selector: 'node[current="yes"]', style: { "background-color": "#7851b6", width: 14, height: 14 } },
-          { selector: "node.missing", style: { "background-color": "#d8cbea", "border-width": 1, "border-color": "#9b80bf", "border-style": "dashed", color: "#81669f" } },
+          { selector: 'node[current="yes"]', style: { "border-width": 2, "border-color": "#7851b6", width: 14, height: 14 } },
+          { selector: "node.missing", style: { "border-width": 1, "border-color": "#9b80bf", "border-style": "dashed", color: "#81669f" } },
           { selector: "edge", style: { width: 1, "line-color": "#bcb9c3", "curve-style": "straight", "target-arrow-shape": "none", "target-arrow-color": "#bcb9c3", "arrow-scale": .45, opacity: .5 } },
           { selector: "edge.relation", style: { "line-color": "#aa8ccf", "line-style": "dashed", "curve-style": "bezier", "target-arrow-color": "#aa8ccf" } },
-          { selector: ":selected", style: { "background-color": "#7851b6", "line-color": "#7851b6", "target-arrow-color": "#7851b6" } },
+          { selector: ":selected", style: { "border-width": 2, "border-color": "#7851b6", "line-color": "#7851b6", "target-arrow-color": "#7851b6" } },
           { selector: ".dimmed", style: { opacity: .15, "text-opacity": 0 } },
-          { selector: "node.neighbor", style: { "background-color": "#7851b6" } },
+          { selector: "node.neighbor", style: { "border-width": 1, "border-color": "#7851b6" } },
           { selector: "edge.neighbor", style: { "line-color": "#9270bd", "target-arrow-color": "#9270bd", "target-arrow-shape": "triangle", opacity: .9, width: 1.5 } },
-          { selector: "node.hovered", style: { label: "data(label)", "min-zoomed-font-size": 0, "text-opacity": 1, "text-wrap": "none", "text-background-color": "#ffffff", "text-background-opacity": .9, "text-background-padding": 4, "background-color": "#7851b6" } },
+          { selector: "node.hovered", style: { label: "data(label)", "min-zoomed-font-size": 0, "text-opacity": 1, "text-wrap": "none", "text-background-color": "#ffffff", "text-background-opacity": .9, "text-background-padding": 4, "border-width": 2, "border-color": "#7851b6" } },
         ],
       });
       graph.on("tap", "node", (event) => {
@@ -837,11 +1019,23 @@
       graph.on("destroy", () => window.cancelAnimationFrame(state.graphLabels.get(graph)?.frame));
       state.graphLabels.set(graph, { frame: null, opacity: null, hidden: null });
       state.graphs.set(mode, graph);
-      state.graphViews.set(graph, kit.createGraphView(graph, { container: graphControl(mode, "canvas") }));
+      state.graphViews.set(graph, kit.createGraphView(graph, { container: graphControl(mode, "canvas"), ...appearance }));
     }
-    if (signature !== state.graphSignatures.get(mode)) {
+    const view = state.graphViews.get(graph), fallback = !view;
+    el(`workspace-${mode}-graph`).classList.toggle("graph-list-fallback", fallback);
+    graphControl(mode, "canvas").hidden = fallback;
+    graphControl(mode, "fallback").hidden = !fallback;
+    graphControl(mode, "show-list").disabled = fallback;
+    graphControl(mode, "show-list").setAttribute("aria-expanded", String(fallback || state.graphLists.has(mode)));
+    list.hidden = !fallback && !state.graphLists.has(mode);
+    renderGraphNoteList(mode, data, appearance, fallback);
+    if (fallback) graphControl(mode, "progress").hidden = true;
+    if (dataChanged) {
       state.graphSignatures.set(mode, signature);
       state.graphLabels.get(graph).opacity = state.graphLabels.get(graph).hidden = null;
+      const positions = state.graphPositions.get(mode) || new Map();
+      graph.nodes().forEach((node) => positions.set(node.id(), { ...node.position() }));
+      state.graphPositions.set(mode, positions);
       const wanted = new Set(elements.map((element) => element.data.id));
       const retained = new Set(graph.nodes().map((node) => node.id())), added = [];
       graph.batch(() => {
@@ -849,7 +1043,7 @@
         for (const element of elements) {
           const existing = graph.getElementById(element.data.id);
           if (existing.length) { existing.data(element.data); existing.toggleClass("missing", Boolean(element.data.missing)); }
-          else { const next = graph.add(element); if (next.isNode()) added.push(next); }
+          else { const next = graph.add(element); if (next.isNode()) { if (positions.has(next.id())) next.position(positions.get(next.id())); else added.push(next); } }
         }
         if (hadNodes) added.forEach((node, index) => {
           const neighbor = node.neighborhood().nodes().filter((entry) => retained.has(entry.id())).first();
@@ -858,21 +1052,25 @@
         });
       });
     }
-    graph.nodes().forEach((node) => node.data("current", node.data("pathAliases")?.includes(path) ? "yes" : "no"));
+    graph.nodes().forEach((node) => { node.data("current", node.data("pathAliases")?.includes(path) ? "yes" : "no"); node.data("graph_color", kit.graphNodeAppearance(node.data(), appearance).color); });
+    view?.setAppearance(appearance);
     updateGraphLabels(mode, graph, true);
     resizeGraph(graph);
-    startGraphLayout(mode, graph, { randomize: !hadNodes });
+    if (dataChanged && !appearanceOnly || !appearanceOnly && state.graphLayoutFailures.has(mode)) startGraphLayout(mode, graph, { randomize: !hadNodes, fit: !hadNodes });
   }
 
   function startGraphLayout(mode, graph, options = {}) {
-    const layout = kit.layoutGraph(graph, { interactive: Boolean(state.graphViews.get(graph)), randomize: false, ...options, onError: () => message("Graph layout could not finish. Try filtering to fewer notes.", true) });
+    const layout = kit.layoutGraph(graph, { interactive: Boolean(state.graphViews.get(graph)), randomize: false, ...options, onError: () => { state.graphLayoutFailures.add(mode); message("Graph layout could not finish. Try filtering to fewer notes.", true); } });
     if (state.graphLayouts.get(mode) !== layout) {
       state.graphLayouts.set(mode, layout);
       graphControl(mode, "progress").hidden = false; graphControl(mode, "canvas").setAttribute("aria-busy", "true");
       layout.finished.then((result) => {
         if (graph.destroyed() || state.graphs.get(mode) !== graph || state.graphLayouts.get(mode) !== layout) return;
         graphControl(mode, "progress").hidden = true; graphControl(mode, "canvas").setAttribute("aria-busy", "false");
-        if (result.status === "complete" && el("workspace-message").textContent === "Graph layout could not finish. Try filtering to fewer notes.") message();
+        if (result.status === "complete") {
+          state.graphLayoutFailures.delete(mode);
+          if (el("workspace-message").textContent === "Graph layout could not finish. Try filtering to fewer notes.") message();
+        }
         updateGraphLabels(mode, graph, true);
       });
     }
@@ -1942,6 +2140,12 @@
   el("workspace-local-toggle").addEventListener("click", () => toggleContext("local"));
   for (const button of document.querySelectorAll("[data-context]")) button.addEventListener("click", () => { state.contextMode = button.dataset.context; state.contextOpen = true; renderContext(); state.view?.requestMeasure(); });
   el("workspace-context-close").addEventListener("click", () => { state.contextOpen = false; renderContext(); state.view?.requestMeasure(); });
+  const refreshGraphColors = () => {
+    for (const mode of ["global", "local"]) if (state.workspace && graphControl(mode, "canvas")) renderGraph(mode, true);
+  };
+  window.matchMedia?.("(prefers-color-scheme: dark)").addEventListener?.("change", refreshGraphColors);
+  const graphThemeObserver = new MutationObserver(refreshGraphColors);
+  for (const element of [document.documentElement, document.body]) graphThemeObserver.observe(element, { attributes: true, attributeFilter: ["data-theme"] });
   screen.addEventListener("click", (event) => {
     const anchor = event.target.closest("[data-note-destination]");
     if (!anchor) return;

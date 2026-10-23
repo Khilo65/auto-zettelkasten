@@ -1,4 +1,5 @@
 import MarkdownIt from "markdown-it";
+import { graphNodeOrigin } from "./workspace_graph_colors.js";
 
 export const LIMITS = Object.freeze({
   documents: 5000,
@@ -45,6 +46,7 @@ const navigationRelationTypes = new Set(["cluster_member", "has_member", "alias_
 function documentMetadata(input) {
   const coverage = input?.source_coverage;
   return {
+    note_origin: graphNodeOrigin(input),
     ...(typeof input?.navigation === "boolean" ? { navigation: input.navigation } : {}),
     ...(coverage && typeof coverage.status === "string" && typeof coverage.label === "string" ? { source_coverage: { status: coverage.status, label: coverage.label } } : {}),
   };
@@ -523,18 +525,32 @@ function finishIndex(index, typedRelations, relationLimit, metadata) {
         if (index.documents.has(path) && /^[a-f0-9]{64}$/.test(revision) && index.documents.get(path).revision === revision) semanticPaths.add(path);
         else if (index.semantic_map.status !== "unavailable") index.semantic_map.status = "partial";
       }
-      for (const community of Array.isArray(semantic.communities) ? semantic.communities.slice(0, relationLimit) : []) {
-        if (!community || !/^[A-Za-z0-9._:-]{1,256}$/.test(community.community_id || "") || !["leiden", "hdbscan"].includes(community.algorithm) || !Array.isArray(community.paths)
-            || community.noise !== undefined && typeof community.noise !== "boolean") continue;
-        const paths = [...new Set(community.paths.filter((path) => semanticPaths.has(path)))];
-        if (!paths.length) continue;
-        const membership = { community_id: community.community_id, algorithm: community.algorithm,
-          ...(typeof community.noise === "boolean" ? { noise: community.noise } : {}) };
-        index.semantic_map.communities.push({ ...membership, paths });
-        for (const path of paths) {
-          const document = index.documents.get(path);
-          document.semantic_communities = [...(document.semantic_communities || []), membership];
+      const projectCommunities = (rows, scale = "default") => {
+        const projected = [], assigned = new Set();
+        for (const community of Array.isArray(rows) ? rows.slice(0, relationLimit) : []) {
+          if (!community || !/^[A-Za-z0-9._:-]{1,256}$/.test(community.community_id || "") || !["leiden", "hdbscan"].includes(community.algorithm) || !Array.isArray(community.paths)
+              || community.noise !== undefined && typeof community.noise !== "boolean") continue;
+          const paths = [...new Set(community.paths.filter((path) => semanticPaths.has(path) && !assigned.has(path)))];
+          if (!paths.length) continue;
+          paths.forEach((path) => assigned.add(path));
+          const membership = { community_id: community.community_id, algorithm: community.algorithm,
+            ...(scale !== "default" || community.scale === "default" ? { scale } : {}),
+            ...(typeof community.display_label === "string" && community.display_label.trim() ? { display_label: community.display_label.trim().slice(0, 160) } : {}),
+            ...(typeof community.noise === "boolean" ? { noise: community.noise } : {}) };
+          projected.push({ ...membership, paths });
+          for (const path of paths) { const document = index.documents.get(path); document.semantic_communities = [...(document.semantic_communities || []), membership]; }
         }
+        return projected;
+      };
+      const suppliedScales = (Array.isArray(semantic.community_scales) ? semantic.community_scales : []).filter((row) => ["broad", "default", "fine"].includes(row?.scale) && Number.isFinite(row.resolution) && row.resolution > 0);
+      const defaultScale = suppliedScales.find((row) => row.scale === "default");
+      index.semantic_map.communities = projectCommunities(defaultScale?.communities || semantic.communities);
+      index.semantic_map.community_scales = [];
+      const seenScales = new Set();
+      for (const row of suppliedScales) {
+        if (seenScales.has(row.scale)) continue;
+        seenScales.add(row.scale);
+        index.semantic_map.community_scales.push({ scale: row.scale, resolution: row.resolution, communities: row.scale === "default" ? index.semantic_map.communities : projectCommunities(row.communities, row.scale) });
       }
     }
   }
@@ -560,6 +576,7 @@ function finishIndex(index, typedRelations, relationLimit, metadata) {
           provenance: { kind: "local_embedding_similarity", embedding_identity: index.semantic_map.identity_digest, accepted: false, evidence_backed: false,
             source_chunk_ids: [...relation.provenance.source_chunk_ids], target_chunk_ids: [...relation.provenance.target_chunk_ids] } });
       }
+      if (researchRelationTypes.has(relation.type) && relation.derived !== true) Object.assign(value, relationshipMetadata(relation, index, source.path, target.path));
       index.relations.push(value);
     }
     else index.warnings.push({ path: String(relation.source || ""), reason: "A typed relation has an unavailable endpoint" });
@@ -671,6 +688,110 @@ export function backlinks(index, path) {
     group.occurrences.push(reference);
   }
   return [...groups.values()].map((group) => ({ ...group, partial: index.partial })).sort((left, right) => left.path.localeCompare(right.path));
+}
+
+function relationshipMetadata(relation, index, source, target) {
+  const result = {};
+  for (const key of ["provider", "model", "template_version", "policy_version", "output_contract", "verification_status"]) {
+    if (typeof relation[key] === "string" && /^[A-Za-z0-9._:-]{1,256}$/.test(relation[key])) result[key] = relation[key];
+  }
+  for (const key of ["confidence", "top_probability", "probability_margin"]) {
+    if (typeof relation[key] === "number" && Number.isFinite(relation[key]) && relation[key] >= 0 && relation[key] <= 1) result[key] = relation[key];
+  }
+  if (["note_summary", "supplied_passages"].includes(relation.evidence_basis)) result.evidence_basis = relation.evidence_basis;
+  if (relation.probabilities && typeof relation.probabilities === "object" && !Array.isArray(relation.probabilities) && Object.keys(relation.probabilities).length <= 255) {
+    const probabilities = Object.fromEntries(Object.entries(relation.probabilities).filter(([key, value]) => /^[A-Za-z0-9._:-]{1,256}$/.test(key) && typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1));
+    if (Object.keys(probabilities).length) result.probabilities = probabilities;
+  }
+  const canonical = (path) => index.canonicalPaths?.get(path) || path;
+  const endpoints = new Set([canonical(source), canonical(target)]);
+  const evidence = (Array.isArray(relation.selected_evidence) ? relation.selected_evidence.slice(0, 2) : []).flatMap((row) => {
+    const path = safePath(row?.path);
+    if (!path || !index.documents.has(path) || !endpoints.has(canonical(path)) || typeof row.text !== "string") return [];
+    const value = { path, text: row.text.slice(0, 1600) };
+    for (const key of ["passage_id", "attribution"]) if (typeof row[key] === "string") value[key] = row[key].slice(0, 256);
+    if (row.locator && typeof row.locator === "object") {
+      const locator = {};
+      for (const key of ["kind", "heading"]) if (typeof row.locator[key] === "string") locator[key] = row.locator[key].slice(0, 256);
+      for (const key of ["line_start", "line_end"]) if (Number.isInteger(row.locator[key]) && row.locator[key] >= 1 && row.locator[key] <= 10000000) locator[key] = row.locator[key];
+      if (Object.keys(locator).length) value.locator = locator;
+    }
+    return [value];
+  });
+  if (evidence.length) result.selected_evidence = evidence;
+  return result;
+}
+
+const researchLookups = new WeakMap();
+
+export function relationshipsForNote(index, path, { relations = index.relations, direction = "both" } = {}) {
+  if (!Array.isArray(relations)) return [];
+  const canonical = (value) => index.canonicalPaths?.get(value) || value;
+  let lookup = researchLookups.get(relations);
+  if (!lookup) {
+    lookup = new Map();
+    for (const relation of relations) {
+      if (!researchRelationTypes.has(relation.type) || relation.derived === true || relation.accepted === false) continue;
+      for (const endpoint of new Set([canonical(relation.source), canonical(relation.target)])) {
+        if (!lookup.has(endpoint)) lookup.set(endpoint, []);
+        lookup.get(endpoint).push(relation);
+      }
+    }
+    researchLookups.set(relations, lookup);
+  }
+  return (lookup.get(canonical(path)) || []).filter((row) => direction === "both" || ["complements", "contrasts", "boundary_contrast", "methodological_fault_line", "interpretive_or_normative_disagreement", "contextual_connection"].includes(row.type)
+    || (direction === "incoming" ? canonical(row.target) === canonical(path) : canonical(row.source) === canonical(path)));
+}
+
+export function appendRelationshipDetails(container, index, path, { relations = index.relations, direction = "both", onOpen = () => {}, title = "Research relationships" } = {}) {
+  const rows = relationshipsForNote(index, path, { relations, direction });
+  if (!rows.length) return null;
+  const doc = container.ownerDocument;
+  const group = doc.createElement("details"); group.className = "relationship-details";
+  const summary = doc.createElement("summary"); summary.textContent = `${title} · ${rows.length}`; group.append(summary);
+  let rendered = false;
+  group.addEventListener("toggle", () => {
+    if (!group.open || rendered) return;
+    rendered = true;
+    for (const relation of rows.slice(0, 50)) {
+      const details = doc.createElement("details"); details.className = "relationship-record";
+      const heading = doc.createElement("summary"); heading.textContent = `${basename(relation.source)} ${relation.type.replace(/_/g, " ")} ${basename(relation.target)}`; details.append(heading);
+      if (Number.isFinite(relation.confidence)) {
+        const confidence = doc.createElement("p"); confidence.className = "relationship-confidence";
+        confidence.textContent = `Model confidence: ${Math.round(relation.confidence * 100)}%`;
+        confidence.title = "The model's preference among the permitted answers, not a verified probability of correctness."; details.append(confidence);
+      }
+      if (relation.evidence_basis) {
+        const basis = doc.createElement("p"); basis.className = "relationship-evidence-basis";
+        basis.textContent = relation.evidence_basis === "note_summary" ? "Based on note summaries" : "Based on supplied passages"; details.append(basis);
+      }
+      const canonical = (value) => index.canonicalPaths?.get(value) || value;
+      const other = canonical(relation.source) === canonical(path) ? relation.target : relation.source;
+      if (index.documents.has(other)) {
+        const open = doc.createElement("button"); open.type = "button"; open.className = "relationship-open-note";
+        open.textContent = `Open ${basename(other)}`; open.addEventListener("click", () => onOpen(other)); details.append(open);
+      }
+      for (const evidence of relation.selected_evidence || []) {
+        // Only validated existing endpoint notes may be used as navigation targets.
+        if (!index.documents.has(evidence.path) || ![relation.source, relation.target].includes(evidence.path)) continue;
+        const button = doc.createElement("button"); button.type = "button"; button.className = "backlink-occurrence relationship-evidence";
+        const locator = evidence.locator;
+        const location = locator?.heading || (locator?.line_start ? `line ${locator.line_start}` : "Evidence");
+        const label = doc.createElement("strong"); label.textContent = `${basename(evidence.path)} · ${location}`;
+        const excerpt = doc.createElement("span"); excerpt.textContent = evidence.text;
+        button.append(label, excerpt); button.addEventListener("click", () => onOpen(evidence.path, locator)); details.append(button);
+        if (evidence.attribution) { const attribution = doc.createElement("p"); attribution.className = "relationship-evidence-basis"; attribution.textContent = evidence.attribution; details.append(attribution); }
+      }
+      if (relation.provider === "typesafe" && !relation.selected_evidence?.length) {
+        const unavailable = doc.createElement("p"); unavailable.className = "relationship-evidence-basis";
+        unavailable.textContent = "Evidence excerpts are unavailable."; details.append(unavailable);
+      }
+      group.append(details);
+    }
+    if (rows.length > 50) { const remaining = doc.createElement("p"); remaining.textContent = `Showing 50 of ${rows.length} relationships.`; group.append(remaining); }
+  });
+  container.append(group);
+  return group;
 }
 
 function shortestDestination(index, sourcePath, path) {
@@ -916,6 +1037,7 @@ export function graphData(index, options = {}) {
     if (!showNavigation && navigation(document.path)) continue;
     const path = canonical(document.path), primary = index.documents.get(path);
     if (!nodes.has(path)) nodes.set(path, { id: path, path, label: basename(path), pathAliases: [], aliases: [], tags: [], folder: path.split("/").slice(0, -1).join("/"), navigation: navigation(path), source_coverage: primary.source_coverage,
+      note_origin: graphNodeOrigin(primary), semantic_status: index.semantic_map?.status,
       ...(primary.semantic_communities ? { semantic_communities: primary.semantic_communities.map((row) => ({ ...row })) } : {}) });
     const node = nodes.get(path);
     node.pathAliases.push(document.path);

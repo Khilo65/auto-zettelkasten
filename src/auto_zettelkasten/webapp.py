@@ -28,10 +28,23 @@ from .readers import (ProviderError, _codex_environment, _codex_executable,
 from .zotero import ZoteroLocalClient, _api_collection_path
 
 _POLICY = LiteratureMappingPolicy(cluster_generation_enabled=False)
+_GRAPH_PREFERENCES_DEFAULT = {"version": 1, "colorBy": "none",
+                              "origins": {"managed": True, "personal": True, "unknown": True}}
 
 
 class RequestError(ValueError):
     pass
+
+
+def _graph_preferences(value):
+    if (not isinstance(value, dict) or set(value) != {"version", "colorBy", "origins"}
+            or type(value.get("version")) is not int or value["version"] != 1
+            or not isinstance(value.get("colorBy"), str) or value["colorBy"] not in {"none", "origin", "community"}
+            or not isinstance(value.get("origins"), dict)
+            or set(value["origins"]) != {"managed", "personal", "unknown"}
+            or any(type(flag) is not bool for flag in value["origins"].values())):
+        raise RequestError("Graph preferences require version 1, a supported color mode and three visibility checkboxes.")
+    return copy.deepcopy(value)
 
 
 class FrozenSource:
@@ -155,6 +168,7 @@ class LocalApp:
         self.preferences = {"vault": "", "remember_vault": False}
         self.codex_executable = ""
         self.embedding_model_path = ""
+        self.graph_preferences = {}
         try:
             saved = json.loads(self.preferences_path.read_text())
             if saved.get("remember_vault") is True and isinstance(saved.get("vault"), str):
@@ -164,6 +178,14 @@ class LocalApp:
             model_path = saved.get("embedding_model_path")
             if isinstance(model_path, str) and len(model_path) <= 4096 and "\x00" not in model_path:
                 self.embedding_model_path = model_path
+            graphs = saved.get("graph_preferences")
+            if isinstance(graphs, dict) and len(graphs) <= 1000:
+                for key, value in graphs.items():
+                    if isinstance(key, str) and re.fullmatch(r"[a-f0-9]{64}", key):
+                        try:
+                            self.graph_preferences[key] = _graph_preferences(value)
+                        except RequestError:
+                            continue
         except (OSError, ValueError, AttributeError):
             pass
         self.auth = {"method": "", "ready": False, "status": "disconnected", "message": "Choose a connection."}
@@ -199,6 +221,8 @@ class LocalApp:
                 saved["codex_executable"] = self.codex_executable
             if self.embedding_model_path:
                 saved["embedding_model_path"] = self.embedding_model_path
+            if self.graph_preferences:
+                saved["graph_preferences"] = self.graph_preferences
             json.dump(saved, handle)
             temporary = Path(handle.name)
         try:
@@ -357,6 +381,20 @@ class LocalApp:
             if route == "/api/workspace/open":
                 return {"workspace": self.documents.open(data.get("path"))}
             workspace_id = data.get("workspace_id")
+            if route == "/api/workspace/graph-preferences":
+                key = self.documents.workspace_key(workspace_id)
+                if "preferences" in data:
+                    preferences = _graph_preferences(data["preferences"])
+                    if key not in self.graph_preferences and len(self.graph_preferences) >= 1000:
+                        raise RequestError("The saved graph preference workspace limit was reached.")
+                    previous = self.graph_preferences
+                    self.graph_preferences = {**previous, key: preferences}
+                    try:
+                        self._write_preferences(self.preferences)
+                    except OSError as exc:
+                        self.graph_preferences = previous
+                        raise RequestError("Graph preferences could not be saved. Check the local preferences folder.") from exc
+                return {"preferences": copy.deepcopy(self.graph_preferences.get(key, _GRAPH_PREFERENCES_DEFAULT))}
             if route == "/api/workspace/tree":
                 return {"workspace": self.documents.tree(workspace_id)}
             if route == "/api/workspace/index":
@@ -496,8 +534,14 @@ class LocalApp:
                 check_local_mapping_availability(local_mapping)
             except (LocalMappingError, OSError, ValueError) as exc:
                 raise RequestError(str(exc)) from exc
+        from .relationship_mapping import RelationshipMappingOptions
+        relationship_options = RelationshipMappingOptions.from_dict(mapping_config.get("relationship_decisions", {})).to_dict()
+        # Source-generation approval does not approve an extra relationship bill
+        # or registry writes. The GUI can prepare this stage's preview only.
+        relationship_options.update(dry_run=True, apply=False)
         request = MapRequest(workspace=workspace, scope=scope, collection_key=key, provider=provider, model=model, literature_model="gpt-5.6-terra" if provider == "codex" else None, reasoning_effort="medium" if provider == "codex" else None, allow_cloud=True, literature_policy=_POLICY,
-                             mapping_backend=mapping_backend, local_mapping=local_mapping)
+                             mapping_backend=mapping_backend, local_mapping=local_mapping,
+                             relationship_decisions=relationship_options)
         with tempfile.TemporaryDirectory(prefix="az-estimate-") as temporary:
             scratch = Path(temporary)
             if workspace.exists():

@@ -9,6 +9,8 @@ export * from "./workspace_links.js";
 export { LibraryParser } from "./workspace_index_client.js";
 export { fitGraph, layoutGraph } from "./workspace_graph.js";
 export { createGraphView } from "./workspace_graph_view.js";
+export * from "./workspace_graph_colors.js";
+export * from "./workspace_graph_communities.js";
 import { renderIndexedMarkdown, renderReferenceEmbed } from "./workspace_links.js";
 export { syntaxTree, syntaxHighlighting, defaultHighlightStyle, bracketMatching, indentOnInput, foldGutter, foldKeymap } from "@codemirror/language";
 export { markdown, markdownLanguage, markdownKeymap, insertNewlineContinueMarkup, deleteMarkupBackward } from "@codemirror/lang-markdown";

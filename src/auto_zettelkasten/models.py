@@ -658,6 +658,7 @@ class MapRequest:
     navigation_policy: NavigationPolicy = field(default_factory=NavigationPolicy)
     mapping_backend: Literal["local", "llm"] = "local"
     local_mapping: Mapping[str, Any] = field(default_factory=dict)
+    relationship_decisions: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "workspace", Path(self.workspace).expanduser())
@@ -679,6 +680,12 @@ class MapRequest:
             "local_mapping",
             LocalMappingOptions.from_dict(self.local_mapping).to_dict(),
         )
+        from .relationship_mapping import RelationshipMappingOptions
+
+        relationship_options = RelationshipMappingOptions.from_dict(self.relationship_decisions)
+        if self.mapping_backend == "llm" and relationship_options.backend != "off":
+            raise ValueError("Jev relationship decisions require the local mapping backend")
+        object.__setattr__(self, "relationship_decisions", relationship_options.to_dict())
         if self.model == "deepseek-v4-flash" and self.provider in {"ollama", "gemini"}:
             object.__setattr__(
                 self,
@@ -854,6 +861,7 @@ class MapRequest:
             # Preserve that route when resuming; new requests default to local.
             mapping_backend=payload.get("mapping_backend", "llm"),
             local_mapping=payload.get("local_mapping", {}),
+            relationship_decisions=payload.get("relationship_decisions", {}),
         )
 
 

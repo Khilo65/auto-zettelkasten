@@ -373,6 +373,7 @@ _CODEX_SOURCE_ROLE = _codex_object(
 )
 
 CODEX_OUTPUT_CONTRACTS: Mapping[str, Mapping[str, Any]] = {
+    "community_name": _codex_object({"title": _CODEX_STRING}),
     "source_bundle": _codex_object(
         {
             "analysis_sections": _codex_object(
@@ -913,6 +914,7 @@ CODEX_OUTPUT_CONTRACTS: Mapping[str, Mapping[str, Any]] = {
 }
 
 CODEX_CONTRACT_RESERVATIONS: Mapping[str, int] = {
+    "community_name": 128,
     "source_bundle": 32_768,
     "evidence_profile": 16_384,
     "literature_family_plan": 49_152,
@@ -1856,6 +1858,33 @@ class _CapabilityAwareReader:
                 ).encode("utf-8")
             ).hexdigest(),
         }
+
+    def community_name_output_tokens(self) -> int:
+        """The naming task never inherits the larger source/literature output cap."""
+        return self._reserved_output_tokens("community_name", 128)
+
+    def community_name_input_budget(self) -> int:
+        """Only model-specific or explicitly configured context is admissible."""
+        if self.context_window_source not in {"model", "configured"}:
+            raise ProviderError("Community naming needs a verified model context allowance")
+        usable = int(int(self.context_window_tokens or 0) * self.direct_read_fraction)
+        if self.name == "codex":
+            usable = min(usable, 200_000)
+        return max(0, usable - self.prompt_reserve_tokens - self.community_name_output_tokens())
+
+    def name_community(self, system_prompt: str, user_prompt: str) -> Mapping[str, Any]:
+        """Optional bounded task; callers must reserve its separate naming budget."""
+        self._authorize_request()
+        output_tokens = self.community_name_output_tokens()
+        if len(system_prompt.encode()) + len(user_prompt.encode()) + 512 > self.community_name_input_budget():
+            raise ProviderError("Community name exceeds the verified source-worker input allowance")
+        self._ensure_prompt_fits(system_prompt, user_prompt, output_tokens, label="community naming")
+        raw = self._generate_with_reasoning(
+            system_prompt, user_prompt, output_tokens,
+            self._request_deadline_seconds(), reasoning_effort="medium",
+            output_contract="community_name",
+        )
+        return _parse_json_object(raw, label="community name")
 
     @property
     def direct_input_token_budget(self) -> int:

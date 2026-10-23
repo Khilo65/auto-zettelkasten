@@ -259,6 +259,27 @@ def build_parser() -> argparse.ArgumentParser:
             local_parser.add_argument("--max-notes", type=int, default=8)
             local_parser.add_argument("--max-chars", type=int, default=12000)
 
+    jev_parser = commands.add_parser(
+        "jev-review",
+        help="Validate and render one bounded Jev relationship packet for local review (dry-run only).",
+    )
+    jev_parser.add_argument("--workspace", type=Path, required=True)
+    jev_parser.add_argument("--input", type=Path, required=True, dest="pair_input")
+
+    calibration_parser = commands.add_parser("calibrate-map", help="Evaluate saved vectors against private, independently reviewed pairs offline.")
+    calibration_parser.add_argument("--workspace", type=Path, required=True)
+    calibration_parser.add_argument("--reviews", type=Path, required=True)
+    naming_parser = commands.add_parser("community-name", help="Preview a bounded community title task; dispatch defaults off.")
+    naming_parser.add_argument("--workspace", type=Path, required=True)
+    naming_parser.add_argument("--community-id", required=True)
+    naming_parser.add_argument("--scale", choices=("broad", "default", "fine"), default="default")
+    naming_parser.add_argument("--execute", action="store_true")
+    naming_parser.add_argument("--allow-cloud", action="store_true")
+    naming_parser.add_argument("--approval", type=Path)
+    naming_parser.add_argument("--input-price-per-million")
+    naming_parser.add_argument("--output-price-per-million")
+    naming_parser.add_argument("--pricing-identity", default="")
+
     migrate_parser = commands.add_parser("migrate", help="Archive legacy generated maps for the current artifact schema.")
     migrate_parser.add_argument("--workspace", type=Path, required=True)
     migrate_parser.add_argument("--dry-run", action="store_true")
@@ -316,6 +337,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 result = {"status": "retrieved", **loaded["index"].recall(args.query, relationships=loaded["relationships"],
                           max_notes=args.max_notes, max_chars=args.max_chars), "coverage": loaded["status"], "provider_calls": 0}
+        elif args.command == "jev-review":
+            from .jev_cli import prepare_review
+
+            result = prepare_review(args.workspace, args.pair_input)
+        elif args.command == "calibrate-map":
+            from .mapping import calibrate_local_map
+
+            result = calibrate_local_map(args.workspace, args.reviews)
+        elif args.command == "community-name":
+            from .mapping import community_name_manifest, _bounded_json
+
+            result = community_name_manifest(
+                args.workspace, args.community_id, scale=args.scale, execute=args.execute,
+                allow_cloud=args.allow_cloud,
+                approval=_bounded_json(args.approval, max_bytes=65536) if args.approval else None,
+                input_price_per_million=args.input_price_per_million,
+                output_price_per_million=args.output_price_per_million,
+                pricing_identity=args.pricing_identity,
+            )
         elif args.command == "map":
             config = load_config(args.workspace)
             configured_provider = str(config.get("provider") or "deepseek")
@@ -366,6 +406,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 navigation_policy=_navigation_policy(args, config),
                 mapping_backend=_mapping_backend(args, config),
                 local_mapping=_local_mapping_options(args, config),
+                relationship_decisions=_relationship_mapping_options(args, config),
             )
             result = run_map(request, run_id=args.run_id or None).to_dict()
         elif args.command == "sync":
@@ -426,6 +467,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 navigation_policy=_navigation_policy(args, config),
                 mapping_backend=_mapping_backend(args, config),
                 local_mapping=_local_mapping_options(args, config),
+                relationship_decisions=_relationship_mapping_options(args, config),
             )
             result = sync_zotero(
                 request,
@@ -506,6 +548,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 local_mapping=_local_mapping_options(args, config),
                 resume=args.resume,
                 retry_terminal_failures=args.retry_terminal_literature,
+                relationship_decisions=_relationship_mapping_options(args, config),
                 **({"ranked_candidates": _read_local_candidates(args.local_candidates)} if args.local_candidates else {}),
             )
             result = manifest.to_dict()
@@ -675,6 +718,22 @@ def _extraction_policy(
 
 
 def _add_local_mapping_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--local-tuning", choices=("auto", "manual"), default=None,
+                        help="Use an admitted offline calibration, or preserve explicit mapping settings.")
+    parser.add_argument("--relationship-decisions", choices=("off", "jev"), default=None,
+                        help="Optional relationship decisions, separate from local clustering; defaults off.")
+    parser.add_argument("--max-relationship-spend-usd", default=None,
+                        help="Separate aggregate Jev spending ceiling; defaults zero.")
+    parser.add_argument("--relationship-approval", type=Path, default=None,
+                        help="Local manifest approving exact request identities and billing policy.")
+    parser.add_argument("--execute-relationship-decisions", action="store_true", default=None,
+                        help="Execute approved decisions; otherwise prepare a dry-run preview.")
+    parser.add_argument("--apply-relationships", action="store_true", default=None,
+                        help="Apply eligible results only in an explicitly marked private copy.")
+    parser.add_argument("--relationship-batch-size", type=int, choices=(1, 2, 3), default=None)
+    parser.add_argument("--relationship-packet-format", choices=("full", "compact"), default=None)
+    parser.add_argument("--relationship-max-pairs", type=int, default=None)
+    parser.add_argument("--relationship-per-source-cap", type=int, default=None)
     parser.add_argument(
         "--mapping-backend",
         choices=("local", "llm"),
@@ -706,6 +765,27 @@ def _mapping_backend(args: argparse.Namespace, config: dict[str, Any]) -> str:
     )
 
 
+def _relationship_mapping_options(args: argparse.Namespace, config: dict[str, Any]) -> dict[str, Any]:
+    from .relationship_mapping import RelationshipMappingOptions
+    value = dict(config.get("relationship_decisions", {}))
+    for field, option in (("backend", "relationship_decisions"),
+                          ("max_spend_usd", "max_relationship_spend_usd"),
+                          ("batch_size", "relationship_batch_size"),
+                          ("packet_format", "relationship_packet_format"),
+                          ("max_pairs", "relationship_max_pairs"),
+                          ("per_source_cap", "relationship_per_source_cap")):
+        supplied = getattr(args, option, None)
+        if supplied is not None:
+            value[field] = supplied
+    if getattr(args, "relationship_approval", None) is not None:
+        value["approval_manifest"] = str(args.relationship_approval)
+    if getattr(args, "execute_relationship_decisions", None) is True:
+        value["dry_run"] = False
+    if getattr(args, "apply_relationships", None) is True:
+        value["apply"] = True
+    return RelationshipMappingOptions.from_dict(value).to_dict()
+
+
 def _local_mapping_options(
     args: argparse.Namespace, config: dict[str, Any]
 ) -> dict[str, Any]:
@@ -715,6 +795,7 @@ def _local_mapping_options(
     defaults = LocalMappingOptions.from_dict(configured)
     payload = defaults.to_dict()
     overrides = {
+        "tuning_mode": getattr(args, "local_tuning", None),
         "encoder": getattr(args, "local_encoder", None),
         "clustering": getattr(args, "local_clustering", None),
         "model_path": getattr(args, "embedding_model_path", None),

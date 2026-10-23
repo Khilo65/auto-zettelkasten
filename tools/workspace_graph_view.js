@@ -1,3 +1,7 @@
+import { graphCommunityMembership, graphNodeAppearance, normalizeGraphPreferences } from "./workspace_graph_colors.js";
+
+import { communityHull } from "./workspace_graph_communities.js";
+
 const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
 const ease = (value) => 1 - (1 - clamp(value, 0, 1)) ** 3;
 
@@ -45,13 +49,23 @@ function viewportCode(x, y, width, height, margin) {
 }
 
 // Cytoscape retains topology and target coordinates; this view owns screen-space painting and input.
-export function createGraphView(graph, { container, labels = true } = {}) {
+export function createGraphView(graph, { container, labels = true, colorBy = "none", dark, communityScale = "default", regions = false } = {}) {
   const win = container?.ownerDocument?.defaultView;
   if (!win || typeof win.CanvasRenderingContext2D !== "function") return null;
   const canvas = container.ownerDocument.createElement("canvas");
   let context;
   try { context = canvas.getContext("2d"); } catch { return null; }
   if (!context) return null;
+  colorBy = normalizeGraphPreferences({ colorBy }).colorBy;
+  let explicitDark = typeof dark === "boolean" ? dark : null;
+  const colorMedia = win.matchMedia?.("(prefers-color-scheme: dark)");
+  const readDark = () => {
+    if (explicitDark !== null) return explicitDark;
+    const theme = container.ownerDocument.body?.dataset.theme || container.ownerDocument.documentElement.dataset.theme;
+    return theme === "dark" || theme !== "light" && Boolean(colorMedia?.matches);
+  };
+  let darkTheme = readDark();
+  const isDark = () => darkTheme;
   const previousPosition = container.style.position;
   if (win.getComputedStyle(container).position === "static") container.style.position = "relative";
   Object.assign(canvas.style, { position: "absolute", inset: "0", width: "100%", height: "100%", touchAction: "none", outlineOffset: "-2px" });
@@ -62,6 +76,7 @@ export function createGraphView(graph, { container, labels = true } = {}) {
   const readViewport = () => ({ zoom: graph.zoom(), pan: { ...graph.pan() } });
   let target = readViewport(), camera = readViewport(), frame = null, destroyed = false, internalViewport = false;
   let width = 0, height = 0, lastWidth = 0, lastHeight = 0, ratio = 0, lastTime = win.performance.now();
+  let regionDirty = true, regionHulls = [];
   let topologyDirty = true, metadataDirty = true, positionsDirty = new Set();
   const nodes = [], edges = [], records = new Map(), edgeRecords = new Map(), pointers = new Map(), grid = new Map();
   let cellSize = 32, gridDirty = true, gesture = null, hover = null, fadingHover = null, hoverMix = 0;
@@ -129,7 +144,7 @@ export function createGraphView(graph, { container, labels = true } = {}) {
     const previousX = node.x, previousY = node.y;
     node.x = node.fromX + (node.targetX - node.fromX) * progress;
     node.y = node.fromY + (node.targetY - node.fromY) * progress;
-    if (node.x !== previousX || node.y !== previousY) gridDirty = true;
+    if (node.x !== previousX || node.y !== previousY) { gridDirty = true; regionDirty = true; }
     return progress < 1;
   }
 
@@ -140,9 +155,11 @@ export function createGraphView(graph, { container, labels = true } = {}) {
     node.current = data.current === "yes"; node.missing = Boolean(data.missing) || node.model.hasClass("missing");
     node.selected = node.model.selected(); node.dimmed = node.model.hasClass("dimmed");
     node.neighbor = node.model.hasClass("neighbor"); node.modelHovered = node.model.hasClass("hovered");
+    node.appearance = graphNodeAppearance(data, { colorBy, dark: isDark(), communityScale });
   }
 
   function syncScene(time) {
+    if (topologyDirty || metadataDirty || positionsDirty.size) regionDirty = true;
     if (topologyDirty) {
       const wanted = new Set(); nodes.length = 0; edges.length = 0;
       graph.nodes().forEach((model) => {
@@ -247,8 +264,38 @@ export function createGraphView(graph, { container, labels = true } = {}) {
     return { text: fitted, width: context.measureText(fitted).width };
   }
 
+  function paintRegions() {
+    if (!regions) return;
+    if (regionDirty) {
+      const groups = new Map();
+      for (const node of nodes) {
+        const membership = graphCommunityMembership(node.model.data(), communityScale);
+        if (!membership) continue;
+        let group = groups.get(membership.community_id);
+        if (!group) { group = { nodes: [], appearance: graphNodeAppearance(node.model.data(), { colorBy: "community", dark: isDark(), communityScale }) }; groups.set(membership.community_id, group); }
+        group.nodes.push(node);
+      }
+      regionHulls = [...groups.values()].map((group) => ({ ...group, hull: communityHull(group.nodes) }));
+      regionDirty = false;
+    }
+    // Hulls live in world space and are reused during zoom/pan. No topology or layout edges.
+    for (const group of regionHulls) {
+      const points = group.hull.map((point) => projectPoint(point, camera));
+      if (!points.length) continue;
+      const padding = 18, xs = points.map((p) => p.x), ys = points.map((p) => p.y);
+      if (Math.max(...xs) < -padding || Math.min(...xs) > width + padding || Math.max(...ys) < -padding || Math.min(...ys) > height + padding) continue;
+      context.beginPath();
+      if (points.length === 1) context.arc(points[0].x, points[0].y, padding, 0, Math.PI * 2);
+      else { context.moveTo(points[0].x, points[0].y); for (const point of points.slice(1)) context.lineTo(point.x, point.y); context.lineTo(points[0].x, points[0].y); }
+      context.fillStyle = group.appearance.color; context.globalAlpha = .065; context.fill();
+      context.strokeStyle = group.appearance.color; context.globalAlpha = .08; context.lineWidth = padding * 2; context.lineJoin = "round"; context.lineCap = "round"; context.setLineDash([]); context.stroke();
+    }
+    context.globalAlpha = 1; context.lineCap = "butt";
+  }
+
   function paint() {
     context.setTransform(ratio, 0, 0, ratio, 0, 0); context.clearRect(0, 0, width, height);
+    paintRegions();
     const growth = Math.sqrt(camera.zoom);
     for (const node of nodes) {
       node.screenX = node.x * camera.zoom + camera.pan.x; node.screenY = node.y * camera.zoom + camera.pan.y;
@@ -290,13 +337,14 @@ export function createGraphView(graph, { container, labels = true } = {}) {
       if (x < -radius - 4 || x > width + radius + 4 || y < -radius - 4 || y > height + radius + 4) continue;
       const hovered = node === hover || node.modelHovered;
       context.globalAlpha = nodeAlpha(node); context.beginPath(); context.arc(x, y, radius, 0, Math.PI * 2);
-      context.fillStyle = hovered || node.selected || node.current || node.neighbor ? "#7851b6" : node.missing ? "#d8cbea" : "#68666d"; context.fill();
-      if (node.missing || hovered) {
-        context.beginPath(); context.arc(x, y, radius + (hovered ? 2.5 : 0), 0, Math.PI * 2);
-        context.strokeStyle = hovered ? "#8b65bd" : "#9b80bf"; context.lineWidth = 1; context.setLineDash(node.missing && !hovered ? [2, 2] : []); context.stroke(); context.setLineDash([]);
+      context.fillStyle = node.appearance.color; context.fill();
+      const highlighted = hovered || node.selected || node.current || node.neighbor;
+      if (node.missing || highlighted) {
+        context.beginPath(); context.arc(x, y, radius + (highlighted ? 2.5 : 0), 0, Math.PI * 2);
+        context.strokeStyle = isDark() ? "#d2b4fa" : "#7851b6"; context.lineWidth = highlighted ? 1.8 : 1; context.setLineDash(node.missing && !highlighted ? [2, 2] : []); context.stroke(); context.setLineDash([]);
       }
       if (labels && labelOpacity > .01 && !hovered) {
-        context.globalAlpha = nodeAlpha(node) * labelOpacity; context.fillStyle = "#57535f";
+        context.globalAlpha = nodeAlpha(node) * labelOpacity; context.fillStyle = isDark() ? "#d3d0da" : "#57535f";
         if (node.shortLabel === undefined) {
           // Measure once at the base size; zoom scales glyphs and label width together.
           context.font = "12px -apple-system, BlinkMacSystemFont, sans-serif";
@@ -316,8 +364,8 @@ export function createGraphView(graph, { container, labels = true } = {}) {
       const labelWidth = hoverLabel.width;
       const x = clamp(point.x, labelWidth / 2 + 4, Math.max(labelWidth / 2 + 4, width - labelWidth / 2 - 4));
       const y = clamp(point.y + radius + 15, 2, Math.max(2, height - font - 2));
-      context.lineWidth = 4; context.strokeStyle = "#ffffff"; context.strokeText(hoverLabel.text, x, y);
-      context.fillStyle = "#684297"; context.fillText(hoverLabel.text, x, y);
+      context.lineWidth = 4; context.strokeStyle = isDark() ? "#222129" : "#ffffff"; context.strokeText(hoverLabel.text, x, y);
+      context.fillStyle = isDark() ? "#d2b4fa" : "#684297"; context.fillText(hoverLabel.text, x, y);
     }
     context.globalAlpha = 1;
   }
@@ -328,7 +376,7 @@ export function createGraphView(graph, { container, labels = true } = {}) {
     const elapsed = Math.min(50, Math.max(1, time - lastTime)); lastTime = time;
     syncScene(time);
     let moving = false;
-    for (const node of nodes) if (pose(node, time)) { moving = true; gridDirty = true; }
+    for (const node of nodes) if (pose(node, time)) { moving = true; gridDirty = true; regionDirty = true; }
     if (inertia && !reducedMotion) {
       const decay = Math.exp(-elapsed / 180); inertia.x *= decay; inertia.y *= decay;
       if (Math.hypot(inertia.x, inertia.y) < .02) inertia = null;
@@ -446,7 +494,14 @@ export function createGraphView(graph, { container, labels = true } = {}) {
   }
   const leave = () => { if (!pointers.size) { latestPointer = null; pointerDirty = false; setHover(null); } };
   const topologyChanged = () => { topologyDirty = true; requestDraw(); };
-  const dataChanged = () => { metadataDirty = true; requestDraw(); };
+  const dataChanged = () => { darkTheme = readDark(); metadataDirty = true; requestDraw(); };
+  function setAppearance(options = {}) {
+    if (Object.hasOwn(options, "colorBy")) colorBy = normalizeGraphPreferences({ colorBy: options.colorBy }).colorBy;
+    if (Object.hasOwn(options, "dark")) explicitDark = typeof options.dark === "boolean" ? options.dark : null;
+    if (["broad", "default", "fine"].includes(options.communityScale)) communityScale = options.communityScale;
+    if (typeof options.regions === "boolean") regions = options.regions;
+    dataChanged();
+  }
   const positionChanged = (event) => { positionsDirty.add(event.target.id()); requestDraw(); };
   const motionChanged = () => {
     reducedMotion = Boolean(media.matches); if (reducedMotion) inertia = null;
@@ -461,13 +516,16 @@ export function createGraphView(graph, { container, labels = true } = {}) {
   graph.on("destroy", destroy);
   win.addEventListener("resize", resize);
   media?.addEventListener?.("change", motionChanged);
+  colorMedia?.addEventListener?.("change", dataChanged);
+  const themeObserver = typeof win.MutationObserver === "function" ? new win.MutationObserver(dataChanged) : null;
+  for (const element of [container.ownerDocument.documentElement, container.ownerDocument.body]) if (element) themeObserver?.observe(element, { attributes: true, attributeFilter: ["data-theme", "class"] });
   const observer = typeof win.ResizeObserver === "function" ? new win.ResizeObserver(resize) : null;
   observer?.observe(container);
   function destroy() {
     if (destroyed) return;
     destroyed = true;
     if (frame !== null) win.cancelAnimationFrame(frame);
-    cancelPointers(false); observer?.disconnect(); win.removeEventListener("resize", resize); media?.removeEventListener?.("change", motionChanged);
+    cancelPointers(false); observer?.disconnect(); themeObserver?.disconnect(); win.removeEventListener("resize", resize); media?.removeEventListener?.("change", motionChanged); colorMedia?.removeEventListener?.("change", dataChanged);
     for (const [type, handler] of Object.entries(handlers)) canvas.removeEventListener(type, handler);
     graph.off("pan zoom", viewportChanged); graph.off("add remove", topologyChanged); graph.off("data style select unselect", dataChanged);
     graph.off("position", "node", positionChanged); graph.off("destroy", destroy);
@@ -475,5 +533,5 @@ export function createGraphView(graph, { container, labels = true } = {}) {
     if (container.style.position === "relative" && previousPosition !== "relative") container.style.position = previousPosition;
   }
   resize(); requestDraw();
-  return { setOptions(options) { if (typeof options?.labels === "boolean") { labels = options.labels; requestDraw(); } }, resize, zoomBy, destroy };
+  return { setOptions(options) { if (typeof options?.labels === "boolean") { labels = options.labels; requestDraw(); } if (options && (Object.hasOwn(options, "colorBy") || Object.hasOwn(options, "dark") || Object.hasOwn(options, "regions") || Object.hasOwn(options, "communityScale"))) setAppearance(options); }, setAppearance, resize, zoomBy, destroy };
 }

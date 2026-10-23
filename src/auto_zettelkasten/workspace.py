@@ -35,6 +35,7 @@ CONFIG_FIELDS = {
     "navigation",
     "mapping_backend",
     "local_mapping",
+    "relationship_decisions",
     "obsidian",
 }
 
@@ -232,6 +233,11 @@ def load_config(workspace: Path | str) -> dict[str, Any]:
     local_options = LocalMappingOptions.from_dict(config.get("local_mapping", {}))
     config.setdefault("mapping_backend", "local")
     config["local_mapping"] = local_options.to_dict()
+    from .relationship_mapping import RelationshipMappingOptions
+
+    config["relationship_decisions"] = RelationshipMappingOptions.from_dict(
+        config.get("relationship_decisions", {})
+    ).to_dict()
     provider = str(config.get("provider") or "deepseek")
     if provider != "codex" and any(
         config.get(field_name) is not None

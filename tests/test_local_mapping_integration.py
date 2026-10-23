@@ -221,6 +221,77 @@ def test_missing_local_setup_blocks_before_any_source_or_zotero_work(tmp_path, s
     assert not list((tmp_path / '02_source_memory/notes').glob('*.md'))
 
 
+def test_community_scales_project_only_current_bound_sources(workspace):
+    import json
+    from auto_zettelkasten.documents import DocumentService
+
+    built = refresh_local_map(workspace, note_rows=all_workspace_note_rows(workspace),
+                              encoder_factory=lambda _: Encoder())
+    mapping = built['result']
+    members = [row['source_id'] for row in mapping['sources']]
+    mapping['communities'] = [{'community_id': 'default-group', 'algorithm': 'leiden',
+                               'source_ids': members, 'display_label': 'Competing institutional explanations'}]
+    mapping['community_scales'] = [{'scale': 'broad', 'resolution': 0.5, 'communities': [
+        {'community_id': 'broad-group', 'algorithm': 'leiden', 'source_ids': members,
+         'display_label': 'Institutional research'}]}]
+    built['path'].write_text(json.dumps(mapping))
+    with_service = DocumentService(journal_root=workspace / 'test-journal')
+    try:
+        wid = with_service.open(workspace)['id']
+        current = with_service.index(wid)['semantic_map']
+        assert current['communities'][0]['display_label'] == 'Competing institutional explanations'
+        assert current['community_scales'][0]['communities'][0]['display_label'] == 'Institutional research'
+        assert len(current['community_scales'][0]['communities'][0]['paths']) == 3
+        path = workspace / mapping['sources'][0]['note_path']
+        path.write_text(path.read_text() + '\nChanged evidence.\n')
+        stale = with_service.index(wid)['semantic_map']
+        assert stale['status'] == 'partial'
+        assert 'display_label' not in stale['communities'][0]
+        assert 'display_label' not in stale['community_scales'][0]['communities'][0]
+        assert len(stale['community_scales'][0]['communities'][0]['paths']) == 2
+    finally:
+        with_service.close()
+
+
+def test_naming_entrypoint_defaults_to_preview_and_preserves_files(workspace):
+    from auto_zettelkasten.mapping import community_name_manifest
+
+    result = refresh_local_map(workspace, note_rows=all_workspace_note_rows(workspace),
+                               encoder_factory=lambda _: Encoder())['result']
+    group = result['communities'][0]
+    class Reader:
+        name = 'deepseek'
+        model = 'deepseek-v4-flash'
+        capabilities = {'capability_identity': 'synthetic-bounded-reader'}
+        def community_name_input_budget(self):
+            return 8192
+        def community_name_output_tokens(self):
+            return 128
+        def name_community(self, *args):
+            pytest.fail('Preview dispatched a provider request')
+    before = {path: path.read_bytes() for path in workspace.rglob('*') if path.is_file()}
+    preview = community_name_manifest(workspace, group['community_id'], reader=Reader())
+    assert preview['status'] == 'deterministic'
+    assert preview['provider_calls'] == 0
+    assert preview['preview']['paid_dispatch_enabled'] is False
+    assert preview['preview']['reserved_cost_usd'] is None
+    assert all(path.read_bytes() == raw for path, raw in before.items())
+    assert not (workspace / '.auto-zettelkasten/mapping/community-names.sqlite3').exists()
+    with pytest.raises(ValueError, match='cloud permission'):
+        community_name_manifest(workspace, group['community_id'], reader=Reader(), execute=True)
+
+
+def test_local_tuning_cli_and_new_entrypoints_are_explicit():
+    from auto_zettelkasten.cli import build_parser, _local_mapping_options
+    parser = build_parser()
+    args = parser.parse_args(['build-map', '--workspace', '/synthetic', '--local-tuning', 'auto'])
+    assert _local_mapping_options(args, {})['tuning_mode'] == 'auto'
+    args = parser.parse_args(['community-name', '--workspace', '/synthetic', '--community-id', 'community-one'])
+    assert not args.execute and not args.allow_cloud and args.approval is None
+    args = parser.parse_args(['calibrate-map', '--workspace', '/synthetic', '--reviews', '/private/reviews.json'])
+    assert str(args.reviews) == '/private/reviews.json'
+
+
 def test_incomplete_cached_model_blocks_before_source_charges(tmp_path, sample_items):
     from conftest import FakeReader, FakeZotero
     model = tmp_path / 'incomplete-model'
@@ -242,3 +313,29 @@ def test_public_api_rejects_malformed_backend_before_work(workspace, backend):
         api.build_map(workspace, mapping_backend=backend)
     with pytest.raises(ValueError, match='mapping_backend'):
         api.estimate_cost(workspace, graph_only=True, mapping_backend=backend)
+
+
+@pytest.mark.parametrize('decision_status,expected', [('blocked', 'partial'), ('partial', 'partial'),
+                                                     ('disabled', 'built'), ('dry_run', 'built')])
+def test_relationship_stage_failure_reaches_public_manifest(workspace, monkeypatch, decision_status, expected):
+    monkeypatch.setattr(local_mapping, '_LocalMiniLM', Encoder)
+    monkeypatch.setattr('auto_zettelkasten.relationship_mapping.run_relationship_mapping',
+                        lambda *_a, **_k: {'status': decision_status, 'provider_calls': 0})
+    manifest = api.build_map(workspace)
+    assert manifest.status == expected
+    assert manifest.metadata['literature_map']['status'] == ('partial' if expected == 'partial' else 'completed')
+
+
+def test_relationship_failure_reaches_pipeline_and_only_applied_links_are_reported(workspace, monkeypatch):
+    from auto_zettelkasten.mapping import pipeline_local_map
+    monkeypatch.setattr(local_mapping, '_LocalMiniLM', Encoder)
+    response = {'status': 'partial', 'application': {'applied': False, 'records': [
+        {'status': 'accepted', 'source_id': 'source-a', 'target_source_id': 'source-b'}]}}
+    monkeypatch.setattr('auto_zettelkasten.relationship_mapping.run_relationship_mapping', lambda *_a, **_k: response)
+    kwargs = {'source_set': {}, 'note_rows': all_workspace_note_rows(workspace), 'request': MapRequest(workspace)}
+    preview = pipeline_local_map(workspace, **kwargs)
+    assert preview['partial_reason'] == 'relationship_decisions_incomplete'
+    assert preview['typed_links']['links'] == []
+    response['application']['applied'] = True
+    applied = pipeline_local_map(workspace, **kwargs)
+    assert len(applied['typed_links']['links']) == 1

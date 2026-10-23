@@ -299,7 +299,7 @@ def test_disabled_override_store_preserves_original_payload_contract(setup, tmp_
         document = plain.read(workspace["id"], "Note.md")
         assert not any(key.startswith("override_") or key in {"source_revision", "source_changed"} for key in document)
         rows = plain.index(workspace["id"])["documents"]
-        assert all(set(row) == {"path", "text", "revision", "editable", "navigation", "source_coverage"} for row in rows)
+        assert all(set(row) == {"path", "text", "revision", "editable", "navigation", "source_coverage", "note_origin"} for row in rows)
     finally:
         plain.close()
 

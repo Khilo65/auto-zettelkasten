@@ -3,6 +3,7 @@ import test from "node:test";
 import cytoscape from "cytoscape";
 import { JSDOM, VirtualConsole } from "jsdom";
 import { createGraphView, graphNodeRadius, projectPoint, segmentVisible, unprojectPoint, zoomViewport } from "../../tools/workspace_graph_view.js";
+import { graphNodeAppearance } from "../../tools/workspace_graph_colors.js";
 
 function harness(t, elements, { reducedMotion = false, width = 400, height = 300 } = {}) {
   const errors = [], virtualConsole = new VirtualConsole();
@@ -248,10 +249,12 @@ test("A static pointer is rechecked when reduced-motion targets move, and an out
 
 test("Topology refresh preserves retained geometry and destroy cancels callbacks and input", (t) => {
   const app = harness(t, [node("A", 100, 100)], { reducedMotion: true }); app.settle();
+  app.view.setAppearance({ dark: false }); app.settle();
   app.graph.add(node("B", 250, 150)); app.graph.add(edge("ab", "A", "B")); app.settle();
   assert.equal(app.paintings.at(-1).circles.length, 2);
   app.graph.$id("A").data("current", "yes"); app.settle();
-  assert.equal(app.paintings.at(-1).circles.find((circle) => circle.x === 100).color, "#7851b6");
+  assert.equal(app.paintings.at(-1).circles.find((circle) => circle.x === 100).color, graphNodeAppearance(app.graph.$id("A").data()).color);
+  assert.ok(app.paintings.at(-1).strokes.some((stroke) => stroke.path.some((arc) => arc.x === 100 && arc.radius > app.paintings.at(-1).circles.find((circle) => circle.x === 100).radius)), "Current note has an outline while retaining its category fill");
   let renders = 0; app.graph.on("render", () => renders++);
   app.view.zoomBy(2); app.frame(); assert.equal(renders, 1);
   app.pointer("pointerdown", 100, 100); app.pointer("pointermove", 150, 150);
@@ -316,4 +319,19 @@ test("Long hover titles use measured ellipsis without compressing either fill or
   app.resize(200, 300); app.settle(); app.pointer("pointermove", 100, 150); app.settle();
   const narrowed = app.paintings.at(-1).texts[0];
   assert.ok(narrowed.width <= 192); assert.equal(narrowed.maxWidth, undefined);
+});
+
+test("Community regions paint behind real nodes without adding topology, degree or viewport changes", (t) => {
+  const membership = { community_id: "semantic-region", algorithm: "leiden", display_label: "Competing explanations" };
+  const app = harness(t, [node("A", 100, 100, { semantic_communities: [membership] }), node("B", 250, 200, { semantic_communities: [membership] }), edge("ab", "A", "B", "relation")]); app.settle();
+  const positions = JSON.stringify(app.graph.nodes().map((entry) => entry.position())), degrees = app.graph.nodes().map((entry) => entry.degree());
+  app.view.setAppearance({ regions: true, colorBy: "community" }); app.settle();
+  assert.equal(app.graph.nodes().length, 2); assert.equal(app.graph.edges().length, 1);
+  assert.equal(JSON.stringify(app.graph.nodes().map((entry) => entry.position())), positions);
+  assert.deepEqual(app.graph.nodes().map((entry) => entry.degree()), degrees);
+  assert.ok(app.paintings.at(-1).strokes.some((stroke) => stroke.alpha === .08 && stroke.width === 36));
+  const before = { zoom: app.graph.zoom(), pan: { ...app.graph.pan() } };
+  app.view.setAppearance({ regions: false }); app.settle();
+  assert.equal(app.graph.zoom(), before.zoom); assert.deepEqual({ ...app.graph.pan() }, before.pan);
+  assert.ok(app.paintings.at(-1).strokes.every((stroke) => stroke.width !== 36));
 });
