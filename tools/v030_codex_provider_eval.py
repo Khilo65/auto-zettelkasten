@@ -65,6 +65,7 @@ from auto_zettelkasten.readers import (  # noqa: E402
 from v030_codex_campaign_guard import CodexCampaignGuard  # noqa: E402
 
 
+# Frozen v0.30 campaign scope; later runtime features do not expand its budget.
 CONTRACTS = (
     "source_bundle",
     "evidence_profile",
@@ -79,6 +80,8 @@ CONTRACTS = (
     "cluster_proposal",
     "gap_adjudication",
 )
+# Community naming has separate admission and tests, not a historical canary case.
+OUT_OF_SCOPE_CONTRACTS = frozenset({"community_name"})
 SOURCE_CONTRACTS = {"source_bundle", "chunk_evidence", "evidence_profile"}
 CONTRACT_METHODS = {
     "source_bundle": "read_source_bundle",
@@ -494,7 +497,7 @@ def _validated_cases(
     rows = manifest.get("cases")
     if not isinstance(rows, list):
         raise ValueError("manifest cases must be a list")
-    if set(CONTRACTS) != set(CODEX_OUTPUT_CONTRACTS):
+    if set(CONTRACTS) != set(CODEX_OUTPUT_CONTRACTS) - OUT_OF_SCOPE_CONTRACTS:
         raise RuntimeError("runner contract inventory does not match Codex contracts")
 
     root = manifest_path.resolve().parent

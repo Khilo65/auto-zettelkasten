@@ -400,6 +400,116 @@ def test_contract_inventory_refusal_precedes_calls(
         )
 
 
+@pytest.mark.parametrize("include_naming", [False, True])
+def test_historical_manifest_is_unchanged_with_optional_runtime_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, include_naming: bool
+) -> None:
+    manifest = _write_manifest(tmp_path / "private")
+    frozen = {
+        path: path.read_bytes() for path in manifest.parent.rglob("*.yml")
+    }
+    runtime = dict(runner.CODEX_OUTPUT_CONTRACTS)
+    if not include_naming:
+        runtime.pop("community_name")
+    monkeypatch.setattr(runner, "CODEX_OUTPUT_CONTRACTS", runtime)
+
+    validated, cases = runner._validated_cases(
+        manifest, sha256_file(manifest), require_clean=False
+    )
+
+    assert validated["schema_version"] == "1"
+    assert tuple(cases) == runner.CONTRACTS
+    assert len(cases) == 12
+    assert "community_name" not in cases
+    assert {path: path.read_bytes() for path in frozen} == frozen
+
+
+@pytest.mark.parametrize("contract_id", [*runner.CONTRACTS, "unexpected_contract"])
+def test_runtime_inventory_drift_still_refuses_before_readers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, contract_id: str
+) -> None:
+    manifest = _write_manifest(tmp_path / "private")
+    runtime = dict(runner.CODEX_OUTPUT_CONTRACTS)
+    if contract_id == "unexpected_contract":
+        runtime[contract_id] = runtime["community_name"]
+    else:
+        runtime.pop(contract_id)
+    monkeypatch.setattr(runner, "CODEX_OUTPUT_CONTRACTS", runtime)
+    workspace = tmp_path / "workspace"
+
+    with pytest.raises(RuntimeError, match="contract inventory does not match"):
+        runner.run_evaluation(
+            manifest_path=manifest,
+            manifest_sha256=sha256_file(manifest),
+            workspace=workspace,
+            execute=True,
+            require_clean=False,
+            reader_factory=lambda **_kwargs: pytest.fail("unexpected reader"),
+        )
+    assert not workspace.exists()
+
+
+@pytest.mark.parametrize("append", [False, True])
+def test_naming_case_cannot_expand_or_replace_historical_scope(
+    tmp_path: Path, append: bool
+) -> None:
+    manifest = _write_manifest(tmp_path / "private")
+    payload = read_yaml(manifest)
+    naming_case = {
+        **payload["cases"][0],
+        "case_id": "case-community_name",
+        "contract_id": "community_name",
+    }
+    if append:
+        payload["cases"].append(naming_case)
+    else:
+        payload["cases"][0] = naming_case
+    write_yaml(manifest, payload)
+
+    with pytest.raises(ValueError, match="unknown or duplicate contract: community_name"):
+        runner.run_evaluation(
+            manifest_path=manifest,
+            manifest_sha256=sha256_file(manifest),
+            workspace=tmp_path / "workspace",
+            execute=True,
+            require_clean=False,
+            reader_factory=lambda **_kwargs: pytest.fail("unexpected reader"),
+        )
+
+
+@pytest.mark.parametrize("control", ["initial_calls", "maximum_attempts"])
+def test_historical_call_limits_cannot_be_enlarged(tmp_path: Path, control: str) -> None:
+    manifest = _write_manifest(tmp_path / "private")
+    payload = read_yaml(manifest)
+    payload["controls"][control] = 13
+    write_yaml(manifest, payload)
+
+    with pytest.raises(ValueError, match="controls do not match"):
+        runner.run_evaluation(
+            manifest_path=manifest,
+            manifest_sha256=sha256_file(manifest),
+            workspace=tmp_path / "workspace",
+            execute=True,
+            require_clean=False,
+            reader_factory=lambda **_kwargs: pytest.fail("unexpected reader"),
+        )
+
+
+def test_attempt_ledger_refuses_thirteenth_reservation(tmp_path: Path) -> None:
+    ledger = tmp_path / "attempts.jsonl"
+    for index, contract_id in enumerate(runner.CONTRACTS, 1):
+        assert runner._reserve_attempt(
+            ledger, {"record": "reserved", "job_id": contract_id}
+        ) == index
+    frozen = ledger.read_bytes()
+
+    with pytest.raises(RuntimeError, match="attempt ceiling would be exceeded"):
+        runner._reserve_attempt(
+            ledger, {"record": "reserved", "job_id": "community_name"}
+        )
+    assert ledger.read_bytes() == frozen
+
+
 def test_dispatches_all_contracts_and_writes_passing_report(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
