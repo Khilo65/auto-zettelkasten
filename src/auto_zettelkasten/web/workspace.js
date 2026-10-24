@@ -744,6 +744,7 @@
           <label class="graph-check"><input id="${mode}-graph-references" type="checkbox"> Markdown links</label>
           <label class="graph-check"><input id="${mode}-graph-citations" type="checkbox"> Citations</label>
           <label class="graph-check"><input id="${mode}-graph-discovery" type="checkbox"> Discovery links</label>
+          <label for="${mode}-graph-discovery-scope">Discovery scope</label><select id="${mode}-graph-discovery-scope"><option value="">Both searches</option><option value="within_collection">Within-collection search</option><option value="whole_library">Whole-library search</option></select>
           <label for="${mode}-graph-discovery-density">Discovery density</label><select id="${mode}-graph-discovery-density"><option value="8">Up to 8 per note</option><option value="16">Up to 16 per note</option><option value="32">Up to 32 per note</option><option value="all">All saved suggestions</option></select>
           <p class="graph-origin-help">Display only. Accepted relationships, citations and the comparison queue are unchanged.</p>
           <label class="graph-check"><input id="${mode}-graph-relations" type="checkbox" checked> Accepted research relations</label>
@@ -916,6 +917,10 @@
     if (local) options.local = { path, depth: Number(graphControl(mode, "depth").value), incoming: graphControl(mode, "incoming").checked, outgoing: graphControl(mode, "outgoing").checked, neighbors: graphControl(mode, "neighbors").checked };
     let data = state.linkIndex ? kit.graphData(state.linkIndex, options) : { nodes: [], edges: [] };
     data = kit.filterGraphOrigins(data, state.graphPreferences.origins);
+    const discoveryScope = graphControl(mode, "discovery-scope");
+    discoveryScope.disabled = !state.linkIndex?.relations.some((relation) => relation.derived === true && relation.type === "semantic_similarity" && relation.provenance?.discovery_scopes?.length);
+    if (discoveryScope.disabled) discoveryScope.value = "";
+    data = kit.filterGraphDiscoveryScopes(data, discoveryScope.value);
     const density = graphControl(mode, "discovery-density").value;
     data = kit.limitGraphDiscovery(data, density === "all" ? "all" : Number(density));
     const scaleSelect = graphControl(mode, "community-scale"), previousScale = scaleSelect.value;
@@ -935,6 +940,7 @@
     const resolutionCounts = [["missing", "missing"], ["ambiguous", "ambiguous"], ["fragments", "missing heading/block"]].filter(([key]) => unresolved[key]).map(([key, label]) => `${unresolved[key]} ${label}`);
     graphControl(mode, "counts").textContent = `${data.nodes.length} ${data.nodes.length === 1 ? "note" : "notes"} · ${data.edges.length} ${data.edges.length === 1 ? "connection" : "connections"}${options.showNavigation ? "" : " · navigation hidden"}${resolutionCounts.length ? ` · ${resolutionCounts.join(", ")}${hidden ? ` (${hidden} hidden)` : ""}` : ""}${data.partial || state.snapshot?.truncated ? " · partial" : ""}`;
     if (data.hidden_discovery_edges) graphControl(mode, "counts").textContent += ` · ${data.hidden_discovery_edges} discovery suggestions hidden by density`;
+    if (data.hidden_discovery_scope_edges) graphControl(mode, "counts").textContent += ` · ${data.hidden_discovery_scope_edges} discovery suggestions hidden by search scope`;
     const scaleRows = data.semantic_map?.community_scales?.find((row) => row.scale === communityScale)?.communities || (communityScale === "default" ? data.semantic_map?.communities : []) || [];
     if (scaleRows.length) {
       graphControl(mode, "counts").textContent += ` · ${scaleRows.length} saved communities`;

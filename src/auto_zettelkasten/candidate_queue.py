@@ -16,7 +16,7 @@ import shutil
 from typing import Any, Mapping, Sequence
 
 from .workspace import resolve_workspace
-from .retrieval import CandidateResourceError
+from .retrieval import CandidateResourceError, _candidate_scope, _select_scope_balanced
 
 
 QUEUE_SCHEMA = "candidate-continuation-v1"
@@ -82,12 +82,23 @@ class CandidateQueue:
             raise CandidateResourceError("candidate queue exceeds its 1 GiB cache bound")
         resolved = {tuple(sorted(pair)) for pair in resolved_pairs}
         prepared = []
+        scoped = set()
         for rank, raw in enumerate(candidates, 1):
             left, right = raw["left_source_id"], raw["right_source_id"]
             if not isinstance(left, str) or not isinstance(right, str) or not left or left >= right or len(left) > 256 or len(right) > 256:
                 raise ValueError("candidate queue requires canonical distinct endpoints")
             if left not in bindings or right not in bindings:
                 raise ValueError("candidate queue requires current endpoint bindings")
+            scope = _candidate_scope(raw)
+            scoped.add(scope is not None)
+            if "shared_collection_keys" in raw:
+                keys = raw["shared_collection_keys"]
+                if (not isinstance(keys, (list, tuple)) or len(keys) > 64
+                        or any(not isinstance(key, str) or not key or len(key) > 256 for key in keys)
+                        or len(set(keys)) != len(keys)
+                        or scope == "within_collection" and not keys
+                        or scope == "whole_library" and keys):
+                    raise ValueError("candidate shared_collection_keys are invalid")
             # Discovery scores/ranks/provenance never invalidate an unchanged
             # decision. Evidence and its interpretation contract do.
             identity = hashlib.sha256(_json({"endpoints": {left: bindings[left], right: bindings[right]}, "contract": contract}).encode()).hexdigest()
@@ -96,6 +107,8 @@ class CandidateQueue:
             if len(encoded.encode()) > 32_768:
                 raise ValueError("candidate queue payload exceeds its bound")
             prepared.append((self.scope, left, right, identity, encoded, rank))
+        if len(scoped) > 1:
+            raise ValueError("candidate pools must not mix legacy and scoped selection metadata")
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             db.execute("UPDATE candidates SET eligible=0 WHERE scope=?", (self.scope,))
@@ -115,7 +128,19 @@ class CandidateQueue:
         with self._connect() as db:
             passes = db.execute("SELECT completed_passes FROM queue_progress WHERE scope=?", (self.scope,)).fetchone()[0]
             initial = None if preferred_pairs is None or passes else {tuple(sorted(pair)) for pair in preferred_pairs}
-            rows = db.execute("SELECT left_id,right_id,payload FROM candidates WHERE scope=? AND eligible=1 AND status='unexamined' ORDER BY selections,rank,left_id,right_id", (self.scope,))
+            query = "SELECT left_id,right_id,payload FROM candidates WHERE scope=? AND eligible=1 AND status='unexamined' ORDER BY selections,rank,left_id,right_id"
+            first = db.execute(query + " LIMIT 1", (self.scope,)).fetchone()
+            if first and _candidate_scope(json.loads(first[2])) is not None:
+                def rows_for_pass():
+                    for left, right, encoded in db.execute(query, (self.scope,)):
+                        if initial is not None and (left, right) not in initial:
+                            continue
+                        row = json.loads(encoded)
+                        if (row.get("left_source_id"), row.get("right_source_id")) != (left, right):
+                            raise ValueError("candidate payload endpoint mismatch")
+                        yield row
+                return _select_scope_balanced(rows_for_pass, per_source_cap=per_source_cap, max_pairs=max_pairs)
+            rows = db.execute(query, (self.scope,))
             for left, right, encoded in rows:
                 if initial is not None and (left, right) not in initial:
                     continue

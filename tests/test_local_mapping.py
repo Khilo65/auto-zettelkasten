@@ -137,6 +137,28 @@ def test_cache_reuses_unchanged_sources_and_refreshes_map(native_graph, tmp_path
     assert changed["sources"][0]["profile_hash"] == "semantic-profile-hash"
 
 
+def test_scoped_discovery_reuses_embeddings_but_refreshes_membership_identity(native_graph, tmp_path):
+    rows = [_row("A", collection_keys=["one"]), _row("B", collection_keys=["one"]), _row("C", collection_keys=["two"])]
+    texts = {sid: _text(sid, "court evidence war") for sid in "ABC"}
+    legacy = mapping.build_local_map(rows, cache_dir=tmp_path, text_sources=texts, encoder_factory=lambda _: _Encoder())
+    encoder = _Encoder()
+    scoped = mapping.build_local_map(rows, cache_dir=tmp_path, text_sources=texts, options={"discovery_scope": "collection_and_library"}, encoder_factory=lambda _: encoder)
+    assert not encoder.calls and scoped["stats"]["encoded_chunks"] == 0
+    assert [row["chunk_id"] for row in legacy["chunks"]] == [row["chunk_id"] for row in scoped["chunks"]]
+    assert "discovery" not in legacy["identity"] and "discovery" in scoped["identity"]
+    assert legacy["identity"]["digest"] != scoped["identity"]["digest"]
+    assert all("source_chunk_ids" in row["provenance"] for row in scoped["neighbors"])
+    assert all("source_chunk_ids" not in row["provenance"] for row in scoped["candidate_neighbors"])
+    memberships = scoped["identity"]["discovery"]["membership_sha256"]
+    rows[1]["collection_keys"] = ["two"]
+    fresh = mapping.build_local_map(rows, cache_dir=tmp_path, text_sources=texts, options={"discovery_scope": "collection_and_library", "tuning_mode": "auto"}, calibration_report={"historical": True}, encoder_factory=lambda _: encoder)
+    assert fresh["stats"]["encoded_chunks"] == 0
+    assert fresh["identity"]["discovery"]["membership_sha256"] != memberships
+    assert fresh["tuning"]["calibration_status"] == "not_applied_discovery_scope_changed"
+    assert fresh["tuning"]["status"] != "calibrated"
+    assert fresh["scope_discovery_coverage"]["sources"] == 3
+
+
 @pytest.mark.parametrize("change", ["model", "token_window", "library", "owner", "cleaning"])
 def test_identity_changes_invalidate_only_affected_cache(native_graph, tmp_path, monkeypatch, change):
     rows = [_row("A"), _row("B")]

@@ -1217,7 +1217,7 @@ class DocumentService:
                 projected.append(item)
             community_scales.append({"scale": scale["scale"], "resolution": scale["resolution"],
                                      "communities": sorted(projected, key=lambda row: row["community_id"])})
-        relations, pairs = [], set()
+        relations, pairs = [], {}
         for row in mapping["neighbors"]:
             if not isinstance(row, dict):
                 invalid = True
@@ -1232,15 +1232,28 @@ class DocumentService:
                 invalid = True
                 continue
             pair = tuple(sorted((source, target)))
-            if pair in pairs:
-                continue
-            pairs.add(pair)
             provenance = row.get("provenance", {})
             safe_provenance = {"kind": "local_embedding_similarity", "embedding_identity": digest,
                                "evidence_backed": False, "accepted": False}
             if not isinstance(provenance, dict):
                 invalid = True
                 continue
+            if "discovery_scopes" in provenance:
+                scopes = provenance["discovery_scopes"]
+                if (not isinstance(scopes, list) or not 1 <= len(scopes) <= 2
+                        or any(not isinstance(value, str) or value not in {"within_collection", "whole_library"} for value in scopes)
+                        or len(set(scopes)) != len(scopes)):
+                    invalid = True
+                    continue
+                safe_provenance["discovery_scopes"] = sorted(scopes)
+            if "shared_collection_keys" in provenance:
+                keys = provenance["shared_collection_keys"]
+                if (not isinstance(keys, list) or len(keys) > 64
+                        or any(not isinstance(value, str) or not 0 < len(value) <= 256
+                               or any(ord(char) < 32 for char in value) for value in keys)):
+                    invalid = True
+                    continue
+                safe_provenance["shared_collection_keys"] = sorted(set(keys))
             for key, owner in (("source_chunk_ids", source), ("target_chunk_ids", target)):
                 chunks = provenance.get(key, [])
                 if (not isinstance(chunks, list) or any(not isinstance(value, str) or value not in sources[owner]["chunk_ids"] for value in chunks)):
@@ -1248,11 +1261,25 @@ class DocumentService:
                     break
                 safe_provenance[key] = list(dict.fromkeys(chunks))
             else:
+                if pair in pairs:
+                    previous = pairs[pair]["provenance"]
+                    merged_metadata = {}
+                    for key in ("discovery_scopes", "shared_collection_keys"):
+                        if key in safe_provenance:
+                            merged = sorted(set(previous.get(key, [])) | set(safe_provenance[key]))
+                            if len(merged) > (2 if key == "discovery_scopes" else 64):
+                                invalid = True
+                                break
+                            merged_metadata[key] = merged
+                    else:
+                        previous.update(merged_metadata)
+                    continue
                 relation_id = hashlib.sha256(json.dumps([digest, *pair]).encode()).hexdigest()[:24]
                 relations.append({"id": f"semantic:{relation_id}", "source": sources[source]["path"],
                                   "target": sources[target]["path"], "type": "semantic_similarity", "derived": True,
                                   "decision_status": "suggested", "accepted": False, "evidence_backed": False,
                                   "score": float(score), "provenance": safe_provenance})
+                pairs[pair] = relations[-1]
         partial = invalid or any(coverage[key] for key in ("unavailable", "stale", "unresolved"))
         metadata = {"status": "partial" if partial else "current", "identity_digest": digest,
                     "communities": sorted(communities, key=lambda row: row["community_id"]),

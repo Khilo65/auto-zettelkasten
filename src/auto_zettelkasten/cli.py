@@ -269,6 +269,12 @@ def build_parser() -> argparse.ArgumentParser:
     calibration_parser = commands.add_parser("calibrate-map", help="Evaluate saved vectors against private, independently reviewed pairs offline.")
     calibration_parser.add_argument("--workspace", type=Path, required=True)
     calibration_parser.add_argument("--reviews", type=Path, required=True)
+    discovery_parser = commands.add_parser("refresh-discovery", help="Refresh collection and library discovery from saved embeddings, without loading a model.")
+    discovery_parser.add_argument("--workspace", type=Path, required=True)
+    discovery_parser.add_argument("--neighbors", type=int, default=8)
+    discovery_parser.add_argument("--preview-decisions", action="store_true", help="Prepare an offline Jev cost preview; paid dispatch stays disabled.")
+    discovery_parser.add_argument("--max-pairs", type=int, default=256)
+    discovery_parser.add_argument("--per-source-cap", type=int, default=8)
     naming_parser = commands.add_parser("community-name", help="Preview a bounded community title task; dispatch defaults off.")
     naming_parser.add_argument("--workspace", type=Path, required=True)
     naming_parser.add_argument("--community-id", required=True)
@@ -345,6 +351,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             from .mapping import calibrate_local_map
 
             result = calibrate_local_map(args.workspace, args.reviews)
+        elif args.command == "refresh-discovery":
+            from .discovery_refresh import refresh_cached_discovery
+
+            result = refresh_cached_discovery(args.workspace, options={"neighbors": args.neighbors},
+                                              preview_decisions=args.preview_decisions,
+                                              max_pairs=args.max_pairs, per_source_cap=args.per_source_cap)
         elif args.command == "community-name":
             from .mapping import community_name_manifest, _bounded_json
 
@@ -718,6 +730,8 @@ def _extraction_policy(
 
 
 def _add_local_mapping_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--discovery-scope", choices=("library", "collection_and_library"), default=None,
+                        help="Use library neighbors, or balance collection-local neighbors with library-wide bridges.")
     parser.add_argument("--local-tuning", choices=("auto", "manual"), default=None,
                         help="Use an admitted offline calibration, or preserve explicit mapping settings.")
     parser.add_argument("--relationship-decisions", choices=("off", "jev"), default=None,
@@ -795,6 +809,7 @@ def _local_mapping_options(
     defaults = LocalMappingOptions.from_dict(configured)
     payload = defaults.to_dict()
     overrides = {
+        "discovery_scope": getattr(args, "discovery_scope", None),
         "tuning_mode": getattr(args, "local_tuning", None),
         "encoder": getattr(args, "local_encoder", None),
         "clustering": getattr(args, "local_clustering", None),

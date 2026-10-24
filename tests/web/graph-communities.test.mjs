@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildLinkIndex, graphData } from "../../tools/workspace_links.js";
+import { buildLibraryIndex, buildLinkIndex, graphData, parseLibraryDocument } from "../../tools/workspace_links.js";
 import { graphCommunityMembership, graphNodeAppearance } from "../../tools/workspace_graph_colors.js";
-import { communityHull, focusGraphCommunity, graphCommunities, graphCommunityScales } from "../../tools/workspace_graph_communities.js";
+import { communityHull, filterGraphDiscoveryScopes, focusGraphCommunity, graphCommunities, graphCommunityScales } from "../../tools/workspace_graph_communities.js";
 
 const revision = "1".repeat(64), identity_digest = "2".repeat(64);
 const docs = ["A.md", "B.md", "C.md", "D.md"].map((path) => ({ path, revision, text: `# ${path}` }));
@@ -73,10 +73,44 @@ test("Discovery display density never changes saved candidates, accepted relatio
   assert.equal(JSON.stringify(data), before);
 });
 
+test("Search-scope filtering changes only semantic suggestions and retains palette metadata", () => {
+  const data = graph(), make = (id, scopes) => ({ id, source: "A.md", target: "B.md", layer: "discovery", type: "semantic_similarity", provenance: scopes && { discovery_scopes: scopes } });
+  const citation = { id: "citation", source: "B.md", target: "C.md", type: "cites", layer: "citation" };
+  const markdown = { id: "markdown", source: "B.md", target: "D.md", layer: "reference" };
+  data.edges.push(citation, markdown, make("within", ["within_collection"]), make("library", ["whole_library"]), make("both", ["within_collection", "whole_library"]), make("legacy"));
+  const before = JSON.stringify(data);
+  for (const [scope, retained] of [["within_collection", ["within", "both"]], ["whole_library", ["library", "both"]]]) {
+    const selected = filterGraphDiscoveryScopes(data, scope);
+    assert.deepEqual(selected.edges.filter((edge) => edge.layer === "discovery").map((edge) => edge.id), retained);
+    assert.ok(selected.edges.includes(citation)); assert.ok(selected.edges.includes(markdown));
+    assert.ok(selected.edges.some((edge) => edge.type === "supports"));
+    assert.equal(selected.hidden_discovery_scope_edges, 2);
+    assert.equal(selected.semantic_map, data.semantic_map);
+    for (const node of selected.nodes) assert.equal(node.degree, selected.edges.reduce((sum, edge) => sum + Number(edge.source === node.id) + Number(edge.target === node.id), 0));
+  }
+  assert.equal(filterGraphDiscoveryScopes(data).edges.length, data.edges.length);
+  assert.equal(JSON.stringify(data), before);
+});
+
+test("Both frontend indexes validate scoped metadata and preserve legacy suggestions", () => {
+  const derived = { id: "suggestion", source: "A.md", target: "B.md", type: "semantic_similarity", derived: true, accepted: false, evidence_backed: false, decision_status: "suggested", score: .8,
+    provenance: { embedding_identity: identity_digest, source_chunk_ids: ["chunk-a"], target_chunk_ids: ["chunk-b"] } };
+  for (const build of [() => (relations) => buildLinkIndex(docs, relations, null, { semantic_map: semantic }), () => (relations) => buildLibraryIndex(docs.map(parseLibraryDocument), relations, null, { semantic_map: semantic })]) {
+    const index = build();
+    assert.equal(index([derived]).relations[0].provenance.discovery_scopes, undefined);
+    const scoped = { ...derived, provenance: { ...derived.provenance, discovery_scopes: ["within_collection", "whole_library"], shared_collection_keys: ["collection-synthetic"] } };
+    assert.deepEqual(graphData(index([scoped]), { showDiscovery: true }).edges[0].provenance.discovery_scopes, ["whole_library", "within_collection"]);
+    for (const malformed of [{ discovery_scopes: "within_collection" }, { discovery_scopes: ["other"] }, { discovery_scopes: [] }, { discovery_scopes: ["whole_library", "whole_library"] }, { shared_collection_keys: ["bad\nkey"] }, { shared_collection_keys: ["x".repeat(257)] }]) {
+      assert.equal(index([{ ...derived, provenance: { ...derived.provenance, ...malformed } }]).relations.length, 0);
+    }
+  }
+});
+
 test("Community connection details distinguish discovery scores, citations and inferred evidence", async () => {
   const { JSDOM } = await import("jsdom"), { appendCommunityConnections } = await import("../../tools/workspace_graph_communities.js");
   const dom = new JSDOM("<aside></aside>"), panel = dom.window.document.querySelector("aside"), data = graph();
-  data.edges.push({ id: "similar", source: "A.md", target: "B.md", layer: "discovery", type: "semantic_similarity", score: .73, derived: true });
+  data.edges.push({ id: "similar", source: "A.md", target: "B.md", layer: "discovery", type: "semantic_similarity", score: .73, derived: true,
+    provenance: { discovery_scopes: ["within_collection", "whole_library"], shared_collection_keys: ["opaque-key-not-a-label"] } });
   data.edges.push({ id: "citation", source: "B.md", target: "C.md", layer: "citation", type: "cites" });
   data.edges[0] = { ...data.edges[0], confidence: .61, evidence_basis: "note_summary", selected_evidence: [{ path: "A.md", text: "A source claim", locator: { heading: "Thesis" } }, { path: "D.md", text: "Fabricated unrelated endpoint" }] };
   const opened = [], details = appendCommunityConnections(panel, graphCommunities(data)[0], data, { onOpen: (...args) => opened.push(args) });
@@ -84,6 +118,8 @@ test("Community connection details distinguish discovery scores, citations and i
   details.open = true; details.dispatchEvent(new dom.window.Event("toggle"));
   assert.match(details.textContent, /similarity 0.730/); assert.match(details.textContent, /Current mapped note revisions/);
   assert.match(details.textContent, /Citation record/); assert.match(details.textContent, /model confidence 61%/);
+  assert.match(details.textContent, /Within-collection search and Whole-library search/); assert.match(details.textContent, /1 shared collection/);
+  assert.doesNotMatch(details.textContent, /opaque-key-not-a-label/);
   assert.match(details.textContent, /A source claim/); assert.doesNotMatch(details.textContent, /Fabricated unrelated endpoint/);
   details.querySelector(".relationship-evidence").click(); assert.deepEqual(opened, [["A.md", { heading: "Thesis" }]]);
   dom.window.close();

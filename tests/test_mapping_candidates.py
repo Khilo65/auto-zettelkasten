@@ -27,6 +27,12 @@ def neighbor(source: str, target: str, score: float = 0.8) -> dict:
                            "target_chunk_ids": [target + "-chunk"]}}
 
 
+def scoped_neighbor(source, target, scope, score=0.8, shared=()):
+    value = neighbor(source, target, score)
+    value["provenance"].update(discovery_scopes=[scope], shared_collection_keys=list(shared))
+    return value
+
+
 def pair_ids(pairs: list[dict]) -> list[tuple[str, str]]:
     return [(pair["left_source_id"], pair["right_source_id"]) for pair in pairs]
 
@@ -118,6 +124,62 @@ def test_caps_bound_each_endpoint_and_total_merged_fanout():
     assert index.last_candidate_stats["max_source_fanout"] <= 5
     assert index.last_candidate_stats["scored_pairs"] <= len(rows) * 5
     assert pairs == LocalRetrievalIndex(list(reversed(rows))).fused_candidate_pairs(list(reversed(edges)), per_source_cap=2, max_pairs=15, fanout=5)
+
+
+def test_scoped_fusion_reserves_neighbors_and_comparisons_for_library_bridges():
+    rows = [row("A")] + [row(sid) for sid in "BCDEFGHI"] + [row(sid, collection="other") for sid in "JKLMNOPQ"]
+    edges = [scoped_neighbor("A", sid, "within_collection", .99 - index / 100, ["one"])
+             for index, sid in enumerate("BCDEFGHI")]
+    edges += [scoped_neighbor("A", sid, "whole_library", .6 - index / 100) for index, sid in enumerate("JKLMNOPQ")]
+    index = LocalRetrievalIndex(rows)
+    pairs = index.fused_candidate_pairs(edges, source_ids=["A"], per_source_cap=4, max_pairs=4, fanout=8, retain_pool=True)
+    assert Counter(pair["comparison_scope"] for pair in pairs) == {"within_collection": 2, "whole_library": 2}
+    assert max(Counter(sid for pair in pair_ids(pairs) for sid in pair).values()) == 4
+    assert Counter(pair["comparison_scope"] for pair in index.last_candidate_pool) == {"within_collection": 4, "whole_library": 4}
+    assert pairs == LocalRetrievalIndex(rows[::-1]).fused_candidate_pairs(edges[::-1], source_ids=["A"], per_source_cap=4, max_pairs=4, fanout=8, retain_pool=True)
+    assert index.last_candidate_stats["scope_balanced"]
+
+
+def test_scope_provenance_merges_inverse_discoveries_and_handles_overlap_and_unfiled():
+    rows = [{**row("A"), "collection_keys": ["one", "two"]},
+            {**row("B"), "collection_keys": ["two", "three"]}, {**row("C"), "collection_keys": []}]
+    edges = [scoped_neighbor("A", "B", "within_collection", .8, ["two"]),
+             scoped_neighbor("B", "A", "whole_library", .9, ["two"]), scoped_neighbor("A", "C", "whole_library", .7)]
+    pairs = LocalRetrievalIndex(rows).fused_candidate_pairs(edges)
+    assert len(pairs) == 2
+    merged = next(pair for pair in pairs if pair_ids([pair]) == [("A", "B")])
+    assert merged["discovery_scopes"] == ["whole_library", "within_collection"]
+    assert merged["shared_collection_keys"] == ["two"]
+    assert merged["comparison_scope"] == "within_collection"
+    proof = next(value for value in merged["discovery_provenance"] if value["signal"] == "semantic_similarity")
+    assert proof["discovery_scopes"] == merged["discovery_scopes"]
+    assert next(pair for pair in pairs if pair["right_source_id"] == "C")["comparison_scope"] == "whole_library"
+
+
+def test_scoped_fusion_keeps_reference_profile_candidates_and_excludes_resolved_first():
+    index = LocalRetrievalIndex([row("A", "rareanchor"), row("B", "rareanchor"), row("C", collection="other"), row("D", collection="other")])
+    pairs = index.fused_candidate_pairs([scoped_neighbor("A", "C", "whole_library", .9), scoped_neighbor("A", "D", "whole_library", .6)],
+                                        source_ids=["A"], per_source_cap=2, max_pairs=2, resolved_pairs=[("A", "C")])
+    assert set(pair_ids(pairs)) == {("A", "B"), ("A", "D")}
+    profile = next(pair for pair in pairs if pair["right_source_id"] == "B")
+    assert profile["candidate_routes"] == ["local_reference_tag_profile"]
+    assert profile["comparison_scope"] == "within_collection"
+
+
+@pytest.mark.parametrize("scopes", [[], "whole_library", ["other"], ["whole_library", "whole_library"], [True]])
+def test_malformed_discovery_scopes_are_rejected(scopes):
+    edge = neighbor("A", "B")
+    edge["provenance"]["discovery_scopes"] = scopes
+    with pytest.raises(ValueError, match="discovery_scopes"):
+        LocalRetrievalIndex([row("A"), row("B")]).fused_candidate_pairs([edge])
+
+
+def test_scope_metadata_cannot_fabricate_shared_membership():
+    index = LocalRetrievalIndex([row("A"), row("B", collection="other")])
+    with pytest.raises(ValueError, match="canonical membership"):
+        index.fused_candidate_pairs([scoped_neighbor("A", "B", "within_collection")])
+    with pytest.raises(ValueError, match="canonical memberships"):
+        index.fused_candidate_pairs([scoped_neighbor("A", "B", "whole_library", shared=["forged"])])
 
 
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -0.1, 1.1, True, "0.5"])

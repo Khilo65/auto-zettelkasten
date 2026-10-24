@@ -21,6 +21,60 @@ def bindings():
     return {sid: {"note_sha256": hashlib.sha256(sid.encode()).hexdigest(), "profile_hash": sid} for sid in "ABCDEFGHIJKLM"}
 
 
+def scoped_candidates():
+    return [{**row, "comparison_scope": "within_collection" if index < 6 else "whole_library",
+             "discovery_scopes": ["within_collection" if index < 6 else "whole_library"],
+             "shared_collection_keys": ["one"] if index < 6 else []} for index, row in enumerate(candidates())]
+
+
+def test_scoped_queue_reserves_each_endpoint_then_continues_without_duplicate_decisions(tmp_path):
+    q = queue(tmp_path)
+    q.sync(scoped_candidates(), bindings=bindings(), contract={"policy": "v1"})
+    reviewed = set()
+    for _ in range(3):
+        batch = q.select(per_source_cap=4, max_pairs=256)
+        assert len(batch) == 4
+        assert Counter(row["comparison_scope"] for row in batch) == {"within_collection": 2, "whole_library": 2}
+        assert q.select(per_source_cap=4, max_pairs=256) == batch
+        for row in batch:
+            assert row["right_source_id"] not in reviewed
+            reviewed.add(row["right_source_id"])
+            q.record(row, "negative")
+        q.sync(scoped_candidates(), bindings=bindings(), contract={"policy": "v1"})
+    assert len(reviewed) == 12 and not q.summary()["unfinished"]
+
+
+def test_scoped_job_reservation_prevents_high_ranked_local_pairs_crowding_all_bridges(tmp_path):
+    q = queue(tmp_path)
+    pairs = [("A", "B"), ("C", "D"), ("E", "F"), ("G", "H"), ("I", "J"), ("K", "L")]
+    pool = [{"left_source_id": left, "right_source_id": right,
+             "comparison_scope": "within_collection" if index < 4 else "whole_library",
+             "discovery_scopes": ["within_collection" if index < 4 else "whole_library"],
+             "shared_collection_keys": ["one"] if index < 4 else []} for index, (left, right) in enumerate(pairs)]
+    q.sync(pool, bindings=bindings(), contract={"policy": "v1"})
+    selected = q.select(per_source_cap=8, max_pairs=4)
+    assert Counter(row["comparison_scope"] for row in selected) == {"within_collection": 2, "whole_library": 2}
+    q.sync(pool[:4], bindings=bindings(), contract={"policy": "v1"})
+    assert len(q.select(per_source_cap=8, max_pairs=4)) == 4  # Fill unused library allocation.
+
+
+def test_scope_ranking_changes_reuse_decisions_and_validate_before_mutating_queue(tmp_path):
+    q = queue(tmp_path)
+    pool = scoped_candidates()
+    q.sync(pool, bindings=bindings(), contract={"policy": "v1"})
+    selected = q.select(per_source_cap=4, max_pairs=2)
+    q.record(selected[0], "negative")
+    changed = [{**row, "comparison_scope": "whole_library", "discovery_scopes": ["whole_library"], "shared_collection_keys": []} for row in pool]
+    q.sync(changed, bindings=bindings(), contract={"policy": "v1"})
+    assert q.summary()["counts"]["negative"] == 1
+    before = q.summary()
+    with pytest.raises(ValueError, match="mix legacy and scoped"):
+        q.sync([pool[0], candidates()[1]], bindings=bindings(), contract={"policy": "v1"})
+    assert q.summary() == before
+    with pytest.raises(ValueError, match="comparison_scope"):
+        q.sync([{**pool[0], "comparison_scope": "fabricated"}], bindings=bindings(), contract={"policy": "v1"})
+
+
 def test_continuation_reaches_beyond_first_endpoint_allocation_and_preserves_provenance(tmp_path):
     q = queue(tmp_path)
     q.sync(candidates(), bindings=bindings(), contract={"policy": "v1"})

@@ -58,6 +58,16 @@ export function limitGraphDiscovery(data, cap = 8) {
   return { ...data, nodes: data.nodes.map((node) => ({ ...node, degree: allDegrees.get(node.id) })), edges, hidden_discovery_edges: candidates.length - retained.size };
 }
 
+export function filterGraphDiscoveryScopes(data, scope = "") {
+  if (!["within_collection", "whole_library"].includes(scope)) return { ...data, hidden_discovery_scope_edges: 0 };
+  const edges = data.edges.filter((edge) => edge.layer !== "discovery" || edge.type !== "semantic_similarity"
+    || Array.isArray(edge.provenance?.discovery_scopes) && edge.provenance.discovery_scopes.includes(scope));
+  const degrees = new Map(data.nodes.map((node) => [node.id, 0]));
+  for (const edge of edges) { degrees.set(edge.source, (degrees.get(edge.source) || 0) + 1); degrees.set(edge.target, (degrees.get(edge.target) || 0) + 1); }
+  return { ...data, nodes: data.nodes.map((node) => ({ ...node, degree: degrees.get(node.id) })), edges,
+    hidden_discovery_scope_edges: data.edges.length - edges.length };
+}
+
 export function appendCommunityConnections(container, community, data, { onOpen = () => {} } = {}) {
   const doc = container.ownerDocument, ids = new Set(community.members.map((node) => node.id));
   const rows = data.edges.filter((edge) => ids.has(edge.source) || ids.has(edge.target));
@@ -76,6 +86,15 @@ export function appendCommunityConnections(container, community, data, { onOpen 
         : edge.layer === "citation" ? "Citation record. A reference connection does not establish agreement."
           : edge.layer === "relation" ? `Saved research relationship${Number.isFinite(edge.confidence) ? ` · model confidence ${Math.round(edge.confidence * 100)}%` : ""}.${edge.evidence_basis === "note_summary" ? " Based on note summaries." : ""}` : "Saved Markdown link.";
       record.append(description);
+      if (edge.layer === "discovery" && Array.isArray(edge.provenance?.discovery_scopes)) {
+        const origins = edge.provenance.discovery_scopes.filter((scope) => ["within_collection", "whole_library"].includes(scope))
+          .map((scope) => scope === "within_collection" ? "Within-collection search" : "Whole-library search");
+        if (origins.length) {
+          const origin = doc.createElement("p"), shared = edge.provenance.shared_collection_keys;
+          origin.textContent = `Discovered by: ${origins.join(" and ")}.${Array.isArray(shared) && shared.length ? ` ${shared.length} shared ${shared.length === 1 ? "collection" : "collections"}.` : ""}`;
+          record.append(origin);
+        }
+      }
       if (Number.isFinite(edge.confidence)) description.title = "Model confidence is not a verified probability of correctness.";
       for (const id of new Set([edge.source, edge.target])) {
         const node = byId.get(id); if (!node?.path || node.missing) continue;

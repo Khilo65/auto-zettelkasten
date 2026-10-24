@@ -23,10 +23,61 @@ _ROLE_FIELDS = (
 _MATCHED = {"matched", "matched_identifier", "matched_metadata", "exact_identifier", "identifier_match", "matched_title_author_year"}
 _PAIR_PROVENANCE_MAX_BYTES = 2048
 _PAIR_PROVENANCE_MAX_ROWS = 6
+_DISCOVERY_SCOPES = frozenset({"within_collection", "whole_library"})
 
 
 class CandidateResourceError(ValueError):
     """Discovery stopped at an explicit bound without discarding saved work."""
+
+
+def _discovery_scopes(value: Any) -> list[str]:
+    if (not isinstance(value, (list, tuple)) or not 1 <= len(value) <= 2
+            or any(not isinstance(scope, str) or scope not in _DISCOVERY_SCOPES for scope in value)
+            or len(set(value)) != len(value)):
+        raise ValueError("discovery_scopes must contain distinct within_collection/whole_library scopes")
+    return sorted(value)
+
+
+def _candidate_scope(row: Mapping[str, Any]) -> str | None:
+    scope = row.get("comparison_scope")
+    if scope is not None and (not isinstance(scope, str) or scope not in _DISCOVERY_SCOPES):
+        raise ValueError("candidate comparison_scope is invalid")
+    if "discovery_scopes" in row:
+        _discovery_scopes(row["discovery_scopes"])
+        if scope is None:
+            raise ValueError("scoped candidates require comparison_scope")
+    return scope
+
+
+def _select_scope_balanced(row_factory, *, per_source_cap: int, max_pairs: int):
+    """Reserve endpoint and job allocations for both scopes, then fill leftovers.
+
+    The factory is replayable so a durable queue can stream bounded payloads
+    twice without materializing its entire pool. Saved ranks remain the order
+    within each allocation. This selects comparisons, never accepted links.
+    """
+    counts, by_scope, jobs = Counter(), Counter(), Counter()
+    selected, seen = [], set()
+    endpoint_share, job_share = (per_source_cap + 1) // 2, (max_pairs + 1) // 2
+    for reserve in (True, False):
+        for row in row_factory():
+            left, right = row["left_source_id"], row["right_source_id"]
+            pair = (left, right)
+            scope = _candidate_scope(row)
+            if scope is None:
+                raise ValueError("scope-balanced selection requires scoped candidates")
+            if pair in seen or counts[left] >= per_source_cap or counts[right] >= per_source_cap:
+                continue
+            if reserve and (jobs[scope] >= job_share or any(by_scope[(sid, scope)] >= endpoint_share for sid in pair)):
+                continue
+            selected.append({**row, "rank": len(selected) + 1})
+            seen.add(pair)
+            counts.update(pair)
+            by_scope.update((sid, scope) for sid in pair)
+            jobs[scope] += 1
+            if len(selected) >= max_pairs:
+                return selected
+    return selected
 
 
 def _limit(value: int, name: str, *, zero: bool = False) -> int:
@@ -506,6 +557,23 @@ class LocalRetrievalIndex:
             stats["selection_truncated"] = int(bool(semantic_neighbors or self.rows))
             return []
         semantic: dict[str, dict[str, tuple[float, dict[str, Any]]]] = defaultdict(dict)
+        scope_balanced = False
+        for raw in semantic_neighbors:
+            provenance = raw.get("provenance") if isinstance(raw, Mapping) else None
+            if isinstance(provenance, Mapping) and "discovery_scopes" in provenance:
+                _discovery_scopes(provenance["discovery_scopes"])
+                scope_balanced = True
+        collections = {sid: set(row["collection_keys"]) for sid, row in self.rows.items()} if scope_balanced else {}
+        pair_scopes: dict[tuple[str, str], set[str]] = defaultdict(set)
+
+        def shared_keys(pair):
+            return sorted(collections[pair[0]] & collections[pair[1]])
+
+        def interleave_scopes(keys):
+            groups = {scope: [] for scope in ("within_collection", "whole_library")}
+            for key in keys:
+                groups["within_collection" if shared_keys(key) else "whole_library"].append(key)
+            return [key for values in zip_longest(*groups.values()) for key in values if key is not None]
 
         def order(sid: str, target: str, score: float) -> tuple[float, bool, str]:
             return (-score, bool(set(self.rows[sid]["collection_keys"]) & set(self.rows[target]["collection_keys"])), target)
@@ -533,6 +601,19 @@ class LocalRetrievalIndex:
                 raise ValueError("semantic embedding identity must be bounded text")
             material: dict[str, Any] = {"signal": "semantic_similarity", "source_id": pair[0], "target_source_id": pair[1],
                                         "embedding_identity": identity, "evidence_backed": False, "accepted": False}
+            if scope_balanced:
+                shared = shared_keys(pair)
+                if "shared_collection_keys" in provenance:
+                    supplied = provenance["shared_collection_keys"]
+                    if (not isinstance(supplied, (list, tuple)) or len(supplied) > 64
+                            or any(not isinstance(key, str) or not key or len(key) > 256 for key in supplied)
+                            or len(set(supplied)) != len(supplied) or sorted(supplied) != shared):
+                        raise ValueError("semantic shared_collection_keys must match canonical memberships")
+                scopes = _discovery_scopes(provenance["discovery_scopes"]) if "discovery_scopes" in provenance else ["within_collection" if shared else "whole_library"]
+                if "within_collection" in scopes and not shared:
+                    raise ValueError("within_collection discovery requires shared canonical membership")
+                pair_scopes[pair].update(scopes)
+                material.update(discovery_scopes=scopes, shared_collection_keys=shared)
             for side, sid in (("source", left), ("target", right)):
                 chunks = provenance.get(f"{side}_chunk_ids")
                 if chunks is not None:
@@ -549,7 +630,14 @@ class LocalRetrievalIndex:
                     continue
                 bucket[target] = (float(score), material)
                 if len(bucket) > fanout:
-                    worst = max(bucket, key=lambda other: order(sid, other, bucket[other][0]))
+                    removable = list(bucket)
+                    if scope_balanced:
+                        within = [other for other in bucket if collections[sid] & collections[other]]
+                        outside = [other for other in bucket if not collections[sid] & collections[other]]
+                        share = (fanout + 1) // 2
+                        removable = (within if len(within) > share and len(outside) <= share else
+                                     outside if len(outside) > share and len(within) <= share else removable)
+                    worst = max(removable, key=lambda other: order(sid, other, bucket[other][0]))
                     del bucket[worst]
                     stats["selection_truncated"] = 1
         proposals: dict[str, list[tuple[str, str]]] = {}
@@ -558,6 +646,9 @@ class LocalRetrievalIndex:
         candidate_keys: set[tuple[str, str]] = set()
         for sid in sources:
             semantic_targets = sorted(semantic[sid], key=lambda target: order(sid, target, semantic[sid][target][0]))
+            if scope_balanced:
+                semantic_targets = [key[1] if key[0] == sid else key[0]
+                                    for key in interleave_scopes([tuple(sorted((sid, target))) for target in semantic_targets])]
             local_targets = self._targets(self._signals(sid), fanout, sid, excluded_targets=excluded[sid])
             local_ranked = []
             for target in local_targets:
@@ -582,7 +673,7 @@ class LocalRetrievalIndex:
                         break
                 if len(merged) >= fanout:
                     break
-            proposals[sid] = list(merged)
+            proposals[sid] = interleave_scopes(merged) if scope_balanced else list(merged)
             candidate_keys.update(merged)
             stats["max_source_fanout"] = max(stats["max_source_fanout"], len(merged))
             if len(local_targets) >= fanout:
@@ -611,22 +702,33 @@ class LocalRetrievalIndex:
             for sid in sources:
                 if rank < len(proposals[sid]):
                     ordered_pool[proposals[sid][rank]] = None
-        if retain_pool and len(ordered_pool) > 100_000:
+        if (retain_pool or scope_balanced) and len(ordered_pool) > 100_000:
             raise CandidateResourceError("candidate pool exceeds the bounded queue; reduce source scope")
         materialized = {}
-        for key in ordered_pool if retain_pool else selected:
+        for key in ordered_pool if retain_pool or scope_balanced else selected:
             row = self._pair(*key)
             row.update(rank=len(materialized) + 1, local_score=row["score"], discovery_route="deterministic_local_fused",
                        ranking_method="alternating_semantic_local", decision_status="unexamined")
             if key in semantic_pairs:
                 score, material = semantic_pairs[key]
+                if scope_balanced:
+                    material = {**material, "discovery_scopes": sorted(pair_scopes[key]), "shared_collection_keys": shared_keys(key)}
                 row["semantic_score"] = score
                 row["discovery_provenance"] = _pair_provenance([*self._pair_material(*key), material])
                 row["why_compare"] = "; ".join(filter(None, ("semantic_similarity", row["why_compare"])))
             row["candidate_routes"] = (["semantic_similarity"] if key in semantic_pairs else []) + (["local_reference_tag_profile"] if key in local_pairs else [])
+            if scope_balanced:
+                shared = shared_keys(key)
+                row.update(discovery_scopes=sorted(pair_scopes[key]) or ["within_collection" if shared else "whole_library"],
+                           comparison_scope="within_collection" if shared else "whole_library", shared_collection_keys=shared,
+                           ranking_method="alternating_collection_library_and_local")
             materialized[key] = row
         self.last_candidate_pool = list(materialized.values()) if retain_pool else []
-        result = [{**materialized[key], "rank": rank} for rank, key in enumerate(selected, 1)]
+        result = (_select_scope_balanced(lambda: iter(materialized.values()), per_source_cap=per_source_cap, max_pairs=max_pairs)
+                  if scope_balanced else [{**materialized[key], "rank": rank} for rank, key in enumerate(selected, 1)])
+        if scope_balanced:
+            stats.update(scope_balanced=True, selected_within_collection=sum(row["comparison_scope"] == "within_collection" for row in result),
+                         selected_whole_library=sum(row["comparison_scope"] == "whole_library" for row in result))
         stats.update(scored_pairs=len(candidate_keys), bounded_candidate_count=len(candidate_keys), returned_pairs=len(result),
                      unexamined_candidate_pairs=len(candidate_keys) - len(result),
                      selection_truncated=int(bool(stats["selection_truncated"] or len(candidate_keys) > len(result))))

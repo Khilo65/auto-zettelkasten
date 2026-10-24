@@ -39,6 +39,7 @@ class LocalMappingError(RuntimeError):
 @dataclass(frozen=True)
 class LocalMappingOptions:
     tuning_mode: str = "manual"
+    discovery_scope: str = "library"
     encoder: str = "minilm"
     clustering: str = "leiden"
     model_path: str | None = None
@@ -77,6 +78,8 @@ class LocalMappingOptions:
     def validate(self) -> None:
         if not isinstance(self.tuning_mode, str) or self.tuning_mode not in {"auto", "manual"}:
             raise ValueError("tuning_mode must be auto or manual")
+        if not isinstance(self.discovery_scope, str) or self.discovery_scope not in {"library", "collection_and_library"}:
+            raise ValueError("discovery_scope must be library or collection_and_library")
         if self.encoder != "minilm":
             raise ValueError("This local mapper supports encoder='minilm'; experimental encoders require an explicit compatible adapter.")
         if self.clustering not in {"leiden", "hdbscan"}:
@@ -366,8 +369,109 @@ def _ranked_neighbors(ids, matrix, *, options, embedding_identity=""):
     return neighbors
 
 
+def scoped_source_neighbors(
+    source_ids: Sequence[str], vectors: Any, collection_memberships: Mapping[str, Sequence[str]], *,
+    options: LocalMappingOptions | None = None, embedding_identity: str = "",
+    check_resources: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    """Rank within-collection and library-wide neighbors using one cosine scan.
+
+    Shared explicit collection keys define the within lane. The library lane
+    prioritizes peers with no shared collection, including unfiled sources; it
+    fills unused capacity from the whole library. Unfiled sources are never
+    treated as one artificial collection. Limits allocate this discovery pass,
+    not permanent caps on saved or accepted relationships.
+    """
+    options = options or LocalMappingOptions(discovery_scope="collection_and_library")
+    options.validate()
+    if options.discovery_scope != "collection_and_library":
+        raise ValueError("scoped discovery requires discovery_scope=collection_and_library")
+    if (not isinstance(source_ids, (list, tuple)) or len(source_ids) > options.max_sources
+            or any(not isinstance(sid, str) or not sid or len(sid) > 256 for sid in source_ids)
+            or len(set(source_ids)) != len(source_ids)):
+        raise ValueError("source IDs must be unique bounded strings within max_sources")
+    if (not isinstance(collection_memberships, Mapping) or set(collection_memberships) - set(source_ids)
+            or not isinstance(embedding_identity, str) or len(embedding_identity) > 256):
+        raise ValueError("scoped discovery requires exact source memberships and a bounded embedding identity")
+    memberships = {}
+    for sid in source_ids:
+        values = collection_memberships.get(sid, ())
+        if (not isinstance(values, (list, tuple, set, frozenset)) or len(values) > 64
+                or any(not isinstance(value, str) or not value or len(value) > 256
+                       or any(ord(char) < 32 for char in value) for value in values)):
+            raise ValueError("collection memberships require at most 64 bounded collection keys per source")
+        memberships[sid] = frozenset(values)
+    ids = sorted(source_ids)
+    scope_identity = {"version": "collection-library-neighbors-v1", "mode": options.discovery_scope,
+                      "membership_sha256": _digest({sid: sorted(memberships[sid]) for sid in ids}),
+                      "neighbors": options.neighbors, "candidate_neighbors": max(64, options.neighbors),
+                      "min_similarity": options.min_similarity, "allocation": "half_within_half_library_bridge_priority"}
+    coverage = {"sources": len(ids), "filed_sources": sum(bool(memberships[sid]) for sid in ids),
+                "unfiled_sources": sum(not memberships[sid] for sid in ids),
+                "collections": len(set().union(*memberships.values())) if memberships else 0,
+                "directed_neighbors": 0, "directed_candidates": 0,
+                "all_pairs_examined": False, "accepted_relationships": False}
+    if not ids:
+        return {"neighbors": [], "candidate_neighbors": [], "scope_identity": scope_identity, "coverage": coverage}
+    np = _numpy()
+    matrix = np.asarray(vectors, dtype=np.float32)
+    if matrix.ndim != 2 or not 1 <= matrix.shape[1] <= 4096:
+        raise ValueError("source vectors must be a bounded-dimension matrix")
+    matrix = _unit_vectors(matrix, len(source_ids), matrix.shape[1])
+    positions = {sid: index for index, sid in enumerate(source_ids)}
+    matrix = matrix[[positions[sid] for sid in ids]]
+    started = time.monotonic()
+
+    def guard():
+        if time.monotonic() - started > options.max_wall_seconds:
+            raise LocalMappingError("Scoped neighbor refresh reached max_wall_seconds; no partial map was committed.")
+        if check_resources:
+            check_resources()
+
+    def select(sid, ranked, values, limit, minimum):
+        eligible = [other for other in ranked if float(values[other]) > minimum]
+        inside = [other for other in eligible if memberships[sid] & memberships[ids[other]]]
+        outside = [other for other in eligible if not memberships[sid] & memberships[ids[other]]]
+        within = inside[:(limit + 1) // 2]
+        # Whole-library search does not let abundant local neighbors crowd out
+        # bridges. When none exist, it still examines the global ranking.
+        whole = (outside + inside)[:limit // 2]
+        selected: dict[int, set[str]] = {}
+        for rank in range(max(len(within), len(whole))):
+            for stream, scope in ((within, "within_collection"), (whole, "whole_library")):
+                if rank < len(stream):
+                    selected.setdefault(stream[rank], set()).add(scope)
+        for other in eligible:
+            if len(selected) >= limit:
+                break
+            selected.setdefault(other, set()).add("whole_library")
+        result = []
+        for other, scopes in selected.items():
+            shared = sorted(memberships[sid] & memberships[ids[other]])
+            result.append({"source_id": sid, "target_source_id": ids[other], "score": min(1.0, float(values[other])),
+                           "provenance": {"kind": "semantic_similarity", "evidence_backed": False,
+                                          "accepted": False, "embedding_identity": embedding_identity,
+                                          "discovery_scopes": sorted(scopes), "shared_collection_keys": shared}})
+        return result
+
+    neighbors, candidates = [], []
+    for first in range(0, len(ids), 64):
+        guard()
+        scores = matrix[first:first + 64] @ matrix.T
+        for offset, values in enumerate(scores):
+            guard()
+            at = first + offset
+            ranked = sorted((other for other in range(len(ids)) if other != at and float(values[other]) > 0),
+                            key=lambda other: (-float(values[other]), ids[other]))
+            candidates.extend(select(ids[at], ranked, values, max(64, options.neighbors), 0.0))
+            neighbors.extend(select(ids[at], ranked, values, options.neighbors, options.min_similarity))
+    guard()
+    coverage.update(directed_neighbors=len(neighbors), directed_candidates=len(candidates))
+    return {"neighbors": neighbors, "candidate_neighbors": candidates, "scope_identity": scope_identity, "coverage": coverage}
+
+
 def cluster_source_vectors(source_ids: Sequence[str], vectors: Any, *, options: LocalMappingOptions | None = None,
-                           embedding_identity: str = "") -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+                           embedding_identity: str = "", collection_memberships: Mapping[str, Sequence[str]] | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Exact bounded-memory cosine graph, followed by the selected local view."""
     options = options or LocalMappingOptions()
     options.validate()
@@ -383,7 +487,13 @@ def cluster_source_vectors(source_ids: Sequence[str], vectors: Any, *, options: 
     order = sorted(range(len(source_ids)), key=lambda index: source_ids[index])
     ids = [source_ids[index] for index in order]
     matrix = matrix[order]
-    neighbors = _ranked_neighbors(ids, matrix, options=options, embedding_identity=embedding_identity)
+    if options.discovery_scope == "collection_and_library":
+        if collection_memberships is None:
+            raise ValueError("collection_and_library requires explicit collection memberships")
+        neighbors = scoped_source_neighbors(ids, matrix, collection_memberships, options=options,
+                                             embedding_identity=embedding_identity)["neighbors"]
+    else:
+        neighbors = _ranked_neighbors(ids, matrix, options=options, embedding_identity=embedding_identity)
     return _communities_from_neighbors(ids, matrix, neighbors, options=options), neighbors
 
 
@@ -510,6 +620,8 @@ def build_local_map(
                 raise ValueError("supplied source text hash does not match its content")
             source = {key: row.get(key, supplied.get(key, "")) for key in ("source_id", "note_id", "note_path", "note_hash", "profile_hash", "projection_hash", "profile_path", "profile_file_sha256", "metadata_path", "metadata_file_sha256")}
             source["note_content_sha256"] = str(supplied.get("note_content_sha256") or source["projection_hash"])
+            if options.discovery_scope == "collection_and_library":
+                source["collection_keys"] = list(index.rows[source_id]["collection_keys"])
             source.update(identity=identity, full_text_sha256=full_hash,
                           input_representation=str(supplied.get("text_origin") or supplied.get("source_scope") or "unavailable"),
                           coverage={"input": dict(supplied.get("coverage") or {}), "cleaning": clean["coverage"],
@@ -626,7 +738,12 @@ def build_local_map(
                 means.append(mean / norm)
         check_resources()
         tuning = {"mode": options.tuning_mode, "status": "manual" if options.tuning_mode == "manual" else "awaiting_evaluation_gate"}
-        if options.tuning_mode == "auto" and calibration_report is not None:
+        if options.tuning_mode == "auto" and calibration_report is not None and options.discovery_scope == "collection_and_library":
+            # Historical evaluations used an unrestricted neighbor selector.
+            # Membership-aware ranking needs its own reviewed admission; the
+            # local repeatability check below makes no semantic quality claim.
+            tuning["calibration_status"] = "not_applied_discovery_scope_changed"
+        if options.tuning_mode == "auto" and calibration_report is not None and options.discovery_scope == "library":
             from .mapping_calibration import admitted_parameters, source_fingerprint, ranking_fingerprint
             active_ids = set(ids)
             ranking_rows = projection_rows if ranking_projection_rows is None else ranking_projection_rows
@@ -649,18 +766,28 @@ def build_local_map(
         emit("clustering", algorithm=options.clustering, sources=len(ids))
         cluster_started = time.monotonic()
         matrix = np.stack(means) if means else np.empty((0, dimension))
-        candidate_neighbors = _ranked_neighbors(ids, matrix, options=replace(options, neighbors=64, min_similarity=0.),
-                                                embedding_identity=embedding_digest)
-        counts: dict[str, int] = defaultdict(int)
-        neighbors = []
-        for neighbor in candidate_neighbors:
-            sid = neighbor["source_id"]
-            if neighbor["score"] > options.min_similarity and counts[sid] < options.neighbors:
-                neighbors.append({**neighbor, "provenance": dict(neighbor["provenance"])})
-                counts[sid] += 1
-        # Explicit manual settings above 64 retain their historical graph policy.
-        if options.neighbors > 64:
-            neighbors = _ranked_neighbors(ids, matrix, options=options, embedding_identity=embedding_digest)
+        discovery_coverage = None
+        if options.discovery_scope == "collection_and_library":
+            scoped = scoped_source_neighbors(ids, matrix, {sid: index.rows[sid]["collection_keys"] for sid in ids},
+                                              options=options, embedding_identity=embedding_digest, check_resources=check_resources)
+            candidate_neighbors, neighbors = scoped["candidate_neighbors"], scoped["neighbors"]
+            discovery_coverage = scoped["coverage"]
+            identity["discovery"] = scoped["scope_identity"]
+            identity.pop("digest", None)
+            identity["digest"] = _digest(identity)
+        else:
+            candidate_neighbors = _ranked_neighbors(ids, matrix, options=replace(options, neighbors=64, min_similarity=0.),
+                                                    embedding_identity=embedding_digest)
+            counts: dict[str, int] = defaultdict(int)
+            neighbors = []
+            for neighbor in candidate_neighbors:
+                sid = neighbor["source_id"]
+                if neighbor["score"] > options.min_similarity and counts[sid] < options.neighbors:
+                    neighbors.append({**neighbor, "provenance": dict(neighbor["provenance"])})
+                    counts[sid] += 1
+            # Explicit manual settings above 64 retain their historical graph policy.
+            if options.neighbors > 64:
+                neighbors = _ranked_neighbors(ids, matrix, options=options, embedding_identity=embedding_digest)
         if tuning["status"] == "awaiting_evaluation_gate" and options.clustering == "leiden":
             from .mapping_calibration import community_resolution_checks
             stability = community_resolution_checks(ids, neighbors, check_resources=check_resources)
@@ -703,6 +830,8 @@ def build_local_map(
                             **dict(phases), "total_seconds": time.monotonic() - started,
                             "input_text_bytes": total_bytes, "new_cache_bytes_upper_bound": writes},
                   "relationship_status": "derived_suggestions_only"}
+        if discovery_coverage is not None:
+            result["scope_discovery_coverage"] = discovery_coverage
         if before_commit:
             before_commit(result)
         serialized = _json(result) + "\n"

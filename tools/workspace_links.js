@@ -572,9 +572,21 @@ function finishIndex(index, typedRelations, relationLimit, metadata) {
         const chunks = (key) => Array.isArray(relation.provenance[key]) && relation.provenance[key].length <= 100000
           && relation.provenance[key].every((value) => typeof value === "string" && value.length > 0 && value.length <= 256);
         if (!chunks("source_chunk_ids") || !chunks("target_chunk_ids")) continue;
+        const scopeMetadata = {};
+        if (Object.hasOwn(relation.provenance, "discovery_scopes")) {
+          const scopes = relation.provenance.discovery_scopes;
+          if (!Array.isArray(scopes) || scopes.length < 1 || scopes.length > 2 || new Set(scopes).size !== scopes.length
+              || !scopes.every((scope) => ["within_collection", "whole_library"].includes(scope))) continue;
+          scopeMetadata.discovery_scopes = [...scopes].sort();
+        }
+        if (Object.hasOwn(relation.provenance, "shared_collection_keys")) {
+          const keys = relation.provenance.shared_collection_keys;
+          if (!Array.isArray(keys) || keys.length > 64 || !keys.every((key) => typeof key === "string" && key.length > 0 && key.length <= 256 && !/[\x00-\x1f]/.test(key))) continue;
+          scopeMetadata.shared_collection_keys = [...new Set(keys)].sort();
+        }
         Object.assign(value, { derived: true, decision_status: "suggested", accepted: false, evidence_backed: false, score: relation.score,
           provenance: { kind: "local_embedding_similarity", embedding_identity: index.semantic_map.identity_digest, accepted: false, evidence_backed: false,
-            source_chunk_ids: [...relation.provenance.source_chunk_ids], target_chunk_ids: [...relation.provenance.target_chunk_ids] } });
+            source_chunk_ids: [...relation.provenance.source_chunk_ids], target_chunk_ids: [...relation.provenance.target_chunk_ids], ...scopeMetadata } });
       }
       if (researchRelationTypes.has(relation.type) && relation.derived !== true) Object.assign(value, relationshipMetadata(relation, index, source.path, target.path));
       index.relations.push(value);

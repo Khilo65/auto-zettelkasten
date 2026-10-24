@@ -99,6 +99,38 @@ def test_legacy_and_paged_project_only_owned_suggestions_without_any_writes(mapp
     assert {str(path.relative_to(root)): path.read_bytes() for path in root.rglob("*") if path.is_file()} == before
 
 
+def test_scoped_projection_merges_duplicate_search_origins_without_promoting_relations(mapped):
+    _, service, workspace_id, payload, result = mapped
+    payload["neighbors"][0]["provenance"].update(discovery_scopes=["within_collection"], shared_collection_keys=["collection-synthetic"])
+    payload["neighbors"].append({"source_id": "source-b", "target_source_id": "source-a", "score": .75,
+                                 "provenance": {"source_chunk_ids": ["chunk-b"], "target_chunk_ids": ["chunk-a"],
+                                                "discovery_scopes": ["whole_library"], "shared_collection_keys": ["collection-synthetic"]}})
+    result.write_text(json.dumps(payload))
+    for snapshot in (service.index(workspace_id), _pages(service, workspace_id)):
+        derived = [row for row in snapshot["relations"] if row.get("derived")]
+        assert len(derived) == 1
+        assert derived[0]["provenance"]["discovery_scopes"] == ["whole_library", "within_collection"]
+        assert derived[0]["provenance"]["shared_collection_keys"] == ["collection-synthetic"]
+        assert derived[0]["accepted"] is False
+        assert snapshot["semantic_map"]["status"] == "current"
+
+
+@pytest.mark.parametrize("key,value", [
+    ("discovery_scopes", "within_collection"), ("discovery_scopes", []),
+    ("discovery_scopes", ["outside"]), ("discovery_scopes", ["whole_library", "whole_library"]),
+    ("discovery_scopes", [{}]), ("shared_collection_keys", "collection-synthetic"),
+    ("shared_collection_keys", ["bad\nkey"]), ("shared_collection_keys", ["x"] * 65),
+])
+def test_malformed_scope_metadata_never_enters_derived_graph_or_erases_accepted_links(mapped, key, value):
+    _, service, workspace_id, payload, result = mapped
+    payload["neighbors"][0]["provenance"][key] = value
+    result.write_text(json.dumps(payload))
+    for snapshot in (service.index(workspace_id), _pages(service, workspace_id)):
+        assert not [row for row in snapshot["relations"] if row.get("derived")]
+        assert {row["type"] for row in snapshot["relations"]} == {"supports", "cites"}
+        assert snapshot["semantic_map"]["status"] == "partial"
+
+
 @pytest.mark.parametrize("changed", ["note", "profile", "source_identity", "ambiguous_owner", "override"])
 def test_changed_inputs_or_ownership_remove_stale_derived_edges(mapped, changed):
     root, service, workspace_id, _, _ = mapped
@@ -182,7 +214,9 @@ def test_backend_results_flow_through_both_actual_javascript_graph_indexes(mappe
     node = shutil.which("node")
     if not node or not (repository / "node_modules/markdown-it").is_dir():
         pytest.skip("Node and installed web dependencies are required")
-    _, service, workspace_id, _, _ = mapped
+    _, service, workspace_id, payload, result = mapped
+    payload["neighbors"][0]["provenance"].update(discovery_scopes=["within_collection", "whole_library"], shared_collection_keys=["collection-synthetic"])
+    result.write_text(json.dumps(payload))
     snapshots = [service.index(workspace_id), _pages(service, workspace_id)]
     script = """
 import fs from 'node:fs';
@@ -201,6 +235,8 @@ console.log(JSON.stringify(output));
         assert len(graph["edges"]) == 1
         assert graph["edges"][0]["layer"] == "discovery"
         assert graph["edges"][0]["score"] == 0.75
+        assert graph["edges"][0]["provenance"]["discovery_scopes"] == ["whole_library", "within_collection"]
+        assert graph["edges"][0]["provenance"]["shared_collection_keys"] == ["collection-synthetic"]
         assert all(row["semantic_communities"] == [{"community_id": "semantic-pair", "algorithm": "leiden"}] for row in graph["nodes"])
 
 

@@ -111,6 +111,9 @@ def prepare_mapping_candidates(
         stats.update(returned_pairs=len(candidates), resolved_pair_count=len(resolved_pairs),
                      unexamined_candidate_pairs=max(0, progress["unexamined_count"] - len(candidates)),
                      selection_truncated=int(progress["unexamined_count"] > len(candidates)))
+        if stats.get("scope_balanced"):
+            stats.update(selected_within_collection=sum(row.get("comparison_scope") == "within_collection" for row in candidates),
+                         selected_whole_library=sum(row.get("comparison_scope") == "whole_library" for row in candidates))
     return {"candidates": candidates, "stats": stats, "queue": progress,
             "status": {**loaded["status"],
                        "decision_status": "unexamined", "all_pairs_examined": False,

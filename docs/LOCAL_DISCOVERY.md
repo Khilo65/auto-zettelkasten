@@ -41,6 +41,46 @@ resolve to their existing source note; ambiguous records remain unresolved.
 
 ## Prepare candidates or research context
 
+### Combine collection and library discovery from saved embeddings
+
+```sh
+auto-zettelkasten refresh-discovery --workspace /path/to/workspace \
+  --neighbors 8 --preview-decisions --max-pairs 256 --per-source-cap 8
+```
+
+This refresh uses checksummed saved vectors and current catalogue collection
+keys. It does not load an embedding model, acquire sources, regenerate notes,
+or contact Zotero. Missing or stale embedding inputs stop publication rather
+than trigger automatic regeneration. Its library scope is the sources in the
+saved map, not every item that may currently exist in Zotero.
+
+The neighbor allocation starts half within shared collections and half across
+the library, prioritizing external neighbors in the library lane. Unused slots
+can be filled from the remaining eligible neighbors. Overlapping collection
+memberships do not multiply the allocation, and unfiled notes remain eligible.
+Duplicate pairs are merged; similarity scores remain discovery suggestions.
+The wider candidate pool and comparison queue retain work for later passes.
+Endpoint and job caps allocate one pass, rather than limiting all future links.
+
+Leiden runs on the combined network, so communities may span collections. The
+graph's **Discovery scope** control filters suggestions by the search that
+found them. It leaves accepted relationships and citations intact. A pair found
+by both searches can appear in either filtered view. Collection folders still
+filter which notes are visible.
+
+`--preview-decisions` prepares the existing isolated-pair Jev packets with a
+zero spending allowance. The output separates a byte-based planning estimate
+from the pinned billing policy's conservative model-usage ceiling. Neither is
+a guaranteed invoice cap. This command has no paid-dispatch option. Explicit
+approval of the exact requests and a separate spending limit remain necessary
+before live decisions. Existing evidence-bound decisions can be reused when
+only discovery ranks or collection memberships change.
+
+For a regular mapping run, `--discovery-scope collection_and_library` enables
+the same scoped discovery policy. The historical `library` behavior remains
+the default. Reviewed calibration from a different discovery policy is not
+silently applied to the new route.
+
 ```sh
 auto-zettelkasten candidates --workspace /path/to/workspace \
   --instance-id my-zotero-desktop --library-id 0 --max-pairs 128 > /path/to/shortlist.json
