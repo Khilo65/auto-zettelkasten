@@ -49,7 +49,7 @@ function viewportCode(x, y, width, height, margin) {
 }
 
 // Cytoscape retains topology and target coordinates; this view owns screen-space painting and input.
-export function createGraphView(graph, { container, labels = true, colorBy = "none", dark, communityScale = "default", regions = false } = {}) {
+export function createGraphView(graph, { container, labels = true, colorBy = "none", dark, communityScale = "default", communityPalette = {}, regions = false } = {}) {
   const win = container?.ownerDocument?.defaultView;
   if (!win || typeof win.CanvasRenderingContext2D !== "function") return null;
   const canvas = container.ownerDocument.createElement("canvas");
@@ -155,7 +155,7 @@ export function createGraphView(graph, { container, labels = true, colorBy = "no
     node.current = data.current === "yes"; node.missing = Boolean(data.missing) || node.model.hasClass("missing");
     node.selected = node.model.selected(); node.dimmed = node.model.hasClass("dimmed");
     node.neighbor = node.model.hasClass("neighbor"); node.modelHovered = node.model.hasClass("hovered");
-    node.appearance = graphNodeAppearance(data, { colorBy, dark: isDark(), communityScale });
+    node.appearance = graphNodeAppearance(data, { colorBy, dark: isDark(), communityScale, communityPalette });
   }
 
   function syncScene(time) {
@@ -272,7 +272,7 @@ export function createGraphView(graph, { container, labels = true, colorBy = "no
         const membership = graphCommunityMembership(node.model.data(), communityScale);
         if (!membership) continue;
         let group = groups.get(membership.community_id);
-        if (!group) { group = { nodes: [], appearance: graphNodeAppearance(node.model.data(), { colorBy: "community", dark: isDark(), communityScale }) }; groups.set(membership.community_id, group); }
+        if (!group) { group = { nodes: [], appearance: graphNodeAppearance(node.model.data(), { colorBy: "community", dark: isDark(), communityScale, communityPalette }) }; groups.set(membership.community_id, group); }
         group.nodes.push(node);
       }
       regionHulls = [...groups.values()].map((group) => ({ ...group, hull: communityHull(group.nodes) }));
@@ -499,6 +499,7 @@ export function createGraphView(graph, { container, labels = true, colorBy = "no
     if (Object.hasOwn(options, "colorBy")) colorBy = normalizeGraphPreferences({ colorBy: options.colorBy }).colorBy;
     if (Object.hasOwn(options, "dark")) explicitDark = typeof options.dark === "boolean" ? options.dark : null;
     if (["broad", "default", "fine"].includes(options.communityScale)) communityScale = options.communityScale;
+    if (Object.hasOwn(options, "communityPalette")) communityPalette = options.communityPalette || {};
     if (typeof options.regions === "boolean") regions = options.regions;
     dataChanged();
   }
@@ -533,5 +534,5 @@ export function createGraphView(graph, { container, labels = true, colorBy = "no
     if (container.style.position === "relative" && previousPosition !== "relative") container.style.position = previousPosition;
   }
   resize(); requestDraw();
-  return { setOptions(options) { if (typeof options?.labels === "boolean") { labels = options.labels; requestDraw(); } if (options && (Object.hasOwn(options, "colorBy") || Object.hasOwn(options, "dark") || Object.hasOwn(options, "regions") || Object.hasOwn(options, "communityScale"))) setAppearance(options); }, setAppearance, resize, zoomBy, destroy };
+  return { setOptions(options) { if (typeof options?.labels === "boolean") { labels = options.labels; requestDraw(); } if (options && (Object.hasOwn(options, "colorBy") || Object.hasOwn(options, "dark") || Object.hasOwn(options, "regions") || Object.hasOwn(options, "communityScale") || Object.hasOwn(options, "communityPalette"))) setAppearance(options); }, setAppearance, resize, zoomBy, destroy };
 }

@@ -942,7 +942,7 @@
       if (noiseCount) graphControl(mode, "counts").textContent += ` · ${noiseCount} saved density-noise sources`;
     }
     if (!local) { el("workspace-save-state").textContent = "Graph view"; el("workspace-counts").textContent = graphControl(mode, "counts").textContent; }
-    const appearance = { colorBy: state.graphPreferences.colorBy, dark: graphIsDark(), communityScale, regions: graphControl(mode, "community-regions").checked };
+    const appearance = { colorBy: state.graphPreferences.colorBy, dark: graphIsDark(), communityScale, communityPalette: kit.graphCommunityPalette(data.semantic_map, communityScale), regions: graphControl(mode, "community-regions").checked };
     renderGraphColorLegend(mode, data.nodes, appearance);
     const signature = JSON.stringify(data);
     const dataChanged = signature !== state.graphSignatures.get(mode);

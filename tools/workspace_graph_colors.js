@@ -1,11 +1,64 @@
 const originLabels = Object.freeze({ managed: "Managed sources", personal: "Verified personal", unknown: "Other or unknown" });
 const colorModes = new Set(["none", "origin", "community"]);
-// Fixed categorical colors are keyed by identity, never by visible order or layout.
-const communityHues = [255, 180, 80, 330, 20, 295, 125, 50, 220, 65, 350, 145];
-const communityColors = Object.freeze({
-  light: communityHues.map((hue) => `oklch(55% 0.12 ${hue})`),
-  dark: communityHues.map((hue) => `oklch(80% 0.12 ${hue})`),
+const originColors = Object.freeze({
+  light: ["oklch(55% 0.12 255)", "oklch(55% 0.12 180)"],
+  dark: ["oklch(80% 0.12 255)", "oklch(80% 0.12 180)"],
 });
+// Paired light/dark OKLCH samples, inside sRGB in both themes. After the first
+// categorical hues, maximize the minimum OKLab distance in either theme.
+// Precomputed so larger maps do not run a color-space search while painting.
+const communityColors = [
+  [54,0.12,78,0.12,245], [54,0.12,78,0.12,30], [54,0.16,78,0.16,145], [54,0.16,78,0.16,330],
+  [66,0.12,66,0.12,70], [42,0.08,90,0.08,100], [66,0.16,66,0.16,290], [66,0.08,66,0.08,185],
+  [66,0.16,66,0.16,0], [42,0.08,90,0.08,325], [66,0.16,66,0.16,125], [66,0.16,66,0.16,245],
+  [48,0.08,84,0.08,185], [54,0.08,78,0.08,100], [60,0.08,72,0.08,310], [66,0.16,66,0.16,325],
+  [66,0.16,66,0.16,35], [48,0.08,84,0.08,280], [66,0.08,66,0.08,265], [66,0.08,66,0.08,15],
+  [48,0.08,84,0.08,55], [48,0.12,84,0.12,125], [66,0.16,66,0.16,155], [66,0.08,66,0.08,115],
+  [60,0.08,72,0.08,225], [54,0.08,78,0.08,350], [60,0.08,72,0.08,50], [60,0.08,72,0.08,150],
+  [54,0.12,78,0.12,295], [48,0.12,84,0.12,335], [60,0.12,72,0.12,5], [60,0.16,72,0.16,310],
+  [60,0.12,72,0.12,90], [42,0.08,90,0.08,155], [60,0.12,72,0.12,270], [66,0.12,66,0.12,220],
+  [54,0.12,78,0.12,65], [60,0.16,72,0.16,340], [60,0.16,72,0.16,45], [60,0.16,72,0.16,135],
+  [54,0.08,78,0.08,205], [48,0.08,84,0.08,5], [66,0.08,66,0.08,325], [48,0.08,84,0.08,230],
+  [54,0.08,78,0.08,160], [48,0.08,84,0.08,100], [54,0.12,78,0.12,125], [54,0.08,78,0.08,270],
+  [66,0.16,66,0.16,270], [60,0.16,72,0.16,25], [60,0.12,72,0.12,120], [66,0.16,66,0.16,55],
+  [66,0.12,66,0.12,140], [66,0.12,66,0.12,345], [48,0.08,84,0.08,145], [66,0.12,66,0.12,305],
+  [66,0.12,66,0.12,95], [60,0.12,72,0.12,245], [60,0.08,72,0.08,345], [48,0.08,84,0.08,315],
+  [54,0.08,78,0.08,315], [66,0.08,66,0.08,50], [60,0.08,72,0.08,185], [54,0.12,78,0.12,5],
+  [54,0.08,78,0.08,50], [60,0.12,72,0.12,65], [60,0.12,72,0.12,165], [60,0.12,72,0.12,325],
+  [60,0.08,72,0.08,105], [66,0.12,66,0.12,170], [60,0.12,72,0.12,295], [60,0.12,72,0.12,35],
+  [66,0.12,66,0.12,280], [66,0.08,66,0.08,150], [66,0.12,66,0.12,25], [60,0.08,72,0.08,260],
+  [54,0.12,78,0.12,340], [66,0.12,66,0.12,255], [66,0.08,66,0.08,230], [54,0.12,78,0.12,150],
+  [60,0.16,72,0.16,0], [54,0.16,78,0.16,345], [66,0.16,66,0.16,340], [60,0.16,72,0.16,150],
+  [66,0.16,66,0.16,15], [54,0.16,78,0.16,315], [66,0.16,66,0.16,310], [60,0.12,72,0.12,140],
+  [66,0.12,66,0.12,5], [54,0.08,78,0.08,20], [60,0.08,72,0.08,20], [66,0.08,66,0.08,80],
+  [54,0.08,78,0.08,235], [66,0.08,66,0.08,295], [66,0.12,66,0.12,45], [48,0.12,84,0.12,150],
+  [54,0.12,78,0.12,320], [66,0.12,66,0.12,120], [54,0.08,78,0.08,130], [60,0.16,72,0.16,325],
+  [66,0.16,66,0.16,140], [60,0.16,72,0.16,295], [60,0.12,72,0.12,345], [66,0.12,66,0.12,325],
+  [42,0.12,90,0.1,135], [60,0.08,72,0.08,80], [66,0.08,66,0.08,350], [42,0.08,90,0.08,75],
+  [54,0.08,78,0.08,75], [48,0.08,84,0.08,30], [48,0.08,84,0.08,340], [48,0.08,84,0.08,255],
+  [60,0.08,72,0.08,285], [66,0.12,66,0.12,240], [48,0.12,84,0.12,320], [66,0.12,66,0.12,155],
+  [54,0.12,78,0.12,50], [60,0.12,72,0.12,50], [60,0.12,72,0.12,20], [60,0.12,72,0.12,105],
+  [60,0.12,72,0.12,310], [60,0.16,72,0.16,15], [66,0.16,66,0.16,25], [60,0.16,72,0.16,35],
+  [66,0.16,66,0.16,45], [66,0.16,66,0.16,255], [66,0.16,66,0.16,280], [60,0.16,72,0.16,350],
+];
+
+function communityColor(index, dark) {
+  const [lightL, lightC, darkL, darkC, baseHue] = communityColors[index % communityColors.length];
+  // Beyond the base palette, hue rotation extends colors without guaranteeing separation.
+  const hue = (baseHue + Math.floor(index / communityColors.length) * 137.508) % 360;
+  const lightness = dark ? darkL : lightL, chroma = dark ? darkC : lightC;
+  return `oklch(${lightness}% ${chroma} ${Number(hue.toFixed(3))})`;
+}
+
+export function graphCommunityPalette(semanticMap, scale = "default") {
+  if (!semanticMap || ["stale", "unavailable"].includes(semanticMap.status)) return {};
+  const view = (Array.isArray(semanticMap.community_scales) ? semanticMap.community_scales : []).find((row) => row?.scale === scale);
+  const rows = view?.communities || (scale === "default" ? semanticMap.communities : []);
+  const ids = new Set((Array.isArray(rows) ? rows : []).filter((row) => row?.algorithm === "leiden" && !row.noise
+    && typeof row.community_id === "string" && /^[A-Za-z0-9._:-]{1,256}$/.test(row.community_id)).map((row) => row.community_id));
+  // Use the complete saved scale, not visible nodes: filtering/focus must not recolor it.
+  return Object.fromEntries([...ids].sort().map((id, index) => [id, index]));
+}
 
 export function graphNodeOrigin(node) {
   return node && !node.missing && Object.hasOwn(node, "note_origin") && ["managed", "personal"].includes(node.note_origin) ? node.note_origin : "unknown";
@@ -33,19 +86,20 @@ function hashIdentity(value) {
   return hash >>> 0;
 }
 
-export function graphNodeAppearance(node, { colorBy = "none", dark = false, communityScale = "default" } = {}) {
+export function graphNodeAppearance(node, { colorBy = "none", dark = false, communityScale = "default", communityPalette = {} } = {}) {
   const neutral = dark ? "oklch(78% 0.012 290)" : "oklch(52% 0.012 290)";
   if (colorBy === "origin") {
     const origin = graphNodeOrigin(node);
-    const palette = communityColors[dark ? "dark" : "light"];
+    const palette = originColors[dark ? "dark" : "light"];
     const colors = { managed: palette[0], personal: palette[1], unknown: neutral };
     return { key: `origin:${origin}`, label: originLabels[origin], color: colors[origin] };
   }
   if (colorBy === "community") {
     const membership = graphCommunityMembership(node, communityScale), identity = membership?.community_id;
     if (!identity) return { key: "community:unassigned", label: "Unassigned or unavailable", color: neutral };
-    const palette = communityColors[dark ? "dark" : "light"];
-    return { key: `community:${identity}`, label: typeof membership.display_label === "string" && membership.display_label.trim() ? membership.display_label.trim().slice(0, 160) : `Community ${identity.replace(/^semantic-/, "").slice(0, 8)}`, color: palette[hashIdentity(identity) % palette.length] };
+    const assigned = communityPalette && Object.hasOwn(communityPalette, identity) ? communityPalette[identity] : undefined;
+    const index = Number.isSafeInteger(assigned) && assigned >= 0 ? assigned : hashIdentity(identity);
+    return { key: `community:${identity}`, label: typeof membership.display_label === "string" && membership.display_label.trim() ? membership.display_label.trim().slice(0, 160) : `Community ${identity.replace(/^semantic-/, "").slice(0, 8)}`, color: communityColor(index, dark) };
   }
   return { key: "none", label: "Notes", color: neutral };
 }

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import cytoscape from "cytoscape";
 import { JSDOM } from "jsdom";
-import { filterGraphOrigins, graphLegend, graphNodeAppearance, graphNodeOrigin, normalizeGraphPreferences } from "../../tools/workspace_graph_colors.js";
+import { filterGraphOrigins, graphCommunityPalette, graphLegend, graphNodeAppearance, graphNodeOrigin, normalizeGraphPreferences } from "../../tools/workspace_graph_colors.js";
 import { buildLibraryIndex, buildLinkIndex, graphData, parseLibraryDocument } from "../../tools/workspace_links.js";
 import { createGraphView } from "../../tools/workspace_graph_view.js";
 
@@ -72,6 +72,52 @@ test("Community colors remain deterministic across ordering, filtering, serializ
   assert.notEqual(graphNodeAppearance(first, { colorBy: "community", dark: false }).color, graphNodeAppearance(first, { colorBy: "community", dark: true }).color);
 });
 
+test("Saved community palettes avoid color collisions and survive filtered views at every scale", () => {
+  const communities = Array.from({ length: 96 }, (_, index) => ({ community_id: `semantic-${String(index).padStart(3, "0")}`, algorithm: "leiden" }));
+  const semantic = { status: "current", communities, community_scales: [
+    { scale: "default", communities }, { scale: "fine", communities: communities.slice(24) },
+  ] };
+  const before = JSON.stringify(semantic), palette = graphCommunityPalette(semantic);
+  assert.deepEqual(graphCommunityPalette({ ...semantic, community_scales: [{ scale: "default", communities: [...communities].reverse() }] }), palette);
+  const nodes = communities.map((row) => ({ semantic_communities: [row] }));
+  for (const dark of [false, true]) {
+    const options = { colorBy: "community", dark, communityPalette: palette };
+    const colors = nodes.map((node) => graphNodeAppearance(node, options).color);
+    assert.equal(new Set(colors).size, 96, "Different communities must not hash into the same twelve colors");
+    assert.ok(new Set(colors.slice(0, 24).map((color) => /oklch\((\d+)%/.exec(color)[1])).size > 1, "Larger maps also vary lightness");
+    const focused = graphLegend([nodes[51], nodes[3]], options);
+    assert.equal(focused.find((entry) => entry.key.endsWith(communities[51].community_id)).color, colors[51]);
+    assert.equal(graphNodeAppearance(nodes[3], { ...options, communityPalette: JSON.parse(JSON.stringify(palette)) }).color, colors[3]);
+  }
+  assert.equal(Object.keys(graphCommunityPalette(semantic, "fine")).length, 72);
+  assert.deepEqual(graphCommunityPalette({ ...semantic, status: "unavailable" }), {});
+  assert.deepEqual(graphCommunityPalette({ communities: [{ ...membership, noise: true }, { ...membership, community_id: "<script>" }] }), {});
+  assert.equal(JSON.stringify(semantic), before);
+});
+
+test("Larger community palettes maintain perceptual separation in both themes without gamut clipping", () => {
+  const communities = Array.from({ length: 128 }, (_, index) => ({ community_id: `semantic-${String(index).padStart(3, "0")}`, algorithm: "leiden" }));
+  const communityPalette = graphCommunityPalette({ communities });
+  for (const dark of [false, true]) {
+    const colors = communities.map((row) => {
+      const color = graphNodeAppearance({ semantic_communities: [row] }, { colorBy: "community", dark, communityPalette }).color;
+      const [, l, c, h] = /^oklch\(([\d.]+)% ([\d.]+) ([\d.]+)\)$/.exec(color);
+      const angle = Number(h) * Math.PI / 180, L = Number(l) / 100, a = Number(c) * Math.cos(angle), b = Number(c) * Math.sin(angle);
+      const x = (L + .3963377774 * a + .2158037573 * b) ** 3;
+      const y = (L - .1055613458 * a - .0638541728 * b) ** 3;
+      const z = (L - .0894841775 * a - 1.291485548 * b) ** 3;
+      const rgb = [4.0767416621 * x - 3.3077115913 * y + .2309699292 * z,
+        -1.2684380046 * x + 2.6097574011 * y - .3413193965 * z, -.0041960863 * x - .7034186147 * y + 1.707614701 * z];
+      assert.ok(rgb.every((value) => value >= -.00001 && value <= 1.00001), `${color} stays within sRGB`);
+      return [L, a, b];
+    });
+    for (let left = 0; left < colors.length; left++) for (let right = 0; right < left; right++) {
+      const distance = Math.hypot(...colors[left].map((value, index) => value - colors[right][index]));
+      assert.ok(distance > (left < 24 ? .08 : left < 96 ? .04 : .027), `Communities ${left} and ${right} should remain separated in ${dark ? "dark" : "light"} mode`);
+    }
+  }
+});
+
 test("Unassigned, stale, missing and density noise stay neutral without erasing another source's current Leiden membership", () => {
   const neutral = graphNodeAppearance({}, { colorBy: "community" });
   for (const node of [{}, { semantic_stale: true, semantic_communities: [membership] }, { semantic_status: "unavailable", semantic_communities: [membership] },
@@ -118,8 +164,9 @@ test("Canvas recoloring and selection use the shared resolver, preserve fills an
   const position = { ...node.position() }, pan = { ...app.graph.pan() }, zoom = app.graph.zoom();
   let layouts = 0; app.graph.on("layoutstart", () => layouts++);
   for (const colorBy of ["origin", "community", "none"]) for (const dark of [false, true]) {
-    app.view.setAppearance({ colorBy, dark }); app.settle();
-    const expected = graphNodeAppearance(node.data(), { colorBy, dark }).color;
+    const communityPalette = { [membership.community_id]: dark ? 2 : 1 };
+    app.view.setAppearance({ colorBy, dark, communityPalette }); app.settle();
+    const expected = graphNodeAppearance(node.data(), { colorBy, dark, communityPalette }).color;
     assert.equal(app.frames.at(-1).fills[0].color, expected);
     node.select(); node.data("current", "yes"); node.addClass("hovered neighbor"); app.settle();
     assert.equal(app.frames.at(-1).fills[0].color, expected);

@@ -157,7 +157,7 @@ test("Recoloring and theme changes reuse positions, viewport and topology withou
   app.w.document.documentElement.dataset.theme = "dark";
   await until(() => app.views.get(graph).appearance.at(-1).dark, "Dark graph palette applied");
   assert.notEqual(node.data("graph_color"), light);
-  assert.equal(node.data("graph_color"), app.kit.graphNodeAppearance(node.data(), { colorBy: "community", dark: true }).color);
+  assert.equal(node.data("graph_color"), app.kit.graphNodeAppearance(node.data(), { colorBy: "community", dark: true, communityPalette: app.views.get(graph).appearance.at(-1).communityPalette }).color);
   assert.equal(app.layouts.length, layouts);
   const row = app.el("global-graph-list").querySelector("button");
   assert.match(row.textContent, /Community/);
