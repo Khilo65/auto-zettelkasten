@@ -324,3 +324,41 @@ def test_nesting_cap_conservatively_counts_root_container_as_first_level():
     payload["state"] = {"extra": payload["state"]}
     with pytest.raises(BillingAdmissionError, match="64-level"):
         billing_admission(payload)
+
+
+def test_historical_billing_contracts_require_explicit_old_template_and_keep_bounds():
+    from auto_zettelkasten.jev_billing import (
+        HISTORICAL_STANDARD_BILLING_POLICY_V3, HISTORICAL_BATCH_BILLING_POLICY_V2,
+        BATCH_BILLING_POLICY, batch_billing_admission,
+    )
+    payload = {"model": "jev-1.13.0", "state": {"synthetic": True},
+               "questions": {"relationship": {"type": "choice", "instructions": "Choose using synthetic evidence.",
+                                               "criteria": {"none": "No connection", "related": "Related"}}}}
+    for old, current, admit in [
+        (HISTORICAL_STANDARD_BILLING_POLICY_V3, STANDARD_BILLING_POLICY, billing_admission),
+        (HISTORICAL_BATCH_BILLING_POLICY_V2, BATCH_BILLING_POLICY, batch_billing_admission),
+    ]:
+        assert old.identity != current.identity
+        assert old.template_version != current.template_version
+        assert old.model == current.model == "jev-1.13.0"
+        assert old.input_token_ceiling == current.input_token_ceiling == 65_536
+        assert old.max_wire_bytes == current.max_wire_bytes == 65_536
+        assert old.input_usd_per_token == current.input_usd_per_token == Decimal("0.000000042")
+        with pytest.raises(BillingAdmissionError, match="template"):
+            admit(payload, policy=old)
+        admission = admit(payload, policy=old, template_version=old.template_version)
+        assert admission.max_model_usage_usd == Decimal("0.002752512")
+
+
+def test_previous_billing_approval_does_not_dispatch_new_recall_request(tmp_path):
+    from auto_zettelkasten.jev_billing import HISTORICAL_STANDARD_BILLING_POLICY_V3
+    request = _request()
+    client = jd.JevDecisionClient(
+        _approved(request, approved_billing_policy_identity=HISTORICAL_STANDARD_BILLING_POLICY_V3.identity),
+        _store(tmp_path), transport=lambda *_a, **_kw: pytest.fail("old approval must not dispatch new rubric"),
+    )
+    result = client.assess(request, dry_run=False)
+    assert result["status"] == "blocked"
+    assert result["provider_calls"] == 0
+    with client.store._connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM reservations").fetchone()[0] == 0

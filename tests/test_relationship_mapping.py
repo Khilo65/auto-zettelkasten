@@ -239,3 +239,38 @@ def test_candidate_resource_bound_reports_unfinished_without_dispatch(notes, mon
     result = run_relationship_mapping(root, [], options={"backend": "jev", "dry_run": False})
     assert result["status"] == "partial" and result["coverage_partial"]
     assert result["candidate_queue"]["unfinished"] and result["provider_calls"] == 0
+
+
+def test_runtime_packet_selects_method_evidence_as_a_verbatim_span(notes):
+    root, rows = notes
+    endpoint = load_decision_endpoints(root, rows)["endpoints"]["source-a"]
+    passage = endpoint.passages[0]
+    assert "Institutions condition election risks." in passage.text
+    assert "Observational evidence." in passage.text
+    assert "## Method and Research Design" in passage.text
+    lines = (root / rows[0]["note_path"]).read_text().splitlines(keepends=True)
+    selected = "".join(lines[passage.locator["line_start"] - 1:passage.locator["line_end"]]).rstrip("\r\n")
+    assert selected == passage.text
+
+
+def test_runtime_packet_accepts_genuine_abstract_with_legacy_context_flag(notes):
+    root, rows = notes
+    path = root / rows[0]["note_path"]
+    path.write_text("---\nsource_id: source-a\nnote_id: note-a\nsource_scope: abstract_only\n---\n# a\n\n## Abstract\n\nA substantive abstract about institutions and growth.\n")
+    save_profile(root / "02_source_memory/profiles", EvidenceProfile(
+        source_id="source-a", note_id="note-a", evidence_eligibility="context_only",
+        context={"note_path": rows[0]["note_path"], "source_scope": "abstract_only"}))
+    loaded = load_decision_endpoints(root, rows[:1])
+    assert loaded["excluded"] == []
+    endpoint = loaded["endpoints"]["source-a"]
+    assert endpoint.coverage["source_scope"] == "abstract_only"
+    assert endpoint.passages[0].locator["heading"] == "Abstract"
+    assert endpoint.passages[0].text == "A substantive abstract about institutions and growth."
+
+
+def test_runtime_packet_excludes_explicit_metadata_only(notes):
+    root, rows = notes
+    rows[0]["source_scope"] = "metadata_only"
+    loaded = load_decision_endpoints(root, rows[:1])
+    assert loaded["endpoints"] == {}
+    assert loaded["excluded"] == [{"source_id": "source-a", "reason": "metadata_only_evidence"}]

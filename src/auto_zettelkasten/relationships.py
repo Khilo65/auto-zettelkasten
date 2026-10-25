@@ -36,6 +36,8 @@ SUBSTANTIVE_RELATION_TYPES = frozenset(
         "sequential_relationship",
         "interpretive_or_normative_disagreement",
         "contextual_connection",
+        "methodological_comparison",
+        "potential_research_resource",
     }
 )
 RECIPROCAL_RELATION_TYPES = {
@@ -51,6 +53,8 @@ RECIPROCAL_RELATION_TYPES = {
     "sequential_relationship": "sequential_relationship",
     "interpretive_or_normative_disagreement": "interpretive_or_normative_disagreement",
     "contextual_connection": "contextual_connection",
+    "methodological_comparison": "methodological_comparison",
+    "potential_research_resource": "has_potential_research_resource",
 }
 RELATIONSHIP_PROJECTION_LABELS = {
     "supports": ("supports", "supported by"),
@@ -74,6 +78,14 @@ RELATIONSHIP_PROJECTION_LABELS = {
         "is contextually connected to",
         "is contextually connected to",
     ),
+    "methodological_comparison": (
+        "offers a methodological comparison with",
+        "offers a methodological comparison with",
+    ),
+    "potential_research_resource": (
+        "may be a research resource for",
+        "has a potential research resource in",
+    ),
 }
 SYMMETRIC_RELATION_TYPES = frozenset(
     {
@@ -83,6 +95,7 @@ SYMMETRIC_RELATION_TYPES = frozenset(
         "methodological_fault_line",
         "interpretive_or_normative_disagreement",
         "contextual_connection",
+        "methodological_comparison",
     }
 )
 _LIMITED_STATUSES = {
@@ -2764,7 +2777,10 @@ def _final_jev_relation(row: Mapping[str, Any]) -> bool:
     return bool(
         _final_jev_decision(row, decision="accepted")
         and _structurally_valid_relationship_row(row)
-        and row.get("relation_type") in {"supports", "undermines", "qualifies", "extends", "complements", "contrasts"}
+        and row.get("relation_type") in {
+            "supports", "undermines", "qualifies", "extends", "complements", "contrasts",
+            "contextual_connection", "methodological_comparison", "potential_research_resource",
+        }
         and isinstance(row.get("selected_evidence"), list)
         and len(row["selected_evidence"]) == 2
     )

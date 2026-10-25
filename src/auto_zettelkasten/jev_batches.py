@@ -28,7 +28,7 @@ from .jev_decisions import (
 )
 
 
-BATCH_RESULT_SCHEMA = "jev-batch-result-v2"
+BATCH_RESULT_SCHEMA = "jev-batch-result-v3"
 MAX_PAIRS = 3
 MAX_CONTEXT_NOTES = 4
 

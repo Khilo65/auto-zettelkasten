@@ -141,21 +141,33 @@ def load_decision_endpoints(workspace: Path | str, rows: Sequence[Mapping[str, A
                          "profile_path": str(profile_path.relative_to(root)),
                          "profile_file_sha256": hashlib.sha256(profile_raw).hexdigest()}
         profiles.append(profile)
-        thesis = _section(text, "Thesis")
-        if not thesis:
-            excluded.append({"source_id": sid, "reason": "missing_substantive_thesis"})
+        scope = str(row.get("source_scope") or front.get("source_scope") or stored_front.get("source_scope")
+                    or (profile.context or {}).get("source_scope") or "note_only")
+        if "metadata" in scope.casefold() or profile.evidence_eligibility == "metadata_only":
+            excluded.append({"source_id": sid, "reason": "metadata_only_evidence"})
             continue
+        heading = "Thesis" if _section(text, "Thesis") else "Abstract"
+        primary = _section(text, heading)
+        if not primary:
+            excluded.append({"source_id": sid, "reason": "missing_substantive_evidence"})
+            continue
+        # Keep one verbatim span so methods are selected evidence, not merely context.
+        end_line = primary[1] + len(primary[0].splitlines()) - 1
+        method = _section(text, "Method and Research Design") if heading == "Thesis" else None
+        if method and method[1] > primary[1]:
+            end_line = method[1] + len(method[0].splitlines()) - 1
+        evidence = "".join(text.splitlines(keepends=True)[primary[1] - 1:end_line]).rstrip("\r\n")
         parts = []
-        for heading in ("Thesis", "Method and Research Design", "Limitations"):
-            section = _section(text, heading)
+        for heading_name in (heading, "Method and Research Design", "Limitations"):
+            section = _section(text, heading_name)
             if section:
-                parts.append(f"## {heading}\n{section[0]}")
+                parts.append(f"## {heading_name}\n{section[0]}")
         title = str(row.get("title") or nid)
         context = f"# {title}\nExisting note summary; no original document is supplied.\n\n" + "\n\n".join(parts)
-        if len(context.encode("utf-8")) > 16_000 or len(thesis[0].encode("utf-8")) > 24_000:
+        if len(context.encode("utf-8")) > 16_000 or len(evidence.encode("utf-8")) > 24_000:
             excluded.append({"source_id": sid, "reason": "selected_note_context_exceeds_bound"})
             continue
-        coverage = {"source_scope": row.get("source_scope", "note_only"),
+        coverage = {"source_scope": "abstract_only" if heading == "Abstract" else scope,
                     "evidence_basis": "existing_note_summary", "original_document_locator_verified": False,
                     "evidence_eligibility": profile.evidence_eligibility}
         ownership = {"attribution": "existing_source_note", "original_source_ownership_verified": False}
@@ -168,12 +180,12 @@ def load_decision_endpoints(workspace: Path | str, rows: Sequence[Mapping[str, A
                     if origin[name] or name not in ownership:
                         ownership[name] = origin[name]
         passage = EvidencePassage(
-            passage_id=f"{nid}-thesis", text=thesis[0],
+            passage_id=f"{nid}-recall-span", text=evidence,
             locator={"kind": "note_lines", "note_id": nid, "note_relative_path": str(path.relative_to(root)),
-                     "heading": "Thesis", "line_start": thesis[1], "line_end": thesis[1] + len(thesis[0].splitlines()) - 1,
+                     "heading": heading, "line_start": primary[1], "line_end": end_line,
                      "original_document_locator_verified": False},
             attribution="Existing generated note summary; not an original-publication quotation.",
-            content_sha256=hashlib.sha256(thesis[0].encode()).hexdigest(),
+            content_sha256=hashlib.sha256(evidence.encode()).hexdigest(),
         )
         endpoint = Endpoint(sid, nid, context, coverage, ownership, (passage,))
         endpoint.validate()

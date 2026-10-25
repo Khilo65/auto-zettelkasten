@@ -16,7 +16,7 @@ from typing import Any
 
 SYSTEM_ONE_URL = "https://api.typesafe.ai/v1/systemone"
 MODEL_ID = "jev-1.13.0"
-TEMPLATE_VERSION = "relationship-decision-v3"
+TEMPLATE_VERSION = "relationship-decision-v4"
 INPUT_USD_PER_TOKEN = Decimal("0.000000042")
 # Covers either the decimal or binary reading of the documented 64k ceiling.
 STANDARD_INPUT_TOKEN_CEILING = 65_536
@@ -42,7 +42,7 @@ class BillingPolicy:
 
 
 STANDARD_BILLING_POLICY = BillingPolicy(
-    identity="typesafe-jev-1.13.0-standard-context-usd-20261022-v2",
+    identity="typesafe-jev-1.13.0-standard-context-usd-20261022-v3",
     model=MODEL_ID,
     template_version=TEMPLATE_VERSION,
     input_usd_per_token=INPUT_USD_PER_TOKEN,
@@ -57,11 +57,23 @@ STANDARD_BILLING_POLICY = BillingPolicy(
 )
 
 # A separate contract preserves historical single-pair admission and replay.
-BATCH_TEMPLATE_VERSION = "relationship-batch-v2"
+BATCH_TEMPLATE_VERSION = "relationship-batch-v3"
 BATCH_BILLING_POLICY = replace(
     STANDARD_BILLING_POLICY,
-    identity="typesafe-jev-1.13.0-standard-batch-usd-20261022-v2",
+    identity="typesafe-jev-1.13.0-standard-batch-usd-20261022-v3",
     template_version=BATCH_TEMPLATE_VERSION,
+)
+
+
+HISTORICAL_STANDARD_BILLING_POLICY_V3 = replace(
+    STANDARD_BILLING_POLICY,
+    identity="typesafe-jev-1.13.0-standard-context-usd-20261022-v2",
+    template_version="relationship-decision-v3",
+)
+HISTORICAL_BATCH_BILLING_POLICY_V2 = replace(
+    BATCH_BILLING_POLICY,
+    identity="typesafe-jev-1.13.0-standard-batch-usd-20261022-v2",
+    template_version="relationship-batch-v2",
 )
 
 
@@ -93,7 +105,7 @@ class BillingAdmission:
             "source_urls": list(self.policy.sources),
             "assumptions": [
                 ("Pinned jev-1.13.0 standard text endpoint and at most three Choice questions."
-                 if self.policy == BATCH_BILLING_POLICY else
+                 if self.policy in (BATCH_BILLING_POLICY, HISTORICAL_BATCH_BILLING_POLICY_V2) else
                  "Pinned jev-1.13.0 standard text endpoint and one Choice question."),
                 "No long-context or other danger-zone header, retries, or fallback model.",
                 "Published input-only USD price and standard context contract remain applicable.",
@@ -120,7 +132,7 @@ def billing_admission(
             or not policy.input_usd_per_token.is_finite()
             or type(policy.input_token_ceiling) is not int
             or type(policy.max_wire_bytes) is not int
-            or policy != STANDARD_BILLING_POLICY):
+            or policy not in (STANDARD_BILLING_POLICY, HISTORICAL_STANDARD_BILLING_POLICY_V3)):
         raise BillingAdmissionError("a supported pinned pricing and context policy is required")
     if endpoint != SYSTEM_ONE_URL:
         raise BillingAdmissionError("billing admission requires the pinned System One endpoint")
@@ -172,9 +184,9 @@ def batch_billing_admission(
             or not policy.input_usd_per_token.is_finite()
             or type(policy.input_token_ceiling) is not int
             or type(policy.max_wire_bytes) is not int
-            or policy != BATCH_BILLING_POLICY):
+            or policy not in (BATCH_BILLING_POLICY, HISTORICAL_BATCH_BILLING_POLICY_V2)):
         raise BillingAdmissionError("a supported pinned batch billing policy is required")
-    if endpoint != SYSTEM_ONE_URL or template_version != BATCH_TEMPLATE_VERSION:
+    if endpoint != SYSTEM_ONE_URL or template_version != policy.template_version:
         raise BillingAdmissionError("batch billing requires the pinned endpoint and template")
     if headers is not None:
         if not isinstance(headers, Mapping) or any(

@@ -69,9 +69,9 @@ identities, exact note and evidence text hashes, locators, coverage, ownership,
 model, template, question criteria, their order, and relevant request options.
 The passage ID `none` is reserved and rejected at input validation.
 
-## Typed decision template v3
+## Typed decision template v4
 
-The application supplies `relationship-decision-v3`. Each choice includes a
+The application supplies `relationship-decision-v4`. Each choice includes a
 relation, its direction, and one exact passage from each endpoint. This keeps
 all three selections together in a single self-contained question. Source text
 is labeled as untrusted data, including any instructions embedded in passages.
@@ -88,14 +88,23 @@ is labeled as untrusted data, including any instructions embedded in passages.
 
 The single `relationship` Choice offers support, undermining, qualification,
 and extension in both directions, plus symmetric complements and contrasts.
-Every substantive option names one offered A/B passage pair. For example,
+Three additional choices cover broader research recall: symmetric
+`contextual_connection` for a bounded conceptual or background connection,
+symmetric `methodological_comparison` for concrete measurement/design comparisons,
+and directional `potential_research_resource` from a dataset or tool to the work
+whose question it might help investigate. A resource connection is a lead, not
+confirmed applicability or a research finding. These choices do not require
+corroboration, but both supplied passages must establish a concrete retrieval
+purpose. Genuine abstracts can establish their stated questions or findings.
+
+Every relationship option names one offered A/B passage pair. For example,
 `supports_B_to_A__A0_B0` means B's first passage supports the proposition in A's
 first passage. `supports_A_to_B__A0_B0` means the reverse. Indices refer to the
 ordered supplied passages; code retains their original stable IDs and text.
-With four passages on each side, at most 160 substantive options are offered.
+With four passages on each side, at most 224 relationship options are offered.
 
 Two further choices, `topical_only_or_none` and `insufficient_evidence`, retain
-no evidence pair or active relation. Missing direction or inadequate evidence
+no evidence pair or active relation. Missing required evidence or unresolved attribution
 calls for insufficient evidence; the application never combines separate
 answers that might have evaluated different comparisons.
 
@@ -109,8 +118,8 @@ The resulting artifact contains the validated typed answer, derived relation
 and direction, and exact supplied supporting text/locators. Provider-generated
 explanations, quotations, or other unrequested fields are rejected. It remains an
 inferred machine proposal, not verified research evidence. Historical cache
-entries remain under their original identities and are never read as version 3
-decisions. Shared-note request packaging uses `relationship-batch-v2`, including
+entries remain under their original identities and are never read as version 4
+decisions. Shared-note request packaging uses `relationship-batch-v3`, including
 the version of each source question in its cache identity.
 
 ## Winner-only inferred links
@@ -119,6 +128,7 @@ The `jev-private-winner-only-v1` policy computes the unique highest-probability
 option locally and checks it against the provider's choice. There is no numeric
 confidence floor or winning-margin cutoff. A topical-only/none winner creates
 no substantive edge; insufficient evidence and tied winners are deferred.
+None of these outcomes removes independent embedding-discovery suggestions.
 Endpoint, model, template, evidence, attribution, coverage and freshness checks
 still apply. Scores, exact selected passages and policy/template versions are
 retained for graph and recall inspection; confidence is not independently

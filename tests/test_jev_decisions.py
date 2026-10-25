@@ -268,3 +268,51 @@ def test_invalid_pins_and_unhashed_evidence_fail_before_transport(tmp_path):
     invalid = jd.DecisionRequest(req.workspace_id, req.library_id, broken, req.endpoint_b)
     with pytest.raises(ValueError, match="hash"):
         jd.build_payload(invalid)
+
+
+@pytest.mark.parametrize(("choice", "relation", "direction"), [
+    ("contextual_connection__A0_B0", "contextual_connection", "symmetric"),
+    ("methodological_comparison__A0_B0", "methodological_comparison", "symmetric"),
+    ("potential_research_resource_A_to_B__A0_B0", "potential_research_resource", "A_to_B"),
+    ("potential_research_resource_B_to_A__A0_B0", "potential_research_resource", "B_to_A"),
+])
+def test_recall_choices_bind_relation_direction_and_exact_evidence(tmp_path, choice, relation, direction):
+    req = _request()
+    client = jd.JevDecisionClient(
+        jd.JevConfig(enabled=True, api_key="synthetic", budget_usd=Decimal("0.01"),
+                     data_sharing_confirmed=True, **_approval(req)),
+        _store(tmp_path), transport=lambda *a, **kw: _response(req, choice=choice),
+    )
+    result = client.assess(req, dry_run=False)
+    assert result["status"] == "review_required"
+    decision = result["decision"]
+    assert decision["schema"] == jd.DECISION_SCHEMA
+    assert decision["relationship"]["relation_type"] == relation
+    assert decision["relationship"]["direction"] == direction
+    assert [row["passage_id"] for row in decision["selected_evidence"]] == ["a-1", "b-1"]
+    assert decision["review"]["accepted"] is False
+
+
+def test_recall_options_remain_bounded_at_maximum_passage_count():
+    req = _request()
+    a = replace(req.endpoint_a, passages=tuple(_passage(f"a-{i}", f"Observed A condition {i}.") for i in range(4)))
+    b = replace(req.endpoint_b, passages=tuple(_passage(f"b-{i}", f"Observed B condition {i}.") for i in range(4)))
+    criteria = jd.build_payload(replace(req, endpoint_a=a, endpoint_b=b))["questions"]["relationship"]["criteria"]
+    assert len(criteria) == 226
+    assert len(criteria) <= 255
+    assert "potential_research_resource_B_to_A__A3_B3" in criteria
+    assert "contextual_connection_A_to_B__A0_B0" not in criteria
+    assert "methodological_comparison_A_to_B__A0_B0" not in criteria
+
+
+def test_new_recall_template_cannot_reinterpret_a_historical_request():
+    assert jd.TEMPLATE_VERSION == "relationship-decision-v4"
+    assert jd.DECISION_SCHEMA == "jev-relationship-decision-v4"
+    with pytest.raises(ValueError, match="old decisions are not reinterpreted"):
+        jd.build_payload(replace(_request(), template_version="relationship-decision-v3"))
+    questions = jd.build_payload(_request())["questions"]
+    for key in list(questions["relationship"]["criteria"]):
+        if key.startswith(("contextual_connection", "methodological_comparison", "potential_research_resource")):
+            del questions["relationship"]["criteria"][key]
+    with pytest.raises(ValueError, match="options must match"):
+        jd.build_payload(replace(_request(), questions=questions))

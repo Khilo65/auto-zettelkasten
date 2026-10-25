@@ -101,3 +101,36 @@ test("Large relationship lists have bounded lazy rendering and do not invent leg
   assert.equal(container.querySelector(".relationship-confidence"), null);
   assert.match(container.textContent, /Showing 50 of 75/);
 });
+
+
+for (const [type, label, symmetric] of [
+  ["contextual_connection", "is contextually connected to", true],
+  ["methodological_comparison", "offers a methodological comparison with", true],
+  ["potential_research_resource", "may be a research resource for", false],
+]) {
+  test(`Recall option ${type} preserves evidence, direction and an independent embedding edge`, (t) => {
+    const dom = new JSDOM("<main></main>"); t.after(() => dom.window.close());
+    const identity = "1".repeat(64), revision = "2".repeat(64);
+    const documents = notes.map((note) => ({ ...note, revision }));
+    const semantic = { status: "current", identity_digest: identity,
+      note_revisions: { "A.md": revision, "B.md": revision }, communities: [] };
+    const discovery = { id: "embedding", source: "A.md", target: "B.md", type: "semantic_similarity",
+      derived: true, accepted: false, evidence_backed: false, decision_status: "suggested", score: .72,
+      provenance: { embedding_identity: identity, source_chunk_ids: ["chunk-a"], target_chunk_ids: ["chunk-b"] } };
+    const index = buildLinkIndex(documents, [relationship({ type, template_version: "relationship-decision-v4" }), discovery], null, { semantic_map: semantic });
+    const research = graphData(index, { showCitations: false, showReferences: false, showDiscovery: false });
+    assert.equal(research.edges.length, 1);
+    assert.equal(research.edges[0].layer, "relation");
+    assert.equal(research.edges[0].confidence, .91);
+    assert.equal(research.edges[0].selected_evidence.length, 1);
+    assert.equal(relationshipsForNote(index, "A.md", { direction: "incoming" }).length, symmetric ? 1 : 0);
+    assert.equal(relationshipsForNote(index, "B.md", { direction: "incoming" }).length, 1);
+    const container = dom.window.document.querySelector("main");
+    const details = appendRelationshipDetails(container, index, "B.md"); expand(dom.window, details);
+    assert.ok(container.textContent.includes(`A ${label} B`));
+    assert.match(container.textContent, type === "potential_research_resource" ? /applicability and coverage may need checking/ : /does not establish corroboration/);
+    assert.equal(container.querySelectorAll(".relationship-evidence").length, 1);
+    const graph = graphData(index, { showCitations: false, showReferences: false });
+    assert.equal(graph.edges.filter((edge) => edge.layer === "discovery").length, 1);
+  });
+}

@@ -326,3 +326,35 @@ def test_caller_mutation_after_snapshot_does_not_change_evidence(tmp_path):
     assert result["decisions"][0]["endpoints"]["A"]["coverage"]["source_scope"] == "note_only"
     assert result["decisions"][0]["selected_evidence"][0]["locator"]["heading"] == "Thesis"
     assert result["decisions"][0]["selected_evidence"][0]["content_sha256"] == original
+
+
+def test_shared_batch_recall_types_only_decide_requested_pairs(tmp_path):
+    pairs = _pairs()
+    batch = jb.BatchRequest((pairs[0],), context_requests=pairs)
+    payload = jb.build_batch_payload(batch)
+    assert len(payload["state"]["notes"]) == 4
+    assert len(payload["questions"]) == 1
+    selected = "potential_research_resource_B_to_A__A0_B0"
+    client = jb.JevBatchClient(
+        _config([batch]), _store(tmp_path),
+        transport=lambda body, **kw: _response(json.loads(body), choice=selected),
+    )
+    result = client.assess(batch, dry_run=False)
+    assert result["status"] == "review_required"
+    assert len(result["decisions"]) == 1
+    assert result["decisions"][0]["relationship"]["relation_type"] == "potential_research_resource"
+    assert result["decisions"][0]["relationship"]["direction"] == "B_to_A"
+    assert result["decisions"][0]["provenance"]["template_version"] == "relationship-batch-v3"
+    assert result["decisions"][0]["provenance"]["source_template_version"] == jd.TEMPLATE_VERSION
+
+
+def test_previous_batch_approval_cannot_dispatch_new_rubric(tmp_path):
+    from auto_zettelkasten.jev_billing import HISTORICAL_BATCH_BILLING_POLICY_V2
+    batch = jb.BatchRequest((_pairs()[0],))
+    client = jb.JevBatchClient(
+        _config([batch], approved_billing_policy_identity=HISTORICAL_BATCH_BILLING_POLICY_V2.identity),
+        _store(tmp_path), transport=lambda *_a, **_kw: pytest.fail("old approval cannot authorize new rubric"),
+    )
+    result = client.assess(batch, dry_run=False)
+    assert result["status"] == "blocked"
+    assert result["provider_calls"] == 0

@@ -22,7 +22,7 @@ from .notes import parse_atomic_note
 from .profiles import profile_sidecar_path
 from .relationships import (
     JEV_RELATIONSHIP_CONTRACT, RECIPROCAL_RELATION_TYPES, canonical_pair,
-    persist_relationship_registry, profile_content_hash, profile_row, stable_hash,
+    RELATIONSHIP_PROJECTION_LABELS, persist_relationship_registry, profile_content_hash, profile_row, stable_hash,
 )
 
 
@@ -30,11 +30,15 @@ CURRENT_POLICY_VERSION = "jev-private-winner-only-v1"
 POLICY_VERSION = CURRENT_POLICY_VERSION
 LEGACY_POLICY_VERSION = "jev-private-policy-v1"
 READABLE_POLICY_VERSIONS = frozenset({CURRENT_POLICY_VERSION, LEGACY_POLICY_VERSION})
-READABLE_SOURCE_TEMPLATE_VERSIONS = frozenset({TEMPLATE_VERSION, "relationship-decision-v2"})
-READABLE_BATCH_TEMPLATE_VERSIONS = frozenset({BATCH_TEMPLATE_VERSION, "relationship-batch-v1"})
+READABLE_SOURCE_TEMPLATE_VERSIONS = frozenset({TEMPLATE_VERSION, "relationship-decision-v3", "relationship-decision-v2"})
+READABLE_BATCH_TEMPLATE_VERSIONS = frozenset({BATCH_TEMPLATE_VERSION, "relationship-batch-v2", "relationship-batch-v1"})
 MARKER_RELATIVE_PATH = ".auto-zettelkasten/jev-private-copy.json"
 MAX_NOTE_BYTES = 2 * 1024 * 1024
-_RELATIONS = {"supports", "undermines", "qualifies", "extends", "complements", "contrasts"}
+_RELATIONS = {
+    "supports", "undermines", "qualifies", "extends", "complements", "contrasts",
+    "contextual_connection", "methodological_comparison", "potential_research_resource",
+}
+_RECALL_RELATIONS = {"contextual_connection", "methodological_comparison", "potential_research_resource"}
 
 
 @dataclass(frozen=True)
@@ -295,7 +299,7 @@ def evaluate_jev_decision(
     if choice == "insufficient_evidence":
         return finish("deferred", "insufficient_evidence")
     if choice == "topical_only_or_none":
-        record["reason"] = "The supplied notes establish no substantive relationship."
+        record["reason"] = "The supplied passages establish no useful research relationship; discovery suggestions remain available."
         return finish("no_relationship")
     if option["relation_type"] not in _RELATIONS:
         return finish("rejected", "unsupported_relationship")
@@ -306,16 +310,21 @@ def evaluate_jev_decision(
             return finish("deferred", "below_probability_margin")
     for endpoint in endpoints.values():
         scope = str(endpoint.coverage.get("source_scope") or endpoint.coverage.get("status") or "").casefold()
-        if "metadata" in scope or endpoint.coverage.get("evidence_eligibility") in {"context_only", "metadata_only"}:
+        eligibility = endpoint.coverage.get("evidence_eligibility")
+        if ("metadata" in scope or eligibility == "metadata_only"
+                or (eligibility == "context_only" and scope not in {"abstract", "abstract_only"})):
             return finish("deferred", "insufficient_source_coverage")
     by_side = {row["source_id"]: row for row in expected_evidence}
     relation_id = "jev-" + stable_hash([record["decision_key"], option["relation_type"], source.source_id, target.source_id])[:24]
     source_title = str(rows.get(source.source_id, {}).get("title") or source.note_id)
     target_title = str(rows.get(target.source_id, {}).get("title") or target.note_id)
+    forward_label = RELATIONSHIP_PROJECTION_LABELS[option["relation_type"]][0]
     record.update(relation_id=relation_id, connection_id=relation_id, active=True,
                   provenance="probabilistic_relationship_jev", inferred=True, strength=110,
                   reciprocal_type=RECIPROCAL_RELATION_TYPES[option["relation_type"]],
-                  reason=f"{source_title} {option['relation_type']} {target_title} using the supplied note evidence.",
+                  relationship_tier="contextual" if option["relation_type"] in _RECALL_RELATIONS else "direct",
+                  cluster_evidence_eligible=option["relation_type"] not in _RECALL_RELATIONS,
+                  reason=f"{source_title} {forward_label} {target_title} using the supplied note evidence.",
                   source_evidence=_copy(by_side[source.source_id]), target_evidence=_copy(by_side[target.source_id]),
                   evidence_basis="note_summary" if all(value["locator"].get("kind") == "note_lines" for value in expected_evidence) else "supplied_passages")
     return finish("accepted")
@@ -397,6 +406,7 @@ def _trusted_decision_record(record: Mapping[str, Any]) -> bool:
         source_template = template
     expected_source_template = {
         BATCH_TEMPLATE_VERSION: TEMPLATE_VERSION,
+        "relationship-batch-v2": "relationship-decision-v3",
         "relationship-batch-v1": "relationship-decision-v2",
     }.get(template, template)
     return bool(
@@ -408,6 +418,7 @@ def _trusted_decision_record(record: Mapping[str, Any]) -> bool:
         and record.get("prompt_version") == template
         and source_template in READABLE_SOURCE_TEMPLATE_VERSIONS
         and source_template == expected_source_template
+        and (record.get("relation_type") not in _RECALL_RELATIONS or source_template == TEMPLATE_VERSION)
     )
 
 

@@ -110,7 +110,7 @@ def test_small_positive_winning_margin_is_not_a_cutoff(pair):
     answer = value["answers"]["relationship"]
     top = answer["choice"]
     second = "topical_only_or_none"
-    answer["probabilities"] = {key: (1 - 0.18 - 0.17999999) / 10 for key in answer["probabilities"]}
+    answer["probabilities"] = {key: (1 - 0.18 - 0.17999999) / (len(answer["probabilities"]) - 2) for key in answer["probabilities"]}
     answer["probabilities"].update({top: 0.18, second: 0.17999999})
     result = evaluate_jev_decision(value, request, profiles=profiles, bindings=bind_jev_request(copy, request, profiles=profiles))
     assert result["status"] == "accepted"
@@ -171,7 +171,7 @@ def test_tie_is_deferred_deterministically(pair):
     answer = value["answers"]["relationship"]
     answer["probabilities"] = {key: 0 for key in answer["probabilities"]}
     answer["probabilities"].update(topical_only_or_none=0.5, insufficient_evidence=0.5)
-    answer["confidence"] = round((0.5 - 1 / 12) / (1 - 1 / 12), 2)
+    answer["confidence"] = round((0.5 - 1 / len(answer["probabilities"])) / (1 - 1 / len(answer["probabilities"])), 2)
     result = evaluate_jev_decision(value, request, profiles=profiles, bindings=bind_jev_request(copy, request, profiles=profiles))
     assert result["status"] == "deferred" and result["reasons"] == ["tied_winning_options"]
 

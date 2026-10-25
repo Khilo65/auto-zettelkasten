@@ -39,7 +39,7 @@ const privateParts = new Set(["node_modules", "venv", "__pycache__", "credential
 const privateNames = new Set(["credential", "credentials", "secret", "secrets", "password", "passwords", "api_key", "api_keys", "tokens"]);
 const externalLink = (value) => /^(?:https?:|mailto:)/i.test(value);
 const syntaxCharacters = new Set("[]()*_~`<>!#|\\=-^\n\r");
-const researchRelationTypes = new Set(["supports", "undermines", "qualifies", "extends", "complements", "contrasts", "rival_explanation", "boundary_contrast", "methodological_fault_line", "sequential_relationship", "interpretive_or_normative_disagreement", "contextual_connection"]);
+const researchRelationTypes = new Set(["supports", "undermines", "qualifies", "extends", "complements", "contrasts", "rival_explanation", "boundary_contrast", "methodological_fault_line", "sequential_relationship", "interpretive_or_normative_disagreement", "contextual_connection", "methodological_comparison", "potential_research_resource"]);
 const citationRelationTypes = new Set(["cites", "cited_by"]);
 const navigationRelationTypes = new Set(["cluster_member", "has_member", "alias_of"]);
 
@@ -735,6 +735,11 @@ function relationshipMetadata(relation, index, source, target) {
 }
 
 const researchLookups = new WeakMap();
+const recallRelationshipLabels = {
+  contextual_connection: "is contextually connected to",
+  methodological_comparison: "offers a methodological comparison with",
+  potential_research_resource: "may be a research resource for",
+};
 
 export function relationshipsForNote(index, path, { relations = index.relations, direction = "both" } = {}) {
   if (!Array.isArray(relations)) return [];
@@ -751,7 +756,7 @@ export function relationshipsForNote(index, path, { relations = index.relations,
     }
     researchLookups.set(relations, lookup);
   }
-  return (lookup.get(canonical(path)) || []).filter((row) => direction === "both" || ["complements", "contrasts", "boundary_contrast", "methodological_fault_line", "interpretive_or_normative_disagreement", "contextual_connection"].includes(row.type)
+  return (lookup.get(canonical(path)) || []).filter((row) => direction === "both" || ["complements", "contrasts", "boundary_contrast", "methodological_fault_line", "interpretive_or_normative_disagreement", "contextual_connection", "methodological_comparison"].includes(row.type)
     || (direction === "incoming" ? canonical(row.target) === canonical(path) : canonical(row.source) === canonical(path)));
 }
 
@@ -767,7 +772,14 @@ export function appendRelationshipDetails(container, index, path, { relations = 
     rendered = true;
     for (const relation of rows.slice(0, 50)) {
       const details = doc.createElement("details"); details.className = "relationship-record";
-      const heading = doc.createElement("summary"); heading.textContent = `${basename(relation.source)} ${relation.type.replace(/_/g, " ")} ${basename(relation.target)}`; details.append(heading);
+      const heading = doc.createElement("summary"); heading.textContent = `${basename(relation.source)} ${recallRelationshipLabels[relation.type] || relation.type.replace(/_/g, " ")} ${basename(relation.target)}`; details.append(heading);
+      if (recallRelationshipLabels[relation.type]) {
+        const scope = doc.createElement("p"); scope.className = "relationship-evidence-basis";
+        scope.textContent = relation.type === "potential_research_resource"
+          ? "Potential research resource; applicability and coverage may need checking."
+          : "Research-recall connection; this does not establish corroboration or a causal relationship.";
+        details.append(scope);
+      }
       if (Number.isFinite(relation.confidence)) {
         const confidence = doc.createElement("p"); confidence.className = "relationship-confidence";
         confidence.textContent = `Model confidence: ${Math.round(relation.confidence * 100)}%`;

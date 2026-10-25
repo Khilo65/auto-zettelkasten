@@ -72,7 +72,7 @@ def _client(tmp_path, monkeypatch, transport, *, request=None):
 
 def test_direction_and_evidence_are_one_self_contained_choice():
     payload = jd.build_payload(_request())
-    assert jd.TEMPLATE_VERSION == "relationship-decision-v3"
+    assert jd.TEMPLATE_VERSION == "relationship-decision-v4"
     assert list(payload["questions"]) == ["relationship"]
     question = payload["questions"]["relationship"]
     assert question["type"] == "choice"
@@ -83,6 +83,8 @@ def test_direction_and_evidence_are_one_self_contained_choice():
         "qualifies_A_to_B__A0_B0", "qualifies_B_to_A__A0_B0",
         "extends_A_to_B__A0_B0", "extends_B_to_A__A0_B0",
         "complements__A0_B0", "contrasts__A0_B0",
+        "contextual_connection__A0_B0", "methodological_comparison__A0_B0",
+        "potential_research_resource_A_to_B__A0_B0", "potential_research_resource_B_to_A__A0_B0",
         "topical_only_or_none", "insufficient_evidence",
     }
     assert "selected primary" not in json.dumps(question).lower()
@@ -96,11 +98,11 @@ def test_direction_and_evidence_are_one_self_contained_choice():
 def test_memory_rubric_keeps_comparisons_distinct_from_corroboration():
     question = jd.build_payload(_request())["questions"]["relationship"]
     instructions = question["instructions"]
-    assert "not only direct corroboration or contradiction" in instructions
-    assert "Different populations or outcome definitions can permit such a bounded comparison without mutual validation" in instructions
-    assert "Partial coverage does not erase a comparison established by the supplied passages" in instructions
+    assert "connection is useful without corroboration" in instructions
+    assert "Preserve differences in constructs, actors, periods, measures and outcomes" in instructions
+    assert "it does not erase supplied content" in instructions
     assert "never to replace missing selected evidence" in instructions
-    assert "a citation, example or document-input relationship alone does not establish it" in instructions
+    assert "not merely a related example or document-input relationship" in instructions
     assert "comparable meaning and scope" in question["criteria"]["supports_A_to_B__A0_B0"]
     assert "different populations or periods alone do not suffice" in question["criteria"]["contrasts__A0_B0"]
 
@@ -285,13 +287,13 @@ def test_unrequested_provider_narrative_is_rejected(tmp_path, monkeypatch, locat
     assert "decision" not in result
 
 
-@pytest.mark.parametrize("version", ["relationship-decision-v1", "relationship-decision-v2"])
-def test_historical_template_is_not_reinterpreted_by_v3_renderer(version):
+@pytest.mark.parametrize("version", ["relationship-decision-v1", "relationship-decision-v2", "relationship-decision-v3"])
+def test_historical_template_is_not_reinterpreted_by_v4_renderer(version):
     with pytest.raises(ValueError, match="template"):
         jd.build_payload(replace(_request(), template_version=version))
 
 
-@pytest.mark.parametrize("version", ["v1", "v2"])
+@pytest.mark.parametrize("version", ["v1", "v2", "v3"])
 def test_historical_cached_artifact_is_preserved_without_reinterpretation(tmp_path, monkeypatch, version):
     request = _request()
     calls = []
@@ -319,8 +321,8 @@ def test_historical_cached_artifact_is_preserved_without_reinterpretation(tmp_pa
     assert calls == [1]
 
 
-@pytest.mark.parametrize("version", ["v1", "v2"])
-def test_historical_cache_key_is_untouched_by_a_v3_request(tmp_path, monkeypatch, version):
+@pytest.mark.parametrize("version", ["v1", "v2", "v3"])
+def test_historical_cache_key_is_untouched_by_a_v4_request(tmp_path, monkeypatch, version):
     request = _request()
     client = _client(tmp_path, monkeypatch, lambda *_a, **_kw: _response(request), request=request)
     template = f"relationship-decision-{version}"
@@ -336,7 +338,7 @@ def test_historical_cache_key_is_untouched_by_a_v3_request(tmp_path, monkeypatch
                    (key, "jev-1.13.0", template, "historical-payload", serialized, 1.0))
     result = client.assess(request, dry_run=False)
     assert result["status"] == "review_required"
-    assert result["decision"]["schema"] == "jev-relationship-decision-v3"
+    assert result["decision"]["schema"] == "jev-relationship-decision-v4"
     assert result["cache_key"] != key
     with client.store._connect() as db:
         assert db.execute("SELECT artifact_json FROM decisions WHERE cache_key=?", (key,)).fetchone() == (serialized,)
@@ -349,16 +351,23 @@ def test_four_by_four_passages_bound_joint_options_and_keep_symmetry(tmp_path, m
     endpoint_b = replace(request.endpoint_b, passages=tuple(_passage(f"b-{index}", f"Synthetic B passage {index}.") for index in range(4)))
     request = replace(request, endpoint_a=endpoint_a, endpoint_b=endpoint_b)
     criteria = jd.build_payload(request)["questions"]["relationship"]["criteria"]
-    assert len(criteria) == 162  # Ten joint relations per pair, plus two no-evidence outcomes.
-    assert len(set(criteria)) == 162
+    assert len(criteria) == 226  # Fourteen joint relations per pair, plus two no-evidence outcomes.
+    assert len(set(criteria)) == 226
     assert "supports_B_to_A__A3_B3" in criteria
     client = _client(tmp_path, monkeypatch, lambda *_a, **_kw: _response(request, choice="complements__A3_B2"), request=request)
     result = client.assess(request, dry_run=False)
-    assert result["status"] == "review_required"
-    assert result["decision"]["relationship"] == {
+    # Maximum option cardinality is valid, but the larger rubric still obeys the wire cap.
+    assert result["status"] == "blocked" and result["provider_calls"] == 0
+    assert "wire-byte admission limit" in result["reason"]
+    response = _response(request, choice="complements__A3_B2")
+    validated, _ = jd._validate_response(response.body, expected_questions=jd.build_payload(request)["questions"],
+                                          expected_model=jd.MODEL_ID, max_tokens=65_536)
+    decision = jd._decision_artifact(request, validated, jd.decision_cache_key(request),
+                                     hashlib.sha256(jd._canonical_json(jd.build_payload(request)).encode()).hexdigest(), Decimal("0"))
+    assert decision["relationship"] == {
         "relation_type": "complements", "direction": "symmetric", "actor_source_id": "", "reference_source_id": "",
     }
-    assert [row["passage_id"] for row in result["decision"]["selected_evidence"]] == ["a-3", "b-2"]
+    assert [row["passage_id"] for row in decision["selected_evidence"]] == ["a-3", "b-2"]
 
 
 def test_public_payload_snapshot_does_not_alias_nested_request_metadata():
