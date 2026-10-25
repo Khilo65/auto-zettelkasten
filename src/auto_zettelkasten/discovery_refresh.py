@@ -82,6 +82,18 @@ def refresh_cached_discovery(
         ids = vectors["source_ids"]
         matrix = vectors["vectors"]
         memberships = {sid: current[sid].get("collection_keys", []) for sid in ids}
+        from .mapping_candidates import CandidateAdmissionError, _scoped_admission
+        try:
+            admission, _ = _scoped_admission(root, canonical)
+        except CandidateAdmissionError as exc:
+            raise LocalMappingError(str(exc)) from exc
+        if admission is not None:
+            if settings.clustering != "leiden" or settings.tuning_mode != "auto":
+                raise LocalMappingError("Reviewed scoped calibration requires automatic Leiden discovery; previous map preserved.")
+            explicit = dict(options or {})
+            if any(key in explicit and explicit[key] != value for key, value in admission["parameters"].items()):
+                raise LocalMappingError("Explicit discovery settings conflict with scoped calibration; previous map preserved.")
+            settings = replace(settings, **admission["parameters"])
         scoped = scoped_source_neighbors(ids, matrix, memberships, options=settings,
                                          embedding_identity=vectors["embedding_identity"], check_resources=check_resources)
         neighbors, candidates = scoped["neighbors"], scoped["candidate_neighbors"]
@@ -90,7 +102,12 @@ def refresh_cached_discovery(
             row["provenance"].update(source_chunk_ids=by_source[row["source_id"]]["chunk_ids"],
                                      target_chunk_ids=by_source[row["target_source_id"]]["chunk_ids"])
         tuning = {"mode": settings.tuning_mode, "status": "manual", "calibration_status": "not_applied_discovery_scope_changed"}
-        if settings.tuning_mode == "auto" and settings.clustering == "leiden":
+        if admission is not None:
+            tuning.update(status="reviewed_scoped_calibration_applied", calibration_status="complete",
+                          calibration_identity=admission["calibration_identity"],
+                          policy_identity=admission["policy_identity"],
+                          admitted_pairs=len(admission["allowed_pairs"]))
+        elif settings.tuning_mode == "auto" and settings.clustering == "leiden":
             stability = community_resolution_checks(ids, neighbors, check_resources=check_resources)
             settings = replace(settings, resolution=stability["selected_resolution"], seed=stability["selected_seed"])
             tuning.update(status="default_policy_local_stability_checked", community_checks=stability["community_scales"],
@@ -130,6 +147,10 @@ def refresh_cached_discovery(
                              "encoded_chunks": 0, "reused_chunks": len(result["chunks"]), "encoder_loads": 0,
                              "total_seconds": time.monotonic() - started, **vectors["stats"]})
         _verify_inputs(inputs)
+        if admission is not None:
+            current_admission, _ = _scoped_admission(root, canonical)
+            if current_admission != admission:
+                raise LocalMappingError("Scoped calibration changed during discovery; previous map preserved.")
         if _bounded_json(result_path, max_bytes=min(settings.max_cache_bytes, settings.max_text_bytes)) != saved:
             raise LocalMappingError("The saved map changed during discovery; no result was published.")
         serialized = _json(result) + "\n"

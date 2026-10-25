@@ -241,7 +241,7 @@ def run_relationship_mapping(
     from .candidate_queue import CandidateQueue, queue_scope
     from .jev_relationships import (apply_jev_decisions, evaluate_jev_decision, reusable_jev_pairs,
                                     validate_private_relationship_workspace)
-    from .mapping_candidates import prepare_mapping_candidates
+    from .mapping_candidates import CandidateAdmissionError, prepare_mapping_candidates
     from .local_tools import load_local_retrieval
 
     root = resolve_workspace(workspace)
@@ -270,6 +270,11 @@ def run_relationship_mapping(
                                "policy": asdict(JevAcceptancePolicy()), "packet_format": settings.packet_format,
                                "batch_size": settings.batch_size},
         )
+    except CandidateAdmissionError as exc:
+        return {"schema": "relationship-mapping-v1", "backend": "jev", "status": "blocked",
+                "coverage_partial": True, "reason": str(exc), "provider_calls": 0,
+                "candidate_count": 0, "accepted_count": 0,
+                "admission": {"status": "blocked", "existing_progress_preserved": True}}
     except CandidateResourceError as exc:
         return {"schema": "relationship-mapping-v1", "backend": "jev", "status": "partial",
                 "coverage_partial": True, "reason": str(exc), "provider_calls": 0,
@@ -341,7 +346,7 @@ def run_relationship_mapping(
     settled = sum((Decimal(actual) for _, actual, state in reservations if state == "settled" and actual is not None), Decimal(0))
     retained = sum((Decimal(reserved) for reserved, _, state in reservations if state != "settled"), Decimal(0))
     failures = {"blocked", "invalid_response", "billing_uncertain", "provider_error", "disabled", "persistence_failed"}
-    progress = queue.summary()
+    progress = queue.summary(allowed_pairs=prepared.get("_allowed_pairs"))
     partial = progress["unfinished"] or bool(unavailable) or prepared["status"].get("profile_load_status") == "partial" or any(s in failures for s in statuses)
     report = {"schema": "relationship-mapping-v1", "backend": "jev",
               "status": "dry_run" if settings.dry_run else "partial" if partial else "completed",
@@ -352,6 +357,7 @@ def run_relationship_mapping(
               "ledger_settled_usd": str(settled), "ledger_retained_reservations_usd": str(retained),
               "request_count": len(batches), "reused_pair_count": len(resolved),
               "candidate_stats": prepared["stats"], "coverage": prepared["status"], "candidate_queue": progress,
+              "admission": prepared["admission"],
               "unavailable": unavailable, "preview": previews, "application": applied,
               "accepted_count": applied.get("counts", {}).get("accepted", 0) if applied.get("applied") else 0,
               "eligible_count": applied.get("counts", {}).get("accepted", 0),

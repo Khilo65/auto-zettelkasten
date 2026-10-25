@@ -120,11 +120,13 @@ class CandidateQueue:
                 db.execute("UPDATE candidates SET status='resolved' WHERE scope=? AND left_id=? AND right_id=? AND eligible=1 AND status='unexamined'", (self.scope, left, right))
 
     def select(self, *, per_source_cap: int, max_pairs: int,
-               preferred_pairs: Sequence[tuple[str, str]] | None = None) -> list[dict[str, Any]]:
+               preferred_pairs: Sequence[tuple[str, str]] | None = None,
+               allowed_pairs: Sequence[tuple[str, str]] | None = None) -> list[dict[str, Any]]:
         if type(per_source_cap) is not int or not 1 <= per_source_cap <= 256 or type(max_pairs) is not int or not 1 <= max_pairs <= 100_000:
             raise ValueError("invalid candidate selection limits")
         counts: Counter[str] = Counter()
         selected = []
+        allowed = _allowed_pairs(allowed_pairs)
         with self._connect() as db:
             passes = db.execute("SELECT completed_passes FROM queue_progress WHERE scope=?", (self.scope,)).fetchone()[0]
             initial = None if preferred_pairs is None or passes else {tuple(sorted(pair)) for pair in preferred_pairs}
@@ -133,6 +135,8 @@ class CandidateQueue:
             if first and _candidate_scope(json.loads(first[2])) is not None:
                 def rows_for_pass():
                     for left, right, encoded in db.execute(query, (self.scope,)):
+                        if allowed is not None and (left, right) not in allowed:
+                            continue
                         if initial is not None and (left, right) not in initial:
                             continue
                         row = json.loads(encoded)
@@ -142,6 +146,8 @@ class CandidateQueue:
                 return _select_scope_balanced(rows_for_pass, per_source_cap=per_source_cap, max_pairs=max_pairs)
             rows = db.execute(query, (self.scope,))
             for left, right, encoded in rows:
+                if allowed is not None and (left, right) not in allowed:
+                    continue
                 if initial is not None and (left, right) not in initial:
                     continue
                 if counts[left] >= per_source_cap or counts[right] >= per_source_cap:
@@ -174,12 +180,36 @@ class CandidateQueue:
         with self._connect() as db:
             db.execute("UPDATE queue_progress SET completed_passes=completed_passes+1 WHERE scope=?", (self.scope,))
 
-    def summary(self) -> dict[str, Any]:
+    def summary(self, *, allowed_pairs: Sequence[tuple[str, str]] | None = None) -> dict[str, Any]:
+        allowed = _allowed_pairs(allowed_pairs)
         with self._connect() as db:
             counts = dict(db.execute("SELECT status,COUNT(*) FROM candidates WHERE scope=? AND eligible=1 GROUP BY status", (self.scope,)))
             passes = db.execute("SELECT completed_passes FROM queue_progress WHERE scope=?", (self.scope,)).fetchone()[0]
             historical = db.execute("SELECT COUNT(*) FROM candidates WHERE scope=? AND eligible=0", (self.scope,)).fetchone()[0]
-        return {"schema": QUEUE_SCHEMA, "counts": counts, "completed_passes": passes, "total": sum(counts.values()),
+            admitted = Counter(status for left, right, status in db.execute(
+                "SELECT left_id,right_id,status FROM candidates WHERE scope=? AND eligible=1", (self.scope,))
+                if (left, right) in allowed) if allowed is not None else None
+        result = {"schema": QUEUE_SCHEMA, "counts": counts, "completed_passes": passes, "total": sum(counts.values()),
                 "unexamined_count": counts.get("unexamined", 0),
                 "unfinished": bool(counts.get("unexamined", 0) or counts.get("unknown_dispatch", 0)),
                 "historical_count": historical, "all_pairs_examined": False}
+        if admitted is not None:
+            result.update(admitted_counts=dict(admitted), admitted_total=sum(admitted.values()),
+                          admitted_unexamined_count=admitted.get("unexamined", 0),
+                          outside_policy_unexamined_count=counts.get("unexamined", 0) - admitted.get("unexamined", 0))
+        return result
+
+
+def _allowed_pairs(pairs):
+    """A policy is a bounded canonical allowlist, including an empty one."""
+    if pairs is None:
+        return None
+    if not isinstance(pairs, (list, tuple, set, frozenset)) or len(pairs) > 100_000:
+        raise ValueError("invalid candidate admission pairs")
+    result = set()
+    for pair in pairs:
+        if (not isinstance(pair, (list, tuple)) or len(pair) != 2
+                or any(not isinstance(sid, str) or not sid for sid in pair) or pair[0] >= pair[1]):
+            raise ValueError("candidate admission pairs must have canonical endpoints")
+        result.add(tuple(pair))
+    return result

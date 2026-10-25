@@ -165,3 +165,57 @@ def test_cli_has_no_paid_switch_and_preserves_validation(canonical_workspace, ca
         parser.parse_args(["refresh-discovery", "--workspace", str(root), "--execute"])
     args = parser.parse_args(["build-map", "--workspace", str(root), "--discovery-scope", "collection_and_library"])
     assert args.discovery_scope == "collection_and_library"
+
+
+def test_reviewed_scoped_policy_controls_cached_graph_without_encoding(canonical_workspace, monkeypatch):
+    from auto_zettelkasten.local_tools import load_local_retrieval
+    from auto_zettelkasten.mapping_calibration import load_cached_source_vectors, source_fingerprint, stratified_holdout
+    from auto_zettelkasten.mapping_candidates import _evidence_bindings
+    from auto_zettelkasten.scoped_calibration import calibrate_scoped_mapping, finalize_scoped_calibration
+    from test_scoped_calibration import _community_reviews
+    root = canonical_workspace
+    original = build(root)
+    before = protected(root)
+    cache = root / ".auto-zettelkasten/mapping"
+    vectors = load_cached_source_vectors(cache)
+    loaded = load_local_retrieval(root, infer_scope=True)
+    collections = {row["source_id"]: row["collection_keys"] for row in loaded["rows"]}
+    held = set(stratified_holdout(collections))
+    train = sorted(set(collections) - held)
+    pairs = [(train[0], train[1], "useful"), (train[0], train[-1], "unsupported"),
+             (min(held), train[0], "useful")]
+    reviews = [{"pair": [left, right], "label": label, "reviewer_id": reviewer, "score_blinded": True}
+               for left, right, label in pairs for reviewer in ("synthetic-a", "synthetic-b")]
+    pending = calibrate_scoped_mapping(vectors["source_ids"], vectors["vectors"], collections, reviews,
+        embedding_identity=vectors["embedding_identity"], source_fingerprint=source_fingerprint(original["sources"]),
+        projection_rows=loaded["rows"], discovery_records=loaded["discovery_records"],
+        citation_records=loaded["citation_records"], evidence_bindings=_evidence_bindings(root, loaded["rows"]))
+    report = finalize_scoped_calibration(pending, _community_reviews(pending, preferred=.5))
+    (cache / "scoped-calibration.json").write_text(json.dumps(report))
+    monkeypatch.setattr(local_mapping, "_LocalMiniLM", lambda *_: pytest.fail("encoder loaded"))
+    refreshed = refresh_cached_discovery(root)
+    result = json.loads((cache / "result.json").read_text())
+    assert result["tuning"]["status"] == "reviewed_scoped_calibration_applied"
+    assert result["identity"]["clustering"]["resolution"] == .5
+    for name in ("neighbors", "min_similarity"):
+        assert result["identity"]["clustering"][name] == report["selected_parameters"][name]
+    assert refreshed["stats"]["encoded_chunks"] == refreshed["stats"]["encoder_loads"] == 0
+    assert result["candidate_neighbors"]  # Broad inventory retained separately.
+    assert result["chunks"] == original["chunks"]
+    assert protected(root) == before
+    saved = (cache / "result.json").read_bytes()
+    for options in ({"clustering": "hdbscan"}, {"tuning_mode": "manual"}, {"min_similarity": .999999}):
+        with pytest.raises(LocalMappingError, match="calibration"):
+            refresh_cached_discovery(root, options=options)
+        assert (cache / "result.json").read_bytes() == saved
+
+
+def test_invalid_scoped_policy_preserves_cached_graph(canonical_workspace):
+    root = canonical_workspace
+    build(root)
+    cache = root / ".auto-zettelkasten/mapping"
+    before = (cache / "result.json").read_bytes()
+    (cache / "scoped-calibration.json").write_text("{}")
+    with pytest.raises(LocalMappingError, match="admission blocked"):
+        refresh_cached_discovery(root)
+    assert (cache / "result.json").read_bytes() == before
