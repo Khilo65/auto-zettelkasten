@@ -21,6 +21,29 @@ def _configure_tls() -> None:
         os.environ["SSL_CERT_FILE"] = certifi.where()
 
 
+def _configure_editing_menu() -> None:
+    if sys.platform != "darwin":
+        return
+    import objc
+    from WebKit import WebMenuItemTagCopy, WebMenuItemTagCut, WebMenuItemTagPaste
+    from webview.platforms.cocoa import BrowserView
+
+    if getattr(BrowserView, "_auto_zettelkasten_editing_menu", False):
+        return
+
+    def willOpenMenu_withEvent_(host, menu, event):
+        # Keep WebKit's own editing items: their targets carry the selection
+        # context. pywebview otherwise removes every item in release builds.
+        for item in tuple(menu.itemArray()):
+            if item.tag() not in {WebMenuItemTagCopy, WebMenuItemTagCut, WebMenuItemTagPaste}:
+                menu.removeItem_(item)
+
+    objc.classAddMethods(BrowserView.WebKitHost, [objc.selector(
+        willOpenMenu_withEvent_, selector=b"willOpenMenu:withEvent:", signature=b"v@:@@",
+    )])
+    BrowserView._auto_zettelkasten_editing_menu = True
+
+
 def _set_view_zoom(window, level: float) -> float:
     if type(level) not in (int, float) or not 0.5 <= level <= 2:
         raise ValueError("View zoom must be a number between 0.5 and 2.")
@@ -72,6 +95,7 @@ def launch() -> None:
         raise RuntimeError("Install the desktop extra: python -m pip install 'auto-zettelkasten[desktop]'.") from exc
 
     _configure_tls()
+    _configure_editing_menu()
     app = LocalApp()
     with LocalServer(("127.0.0.1", 0), app=app) as server:
         window = webview.create_window(

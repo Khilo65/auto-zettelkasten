@@ -54,9 +54,59 @@ def test_desktop_tls_uses_bundled_roots_and_preserves_explicit_trust(monkeypatch
     assert "SSL_CERT_FILE" not in desktop.os.environ
 
 
+def test_cocoa_context_menu_keeps_native_editing_actions_without_debug(monkeypatch):
+    class Host:
+        pass
+
+    browser = SimpleNamespace(WebKitHost=Host)
+    monkeypatch.setattr(desktop.sys, "platform", "darwin")
+    monkeypatch.setitem(sys.modules, "webview.platforms.cocoa", SimpleNamespace(BrowserView=browser))
+    monkeypatch.setitem(sys.modules, "WebKit", SimpleNamespace(
+        WebMenuItemTagCopy=8, WebMenuItemTagCut=13, WebMenuItemTagPaste=14,
+    ))
+    replacements = []
+
+    def selector(method, **kwargs):
+        assert kwargs == {"selector": b"willOpenMenu:withEvent:", "signature": b"v@:@@"}
+        return method
+
+    def add_methods(host, methods):
+        replacements.append(host)
+        for method in methods:
+            setattr(host, method.__name__, method)
+
+    monkeypatch.setitem(sys.modules, "objc", SimpleNamespace(selector=selector, classAddMethods=add_methods))
+    copy = SimpleNamespace(tag=lambda: 8, title="Copier", target=object(), enabled=True)
+    cut = SimpleNamespace(tag=lambda: 13, title="Cut", target=object(), enabled=False)
+    paste = SimpleNamespace(tag=lambda: 14, title="Paste", target=object(), enabled=True)
+    items = [SimpleNamespace(tag=lambda: 99), copy, SimpleNamespace(tag=lambda: 3), cut, paste]
+    menu = SimpleNamespace(itemArray=lambda: items, removeItem_=items.remove)
+    original_targets = [item.target for item in (copy, cut, paste)]
+
+    desktop._configure_editing_menu()
+    desktop._configure_editing_menu()
+    assert browser.WebKitHost is Host
+    assert replacements == [Host]
+    Host().willOpenMenu_withEvent_(menu, object())
+    assert items == [copy, cut, paste]
+    assert [item.target for item in items] == original_targets
+    assert cut.enabled is False
+    items.clear()
+    Host().willOpenMenu_withEvent_(menu, object())
+    assert items == []
+
+
+@pytest.mark.parametrize("platform", ["win32", "linux"])
+def test_native_editing_menu_does_not_import_cocoa_on_other_platforms(monkeypatch, platform):
+    monkeypatch.setattr(desktop.sys, "platform", platform)
+    monkeypatch.setitem(sys.modules, "webview.platforms.cocoa", None)
+    desktop._configure_editing_menu()
+
+
 @pytest.mark.parametrize("platform,renderer", [("darwin", "cocoa"), ("win32", "edgechromium")])
 def test_desktop_owns_server_native_picker_and_protects_running_job(tmp_path, monkeypatch, platform, renderer, close_checks):
     created = []
+    editing_menu_calls = []
     view_zooms = []
     app = webapp.LocalApp(preferences_path=tmp_path / "preferences.json")
     event = Event()
@@ -94,6 +144,7 @@ def test_desktop_owns_server_native_picker_and_protects_running_job(tmp_path, mo
     monkeypatch.setitem(sys.modules, "webview", SimpleNamespace(create_window=create_window, start=start, FileDialog=SimpleNamespace(FOLDER=1)))
     monkeypatch.setattr(desktop, "LocalApp", lambda: app)
     monkeypatch.setattr(desktop, "_configure_tls", lambda: None)
+    monkeypatch.setattr(desktop, "_configure_editing_menu", lambda: editing_menu_calls.append(True))
     monkeypatch.setattr(desktop, "_set_view_zoom", lambda candidate, level: view_zooms.append((candidate, level)) or level)
     monkeypatch.setattr(desktop.sys, "platform", platform)
     desktop.launch()
@@ -102,6 +153,7 @@ def test_desktop_owns_server_native_picker_and_protects_running_job(tmp_path, mo
     assert created[0][1].startswith("http://127.0.0.1:")
     assert created[0][2]["zoomable"] is True
     assert view_zooms == [(window, 1.2)]
+    assert editing_menu_calls == [True]
     assert len(dialog_calls) == 2
 
 
@@ -245,6 +297,7 @@ def test_desktop_close_protects_unsaved_notes_and_failed_checks(tmp_path, monkey
     monkeypatch.setitem(sys.modules, "webview", SimpleNamespace(create_window=lambda *a, **kw: window, start=start))
     monkeypatch.setattr(desktop, "LocalApp", lambda: app)
     monkeypatch.setattr(desktop, "_configure_tls", lambda: None)
+    monkeypatch.setattr(desktop, "_configure_editing_menu", lambda: None)
     desktop.launch()
     assert dialogs == ["Unsaved notes", "Unable to check unsaved notes", "Unsaved notes"]
 
