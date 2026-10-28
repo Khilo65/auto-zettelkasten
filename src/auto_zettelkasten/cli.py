@@ -294,6 +294,21 @@ def build_parser() -> argparse.ArgumentParser:
     naming_parser.add_argument("--output-price-per-million")
     naming_parser.add_argument("--pricing-identity", default="")
 
+    names_parser = commands.add_parser("community-names", help="Preview or reuse cached two-stage community names; paid generation defaults off.")
+    names_parser.add_argument("--workspace", type=Path, required=True)
+    names_parser.add_argument("--scale", choices=("broad", "default", "fine"), default="default")
+    names_parser.add_argument("--apply", action="store_true", help="Apply only complete, current cached names to matching graph views.")
+    names_parser.add_argument("--cache", type=Path)
+    names_parser.add_argument("--override-root", type=Path)
+    names_parser.add_argument("--provider", default="openai")
+    names_parser.add_argument("--model", default="gpt-6-luna")
+    names_parser.add_argument("--execute", action="store_true", help="Generate missing names only with separate exact naming approval.")
+    names_parser.add_argument("--allow-cloud", action="store_true")
+    names_parser.add_argument("--approval", type=Path)
+    names_parser.add_argument("--input-price-per-million")
+    names_parser.add_argument("--output-price-per-million")
+    names_parser.add_argument("--pricing-identity", default="")
+
     migrate_parser = commands.add_parser("migrate", help="Archive legacy generated maps for the current artifact schema.")
     migrate_parser.add_argument("--workspace", type=Path, required=True)
     migrate_parser.add_argument("--dry-run", action="store_true")
@@ -377,6 +392,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = community_name_manifest(
                 args.workspace, args.community_id, scale=args.scale, execute=args.execute,
                 allow_cloud=args.allow_cloud,
+                approval=_bounded_json(args.approval, max_bytes=65536) if args.approval else None,
+                input_price_per_million=args.input_price_per_million,
+                output_price_per_million=args.output_price_per_million,
+                pricing_identity=args.pricing_identity,
+            )
+        elif args.command == "community-names":
+            from .community_naming_workspace import community_names_manifest
+            from .mapping import _bounded_json
+
+            result = community_names_manifest(
+                args.workspace, scale=args.scale, apply=args.apply, cache_path=args.cache,
+                override_root=args.override_root, provider=args.provider, model=args.model,
+                enabled=args.execute, allow_cloud=args.allow_cloud,
                 approval=_bounded_json(args.approval, max_bytes=65536) if args.approval else None,
                 input_price_per_million=args.input_price_per_million,
                 output_price_per_million=args.output_price_per_million,

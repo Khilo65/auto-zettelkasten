@@ -372,6 +372,17 @@ _CODEX_SOURCE_ROLE = _codex_object(
     {"source_id": _CODEX_STRING, "role": _CODEX_STRING}
 )
 
+TWO_STAGE_COMMUNITY_NAMING_CONTRACTS: Mapping[str, Mapping[str, Any]] = {
+    "community_name_local_v1": _codex_object({"labels": _codex_array(_codex_object({
+        "community_id": _CODEX_STRING, "title": {"type": ["string", "null"]},
+        "scope": {"type": ["string", "null"]},
+    }))}),
+    "community_name_reconciliation_v1": _codex_object({"labels": _codex_array(_codex_object({
+        "community_id": _CODEX_STRING, "title": {"type": ["string", "null"]},
+    }))}),
+}
+
+
 CODEX_OUTPUT_CONTRACTS: Mapping[str, Mapping[str, Any]] = {
     "community_name": _codex_object({"title": _CODEX_STRING}),
     "source_bundle": _codex_object(
@@ -1886,6 +1897,12 @@ class _CapabilityAwareReader:
         )
         return _parse_json_object(raw, label="community name")
 
+    def name_community_stage(
+        self, system_prompt: str, user_prompt: str, *, stage: str, output_tokens: int,
+    ) -> Mapping[str, Any]:
+        """Require a compatible adapter instead of changing a frozen stage's model route."""
+        raise ProviderError("This source reader has no compatible two-stage naming adapter")
+
     @property
     def direct_input_token_budget(self) -> int:
         usable = int(int(self.context_window_tokens or 0) * self.direct_read_fraction)
@@ -3119,6 +3136,97 @@ class _CapabilityAwareReader:
         deadline_seconds: float,
     ) -> Any:
         raise NotImplementedError
+
+
+@dataclass(slots=True)
+class OpenAICommunityNamingReader:
+    """Optional naming-only API adapter; construction cannot read a key or dispatch.
+
+    This is deliberately separate from source generation and its historical
+    provider routes. The caller owns exact request approval and spending admission.
+    """
+
+    model: str = "gpt-6-luna"
+    allow_cloud: bool = False
+    timeout: float = 60.0
+    name: str = field(init=False, default="openai")
+    is_cloud: bool = field(init=False, default=True)
+
+    def __post_init__(self) -> None:
+        if self.model != "gpt-6-luna":
+            raise ValueError("Two-stage API naming requires its verified pinned model")
+        if type(self.allow_cloud) is not bool:
+            raise ValueError("allow_cloud must be a boolean")
+        if (isinstance(self.timeout, bool) or not isinstance(self.timeout, (int, float))
+                or not 0 < self.timeout <= 120):
+            raise ValueError("Naming timeout must be positive and at most 120 seconds")
+
+    def name_community_stage(
+        self, system_prompt: str, user_prompt: str, *, stage: str, output_tokens: int,
+    ) -> Mapping[str, Any]:
+        from .community_naming import _json
+        from .community_naming_pipeline import MAX_INPUT_TOKENS
+        from .framework_http import _direct_https_opener
+
+        limits = {"local": 384, "reconciliation": 1024}
+        if stage not in limits or type(output_tokens) is not int or output_tokens != limits[stage]:
+            raise ProviderError("Invalid two-stage naming output contract")
+        if (not isinstance(system_prompt, str) or not isinstance(user_prompt, str)
+                or not system_prompt.strip() or not user_prompt.strip()):
+            raise ProviderError("Naming prompts must be nonempty text")
+        body = {
+            "model": self.model,
+            "messages": [{"role": "system", "content": system_prompt},
+                         {"role": "user", "content": user_prompt}],
+            "max_completion_tokens": output_tokens, "reasoning_effort": "none",
+            "stream": False, "n": 1, "response_format": {"type": "json_object"},
+            "store": False, "service_tier": "default",
+            "prompt_cache_options": {"mode": "explicit", "ttl": "30m"},
+        }
+        if len(_json(body).encode("utf-8")) + 2048 > MAX_INPUT_TOKENS:
+            raise ProviderError("Naming request exceeds its verified context allowance")
+        if not self.allow_cloud:
+            raise CloudPermissionError("OpenAI naming requires explicit allow_cloud consent")
+        key = os.environ.get("OPENAI_API_KEY")
+        if not key:
+            raise ProviderError("OPENAI_API_KEY is not configured")
+        try:
+            payload = _post_json(
+                "https://api.openai.com/v1/chat/completions", body,
+                headers={"Authorization": f"Bearer {key}"}, timeout=self.timeout,
+                connect_timeout=min(self.timeout, 30.0), response_byte_limit=2 * 1024 * 1024,
+                max_attempts=1, request_opener=_direct_https_opener().open,
+            )
+        except Exception:
+            # Provider error bodies can echo credentials. Never propagate one
+            # through a naming result, cache, CLI diagnostic or exception chain.
+            raise ProviderError("OpenAI naming request failed; no automatic retry") from None
+        if payload.get("model") != self.model or payload.get("service_tier") != "default":
+            raise ProviderError("Naming response changed the pinned model or pricing tier")
+        usage = payload.get("usage")
+        if (not isinstance(usage, Mapping)
+                or type(usage.get("prompt_tokens")) is not int
+                or not 0 <= usage["prompt_tokens"] <= len(_json(body).encode("utf-8")) + 2048
+                or type(usage.get("completion_tokens")) is not int
+                or not 0 <= usage["completion_tokens"] <= output_tokens):
+            raise ProviderError("Naming response usage exceeds its reserved contract")
+        details = usage.get("prompt_tokens_details")
+        if details is not None and (not isinstance(details, Mapping) or details.get("cache_write_tokens", 0) != 0):
+            raise ProviderError("Naming response has unapproved cache-write usage")
+        choices = payload.get("choices")
+        if (not isinstance(choices, list) or len(choices) != 1
+                or not isinstance(choices[0], Mapping)
+                or choices[0].get("finish_reason") != "stop"
+                or not isinstance(choices[0].get("message"), Mapping)
+                or not isinstance(choices[0]["message"].get("content"), str)):
+            raise ProviderError("Naming response is missing or incomplete")
+        try:
+            result = json.loads(choices[0]["message"]["content"])
+        except (ValueError, TypeError) as exc:
+            raise ProviderError("Naming response is not valid JSON") from exc
+        if not isinstance(result, dict):
+            raise ProviderError("Naming response must contain a JSON object")
+        return result
 
 
 @dataclass(slots=True)
@@ -9012,6 +9120,7 @@ def _post_json(
     max_attempts: int = 1,
     on_attempt: Callable[[], None] | None = None,
     response_reader: Callable[[Any, float, int], dict[str, Any]] | None = None,
+    request_opener: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     if timeout <= 0:
         raise ValueError("timeout must be positive")
@@ -9037,7 +9146,7 @@ def _post_json(
         if on_attempt is not None:
             on_attempt()
         try:
-            response = urllib.request.urlopen(
+            response = (request_opener or urllib.request.urlopen)(
                 request, timeout=min(timeout, connect_timeout)
             )
             _set_response_read_timeout(response, timeout)

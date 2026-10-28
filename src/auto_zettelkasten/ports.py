@@ -51,6 +51,19 @@ class CommunityNamingProvider(ReaderProvider, Protocol):
 
 
 @runtime_checkable
+class TwoStageCommunityNamingProvider(Protocol):
+    """Naming-only boundary; no source-reading or mapping permission implied."""
+
+    name: str
+    model: str
+    is_cloud: bool
+
+    def name_community_stage(
+        self, system_prompt: str, user_prompt: str, *, stage: str, output_tokens: int,
+    ) -> Mapping[str, Any]: ...
+
+
+@runtime_checkable
 class HierarchicalReaderProvider(ReaderProvider, Protocol):
     """Optional reader extension for documents that exceed a model context budget."""
 
