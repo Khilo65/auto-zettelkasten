@@ -18,7 +18,7 @@
     graphs: new Map(), graphViews: new WeakMap(), graphLayouts: new Map(), graphSizes: new WeakMap(), graphLabels: new WeakMap(), graphSignatures: new Map(), graphLists: new Set(), graphPositions: new Map(),
     graphCommunities: new Map(),
     graphPreferences: null, graphPreferencesError: "", graphPreferenceWrites: Promise.resolve(), graphLayoutFailures: new Set(),
-    organization: null, organizationMenu: null, organizationRequest: 0, requiresReopen: false,
+    organization: null, organizationMenu: null, organizationRequest: 0, requiresReopen: false, linkExport: null,
   };
 
   function icon(name) {
@@ -47,7 +47,7 @@
   const normalizeText = (text) => text.replace(/\r\n/g, "\n");
   const recoveryKey = (doc) => `az.workspace.draft.${doc.recovery_key}`;
   const workspaceVisible = () => !screen.hidden;
-  const hasBusyWrite = () => state.opening || state.creating || Boolean(state.organization) || [...state.documents.values()].some((doc) => doc.saving);
+  const hasBusyWrite = () => state.opening || state.creating || Boolean(state.organization) || Boolean(state.linkExport?.pending) || [...state.documents.values()].some((doc) => doc.saving);
 
   window.workspaceHasUnsavedChanges = () => hasBusyWrite() || [...state.documents.values()].some((doc) => dirty(doc) || doc.recovery);
 
@@ -1766,8 +1766,96 @@
     el("workspace-file-menu-reason").hidden = !reason;
     el("workspace-file-rename").disabled = Boolean(reason);
     el("workspace-file-move").disabled = Boolean(reason);
+    el("workspace-file-export").disabled = hasBusyWrite() || state.requiresReopen;
     el("workspace-file-menu").showModal();
     el(reason ? "workspace-file-menu-close" : "workspace-file-rename").focus();
+  }
+
+  function exportNotesReason() {
+    if (!state.workspace || state.requiresReopen) return "Open the workspace again before exporting.";
+    if ([...state.documents.values()].some((doc) => dirty(doc) || doc.recovery)) return "Save or review all drafts before exporting.";
+    return "";
+  }
+
+  function renderLinkExport() {
+    const operation = state.linkExport;
+    const pending = Boolean(operation?.pending);
+    for (const id of ["workspace-export-destination", "workspace-export-cap", "workspace-export-preview", "workspace-export-close"]) el(id).disabled = pending;
+    el("workspace-export-apply").disabled = pending || !operation?.preview;
+  }
+
+  function invalidateLinkExport() {
+    if (state.linkExport?.pending) return;
+    if (state.linkExport) state.linkExport.preview = null;
+    el("workspace-export-summary").textContent = "";
+    el("workspace-export-error").textContent = "";
+    renderLinkExport();
+  }
+
+  function closeLinkExport() {
+    if (state.linkExport?.pending) return;
+    const previous = state.linkExport?.previousFocus;
+    state.linkExport = null;
+    el("workspace-export-dialog").close();
+    if (previous?.isConnected) previous.focus();
+  }
+
+  function showLinkExport() {
+    const previousFocus = state.organizationMenu?.previousFocus || document.activeElement;
+    closeFileActions(false);
+    if (hasBusyWrite()) return message("Wait for the current file operation to finish.");
+    const reason = exportNotesReason();
+    if (reason) return message(reason, true);
+    state.linkExport = { epoch: state.epoch, workspaceId: state.workspace.id, previousFocus, pending: false, preview: null };
+    el("workspace-export-destination").value = `${state.workspace.path} linked Markdown`;
+    el("workspace-export-cap").value = "8";
+    invalidateLinkExport();
+    el("workspace-export-dialog").showModal();
+    el("workspace-export-destination").focus();
+  }
+
+  async function requestLinkExport(apply, event) {
+    event?.preventDefault();
+    const operation = state.linkExport;
+    if (!operation || operation.pending || operation.epoch !== state.epoch || operation.workspaceId !== state.workspace?.id || apply && !operation.preview) return;
+    const reason = exportNotesReason();
+    if (reason) {
+      operation.preview = null;
+      el("workspace-export-error").textContent = reason;
+      renderLinkExport();
+      return;
+    }
+    const destination = el("workspace-export-destination").value.trim();
+    if (!destination) { el("workspace-export-error").textContent = "Enter a new export folder."; return; }
+    const degree_cap = Number(el("workspace-export-cap").value);
+    if (apply && (operation.preview.destination !== destination || operation.preview.degree_cap !== degree_cap)) {
+      invalidateLinkExport();
+      return;
+    }
+    const body = { workspace_id: operation.workspaceId, destination, degree_cap,
+      ...(apply ? { preview_identity: operation.preview.preview_identity } : {}) };
+    operation.pending = true;
+    el("workspace-export-error").textContent = "";
+    el("workspace-export-summary").textContent = apply ? "Exporting saved notes…" : "Preparing export preview…";
+    renderLinkExport();
+    try {
+      const result = await api(apply ? "workspace/export-links" : "workspace/export-links-preview", body);
+      if (state.linkExport !== operation || operation.epoch !== state.epoch || operation.workspaceId !== state.workspace?.id) return;
+      if (!(apply ? ["exported", "unchanged"].includes(result.status) : result.status === "preview") || typeof result.preview_identity !== "string" || !result.preview_identity
+          || [result.note_count, result.edge_count, result.override_count].some((value) => !Number.isSafeInteger(value) || value < 0)) throw new Error("The export result could not be verified. Review a fresh preview before trying again.");
+      const summary = `${result.note_count} notes · ${result.edge_count} automatic connections · notes with personal edits: ${result.override_count}${result.stale_source_count ? ` · ${result.stale_source_count} changed notes exported without stale automatic links` : ""}`;
+      operation.preview = apply ? null : { preview_identity: result.preview_identity, destination, degree_cap };
+      el("workspace-export-summary").textContent = apply ? `${summary}. Exported to ${result.destination || destination}.` : `${summary}. Your source notes stay unchanged. Choose Export to create the new folder.`;
+    } catch (error) {
+      if (state.linkExport === operation) {
+        operation.preview = null;
+        el("workspace-export-summary").textContent = "";
+        el("workspace-export-error").textContent = error.message;
+      }
+    } finally {
+      operation.pending = false;
+      if (state.linkExport === operation) renderLinkExport();
+    }
   }
 
   function beginOrganization(action, entry = focusedEntry()) {
@@ -2118,6 +2206,12 @@
   el("workspace-file-actions").addEventListener("click", () => showFileActions());
   el("workspace-file-menu-close").addEventListener("click", () => closeFileActions());
   el("workspace-file-menu").addEventListener("cancel", (event) => { event.preventDefault(); closeFileActions(); });
+  el("workspace-file-export").addEventListener("click", showLinkExport);
+  el("workspace-export-close").addEventListener("click", closeLinkExport);
+  el("workspace-export-dialog").addEventListener("cancel", (event) => { event.preventDefault(); closeLinkExport(); });
+  el("workspace-export-form").addEventListener("submit", (event) => requestLinkExport(false, event));
+  el("workspace-export-apply").addEventListener("click", () => requestLinkExport(true));
+  for (const id of ["workspace-export-destination", "workspace-export-cap"]) el(id).addEventListener(id.endsWith("cap") ? "change" : "input", invalidateLinkExport);
   for (const [id, action] of [["workspace-file-rename", "rename"], ["workspace-file-move", "move"]]) el(id).addEventListener("click", () => {
     const entry = state.workspace?.entries.find((row) => row.path === state.organizationMenu?.path);
     beginOrganization(action, entry);

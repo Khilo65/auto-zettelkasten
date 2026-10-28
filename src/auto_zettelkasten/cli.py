@@ -315,6 +315,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     export_parser = commands.add_parser("export", help="Export generated Markdown projections.")
     export_commands = export_parser.add_subparsers(dest="export_command", required=True)
+    links_parser = export_commands.add_parser("links", help="Preview or export saved notes and automatic links to a separate portable Markdown folder, without provider calls.")
+    links_parser.add_argument("--workspace", type=Path, required=True)
+    links_parser.add_argument("--destination", type=Path, required=True)
+    links_parser.add_argument("--degree-cap", type=int, choices=(2, 4, 8, 16, 32), default=8)
+    links_parser.add_argument("--override-root", type=Path)
+    links_parser.add_argument("--apply", action="store_true")
+    links_parser.add_argument("--preview-identity", help="Exact identity returned by the local preview; required to export.")
     obsidian_parser = export_commands.add_parser("obsidian", help="Export an Obsidian-ready vault projection.")
     obsidian_parser.add_argument("--workspace", type=Path, required=True)
     obsidian_parser.add_argument("--vault", type=Path)
@@ -628,6 +635,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
         elif args.command == "migrate":
             result = migrate_workspace(args.workspace, dry_run=args.dry_run)
+        elif args.command == "export" and args.export_command == "links":
+            from .markdown_link_export import export_markdown_links
+
+            result = export_markdown_links(
+                args.workspace, args.destination, degree_cap=args.degree_cap, apply=args.apply,
+                preview_identity=args.preview_identity, override_root=args.override_root,
+            )
         elif args.command == "export" and args.export_command == "obsidian":
             config = load_config(args.workspace)
             obsidian = config.get("obsidian", {}) if isinstance(config.get("obsidian", {}), dict) else {}

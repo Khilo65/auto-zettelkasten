@@ -406,6 +406,23 @@ class LocalApp:
             if route == "/api/workspace/open":
                 return {"workspace": self.documents.open(data.get("path"))}
             workspace_id = data.get("workspace_id")
+            if route in {"/api/workspace/export-links-preview", "/api/workspace/export-links"}:
+                self._editable()
+                allowed = {"workspace_id", "destination", "degree_cap"}
+                if route == "/api/workspace/export-links":
+                    allowed.add("preview_identity")
+                if set(data) - allowed:
+                    raise RequestError("Unsupported Markdown export options.")
+                from .markdown_link_export import export_markdown_links
+
+                try:
+                    return export_markdown_links(
+                        self.documents.workspace_path(workspace_id), data.get("destination"),
+                        apply=route == "/api/workspace/export-links", preview_identity=data.get("preview_identity"),
+                        degree_cap=data.get("degree_cap", 8), documents=self.documents, workspace_id=workspace_id,
+                    )
+                except (ValueError, OSError) as exc:
+                    raise RequestError(str(exc)) from exc
             if route == "/api/workspace/graph-preferences":
                 key = self.documents.workspace_key(workspace_id)
                 if "preferences" in data:

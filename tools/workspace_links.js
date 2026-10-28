@@ -386,6 +386,11 @@ function parseNote(path, text, budgets, limits) {
     const from = originalStarts[literature[0].map[1]], to = originalStarts[literature[1].map[0]];
     for (const ref of result.references) if (ref.from >= from && ref.to <= to) ref.layer = "citation";
   }
+  const related = result.tokens.filter((token) => token.type === "html_block" && /^<!-- auto-zettelkasten:related:(?:start|end) -->\s*$/.test(token.content) && text.slice(originalStarts[token.map[0]], originalStarts[token.map[0] + 1] ?? text.length).trimEnd() === token.content.trim());
+  if (related.length === 2 && related[0].content.trim() === "<!-- auto-zettelkasten:related:start -->" && related[1].content.trim() === "<!-- auto-zettelkasten:related:end -->") {
+    const from = originalStarts[related[0].map[1]], to = originalStarts[related[1].map[0]];
+    for (const ref of result.references) if (ref.from >= from && ref.to <= to) { ref.layer = "discovery"; ref.origin = "automatic_embedding"; }
+  }
   const markers = result.tokens.filter((token) => token.type === "html_block" && /^<!-- auto-zettelkasten:graph:(?:start|end) -->\s*$/.test(token.content) && text.slice(originalStarts[token.map[0]], originalStarts[token.map[0] + 1] ?? text.length).trimEnd() === token.content.trim());
   if (markers.length === 2 && markers[0].content.trim() === "<!-- auto-zettelkasten:graph:start -->" && markers[1].content.trim() === "<!-- auto-zettelkasten:graph:end -->") {
     const from = originalStarts[markers[0].map[1]];
@@ -1084,7 +1089,7 @@ export function graphData(index, options = {}) {
     let target = resolution.status === "resolved" ? canonical(resolution.path) : null;
     if (resolution.status === "invalid") continue;
     if (ref.relationId && target && projected.has(JSON.stringify([ref.relationId, source, target]))) continue;
-    const layer = navigation(ref.sourcePath) || target && navigation(target) ? "navigation" : ref.layer === "citation" ? "citation" : "reference";
+    const layer = navigation(ref.sourcePath) || target && navigation(target) ? "navigation" : ref.layer === "citation" ? "citation" : ref.layer === "discovery" ? "discovery" : "reference";
     if (!enabled(layer)) continue;
     if (!target) {
       target = `unresolved:${JSON.stringify([resolution.status, fold(resolution.path || resolution.target || ref.destination), resolution.fragment || "", resolution.candidates || []])}`;
@@ -1093,6 +1098,15 @@ export function graphData(index, options = {}) {
     }
     if (layer === "citation") {
       addCitation(source, target, { kind: "managed_markdown", source: ref.sourcePath, line: ref.line, destination: ref.destination, from: ref.from, to: ref.to });
+      continue;
+    }
+    if (layer === "discovery") {
+      const endpoints = [source, target].sort();
+      const id = `discovery:${JSON.stringify([...endpoints, "semantic_similarity"])}`;
+      if (edges.has(id)) edges.get(id).count += 1;
+      else edges.set(id, { id, source: endpoints[0], target: endpoints[1], layer, count: 1,
+        type: "semantic_similarity", derived: true, accepted: false, evidence_backed: false,
+        provenance: { kind: "exported_embedding_link", origin: "automatic_embedding" } });
       continue;
     }
     const id = `${layer}:${JSON.stringify([source, target])}`;
@@ -1111,6 +1125,16 @@ export function graphData(index, options = {}) {
       continue;
     }
     const id = `${layer}:${JSON.stringify([source, target, relation.type])}`;
+    if (layer === "discovery" && relation.type === "semantic_similarity" && relation.derived === true) {
+      const exportedId = `discovery:${JSON.stringify([...[source, target].sort(), "semantic_similarity"])}`;
+      const exported = edges.get(exportedId);
+      if (exported?.provenance?.kind === "exported_embedding_link") {
+        edges.delete(exportedId);
+        edges.set(id, { ...relation, id, source, target, layer, count: exported.count,
+          provenance: { ...relation.provenance, exported_markdown: true } });
+        continue;
+      }
+    }
     if (!edges.has(id)) edges.set(id, { ...relation, id, source, target, layer, count: 1 });
   }
   let allowed = new Set(nodes.keys());

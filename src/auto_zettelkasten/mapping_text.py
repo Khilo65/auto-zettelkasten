@@ -17,6 +17,7 @@ from .indexes import local_retrieval_projection
 from .local_tools import MAX_INDEX_DOCUMENT_BYTES, MAX_INDEX_YAML_NODES, _ReadBudget
 from .notes import (GRAPH_END_MARKER, GRAPH_START_MARKER, LITERATURE_END_MARKER,
                     LITERATURE_START_MARKER, SOURCE_END_MARKER, SOURCE_START_MARKER,
+                    RELATED_END_MARKER, RELATED_START_MARKER, RELATED_HEADING,
                     NOTE_METADATA_SCHEMA_VERSION, parse_atomic_note)
 from .profiles import profile_from_dict, profile_sidecar_path, profile_to_dict
 from .relationships import profile_content_hash, profile_hash_aliases
@@ -39,7 +40,7 @@ _NONBODY = {
     "dedication": "frontmatter", "foreword": "foreword", "endnotes": "endnotes",
     "acknowledgments and funding": "acknowledgments", "acknowledgements and funding": "acknowledgments",
 }
-_MANAGED_MARKERS = {GRAPH_START_MARKER: GRAPH_END_MARKER, LITERATURE_START_MARKER: LITERATURE_END_MARKER, SOURCE_START_MARKER: SOURCE_END_MARKER}
+_MANAGED_MARKERS = {GRAPH_START_MARKER: GRAPH_END_MARKER, LITERATURE_START_MARKER: LITERATURE_END_MARKER, SOURCE_START_MARKER: SOURCE_END_MARKER, RELATED_START_MARKER: RELATED_END_MARKER}
 _BODY_HEADING = re.compile(r"^(?:(?:chapter|part)\s+(?:\d+|[ivxlcdm]+|one|two|three|four|five|six|seven|eight|nine|ten)\b|\d+(?:\.\d+)*[.)]?\s+(?:introduction|background|conclusions?|discussion|results|methods|methodology|findings|appendix)\b)", re.I)
 _BODY_NAMES = {"introduction", "conclusion", "conclusions", "discussion", "results", "methods", "methodology", "findings", "appendix"}
 
@@ -54,6 +55,7 @@ _TEMPLATE_HEADINGS = frozenset({
 _MANAGED_HEADING_MARKERS = {
     "graph links": GRAPH_START_MARKER,
     "position in the literature": LITERATURE_START_MARKER,
+    RELATED_HEADING.removeprefix("## ").casefold(): RELATED_START_MARKER,
 }
 
 

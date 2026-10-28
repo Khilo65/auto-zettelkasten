@@ -99,3 +99,28 @@ To use the existing provider-based mapping compatibility route, explicitly pass
 literature model selection, and spending controls still apply on that route.
 Saved requests from before backend selection existed resume with their
 historical LLM route; new requests and workspace configuration default to local.
+
+## Optional linked Markdown snapshot
+
+In the workspace Files menu, choose **Export linked Markdown…**, select a new
+destination and discovery density, then preview and export. The snapshot copies
+saved effective notes, including personal edit overrides, and puts selected
+embedding links in a separate **Related notes — automatic** section. Existing
+manual links and relationship text are preserved. The snapshot does not copy
+internal registries or embedding caches. The source workspace
+and overrides are never rewritten, and no provider or Zotero calls are made.
+Automatic sections are excluded from embedding inputs. If edited notes have
+stale embeddings, their text is exported but stale automatic links are omitted.
+
+The equivalent CLI previews by default:
+
+```sh
+auto-zettelkasten export links --workspace /path/to/workspace \
+  --destination /path/to/linked-vault --degree-cap 8
+```
+
+Repeat with `--apply --preview-identity ID` using the exact returned preview
+identity. Use `--override-root /path/to/overrides` when the desktop uses a custom
+override location. Existing edited exports are never overwritten; select a new
+destination for an updated snapshot. This optional export does not enable
+automatic synchronization or Jev.

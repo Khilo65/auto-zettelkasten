@@ -104,6 +104,9 @@ REVIEW_STATUS_HEADINGS = ("Automated Validation", "Source-Faithfulness Review")
 GRAPH_HEADING = "## Graph Links"
 GRAPH_START_MARKER = "<!-- auto-zettelkasten:graph:start -->"
 GRAPH_END_MARKER = "<!-- auto-zettelkasten:graph:end -->"
+RELATED_HEADING = "## Related notes — automatic"
+RELATED_START_MARKER = "<!-- auto-zettelkasten:related:start -->"
+RELATED_END_MARKER = "<!-- auto-zettelkasten:related:end -->"
 LITERATURE_HEADING = "## Position in the Literature"
 LITERATURE_START_MARKER = "<!-- auto-zettelkasten:literature:start -->"
 LITERATURE_END_MARKER = "<!-- auto-zettelkasten:literature:end -->"
@@ -773,6 +776,12 @@ def strip_review_status_material(text: str, *, update_versions: bool = False) ->
 
 
 def _strip_generated_note_sections(body: str) -> str:
+    # Exported discovery is navigation, never new source evidence. Reuse the
+    # exporter's strict fenced-code-aware ownership parser when present.
+    if RELATED_START_MARKER in body or RELATED_END_MARKER in body:
+        from .markdown_link_export import strip_related_links
+
+        body = strip_related_links(body)
     body = _strip_review_status_sections(body)
     source = _managed_source_block(body)
     if source:
