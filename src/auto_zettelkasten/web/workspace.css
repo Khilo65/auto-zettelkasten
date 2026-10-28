@@ -64,6 +64,29 @@ body.workspace-active { overflow: hidden; background: var(--workspace-paper); }
 .workspace-document-area { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 #workspace-content.workspace-content { flex: 1; min-width: 0; max-width: none; margin: 0; padding: 0; overflow: auto; position: relative; }
 .workspace-file-title { max-width: 780px; padding: 26px 44px 16px; margin: 0 auto; font-size: 30px; line-height: 1.25; font-weight: 700; letter-spacing: -.025em; overflow-wrap: anywhere; }
+.workspace-title-area { max-width: 780px; margin: 0 auto; }
+.workspace-screen button.workspace-file-title { display: block; width: 100%; border: 0; border-radius: 4px; background: transparent; color: inherit; text-align: left; cursor: text; font-size: 30px; font-weight: 700; line-height: 1.25; }
+button.workspace-file-title:focus-visible { outline: 2px solid var(--workspace-accent, #7555c5); outline-offset: -4px; }
+#workspace-title-form { padding: 26px 44px 16px; }
+#workspace-title-input { width: 100%; font: inherit; font-size: 30px; font-weight: 700; line-height: 1.25; color: inherit; border: 0; border-bottom: 1px solid var(--workspace-accent, #7555c5); background: transparent; }
+.title-actions { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-top: 8px; font-size: 12px; color: var(--workspace-muted, #696573); }
+#workspace-title-error, .property-error { color: #a23546; font-size: 13px; margin: 6px 0; }
+.workspace-properties { max-width: 780px; margin: 0 auto; padding: 0 44px 14px; font-size: 13px; }
+.workspace-properties summary { cursor: pointer; color: var(--workspace-muted, #696573); padding: 6px 0; }
+.property-row { display: grid; grid-template-columns: minmax(90px, 1fr) minmax(0, 2fr) auto; gap: 12px; align-items: baseline; padding: 7px 0; border-bottom: 1px solid var(--workspace-line); }
+.property-key { overflow-wrap: anywhere; color: var(--workspace-muted, #696573); }
+.property-value { white-space: pre-wrap; overflow-wrap: anywhere; }
+.property-owner { font-size: 11px; color: var(--workspace-muted, #696573); }
+.property-row button, .workspace-properties button, .workspace-kind button, .title-actions button { font: inherit; padding: 3px 7px; border: 1px solid var(--workspace-line); border-radius: 4px; background: transparent; color: inherit; cursor: pointer; }
+.property-personal-heading { font-size: 13px; font-weight: 600; margin: 16px 0 4px; }
+.property-edit-form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 0; }
+.property-edit-form input, .property-edit-form select, .property-edit-form textarea { min-width: 0; max-width: 100%; font: inherit; color: inherit; background: var(--workspace-paper, #faf9fc); border: 1px solid var(--workspace-line); border-radius: 4px; padding: 6px 8px; }
+.property-edit-form textarea { width: 100%; min-height: 60px; }
+.workspace-kind { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 6px 18px; border-bottom: 1px solid var(--workspace-line); font-size: 12px; }
+#workspace-kind-label { font-weight: 600; }
+#workspace-kind-description { color: var(--workspace-muted, #696573); }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+@media (max-width: 700px) { #workspace-title-form { padding: 24px 24px 14px; } .workspace-properties { padding-left: 24px; padding-right: 24px; } .property-row { grid-template-columns: minmax(70px, 1fr) minmax(0, 2fr) auto; gap: 6px; } }
 .workspace-editor { min-height: calc(100% - 100px); }
 .workspace-editor .cm-editor { min-height: 100%; font-size: 16px; line-height: 1.7; background: transparent; outline: none; }
 .workspace-editor .cm-scroller { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; overflow: visible; }

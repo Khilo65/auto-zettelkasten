@@ -135,7 +135,7 @@ def _corpus(snapshot, *, instance_id=None, library_id=None):
         fields = document["frontmatter"]
         if counts[sid] > 1:
             sid = "note-" + _sha(document["path"])
-        title = fields.get("title")
+        title = document.get("personal_display_title") or fields.get("title")
         title = title[:1000] if isinstance(title, str) and title.strip() else Path(document["path"]).stem[:1000]
         row = {"source_id": sid, "title": title, "text": text, "content_sha256": _sha(text),
                "note_path": document["path"], "coverage": {**document["source_coverage"],

@@ -19,6 +19,8 @@ import tempfile
 import unicodedata
 from urllib.parse import quote
 
+import yaml
+
 from .documents import DocumentService, MAX_FILE_BYTES
 from .notes import GRAPH_END_MARKER, GRAPH_START_MARKER, RELATED_END_MARKER, RELATED_START_MARKER, RELATED_HEADING
 from .workspace import resolve_workspace
@@ -67,7 +69,7 @@ def _markers(text):
     return result
 
 
-def project_related_links(text, targets, *, source_path=None):
+def project_related_links(text, targets, *, source_path=None, titles=None):
     """Replace only our owned section; preserve authored text and other links."""
     markers = _markers(text)
     related = [row for row in markers if row[0] == "related"]
@@ -79,7 +81,7 @@ def project_related_links(text, targets, *, source_path=None):
             raise ValueError("Nested generated sections cannot be exported.")
     newline = "\r\n" if "\r\n" in text and "\n" not in text.replace("\r\n", "") else "\n"
     lines = [RELATED_START_MARKER, RELATED_HEADING, "", "Semantic similarity, not a claim of agreement.", ""]
-    lines.extend("- " + _link_markup(target, source_path=source_path) for target in targets)
+    lines.extend("- " + _link_markup(target, source_path=source_path, title=(titles or {}).get(target)) for target in targets)
     if not targets:
         lines.append("No automatic connections selected for this export. Unconnected does not mean unrelated.")
     lines.append(RELATED_END_MARKER)
@@ -134,17 +136,112 @@ def _wiki_target(value):
     return str(path.with_suffix(""))
 
 
-def _link_markup(target, *, source_path=None):
+def _link_markup(target, *, source_path=None, title=None):
     path = _relative(target)
+    label = title if isinstance(title, str) and title.strip() else path.stem
     try:
-        return f"[[{_wiki_target(target)}|{path.stem}]]"
+        if any(char in label for char in "|[]\r\n"):
+            raise ValueError("The display title needs Markdown escaping.")
+        return f"[[{_wiki_target(target)}|{label}]]"
     except ValueError:
         # Valid filenames can contain Markdown/wikilink delimiters. An encoded,
         # source-relative Markdown link preserves identity without renaming it.
         parent = str(_relative(source_path).parent) if source_path is not None else "."
         relative = posixpath.relpath(str(path), start=parent)
-        label = re.sub(r"([\\\[\]`*_<>])", r"\\\1", path.stem)
+        label = re.sub(r"([\\\[\]`*_<>])", r"\\\1", label)
         return f"[{label}]({quote(relative, safe='/')})"
+
+
+def _project_personal_metadata(text, title, personal):
+    """Project private labels into a fresh export, never into source Markdown."""
+    if title is None and not personal:
+        return text, None
+    if title is not None and (not isinstance(title, str) or not title.strip() or len(title) > 512
+                              or any(ord(char) < 32 or ord(char) == 127 for char in title)):
+        raise ValueError("Invalid personal export title.")
+    if not isinstance(personal, dict):
+        raise ValueError("Invalid personal export properties.")
+    newline = "\r\n" if "\r\n" in text and "\n" not in text.replace("\r\n", "") else "\n"
+    bom = "\ufeff" if text.startswith("\ufeff") else ""
+    source = text[len(bom):]
+    header = re.match(r"^---\r?\n([\s\S]*?)^(?:---|\.\.\.)[ \t]*(?:\r?\n|$)", source, re.MULTILINE)
+    fields, nodes = {}, {}
+    if source.startswith(("---\n", "---\r\n")) and header is None:
+        raise ValueError("Personal metadata cannot be exported into malformed YAML.")
+    if header:
+        raw = header[1]
+        if len(raw) > 65536:
+            raise ValueError("Export properties exceed the metadata limit.")
+        try:
+            depth = 0
+            for count, event in enumerate(yaml.parse(raw, Loader=yaml.SafeLoader)):
+                if isinstance(event, yaml.AliasEvent) or count > 4096:
+                    raise ValueError("Unsupported export properties.")
+                if isinstance(event, (yaml.MappingStartEvent, yaml.SequenceStartEvent)):
+                    depth += 1
+                    if depth > 32:
+                        raise ValueError("Unsupported export properties.")
+                elif isinstance(event, (yaml.MappingEndEvent, yaml.SequenceEndEvent)):
+                    depth -= 1
+            tree = yaml.compose(raw, Loader=yaml.SafeLoader)
+            fields = yaml.safe_load(raw) or {}
+            if tree is not None and not isinstance(tree, yaml.MappingNode) or not isinstance(fields, dict):
+                raise ValueError("Export properties must be a YAML mapping.")
+            for key, value in tree.value if tree is not None else []:
+                if not isinstance(key, yaml.ScalarNode) or key.tag != "tag:yaml.org,2002:str" or key.value in nodes:
+                    raise ValueError("Export properties contain duplicate or unsupported keys.")
+                nodes[key.value] = key, value
+        except (yaml.YAMLError, RecursionError) as exc:
+            raise ValueError("Personal metadata cannot be exported into malformed YAML.") from exc
+    changes, conflicts = {}, []
+
+    def strings(value):
+        return [value] if isinstance(value, str) else [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
+
+    for key, value in personal.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError("Invalid personal export property name.")
+        valid = isinstance(value, (str, bool)) or type(value) in (int, float) and math.isfinite(value)
+        if isinstance(value, list):
+            valid = all(isinstance(item, str) for item in value)
+        if not valid:
+            raise ValueError("Unsupported personal export property value.")
+        if key in {"tags", "aliases"}:
+            previous = fields.get(key, fields.get("tag" if key == "tags" else "alias"))
+            values = strings(previous) + strings(value)
+            changes[key] = list(dict.fromkeys(item.removeprefix("#") if key == "tags" else item for item in values))
+        elif key in fields:
+            conflicts.append(key)
+        else:
+            changes[key] = value
+    if title is not None:
+        changes["title"] = title
+        changes["aliases"] = list(dict.fromkeys(strings(changes.get("aliases", fields.get("aliases", fields.get("alias")))) + [title]))
+    provenance = {"canonical_title": fields.get("title") if isinstance(fields.get("title"), str) else None, "personal_display_title": title,
+                  "personal_properties": personal, "property_conflicts": sorted(conflicts),
+                  "source_identity": {key: fields[key] for key in ("note_id", "source_id") if isinstance(fields.get(key), str)}}
+    edits, additions = [], []
+    for key, value in sorted(changes.items()):
+        encoded = json.dumps(value, ensure_ascii=False, allow_nan=False)
+        if key in nodes:
+            key_node, value_node = nodes[key]
+            # End at the final scalar, not the collection's trailing comments.
+            last = value_node
+            if isinstance(last, yaml.SequenceNode) and not last.flow_style and last.value:
+                last = last.value[-1]
+            end = last.end_mark.index
+            suffix = newline if header[1][:end].endswith("\n") else ""
+            edits.append((key_node.end_mark.index, end, ": " + encoded + suffix))
+        else:
+            additions.append(json.dumps(key, ensure_ascii=False) + ": " + encoded + newline)
+    if header:
+        projected = header[1]
+        for start, end, replacement in sorted(edits, reverse=True):
+            projected = projected[:start] + replacement + projected[end:]
+        if additions:
+            projected += ("" if not projected or projected.endswith("\n") else newline) + "".join(additions)
+        return bom + source[:header.start(1)] + projected + source[header.end(1):], provenance
+    return bom + "---" + newline + "".join(additions) + "---" + newline + source, provenance
 
 
 def _destination(value, source, override_root):
@@ -199,8 +296,11 @@ def _snapshot(documents, workspace_id, cap):
         text = effective["text"]
         if not isinstance(text, str):
             raise ValueError("Export notes require readable Markdown text.")
-        notes[path] = {"text": ("\ufeff" if effective.get("bom") else "") + text,
-                       "revision": effective["revision"], "override_saved": effective.get("override_saved") is True}
+        text, provenance = _project_personal_metadata(("\ufeff" if effective.get("bom") else "") + text,
+                                                     effective.get("personal_display_title"), effective.get("personal_properties", {}))
+        notes[path] = {"text": text, "display_title": effective.get("display_title") or PurePosixPath(path).stem,
+                       "personal_metadata": provenance, "revision": effective["revision"],
+                       "override_saved": effective.get("override_saved") is True}
     if not notes:
         raise ValueError("No readable notes are available to export.")
     candidates = {}
@@ -234,12 +334,14 @@ def _snapshot(documents, workspace_id, cap):
     for edge in selected:
         neighbors[edge["source"]].append((edge["target"], edge["score"]))
         neighbors[edge["target"]].append((edge["source"], edge["score"]))
-    contents = {path: project_related_links(row["text"], [target for target, _ in sorted(neighbors[path], key=lambda row: (-row[1], row[0]))], source_path=path)
+    titles = {path: row["display_title"] for path, row in notes.items()}
+    contents = {path: project_related_links(row["text"], [target for target, _ in sorted(neighbors[path], key=lambda row: (-row[1], row[0]))], source_path=path, titles=titles)
                 for path, row in sorted(notes.items())}
     if any(len(text.encode("utf-8")) > MAX_FILE_BYTES for text in contents.values()):
         raise ValueError("An exported note would exceed the document size limit.")
     identity = {"notes": notes, "semantic_map": semantic, "relations": snapshot.get("relations", [])}
-    return contents, selected, _digest(identity), sum(row["override_saved"] for row in notes.values()), len(candidates), stale_count
+    personal_metadata = {path: row["personal_metadata"] for path, row in sorted(notes.items()) if row["personal_metadata"] is not None}
+    return contents, selected, _digest(identity), sum(row["override_saved"] for row in notes.values()), len(candidates), stale_count, personal_metadata
 
 
 def _matches_export(target, contents, manifest):
@@ -291,19 +393,22 @@ def export_markdown_links(workspace, destination, *, apply=False, preview_identi
             workspace_id = documents.open(root)["id"]
         elif not workspace_id or Path(documents.workspace_path(workspace_id)) != root:
             raise ValueError("Supply the current document workspace identity.")
-        contents, selected, source_identity, override_count, candidate_count, stale_count = _snapshot(documents, workspace_id, degree_cap)
+        contents, selected, source_identity, override_count, candidate_count, stale_count, personal_metadata = _snapshot(documents, workspace_id, degree_cap)
         file_hashes = {path: hashlib.sha256(text.encode("utf-8")).hexdigest() for path, text in contents.items()}
         identity = _digest({"schema_version": SCHEMA_VERSION, "source": str(root), "destination": str(target),
                             "source_identity": source_identity, "degree_cap": degree_cap, "files": file_hashes})
         manifest = {"schema_version": SCHEMA_VERSION, "preview_identity": identity, "source_identity": source_identity,
                     "source_workspace": str(root), "degree_cap": degree_cap, "links": selected,
-                    "files": file_hashes,
+                    "files": file_hashes, "personal_metadata": personal_metadata,
                     "automatic_link_origin": "local_embedding_similarity", "jev_enabled": False, "provider_calls": 0}
         existing = _matches_export(target, contents, manifest)
         report = {"status": "preview", "applied": False, "preview_identity": identity, "destination": str(target),
                   "note_count": len(contents), "edge_count": len(selected), "candidate_count": candidate_count,
                   "override_count": override_count, "degree_cap": degree_cap, "provider_calls": 0,
-                  "stale_source_count": stale_count,
+                  "stale_source_count": stale_count, "personal_metadata_count": len(personal_metadata),
+                  "personal_title_count": sum(row["personal_display_title"] is not None for row in personal_metadata.values()),
+                  "personal_property_count": sum(len(row["personal_properties"]) for row in personal_metadata.values()),
+                  "personal_property_conflict_count": sum(len(row["property_conflicts"]) for row in personal_metadata.values()),
                   "jev_enabled": False, "source_changed": False,
                   "planned_files": list(contents), "existing_matching_export": existing}
         if not apply:

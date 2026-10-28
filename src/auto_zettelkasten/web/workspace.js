@@ -44,12 +44,15 @@
   const parentPath = (path) => path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
   const basename = (path) => path.slice(path.lastIndexOf("/") + 1);
   const withoutExtension = (name) => name.replace(/\.md$/i, "");
+  const noteTitle = (doc) => doc?.display_title || withoutExtension(doc?.name || basename(doc?.path || ""));
+  const metadataDraft = (doc) => Boolean(doc && (typeof doc.titleDraft === "string" && doc.titleDraft !== noteTitle(doc) || doc.propertyDraft));
+  const titleAt = (path) => noteTitle(state.documents.get(path) || state.linkIndex?.documents.get(path) || state.workspace?.entries.find((row) => row.path === path) || { path });
   const normalizeText = (text) => text.replace(/\r\n/g, "\n");
   const recoveryKey = (doc) => `az.workspace.draft.${doc.recovery_key}`;
   const workspaceVisible = () => !screen.hidden;
   const hasBusyWrite = () => state.opening || state.creating || Boolean(state.organization) || Boolean(state.linkExport?.pending) || [...state.documents.values()].some((doc) => doc.saving);
 
-  window.workspaceHasUnsavedChanges = () => hasBusyWrite() || [...state.documents.values()].some((doc) => dirty(doc) || doc.recovery);
+  window.workspaceHasUnsavedChanges = () => hasBusyWrite() || [...state.documents.values()].some((doc) => dirty(doc) || doc.recovery || metadataDraft(doc));
 
   function storageFailure(error) {
     state.recoveryError = "Local recovery is unavailable. Save your notes before closing this app.";
@@ -219,7 +222,184 @@
     el("workspace-empty-create").hidden = !writable;
     el("workspace-tree-note").hidden = !workspace.truncated;
     el("workspace-tree-note").textContent = "This folder has more entries than can be shown. Open a smaller folder.";
-    renderTree(); renderOrganizationControl();
+    renderWorkspaceKind(); renderTree(); renderOrganizationControl();
+  }
+
+  function renderWorkspaceKind() {
+    const workspace = state.workspace, kind = workspace?.workspace_kind;
+    el("workspace-kind").hidden = !workspace;
+    el("workspace-kind-label").textContent = kind === "markdown_export" ? "Markdown export" : kind === "mapped" ? "Mapped workspace" : "Markdown folder";
+    const mapping = workspace?.mapping_status;
+    el("workspace-kind-description").textContent = kind === "markdown_export"
+      ? "This Markdown export contains links but not saved communities."
+      : workspace?.export_status === "invalid" ? "Export metadata could not be read. No source folder was opened."
+      : mapping === "invalid" || mapping === "unavailable" ? "Saved community data could not be read."
+      : kind === "mapped" ? "Community data and links belong to this workspace." : "No saved community map in this folder.";
+    const source = workspace?.source_workspace;
+    el("workspace-open-mapped").hidden = kind !== "markdown_export" || typeof source !== "string" || !source;
+    el("workspace-open-mapped").title = source || "";
+  }
+
+  function renderTitle(doc) {
+    const editing = typeof doc.titleDraft === "string";
+    el("workspace-title-area").hidden = false;
+    el("workspace-file-title").hidden = editing;
+    el("workspace-file-title").textContent = noteTitle(doc);
+    el("workspace-file-title").disabled = !canEdit(doc) || Boolean(doc.recovery) || state.requiresReopen;
+    el("workspace-file-title").setAttribute("aria-label", `Edit title: ${noteTitle(doc)}`);
+    el("workspace-title-form").hidden = !editing;
+    if (editing && el("workspace-title-input").value !== doc.titleDraft) el("workspace-title-input").value = doc.titleDraft;
+    el("workspace-title-input").disabled = doc.saving;
+    el("workspace-title-reset").hidden = !doc.override_available || !doc.personal_display_title;
+    el("workspace-title-reset").disabled = doc.saving;
+    el("workspace-title-error").textContent = doc.titleError || "";
+  }
+
+  function beginTitle() {
+    const doc = active();
+    if (!doc || !canEdit(doc) || doc.recovery || hasBusyWrite() || state.requiresReopen) return;
+    doc.titleDraft = noteTitle(doc); doc.titleError = "";
+    renderTitle(doc); el("workspace-title-input").focus(); el("workspace-title-input").select();
+  }
+
+  async function savePersonalMetadata(doc, patch) {
+    if (dirty(doc) || doc.recovery) throw new Error("Save or discard body changes before changing personal metadata.");
+    if (hasBusyWrite() || state.requiresReopen) throw new Error("Wait for the current file operation to finish.");
+    const epoch = state.epoch, workspaceId = state.workspace.id;
+    doc.saving = true; if (active() === doc) renderDocumentStatus();
+    try {
+      const { document: saved } = await api("workspace/save-personal-metadata", { workspace_id: workspaceId, document_id: doc.id, revision: doc.revision, ...patch });
+      if (epoch !== state.epoch || state.documents.get(doc.path) !== doc) return false;
+      if (saved.path !== doc.path || saved.id !== doc.id || normalizeText(saved.text) !== doc.savedText) throw new Error("The metadata result changed the note body or identity. Reopen the note before retrying.");
+      applyDocumentPolicy(doc, saved); doc.revision = saved.revision; doc.savedText = normalizeText(saved.text);
+      rememberDocument(saved, true);
+      const entry = state.workspace.entries.find((row) => row.path === doc.path);
+      if (entry) Object.assign(entry, { display_title: saved.display_title });
+      persistDraft(doc); renderTree();
+      return true;
+    } catch (error) {
+      if (epoch === state.epoch && error.status === 409 && error.current) {
+        doc.external = error.current;
+        message("This note changed. Review its disk version before saving personal metadata.", true);
+      }
+      throw error;
+    } finally { doc.saving = false; if (epoch === state.epoch && active() === doc) renderDocumentStatus(); }
+  }
+
+  async function commitTitle(reset = false) {
+    const doc = active(); if (!doc || typeof doc.titleDraft !== "string") return;
+    try {
+      const title = el("workspace-title-input").value.trim(); doc.titleDraft = title;
+      if (!reset && (!title || title.length > 512 || /[\x00-\x1f\x7f]/.test(title))) throw new Error("Enter a title on one line, up to 512 characters.");
+      if (dirty(doc) || doc.recovery) throw new Error("Save or discard body changes before changing the title.");
+      if (doc.override_available) {
+        if (!await savePersonalMetadata(doc, { display_title: reset ? null : title })) return;
+        doc.titleDraft = null; doc.titleError = ""; renderActive(); el("workspace-file-title").focus();
+      } else {
+        const entry = state.workspace.entries.find((row) => row.path === doc.path);
+        const reason = organizationReason(entry); if (reason) throw new Error(reason);
+        if (title === withoutExtension(doc.name)) { doc.titleDraft = null; renderTitle(doc); return; }
+        beginOrganization("rename", entry);
+        if (!state.organization) throw new Error("The rename review could not be opened.");
+        doc.titleDraft = null; doc.titleError = "";
+        el("workspace-rename-name").value = /\.md$/i.test(title) ? title : `${title}.md`;
+        await previewOrganization({ preventDefault() {} });
+      }
+    } catch (error) { doc.titleError = error.message; if (active() === doc) renderTitle(doc); }
+  }
+
+  function propertyValue(value) {
+    if (typeof value === "string") return value;
+    if (Array.isArray(value)) return value.join(", ");
+    return value === null ? "Empty" : typeof value === "object" ? JSON.stringify(value) : String(value);
+  }
+
+  function renderProperties(doc) {
+    const panel = el("workspace-properties");
+    panel.hidden = doc.mode === "source";
+    if (panel.hidden || !kit.inspectProperties) return;
+    const inspected = kit.inspectProperties(textOf(doc));
+    const signature = JSON.stringify([textOf(doc), doc.personal_properties, doc.property_conflicts, doc.propertyDraft, doc.propertyError, doc.propertiesOpen, doc.override_available, doc.editable]);
+    if (panel.dataset.signature === signature && panel.dataset.path === doc.path) return;
+    panel.dataset.signature = signature; panel.dataset.path = doc.path; panel.replaceChildren();
+    const details = document.createElement("details"); details.open = doc.propertiesOpen ?? false;
+    const summary = document.createElement("summary"); summary.textContent = `Properties${inspected.rows.length ? ` · ${inspected.rows.length}` : ""}`;
+    details.append(summary); details.addEventListener("toggle", () => { doc.propertiesOpen = details.open; });
+    if (inspected.error) {
+      const notice = document.createElement("p"); notice.className = "property-error"; notice.textContent = `${inspected.error} Use Source mode to inspect the YAML.`; details.append(notice);
+      const pre = document.createElement("pre"); pre.textContent = inspected.frontmatter?.text || ""; details.append(pre);
+    }
+    const appendRow = (row, personal = false) => {
+      const line = document.createElement("div"); line.className = "property-row";
+      const key = document.createElement("span"); key.className = "property-key"; key.textContent = row.key;
+      const value = document.createElement("span"); value.className = "property-value"; value.textContent = propertyValue(row.value).slice(0, 600); value.title = propertyValue(row.value);
+      const controls = document.createElement("span");
+      const editable = personal || doc.editable && row.editable !== false && !inspected.error;
+      if (editable) {
+        const edit = document.createElement("button"); edit.type = "button"; edit.textContent = "Edit"; edit.setAttribute("aria-label", `Edit property ${row.key}${personal ? " (personal)" : ""}`);
+        edit.addEventListener("click", () => { doc.propertyDraft = { key: row.key, value: row.value, type: row.type, personal, existing: true }; doc.propertyError = ""; renderProperties(doc); panel.querySelector(".property-edit-form input")?.focus(); }); controls.append(edit);
+      } else { const owner = document.createElement("span"); owner.className = "property-owner"; owner.textContent = "Source"; controls.append(owner); }
+      line.append(key, value, controls); details.append(line);
+    };
+    if (!inspected.error) inspected.rows.forEach((row) => appendRow(row));
+    if (doc.override_available) {
+      const heading = document.createElement("h3"); heading.className = "property-personal-heading"; heading.textContent = "Personal properties"; details.append(heading);
+      for (const [key, value] of Object.entries(doc.personal_properties || {})) appendRow({ key, value, type: kit.propertyType(value, key) }, true);
+      if (doc.property_conflicts?.length) { const warning = document.createElement("p"); warning.className = "property-error"; warning.textContent = `Personal values conflict with source fields and do not replace them: ${doc.property_conflicts.join(", ")}`; details.append(warning); }
+    }
+    if ((doc.editable && !inspected.error || doc.override_available) && !doc.recovery) {
+      const add = document.createElement("button"); add.type = "button"; add.textContent = doc.override_available ? "Add personal property" : "Add property";
+      add.addEventListener("click", () => { doc.propertyDraft = { key: "", value: "", type: "text", personal: Boolean(doc.override_available), existing: false }; doc.propertiesOpen = true; doc.propertyError = ""; renderProperties(doc); panel.querySelector(".property-edit-form input")?.focus(); }); details.append(add);
+    }
+    if (doc.propertyDraft) { details.open = true; renderPropertyForm(doc, details, inspected); }
+    panel.append(details);
+  }
+
+  function renderPropertyForm(doc, details, inspected) {
+    const draft = doc.propertyDraft, form = document.createElement("form"); form.className = "property-edit-form";
+    const key = document.createElement("input"); key.type = "text"; key.placeholder = "Property name"; key.setAttribute("aria-label", "Property name"); key.value = draft.key; key.required = true; key.disabled = draft.existing;
+    const type = document.createElement("select"); type.setAttribute("aria-label", "Property type");
+    for (const [name, label] of [["text", "Text"], ["list", "List"], ["tags", "Tags"], ["number", "Number"], ["checkbox", "Checkbox"], ["date", "Date"], ["datetime", "Date and time"]]) { const option = document.createElement("option"); option.value = name; option.textContent = label; type.append(option); }
+    type.value = draft.type || "text";
+    const value = document.createElement("textarea"); value.setAttribute("aria-label", "Property value"); value.value = Array.isArray(draft.value) ? draft.value.join("\n") : String(draft.value ?? "");
+    const help = document.createElement("small"); help.textContent = "Lists and tags: one value per line. Checkbox: true or false. Dates: YYYY-MM-DD.";
+    const keepDraft = () => { draft.key = key.value; draft.type = type.value; draft.value = value.value; };
+    key.addEventListener("input", keepDraft); type.addEventListener("change", keepDraft); value.addEventListener("input", keepDraft);
+    const save = document.createElement("button"); save.type = "submit"; save.textContent = "Apply property";
+    const cancel = document.createElement("button"); cancel.type = "button"; cancel.textContent = "Cancel"; cancel.addEventListener("click", () => { doc.propertyDraft = null; doc.propertyError = ""; renderProperties(doc); });
+    const commit = async (remove = false) => {
+      keepDraft();
+      try {
+        let parsed = value.value;
+        if (!remove) {
+          if (["list", "tags"].includes(type.value)) parsed = parsed.split("\n").map((part) => part.trim()).filter(Boolean);
+          if (type.value === "number") { if (!parsed.trim() || !Number.isFinite(Number(parsed))) throw new Error("Enter a finite number."); parsed = Number(parsed); }
+          if (type.value === "checkbox") { if (!["true", "false"].includes(parsed.trim())) throw new Error("Enter true or false."); parsed = parsed.trim() === "true"; }
+          if (type.value === "date" && (!/^\d{4}-\d{2}-\d{2}$/.test(parsed) || Number.isNaN(Date.parse(parsed)) || new Date(parsed).toISOString().slice(0, 10) !== parsed)) throw new Error("Enter a valid date as YYYY-MM-DD.");
+          if (type.value === "datetime" && (!/^\d{4}-\d{2}-\d{2}T/.test(parsed) || Number.isNaN(Date.parse(parsed)))) throw new Error("Enter an ISO date and time.");
+        }
+        if (!key.value.trim()) throw new Error("Enter a property name.");
+        if (draft.personal) {
+          if (inspected.rows.some((row) => row.key === key.value.trim()) && !["tags", "aliases"].includes(key.value.trim()) && !remove) throw new Error("Personal fields cannot replace generated source properties.");
+          const properties = { ...doc.personal_properties };
+          if (remove) delete properties[key.value.trim()]; else properties[key.value.trim()] = parsed;
+          if (!await savePersonalMetadata(doc, { personal_properties: properties })) return;
+        } else {
+          if (!canEdit(doc) || doc.recovery || hasBusyWrite()) throw new Error("Wait for the current file operation to finish.");
+          const text = kit.patchProperty(textOf(doc), key.value.trim(), parsed, { remove, type: type.value });
+          // One editor transaction keeps the property change undoable with the body.
+          const change = { changes: { from: 0, to: doc.editorState.doc.length, insert: text }, userEvent: "input" };
+          if (state.view && active() === doc) state.view.dispatch(change); else doc.editorState = doc.editorState.update(change).state;
+          persistDraft(doc); scheduleLinks();
+        }
+        doc.propertyDraft = null; doc.propertyError = ""; renderActive();
+      } catch (error) { doc.propertyError = error.message; errorBox.textContent = error.message; }
+    };
+    form.addEventListener("submit", (event) => { event.preventDefault(); commit(); });
+    form.addEventListener("keydown", (event) => { if (event.key === "Escape") { event.preventDefault(); cancel.click(); } });
+    form.append(key, type, value, help, save, cancel);
+    if (draft.existing) { const remove = document.createElement("button"); remove.type = "button"; remove.textContent = "Remove property"; remove.addEventListener("click", () => commit(true)); form.append(remove); }
+    const errorBox = document.createElement("p"); errorBox.className = "property-error"; errorBox.setAttribute("role", "alert"); errorBox.textContent = doc.propertyError || ""; form.append(errorBox); details.append(form);
   }
 
   function visibleEntries() {
@@ -275,7 +455,7 @@
       }
       const fileIcon = icon(entry.kind === "directory" ? (state.expanded.has(entry.path) ? "FolderOpen" : "Folder") : "FileText");
       const name = document.createElement("span"); name.className = "tree-label";
-      name.textContent = entry.kind === "file" ? withoutExtension(entry.name) : entry.name;
+      name.textContent = entry.kind === "file" ? noteTitle(entry) : entry.name;
       row.append(disclosure, fileIcon, name);
       row.addEventListener("focus", () => { state.treeFocus = entry.path; renderOrganizationControl(); });
       row.addEventListener("click", () => {
@@ -333,12 +513,17 @@
     }
   }
 
-  function rememberDocument(value) {
+  function rememberDocument(value, metadataOnly = false) {
     if (!state.snapshot) state.snapshot = { documents: [], relations: [], warnings: [] };
     const previous = state.snapshot.documents.find((doc) => doc.path === value.path);
     state.snapshot.documents = state.snapshot.documents.filter((doc) => doc.path !== value.path);
     const record = { ...previous, ...value, text: normalizeText(value.text) };
-    if (previous && previous.revision !== value.revision) state.snapshot.document_identities = (state.snapshot.document_identities || []).filter((identity) => ![identity.canonical_path, ...identity.path_aliases].includes(value.path));
+    if (previous && previous.revision !== value.revision) {
+      if (!metadataOnly) state.snapshot.document_identities = (state.snapshot.document_identities || []).filter((identity) => ![identity.canonical_path, ...identity.path_aliases].includes(value.path));
+      else if (state.snapshot.semantic_map?.note_revisions?.[value.path] === previous.revision) {
+        state.snapshot.semantic_map = { ...state.snapshot.semantic_map, note_revisions: { ...state.snapshot.semantic_map.note_revisions, [value.path]: value.revision } };
+      }
+    }
     state.snapshot.documents.push(state.snapshot.library ? kit.parseLibraryDocument(record) : record);
     rebuildLinks();
   }
@@ -356,7 +541,7 @@
       return !doc || !dirty(doc) && doc.revision === documents.get(path)?.revision;
     }));
     for (const [path, value] of state.previewDocuments) if (documents.has(path)) documents.set(path, { ...documents.get(path), ...value });
-    for (const doc of state.documents.values()) documents.set(doc.path, { ...documents.get(doc.path), path: doc.path, text: textOf(doc), revision: doc.revision, editable: doc.editable });
+    for (const doc of state.documents.values()) documents.set(doc.path, { ...documents.get(doc.path), ...doc, text: textOf(doc) });
     const ordered = [...documents.values()].sort((a, b) => Number(b.path === state.active) - Number(a.path === state.active) || a.path.localeCompare(b.path));
     let semantic = state.snapshot?.semantic_map;
     const editedSources = new Set();
@@ -540,6 +725,13 @@
     };
   }
 
+  class CoverageNoticeWidget extends (kit?.WidgetType || class {}) {
+    constructor(summary) { super(); this.summary = summary; }
+    eq(other) { return other.summary === this.summary; }
+    toDOM() { const node = document.createElement("span"); node.className = "live-coverage-notice"; node.textContent = this.summary; return node; }
+    ignoreEvent() { return false; }
+  }
+
   class NoteLinkWidget extends (kit?.WidgetType || class {}) {
     constructor(reference, embed) { super(); this.reference = reference; this.embed = embed; this.key = `${state.indexVersion}:${reference.sourcePath}:${reference.from}:${reference.destination}`; }
     eq(other) { return other.key === this.key; }
@@ -606,7 +798,7 @@
       if (!groups.length) { const p = document.createElement("p"); p.className = "context-empty"; p.textContent = "No linked mentions yet."; container.append(p); }
       for (const group of groups) {
         const details = document.createElement("details"); details.open = true; details.className = "backlink-group";
-        const summary = document.createElement("summary"); summary.textContent = `${withoutExtension(basename(group.path))} · ${group.count}`; summary.title = group.path;
+        const summary = document.createElement("summary"); summary.textContent = `${titleAt(group.path)} · ${group.count}`; summary.title = group.path;
         details.append(summary);
         for (const occurrence of group.occurrences) {
           const button = document.createElement("button"); button.type = "button"; button.className = "backlink-occurrence";
@@ -865,7 +1057,8 @@
     const current = state.graphCommunities.get(mode), select = graphControl(mode, "community"), panel = graphControl(mode, "community-panel");
     const communities = kit.graphCommunities(data, scale), selected = communities.find((row) => row.community_id === current.selected);
     select.replaceChildren();
-    for (const row of [{ community_id: "", label: communities.length ? "All communities" : "No saved communities" }, ...communities]) {
+    const communityEmpty = state.indexing ? "Loading communities…" : state.workspace?.mapping_status === "invalid" ? "Community data unavailable" : state.snapshot?.semantic_map?.status === "partial" ? "Communities are partial" : "No saved communities";
+    for (const row of [{ community_id: "", label: communities.length ? "All communities" : communityEmpty }, ...communities]) {
       const option = document.createElement("option"); option.value = row.community_id; option.textContent = `${row.label}${row.members ? ` (${row.members.length})` : ""}`; select.append(option);
     }
     select.disabled = !communities.length;
@@ -904,7 +1097,7 @@
     ensureGraphControls(mode); populateGraphChoices(mode); renderIndexStatus();
     const local = mode === "local", path = local ? state.localPinned || active()?.path : active()?.path;
     if (local) {
-      graphControl(mode, "title").textContent = path ? `Graph of ${withoutExtension(basename(path))}` : "Local graph";
+      graphControl(mode, "title").textContent = path ? `Graph of ${titleAt(path)}` : "Local graph";
       graphControl(mode, "context").textContent = state.localPinned ? "Pinned to this note" : "Linked to active note";
       graphControl(mode, "pin").setAttribute("aria-pressed", String(Boolean(state.localPinned)));
       graphControl(mode, "pin").setAttribute("aria-label", state.localPinned ? "Unpin local graph" : "Pin local graph");
@@ -1103,6 +1296,13 @@
     });
   }
 
+  function propertyDecorations(editorState, doc) {
+    if (doc.mode !== "live" || !kit.inspectProperties) return kit.Decoration.none;
+    const properties = kit.inspectProperties(editorState.doc.toString());
+    if (properties.error || !properties.frontmatter) return kit.Decoration.none;
+    return kit.Decoration.set([kit.Decoration.replace({ block: true }).range(properties.frontmatter.from, properties.frontmatter.to)]);
+  }
+
   function liveDecorations(view, doc) {
     if (doc.mode !== "live") return kit.Decoration.none;
     const decorations = [];
@@ -1112,6 +1312,13 @@
     const outsideSelection = (from, to) => to < activeFrom || from > activeTo;
     kit.syntaxTree(view.state).iterate({ enter(node) {
       const name = node.name;
+      if (name === "Blockquote") {
+        const summary = kit.compactCoverageNotice?.(view.state.doc.sliceString(node.from, node.to));
+        const first = view.state.doc.lineAt(node.from), last = view.state.doc.lineAt(node.to - 1);
+        if (summary && last.number === first.number + 1 && last.text.startsWith("> ") && outsideSelection(last.from, last.to)) {
+          decorations.push(kit.Decoration.replace({ widget: new CoverageNoticeWidget(summary) }).range(last.from + 2, last.to));
+        }
+      }
       if (/^ATXHeading[1-6]$/.test(name)) decorations.push(kit.Decoration.line({ class: `live-heading live-h${name.slice(-1)}` }).range(view.state.doc.lineAt(node.from).from));
       if (name === "HeaderMark") decorations.push(kit.Decoration.mark({ class: "live-source-mark" }).range(node.from, node.to));
       if (name === "FencedCode") {
@@ -1153,7 +1360,7 @@
           kit.EditorState.readOnly.of(!canEdit(doc) || Boolean(doc.recovery)),
           kit.EditorView.editable.of(canEdit(doc) && !doc.recovery),
         ]),
-        doc.identityAttributes.of(kit.EditorView.contentAttributes.of({ "aria-label": `Edit ${doc.name}`, spellcheck: "true" })),
+        doc.identityAttributes.of(kit.EditorView.contentAttributes.of({ "aria-label": `Edit ${noteTitle(doc)}`, spellcheck: "true" })),
         kit.Prec.highest(kit.keymap.of([
           { key: "Mod-s", run: () => { saveDocument(doc); return true; } },
           { key: "Mod-b", run: (view) => formatSelection(view, "**") },
@@ -1162,6 +1369,11 @@
           ...(kit.indentWithTab ? [kit.indentWithTab] : []),
         ])),
         preview,
+        kit.StateField.define({
+          create: (editorState) => propertyDecorations(editorState, doc),
+          update: (value, transaction) => propertyDecorations(transaction.state, doc),
+          provide: (field) => kit.EditorView.decorations.from(field),
+        }),
         kit.StateField.define({
           create: (editorState) => linkDecorations(editorState, doc),
           update: (value, transaction) => linkDecorations(transaction.state, doc),
@@ -1172,7 +1384,7 @@
           if (update.docChanged && !doc.ignoreChanges) {
             persistDraft(doc);
             scheduleLinks();
-            if (state.active === doc.path) { renderTabs(); renderDocumentStatus(); renderOutline(); }
+            if (state.active === doc.path) { renderTabs(); renderDocumentStatus(); renderOutline(); renderProperties(doc); }
           }
         }),
       ],
@@ -1276,11 +1488,11 @@
         wrapper.append(button, close);
       }
       const selected = doc ? doc.path === state.active && !state.graphActive : state.graphActive;
-      const button = wrapper.firstElementChild, close = wrapper.lastElementChild, name = doc?.name || "Graph view";
+      const button = wrapper.firstElementChild, close = wrapper.lastElementChild, name = doc ? doc.personal_display_title || doc.name : "Graph view";
       wrapper.dataset.path = doc?.path || ""; wrapper.classList.toggle("active", selected);
       button.setAttribute("aria-selected", String(selected)); button.tabIndex = selected ? 0 : -1;
       button.title = doc?.path || name;
-      const title = doc ? withoutExtension(name) + (dirty(doc) ? " •" : "") : name;
+      const title = doc ? noteTitle(doc) + (dirty(doc) ? " •" : "") : name;
       if (button.textContent !== title) button.textContent = title;
       button.setAttribute("aria-label", `${name}${dirty(doc) ? ", unsaved" : ""}`);
       close.setAttribute("aria-label", `Close ${name}`); close.title = `Close ${name}`;
@@ -1296,7 +1508,7 @@
     const focused = el("workspace-tabs").contains(document.activeElement);
     if (doc.saving) return message("Wait for this note to finish saving.");
     const epoch = state.epoch;
-    if (dirty(doc) || doc.recovery) {
+    if (dirty(doc) || doc.recovery || metadataDraft(doc)) {
       const accepted = await confirmAction(`Close ${doc.name}?`, "This note has unsaved changes. Recovery is available on reload in this browser session. Save first to keep changes across app restarts.", "Close without saving");
       if (!accepted || epoch !== state.epoch || state.documents.get(doc.path) !== doc || doc.saving) return;
     }
@@ -1337,12 +1549,12 @@
     if (!doc) {
       el("workspace-context").hidden = true;
       el("workspace-policy").hidden = true; el("workspace-recovery").hidden = true; el("workspace-conflict").hidden = true;
+      el("workspace-title-area").hidden = true; el("workspace-properties").hidden = true;
       el("workspace-file-title").hidden = true; el("workspace-outline-items").replaceChildren();
       el("workspace-save-state").textContent = state.workspace ? "No note selected" : "Markdown workspace";
       el("workspace-counts").textContent = ""; renderTree(); return;
     }
-    el("workspace-file-title").hidden = false;
-    el("workspace-file-title").textContent = withoutExtension(doc.name);
+    renderTitle(doc); renderProperties(doc);
     el("workspace-breadcrumbs").textContent = doc.path.split("/").map(withoutExtension).join(" / ");
     el("workspace-breadcrumbs").title = doc.path;
     renderDocumentPolicy(doc);
@@ -1361,7 +1573,7 @@
   function renderDocumentPolicy(doc) {
     el("workspace-policy").hidden = state.graphActive || canEdit(doc) && !doc.override_available && !state.requiresReopen;
     el("workspace-policy").textContent = state.requiresReopen ? "Reopen this folder before editing. The last file operation could not be verified." : doc.override_available
-      ? `${doc.source_changed ? "The generated note changed. Your personal edits are preserved." : "Personal edits are saved separately from the generated note."} Only the note body can be saved.${doc.mode === "reading" ? " Choose Source or Live Preview to edit." : ""}`
+      ? `${doc.source_changed ? "The generated note changed. Your personal edits are preserved." : "Your body edits, title and personal properties are saved privately."} Source identity stays protected.${doc.mode === "reading" ? " Choose Source or Live Preview to edit the body." : ""}`
       : doc.reason || "This generated note is read-only. Its metadata and generated content are managed by the research engine.";
   }
 
@@ -1395,6 +1607,7 @@
   function renderReading(doc) {
     const indexed = state.linkIndex?.documents.get(doc.path)?.text === textOf(doc);
     el("workspace-reader").innerHTML = kit.renderMarkdown(textOf(doc), indexed ? { index: state.linkIndex, path: doc.path } : undefined);
+    el("workspace-reader").querySelector(":scope > .markdown-properties")?.remove();
     for (const anchor of el("workspace-reader").querySelectorAll('a:not([data-note-destination])')) anchor.setAttribute("rel", "noopener noreferrer");
     hydrateEmbeds();
   }
@@ -1468,7 +1681,10 @@
     const changed = doc.editable !== value.editable || doc.reason !== value.reason
       || ["override_available", "override_saved", "source_changed"].some((key) => Boolean(doc[key]) !== Boolean(value[key]));
     doc.editable = value.editable; doc.reason = value.reason;
-    for (const key of ["override_available", "override_saved", "source_changed", "source_revision"]) doc[key] = value[key];
+    for (const key of ["override_available", "override_saved", "source_changed", "source_revision", "display_title", "personal_display_title", "personal_properties", "property_ownership", "property_conflicts", "effective_tags", "effective_aliases"]) doc[key] = value[key];
+    const identity = doc.identityAttributes.reconfigure(kit.EditorView.contentAttributes.of({ "aria-label": `Edit ${noteTitle(doc)}`, spellcheck: "true" }));
+    if (active() === doc && state.view) state.view.dispatch({ effects: identity });
+    else doc.editorState = doc.editorState.update({ effects: identity }).state;
     doc.bom = value.bom; doc.newline = value.newline;
     if (changed) {
       const effects = doc.editability.reconfigure([
@@ -1687,7 +1903,7 @@
       const button = document.createElement("button"); button.type = "button"; button.setAttribute("role", "option");
       button.id = `workspace-quick-result-${index}`; button.setAttribute("aria-selected", String(index === state.quickIndex));
       const name = document.createElement("span"), path = document.createElement("small");
-      name.textContent = entry.alias || withoutExtension(entry.name || basename(entry.path)); path.textContent = entry.path;
+      name.textContent = entry.alias || entry.display_title || withoutExtension(entry.name || basename(entry.path)); path.textContent = entry.path;
       button.append(name, path);
       if (entry.excerpt) { const excerpt = document.createElement("small"); excerpt.className = "quick-excerpt"; excerpt.textContent = entry.excerpt.slice(0, 240); button.append(excerpt); }
       button.addEventListener("click", () => { closeQuickOpen(); openDocument(entry.path); }); list.append(button);
@@ -1843,7 +2059,7 @@
       if (state.linkExport !== operation || operation.epoch !== state.epoch || operation.workspaceId !== state.workspace?.id) return;
       if (!(apply ? ["exported", "unchanged"].includes(result.status) : result.status === "preview") || typeof result.preview_identity !== "string" || !result.preview_identity
           || [result.note_count, result.edge_count, result.override_count].some((value) => !Number.isSafeInteger(value) || value < 0)) throw new Error("The export result could not be verified. Review a fresh preview before trying again.");
-      const summary = `${result.note_count} notes · ${result.edge_count} automatic connections · notes with personal edits: ${result.override_count}${result.stale_source_count ? ` · ${result.stale_source_count} changed notes exported without stale automatic links` : ""}`;
+      const summary = `${result.note_count} notes · ${result.edge_count} automatic connections · notes with personal edits: ${result.override_count}${result.personal_metadata_count ? ` · ${result.personal_title_count || 0} personal titles and ${result.personal_property_count || 0} personal properties included` : ""}${result.personal_property_conflict_count ? ` · ${result.personal_property_conflict_count} conflicting personal properties preserved in provenance, not substituted for source fields` : ""}${result.stale_source_count ? ` · ${result.stale_source_count} changed notes exported without stale automatic links` : ""}`;
       operation.preview = apply ? null : { preview_identity: result.preview_identity, destination, degree_cap };
       el("workspace-export-summary").textContent = apply ? `${summary}. Exported to ${result.destination || destination}.` : `${summary}. Your source notes stay unchanged. Choose Export to create the new folder.`;
     } catch (error) {
@@ -2070,8 +2286,8 @@
       const nextPath = mappedOrganizationPath(path, preview), value = values.get(nextPath);
       const selection = doc.editorState.selection, originalText = textOf(doc);
       doc.path = nextPath;
-      if (value) for (const key of ["id", "name", "revision", "editable", "reason", "bom", "newline", "recovery_key"]) doc[key] = value[key];
-      else if (nextPath !== path) doc.name = basename(nextPath);
+      if (value) for (const key of ["id", "name", "revision", "editable", "reason", "bom", "newline", "recovery_key", "display_title", "personal_display_title", "personal_properties", "property_ownership", "property_conflicts", "effective_tags", "effective_aliases"]) doc[key] = value[key];
+      else if (nextPath !== path) { doc.name = basename(nextPath); doc.display_title = null; }
       const text = value ? normalizeText(value.text) : originalText;
       doc.savedText = text; doc.external = null; doc.recovery = null;
       if (text !== originalText) {
@@ -2080,7 +2296,7 @@
       } else {
         doc.editorState = doc.editorState.update({ effects: [
           doc.editability.reconfigure([kit.EditorState.readOnly.of(!canEdit(doc)), kit.EditorView.editable.of(canEdit(doc))]),
-          doc.identityAttributes.reconfigure(kit.EditorView.contentAttributes.of({ "aria-label": `Edit ${doc.name}`, spellcheck: "true" })),
+          doc.identityAttributes.reconfigure(kit.EditorView.contentAttributes.of({ "aria-label": `Edit ${noteTitle(doc)}`, spellcheck: "true" })),
         ] }).state;
       }
       nextDocuments.set(nextPath, doc);
@@ -2273,6 +2489,22 @@
   el("workspace-back").addEventListener("click", () => navigateHistory(-1));
   el("workspace-forward").addEventListener("click", () => navigateHistory(1));
   el("workspace-save").addEventListener("click", () => saveDocument());
+  el("workspace-file-title").addEventListener("click", beginTitle);
+  el("workspace-title-input").addEventListener("input", () => { const doc = active(); if (doc) doc.titleDraft = el("workspace-title-input").value; });
+  el("workspace-title-form").addEventListener("submit", (event) => { event.preventDefault(); commitTitle(); });
+  el("workspace-title-form").addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    event.preventDefault(); const doc = active(); if (!doc || doc.saving) return;
+    doc.titleDraft = null; doc.titleError = ""; renderTitle(doc); el("workspace-file-title").focus();
+  });
+  el("workspace-title-reset").addEventListener("click", () => commitTitle(true));
+  el("workspace-open-mapped").addEventListener("click", async () => {
+    const path = state.workspace?.source_workspace;
+    if (typeof path !== "string" || !path) return;
+    if (!await openWorkspace(null, path)) {
+      showFolderDialog(); el("workspace-folder-error").textContent = "The mapped workspace could not be opened. Select its current folder.";
+    }
+  });
   for (const button of document.querySelectorAll("[data-mode]")) button.addEventListener("click", () => setMode(button.dataset.mode));
   el("workspace-restore").addEventListener("click", restoreRecovery);
   el("workspace-discard-recovery").addEventListener("click", discardRecovery);

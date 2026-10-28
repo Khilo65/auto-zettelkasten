@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from auto_zettelkasten import markdown_link_export as export
 from auto_zettelkasten.documents import DocumentService
@@ -315,7 +316,8 @@ def test_partial_stale_note_exports_effective_text_without_stale_incident_links(
     assert "[[Notes/A|A]]" not in (destination / "Notes/B.md").read_text()
 
 
-def test_real_document_service_preserves_effective_personal_override_and_original_files(tmp_path):
+@pytest.mark.parametrize("personal_metadata", [False, True])
+def test_real_document_service_preserves_effective_personal_override_and_original_files(tmp_path, personal_metadata):
     root = tmp_path / "source"
     notes, profiles = root / "02_source_memory/notes", root / "02_source_memory/profiles"
     notes.mkdir(parents=True)
@@ -342,13 +344,105 @@ def test_real_document_service_preserves_effective_personal_override_and_origina
         workspace_id = service.open(root)["id"]
         doc = service.read(workspace_id, "Personal.md")
         service.save_override(workspace_id, doc["id"], doc["revision"], "# Personal\nMy edited thought and [[02_source_memory/notes/a]].\n")
+        if personal_metadata:
+            doc = service.read(workspace_id, "02_source_memory/notes/a.md")
+            service.save_personal_metadata(workspace_id, doc["id"], doc["revision"],
+                                           {"display_title": "Personal source title", "personal_properties": {"tags": ["reviewed"]}})
         before = {str(p): p.read_bytes() for base in (root, overrides) for p in base.rglob("*") if p.is_file()}
         destination = tmp_path / "portable"
         preview = export.export_markdown_links(root, destination, documents=service, workspace_id=workspace_id)
-        assert preview["override_count"] == 1 and preview["edge_count"] == 1
+        assert preview["override_count"] == 1 + personal_metadata and preview["edge_count"] == 1
         export.export_markdown_links(root, destination, documents=service, workspace_id=workspace_id, apply=True, preview_identity=preview["preview_identity"])
         assert "My edited thought" in (destination / "Personal.md").read_text()
         assert "My original thought" in (root / "Personal.md").read_text()
+        if personal_metadata:
+            assert preview["personal_title_count"] == preview["personal_property_count"] == 1
+            assert "[[02_source_memory/notes/a|Personal source title]]" in (destination / "02_source_memory/notes/b.md").read_text()
+            assert "Personal source title" not in (root / "02_source_memory/notes/a.md").read_text()
         assert before == {str(p): p.read_bytes() for base in (root, overrides) for p in base.rglob("*") if p.is_file()}
     finally:
         service.close()
+
+
+def test_fresh_export_projects_personal_metadata_and_labels_without_renaming(sample):
+    root, destination, service = sample
+    original = "---\n# Keep this comment\ntitle: Original source title # source title comment\nsource_id: stable-source\nnote_id: stable-note\ntags:\n- generated\naliases: [Original alias]\nrating: 2\n---\n# Authored heading\nManual [[B|My label]] stays.  \n"
+    row = service.notes["Notes/A.md"]
+    row.update(text=original, display_title="My research title", personal_display_title="My research title",
+               personal_properties={"tags": ["generated", "#personal"], "aliases": ["Personal alias"], "rating": 5,
+                                    "reviewed": True, "due": "2026-10-28"})
+    before = {str(path): path.read_bytes() for path in root.rglob("*.md")}
+    preview = run(sample)
+    assert preview["personal_metadata_count"] == preview["personal_title_count"] == 1
+    assert preview["personal_property_count"] == 5 and preview["personal_property_conflict_count"] == 1
+    run(sample, apply=True, preview_identity=preview["preview_identity"])
+    exported = (destination / "Notes/A.md").read_text()
+    fields = yaml.safe_load(exported.split("---\n", 2)[1])
+    assert fields == {"title": "My research title", "source_id": "stable-source", "note_id": "stable-note",
+                      "tags": ["generated", "personal"], "aliases": ["Original alias", "Personal alias", "My research title"],
+                      "rating": 2, "reviewed": True, "due": "2026-10-28"}
+    assert "# Keep this comment" in exported and "# source title comment" in exported
+    assert "# Authored heading\nManual [[B|My label]] stays.  \n" in exported
+    assert "[[Notes/A|My research title]]" in (destination / "Notes/B.md").read_text()
+    assert {str(path): path.read_bytes() for path in root.rglob("*.md")} == before
+    manifest = json.loads((destination / ".auto-zettelkasten/related-export.json").read_text())
+    provenance = manifest["personal_metadata"]["Notes/A.md"]
+    assert provenance["canonical_title"] == "Original source title"
+    assert provenance["source_identity"] == {"source_id": "stable-source", "note_id": "stable-note"}
+    assert provenance["property_conflicts"] == ["rating"]
+    assert run(sample, apply=True, preview_identity=preview["preview_identity"])["status"] == "unchanged"
+    assert sorted(path.relative_to(destination).as_posix() for path in destination.rglob("*.md")) == sorted(service.notes)
+
+
+def test_personal_metadata_change_invalidates_preview_and_preserves_frozen_export(sample):
+    _, destination, service = sample
+    preview = run(sample)
+    service.notes["Notes/A.md"].update(display_title="New title", personal_display_title="New title")
+    with pytest.raises(ValueError, match="exact current preview"):
+        run(sample, apply=True, preview_identity=preview["preview_identity"])
+    preview = run(sample)
+    run(sample, apply=True, preview_identity=preview["preview_identity"])
+    frozen = {str(path): path.read_bytes() for path in destination.rglob("*") if path.is_file()}
+    service.notes["Notes/A.md"].update(display_title="Another title", personal_display_title="Another title")
+    with pytest.raises(ValueError, match="edited or differs"):
+        run(sample)
+    assert {str(path): path.read_bytes() for path in destination.rglob("*") if path.is_file()} == frozen
+
+
+def test_export_metadata_preserves_bom_crlf_and_handles_absent_frontmatter():
+    text = "\ufeff# Manual heading\r\nAuthored [[Other]].  \r\n"
+    projected, _ = export._project_personal_metadata(text, "A personal title", {"tags": ["one"], "score": .5})
+    assert projected.startswith("\ufeff---\r\n")
+    assert projected.endswith(text[1:])
+    assert "\n" not in projected.replace("\r\n", "")
+    assert yaml.safe_load(projected[1:].split("---\r\n", 2)[1])["title"] == "A personal title"
+
+
+@pytest.mark.parametrize("header", ["---\ntags: [broken\n---\n", "---\ntitle: First\ntitle: Second\n---\n",
+                                       "---\ntags: &t [one]\naliases: *t\n---\n", "---\nnever closes\n"])
+def test_unsafe_header_cannot_be_rewritten_for_personal_export_metadata(header):
+    with pytest.raises(ValueError):
+        export._project_personal_metadata(header + "Manual body", "Personal", {})
+    assert export._project_personal_metadata(header + "Manual body", None, {}) == (header + "Manual body", None)
+
+
+def test_display_title_delimiters_use_safe_links_and_duplicate_titles_keep_paths(sample):
+    _, destination, service = sample
+    for path in ("Notes/A.md", "Notes/C.md"):
+        service.notes[path].update(display_title="Same [title] | label", personal_display_title="Same [title] | label")
+    preview = run(sample)
+    run(sample, apply=True, preview_identity=preview["preview_identity"])
+    text = (destination / "Notes/B.md").read_text()
+    assert "[Same \\[title\\] | label](A.md)" in text
+    assert (destination / "Notes/A.md").is_file() and (destination / "Notes/C.md").is_file()
+
+
+@pytest.mark.parametrize("header", ["---\n---\n", "---\n# Empty properties\n---\n",
+                                       "---\ntitle: |\n  Multiline\n  source title\nsource_id: stable\n---\n"])
+def test_personal_title_projection_handles_empty_and_multiline_headers(header):
+    text, _ = export._project_personal_metadata(header + "Authored body.\n", "Personal title", {})
+    fields = yaml.safe_load(text.split("---\n", 2)[1])
+    assert fields["title"] == "Personal title" and fields["aliases"] == ["Personal title"]
+    if "source_id" in header:
+        assert fields["source_id"] == "stable"
+    assert text.endswith("Authored body.\n")

@@ -230,6 +230,13 @@ def test_reuses_real_mapping_chunk_format_only_for_identical_note_text(workspace
     assert result["coverage"]["semantic"]["reason"] == "verified_saved_note_embeddings"
     assert result["coverage"]["semantic"]["source_count"] == 1
     assert len(encoders) == 1 and len(encoders[0].calls) == 1  # query only
+    current = value._documents.read(value._workspace_id, "A.md")
+    value._documents.save_personal_metadata(value._workspace_id, current["id"], current["revision"], {"display_title": "Personal peace title"})
+    renamed = value.recall(workspace, "diplomacy", model_path="synthetic")
+    assert renamed["notes"][0]["title"] == "Personal peace title"
+    assert renamed["coverage"]["semantic"]["source_count"] == 1
+    assert len(encoders[0].calls) == 1
+    assert path.read_text() == raw
     path.write_text(raw + "A changed passage.")
     stale = value.recall(workspace, "changed", model_path="synthetic")
     assert paths(stale) == ["A.md"]

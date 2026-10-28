@@ -52,6 +52,12 @@ function harness(t, { recovery = false } = {}) {
         entries: [...notes.values()].map((note) => ({ path: note.path, name: note.name, kind: "file", editable: note.editable })),
         relations, semantic_map, warnings: [], truncated: false };
     else if (url.endsWith("/read")) result = { document: notes.get(body.path) };
+    else if (url.endsWith("/save-personal-metadata")) {
+      const note = notes.get(body.document_id);
+      assert.equal(body.revision, note.revision);
+      notes.set(note.path, { ...note, display_title: body.display_title, personal_display_title: body.display_title, override_saved: true, revision: "4".repeat(64) });
+      result = { document: notes.get(note.path) };
+    }
     else throw new Error(`Unexpected request ${url}`);
     return { ok: true, status: 200, json: async () => structuredClone(result) };
   };
@@ -103,6 +109,21 @@ function harness(t, { recovery = false } = {}) {
 
 const derivedPairs = (graph) => [...graph.edges().filter((edge) => edge.data("derived")).map((edge) => `${edge.data("source")}>${edge.data("target")}`)].sort();
 const memberships = (graph, path) => JSON.parse(JSON.stringify(graph.getElementById(path).data("semantic_communities") || []));
+
+test("Metadata-only saves preserve graph connections and memberships immediately without polling", async (t) => {
+  const app = harness(t); await app.root(); const graph = app.graph(); await app.open("A.md");
+  app.el("workspace-file-title").click(); app.el("workspace-title-input").value = "A personal title";
+  app.el("workspace-title-form").dispatchEvent(new app.w.Event("submit", { bubbles: true, cancelable: true }));
+  await until(() => app.el("workspace-file-title").textContent === "A personal title", "metadata label saved");
+  app.graph();
+  assert.deepEqual(derivedPairs(graph), ["A.md>B.md", "C.md>D.md"]);
+  assert.deepEqual(memberships(graph, "A.md"), [{ community_id: "semantic-ab", algorithm: "leiden" }]);
+  assert.equal(graph.getElementById("A.md").data("label"), "A personal title");
+  await app.open("A.md");
+  const local = app.graph("local");
+  assert.deepEqual(derivedPairs(local), ["A.md>B.md"]);
+  assert.match(app.el("local-graph-title").textContent, /A personal title/);
+});
 
 test("Reading unchanged embedded notes and polling preserve semantic neighbors and communities in both graphs", async (t) => {
   const app = harness(t); await app.root();

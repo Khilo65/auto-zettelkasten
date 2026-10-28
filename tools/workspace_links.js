@@ -1,5 +1,7 @@
 import MarkdownIt from "markdown-it";
 import { graphNodeOrigin } from "./workspace_graph_colors.js";
+import { compactCoverageNotice } from "./workspace_coverage.js";
+import { propertyLists, renderProperties } from "./workspace_properties.js";
 
 export const LIMITS = Object.freeze({
   documents: 5000,
@@ -47,6 +49,11 @@ function documentMetadata(input) {
   const coverage = input?.source_coverage;
   return {
     note_origin: graphNodeOrigin(input),
+    display_title: typeof input?.display_title === "string" && input.display_title.trim() ? input.display_title : basename(input?.path || ""),
+    personal_display_title: typeof input?.personal_display_title === "string" ? input.personal_display_title : null,
+    personal_properties: input?.personal_properties && typeof input.personal_properties === "object" ? input.personal_properties : {},
+    property_ownership: input?.property_ownership || {},
+    property_conflicts: input?.property_conflicts || [],
     ...(typeof input?.navigation === "boolean" ? { navigation: input.navigation } : {}),
     ...(coverage && typeof coverage.status === "string" && typeof coverage.label === "string" ? { source_coverage: { status: coverage.status, label: coverage.label } } : {}),
   };
@@ -102,77 +109,26 @@ function lineAt(starts, offset) {
   return low;
 }
 
-function stripComment(value) {
-  let quote = "";
-  for (let at = 0; at < value.length; at += 1) {
-    if (quote) {
-      if (quote === '"' && value[at] === "\\") { at += 1; continue; }
-      if (value[at] === quote) { if (quote === "'" && value[at + 1] === "'") at += 1; else quote = ""; }
-    } else if (value[at] === '"' || value[at] === "'") quote = value[at];
-    else if (value[at] === "#" && (at === 0 || /\s/.test(value[at - 1]))) return value.slice(0, at).trim();
-  }
-  return value.trim();
-}
-
-function scalar(value) {
-  value = stripComment(value);
-  value = value.trim();
-  if (!value) return "";
-  if (value[0] === '"') { const parsed = JSON.parse(value); if (typeof parsed !== "string") throw new Error("Expected string"); return parsed; }
-  if (value[0] === "'") {
-    if (!/^'(?:[^']|'')*'$/.test(value)) throw new Error("Invalid quoted string");
-    return value.slice(1, -1).replace(/''/g, "'");
-  }
-  if (/^[!&*\[\]{}>|?]/.test(value) || /:\s/.test(value)) throw new Error("Unsupported YAML value");
-  return value;
-}
-
-function scalarList(value) {
-  value = stripComment(value);
-  if (!value.startsWith("[")) return [scalar(value)].filter(Boolean);
-  if (!value.endsWith("]")) throw new Error("Unclosed YAML array");
-  const result = [];
-  let start = 1;
-  let quote = "";
-  for (let at = 1; at < value.length; at += 1) {
-    const char = value[at];
-    if (quote) {
-      if (quote === '"' && char === "\\") { at += 1; continue; }
-      if (char === quote) { if (quote === "'" && value[at + 1] === "'") at += 1; else quote = ""; }
-    } else if (char === '"' || char === "'") quote = char;
-    else if (char === "," || at === value.length - 1) { result.push(scalar(value.slice(start, at))); start = at + 1; }
-  }
-  if (quote || result.length > 200) throw new Error("Unsupported YAML array");
-  return result.filter(Boolean);
-}
-
 function metadata(text) {
-  const result = { aliases: [], tags: [], frontmatter: null, warnings: [] };
-  const match = /^(?:\uFEFF)?---\n([\s\S]*?)\n(?:---|\.\.\.)[ \t]*(?:\n|$)/.exec(text);
-  if (!match) {
-    if (/^(?:\uFEFF)?---\n/.test(text)) { result.frontmatter = { from: 0, to: text.length, text }; result.warnings.push("Unclosed properties block was excluded from the link index"); }
-    return result;
-  }
-  result.frontmatter = { from: 0, to: match[0].length, text: match[1] };
-  if (match[1].length > 65536) { result.warnings.push("Properties exceed the metadata limit"); return result; }
-  const lines = match[1].split("\n");
-  for (let at = 0; at < lines.length; at += 1) {
-    const entry = /^(aliases?|tags?):\s*(.*)$/.exec(lines[at]);
-    if (!entry) continue;
-    const key = entry[1].startsWith("alias") ? "aliases" : "tags";
-    try {
-      let values;
-      if (entry[2].trim()) values = scalarList(entry[2]);
-      else {
-        values = [];
-        while (at + 1 < lines.length && /^\s+-\s/.test(lines[at + 1])) values.push(scalar(lines[++at].replace(/^\s+-\s*/, "")));
-      }
-      result[key].push(...values.slice(0, 200));
-    } catch { result.warnings.push(`Unsupported ${key} metadata; use strings or a simple string list`); }
-  }
-  result.aliases = [...new Set(result.aliases)];
-  result.tags = [...new Set(result.tags.map((tag) => tag.replace(/^#/, "")))];
-  return result;
+  const properties = propertyLists(text);
+  return { aliases: properties.aliases, tags: properties.tags, frontmatter: properties.frontmatter,
+    warnings: properties.warnings };
+}
+
+const safeStrings = (values) => Array.isArray(values) ? values.filter((value) => typeof value === "string" && value.length <= 2048).slice(0, 200) : [];
+
+export function documentTitle(document, fallbackPath = "") {
+  return typeof document?.display_title === "string" && document.display_title.trim()
+    ? document.display_title : basename(document?.path || fallbackPath);
+}
+
+function effectiveMetadata(parsed, input) {
+  const aliases = parsed.source_aliases || parsed.aliases || [];
+  const tags = parsed.source_tags || parsed.tags || [];
+  const personal = input?.personal_properties;
+  return { ...documentMetadata(input), source_aliases: [...aliases], source_tags: [...tags],
+    aliases: [...new Set([...aliases, ...safeStrings(input?.effective_aliases), ...safeStrings(personal?.aliases)])],
+    tags: [...new Set([...tags, ...safeStrings(input?.effective_tags), ...safeStrings(personal?.tags)].map((tag) => tag.replace(/^#/, "")))] };
 }
 
 const parser = new MarkdownIt({ html: true, linkify: false, typographer: false, maxNesting: 32 });
@@ -489,7 +445,7 @@ export function buildLinkIndex(documents, typedRelations = [], previousIndex = n
       && (cached.syntaxLimited ? cached.syntaxBudget === syntaxBudget : cached.syntaxCost <= syntaxBudget)
       && (!cached.referenceLimited || cached.referenceBudget >= referenceBudget);
     const parsed = reusable ? cached : parseDocument(path, text, { syntaxBudget, referenceBudget });
-    const document = { ...parsed, ...documentMetadata(input), revision: input.revision, editable: publishedIndexPath(path) ? false : input.editable, warnings: [...parsed.warnings], references: parsed.references.slice(0, referenceBudget).map((ref) => ({ ...ref, sourcePath: path, resolution: undefined })) };
+    const document = { ...parsed, ...effectiveMetadata(parsed, input), revision: input.revision, editable: publishedIndexPath(path) ? false : input.editable, warnings: [...parsed.warnings], references: parsed.references.slice(0, referenceBudget).map((ref) => ({ ...ref, sourcePath: path, resolution: undefined })) };
     if (parsed.references.length > referenceBudget) {
       document.referenceLimited = true;
       document.referenceBudget = referenceBudget;
@@ -610,7 +566,7 @@ export function parseLibraryDocument(input) {
   if (typeof path !== "string" || safePath(path) !== path || !/\.md$/i.test(path)) { parsed.unsupported = true; parsed.warnings.push("Unsupported note path"); }
   const { text, tokens, frontmatter, ...projection } = parsed;
   // Copy sliced strings too, so a short snippet cannot retain a whole note body.
-  return JSON.parse(JSON.stringify({ ...projection, ...documentMetadata(input), compact: true, textLength: source.length, revision: input?.revision, editable: publishedIndexPath(path || "") ? false : input?.editable }));
+  return JSON.parse(JSON.stringify({ ...projection, ...effectiveMetadata(parsed, input), compact: true, textLength: source.length, revision: input?.revision, editable: publishedIndexPath(path || "") ? false : input?.editable }));
 }
 
 export function buildLibraryIndex(records, typedRelations = [], previousIndex = null, metadata = {}) {
@@ -632,7 +588,7 @@ export function buildLibraryIndex(records, typedRelations = [], previousIndex = 
       } else parsed = parseLibraryDocument(input);
     } else if (input.compact === true && Number.isInteger(input.textLength) && input.textLength >= 0 && ["aliases", "tags", "headings", "blocks", "references", "warnings"].every((key) => Array.isArray(input[key]))) parsed = input;
     else parsed = parseLibraryDocument(input);
-    const document = { ...parsed, ...documentMetadata(input), revision: input.revision, editable: publishedIndexPath(path) ? false : input.editable, warnings: [...parsed.warnings], references: parsed.references.slice(0, remainingReferences).map((ref) => ({ ...ref, sourcePath: path, resolution: undefined })) };
+    const document = { ...parsed, ...effectiveMetadata(parsed, input), revision: input.revision, editable: publishedIndexPath(path) ? false : input.editable, warnings: [...parsed.warnings], references: parsed.references.slice(0, remainingReferences).map((ref) => ({ ...ref, sourcePath: path, resolution: undefined })) };
     if (parsed.references.length > remainingReferences) {
       document.referenceLimited = true;
       document.truncated = true;
@@ -777,7 +733,7 @@ export function appendRelationshipDetails(container, index, path, { relations = 
     rendered = true;
     for (const relation of rows.slice(0, 50)) {
       const details = doc.createElement("details"); details.className = "relationship-record";
-      const heading = doc.createElement("summary"); heading.textContent = `${basename(relation.source)} ${recallRelationshipLabels[relation.type] || relation.type.replace(/_/g, " ")} ${basename(relation.target)}`; details.append(heading);
+      const heading = doc.createElement("summary"); heading.textContent = `${documentTitle(index.documents.get(relation.source), relation.source)} ${recallRelationshipLabels[relation.type] || relation.type.replace(/_/g, " ")} ${documentTitle(index.documents.get(relation.target), relation.target)}`; details.append(heading);
       if (recallRelationshipLabels[relation.type]) {
         const scope = doc.createElement("p"); scope.className = "relationship-evidence-basis";
         scope.textContent = relation.type === "potential_research_resource"
@@ -798,7 +754,7 @@ export function appendRelationshipDetails(container, index, path, { relations = 
       const other = canonical(relation.source) === canonical(path) ? relation.target : relation.source;
       if (index.documents.has(other)) {
         const open = doc.createElement("button"); open.type = "button"; open.className = "relationship-open-note";
-        open.textContent = `Open ${basename(other)}`; open.addEventListener("click", () => onOpen(other)); details.append(open);
+        open.textContent = `Open ${documentTitle(index.documents.get(other), other)}`; open.addEventListener("click", () => onOpen(other)); details.append(open);
       }
       for (const evidence of relation.selected_evidence || []) {
         // Only validated existing endpoint notes may be used as navigation targets.
@@ -806,7 +762,7 @@ export function appendRelationshipDetails(container, index, path, { relations = 
         const button = doc.createElement("button"); button.type = "button"; button.className = "backlink-occurrence relationship-evidence";
         const locator = evidence.locator;
         const location = locator?.heading || (locator?.line_start ? `line ${locator.line_start}` : "Evidence");
-        const label = doc.createElement("strong"); label.textContent = `${basename(evidence.path)} · ${location}`;
+        const label = doc.createElement("strong"); label.textContent = `${documentTitle(index.documents.get(evidence.path), evidence.path)} · ${location}`;
         const excerpt = doc.createElement("span"); excerpt.textContent = evidence.text;
         button.append(label, excerpt); button.addEventListener("click", () => onOpen(evidence.path, locator)); details.append(button);
         if (evidence.attribution) { const attribution = doc.createElement("p"); attribution.className = "relationship-evidence-basis"; attribution.textContent = evidence.attribution; details.append(attribution); }
@@ -1037,7 +993,7 @@ export function completionCandidates(index, sourcePath, query = "") {
   for (const document of index.documents.values()) {
     const canonical = shortestDestination(index, sourcePath, document.path);
     if (canonical === null) continue;
-    if (!needle || fold(document.path).includes(needle)) result.push({ label: basename(document.path), detail: document.path, insert: canonical, path: document.path });
+    if (!needle || fold(document.path + " " + documentTitle(document)).includes(needle)) result.push({ label: documentTitle(document), detail: document.path, insert: canonical, path: document.path });
     for (const alias of document.aliases) {
       if (needle && fold(alias).includes(needle)) result.push({ label: alias, detail: `${document.path} · alias`, insert: `${canonical}|${alias}`, path: document.path });
     }
@@ -1048,10 +1004,10 @@ export function completionCandidates(index, sourcePath, query = "") {
 export function searchNotes(index, query = "") {
   const terms = fold(query.trim()).split(/\s+/).filter(Boolean);
   return [...index.documents.values()].flatMap((document) => {
-    const haystack = fold([document.path, ...document.aliases].join(" "));
+    const haystack = fold([document.path, documentTitle(document), ...document.aliases].join(" "));
     if (!terms.every((term) => haystack.includes(term))) return [];
     const alias = document.aliases.find((value) => terms.length && terms.every((term) => fold(value).includes(term)));
-    return [{ path: document.path, name: basename(document.path), ...(alias ? { alias } : {}) }];
+    return [{ path: document.path, name: documentTitle(document), ...(alias ? { alias } : {}) }];
   }).sort((left, right) => left.path.localeCompare(right.path));
 }
 
@@ -1065,7 +1021,7 @@ export function graphData(index, options = {}) {
   for (const document of index.documents.values()) {
     if (!showNavigation && navigation(document.path)) continue;
     const path = canonical(document.path), primary = index.documents.get(path);
-    if (!nodes.has(path)) nodes.set(path, { id: path, path, label: basename(path), pathAliases: [], aliases: [], tags: [], folder: path.split("/").slice(0, -1).join("/"), navigation: navigation(path), source_coverage: primary.source_coverage,
+    if (!nodes.has(path)) nodes.set(path, { id: path, path, label: documentTitle(primary, path), pathAliases: [], aliases: [], tags: [], folder: path.split("/").slice(0, -1).join("/"), navigation: navigation(path), source_coverage: primary.source_coverage,
       note_origin: graphNodeOrigin(primary), semantic_status: index.semantic_map?.status,
       ...(primary.semantic_communities ? { semantic_communities: primary.semantic_communities.map((row) => ({ ...row })) } : {}) });
     const node = nodes.get(path);
@@ -1259,7 +1215,20 @@ function renderParsed(index, document, context, properties = true) {
     document = renderedDocuments.get(document);
   }
   if (document.syntaxLimited) return `<p class="note-analysis-paused">Live link analysis is paused for this note. Backlinks and graphs are partial. Showing the source text safely.</p><pre class="note-source-fallback" data-source-path="${escapeHtml(document.path)}" data-source-from="${context.offset}">${escapeHtml(document.text)}</pre>`;
+  let quoteDepth = 0;
   const tokens = document.tokens.map((token) => {
+    if (token.type === "blockquote_open") quoteDepth += 1;
+    if (token.type === "blockquote_close") quoteDepth -= 1;
+    const summary = quoteDepth > 0 && token.type === "inline" ? compactCoverageNotice(token.content) : null;
+    if (summary) {
+      const clone = Object.assign(Object.create(Object.getPrototypeOf(token)), token);
+      const body = new token.constructor("text", "", 0);
+      body.content = summary;
+      const boundary = token.children.findIndex((child) => child.type === "softbreak");
+      clone.children = [...token.children.slice(0, boundary + 1), body];
+      clone.content = `[!warning] Coverage boundary\n${summary}`;
+      return clone;
+    }
     if (token.nesting !== 1 || !token.meta || token.hidden) return token;
     const clone = Object.assign(Object.create(Object.getPrototypeOf(token)), token);
     clone.attrs = token.attrs ? token.attrs.map((attr) => [...attr]) : [];
@@ -1268,7 +1237,7 @@ function renderParsed(index, document, context, properties = true) {
     if (token.meta.heading) clone.attrSet("id", token.meta.heading.id);
     return clone;
   });
-  const frontmatter = properties && document.frontmatter ? `<details class="markdown-properties"><summary>Properties</summary><pre>${escapeHtml(document.frontmatter.text)}</pre></details>` : "";
+  const frontmatter = properties && document.frontmatter ? renderProperties(document.text || "") : "";
   return frontmatter + parser.renderer.render(tokens, parser.options, { index, path: document.path, context });
 }
 

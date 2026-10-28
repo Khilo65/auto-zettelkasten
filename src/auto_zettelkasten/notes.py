@@ -363,7 +363,7 @@ def render_atomic_note(frontmatter: Mapping[str, Any], analysis: Mapping[str, An
             [
                 "> [!warning] Coverage boundary",
                 "> "
-                + _partial_coverage_limitation(frontmatter).replace("\n", "\n> "),
+                + _partial_coverage_notice(frontmatter),
                 "",
             ]
         )
@@ -1369,6 +1369,12 @@ def _positive_page_numbers(value: Any) -> tuple[int, ...]:
         if page > 0 and page not in pages:
             pages.append(page)
     return tuple(pages)
+
+
+def _partial_coverage_notice(frontmatter: Mapping[str, Any]) -> str:
+    if _coverage_metrics(frontmatter).get("missing_scope") == "remainder_of_parent_work":
+        return "This note covers only the available excerpt, not the complete work."
+    return "This note is based on an incomplete extraction of the document."
 
 
 def _partial_coverage_limitation(frontmatter: Mapping[str, Any]) -> str:

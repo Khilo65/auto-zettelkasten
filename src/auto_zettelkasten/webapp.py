@@ -457,6 +457,12 @@ class LocalApp:
             if route == "/api/workspace/save-override":
                 self._editable()
                 return {"document": self.documents.save_override(workspace_id, data.get("document_id"), data.get("revision"), data.get("text"))}
+            if route == "/api/workspace/save-personal-metadata":
+                self._editable()
+                if set(data) - {"workspace_id", "document_id", "revision", "display_title", "personal_properties"}:
+                    raise RequestError("Unsupported personal metadata fields.")
+                changes = {key: data[key] for key in ("display_title", "personal_properties") if key in data}
+                return {"document": self.documents.save_personal_metadata(workspace_id, data.get("document_id"), data.get("revision"), changes)}
             if route == "/api/workspace/create":
                 self._editable()
                 return self.documents.create(workspace_id, data.get("parent", ""), data.get("name"), data.get("kind"))

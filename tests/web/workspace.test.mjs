@@ -63,6 +63,7 @@ function harness(t, options = {}) {
     id: "workspace-1", name: "Notes", path: "/notes", editable: true,
     entries: [{ path: "Start.md", name: "Start.md", kind: "file", editable: true }],
     truncated: false,
+    ...options.workspace,
   };
   window.fetch = async (url, request = {}) => {
     const body = request.body ? JSON.parse(request.body) : {};
@@ -75,6 +76,16 @@ function harness(t, options = {}) {
     }
     else if (url === "/api/workspace/recall-index") result = options.prepareRecall ? await options.prepareRecall(body) : { status: "prepared", provider_calls: 0 };
     else if (url === "/api/workspace/read") result = { document: { ...data.disk } };
+    else if (url === "/api/workspace/save-personal-metadata") {
+      if (options.metadataSave) result = await options.metadataSave(body);
+      else {
+        if (body.display_title !== undefined) data.disk.personal_display_title = body.display_title;
+        if (body.personal_properties !== undefined) data.disk.personal_properties = body.personal_properties;
+        data.disk.display_title = data.disk.personal_display_title || data.disk.name.replace(/\.md$/i, "");
+        data.disk.revision = `metadata-${requests.length}`;
+        result = { document: { ...data.disk } };
+      }
+    }
     else if (url === "/api/workspace/save" || url === "/api/workspace/save-override") {
       data.saves += 1;
       await data.beforeSave?.(body);
@@ -130,6 +141,112 @@ function harness(t, options = {}) {
   };
   return { window, data, requests, element, click, open, append, mode, save, getView, confirm, poll: () => polls[0]() };
 }
+
+test("Personal source title saves explicitly, resets and preserves canonical body", async (t) => {
+  const app = harness(t, { document: { editable: false, override_available: true, personal_properties: {}, display_title: "Start" } });
+  const view = await app.open(); const original = view.state.doc.toString();
+  for (const mode of ["source", "live", "reading"]) {
+    app.mode(mode); app.click("workspace-file-title");
+    app.element("workspace-title-input").value = "Unsaved title";
+    app.element("workspace-title-input").dispatchEvent(new app.window.Event("input", { bubbles: true }));
+    app.element("workspace-title-input").dispatchEvent(new app.window.FocusEvent("blur"));
+    assert.equal(app.requests.filter((row) => row.url.endsWith("save-personal-metadata")).length, 0);
+    app.element("workspace-title-input").dispatchEvent(new app.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    assert.equal(app.element("workspace-file-title").textContent, "Start");
+  }
+  app.click("workspace-file-title"); app.element("workspace-title-input").value = "My research title";
+  app.element("workspace-title-form").dispatchEvent(new app.window.Event("submit", { bubbles: true, cancelable: true }));
+  await until(() => app.element("workspace-file-title").textContent === "My research title", "personal title save");
+  assert.equal(app.data.disk.path, "Start.md"); assert.equal(app.getView().state.doc.toString(), original);
+  assert.match(app.window.document.querySelector(".document-tab").textContent, /My research title/);
+  app.click("workspace-file-title"); app.click("workspace-title-reset");
+  await until(() => app.element("workspace-file-title").textContent === "Start", "reset title");
+});
+
+test("Unsaved body prevents metadata commits without losing either draft", async (t) => {
+  const app = harness(t, { document: { editable: false, override_available: true } });
+  await app.open(); app.append("\nMy pending body"); app.click("workspace-file-title");
+  app.element("workspace-title-input").value = "Pending title";
+  app.element("workspace-title-form").dispatchEvent(new app.window.Event("submit", { bubbles: true, cancelable: true }));
+  await until(() => app.element("workspace-title-error").textContent.includes("body changes"), "draft guard");
+  assert.equal(app.element("workspace-title-input").value, "Pending title");
+  assert.match(app.getView().state.doc.toString(), /My pending body/);
+  assert.ok(!app.requests.some((row) => row.url.endsWith("save-personal-metadata")));
+});
+
+test("Failed metadata saves retain the title draft and close cancellation preserves it", async (t) => {
+  const app = harness(t, { document: { editable: false, override_available: true }, metadataSave: () => { throw new Error("Offline test"); } });
+  await app.open(); app.click("workspace-file-title"); app.element("workspace-title-input").value = "Keep my draft";
+  app.element("workspace-title-form").dispatchEvent(new app.window.Event("submit", { bubbles: true, cancelable: true }));
+  await until(() => app.element("workspace-title-error").textContent.includes("Offline test"), "metadata failure");
+  assert.equal(app.element("workspace-title-input").value, "Keep my draft");
+  assert.equal(app.data.disk.path, "Start.md"); assert.equal(app.data.disk.personal_display_title, undefined);
+  assert.equal(app.window.workspaceHasUnsavedChanges(), true);
+  app.window.document.querySelector('[aria-label="Close Start.md"]').click();
+  await app.confirm(false);
+  assert.equal(app.element("workspace-title-input").value, "Keep my draft");
+});
+
+test("Typed personal-note properties preserve text and are undoable", async (t) => {
+  const text = "---\n# Keep comment\ntags:\n- existing\nscore: 1 # Keep inline\n---\n# Body\nAuthored text.\n";
+  const app = harness(t, { text }); await app.open();
+  assert.ok(app.element("workspace-properties").textContent.includes("existing"));
+  assert.ok(!app.window.document.querySelector(".cm-content").textContent.includes("Keep comment"));
+  app.element("workspace-properties").querySelector('[aria-label="Edit property score"]').click();
+  const form = app.element("workspace-properties").querySelector("form");
+  form.querySelector("textarea").value = "2";
+  form.dispatchEvent(new app.window.Event("submit", { bubbles: true, cancelable: true }));
+  await until(() => app.getView().state.doc.toString().includes("score: 2"), "property transaction");
+  assert.match(app.getView().state.doc.toString(), /# Keep comment/);
+  assert.match(app.getView().state.doc.toString(), /# Keep inline/);
+  app.window.WorkspaceKit.undo(app.getView());
+  assert.equal(app.getView().state.doc.toString(), text);
+  app.mode("source"); assert.ok(app.element("workspace-properties").hidden);
+  assert.ok(app.window.document.querySelector(".cm-content").textContent.includes("Keep comment"));
+});
+
+test("Generated properties are locked while personal additions use metadata endpoint", async (t) => {
+  const app = harness(t, { text: "---\nsource_id: canonical\ntags:\n- generated\n---\n# Body\n", document: { editable: false, override_available: true, personal_properties: { tags: ["mine"] } } });
+  await app.open();
+  const panel = app.element("workspace-properties");
+  assert.equal(panel.querySelector('[aria-label="Edit property source_id"]'), null);
+  panel.querySelector('[aria-label="Edit property tags (personal)"]').click();
+  const form = panel.querySelector("form"); form.querySelector("textarea").value = "mine\nresearch";
+  form.dispatchEvent(new app.window.Event("submit", { bubbles: true, cancelable: true }));
+  await until(() => app.data.disk.personal_properties.tags.length === 2, "personal tags save");
+  assert.deepEqual(app.data.disk.personal_properties.tags, ["mine", "research"]);
+  assert.match(app.data.disk.text, /source_id: canonical\ntags:\n- generated/);
+});
+
+test("Workspace indicator explains portable exports and requires explicit source open", async (t) => {
+  const app = harness(t, { workspace: { workspace_kind: "markdown_export", source_workspace: "/original/mapped" } });
+  await app.open();
+  assert.equal(app.element("workspace-kind-label").textContent, "Markdown export");
+  assert.match(app.element("workspace-kind-description").textContent, /links but not saved communities/);
+  assert.equal(app.element("workspace-open-mapped").title, "/original/mapped");
+  assert.equal(app.requests.filter((row) => row.url.endsWith("workspace/open")).length, 1);
+  app.click("workspace-open-mapped");
+  await until(() => app.requests.some((row) => row.url.endsWith("workspace/open") && row.body.path === "/original/mapped"), "explicit mapped workspace action");
+});
+
+test("Legacy coverage inventories are compact in previews while source and citations remain intact", async (t) => {
+  const inventory = "Recovered PDF pages: 1, 2, 4. Missing or unresolved PDF pages: 3. Claims in this note are restricted to the recovered pages and must not be treated as findings from the complete document.";
+  const text = `# Start\n\n> [!warning] Coverage boundary\n> ${inventory}\n\n## Thesis\nA finding supported on PDF page 4.\n`;
+  const app = harness(t, { text });
+  const view = await app.open();
+  await until(() => app.window.document.querySelector(".live-coverage-notice"), "compact live coverage notice");
+  assert.ok(!app.window.document.querySelector(".cm-content").textContent.includes("Recovered PDF pages"));
+  assert.equal(view.state.doc.toString(), text);
+  app.mode("source");
+  assert.ok(app.window.document.querySelector(".cm-content").textContent.includes("Recovered PDF pages"));
+  app.mode("reading");
+  const reading = app.element("workspace-reader");
+  assert.ok(reading.textContent.includes("incomplete extraction"));
+  assert.ok(!reading.textContent.includes("Recovered PDF pages"));
+  assert.ok(reading.textContent.includes("PDF page 4"));
+  assert.equal(app.data.saves, 0);
+  assert.equal(app.data.disk.text, text);
+});
 
 test("quick-open finds full-note content, renders literal excerpts and opens its bound file", async (t) => {
   const app = harness(t, { recall: async (body) => {
@@ -395,7 +512,7 @@ test("Generated notes edit and save personal overrides in Source and Live Previe
   const view = await app.open();
   assert.equal(view.state.readOnly, false);
   assert.equal(app.window.document.querySelector('[data-mode="live"]').getAttribute("aria-pressed"), "true");
-  assert.match(app.element("workspace-policy").textContent, /saved separately/);
+  assert.match(app.element("workspace-policy").textContent, /saved privately/);
   app.mode("source"); app.append("Personal addition.\n"); await app.save();
   assert.equal(app.data.disk.editable, false, "Canonical ownership must remain protected");
   assert.equal(app.requests.filter(({ url }) => url === "/api/workspace/save").length, 0);

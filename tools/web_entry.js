@@ -6,6 +6,8 @@ export { searchKeymap, openSearchPanel, highlightSelectionMatches } from "@codem
 export { closeBrackets, closeBracketsKeymap, autocompletion, startCompletion, acceptCompletion, completionStatus } from "@codemirror/autocomplete";
 export { default as cytoscape } from "cytoscape";
 export * from "./workspace_links.js";
+export { compactCoverageNotice } from "./workspace_coverage.js";
+export * from "./workspace_properties.js";
 export { LibraryParser } from "./workspace_index_client.js";
 export { fitGraph, layoutGraph } from "./workspace_graph.js";
 export { createGraphView } from "./workspace_graph_view.js";

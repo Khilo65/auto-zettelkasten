@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -18,6 +19,46 @@ except ImportError:  # Safe writes are disabled on platforms without directory h
     fcntl = None
 
 _MAX_RECORD_BYTES = MAX_FILE_BYTES + 65536
+
+
+def personal_metadata(display_title=None, properties=None):
+    """Validate small personal values without allowing YAML objects or identities."""
+    if display_title is not None and (not isinstance(display_title, str) or not display_title.strip()
+            or len(display_title) > 512 or any(ord(c) < 32 or ord(c) == 127 for c in display_title)):
+        raise DocumentError("A personal title must be a single line of 1–512 characters.")
+    if properties is None:
+        properties = {}
+    if not isinstance(properties, dict) or len(properties) > 100:
+        raise DocumentError("Personal properties require at most 100 named values.")
+    result = {}
+    reserved = {"__proto__", "prototype", "constructor", "note_id", "source_id", "source_ids",
+                "zotero_item_key", "source_file", "machine_preservation_hash", "inspected_content_hash",
+                "reader_provider", "reader_model", "engine_version", "artifact_schema_version", "cluster_id", "gap_id", "map_id"}
+    for key, value in properties.items():
+        if (not isinstance(key, str) or not key.strip() or key != key.strip() or len(key) > 128
+                or key.casefold() in reserved or any(ord(c) < 32 or ord(c) == 127 for c in key)):
+            raise DocumentError("Personal property names must be bounded text and cannot replace source identities.")
+        valid = isinstance(value, (str, bool))
+        if type(value) in (int, float):
+            try:
+                valid = math.isfinite(value)
+            except OverflowError:
+                valid = False
+        if isinstance(value, list):
+            valid = len(value) <= 200 and all(isinstance(item, str) and len(item) <= 4096 and "\x00" not in item for item in value)
+        if not valid or isinstance(value, str) and (len(value) > 4096 or "\x00" in value):
+            raise DocumentError("Personal properties support text, string lists, finite numbers and checkboxes.")
+        if key in {"tags", "aliases"} and not (isinstance(value, str) or isinstance(value, list)):
+            raise DocumentError("Personal tags and aliases require text or a string list.")
+        result[key] = value
+    try:
+        if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) > 12000:
+            raise DocumentError("Personal properties exceed the 12 KiB limit.")
+        if display_title is not None:
+            display_title.encode("utf-8")
+    except UnicodeError as exc:
+        raise DocumentError("Personal metadata must contain valid Unicode.") from exc
+    return display_title.strip() if display_title is not None else None, result
 
 
 class Overrides:
@@ -138,20 +179,32 @@ class _View:
             os.close(fd)
         try:
             record = json.loads(raw)
-            if (not isinstance(record, dict) or record.get("version") != 1 or record.get("path") != path
-                    or not isinstance(record.get("body"), str) or "\x00" in record["body"] or "\r" in record["body"]
+            if (not isinstance(record, dict) or type(record.get("version")) is not int or record.get("version") not in (1, 2) or record.get("path") != path
+                    or record.get("version") == 1 and "body" not in record
+                    or "body" in record and (not isinstance(record["body"], str) or "\x00" in record["body"] or "\r" in record["body"]
+                                              or len(record["body"].encode("utf-8")) > MAX_FILE_BYTES)
                     or not isinstance(record.get("source_revision"), str) or not re.fullmatch(r"[a-f0-9]{64}", record["source_revision"])
-                    or len(record["body"].encode("utf-8")) > MAX_FILE_BYTES):
+                    ):
                 raise ValueError()
+            if record["version"] == 2:
+                personal_metadata(record.get("display_title"), record.get("personal_properties", {}))
         except (ValueError, UnicodeError, RecursionError) as exc:
             raise DocumentError("The saved override is invalid. Restore its private backup before editing.") from exc
         return record, hashlib.sha256(raw).hexdigest(), before
 
-    def write(self, path, body, source_revision, verify):
+    def write(self, path, body, source_revision, verify, *, metadata=None):
         if not self.writable():
             raise DocumentError("Override storage is read-only.")
-        record = {"version": 1, "path": path, "source_revision": source_revision, "body": body,
+        record = {"version": 2, "path": path, "source_revision": source_revision,
                   "save_id": secrets.token_hex(16)}
+        if body is not None:
+            record["body"] = body
+        if metadata:
+            title, properties = personal_metadata(metadata.get("display_title"), metadata.get("personal_properties", {}))
+            if title is not None:
+                record["display_title"] = title
+            if properties:
+                record["personal_properties"] = properties
         data = json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         if len(data) > _MAX_RECORD_BYTES:
             raise DocumentError("The override exceeds the document limit.")

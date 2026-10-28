@@ -325,6 +325,30 @@ def _document_metadata(path: str, fields: dict[str, Any]) -> dict[str, Any]:
     return {"navigation": bool(navigation), "source_coverage": coverage}
 
 
+def _personal_projection(document, record=None):
+    fields = _frontmatter(document["text"])
+    personal = copy.deepcopy((record or {}).get("personal_properties", {}))
+    title = (record or {}).get("display_title")
+    managed = document.get("reason") == _ENGINE_REASON
+    conflicts = sorted(key for key in personal if key in fields and key not in {"tags", "aliases"})
+
+    def strings(value):
+        return [value] if isinstance(value, str) else [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
+
+    tags = list(dict.fromkeys(value.removeprefix("#") for value in strings(fields.get("tags", fields.get("tag")))
+                              + strings(personal.get("tags")) if value))
+    aliases = list(dict.fromkeys(strings(fields.get("aliases", fields.get("alias"))) + strings(personal.get("aliases"))))
+    ownership = {key: "generated" if managed else "personal" for key in fields}
+    for key in personal:
+        if key not in fields:
+            ownership[key] = "personal"
+        elif key in {"tags", "aliases"}:
+            ownership[key] = "mixed"
+    return {"display_title": title or Path(document["path"]).stem, "personal_display_title": title,
+            "personal_properties": personal, "property_ownership": ownership, "property_conflicts": conflicts,
+            "effective_tags": tags, "effective_aliases": aliases}
+
+
 def _generated_identity(path: str, fields: dict[str, Any], revision: str, effective_text: str):
     """Recognize the writer's explicit projections, never title or source-note lookalikes."""
     parts = path.split("/")
@@ -690,7 +714,7 @@ class DocumentService:
             run = {"root_stamp": stamp, "note_ids": {}, "cluster_ids": {}, "projected": {},
                    "unresolved": {}, "warnings": [], "truncated": False, "recall_only": True,
                    "recall_paths": set(note_paths),
-                   "recall_overridden_paths": {row["path"] for row in selected if row.get("override_saved")}}
+                   "recall_overridden_paths": {row["path"] for row in selected if row.get("body_override_saved")}}
             for row in snapshot["documents"]:
                 self._index_identity(run["note_ids"], row["frontmatter"].get("note_id"), row["path"],
                                      2 if row["path"].split("/")[:2] == ["02_source_memory", "notes"] else 1)
@@ -864,9 +888,10 @@ class DocumentService:
         return self._overrides.generation(self._root, self._root_identity) if self._override_location() else None
 
     def _override_document(self, document, view=None, *, guarded=False, protected=None):
+        document = {**document, **_personal_projection(document)}
         if self._overrides is None:
             return document
-        result = {**document, "override_available": False, "override_saved": False,
+        result = {**document, "override_available": False, "override_saved": False, "body_override_saved": False,
                   "source_changed": False, "source_revision": document["revision"]}
         if (not self._override_location() or document.get("reason") != _ENGINE_REASON
                 or document.get("newline") == "mixed"):
@@ -887,12 +912,14 @@ class DocumentService:
         if info is not None and not info.st_mode & 0o222:
             result["override_available"] = False
         if record:
-            text = parts[0] + record["body"]
+            text = parts[0] + record["body"] if "body" in record else document["text"]
             if len(text.encode("utf-8")) > MAX_FILE_BYTES:
                 raise DocumentError("The regenerated properties and saved override exceed the document limit.")
-            result.update(text=text, newline="lf", override_saved=True,
-                          source_changed=record["source_revision"] != document["revision"],
+            result.update(text=text, newline="lf" if "body" in record else document.get("newline", "lf"), override_saved=True,
+                          body_override_saved=text.replace("\r\n", "\n") != document["text"].replace("\r\n", "\n"),
+                          source_changed="body" in record and record["source_revision"] != document["revision"],
                           revision=hashlib.sha256(f"override-v1\0{document['revision']}\0{digest}".encode()).hexdigest())
+            result.update(_personal_projection(document, record))
         return result
 
     def _document(self, relative: str, directory: _Directory, *, effective=True) -> dict[str, Any]:
@@ -986,6 +1013,7 @@ class DocumentService:
                             continue
                         relative = "/".join(child)
                         row_reason = self._reason(directory)
+                        presentation = {}
                         if stat.S_ISDIR(info.st_mode):
                             if child[:2] == ("02_source_memory", "indexes") and not _published_index_directory(child):
                                 continue
@@ -1006,13 +1034,17 @@ class DocumentService:
                                 try:
                                     text, _, newline = _decode(data)
                                     row_reason = self._reason(directory, text, newline)
+                                    if self._overrides is not None:
+                                        effective = self._override_document({"path": relative, "text": text, "reason": row_reason,
+                                                                             "revision": hashlib.sha256(data).hexdigest(), "newline": newline})
+                                        presentation = {key: effective[key] for key in ("display_title", "personal_display_title")}
                                 except DocumentError as exc:
                                     row_reason = str(exc)
                                 if not info.st_mode & 0o222 and not row_reason:
                                     row_reason = "The note is read-only."
                         else:
                             continue
-                        entries.append({"path": relative, "name": name, "kind": kind, "editable": not row_reason, "reason": row_reason})
+                        entries.append({"path": relative, "name": name, "kind": kind, "editable": not row_reason, "reason": row_reason, **presentation})
                         if len(entries) >= MAX_ENTRIES:
                             truncated = True
                             break
@@ -1022,11 +1054,52 @@ class DocumentService:
                 "id": self._workspace_id, "name": self._root.name,
                 "path": str(self._root), "entries": sorted(entries, key=lambda row: row["path"].casefold()),
                 "truncated": truncated, "editable": not reason, "reason": reason,
+                **self._workspace_presentation(),
             }
             master = "02_source_memory/indexes/INDEX.md"
             if published and any(row["path"] == master and row["kind"] == "file" and row["reason"] == _ENGINE_REASON for row in entries):
                 workspace["preferred_path"] = master
             return workspace
+
+    def _workspace_presentation(self):
+        """Classify only fixed, bounded metadata; never follow exported paths."""
+        stamp = (str(self._root), self._root_identity, self._index_semantic_stamp())
+        export_stamp = None
+        try:
+            with self._directory((".auto-zettelkasten",)) as directory:
+                export_stamp = _stamp(directory.stat("related-export.json"))
+        except FileNotFoundError:
+            pass
+        except (DocumentError, OSError):
+            export_stamp = "unavailable"
+        stamp = (*stamp, export_stamp)
+        cached = getattr(self, "_workspace_presentation_cache", None)
+        if cached and cached[0] == stamp:
+            return dict(cached[1])
+        result = {"workspace_kind": "markdown", "mapping_status": "absent"}
+        mapping = self._read_semantic_map()
+        if mapping is not None:
+            result = {"workspace_kind": "mapped", "mapping_status": "invalid" if mapping.get("unavailable") else "saved"}
+        elif export_stamp is not None:
+            try:
+                with self._directory((".auto-zettelkasten",)) as directory:
+                    raw, _ = self._read_derived_bytes(directory, "related-export.json", max_bytes=16 * MAX_FILE_BYTES)
+                manifest = json.loads(raw)
+                source = manifest.get("source_workspace")
+                files = manifest.get("files")
+                if (manifest.get("schema_version") != "markdown-related-export-v1"
+                        or not isinstance(source, str) or not Path(source).is_absolute() or ".." in Path(source).parts
+                        or any(ord(char) < 32 or 0xD800 <= ord(char) <= 0xDFFF for char in source)
+                        or not isinstance(files, dict) or len(files) > 20000
+                        or any(not isinstance(path, str) or Path(path).is_absolute() or ".." in path.split("/")
+                               or not path.endswith(".md") or not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest)
+                               for path, digest in files.items())):
+                    raise ValueError()
+                result = {"workspace_kind": "markdown_export", "mapping_status": "absent", "source_workspace": source}
+            except (DocumentError, OSError, UnicodeError, ValueError, AttributeError, RecursionError):
+                result["export_status"] = "invalid"
+        self._workspace_presentation_cache = (stamp, result)
+        return dict(result)
 
     def read(self, workspace_id: str, path: str) -> dict[str, Any]:
         with _LOCK, self._errors():
@@ -1823,6 +1896,7 @@ class DocumentService:
                             document = {"path": path, "text": text, "revision": hashlib.sha256(data).hexdigest(), "editable": not reason}
                             if self._overrides is not None:
                                 document = self._override_document({**document, "reason": reason, "newline": newline})
+                            row.update({key: document[key] for key in ("display_title", "personal_display_title") if key in document})
                             effective_bytes = len(document["text"].encode("utf-8")) if self._overrides is not None else len(data)
                             if page_bytes and page_bytes + effective_bytes > INDEX_PAGE_BYTES:
                                 run["pending"] = item
@@ -2155,7 +2229,7 @@ class DocumentService:
                 if proposed is None or proposed[0] != original[0]:
                     raise DocumentError("Generated properties and identity fields cannot be changed. Edit only the Markdown body.")
                 record, _, _ = view.read(relative)
-                if record and record["body"] == proposed[1] and record["source_revision"] == canonical["revision"]:
+                if record and record.get("body") == proposed[1] and record["source_revision"] == canonical["revision"]:
                     return current
 
                 def verify():
@@ -2165,7 +2239,57 @@ class DocumentService:
                     if not latest["override_available"]:
                         raise DocumentError("This note no longer supports a private body override.")
 
-                view.write(relative, proposed[1], canonical["revision"], verify)
+                view.write(relative, proposed[1], canonical["revision"], verify, metadata=record)
+                return self._override_document(self._document(relative, directory, effective=False), view, guarded=True)
+
+    def save_personal_metadata(self, workspace_id: str, document_id: str, revision: str, changes: dict[str, Any]) -> dict[str, Any]:
+        """Update only private display metadata, never the generated Markdown."""
+        from .document_overrides import personal_metadata
+
+        with _LOCK, self._errors():
+            self._workspace(workspace_id)
+            if not isinstance(document_id, str) or document_id not in self._documents:
+                raise DocumentError("Open the document before saving personal metadata.")
+            if not isinstance(revision, str) or not re.fullmatch(r"[a-f0-9]{64}", revision):
+                raise DocumentError("A document revision is required.")
+            if (not isinstance(changes, dict) or not changes or set(changes) - {"display_title", "personal_properties"}):
+                raise DocumentError("Unsupported personal metadata fields.")
+            if not self._override_location():
+                raise DocumentError("Private override storage is unavailable or inside the workspace.")
+            relative = self._documents[document_id][0]
+            with self._directory() as root_directory:
+                published = self._published_indexes(root_directory)
+            parts = _parts(relative, published=published)
+            with self._directory(parts[:-1]) as directory, self._overrides.guard(self._root, self._root_identity, create=True) as view:
+                canonical = self._document(relative, directory, effective=False)
+                current = self._override_document(canonical, view, guarded=True)
+                if current["revision"] != revision:
+                    raise DocumentConflict(current)
+                if not current["override_available"]:
+                    raise DocumentError("This note does not support private personal metadata.")
+                record, _, _ = view.read(relative)
+                record = record or {}
+                if "personal_properties" in changes and not isinstance(changes["personal_properties"], dict):
+                    raise DocumentError("Personal properties require a named-value map.")
+                title, properties = personal_metadata(changes.get("display_title", record.get("display_title")),
+                                                       changes.get("personal_properties", record.get("personal_properties", {})))
+                fields = _frontmatter(canonical["text"])
+                old = record.get("personal_properties", {})
+                if any(key in fields and key not in {"tags", "aliases"} and (key not in old or value != old[key])
+                       for key, value in properties.items()):
+                    raise DocumentError("Personal properties cannot replace generated properties.")
+                if title == record.get("display_title") and properties == record.get("personal_properties", {}):
+                    return current
+
+                def verify():
+                    latest = self._override_document(self._document(relative, directory, effective=False), view, guarded=True)
+                    if latest["revision"] != revision:
+                        raise DocumentConflict(latest)
+                    if not latest["override_available"]:
+                        raise DocumentError("This note no longer supports private personal metadata.")
+
+                view.write(relative, record.get("body"), record.get("source_revision", canonical["revision"]), verify,
+                           metadata={"display_title": title, "personal_properties": properties})
                 return self._override_document(self._document(relative, directory, effective=False), view, guarded=True)
 
     def create(self, workspace_id: str, parent: str, name: str, kind: str) -> dict[str, Any]:

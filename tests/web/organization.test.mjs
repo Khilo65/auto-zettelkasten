@@ -134,6 +134,23 @@ function harness(t, options = {}) {
   return { w, kit, el, click, input, view, notes, put, requests, hooks, root, open, focus, rename, confirm, poll: () => polls[0]() };
 }
 
+test("inline personal title submits into reviewed rename and preserves YAML and authored heading", async (t) => {
+  const app = harness(t); await app.root(); await app.open("Notes/Target Name.md");
+  app.notes.get("Notes/Target Name.md").display_title = "Target Name";
+  await app.open("Notes/Target Name.md");
+  const before = app.notes.get("Notes/Target Name.md").text;
+  app.click("workspace-file-title"); app.input("workspace-title-input", "A better title");
+  app.el("workspace-title-form").dispatchEvent(new app.w.Event("submit", { bubbles: true, cancelable: true }));
+  await until(() => app.el("workspace-organization-review").open, "inline rename review");
+  assert.equal(app.el("workspace-organization-to").textContent, "Notes/A better title.md");
+  assert.equal(app.requests.filter(({ url }) => url.endsWith("/relocate")).length, 0);
+  app.click("workspace-organization-repair");
+  await until(() => app.notes.has("Notes/A better title.md"), "inline rename applied");
+  assert.equal(app.notes.get("Notes/A better title.md").text, before);
+  assert.equal(app.el("workspace-file-title").textContent, "A better title");
+  assert.match(app.notes.get("One.md").text, /better%20title/);
+});
+
 test("rename review counts seven references in two files, shows exact destination changes, and Cancel makes no writes", async (t) => {
   const app = harness(t); await app.root(); await app.open("Notes/Target Name.md");
   const before = new Map([...app.notes].map(([path, note]) => [path, note.text]));
