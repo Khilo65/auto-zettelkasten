@@ -61,3 +61,14 @@ test("properties expose only recognized source URLs without changing stored valu
   assert.equal(escaped.querySelectorAll("img").length, 0);
   assert.equal(escaped.querySelector("a").textContent, '<img src="x" onerror="alert(1)">');
 });
+
+test("annotation source quotations remain distinct from personal interpretations in Reading", () => {
+  const text = `## Highlights and annotations\n\n- [Highlight · p. 458](${pdf}?page=1&annotation=ANNOT001)\n\n  **Source quotation:**\n\n  > The source's own claim.\n\n  **Personal comment:**\n\n  My interpretation of that claim.\n`;
+  const index = buildLinkIndex([note("Source.md", text)]);
+  const document = new JSDOM(renderIndexedMarkdown(index, "Source.md")).window.document;
+  assert.equal(document.querySelector("blockquote").textContent.trim(), "The source's own claim.");
+  const label = [...document.querySelectorAll("strong")].find(row => row.textContent === "Personal comment:");
+  assert.ok(label); assert.equal(label.closest("blockquote"), null);
+  assert.equal(label.closest("li").querySelector("[data-source-uri]").dataset.sourceUri, `${pdf}?page=1&annotation=ANNOT001`);
+  assert.match(label.closest("li").textContent, /My interpretation of that claim/);
+});

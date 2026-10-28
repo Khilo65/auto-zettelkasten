@@ -44,7 +44,9 @@ function harness(t, options = {}) {
       else { saved.push(body.text); data.disk = { ...data.disk, text: body.text, revision: `r${saved.length + 1}` }; result = { document: data.disk }; }
     }
     else if (["/api/zotero/open-source", "/api/zotero/open-pdf"].includes(url)) result = { reader: structuredClone(reader) };
-    else if (url === "/api/zotero/annotation-refresh") result = { annotations: structuredClone(reader.annotations) };
+    else if (url === "/api/zotero/annotation-refresh") result = { annotations: structuredClone(reader.annotations), readOnly: reader.readOnly, pending: [] };
+    else if (url === "/api/zotero/annotation-recovery") result = { records: [], next_start: null, server_id: "SYNTHETIC001" };
+    else if (url.startsWith("/api/zotero/annotation-sync-")) result = { enabled: true, jobs: [], drafts: [] };
     else if (url === "/api/zotero/status") result = { connected: true, writable: false, writes_available: false, server_id: "SYNTHETIC001" };
     else if (url === "/api/zotero/libraries") result = { libraries: [{ scope: "users/0", name: "My Library", writable: false }] };
     else if (url === "/api/zotero/collections") result = page([]);
@@ -53,7 +55,7 @@ function harness(t, options = {}) {
     else throw new Error(`Unexpected synthetic API request ${url}`);
     return { ok: status < 400, status, json: async () => structuredClone(result) };
   };
-  for (const name of ["workspace-vendor.js", "app.js", "workspace-library.js", "workspace-source-reader.js", "workspace.js"]) {
+  for (const name of ["workspace-vendor.js", "app.js", "workspace-library.js", "workspace-source-reader.js", "workspace-annotations.js", "workspace.js"]) {
     const script = d.createElement("script"); script.textContent = asset(name); d.body.append(script);
   }
   const el = (id) => d.getElementById(id), click = (id) => el(id).click();
@@ -216,7 +218,8 @@ test("failed annotation save is retained and explicit reconciliation unblocks cl
   assert.equal(app.el("workspace-pdf-retry").hidden, false);
   assert.equal(app.w.workspaceHasUnsavedChanges(), true);
   app.d.querySelector('[data-tab-key="source:users/0:PDF00001"] .tab-close').click();
-  await until(() => app.el("workspace-message").textContent.includes("pending annotation"));
+  await until(() => app.el("workspace-confirm-dialog").open);
+  app.click("workspace-confirm-cancel");
   assert.ok(app.d.querySelector('[data-tab-key="source:users/0:PDF00001"]'));
   app.click("workspace-pdf-refresh"); await until(() => app.requests.some((row) => row.url === "/api/zotero/annotation-reconcile"));
   await until(() => !app.w.workspaceHasUnsavedChanges());
@@ -411,4 +414,122 @@ test("failed or mismatched renewal leaves a retryable source tab without opening
   reopen(); await until(() => app.d.querySelector(".source-reader-frame")); app.connectFrame(app.d.querySelector(".source-reader-frame"));
   assert.equal(app.packets.filter((row) => row.packet.type === "init").at(-1).packet.document.url, "/api/zotero/attachments/recovered-capability/file");
   assert.equal(attempts, 3, "retries are explicit tab selections");
+});
+
+test("authorizing an already open PDF updates permissions without reopening, and revocation locks it", async (t) => {
+  let authorized = false;
+  const app = harness(t, { fetch: (url, body, { reader }) => {
+    if (url === "/api/zotero/status") return { connected: true, writable: authorized, writes_available: true };
+    if (url === "/api/zotero/authorize") { authorized = true; return { authorized: true }; }
+    if (url === "/api/zotero/annotation-refresh") return { annotations: reader.annotations, pending: [], readOnly: !authorized, readOnlyReason: authorized ? "" : "Editing permission is required" };
+  } });
+  await app.open(); const frame = await app.openPDF();
+  await until(() => !app.el("workspace-pdf-authorize").hidden);
+  app.click("workspace-pdf-authorize");
+  await until(() => app.packets.some(({ packet }) => packet.type === "read-only" && packet.readOnly === false));
+  assert.equal(app.d.querySelector(".source-reader-frame"), frame);
+  assert.equal(app.el("workspace-pdf-authorize").hidden, true);
+  authorized = false; app.click("workspace-pdf-refresh");
+  await until(() => app.packets.filter(({ packet }) => packet.type === "read-only").at(-1)?.packet.readOnly === true);
+  assert.match(app.el("workspace-pdf-notice").textContent, /permission/);
+});
+
+test("a PDF restriction explains its read-only state as soon as the reader opens", async (t) => {
+  const app = harness(t, { reader: { readOnly: true, readOnlyReason: "This library does not allow annotation edits." } });
+  await app.open(); await app.openPDF();
+  assert.equal(app.el("workspace-pdf-notice").textContent, "This library does not allow annotation edits.");
+});
+
+test("an interrupted receipt with no queued operations never acknowledges a Zotero save", async (t) => {
+  const app = harness(t, { reader: { readOnly: false }, fetch: (url) => {
+    if (url === "/api/zotero/annotation-save") return { pending: [], resolved: false, retained: true, pending_receipt_ids: ["receipt"], warning: "Interrupted request retained" };
+  } });
+  await app.open(); const frame = await app.openPDF();
+  app.emit(frame, "save-annotations", { operationId: "before-admission", annotations: [{ ...app.reader.annotations[0], comment: "Retain this draft" }] });
+  await until(() => app.packets.some(({ packet }) => packet.type === "operation-result" && packet.operationId === "before-admission"));
+  const ack = app.packets.find(({ packet }) => packet.type === "operation-result" && packet.operationId === "before-admission").packet;
+  assert.equal(ack.success, false); assert.equal(app.w.workspaceHasUnsavedChanges(), true);
+});
+
+test("shared-note drafts restore from private backend storage after browser storage is empty", async (t) => {
+  const retained = `${baseText}\nRetained across the desktop restart.\n`;
+  const app = harness(t, { document: { live_binding: { item_key: "ITEM0001" } }, fetch: (url) => {
+    if (url.startsWith("/api/zotero/annotation-sync-")) return { enabled: true, jobs: [], drafts: [{ note_path: "Source.md", revision: "r1", text: retained }] };
+  } });
+  await app.open();
+  assert.equal(app.el("workspace-recovery").hidden, false);
+  app.click("workspace-restore");
+  assert.match(app.getView().state.doc.toString(), /Retained across the desktop restart/);
+  assert.equal(app.saved.length, 0, "recovery does not overwrite the note without saving");
+});
+
+test("a shared note edited during its close checkpoint stays open with the newer draft", async (t) => {
+  const checkpoint = delayed(); let delayNext = false;
+  const app = harness(t, { document: { live_binding: { item_key: "ITEM0001" } }, fetch: async (url) => {
+    if (url === "/api/zotero/annotation-sync-buffers" && delayNext) { delayNext = false; return checkpoint.promise; }
+  } });
+  await app.open(); delayNext = true;
+  app.d.querySelector('[data-tab-key="note:Source.md"] .tab-close').click();
+  await until(() => !delayNext);
+  app.append("\nTyped while the checkpoint was pending.");
+  checkpoint.resolve({ enabled: true, jobs: [], drafts: [] });
+  await until(() => app.el("workspace-message").textContent.includes("changed while closing"));
+  assert.ok(app.d.querySelector('[data-tab-key="note:Source.md"]'));
+  assert.match(app.getView().state.doc.toString(), /Typed while the checkpoint/);
+});
+
+test("a restarted reader with an interrupted receipt stays blocked even when the outbox is empty", async (t) => {
+  const app = harness(t, { fetch: (url, body, { reader }) => {
+    if (url === "/api/zotero/annotation-refresh") return { annotations: reader.annotations, pending: [], pending_receipt_ids: ["receipt"], readOnly: true };
+  } });
+  await app.open(); await app.openPDF(); app.click("workspace-pdf-refresh");
+  await until(() => app.el("workspace-message").textContent.includes("need recovery"));
+  assert.equal(app.el("workspace-pdf-retry").hidden, false);
+});
+
+test("newer buffered annotation text is retained without claiming it was saved in Zotero", async (t) => {
+  const app = harness(t, { reader: { readOnly: false }, fetch: (url) => {
+    if (url === "/api/zotero/annotation-retain") return { retained: true, resolved: false, pending_receipt_ids: ["newer"] };
+  } });
+  await app.open(); const frame = await app.openPDF();
+  app.emit(frame, "retain-annotations", { operationId: "retained-newer", annotations: [{ ...app.reader.annotations[0], comment: "Entire latest comment" }] });
+  await until(() => app.packets.some(({ packet }) => packet.type === "retention-result"));
+  assert.equal(app.packets.find(({ packet }) => packet.type === "retention-result").packet.retained, true);
+  assert.equal(app.requests.find(row => row.url === "/api/zotero/annotation-retain").body.annotations[0].comment, "Entire latest comment");
+  assert.equal(app.packets.some(({ packet }) => packet.type === "operation-result" && packet.success), false);
+});
+
+test("desktop close preparation waits for the PDF flush and cancellation restores the workspace", async (t) => {
+  const app = harness(t); await app.open(); const frame = await app.openPDF();
+  assert.equal(app.w.workspacePrepareClose(), "waiting");
+  await until(() => app.packets.some(({ packet }) => packet.type === "flush"));
+  assert.equal(app.w.workspacePrepareClose(), "waiting");
+  app.emit(frame, "flush-result", { success: true });
+  await until(() => app.w.workspacePrepareClose() === "ready");
+  assert.equal(app.el("workspace-screen").inert, true);
+  app.w.workspaceCancelClose(); assert.equal(app.el("workspace-screen").inert, false);
+});
+
+test("a cancelled desktop close cannot reuse a late flush result for a later close", async (t) => {
+  const app = harness(t); await app.open(); const frame = await app.openPDF();
+  assert.equal(app.w.workspacePrepareClose(), "waiting");
+  await until(() => app.packets.some(({ packet }) => packet.type === "flush"));
+  app.w.workspaceCancelClose();
+  app.emit(frame, "flush-result", { success: true });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(app.w.workspacePrepareClose(), "waiting", "the new close needs its own checkpoint");
+  await until(() => app.packets.filter(({ packet }) => packet.type === "flush").length === 2);
+  app.emit(frame, "flush-result", { success: true });
+  await until(() => app.w.workspacePrepareClose() === "ready");
+});
+
+test("sharing a note before opening its PDF binds its explicit source and attachment URIs", async (t) => {
+  const app = harness(t, { fetch: (url, body) => {
+    if (url === "/api/zotero/migration-preview") return { preview_identity: "preview", binding: { item_key: body.item_key }, text: baseText };
+  } });
+  await app.open(); app.click("workspace-source-share");
+  await until(() => app.el("workspace-migration-dialog").open);
+  const request = app.requests.find(({ url }) => url === "/api/zotero/migration-preview").body;
+  assert.equal(request.scope, "users/0"); assert.equal(request.item_key, "ITEM0001"); assert.equal(request.attachment_key, "PDF00001");
+  assert.equal(app.requests.some(({ url }) => url === "/api/zotero/migrate"), false, "preview alone never attaches a note");
 });

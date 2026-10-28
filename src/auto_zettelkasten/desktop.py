@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 from .webapp import LocalApp, LocalServer
@@ -132,6 +133,27 @@ def launch() -> None:
                     return
                 try:
                     # evaluate_js wraps eval, which the local app's script policy forbids.
+                    prepare_script = "window.workspacePrepareClose ? window.workspacePrepareClose() : 'legacy'"
+                    prepared = window.run_js(prepare_script)
+                    if prepared not in ("waiting", "ready", "blocked", "legacy") and isinstance(prepared, str):
+                        prepared = json.loads(prepared)
+                    deadline = time.monotonic() + 9
+                    while prepared == "waiting":
+                        if operation_in_progress():
+                            window.create_confirmation_dialog("Operation in progress", "Keep this window open until mapping or sign-in finishes. You can minimize it while you wait.")
+                            return
+                        if time.monotonic() >= deadline:
+                            prepared = "blocked"
+                            break
+                        time.sleep(0.05)
+                        prepared = window.run_js(prepare_script)
+                        if prepared not in ("waiting", "ready", "blocked", "legacy") and isinstance(prepared, str):
+                            prepared = json.loads(prepared)
+                    if prepared == "blocked":
+                        window.create_confirmation_dialog("PDF changes need attention", "Some PDF annotation changes are not confirmed as saved or retained locally. Return to Annotation changes to review them, or close the PDF with Close and keep changes pending before quitting.")
+                        return
+                    if prepared not in ("ready", "legacy"):
+                        raise ValueError("Reader save state is unavailable")
                     result = window.run_js("window.workspaceHasUnsavedChanges ? (window.workspaceHasUnsavedChanges() ? 'dirty' : 'clean') : 'unavailable'")
                     if result not in ("dirty", "clean") and isinstance(result, str):
                         result = json.loads(result)
@@ -150,6 +172,11 @@ def launch() -> None:
                     except Exception:
                         close_ready.clear()
             finally:
+                if not close_ready.is_set():
+                    try:
+                        window.run_js("if (window.workspaceCancelClose) window.workspaceCancelClose();")
+                    except Exception:
+                        pass
                 close_pending.release()
 
         def closing():
@@ -213,6 +240,7 @@ def smoke_test() -> dict:
             try:
                 for route in ("/", "/styles.css", "/app.js", "/workspace.js", "/workspace.css",
                               "/workspace-vendor.js", "/workspace-index-worker.js", "/workspace-graph-worker.js",
+                              "/workspace-annotations.js", "/workspace-annotations.css", "/workspace-source-reader.js", "/zotero-reader-host.js",
                               "/workspace-licenses.txt"):
                     connection.request("GET", route)
                     response = connection.getresponse()

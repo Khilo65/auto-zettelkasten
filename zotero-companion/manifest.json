@@ -1,0 +1,14 @@
+{
+  "manifest_version": 2,
+  "name": "Auto-Zettelkasten Annotation Capabilities",
+  "version": "1.0.2",
+  "description": "Read-only, attachment-bound annotation permissions for the local workspace.",
+  "applications": {
+    "zotero": {
+      "id": "annotation-capabilities@auto-zettelkasten.org",
+      "update_url": "https://updates.invalid/auto-zettelkasten-annotation-capabilities.json",
+      "strict_min_version": "10.0",
+      "strict_max_version": "10.0.*"
+    }
+  }
+}

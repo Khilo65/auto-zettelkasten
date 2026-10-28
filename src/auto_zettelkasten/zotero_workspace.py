@@ -6,6 +6,7 @@ cloud fallbacks, database access, or authorization prompts during reads.
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -109,7 +110,8 @@ class ZoteroWorkspaceClient:
         "annotationPageLabel", "annotationSortIndex", "annotationPosition", "tags",
     })
 
-    def __init__(self, base_url: str = "http://127.0.0.1:23119", *, credential_path: Path | None = None, timeout: float = 20.0):
+    def __init__(self, base_url: str = "http://127.0.0.1:23119", *, credential_path: Path | None = None, timeout: float = 20.0,
+                 expected_server_id: str | None = None, allowed_origin: str | None = None):
         require_loopback_http_url(base_url, label="Zotero workspace URL")
         parts = urllib.parse.urlsplit(base_url)
         if parts.username or parts.password or parts.query or parts.fragment or parts.path not in {"", "/"}:
@@ -117,21 +119,32 @@ class ZoteroWorkspaceClient:
         if not 0 < timeout <= 120:
             raise ValueError("Timeout must be between 0 and 120 seconds")
         self.base_url = base_url.rstrip("/")
+        if allowed_origin is not None and allowed_origin.rstrip("/") != self.base_url:
+            raise ValueError("The Zotero connection is outside its allowed origin")
+        if expected_server_id is not None and not re.fullmatch(r"[A-Za-z0-9]{12}", expected_server_id):
+            raise ValueError("Expected Zotero server identity must contain 12 letters or digits")
+        self._allowed_origin = self.base_url
+        self.expected_server_id = expected_server_id
         self.credential_path = Path(credential_path) if credential_path is not None else None
         self.timeout = timeout
         self.server_id: str | None = None
         self.schema_version: int | None = None
         self._credential: dict[str, Any] | None = None
         self._created_annotations: set[tuple[str, str, str]] = set()
+        self._bridge_status = "unchecked"
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
     def _request(self, endpoint: str, *, method: str = "GET", body: Any = None, write_token: str | None = None, authorize: bool = False, delete_version: int | None = None) -> tuple[bytes, Mapping[str, str]]:
+        if self.base_url != self._allowed_origin:
+            raise ZoteroWorkspaceError("Zotero connection origin changed; reconnect explicitly.", code="server_changed")
         if not endpoint.startswith(("users/0/", "groups/", "local/authorize")) and endpoint != "":
             raise ValueError("Unsupported local Zotero endpoint")
         headers = {"Zotero-API-Version": "3", "Accept": "application/json"}
-        if self.server_id:
-            headers["Zotero-Server-ID"] = self.server_id
+        if self.server_id or self.expected_server_id:
+            headers["Zotero-Server-ID"] = self.server_id or self.expected_server_id
         writing = method != "GET"
+        if writing and authorize:
+            self._require_write_capability()
         if writing and not authorize:
             self._require_write_capability()
             credential = self._load_credential()
@@ -162,7 +175,19 @@ class ZoteroWorkspaceClient:
                 return data, response_headers
         except urllib.error.HTTPError as exc:
             status = exc.code
-            exc.close()
+            try:
+                error_headers = dict(exc.headers.items())
+                header_names = {name.lower() for name in error_headers}
+                # Zotero's router answers an unregistered companion path before
+                # local-API response decoration. Only this narrow read-only
+                # absence may lack identity headers; it grants no permissions.
+                absent_companion = (method == "GET" and status in {404, 405, 501}
+                    and re.fullmatch(r"(?:users/0|groups/[1-9][0-9]{0,14})/items/[A-Z0-9]{8}/az-annotation-capabilities\?annotationKeys=[A-Z0-9%,]*", endpoint)
+                    and not header_names.intersection({"zotero-server-id", "zotero-api-version", "zotero-schema-version"}))
+                if not absent_companion:
+                    self._check_headers(error_headers)
+            finally:
+                exc.close()
             if status == 401:
                 self._forget_credential()
             codes = {401: "authorization_required", 403: "access_denied", 404: "not_found", 412: "version_conflict", 428: "precondition_required"}
@@ -182,6 +207,9 @@ class ZoteroWorkspaceClient:
         identity = lower.get("zotero-server-id", "")
         if not re.fullmatch(r"[A-Za-z0-9]{12}", identity):
             raise ZoteroWorkspaceError("Zotero server identity is unavailable.", code="unsupported_server")
+        if self.expected_server_id is not None and identity != self.expected_server_id:
+            self._forget_credential()
+            raise ZoteroWorkspaceError("This is not the selected Zotero server.", code="server_changed")
         if self.server_id is not None and self.server_id != identity:
             self._forget_credential()
             raise ZoteroWorkspaceError("Zotero server identity changed; reconnect explicitly.", code="server_changed")
@@ -199,7 +227,9 @@ class ZoteroWorkspaceClient:
             self._request("")
 
     def _require_write_capability(self) -> None:
-        self._ready()
+        # A remembered identity is not a current connection check. Preflight
+        # every mutation/consent request before sending credentials or data.
+        self._request("")
         if self.schema_version not in self.WRITE_SCHEMA_VERSIONS:
             raise ZoteroWorkspaceError("Zotero writes are disabled for this unverified schema version.", code="unsupported_version")
 
@@ -209,7 +239,8 @@ class ZoteroWorkspaceClient:
             return {"available": True, "base_url": self.base_url, "server_id": self.server_id,
                     "api_version": 3, "schema_version": self.schema_version,
                     "write_supported": self.schema_version in self.WRITE_SCHEMA_VERSIONS,
-                    "authorized": self._load_credential() is not None, "deletion_feed": False}
+                    "authorized": self._load_credential() is not None, "deletion_feed": False,
+                    "annotation_capabilities": self._bridge_status}
         except ZoteroWorkspaceError as exc:
             return {"available": False, "base_url": self.base_url, "code": exc.code, "reason": str(exc), "authorized": False}
 
@@ -241,7 +272,8 @@ class ZoteroWorkspaceClient:
             raise ZoteroWorkspaceError("Unable to read private Zotero authorization.", code="credential_storage") from None
         if not isinstance(entry, dict) or entry.get("server_id") != self.server_id or entry.get("base_url") != self.base_url:
             return None
-        if not isinstance(entry.get("key"), str) or not re.fullmatch(r"[A-Za-z0-9]{32}", entry["key"]):
+        if (not isinstance(entry.get("key"), str) or not re.fullmatch(r"[A-Za-z0-9]{32}", entry["key"])
+                or type(entry.get("remember")) is not bool):
             raise ZoteroWorkspaceError("Invalid private credential record.", code="credential_storage")
         self._credential = entry
         return entry
@@ -307,6 +339,124 @@ class ZoteroWorkspaceClient:
 
     def item(self, scope: str, key: str) -> dict[str, Any] | None:
         return self._get_record(scope, key)
+
+    def annotation_capabilities(self, scope: str, attachment_key: str, keys: list[str]) -> dict[str, Any] | None:
+        """Read authoritative permissions without consuming native write consent.
+
+        This GET-only companion supplies no annotation content. Its response is
+        never reused as an affirmative permission cache.
+        """
+        _scope(scope)
+        _key(attachment_key)
+        if (not isinstance(keys, list) or len(keys) > 64
+                or any(not isinstance(key, str) for key in keys) or len(set(keys)) != len(keys)):
+            raise ValueError("Select at most 64 distinct annotation keys")
+        for key in keys:
+            _key(key)
+        self._ready()
+        endpoint = f"{scope}/items/{attachment_key}/az-annotation-capabilities?" + urllib.parse.urlencode({"annotationKeys": ",".join(keys)})
+        try:
+            payload, _ = self._request(endpoint)
+        except ZoteroWorkspaceError as exc:
+            if exc.status in {404, 405, 501}:
+                self._bridge_status = "unavailable"
+                return None
+            raise
+        value = self._json(payload)
+        if (not isinstance(value, dict) or type(value.get("bridge_version")) is not int or value.get("bridge_version") != 1
+                or not isinstance(value.get("zotero_version"), str) or not re.fullmatch(r"10\.0(?:\.[0-9A-Za-z.-]+)?", value["zotero_version"])
+                or value.get("server_id") != self.server_id or value.get("scope") != scope
+                or value.get("attachment_key") != attachment_key
+                or type(value.get("attachment_read_only")) is not bool
+                or not isinstance(value.get("annotations"), list) or not isinstance(value.get("missing"), list)):
+            self._bridge_status = "incompatible"
+            raise ZoteroWorkspaceError("Annotation capability response identity mismatch.", code="identity_mismatch")
+        _version(value.get("attachment_version"))
+        seen = set()
+        for row in value["annotations"]:
+            if (not isinstance(row, dict) or row.get("key") not in keys or row.get("key") in seen
+                    or type(row.get("isExternal")) is not bool or type(row.get("readOnly")) is not bool):
+                raise ZoteroWorkspaceError("Invalid annotation capabilities.", code="invalid_response")
+            _version(row.get("version"))
+            seen.add(row["key"])
+        if (any(not isinstance(key, str) or key not in keys or key in seen for key in value["missing"])
+                or len(set(value["missing"])) != len(value["missing"])
+                or seen | set(value["missing"]) != set(keys)):
+            raise ZoteroWorkspaceError("Incomplete annotation capabilities.", code="incomplete_inventory")
+        self._bridge_status = "available"
+        return value
+
+    def attachment_read_only(self, scope: str, attachment_key: str) -> bool | None:
+        """Fresh attachment permissions, including PDFs with no annotations.
+
+        None means the companion endpoint is absent, never affirmative edit
+        authority. An incompatible/stale response denies editing; connection
+        failures propagate so callers cannot retain a stale writable state.
+        """
+        pdf = self._pdf_item(scope, attachment_key)
+        try:
+            capability = self.annotation_capabilities(scope, attachment_key, [])
+        except (ValueError, ZoteroWorkspaceError) as exc:
+            if (isinstance(exc, ZoteroWorkspaceError) and exc.status != 400 and exc.code not in {
+                    "invalid_response", "identity_mismatch", "incomplete_inventory"}):
+                raise
+            self._bridge_status = "incompatible"
+            return True
+        if capability is None:
+            return None
+        if capability["attachment_version"] != pdf["version"]:
+            self._bridge_status = "incompatible"
+            return True
+        return capability["attachment_read_only"]
+
+    def _annotation_capability_records(self, scope: str, attachment_key: str, rows: list[dict[str, Any]], *, attachment_version: int) -> list[dict[str, Any]]:
+        result = copy.deepcopy(rows)
+        for start in range(0, len(result), 64):
+            batch = result[start:start + 64]
+            keys = [_key(_data(row).get("key")) for row in batch]
+            try:
+                capability = self.annotation_capabilities(scope, attachment_key, keys)
+            except (ValueError, ZoteroWorkspaceError) as exc:
+                if isinstance(exc, ZoteroWorkspaceError) and exc.code not in {
+                        "invalid_response", "identity_mismatch", "incomplete_inventory"}:
+                    raise
+                self._bridge_status = "incompatible"
+                for row in batch:
+                    row["readOnly"] = True
+                continue
+            if capability is None:
+                continue
+            flags = {row["key"]: row for row in capability["annotations"]}
+            for row in batch:
+                data = _data(row)
+                proof = flags.get(data["key"])
+                # Missing or stale capabilities must override any historical
+                # successful-creation provenance in the service.
+                if (proof is None or proof["version"] != data["version"]
+                        or capability["attachment_version"] != attachment_version):
+                    row["readOnly"] = True
+                    continue
+                row["isExternal"] = proof["isExternal"]
+                row["readOnly"] = capability["attachment_read_only"] or proof["readOnly"] or proof["isExternal"]
+                data["isExternal"] = row["isExternal"]
+                data["readOnly"] = row["readOnly"]
+        return result
+
+    def annotation_record(self, scope: str, attachment_key: str, key: str) -> dict[str, Any] | None:
+        pdf = self._pdf_item(scope, attachment_key)
+        row = self.item(scope, key)
+        if row is None:
+            return None
+        data = _data(row)
+        if data.get("itemType") != "annotation" or data.get("parentItem") != attachment_key:
+            raise ZoteroWorkspaceError("Annotation is bound to another attachment.", code="identity_mismatch")
+        library = row.get("library")
+        if library is not None:
+            expected_type = "user" if scope == "users/0" else "group"
+            if (not isinstance(library, dict) or library.get("type") != expected_type
+                    or scope != "users/0" and str(library.get("id")) != scope.split("/")[1]):
+                raise ZoteroWorkspaceError("Annotation library identity mismatch.", code="identity_mismatch")
+        return self._annotation_capability_records(scope, attachment_key, [row], attachment_version=pdf["version"])[0]
 
     def _page(self, endpoint: str, *, start: int, limit: int, query: Mapping[str, str] | None = None) -> dict[str, Any]:
         if type(start) is not int or not 0 <= start < self.MAX_INVENTORY or type(limit) is not int or not 1 <= limit <= 64:
@@ -395,7 +545,7 @@ class ZoteroWorkspaceClient:
         return {"complete": True, "server_id": self.server_id, "scope": scope, "kind": kind, "library_version": version, "versions": versions}
 
     def annotations(self, scope: str, attachment_key: str) -> list[dict[str, Any]]:
-        self._pdf_item(scope, attachment_key)
+        pdf = self._pdf_item(scope, attachment_key)
         # The native local children search omits annotations unless itemType is
         # explicit. Keep both predicates: a plain children response cannot prove
         # deletion, and a whole-library annotation scan makes each PDF open slow.
@@ -420,7 +570,7 @@ class ZoteroWorkspaceClient:
             return parent == attachment_key
         rows, _ = self._all(f"{_scope(scope)}/items/{_key(attachment_key)}/children",
                            query={"itemType": "annotation"}, record_filter=belongs_to_attachment)
-        return rows
+        return self._annotation_capability_records(scope, attachment_key, rows, attachment_version=pdf["version"])
 
     def _pdf_item(self, scope: str, key: str) -> dict[str, Any]:
         row = self.item(scope, key)
@@ -607,7 +757,8 @@ class ZoteroWorkspaceClient:
 
     def _annotation_editable(self, scope: str, key: str, row: Mapping[str, Any], *, known_internal: bool) -> bool:
         data = _data(row)
-        flags = {**dict(row.get("meta", {})), **data}
+        flags = {**dict(row.get("meta", {})), **data,
+                 **{name: row[name] for name in ("annotationIsExternal", "isExternal", "readOnly") if name in row}}
         if flags.get("annotationIsExternal") or flags.get("isExternal") or flags.get("readOnly"):
             return False
         # Generic API item JSON omits the external-annotation flag. A missing
@@ -648,13 +799,25 @@ class ZoteroWorkspaceClient:
                 raise ValueError()
         except (KeyError, ValueError, TypeError):
             raise ValueError("Annotation requires a valid physical page position") from None
-        current = self.item(scope, key)
+        current = self.annotation_record(scope, attachment_key, key)
         if current is not None:
             current_data = _data(current)
             if current_data.get("itemType") != "annotation" or current_data.get("parentItem") != attachment_key:
                 raise ZoteroWorkspaceError("Annotation is bound to another attachment.", code="identity_mismatch")
             if not self._annotation_editable(scope, key, current, known_internal=known_internal):
                 raise ZoteroWorkspaceError("Annotation editability has not been verified; use Zotero to edit it.", code="annotation_read_only")
+            if current_data["version"] != expected_version:
+                raise ZoteroWorkspaceError("Annotation changed; reconcile before saving.", code="version_conflict", status=412)
+            if self._annotation_unchanged(current_data, clean):
+                # Reader callbacks can repeat the already-saved value. Native
+                # Zotero legitimately keeps its version unchanged for that case;
+                # do not send a PATCH or consume single-use consent.
+                self._require_write_capability()
+                if self._load_credential() is None:
+                    raise ZoteroWorkspaceError("Authorize this application in Zotero before writing.", code="authorization_required")
+                if not isinstance(write_token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{5,32}", write_token):
+                    raise ValueError("A stable write token of 5–32 characters is required")
+                return current
             return self._update(scope, key, clean, kind="items", expected_version=expected_version, write_token=write_token)
         if expected_version != 0:
             raise ZoteroWorkspaceError("Annotation no longer exists.", code="version_conflict", status=412)
@@ -662,13 +825,24 @@ class ZoteroWorkspaceClient:
         self._created_annotations.add((str(self.server_id), scope, key))
         return saved
 
+    @classmethod
+    def _annotation_unchanged(cls, current: Mapping[str, Any], desired: Mapping[str, Any]) -> bool:
+        if not cls._matches(current, {key: value for key, value in desired.items() if key != "annotationPosition"}):
+            return False
+        if "annotationPosition" not in desired:
+            return True
+        try:
+            return json.loads(current.get("annotationPosition", "")) == json.loads(desired["annotationPosition"])
+        except (ValueError, TypeError):
+            return False
+
     def delete_annotation(self, scope: str, attachment_key: str, key: str, *, expected_version: int, write_token: str, known_internal: bool = False) -> dict[str, Any]:
         # A deletion is a narrow operation on one confirmed annotation, never a
         # general item-deletion interface. Query-free credentials stay in headers.
         _write_key(key)
         _write_key(attachment_key)
         self._pdf_item(scope, attachment_key)
-        current = self.item(scope, key)
+        current = self.annotation_record(scope, attachment_key, key)
         if current is None:
             return {"deleted": True, "key": key, "already_absent": True}
         data = _data(current)

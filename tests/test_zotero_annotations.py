@@ -360,3 +360,54 @@ def test_creation_receipt_allows_reconcile_unchanged_record_without_external_fla
     remote = api(); del remote["annotationIsExternal"]
     again = outbox.reconcile(sent["id"], sent["revision"], remote_record=remote, known_internal=True)
     assert again["state"] == "queued"
+
+
+def test_queued_exact_noop_confirms_without_dispatch_or_version_advance(tmp_path):
+    outbox = PendingAnnotations(tmp_path / "outbox")
+    queued = enqueue(outbox)
+    result = outbox.confirm_unchanged(queued["id"], queued["revision"], remote_record=api())
+    assert result["state"] == "confirmed" and result["attempt_id"] is None
+    assert result["observed"] == {"version": 3, "no_change": True}
+    assert result["events"][-2:] == ["no_change", "confirmed"]
+    assert outbox.pending() == []
+
+
+@pytest.mark.parametrize("remote", [api(comment="Meaningfully different"), api(version=4), {**api(), "annotationIsExternal": True}])
+def test_noop_confirmation_rejects_changed_stale_or_readonly_evidence(tmp_path, remote):
+    outbox = PendingAnnotations(tmp_path / "outbox")
+    queued = enqueue(outbox)
+    with pytest.raises(AnnotationConflict):
+        outbox.confirm_unchanged(queued["id"], queued["revision"], remote_record=remote)
+    assert outbox.get(queued["id"]) == queued
+
+
+def test_noop_confirmation_cannot_confirm_a_dispatched_meaningful_edit(tmp_path):
+    outbox = PendingAnnotations(tmp_path / "outbox")
+    queued = enqueue(outbox)
+    sent = outbox.mark_dispatched(queued["id"], queued["revision"])
+    with pytest.raises(AnnotationConflict, match="queued"):
+        outbox.confirm_unchanged(sent["id"], sent["revision"], remote_record=api())
+    with pytest.raises(AnnotationConflict, match="did not confirm"):
+        outbox.confirm(sent["id"], sent["revision"], remote_record=api())
+    assert outbox.get(sent["id"])["state"] == "queued"
+
+
+def test_queued_noop_uses_native_string_normalization(tmp_path):
+    outbox = PendingAnnotations(tmp_path / "outbox")
+    queued = enqueue(outbox)
+    result = outbox.confirm_unchanged(queued["id"], queued["revision"],
+        remote_record=api(comment="  My interpretation.  ", text=" A quoted finding. "))
+    assert result["state"] == "confirmed" and result["observed"]["no_change"]
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_projection_separates_personal_comment_from_source_blockquote(newline):
+    human = "Personal prose before." + newline + newline
+    tail = "## Graph Links" + newline + "Human text after." + newline
+    note = human + tail
+    annotation = reader(text="Source line one\nSource line two", comment="My interpretation\nAnother personal line")
+    projected = project_annotations(note, groups(annotation))["text"]
+    normalized = projected.replace("\r\n", "\n")
+    assert ")\n\n  **Source quotation:**\n\n  > Source line one\n  > Source line two\n\n  **Personal comment:**\n\n  My interpretation  \n  Another personal line  \n" in normalized
+    assert projected.startswith(human) and projected.endswith(tail)
+    assert projected.count(START) == projected.count(END) == 1

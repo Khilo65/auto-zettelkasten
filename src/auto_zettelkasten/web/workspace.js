@@ -6,6 +6,7 @@
   const screen = el("workspace-screen");
   const state = {
     sourceTabs: new Map(), sourceActive: null, treeKind: "notes", incremental: null,
+    annotationStatus: null, annotationDrafts: new Map(), annotationSession: crypto.randomUUID(), annotationWrites: Promise.resolve(), annotationTimer: null, annotationLastPoll: 0, zoteroStatus: null,
     workspace: null, epoch: 0, openRequest: 0, opening: false, creating: false,
     documents: new Map(), active: null, expanded: new Set(), treeFocus: "",
     descending: false, history: [], historyIndex: -1, view: null,
@@ -56,9 +57,70 @@
   window.workspaceHasUnsavedChanges = () => sourceReader?.hasPending() || libraryPanel?.hasDraft() || libraryPanel?.isBusy() || hasBusyWrite() || [...state.documents.values()].some((doc) => dirty(doc) || doc.recovery || metadataDraft(doc));
 
   const sourceReader = window.createSourceReader?.({ container: el("workspace-pdf-host"), api, message, onAnnotations: projectSourceAnnotations, onState: updateSourceActions });
+  const annotationPanel = window.createAnnotationPanel?.({ container: el("workspace-annotation-panel"), api, message, getWorkspace: () => state.workspace,
+    getDocument: async (path) => { const doc = state.documents.get(path); return doc ? { ...doc, text: textOf(doc), dirty: dirty(doc) || metadataDraft(doc) } : (await api("workspace/read", { workspace_id: state.workspace.id, path })).document; },
+    onUpdated: async (result) => { if (result.document) acceptAnnotationDocument(result.document); await sourceReader?.refreshAll(); await synchronizeAnnotationBuffers(); },
+    onOpenPDF: openSourcePDF, onOpenNote: (path) => openDocument(path) });
   const libraryPanel = window.createZoteroLibraryPanel?.({ container: el("workspace-zotero-panel"), api, message,
-    getWorkspace: () => state.workspace, onOpenNote: (path) => openDocument(path), onOpenPDF: openSourcePDF, onMigrate: prepareSharedNote });
+    getWorkspace: () => state.workspace, onOpenNote: (path) => openDocument(path), onOpenPDF: openSourcePDF, onMigrate: prepareSharedNote,
+    onAuthorization: refreshZoteroPermission });
   let migration = null;
+  let annotationCloseState = "idle";
+  let annotationCloseGeneration = 0;
+  window.workspacePrepareClose = () => {
+    if (annotationCloseState === "idle") {
+      const generation = ++annotationCloseGeneration;
+      annotationCloseState = "waiting"; screen.inert = true;
+      Promise.resolve().then(async () => { await synchronizeAnnotationBuffers(); return sourceReader ? sourceReader.flushAll() : true; })
+        .then((okay) => { if (generation === annotationCloseGeneration && annotationCloseState === "waiting") annotationCloseState = okay ? "ready" : "blocked"; })
+        .catch((error) => { if (generation === annotationCloseGeneration && annotationCloseState === "waiting") { annotationCloseState = "blocked"; message(error.message, true); } });
+    }
+    return annotationCloseState;
+  };
+  window.workspaceCancelClose = () => { ++annotationCloseGeneration; annotationCloseState = "idle"; screen.inert = false; };
+
+  function acceptAnnotationDocument(value, beforeText) {
+    const doc = state.documents.get(value.path); if (!doc) return;
+    if (dirty(doc) && (beforeText === undefined || textOf(doc) !== beforeText) || doc.recovery || metadataDraft(doc)) { doc.external = value; if (active() === doc) renderDocumentStatus(); return; }
+    doc.savedText = normalizeText(value.text); doc.revision = value.revision; applyDocumentPolicy(doc, value); replaceDocumentText(doc, value.text); rememberDocument(value);
+    if (active() === doc) renderActive();
+  }
+  function rememberAnnotationStatus(value) {
+    if (!value || !Array.isArray(value.jobs)) return;
+    state.annotationStatus = value;
+    const drafts = new Map();
+    for (const row of value.drafts || []) { const path = row.note_path || row.path; if (!path || typeof row.text !== "string") continue; if (!drafts.has(path)) drafts.set(path, []); drafts.get(path).push(row); }
+    state.annotationDrafts = drafts;
+  }
+  function synchronizeAnnotationBuffers(releasePaths = []) {
+    if (!annotationPanel || !state.workspace) return Promise.resolve();
+    const workspaceId = state.workspace.id, epoch = state.epoch;
+    const buffers = [...state.documents.values()].map((doc) => ({ path: doc.path, revision: doc.revision, dirty: dirty(doc) || metadataDraft(doc), recoverable: Boolean(doc.recovery),
+      ...(dirty(doc) || doc.recovery ? { text: doc.recovery?.text || textOf(doc) } : {}) }));
+    const run = async () => {
+      if (epoch !== state.epoch) return;
+      const result = await api("zotero/annotation-sync-buffers", { workspace_id: workspaceId, session_id: state.annotationSession, buffers, release_paths: releasePaths });
+      if (epoch === state.epoch) rememberAnnotationStatus(result);
+    };
+    const operation = state.annotationWrites.catch(() => {}).then(run);
+    state.annotationWrites = operation;
+    return operation;
+  }
+  function scheduleAnnotationBuffers() {
+    if (!annotationPanel || !state.workspace) return;
+    clearTimeout(state.annotationTimer);
+    state.annotationTimer = setTimeout(() => synchronizeAnnotationBuffers().catch((error) => message(`Annotation updates paused: ${error.message}`, true)), 100);
+  }
+  async function refreshZoteroPermission(refreshReaders = true) {
+    try { state.zoteroStatus = await api("zotero/status", {}); if (refreshReaders) await sourceReader?.refreshAll(); updateSourceActions(); await annotationPanel?.refresh(); }
+    catch (error) { message(error.message, true); }
+  }
+  async function authorizeAnnotations() {
+    el("workspace-pdf-authorize").disabled = true;
+    try { message("Review the editing permission request in Zotero."); await api("zotero/authorize", {}); await refreshZoteroPermission(); }
+    catch (error) { message(error.message, true); await refreshZoteroPermission(); }
+    finally { el("workspace-pdf-authorize").disabled = false; }
+  }
 
   function sourceFields(doc) {
     return { ...(doc?.source_navigation?.verified ? doc.source_navigation : {}), ...Object.fromEntries((kit.inspectProperties(doc ? textOf(doc) : "").rows || []).map((row) => [row.key, row.value])) };
@@ -109,6 +171,7 @@
       else state.active = null;
       state.sourceTabs.set(config.id, sourceReader.register(config)); state.sourceActive = config.id; state.graphActive = false;
       showWorkspace(); renderActive();
+      refreshZoteroPermission(false);
       if (config.warning) message(config.warning);
     } catch (error) { message(error.message, true); }
   }
@@ -122,7 +185,9 @@
     const config = state.sourceTabs.get(id), doc = config?.note_path && state.documents.get(config.note_path);
     // The paired tab does not own another note buffer; keep its ordinary note tab.
     if (doc) persistDraft(doc);
-    if (!(await sourceReader.close(id))) return;
+    let keepPending = false;
+    if (sourceReader.hasFailed(id)) keepPending = await confirmAction("Keep annotation changes pending?", "Close this PDF only if its changes are retained locally. They remain available in Annotation changes after restarting; this does not report them as saved in Zotero.", "Close and keep changes pending");
+    if (!(await sourceReader.close(id, { keepPending }))) return;
     state.sourceTabs.delete(id); if (state.sourceActive === id) state.sourceActive = null;
     renderActive();
   }
@@ -136,10 +201,12 @@
       message("Annotations are saved in Zotero. Their note section will update after this draft is saved or discarded."); return;
     }
     try {
+      const beforeText = textOf(doc);
       const result = await api("zotero/annotation-project", { workspace_id: state.workspace.id, note_path: doc.path, document_id: doc.id, revision: doc.revision,
         scope: config.scope, attachment_key: config.attachment_key });
-      if (result.document) { doc.savedText = normalizeText(result.document.text); doc.revision = result.document.revision; applyDocumentPolicy(doc, result.document); replaceDocumentText(doc, result.document.text); rememberDocument(result.document); }
+      if (result.document) acceptAnnotationDocument(result.document, beforeText);
       doc.annotationsPending.delete(config.id);
+      await synchronizeAnnotationBuffers();
       if (active() === doc) renderActive();
     } catch (error) { message(`Annotations remain saved in Zotero. ${error.message}`, true); }
   }
@@ -162,9 +229,13 @@
     const doc = state.documents.get(path);
     if (!doc || dirty(doc) || metadataDraft(doc) || doc.recovery) return message("Save or discard the note's pending edits before sharing its active file.");
     try {
+      await synchronizeAnnotationBuffers();
       const selectedSource = [...state.sourceTabs.values()].find((row) => row.note_path === doc.path);
-      if (!sourceFields(doc).zotero_item_uri && !selectedSource && !target.scope) return message("Open Source PDF first to select this historical note's library and attachment, then share the file.");
-      migration = { ...(selectedSource ? { scope: selectedSource.scope, item_key: selectedSource.item_key, attachment_key: selectedSource.attachment_key, confirm_scope: true } : {}), workspace_id: state.workspace.id, document_id: doc.id, revision: doc.revision, note_path: doc.path, ...target };
+      const fields = sourceFields(doc), source = kit.parseZoteroURI(fields.zotero_item_uri), pdf = kit.parseZoteroURI(fields.source_pdf_uri);
+      const recordedSource = source?.action === "select" ? { scope: source.scope === "library" ? "users/0" : source.scope, item_key: source.key,
+        ...(pdf?.action === "open-pdf" && pdf.scope === source.scope ? { attachment_key: pdf.key } : {}) } : null;
+      if (!recordedSource && !selectedSource && !target.scope) return message("Open Source PDF first to select this historical note's library and attachment, then share the file.");
+      migration = { ...(selectedSource ? { scope: selectedSource.scope, item_key: selectedSource.item_key, attachment_key: selectedSource.attachment_key, confirm_scope: true } : recordedSource || {}), workspace_id: state.workspace.id, document_id: doc.id, revision: doc.revision, note_path: doc.path, ...target };
       const result = await api("zotero/migration-preview", migration);
       migration = { ...migration, preview_identity: result.preview_identity, binding: result.binding };
       el("workspace-migration-summary").textContent = result.summary || `Shared file: ${doc.path}. Existing edits and personal properties will be preserved.`;
@@ -175,6 +246,12 @@
   }
   function updateSourceActions() {
     el("workspace-pdf-retry").hidden = !sourceReader?.hasFailed(state.sourceActive);
+    const config = state.sourceTabs.get(state.sourceActive), status = state.zoteroStatus;
+    el("workspace-pdf-authorize").hidden = !config || !status?.writes_available || status.writable === true;
+    if (config) {
+      el("workspace-pdf-notice").textContent = config.read_only_reason || config.warning || (config.readOnly ? "Read-only connection · enable editing to add annotations" : "Annotation edits save to Zotero");
+      el("workspace-pdf-notice").hidden = false;
+    }
   }
   function renderSource() {
     updateSourceActions();
@@ -188,7 +265,7 @@
     sourceReader?.activate(showing ? config.id : null);
     if (!showing) return;
     el("workspace-pdf-title").textContent = config.title;
-    el("workspace-pdf-notice").textContent = config.warning || (config.readOnly ? "Read-only connection · PDF and Zotero annotations" : "Annotation edits save to Zotero");
+    el("workspace-pdf-notice").textContent = config.read_only_reason || config.warning || (config.readOnly ? "Read-only connection · PDF and Zotero annotations" : "Annotation edits save to Zotero");
     el("workspace-pdf-notice").hidden = false;
     el("workspace-note-expand").disabled = !config.note_path;
     el("workspace-pdf-expand").textContent = config.expanded === "pdf" ? "Show both" : "Expand PDF";
@@ -207,6 +284,9 @@
       if (!dirty(doc)) localStorage.removeItem(recoveryKey(doc));
       else localStorage.setItem(recoveryKey(doc), JSON.stringify({ text: textOf(doc), revision: doc.revision, updatedAt: Date.now() }));
     } catch (error) { storageFailure(error); }
+    if (doc.live_binding && (dirty(doc) || doc.recovery)) state.annotationDrafts.set(doc.path, [{ note_path: doc.path, revision: doc.recovery?.revision || doc.revision, text: doc.recovery?.text || textOf(doc) }]);
+    else state.annotationDrafts.delete(doc.path);
+    scheduleAnnotationBuffers();
   }
 
   function forgetDraft(doc) {
@@ -312,12 +392,14 @@
       // Opening a folder replaces its document-service identity. Finish ordered display
       // writes first so queued settings still address the outgoing workspace.
       await state.graphPreferenceWrites;
-      const result = await api("workspace/open", { path });
       for (const doc of state.documents.values()) if (!doc.recovery) persistDraft(doc);
+      if (state.workspace) await synchronizeAnnotationBuffers();
+      const result = await api("workspace/open", { path });
       state.epoch += 1; state.requiresReopen = false;
       state.openRequest += 1;
       state.workspace = result.workspace;
       state.documents.clear(); state.active = null;
+      state.annotationStatus = null; state.annotationDrafts.clear();
       state.incremental = null; state.snapshot = null; state.linkIndex = null; state.indexError = ""; state.indexRequest += 1; state.indexing = false;
       state.indexParser?.close(); state.indexParser = null; state.previewDocuments.clear(); state.previewRequests.clear();
       state.graphTab = false; state.graphActive = false; state.localPinned = null;
@@ -334,6 +416,11 @@
       el("workspace-folder-dialog").close();
       message(state.workspace.reason || "");
       applyWorkspace(state.workspace);
+      if (annotationPanel) {
+        rememberAnnotationStatus(await api("zotero/annotation-sync-status", { workspace_id: state.workspace.id }));
+        await synchronizeAnnotationBuffers();
+        annotationPanel.refresh();
+      }
       renderActive(); showWorkspace();
       if (window.innerWidth >= 700) setSidebar(false);
       return true;
@@ -1566,6 +1653,11 @@
       }
     } catch (error) { storageFailure(error); }
     doc.editorState = makeEditorState(doc, value.text);
+    if (!doc.recovery) {
+      const variants = state.annotationDrafts.get(doc.path) || [];
+      const retained = variants.filter((row) => normalizeText(row.text) !== doc.savedText);
+      if (retained.length) { doc.annotationDraftVariants = retained; doc.recovery = { ...retained[0], text: normalizeText(retained[0].text) }; }
+    }
     return doc;
   }
 
@@ -1594,6 +1686,15 @@
             }
           }
           applyDocumentPolicy(doc, result.document); rememberDocument(result.document);
+        }
+      }
+      if (epoch !== state.epoch || request !== state.openRequest) return;
+      if (doc.live_binding) {
+        await synchronizeAnnotationBuffers();
+        const latest = (await api("workspace/read", { workspace_id: state.workspace.id, path: doc.path })).document;
+        if (latest.revision !== doc.revision) {
+          if (dirty(doc) || doc.recovery) doc.external = latest;
+          else { doc.savedText = normalizeText(latest.text); doc.revision = latest.revision; applyDocumentPolicy(doc, latest); replaceDocumentText(doc, latest.text); }
         }
       }
       if (epoch !== state.epoch || request !== state.openRequest) return;
@@ -1671,8 +1772,15 @@
       if (!accepted || epoch !== state.epoch || state.documents.get(doc.path) !== doc || doc.saving) return;
     }
     if (!doc.recovery) persistDraft(doc);
+    const closingText = textOf(doc), closingRevision = doc.revision, closingRecovery = doc.recovery, closingMetadata = JSON.stringify([doc.titleDraft, doc.propertyDraft]);
+    if (doc.live_binding) await synchronizeAnnotationBuffers();
+    if (epoch !== state.epoch || state.documents.get(doc.path) !== doc) return;
+    if (closingText !== textOf(doc) || closingRevision !== doc.revision || closingRecovery !== doc.recovery || closingMetadata !== JSON.stringify([doc.titleDraft, doc.propertyDraft])) {
+      persistDraft(doc); message("This note changed while closing. Its latest draft remains open; review it before closing again."); return;
+    }
     const paths = [...state.documents.keys()], index = paths.indexOf(doc.path);
     state.documents.delete(doc.path);
+    if (doc.live_binding) await synchronizeAnnotationBuffers();
     if (state.active === doc.path) {
       state.active = paths[index - 1] || paths[index + 1] || null;
       if (!state.active && state.graphTab) state.graphActive = true;
@@ -1742,6 +1850,12 @@
     const doc = active(); if (!doc) return;
     renderDocumentPolicy(doc);
     el("workspace-recovery").hidden = !doc.recovery;
+    const variants = doc.annotationDraftVariants || [], choice = el("workspace-recovery-variant");
+    el("workspace-recovery-variant-label").hidden = variants.length < 2;
+    if (variants.length > 1 && choice.dataset.document !== doc.id) {
+      choice.replaceChildren(new Option("Choose the draft to restore", ""), ...variants.map((row, index) => new Option(`Draft ${index + 1} · ${row.revision.slice(0, 12)} · ${row.text.slice(0, 70)}`, String(index)))); choice.dataset.document = doc.id;
+    }
+    el("workspace-restore").disabled = variants.length > 1 && !doc.annotationDraftChoice;
     el("workspace-restore").disabled = !canEdit(doc);
     el("workspace-conflict").hidden = !doc.external;
     if (!doc.external) el("workspace-disk-panel").hidden = true;
@@ -1886,6 +2000,7 @@
     } finally {
       doc.saving = false;
       if (state.documents.get(doc.path) === doc) {
+        await synchronizeAnnotationBuffers(!dirty(doc) && !doc.recovery ? [doc.path] : []);
         renderTabs(); if (active() === doc) renderDocumentStatus();
         await flushAnnotationProjection(doc);
       }
@@ -1912,7 +2027,7 @@
     const epoch = state.epoch, recovery = doc.recovery;
     const accepted = await confirmAction("Discard recovery draft?", "Keep the current disk version and remove this note's recovered draft.", "Discard recovery draft");
     if (!accepted || epoch !== state.epoch || active() !== doc || doc.recovery !== recovery || doc.saving) return;
-    doc.recovery = null; forgetDraft(doc); replaceDocumentText(doc, doc.savedText); renderActive(); await flushAnnotationProjection(doc);
+    doc.recovery = null; doc.annotationDraftVariants = null; state.annotationDrafts.delete(doc.path); forgetDraft(doc); replaceDocumentText(doc, doc.savedText); renderActive(); await synchronizeAnnotationBuffers([doc.path]); await flushAnnotationProjection(doc);
   }
 
   async function useDiskVersion() {
@@ -2105,6 +2220,15 @@
             if (active() === doc) { renderActive(); message("Updated from disk."); }
           }
         }
+      }
+      if (annotationPanel && Date.now() - state.annotationLastPoll > 5000) {
+        state.annotationLastPoll = Date.now();
+        await synchronizeAnnotationBuffers();
+        for (const job of state.annotationStatus?.jobs || []) {
+          const opened = state.documents.get(job.note_path);
+          if (job.ready && opened && !dirty(opened) && !opened.recovery && !metadataDraft(opened) && !opened.saving) await projectSourceAnnotations(job);
+        }
+        if (annotationPanel.isVisible()) await annotationPanel.refresh();
       }
     } catch (error) { if (epoch === state.epoch && !state.opening) message(`Could not refresh files. ${error.message}`, true); }
     finally { state.polling = false; if (epoch === state.epoch && !state.opening) await refreshIndex(); }
@@ -2601,6 +2725,15 @@
   el("workspace-pdf-refresh").addEventListener("click", async () => {
     try { await sourceReader.refresh(state.sourceActive); } catch (error) { message(error.message, true); }
   });
+  el("workspace-pdf-authorize").addEventListener("click", authorizeAnnotations);
+  el("workspace-recovery-variant").addEventListener("change", (event) => {
+    const doc = active(), index = Number(event.target.value);
+    if (!doc || event.target.value === "" || !doc.annotationDraftVariants?.[index]) return;
+    doc.recovery = { ...doc.annotationDraftVariants[index] }; doc.annotationDraftChoice = true; renderDocumentStatus();
+  });
+  el("workspace-annotation-changes").addEventListener("click", () => annotationPanel?.show());
+  el("workspace-annotation-recovery-open").addEventListener("click", () => annotationPanel?.show());
+  window.addEventListener("focus", () => { if (annotationPanel && workspaceVisible()) refreshZoteroPermission(); });
   for (const pane of ["pdf", "note"]) el(`workspace-${pane}-expand`).addEventListener("click", () => {
     const config = state.sourceTabs.get(state.sourceActive); if (!config) return;
     config.expanded = config.expanded === pane ? null : pane; renderSource(); state.view?.requestMeasure();

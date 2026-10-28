@@ -115,7 +115,7 @@ def test_desktop_owns_server_native_picker_and_protects_running_job(tmp_path, mo
         events=SimpleNamespace(closing=event),
         create_file_dialog=lambda *a, **kw: [str(tmp_path)],
         create_confirmation_dialog=lambda *a: dialog_calls.append(a),
-        run_js=lambda script: '"clean"' if platform == "win32" else "clean",
+        run_js=lambda script: "legacy" if "workspacePrepareClose" in script else '"clean"' if platform == "win32" else "clean",
         destroy=lambda: event.handlers[0](),
     )
 
@@ -268,6 +268,10 @@ def test_desktop_close_protects_unsaved_notes_and_failed_checks(tmp_path, monkey
 
     def evaluate(script):
         assert threading.current_thread() is not threading.main_thread()
+        if "workspacePrepareClose" in script:
+            return "legacy"
+        if "workspaceCancelClose" in script:
+            return
         assert "workspaceHasUnsavedChanges" in script
         if state["failed"]:
             raise RuntimeError("Editor did not respond")
@@ -300,6 +304,89 @@ def test_desktop_close_protects_unsaved_notes_and_failed_checks(tmp_path, monkey
     monkeypatch.setattr(desktop, "_configure_editing_menu", lambda: None)
     desktop.launch()
     assert dialogs == ["Unsaved notes", "Unable to check unsaved notes", "Unsaved notes"]
+
+
+def test_desktop_close_flushes_pdf_before_checking_notes(tmp_path, monkeypatch, close_checks):
+    app = webapp.LocalApp(preferences_path=tmp_path / "preferences.json")
+    event, calls, destroyed, dialogs = Event(), [], [], []
+    prepared = iter(['"waiting"', '"ready"'])
+
+    def evaluate(script):
+        assert threading.current_thread() is not threading.main_thread()
+        if "workspacePrepareClose" in script:
+            calls.append("prepare")
+            return next(prepared)
+        if "workspaceHasUnsavedChanges" in script:
+            assert calls == ["prepare", "prepare"]
+            calls.append("notes")
+            return "clean"
+        if "workspaceCancelClose" in script:
+            calls.append("cancel")
+
+    window = SimpleNamespace(events=SimpleNamespace(closing=event), run_js=evaluate,
+        create_confirmation_dialog=lambda *args: dialogs.append(args) or False,
+        destroy=lambda: destroyed.append(event.handlers[0]()))
+
+    def start(**kwargs):
+        assert event.handlers[0]() is False
+        close_checks()
+        assert destroyed == [True]
+
+    monkeypatch.setitem(sys.modules, "webview", SimpleNamespace(create_window=lambda *args, **kwargs: window, start=start))
+    monkeypatch.setattr(desktop, "LocalApp", lambda: app)
+    monkeypatch.setattr(desktop, "_configure_tls", lambda: None)
+    monkeypatch.setattr(desktop, "_configure_editing_menu", lambda: None)
+    desktop.launch()
+    assert calls == ["prepare", "prepare", "notes"] and dialogs == []
+
+
+@pytest.mark.parametrize("scenario,expected_dialog", [
+    ("blocked", "PDF changes need attention"),
+    ("timeout", "PDF changes need attention"),
+    ("error", "Unable to check unsaved notes"),
+    ("cancel", "Unsaved notes"),
+    ("operation", "Operation in progress"),
+])
+def test_desktop_close_restores_editor_after_aborted_pdf_preparation(tmp_path, monkeypatch, close_checks, scenario, expected_dialog):
+    app = webapp.LocalApp(preferences_path=tmp_path / "preferences.json")
+    event, calls, destroyed, dialogs = Event(), [], [], []
+
+    def evaluate(script):
+        if "workspacePrepareClose" in script:
+            calls.append("prepare")
+            if scenario == "error":
+                raise RuntimeError("Reader unavailable")
+            if scenario == "operation":
+                app.run["status"] = "running"
+                return "waiting"
+            return "ready" if scenario == "cancel" else "waiting" if scenario == "timeout" else "blocked"
+        if "workspaceHasUnsavedChanges" in script:
+            calls.append("notes")
+            return "dirty"
+        if "workspaceCancelClose" in script:
+            calls.append("cancel")
+
+    window = SimpleNamespace(events=SimpleNamespace(closing=event), run_js=evaluate,
+        create_confirmation_dialog=lambda title, text: dialogs.append((title, text)) or False,
+        destroy=lambda: destroyed.append(True))
+
+    def start(**kwargs):
+        assert event.handlers[0]() is False
+        close_checks()
+        assert destroyed == []
+
+    if scenario == "timeout":
+        clock = iter([0, 10])
+        monkeypatch.setattr(desktop, "time", SimpleNamespace(monotonic=lambda: next(clock), sleep=lambda duration: pytest.fail("Expired preparation must not sleep")))
+    monkeypatch.setitem(sys.modules, "webview", SimpleNamespace(create_window=lambda *args, **kwargs: window, start=start))
+    monkeypatch.setattr(desktop, "LocalApp", lambda: app)
+    monkeypatch.setattr(desktop, "_configure_tls", lambda: None)
+    monkeypatch.setattr(desktop, "_configure_editing_menu", lambda: None)
+    desktop.launch()
+    assert calls[-1] == "cancel" and len(dialogs) == 1 and dialogs[0][0] == expected_dialog
+    if scenario in {"blocked", "timeout"}:
+        assert "Close and keep changes pending" in dialogs[0][1]
+    assert ("notes" in calls) is (scenario == "cancel")
 
 
 def test_smoke_report_and_failure_exit_code(tmp_path, monkeypatch):

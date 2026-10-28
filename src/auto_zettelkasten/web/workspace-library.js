@@ -20,7 +20,7 @@
     return key;
   };
 
-  window.createZoteroLibraryPanel = function ({ container, api, onOpenNote, onOpenPDF, onMigrate, getWorkspace, message = () => {} }) {
+  window.createZoteroLibraryPanel = function ({ container, api, onOpenNote, onOpenPDF, onMigrate, onAuthorization, getWorkspace, message = () => {} }) {
     if (!container || typeof api !== "function") throw new Error("The Zotero panel needs a container and local API.");
     const doc = container.ownerDocument;
     const state = { visible: false, destroyed: false, generation: 0, scope: "users/0", collection: "", query: "", status: {}, libraries: [], collections: [], collectionPage: null, items: [], itemPage: null, selected: null, children: [], childrenPage: null, busy: false, refreshing: false, form: null, timer: null };
@@ -338,6 +338,7 @@
       try { await api("zotero/authorize", {}); }
       finally { state.busy = false; renderStatus(); }
       await refresh();
+      await onAuthorization?.();
     }
     library.addEventListener("change", () => {
       if (!canAct() || state.form) { library.value = state.scope; return; }

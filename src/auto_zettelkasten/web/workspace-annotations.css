@@ -1,0 +1,24 @@
+.workspace-annotations { padding: 12px; color: var(--workspace-ink); background: var(--workspace-paper); border: 1px solid var(--workspace-line); border-radius: 6px; font-size: 12px; overflow: auto; max-height: min(78vh, 900px); }
+.workspace-annotations[hidden] { display: none; }
+.annotation-panel-heading { display: flex; align-items: center; gap: 8px; position: sticky; top: -12px; padding: 8px 0; background: var(--workspace-paper); z-index: 1; }
+.annotation-panel-heading h2 { margin: 0 auto 0 0; font-size: 15px; }
+.workspace-annotations h3 { font-size: 13px; margin: 16px 0 8px; }
+.workspace-annotations h4 { font-size: 12px; margin: 0 0 5px; overflow-wrap: anywhere; }
+.workspace-annotations button { font: inherit; color: inherit; background: var(--workspace-paper); border: 1px solid var(--workspace-line); border-radius: 4px; padding: 5px 8px; cursor: pointer; }
+.workspace-annotations button:hover:not(:disabled) { background: var(--workspace-selection); }
+.workspace-annotations button:disabled { opacity: .55; cursor: default; }
+.workspace-annotations button:focus-visible, .workspace-annotations textarea:focus-visible, .workspace-annotations summary:focus-visible { outline: 2px solid var(--workspace-accent); outline-offset: 2px; }
+.annotation-panel-notice, .annotation-change-reason, .annotation-empty { color: var(--workspace-muted); line-height: 1.5; overflow-wrap: anywhere; }
+.annotation-panel-notice.is-error { color: #a23546; }
+.annotation-change { border-top: 1px solid var(--workspace-line); padding: 10px 0; }
+.annotation-change-state { color: var(--workspace-accent); font-weight: 600; margin: 4px 0; }
+.annotation-change-reason { margin: 5px 0; }
+.annotation-actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 0; }
+.annotation-local-draft { margin: 8px 0; }
+.annotation-local-draft summary { cursor: pointer; margin-bottom: 6px; }
+.workspace-annotations textarea { display: block; box-sizing: border-box; width: 100%; resize: vertical; padding: 8px; margin: 6px 0; background: var(--workspace-paper); color: var(--workspace-ink); border: 1px solid var(--workspace-line); border-radius: 4px; font: 11px/1.5 ui-monospace, monospace; }
+.annotation-review { border: 1px solid var(--workspace-accent); border-radius: 5px; padding: 10px; margin-top: 12px; line-height: 1.5; }
+.annotation-review[hidden] { display: none; }
+.annotation-review > button { margin: 8px 6px 0 0; }
+.annotation-review pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
+.annotation-preview-field { display: block; margin: 10px 0; color: var(--workspace-muted); }

@@ -204,6 +204,9 @@ class LocalApp:
 
         from .zotero_workspace_service import ZoteroWorkspaceService
         self.zotero_workspace = ZoteroWorkspaceService(self.documents, self.preferences_path.parent / "zotero-workspace", client=zotero_client, writes_enabled=zotero_writes_enabled)
+        from .annotation_sync import AnnotationSyncService
+        self.annotation_sync = AnnotationSyncService(self.documents, self.zotero_workspace, self.preferences_path.parent / "annotation-sync")
+        self.zotero_workspace.annotation_sync = self.annotation_sync
         self.note_recall = NoteRecallService(annotation_resolver=self.zotero_workspace.annotation_snapshot)
         from .incremental_notes import IncrementalNoteDiscovery
         self.incremental_notes = IncrementalNoteDiscovery(self.preferences_path.parent / "incremental-notes", recall=self.note_recall)
@@ -329,6 +332,17 @@ class LocalApp:
 
     def handle(self, method: str, route: str, data: dict | None = None):
         data = data or {}
+        if method == "POST" and route in {"/api/zotero/annotation-sync-status", "/api/zotero/annotation-sync-buffers", "/api/zotero/annotation-sync-refresh"}:
+            try:
+                workspace_id = data.get("workspace_id")
+                self.annotation_sync.select_workspace(workspace_id)
+                if route.endswith("annotation-sync-buffers"):
+                    return self.annotation_sync.register_buffers(workspace_id, data.get("session_id"), data.get("buffers"), release_paths=data.get("release_paths"))
+                if route.endswith("annotation-sync-refresh"):
+                    self.annotation_sync.enqueue_workspace(workspace_id)
+                return self.annotation_sync.status(workspace_id)
+            except (DocumentError, ValueError, RuntimeError, OSError) as exc:
+                raise RequestError(str(exc)) from exc
         if method == "POST" and route.startswith("/api/zotero/"):
             try:
                 return self.zotero_workspace.handle(route.removeprefix("/api/zotero/"), data)
@@ -751,6 +765,7 @@ class LocalServer(ThreadingHTTPServer):
         try:
             super().server_close()
         finally:
+            self.app.annotation_sync.close()
             self.app.documents.close()
 
 
@@ -861,7 +876,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/workspace-graph-worker.js": ("workspace-graph-worker.js", "text/javascript; charset=utf-8"),
                 "/workspace-licenses.txt": ("workspace-licenses.txt", "text/plain; charset=utf-8"),
             }
-            for name in ("workspace-library.js", "workspace-library.css", "workspace-source-reader.js", "zotero-reader-host.html", "zotero-reader-host.js"):
+            for name in ("workspace-library.js", "workspace-library.css", "workspace-source-reader.js", "workspace-annotations.js", "workspace-annotations.css", "zotero-reader-host.html", "zotero-reader-host.js"):
                 assets["/" + name] = (name, mimetypes.guess_type(name)[0] or "application/octet-stream")
             if self.command == "GET" and route.startswith("/zotero-reader/"):
                 parts = route.lstrip("/").split("/")

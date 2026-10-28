@@ -64,6 +64,8 @@ include = [
   "/tools/build_desktop.py",
   "/tools/build_web.mjs",
   "/tools/build_zotero_reader.py",
+  "/tools/build_zotero_companion.py",
+  "/zotero-companion",
   "/third_party/zotero-reader",
   "/tools/web_entry.js",
   "/tools/workspace_links.js",

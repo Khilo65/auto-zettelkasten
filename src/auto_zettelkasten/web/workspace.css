@@ -18,6 +18,10 @@ body.workspace-active { overflow: hidden; background: var(--workspace-paper); }
 .workspace-rail .rail-label { font-size: 9px; font-weight: 600; line-height: 1.2; }
 .rail-spacer { flex: 1; }
 .workspace-rail svg { width: 21px; height: 21px; stroke-width: 1.7; }
+#workspace-annotation-panel { position: fixed; z-index: 45; right: 16px; top: 56px; width: min(460px, calc(100vw - 76px)); box-shadow: 0 8px 32px #0002; }
+.source-annotation-status { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 4px 10px; border-bottom: 1px solid var(--workspace-line); }
+.source-annotation-status .source-reader-notice { flex: 1 1 180px; border: 0; padding: 0; margin: 0; }
+.source-annotation-status button { font-size: 11px; min-height: 26px; padding: 2px 7px; }
 .workspace-screen { --sidebar-width: 260px; display: grid; grid-template-columns: var(--sidebar-width) 1px minmax(0, 1fr); height: 100dvh; color: var(--workspace-ink); font-size: 14px; }
 .workspace-screen button, .workspace-dialog button { font-family: inherit; font-size: 13px; font-weight: 400; min-height: 32px; line-height: 1.4; border-color: var(--workspace-line); color: var(--workspace-ink); }
 .workspace-screen button:focus-visible, .workspace-dialog button:focus-visible, .workspace-screen [tabindex]:focus-visible { outline: 2px solid var(--workspace-accent); outline-offset: -2px; }

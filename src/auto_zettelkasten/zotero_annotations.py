@@ -402,10 +402,12 @@ def project_annotations(markdown, attachment_groups, *, expected_hash=None, prev
         label = _escape(record["page_label"] or str(record["page_index"] + 1))
         lines.append(f"- [{record['type'].capitalize()} · p. {label}]({record['uri']})")
         if record["quote"]:
-            lines.append("  **Source quotation:**")
+            lines += ["", "  **Source quotation:**", ""]
             lines.extend(f"  > {_escape(line)}" for line in record["quote"].split("\n"))
         if record["comment"]:
-            lines.append("  **Personal comment:**")
+            # Markdown permits lazy blockquote continuation. A blank paragraph
+            # boundary keeps personal interpretation outside the quoted source.
+            lines += ["", "  **Personal comment:**", ""]
             lines.extend(f"  {_escape(line)}  " for line in record["comment"].split("\n"))
         preview = previews.get((*attachment, record["annotation_key"]))
         if preview is not None:
@@ -413,9 +415,9 @@ def project_annotations(markdown, attachment_groups, *, expected_hash=None, prev
                     or not re.fullmatch(r"[A-Za-z0-9_./-]+\.(?:png|jpe?g|webp)", preview, re.I)
                     or preview.startswith("/") or ".." in preview.split("/") or "//" in preview):
                 raise AnnotationError("Annotation previews require a safe relative image asset.")
-            lines.append(f"  ![Annotation preview]({preview})")
+            lines += ["", f"  ![Annotation preview]({preview})"]
         elif record["type"] in {"image", "ink"}:
-            lines.append("  Visual annotation; open the PDF to inspect it.")
+            lines += ["", "  Visual annotation; open the PDF to inspect it."]
         lines.append("")
     if not records:
         lines += ["No confirmed annotations.", ""]
@@ -584,7 +586,7 @@ class PendingAnnotations:
             revision = current["revision"] if current else None
             if expected_revision != revision:
                 raise AnnotationConflict("Annotation outbox changed; reload before saving.")
-            if current and current["state"] not in {"confirmed", "conflict", "discarded"}:
+            if current and current["state"] not in {"confirmed", "discarded"}:
                 raise AnnotationConflict("A pending annotation operation must finish or be reconciled first.")
             record = {"schema_version": 1, "id": operation_id, "revision": (revision or 0) + 1,
                       "scope": scope, "attachment_key": attachment_key, "annotation_key": annotation_key,
@@ -604,7 +606,8 @@ class PendingAnnotations:
             record["state"] = state
             if state == "dispatched":
                 record["attempt_id"] = secrets.token_hex(16)
-            record["events"] = (record.get("events", []) + [state])[-64:]
+            events = ["no_change", state] if observed and observed.get("no_change") is True else [state]
+            record["events"] = (record.get("events", []) + events)[-64:]
             if observed is not None:
                 record["observed"] = observed
             self._write(directory, record)
@@ -655,3 +658,31 @@ class PendingAnnotations:
         if result["state"] != "confirmed":
             raise AnnotationConflict("Remote read did not confirm the submitted annotation operation.")
         return result
+
+    def confirm_unchanged(self, operation_id, revision, *, remote_record, known_internal=False):
+        """Confirm an exact current-state no-op before any HTTP dispatch.
+
+        An unchanged version can never prove a dispatched meaningful edit.
+        Only an existing, queued upsert with freshly read identical fields may
+        take this path; all other operations retain normal version semantics.
+        """
+        current = self.get(operation_id)
+        if (current is None or current["revision"] != revision or current["state"] != "queued"
+                or current["operation"] != "upsert" or current["base_version"] == 0):
+            raise AnnotationConflict("Only a queued existing annotation can confirm an unchanged value.")
+        remote = api_to_reader(remote_record, scope=current["scope"], attachment_key=current["attachment_key"],
+            writable=True, known_internal=known_internal)
+        if remote["readOnly"]:
+            raise AnnotationConflict("Fresh annotation state does not confirm an unchanged value.")
+        canonical_remote = reader_to_api(remote, scope=current["scope"], attachment_key=current["attachment_key"],
+            expected_version=remote["version"], existing=remote)
+        normalized = api_to_reader(canonical_remote, scope=current["scope"], attachment_key=current["attachment_key"],
+            writable=True, known_internal=True)
+        wanted = api_to_reader(current["payload"], scope=current["scope"], attachment_key=current["attachment_key"],
+            writable=True, known_internal=True)
+        fields = ("type", "position", "text", "comment", "color", "pageLabel", "sortIndex", "tags")
+        if (remote["id"] != current["annotation_key"] or remote["version"] != current["base_version"]
+                or not all(normalized.get(field) == wanted.get(field) for field in fields)):
+            raise AnnotationConflict("Fresh annotation state does not confirm an unchanged value.")
+        return self._transition(operation_id, revision, {"queued"}, "confirmed",
+            observed={"version": remote["version"], "no_change": True})

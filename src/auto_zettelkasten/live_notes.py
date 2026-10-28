@@ -245,6 +245,44 @@ class LiveNotes:
         with self.guard(workspace) as directory:
             return self._record(directory, workspace, identity, path)
 
+    def list_active(self, workspace, identity, *, limit=10000):
+        """Enumerate completed bindings for this exact checkout, without baselines.
+
+        The private journal is shared by workspaces. A copied directory must not
+        enroll another workspace's source notes merely because paths match.
+        """
+        workspace = Path(workspace)
+        if type(limit) is not int or not 1 <= limit <= 20000:
+            raise DocumentError("Shared-note inventory limit must be between 1 and 20000.")
+        if self.root.is_relative_to(workspace) or workspace.is_relative_to(self.root):
+            return []
+        with self.guard(workspace) as directory:
+            if directory is None:
+                return []
+            names = os.listdir(directory.fd)
+            if len(names) > 100002:
+                raise DocumentError("Shared-note history exceeds its inventory limit.")
+            result = []
+            for name in sorted(names):
+                if not re.fullmatch(r"binding-[a-f0-9]{64}\.json", name):
+                    continue
+                candidate = _safe_read(directory, name)
+                if (not candidate or candidate.get("workspace") != str(workspace)
+                        or candidate.get("workspace_identity") != list(identity)
+                        or candidate.get("phase") != "archived"):
+                    continue
+                path = candidate.get("path")
+                if not isinstance(path, str):
+                    raise DocumentError("Invalid shared-note inventory path.")
+                record = self._record(directory, workspace, identity, path)
+                if not record or "binding-" + binding_identity(record["binding"])[1] + ".json" != name:
+                    raise DocumentError("Shared-note inventory binding is inconsistent.")
+                result.append({"path": path, "binding": dict(record["binding"]),
+                               "source_identity": dict(record.get("source_identity", {})), "phase": "archived"})
+                if len(result) > limit:
+                    raise DocumentError("Shared-note inventory exceeds its selected limit.")
+            return result
+
     def generation(self, workspace):
         if self.root.is_relative_to(workspace) or workspace.is_relative_to(self.root):
             return None

@@ -15,6 +15,9 @@ from auto_zettelkasten.zotero_workspace import VerifiedPDF, ZoteroWorkspaceError
 
 class OfflineWorkspaceClient:
     server_id = "TESTSERVER01"
+    base_url = "http://127.0.0.1:23129"
+    _allowed_origin = base_url
+    expected_server_id = None
 
     def __init__(self, path):
         self.path = path
@@ -45,6 +48,10 @@ class OfflineWorkspaceClient:
     def annotations(self, scope, key):
         self.calls.append(("annotations", scope, key))
         return []
+
+    def attachment_read_only(self, scope, key):
+        self.calls.append(("attachment_read_only", scope, key))
+        return None
 
     def items_page(self, scope, **options):
         self.calls.append(("items_page", scope, options))
@@ -248,3 +255,10 @@ def test_static_reader_rejects_symlinked_ancestor_directories(unified_server, tm
     status, body, _ = request("/zotero-reader/linked/private.js", authenticated=False)
     assert status == 404, "A symlinked parent escaped the reader asset subtree"
     assert body != b"private contents"
+
+@pytest.mark.parametrize('asset,marker', [('/workspace-annotations.js', b'createAnnotationPanel'), ('/workspace-annotations.css', b'annotation-change')])
+def test_annotation_recovery_assets_are_served_by_the_real_http_handler(unified_server, asset, marker):
+    _, _, _, request = unified_server
+    status, body, headers = request(asset, authenticated=False)
+    assert status == 200 and marker in body
+    assert headers['Content-Type'].startswith(('text/', 'application/javascript'))

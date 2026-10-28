@@ -26,7 +26,7 @@ except ImportError:
 
 from .documents import DocumentConflict, DocumentError
 from .zotero_annotations import (AnnotationConflict, PendingAnnotations, api_to_reader,
-    project_annotations, reader_to_api, verified_annotation_span)
+    project_annotations, reader_to_api, verified_annotation_span, START, END)
 from .zotero_links import parse_zotero_uri
 from .zotero_workspace import VerifiedPDF, ZoteroWorkspaceClient, ZoteroWorkspaceError
 
@@ -237,9 +237,17 @@ class ZoteroWorkspaceService:
         self._source_parents = {}
         self._manual_sources = {}
         self._unbound_notes = {}
+        self.annotation_sync = None
+        self._projection_previews = {}
 
     def _status(self):
         value = self.client.status()
+        origin = getattr(self.client, "base_url", None)
+        if value.get("available") is True and origin and value.get("server_id") == self.client.server_id:
+            connection = {"base_url": origin, "server_id": self.client.server_id}
+            path = self.private_root / "last-connection.json"
+            if _read_json(path) != connection:
+                _write_json(path, connection)
         writable = self.writes_enabled and value.get("available") is True and value.get("authorized") is True and value.get("write_supported") is True
         return {**value, "connected": value.get("available") is True, "writable": writable,
             "writes_enabled": self.writes_enabled, "writes_available": self.writes_enabled and value.get("write_supported") is True}
@@ -253,11 +261,74 @@ class ZoteroWorkspaceService:
         return status
 
     def _queue(self):
-        if not self.client.server_id:
-            raise ValueError("Connect to Zotero before accessing annotation operations.")
-        root = self.private_root / "outbox" / _sha(self.client.server_id)
+        root = self.private_root / "outbox" / _sha(self._recovery_server_id())
         _private_directory(root.parent)
         return PendingAnnotations(root)
+
+    def _recovery_server_id(self):
+        """Choose a local recovery namespace, never remote write authority."""
+        origin = getattr(self.client, "base_url", None)
+        if origin is not None and origin != getattr(self.client, "_allowed_origin", origin):
+            raise ValueError("The configured Zotero connection changed; reconnect explicitly.")
+        server_id = self.client.server_id or getattr(self.client, "expected_server_id", None)
+        if server_id:
+            return server_id
+        recorded = _read_json(self.private_root / "last-connection.json")
+        if (recorded and recorded.get("base_url") == origin and isinstance(recorded.get("server_id"), str)
+                and re.fullmatch(r"[A-Za-z0-9]{12}", recorded["server_id"])):
+            return recorded["server_id"]
+        raise ValueError("Connect to this Zotero profile once before accessing its retained annotation changes.")
+
+    def _notify_annotations(self, scope, attachment_key):
+        if self.annotation_sync is not None:
+            self.annotation_sync.enqueue_attachment(scope, attachment_key)
+
+    def _annotation_record(self, scope, attachment_key, key):
+        resolver = getattr(self.client, "annotation_record", None)
+        return resolver(scope, attachment_key, key) if resolver is not None else self.client.item(scope, key)
+
+    def _attachment_permission(self, scope, attachment_key):
+        """Project authoritative restrictions without caching permission grants."""
+        resolver = getattr(self.client, "attachment_read_only", None)
+        identity = [self.client.server_id, scope, attachment_key]
+        path = self.private_root / "attachment-permissions" / (_sha(json.dumps(identity)) + ".json")
+        try:
+            prior = _read_json(path)
+            value = resolver(scope, attachment_key) if resolver is not None else None
+            if value is not None and type(value) is not bool:
+                return True, "The PDF editing permission could not be verified."
+            if value is True:
+                denial = {"identity": identity, "read_only": True}
+                if prior != denial:
+                    _write_json(path, denial)
+                return True, "This PDF is read-only in Zotero."
+            if value is False:
+                # A fresh scoped capability can release an earlier denial; an
+                # absent companion cannot silently release a known restriction.
+                if prior and prior.get("identity") == identity:
+                    path.unlink()
+                return False, ""
+            if prior and prior.get("identity") == identity and prior.get("read_only") is True:
+                return True, "This PDF was read-only. Reconnect its Zotero capability companion to verify editing."
+            if scope.startswith("groups/"):
+                return True, "Group PDF editing requires verified Zotero permissions."
+            return False, ""
+        except (ValueError, ZoteroWorkspaceError, OSError):
+            return True, "The PDF editing permission could not be verified."
+
+    def _confirm_queued_no_change(self, queue, record):
+        if record["operation"] != "upsert" or record["base_version"] == 0:
+            return None
+        remote = self._annotation_record(record["scope"], record["attachment_key"], record["annotation_key"])
+        if remote is None:
+            return None
+        try:
+            settled = queue.confirm_unchanged(record["id"], record["revision"], remote_record=remote,
+                known_internal=self._known_internal(record["scope"], record["attachment_key"], record["annotation_key"]))
+        except AnnotationConflict:
+            return None
+        self._remember_internal(settled)
+        return remote
 
     def _attachment_parent(self, scope, key):
         identity = (self.client.server_id, scope, key)
@@ -436,51 +507,213 @@ class ZoteroWorkspaceService:
     def _request_path(self, request_id):
         if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{5,128}", request_id):
             raise ValueError("Invalid saved annotation request identity.")
-        return self.private_root / "annotation-requests" / (_sha(json.dumps([self.client.server_id, request_id])) + ".json")
+        return self.private_root / "annotation-requests" / (_sha(json.dumps([self._recovery_server_id(), request_id])) + ".json")
 
     @staticmethod
     def _operation_ref(record):
         return {key: record[key] for key in ("id", "scope", "attachment_key", "annotation_key", "operation", "base_version")} | {
             "payload_hash": _sha(json.dumps(record.get("payload"), sort_keys=True, allow_nan=False))}
 
-    def _saved_requests(self, data, scope, attachment_key, queue):
-        identifiers = data.get("request_ids")
-        if not isinstance(identifiers, list) or not 1 <= len(identifiers) <= 64 or any(not isinstance(value, str) for value in identifiers) or len(set(identifiers)) != len(identifiers):
+    def _receipt_path(self, receipt_id):
+        if not isinstance(receipt_id, str) or not re.fullmatch(r"[0-9a-f]{64}", receipt_id):
+            raise ValueError("Invalid saved annotation receipt identity.")
+        return self.private_root / "annotation-requests" / (receipt_id + ".json")
+
+    @staticmethod
+    def _request_selector(data):
+        fields = [field for field in ("request_ids", "receipt_ids", "operation_ids") if field in data]
+        if len(fields) != 1 or fields[0] == "operation_ids":
+            raise ValueError("Select saved request identities or receipt identities, not both.")
+        field = fields[0]
+        identifiers = data[field]
+        if (not isinstance(identifiers, list) or not 1 <= len(identifiers) <= 64
+                or any(not isinstance(value, str) for value in identifiers) or len(set(identifiers)) != len(identifiers)):
             raise ValueError("Select distinct saved annotation request identities (at most 64).")
-        requests, unresolved = [], []
-        count = 0
-        for request_id in identifiers:
-            path = self._request_path(request_id)
-            receipt = _read_json(path)
-            if not receipt or receipt.get("scope") != scope or receipt.get("attachment_key") != attachment_key:
-                unresolved.append(request_id)
-                continue
-            drafts = receipt.get("drafts")
-            if (not isinstance(drafts, list) or not 1 <= len(drafts) <= 64 or type(receipt.get("delete")) is not bool
-                    or receipt.get("request_hash") != _sha(json.dumps([scope, attachment_key, receipt["delete"], drafts], sort_keys=True, allow_nan=False))):
-                unresolved.append(request_id)
-                continue
-            count += len(drafts)
-            if count > 64:
-                raise ValueError("Recover at most 64 annotation changes per action.")
-            refs = receipt.get("operation_refs")
-            rows = []
-            if receipt.get("state") not in {"confirmed", "discarded"}:
-                if not isinstance(refs, list) or len(refs) != len(drafts):
-                    requests.append({"id": request_id, "path": path, "receipt": receipt, "records": [], "needs_admission": True})
-                    continue
+        return field, identifiers
+
+    def _load_saved_request(self, path, queue, *, identity, trusted_path=False):
+        receipt = _read_json(path)
+        if not receipt:
+            return None
+        scope, attachment_key = receipt.get("scope"), receipt.get("attachment_key")
+        try:
+            _scope(scope)
+            _key(attachment_key)
+        except ValueError:
+            return None
+        if receipt.get("server_id", self._recovery_server_id()) != self._recovery_server_id():
+            return None
+        original_id = receipt.get("request_id")
+        if original_id is not None:
+            try:
+                if self._request_path(original_id) != path:
+                    return None
+            except ValueError:
+                return None
+        drafts = receipt.get("drafts")
+        if (not isinstance(drafts, list) or not 1 <= len(drafts) <= 64 or any(not isinstance(row, dict) for row in drafts)
+                or type(receipt.get("delete")) is not bool
+                or receipt.get("request_hash") != _sha(json.dumps([scope, attachment_key, receipt["delete"], drafts], sort_keys=True, allow_nan=False))):
+            return None
+        if receipt.get("state") not in {"prepared", "confirmed", "discarded"}:
+            return None
+        try:
+            keys = [_key(row.get("id")) for row in drafts]
+            if len(keys) != len(set(keys)):
+                return None
+            for row in drafts:
+                _version(row.get("version", 0))
+        except ValueError:
+            return None
+        refs = receipt.get("operation_refs")
+        rows = []
+        refs_complete = isinstance(refs, list) and len(refs) == len(drafts)
+        if refs_complete:
+            try:
                 for ref, draft in zip(refs, drafts):
                     row = queue.get(ref.get("id")) if isinstance(ref, dict) else None
-                    if (not row or not isinstance(draft, dict) or self._operation_ref(row) != ref
+                    if (not row or self._operation_ref(row) != ref
                             or (row["scope"], row["attachment_key"], row["annotation_key"], row["base_version"], row["operation"]) !=
-                            (scope, attachment_key, draft.get("id"), draft.get("version", 0), "delete" if receipt["delete"] else "upsert")):
+                            (scope, attachment_key, draft["id"], draft.get("version", 0), "delete" if receipt["delete"] else "upsert")):
                         break
                     rows.append(row)
-                if len(rows) != len(refs):
-                    unresolved.append(request_id)
-                    continue
-            requests.append({"id": request_id, "path": path, "receipt": receipt, "records": rows})
+            except (ValueError, KeyError, TypeError):
+                return None
+            if len(rows) != len(refs):
+                # Settled historical receipts can outlive a later edit on the
+                # same annotation. They remain audit history, never recovery authority.
+                if receipt["state"] not in {"confirmed", "discarded"}:
+                    return None
+                rows = []
+        # Old receipts did not record server/request identities. A known request
+        # path pins its server; opaque inventory may trust only matching records
+        # in this server's outbox. Unattested legacy drafts stay on disk.
+        if not trusted_path and receipt.get("server_id") is None and original_id is None and not rows:
+            return None
+        return {"id": identity, "receipt_id": path.stem, "path": path, "receipt": receipt,
+            "records": rows, "needs_admission": receipt["state"] == "prepared" and not refs_complete}
+
+    def _saved_requests(self, data, scope, attachment_key, queue):
+        field, identifiers = self._request_selector(data)
+        requests, unresolved, count = [], [], 0
+        for identifier in identifiers:
+            path = self._receipt_path(identifier) if field == "receipt_ids" else self._request_path(identifier)
+            request = self._load_saved_request(path, queue, identity=identifier, trusted_path=field == "request_ids")
+            if request is None or (request["receipt"]["scope"], request["receipt"]["attachment_key"]) != (scope, attachment_key):
+                unresolved.append(identifier)
+                continue
+            count += len(request["receipt"]["drafts"])
+            if count > 64:
+                raise ValueError("Recover at most 64 annotation changes per action.")
+            requests.append(request)
         return requests, unresolved
+
+    def _recovery_requests(self, queue):
+        directory = self.private_root / "annotation-requests"
+        if not directory.exists():
+            return []
+        _private_directory(directory)
+        names = sorted(directory.iterdir())
+        if len(names) > 10000:
+            raise ValueError("Annotation request history exceeds its inventory limit.")
+        requests = []
+        for path in names:
+            if not re.fullmatch(r"[0-9a-f]{64}\.json", path.name):
+                continue
+            try:
+                request = self._load_saved_request(path, queue, identity=path.stem)
+            except (OSError, ValueError, TypeError, KeyError):
+                request = None
+            if request is not None:
+                requests.append(request)
+        return requests
+
+    def _pending_attachment(self, scope, attachment_key):
+        queue = self._queue()
+        pending = [row for row in queue.pending() if (row["scope"], row["attachment_key"]) == (scope, attachment_key)]
+        interrupted = [request for request in self._recovery_requests(queue)
+            if request["receipt"]["state"] == "prepared" and request.get("needs_admission")
+            and (request["receipt"]["scope"], request["receipt"]["attachment_key"]) == (scope, attachment_key)]
+        return pending, interrupted
+
+    def _annotation_recovery(self, data):
+        connection = self._status()
+        queue = self._queue()
+        scope = _scope(data["scope"]) if "scope" in data else None
+        attachment_key = _key(data["attachment_key"]) if "attachment_key" in data else None
+        start, limit = data.get("start", 0), data.get("limit", 32)
+        if type(start) is not int or not 0 <= start <= 10000 or type(limit) is not int or not 1 <= limit <= 64:
+            raise ValueError("Recovery pagination requires a nonnegative start and limit up to 64.")
+        rows, referenced = [], set()
+        for request in self._recovery_requests(queue):
+            receipt = request["receipt"]
+            if (scope is not None and receipt["scope"] != scope) or (attachment_key is not None and receipt["attachment_key"] != attachment_key):
+                continue
+            records = request["records"]
+            referenced.update(row["id"] for row in records)
+            states = {row["state"] for row in records}
+            status = ("conflict" if receipt.get("admission_state") == "conflict" and receipt["state"] == "prepared"
+                else "unable_to_verify" if receipt.get("admission_state") == "unable_to_verify" and receipt["state"] == "prepared"
+                else "discarded" if receipt["state"] == "discarded" or states and states <= {"confirmed", "discarded"} and "discarded" in states
+                else "saved" if receipt["state"] == "confirmed" or states == {"confirmed"}
+                else "conflict" if "conflict" in states
+                else "checking_outcome" if states & {"dispatched", "uncertain"}
+                else "waiting_to_send" if request.get("needs_admission") or states == {"queued"}
+                else "waiting_to_send" if states and states <= {"queued", "confirmed", "discarded"}
+                else "unable_to_verify")
+            settled = receipt["state"] in {"confirmed", "discarded"}
+            observed = [{"id": row["annotation_key"], "state": row["state"], **copy.deepcopy(row.get("observed", {}))} for row in records]
+            observed_keys = {row["id"] for row in observed}
+            observed.extend({"id": draft["id"], "state": receipt.get("admission_state", "retained"), "base_version": draft.get("version", 0)}
+                for draft in receipt["drafts"] if draft["id"] not in observed_keys)
+            rows.append({"receipt_id": request["receipt_id"], "scope": receipt["scope"], "attachment_key": receipt["attachment_key"],
+                "status": status, "durable": True, "request_id": receipt.get("request_id"), "drafts": copy.deepcopy(receipt["drafts"]), "delete": receipt["delete"],
+                "observed": observed,
+                "actions": {"check": not settled, "retry": not settled and status == "waiting_to_send",
+                    "discard": not settled and status in {"waiting_to_send", "conflict"}}})
+        # A damaged/missing receipt must not hide an otherwise durable operation.
+        # It can be checked by its exact operation ID, but cannot be resent as
+        # though the original batch contract had been recovered.
+        for row in queue.pending():
+            if row["id"] in referenced or (scope is not None and row["scope"] != scope) or (attachment_key is not None and row["attachment_key"] != attachment_key):
+                continue
+            rows.append({"receipt_id": None, "operation_ids": [row["id"]], "scope": row["scope"], "attachment_key": row["attachment_key"],
+                "status": "unable_to_verify", "durable": True, "drafts": [copy.deepcopy(row.get("payload") or {"id": row["annotation_key"]})],
+                "observed": [{"id": row["annotation_key"], "state": row["state"], **copy.deepcopy(row.get("observed", {}))}],
+                "actions": {"check": True, "retry": False, "discard": False}})
+        rows.sort(key=lambda row: (row["status"] in {"saved", "discarded"}, row["scope"], row["attachment_key"], row["receipt_id"] or row["operation_ids"][0]))
+        page, changes, offset = [], 0, start
+        while offset < len(rows) and len(page) < limit:
+            row = rows[offset]
+            if page and changes + len(row["drafts"]) > 64:
+                break
+            page.append(row)
+            changes += len(row["drafts"])
+            offset += 1
+        remote_available = connection["connected"]
+        for row in page:
+            if not connection["connected"]:
+                row["local_status"] = row["status"]
+                if row["status"] not in {"saved", "discarded"}:
+                    row["status"] = "unable_to_verify"
+                row["actions"] = {"check": False, "retry": False, "discard": False}
+                row["reason"] = "The changes are retained locally. Open the matching Zotero profile to verify them."
+            elif not connection["writable"]:
+                row["actions"]["retry"] = False
+            if row["status"] in {"saved", "discarded"} or not remote_available:
+                continue
+            for observed in row["observed"]:
+                try:
+                    remote = self._annotation_record(row["scope"], row["attachment_key"], observed["id"])
+                    observed["remote"] = api_to_reader(remote, scope=row["scope"], attachment_key=row["attachment_key"]) if remote else None
+                    observed["remote_absent"] = remote is None
+                except (ValueError, ZoteroWorkspaceError, OSError) as exc:
+                    row["remote_error"] = str(exc)
+                    remote_available = False
+                    break
+        return {"records": page, "start": start, "limit": limit, "total": len(rows),
+            "next_start": offset if offset < len(rows) else None, "server_id": self._recovery_server_id(),
+            "connected": connection["connected"], "offline": not connection["connected"]}
 
     def _confirm_request(self, request, queue, *, event):
         receipt = request["receipt"]
@@ -514,7 +747,10 @@ class ZoteroWorkspaceService:
         status = self._status()
         pdf = self.client.pdf_file(scope, key)
         identity, stamp, replaced = self._pdf_baseline(pdf)
-        annotations = self._annotations(scope, key, writable=status["writable"] and not replaced)
+        attachment_read_only, permission_reason = self._attachment_permission(scope, key)
+        pending, interrupted = self._pending_attachment(scope, key)
+        blocked = bool(pending or interrupted)
+        annotations = self._annotations(scope, key, writable=status["writable"] and not replaced and not blocked and not attachment_read_only)
         notes = self._notes(data.get("workspace_id"), scope, pdf.parent_item) if pdf.parent_item else []
         selected = next((row for row in notes if row["path"] == data.get("note_path")), None)
         if data.get("note_path") and selected is None:
@@ -548,7 +784,12 @@ class ZoteroWorkspaceService:
         reader = {"id": self._reader_id(pdf), "title": _record_data(attachment).get("title") or "Source PDF",
             "url": f"/api/zotero/attachments/{token}/file", "scope": scope, "attachment_key": key,
             "item_key": pdf.parent_item, "annotations": annotations, "location": location,
-            "readOnly": not status["writable"] or replaced, "pdf_identity": identity, "source_pdf_uri": source_uri}
+            "readOnly": not status["writable"] or replaced or blocked or attachment_read_only, "attachment_read_only": attachment_read_only,
+            "pdf_identity": identity, "source_pdf_uri": source_uri,
+            "readOnlyReason": "Pending annotation changes require recovery." if blocked else
+                "The PDF changed; verify annotations before editing." if replaced else
+                "Authorize editing in Zotero." if not status["writable"] else permission_reason,
+            "pending": pending, "pending_receipt_ids": [request["receipt_id"] for request in interrupted]}
         if selected:
             reader["note_path"] = selected["path"]
         if warning:
@@ -642,24 +883,54 @@ class ZoteroWorkspaceService:
             raise ValueError("Prepare and review a current migration preview first.")
         if preview["binding"]["server_id"] != self.client.server_id:
             raise ValueError("Zotero server changed; prepare a new migration preview.")
-        return self.documents.migrate_live_note(preview["workspace_id"], preview["document_id"], preview["revision"],
+        result = self.documents.migrate_live_note(preview["workspace_id"], preview["document_id"], preview["revision"],
             preview["binding"], registrar=_Registrar(self.client))
+        if self.annotation_sync is not None:
+            self.annotation_sync.enqueue_workspace(preview["workspace_id"])
+        return result
 
-    def _annotation_write(self, data, *, delete=False):
-        self._require_writes()
+    def _annotation_write(self, data, *, delete=False, retain_only=False):
+        # Retaining a reader draft is not permission to dispatch it. Keep that
+        # distinction when authorization expires or Zotero changes mid-edit.
+        if not self.writes_enabled:
+            raise ValueError("Zotero writes are disabled for this workspace session.")
         scope, attachment_key = _scope(data.get("scope", "users/0")), _key(data.get("attachment_key"))
-        pdf = self.client.pdf_file(scope, attachment_key)
-        if self._pdf_baseline(pdf)[2]:
-            raise ValueError("The PDF changed. Verify its annotations before writing.")
         drafts = data.get("annotations")
         if not isinstance(drafts, list) or not 1 <= len(drafts) <= 64 or any(not isinstance(row, dict) for row in drafts):
             raise ValueError("Save at most 64 explicitly identified annotations at once.")
         keys = [_key(row.get("id")) for row in drafts]
         if len(set(keys)) != len(keys):
             raise ValueError("A save cannot repeat an annotation identity.")
+        if not re.fullmatch(r"[23456789ABCDEFGHIJKLMNPQRSTUVWXYZ]{8}", attachment_key):
+            raise ValueError("Invalid Zotero attachment write key.")
+        local_payloads = []
+        for draft, key in zip(drafts, keys):
+            version = _version(draft.get("version", 0))
+            if not re.fullmatch(r"[23456789ABCDEFGHIJKLMNPQRSTUVWXYZ]{8}", key):
+                raise ValueError("Invalid Zotero annotation write key.")
+            if delete:
+                if (version == 0 and not retain_only) or any(field in draft and draft[field] != value for field, value in
+                        (("scope", scope), ("attachment_key", attachment_key), ("parentItem", attachment_key), ("key", key))):
+                    raise ValueError("Annotation deletion identity does not match its bound attachment.")
+                local_payloads.append(None)
+            else:
+                # Validate shape using the creation codec without pretending its
+                # fabricated version is evidence of current edit permission.
+                payload = reader_to_api({**draft, "version": 0}, scope=scope, attachment_key=attachment_key, expected_version=0)
+                local_payloads.append({**payload, "version": version})
         operation = data.get("operation_id")
         if not isinstance(operation, str) or not re.fullmatch(r"[A-Za-z0-9_-]{5,128}", operation):
             raise ValueError("A stable operation identity is required.")
+        # An already opened reader proves where an offline draft belongs. It
+        # cannot authorize a write: the current PDF and connection are checked
+        # again below. Direct callers without that proof need an initial read.
+        bound = any((entry["pdf"].server_id, entry["pdf"].scope, entry["pdf"].attachment_key) ==
+            (self.client.server_id, scope, attachment_key) for entry in self._pdfs.values())
+        reader_id = _sha(json.dumps([self.client.server_id, scope, attachment_key], separators=(",", ":"))) if self.client.server_id else None
+        baseline_path = self.private_root / "pdf-identities" / (reader_id + ".json") if reader_id else None
+        if not bound and not (baseline_path and baseline_path.exists() and _read_json(baseline_path)):
+            pdf = self.client.pdf_file(scope, attachment_key)
+            self._pdf_baseline(pdf)
         queue = self._queue()
         request_hash = _sha(json.dumps([scope, attachment_key, delete, drafts], sort_keys=True, allow_nan=False))
         request_path = self._request_path(operation)
@@ -669,34 +940,66 @@ class ZoteroWorkspaceService:
                 raise ValueError("This operation identity was already used for a different request.")
             if prior_request.get("result") is not None:
                 return prior_request["result"]
-            return {"annotations": [], "pending": [queue.lookup(scope, attachment_key, key) for key in keys if queue.lookup(scope, attachment_key, key)],
+            return {"annotations": [], "resolved": False, "retained": True, "pending_receipt_ids": [request_path.stem],
+                "pending": [record for key in keys if (record := queue.lookup(scope, attachment_key, key)) and record["state"] not in {"confirmed", "discarded"}],
                 "warning": "A prior operation was interrupted. Reconcile its saved state before continuing."}
-        prepared = []
-        for draft, key in zip(drafts, keys):
-            version = _version(draft.get("version", 0))
-            old = queue.lookup(scope, attachment_key, key)
-            if old and old["state"] not in {"confirmed", "conflict", "discarded"}:
-                return {"annotations": [], "pending": [old], "warning": "A saved operation requires reconciliation before another write."}
-            remote = self.client.item(scope, key)
-            existing = api_to_reader(remote, scope=scope, attachment_key=attachment_key, writable=True,
-                known_internal=self._known_internal(scope, attachment_key, key)) if remote else None
-            if delete:
-                if any(field in draft and draft[field] != value for field, value in
-                       (("scope", scope), ("attachment_key", attachment_key), ("parentItem", attachment_key), ("key", key))):
-                    raise ValueError("Annotation deletion identity does not match its bound attachment.")
-                if version == 0 or existing is None or existing["version"] != version or existing["readOnly"]:
-                    raise AnnotationConflict("Only the current writable annotation version may be deleted.")
-                payload = None
-            else:
-                if remote is not None and version == 0:
-                    raise AnnotationConflict("This annotation key already exists.")
-                payload = reader_to_api(draft, scope=scope, attachment_key=attachment_key, expected_version=version, existing=existing)
-            prepared.append((draft, payload, old))
-        request_record = {"request_hash": request_hash, "state": "prepared", "scope": scope,
-            "attachment_key": attachment_key, "delete": delete, "drafts": drafts,
+        request_record = {"request_id": operation, "server_id": self.client.server_id, "request_hash": request_hash,
+            "state": "prepared", "admission_state": "retained", "scope": scope, "attachment_key": attachment_key,
+            "delete": delete, "drafts": drafts,
             "prepared_operations": [{"id": queue.operation_id(scope, attachment_key, draft["id"]), "scope": scope,
                 "attachment_key": attachment_key, "annotation_key": draft["id"], "operation": "delete" if delete else "upsert",
-                "base_version": draft.get("version", 0), "payload": payload} for draft, payload, _ in prepared]}
+                "base_version": draft.get("version", 0), "payload": payload} for draft, payload in zip(drafts, local_payloads)]}
+        _write_json(request_path, request_record)
+        if retain_only:
+            if delete and any(draft.get("version", 0) == 0 for draft in drafts):
+                request_record["admission_state"] = "conflict"
+                request_record["admission_error"] = "This deletion was requested before the annotation's current version was known. Review the current annotation before submitting a new deletion."
+            result = {"annotations": [], "resolved": False, "retained": True, "retain_only": True,
+                "pending_receipt_ids": [request_path.stem], "pending": [],
+                "warning": request_record.get("admission_error", "These annotation changes are retained locally. Check the saved state before explicitly retrying them.")}
+            _write_json(request_path, {**request_record, "retained_only": True, "result": result})
+            return result
+        prepared = []
+        admission_stage = "authorization"
+        try:
+            self._require_writes()
+            admission_stage = "validation"
+            pdf = self.client.pdf_file(scope, attachment_key)
+            if self._pdf_baseline(pdf)[2]:
+                raise AnnotationConflict("The PDF changed. Verify its annotations before writing.")
+            attachment_read_only, permission_reason = self._attachment_permission(scope, attachment_key)
+            if attachment_read_only:
+                raise AnnotationConflict(permission_reason)
+            for draft, key in zip(drafts, keys):
+                version = _version(draft.get("version", 0))
+                old = queue.lookup(scope, attachment_key, key)
+                if old and old["state"] not in {"confirmed", "discarded"}:
+                    raise AnnotationConflict("A retained annotation change requires reconciliation before another write.")
+                remote = self._annotation_record(scope, attachment_key, key)
+                existing = api_to_reader(remote, scope=scope, attachment_key=attachment_key, writable=True,
+                    known_internal=self._known_internal(scope, attachment_key, key)) if remote else None
+                if delete:
+                    if existing is None or existing["version"] != version or existing["readOnly"]:
+                        raise AnnotationConflict("Only the current writable annotation version may be deleted.")
+                    payload = None
+                else:
+                    if remote is not None and version == 0:
+                        raise AnnotationConflict("This annotation key already exists.")
+                    payload = reader_to_api(draft, scope=scope, attachment_key=attachment_key, expected_version=version, existing=existing)
+                prepared.append((draft, payload, old))
+        except Exception as exc:
+            unavailable = admission_stage == "authorization" or isinstance(exc, (OSError, ZoteroWorkspaceError)) and not isinstance(exc, AnnotationConflict)
+            request_record["admission_state"] = "unable_to_verify" if unavailable else "conflict"
+            request_record["admission_error"] = str(exc)
+            result = {"annotations": [], "resolved": False, "retained": True, "pending_receipt_ids": [request_path.stem],
+                "pending": [record for key in keys if (record := queue.lookup(scope, attachment_key, key)) and record["state"] not in {"confirmed", "discarded"}],
+                "warning": str(exc), "code": getattr(exc, "code", "annotation_conflict")}
+            _write_json(request_path, {**request_record, "result": result})
+            return result
+        request_record["admission_state"] = "validated"
+        request_record["prepared_operations"] = [{"id": queue.operation_id(scope, attachment_key, draft["id"]), "scope": scope,
+            "attachment_key": attachment_key, "annotation_key": draft["id"], "operation": "delete" if delete else "upsert",
+            "base_version": draft.get("version", 0), "payload": payload} for draft, payload, _ in prepared]
         _write_json(request_path, request_record)
         queued = []
         for draft, payload, old in prepared:
@@ -709,8 +1012,13 @@ class ZoteroWorkspaceService:
         _write_json(request_path, request_record)
         confirmed, pending = [], []
         for offset, ((draft, payload, old), record) in enumerate(zip(prepared, queued)):
-            record = queue.mark_dispatched(record["id"], record["revision"])
             try:
+                unchanged = self._confirm_queued_no_change(queue, record)
+                if unchanged is not None:
+                    confirmed.append(api_to_reader(unchanged, scope=scope, attachment_key=attachment_key, writable=True,
+                        known_internal=self._known_internal(scope, attachment_key, draft["id"])))
+                    continue
+                record = queue.mark_dispatched(record["id"], record["revision"])
                 if delete:
                     self.client.delete_annotation(scope, attachment_key, draft["id"], expected_version=draft["version"], write_token=record["attempt_id"],
                         known_internal=self._known_internal(scope, attachment_key, draft["id"]))
@@ -735,6 +1043,7 @@ class ZoteroWorkspaceService:
                 return result
         result = {"annotations": confirmed, "pending": [], "deleted": keys if delete else []}
         _write_json(request_path, {**request_record, "state": "confirmed", "result": result})
+        self._notify_annotations(scope, attachment_key)
         return result
 
     def _annotation_refresh(self, data, *, reconcile=False):
@@ -742,10 +1051,11 @@ class ZoteroWorkspaceService:
         status = self._status()
         pdf = self.client.pdf_file(scope, key)
         _, stamp, replaced = self._pdf_baseline(pdf)
+        attachment_read_only, permission_reason = self._attachment_permission(scope, key)
         queue = self._queue()
         requested = data.get("operation_ids")
         requests, unresolved = None, []
-        if reconcile and "request_ids" in data:
+        if reconcile and ("request_ids" in data or "receipt_ids" in data):
             if "operation_ids" in data:
                 raise ValueError("Use saved request identities or operation identities, not both.")
             requests, unresolved = self._saved_requests(data, scope, key, queue)
@@ -754,18 +1064,34 @@ class ZoteroWorkspaceService:
             raise ValueError("Select at most 64 saved annotation operations to reconcile.")
         if reconcile and len(set(requested)) != len(requested):
             raise ValueError("A reconciliation cannot repeat an operation identity.")
+        if requests is not None:
+            for request in requests:
+                if not request.get("needs_admission") or request["receipt"].get("admission_state") not in {"conflict", "unable_to_verify"}:
+                    continue
+                try:
+                    for draft in request["receipt"]["drafts"]:
+                        self._validate_saved_change(scope, key, draft, delete=request["receipt"]["delete"])
+                    request["receipt"]["admission_state"] = "validated"
+                    request["receipt"].pop("admission_error", None)
+                except Exception as exc:
+                    request["receipt"]["admission_state"] = "unable_to_verify" if isinstance(exc, (OSError, ZoteroWorkspaceError)) and not isinstance(exc, AnnotationConflict) else "conflict"
+                    request["receipt"]["admission_error"] = str(exc)
+                _write_json(request["path"], request["receipt"])
         records = [queue.get(value) for value in requested] if reconcile else queue.pending()
         if reconcile and any(not row or (row["scope"], row["attachment_key"]) != (scope, key) for row in records):
             raise ValueError("The requested operations do not belong to this attachment.")
+        confirmed_change = False
         for pending in records:
             if replaced or (pending["scope"], pending["attachment_key"]) != (scope, key) or pending["state"] not in {"dispatched", "uncertain"}:
                 continue
-            remote = self.client.item(scope, pending["annotation_key"])
-            self._remember_internal(queue.reconcile(pending["id"], pending["revision"], remote_record=remote, confirmed_absent=remote is None,
-                known_internal=self._known_internal(scope, key, pending["annotation_key"])))
+            remote = self._annotation_record(scope, key, pending["annotation_key"])
+            settled = queue.reconcile(pending["id"], pending["revision"], remote_record=remote, confirmed_absent=remote is None,
+                known_internal=self._known_internal(scope, key, pending["annotation_key"]))
+            self._remember_internal(settled)
+            confirmed_change = confirmed_change or settled["state"] == "confirmed"
         remaining = [row for row in queue.pending() if (row["scope"], row["attachment_key"]) == (scope, key)]
-        result = {"annotations": self._annotations(scope, key, writable=status["writable"] and not replaced), "pending": remaining,
-            "readOnly": not status["writable"] or replaced}
+        result = {"pending": remaining, "permission_read_only": not status["writable"] or replaced or attachment_read_only,
+            "attachment_read_only": attachment_read_only}
         if reconcile:
             if requests is not None:
                 complete = [self._confirm_request(request, queue, event="reconciled") for request in requests]
@@ -778,13 +1104,23 @@ class ZoteroWorkspaceService:
                 result["resolved"] = not replaced and all(queue.get(value)["state"] in {"confirmed", "discarded"} for value in requested)
         if replaced:
             result["warning"] = "The PDF changed. Verify its annotations before editing or projecting them."
+        remaining, interrupted = self._pending_attachment(scope, key)
+        blocked = bool(remaining or interrupted)
+        result.update(pending=remaining, pending_receipt_ids=[request["receipt_id"] for request in interrupted],
+            readOnly=not status["writable"] or replaced or blocked or attachment_read_only,
+            readOnlyReason="Pending annotation changes require recovery." if blocked else
+                "The PDF changed; verify annotations before editing." if replaced else
+                "Authorize editing in Zotero." if not status["writable"] else permission_reason,
+            annotations=self._annotations(scope, key, writable=status["writable"] and not replaced and not blocked and not attachment_read_only))
+        if confirmed_change:
+            self._notify_annotations(scope, key)
         if not reconcile and status["connected"] and not replaced:
             self._refresh_pdf_leases(pdf, stamp)
         return result
 
     def _validate_saved_change(self, scope, attachment_key, draft, *, delete):
         key, version = _key(draft.get("id")), _version(draft.get("version", 0))
-        remote = self.client.item(scope, key)
+        remote = self._annotation_record(scope, attachment_key, key)
         existing = api_to_reader(remote, scope=scope, attachment_key=attachment_key, writable=True,
             known_internal=self._known_internal(scope, attachment_key, key)) if remote else None
         if delete:
@@ -822,11 +1158,11 @@ class ZoteroWorkspaceService:
 
     def _annotation_retry(self, data):
         self._require_writes()
-        if "request_ids" not in data:
+        if "request_ids" not in data and "receipt_ids" not in data:
             raise ValueError("Explicit retry requires the saved request identities.")
         before = self._annotation_refresh(data, reconcile=True)
         before["retried"] = 0
-        if before.get("resolved") or before.get("unresolved_request_ids") or before.get("readOnly"):
+        if before.get("resolved") or before.get("unresolved_request_ids") or before.get("permission_read_only", before.get("readOnly")):
             return before
         scope, attachment_key = _scope(data.get("scope", "users/0")), _key(data.get("attachment_key"))
         queue = self._queue()
@@ -855,9 +1191,12 @@ class ZoteroWorkspaceService:
         for row in selected.values():
             # mark_dispatched is a revision CAS; a concurrent request cannot send
             # this queued operation twice. Each explicit attempt gets one token.
-            dispatched = queue.mark_dispatched(row["id"], row["revision"])
-            retried += 1
+            dispatched = row
             try:
+                if self._confirm_queued_no_change(queue, row) is not None:
+                    continue
+                dispatched = queue.mark_dispatched(row["id"], row["revision"])
+                retried += 1
                 if row["operation"] == "delete":
                     self.client.delete_annotation(scope, attachment_key, row["annotation_key"], expected_version=row["base_version"],
                         write_token=dispatched["attempt_id"], known_internal=self._known_internal(scope, attachment_key, row["annotation_key"]))
@@ -886,7 +1225,7 @@ class ZoteroWorkspaceService:
         return {**result, "retried": retried}
 
     def _annotation_discard(self, data):
-        if data.get("discard") is not True or "request_ids" not in data:
+        if data.get("discard") is not True or not ("request_ids" in data or "receipt_ids" in data):
             raise ValueError("Explicitly confirm discarding the saved request changes.")
         before = self._annotation_refresh(data, reconcile=True)
         if before.get("unresolved_request_ids") or before.get("readOnly") and not self._status()["connected"]:
@@ -931,16 +1270,26 @@ class ZoteroWorkspaceService:
         with self._lock:
             return read_annotation_snapshot(self.private_root, workspace_path, note_path)
 
-    def _project(self, data):
-        if data.get("dirty") is True:
-            return {"deferred": True, "reason": "Save or discard the note draft before projecting annotations."}
-        workspace_id, note_path = data["workspace_id"], data["note_path"]
-        root, root_identity, _ = _workspace_identity(self.documents.workspace_path(workspace_id), note_path)
-        receipt_path = _snapshot_path(self.private_root, root, root_identity, note_path)
-        with _receipt_guard(receipt_path):
-            return self._project_locked(data, root, root_identity, receipt_path)
+    def _projection_history(self, root, root_identity, note_path, receipt_path):
+        """History is retained even when an edited/deleted block is untrusted."""
+        trusted = self.annotation_snapshot(root, note_path)
+        if trusted is not None:
+            return trusted
+        receipt = _read_json(receipt_path)
+        if receipt is None:
+            return None
+        if ((receipt.get("workspace"), receipt.get("workspace_identity"), receipt.get("path")) !=
+                (str(root), root_identity, note_path) or receipt.get("state") not in {"prepared", "confirmed"}
+                or not isinstance(receipt.get("block_hash"), str) or not re.fullmatch(r"[0-9a-f]{64}", receipt["block_hash"])
+                or not isinstance(receipt.get("groups"), list)):
+            raise AnnotationConflict("Annotation history cannot be verified. Preserve the note and review its recovery history.")
+        return {"block_hash": receipt["block_hash"], "groups": copy.deepcopy(receipt["groups"])}
 
-    def _project_locked(self, data, root, root_identity, receipt_path):
+    @staticmethod
+    def _projection_pause_path(receipt_path):
+        return receipt_path.with_suffix(".pause.json")
+
+    def _projection_context(self, data, root, root_identity, receipt_path):
         workspace_id, note_path = data["workspace_id"], data["note_path"]
         current = self.documents.read(workspace_id, note_path)
         if current["id"] != data.get("document_id"):
@@ -956,27 +1305,126 @@ class ZoteroWorkspaceService:
         binding_scope = "users/0" if binding["library_type"] == "user" and binding["library_id"] == "0" else f"groups/{binding['library_id']}"
         if (binding["server_id"], binding_scope, binding["item_key"]) != (pdf.server_id, scope, pdf.parent_item) or replaced:
             raise ValueError("The PDF no longer matches this active source note.")
-        previous = self.annotation_snapshot(root, note_path)
+        previous = self._projection_history(root, root_identity, note_path, receipt_path)
         groups = previous["groups"] if previous else []
         groups = [group for group in groups if (group["scope"], group["attachment_key"]) != (scope, key)]
         attachment = self.client.item(scope, key)
         groups.append({"scope": scope, "attachment_key": key, "title": _record_data(attachment).get("title") or "Source PDF",
             "confirmed": True, "pdf_hash": identity, "expected_pdf_hash": identity,
             "annotations": self._annotations(scope, key)})
-        projected = project_annotations(current["text"], groups, expected_hash=previous["block_hash"] if previous else None)
+        return current, previous, groups
+
+    def _projection_status(self, data):
+        root, root_identity, _ = _workspace_identity(self.documents.workspace_path(data["workspace_id"]), data["note_path"])
+        receipt_path = _snapshot_path(self.private_root, root, root_identity, data["note_path"])
+        current = self.documents.read(data["workspace_id"], data["note_path"])
+        previous = self._projection_history(root, root_identity, data["note_path"], receipt_path)
+        pause = _read_json(self._projection_pause_path(receipt_path))
+        paused = bool(pause and (pause.get("workspace"), pause.get("workspace_identity"), pause.get("path")) ==
+            (str(root), root_identity, data["note_path"]) and pause.get("paused") is True)
+        verified = (not (START in current["text"] or END in current["text"])) if previous is None else verified_annotation_span(current["text"], previous["block_hash"]) is not None
+        state = "paused" if paused else "conflict" if not verified else "current" if previous else "new"
+        return {"state": state, "paused": paused, "revision": current["revision"], "note_path": data["note_path"],
+            "block_hash": previous["block_hash"] if previous else None}
+
+    def _project(self, data):
+        if data.get("dirty") is True:
+            return {"deferred": True, "reason": "Save or discard the note draft before projecting annotations."}
+        workspace_id, note_path = data["workspace_id"], data["note_path"]
+        root, root_identity, _ = _workspace_identity(self.documents.workspace_path(workspace_id), note_path)
+        receipt_path = _snapshot_path(self.private_root, root, root_identity, note_path)
+        with _receipt_guard(receipt_path):
+            if self._projection_status(data)["paused"]:
+                return {"deferred": True, "paused": True, "reason": "Automatic annotation updates are paused for this note."}
+            current, previous, groups = self._projection_context(data, root, root_identity, receipt_path)
+            projected = project_annotations(current["text"], groups, expected_hash=previous["block_hash"] if previous else None)
+            return self._commit_projection(data, root, root_identity, receipt_path, current, previous, groups, projected)
+
+    def _commit_projection(self, data, root, root_identity, receipt_path, current, previous, groups, projected):
         raw = (b"\xef\xbb\xbf" if current.get("bom") else b"") + projected["text"].encode()
-        receipt = {"schema_version": 1, "workspace": str(root), "workspace_identity": root_identity, "path": note_path,
+        receipt = {"schema_version": 1, "workspace": str(root), "workspace_identity": root_identity, "path": data["note_path"],
             "block_hash": projected["block_hash"], "groups": groups, "state": "prepared", "projected_revision": _sha(raw)}
         if previous:
             receipt["previous"] = {"schema_version": 1, "workspace": str(root), "workspace_identity": root_identity,
-                "path": note_path, "state": "confirmed", **previous}
-        _private_directory(receipt_path.parent.parent)
+                "path": data["note_path"], "state": "confirmed", **previous}
         _write_json(receipt_path, receipt)
-        document = self.documents.save(workspace_id, current["id"], current["revision"], projected["text"])
-        document = self.documents.confirm_annotation_projection(workspace_id, document["id"], document["revision"], projected["block_hash"])
+        unchanged = current["text"] == projected["text"]
+        document = current if unchanged else self.documents.save(data["workspace_id"], current["id"], current["revision"], projected["text"])
+        document = self.documents.confirm_annotation_projection(data["workspace_id"], document["id"], document["revision"], projected["block_hash"])
         receipt["state"] = "confirmed"
         _write_json(receipt_path, receipt)
-        return {"document": document, "block_hash": projected["block_hash"], "annotation_count": len(projected["annotations"])}
+        if self.annotation_sync is not None:
+            self.annotation_sync.projected(data["workspace_id"], data["note_path"], _scope(data.get("scope", "users/0")),
+                _key(data.get("attachment_key")), document["revision"])
+        return {"document": document, "block_hash": projected["block_hash"], "annotation_count": len(projected["annotations"]), "unchanged": unchanged}
+
+    @staticmethod
+    def _existing_section(text):
+        start, end = text.find(START), text.find(END)
+        if start >= 0 and end >= start and text.count(START) == 1 and text.count(END) == 1:
+            return (start, end + len(END)), text[start:end + len(END)]
+        if START in text or END in text:
+            # Ambiguous markers do not establish a safe deletion span. Display
+            # the complete file so the user can review retained text.
+            return None, text
+        return None, ""
+
+    def _projection_preview(self, data):
+        root, root_identity, _ = _workspace_identity(self.documents.workspace_path(data["workspace_id"]), data["note_path"])
+        receipt_path = _snapshot_path(self.private_root, root, root_identity, data["note_path"])
+        with _receipt_guard(receipt_path):
+            current, previous, groups = self._projection_context(data, root, root_identity, receipt_path)
+            _, existing = self._existing_section(current["text"])
+            proposed = project_annotations("", groups)["text"]
+            token = secrets.token_urlsafe(24)
+            self._projection_previews = {key: value for key, value in self._projection_previews.items() if value["expires"] > time.monotonic()}
+            while len(self._projection_previews) >= 32:
+                self._projection_previews.pop(next(iter(self._projection_previews)))
+            self._projection_previews[token] = {"data": {key: data[key] for key in ("workspace_id", "note_path", "document_id", "revision", "attachment_key")},
+                "scope": data.get("scope", "users/0"), "root_identity": root_identity, "groups_hash": _sha(json.dumps(groups, sort_keys=True)),
+                "expires": time.monotonic() + 900}
+            return {"preview_token": token, "revision": current["revision"], "existing_section": existing,
+                "proposed_section": proposed, "choices": ["preserve", "replace", "pause"], **self._projection_status(data)}
+
+    def _projection_resolve(self, data):
+        preview = self._projection_previews.get(data.get("preview_token"))
+        if (not preview or preview["expires"] <= time.monotonic()
+                or any(data.get(key) != value for key, value in preview["data"].items())
+                or data.get("scope", "users/0") != preview["scope"]):
+            raise ValueError("Review a current annotation projection preview before resolving it.")
+        choice = data.get("choice")
+        if choice not in {"preserve", "replace", "pause"}:
+            raise ValueError("Select preserve, replace or pause for this note section.")
+        root, root_identity, _ = _workspace_identity(self.documents.workspace_path(data["workspace_id"]), data["note_path"])
+        if root_identity != preview["root_identity"]:
+            raise ValueError("The workspace changed; review a new annotation preview.")
+        receipt_path = _snapshot_path(self.private_root, root, root_identity, data["note_path"])
+        with _receipt_guard(receipt_path):
+            current, previous, groups = self._projection_context(data, root, root_identity, receipt_path)
+            if _sha(json.dumps(groups, sort_keys=True)) != preview["groups_hash"]:
+                raise AnnotationConflict("Zotero annotations changed since the preview. Review their current state.")
+            if choice == "pause":
+                _write_json(self._projection_pause_path(receipt_path), {"workspace": str(root), "workspace_identity": root_identity,
+                    "path": data["note_path"], "paused": True, "revision": current["revision"]})
+                return {"paused": True, "state": "paused", "revision": current["revision"]}
+            backup = self.private_root / "projection-history" / (_sha(json.dumps([str(root), root_identity, data["note_path"], current["revision"]])) + ".json")
+            _write_json(backup, {"workspace": str(root), "workspace_identity": root_identity, "path": data["note_path"],
+                "revision": current["revision"], "text": current["text"], "choice": choice})
+            span, existing = self._existing_section(current["text"])
+            text = current["text"]
+            if span is not None:
+                personal = existing.replace(START, "").replace(END, "").replace("## Highlights and annotations", "## Personal annotation notes", 1).strip()
+                text = text[:span[0]] + (personal + "\n\n" if choice == "preserve" else "") + text[span[1]:]
+            else:
+                # Never guess which human text a damaged marker used to enclose.
+                text = text.replace(START, "").replace(END, "")
+                if existing:
+                    text = text.replace("## Highlights and annotations", "## Personal annotation notes", 1)
+            projected = project_annotations(text, groups)
+            result = self._commit_projection(data, root, root_identity, receipt_path, current, previous, groups, projected)
+            self._projection_pause_path(receipt_path).unlink(missing_ok=True)
+            self._projection_previews.pop(data["preview_token"], None)
+            return result
 
     def handle(self, action, data):
         if not isinstance(data, dict):
@@ -1026,8 +1474,14 @@ class ZoteroWorkspaceService:
                 return {"closed": True}
             if action == "annotation-save":
                 return self._annotation_write(data)
+            if action == "annotation-retain":
+                if "delete" in data and type(data["delete"]) is not bool:
+                    raise ValueError("Retained deletion intent requires an explicit boolean.")
+                return self._annotation_write(data, delete=data.get("delete") is True, retain_only=True)
             if action == "annotation-delete":
                 return self._annotation_write(data, delete=True)
+            if action == "annotation-recovery":
+                return self._annotation_recovery(data)
             if action == "annotation-refresh":
                 return self._annotation_refresh(data)
             if action == "annotation-reconcile":
@@ -1038,6 +1492,12 @@ class ZoteroWorkspaceService:
                 return self._annotation_discard(data)
             if action == "annotation-project":
                 return self._project(data)
+            if action == "annotation-projection-status":
+                return self._projection_status(data)
+            if action == "annotation-projection-preview":
+                return self._projection_preview(data)
+            if action == "annotation-projection-resolve":
+                return self._projection_resolve(data)
             if action == "migration-preview":
                 return self._migration_preview(data)
             if action == "migrate":

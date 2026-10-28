@@ -5,6 +5,19 @@
 window.createSourceReader = function ({ container, api, message, onAnnotations, onState }) {
   const channel = "az-zotero-reader-v1", entries = new Map();
   let active = null;
+  function permissions(entry, result = {}) {
+    if (typeof result.readOnly === "boolean") entry.config.readOnly = result.readOnly;
+    if (typeof (result.readOnlyReason ?? result.read_only_reason) === "string") entry.config.read_only_reason = result.readOnlyReason ?? result.read_only_reason;
+    if (entry.initialized) send(entry, "read-only", { readOnly: entry.failed || entry.config.readOnly !== false });
+    onState?.(entry.config.id, entry.viewState);
+  }
+  function boundDraft(entry, row) {
+    if (!row || typeof row !== "object") throw new Error("Invalid annotation draft.");
+    for (const [key, expected] of [["scope", entry.config.scope], ["attachment_key", entry.config.attachment_key], ["parentItem", entry.config.attachment_key]]) {
+      if (row[key] !== undefined && row[key] !== expected) throw new Error("The annotation draft belongs to another source.");
+    }
+    return { ...entry.config.annotations.find((prior) => prior.id === row.id), ...row, scope: entry.config.scope, attachment_key: entry.config.attachment_key, parentItem: entry.config.attachment_key, version: row.version ?? entry.config.annotations.find((prior) => prior.id === row.id)?.version ?? 0 };
+  }
   const send = (entry, type, fields = {}) => entry.frame?.contentWindow?.postMessage({ channel, instanceId: entry.instanceId, type, ...fields }, location.origin);
   const stateKey = (entry) => `az.reader.${entry.config.id}.${entry.config.pdf_identity || ""}`;
   function savedState(entry) {
@@ -70,9 +83,21 @@ window.createSourceReader = function ({ container, api, message, onAnnotations, 
         location: entry.config.location, viewState: entry.resetViewState ? null : entry.viewState || savedState(entry), readOnly: entry.config.readOnly !== false });
     } else if (data.type === "initialized") {
       entry.initialized = true; entry.frame.inert = false;
+      permissions(entry);
       send(entry, "suspend", { suspended: active !== entry.config.id });
     } else if (data.type === "view-state" && data.primary !== false && data.viewState) {
       entry.viewState = data.viewState; entry.resetViewState = false; persist(entry); onState?.(entry.config.id, data.viewState);
+    } else if (data.type === "retain-annotations") {
+      entry.pending += 1; entry.failed = true; entry.failedOperations.add(data.operationId); permissions(entry);
+      try {
+        const annotations = data.deleting ? data.ids.map((id) => ({ id, version: entry.config.annotations.find((row) => row.id === id)?.version || 0 }))
+          : data.annotations.map((row) => boundDraft(entry, row));
+        const result = await api("zotero/annotation-retain", { scope: entry.config.scope, attachment_key: entry.config.attachment_key, operation_id: data.operationId, annotations, delete: data.deleting === true });
+        if (result.retained !== true) throw new Error("The newer annotation draft was not confirmed as retained locally.");
+        send(entry, "retention-result", { operationId: data.operationId, retained: true });
+        message("Annotation save needs review. Your latest changes are retained locally in Annotation changes.");
+      } catch (error) { send(entry, "retention-result", { operationId: data.operationId, retained: false, error: error.message }); message(error.message, true); }
+      finally { entry.pending -= 1; onState?.(entry.config.id, entry.viewState); }
     } else if (data.type === "save-annotations" || data.type === "delete-annotations") {
       entry.pending += 1;
       try {
@@ -81,12 +106,12 @@ window.createSourceReader = function ({ container, api, message, onAnnotations, 
           const prior = entry.config.annotations.find((row) => row.id === id);
           if (!prior) throw new Error("An annotation changed. Refresh before deleting it.");
           return { id, version: prior.version };
-        }) : data.annotations.map((row) => ({ ...entry.config.annotations.find((prior) => prior.id === row.id), ...row }));
+        }) : data.annotations.map((row) => boundDraft(entry, row));
         const result = await api(`zotero/annotation-${deleting ? "delete" : "save"}`, {
           scope: entry.config.scope, attachment_key: entry.config.attachment_key, operation_id: data.operationId, annotations,
         });
-        if (Array.isArray(result.pending) ? result.pending.length > 0 : result.pending) throw new Error(result.warning || "The annotation save is pending reconciliation. It has been retained locally.");
-        send(entry, "operation-result", { operationId: data.operationId, success: true });
+        if (result.resolved === false || result.pending_receipt_ids?.length || (Array.isArray(result.pending) ? result.pending.length > 0 : result.pending)) throw new Error(result.warning || "The annotation save is pending reconciliation. It has been retained locally.");
+        permissions(entry, result);
         if (Array.isArray(result.annotations) || Array.isArray(result.deleted)) {
           // Write responses contain confirmed deltas, not an attachment snapshot.
           // A replay may return no changes; absence never means deletion here.
@@ -95,8 +120,9 @@ window.createSourceReader = function ({ container, api, message, onAnnotations, 
           const deletedIds = [...new Set(result.deleted || [])];
           for (const id of deletedIds) merged.delete(id);
           entry.config.annotations = [...merged.values()];
-          send(entry, "annotations", { annotations: entry.config.annotations, deletedIds });
+          send(entry, "annotations", { annotations: entry.config.annotations, deletedIds, confirmedIds: (result.annotations || []).map((row) => row.id) });
         }
+        send(entry, "operation-result", { operationId: data.operationId, success: true });
         Promise.resolve(onAnnotations?.(entry.config)).catch((error) => message(`Annotations saved; note projection: ${error.message}`, true));
       } catch (error) {
         entry.failed = true; entry.failedOperations.add(data.operationId); onState?.(entry.config.id, entry.viewState);
@@ -107,6 +133,8 @@ window.createSourceReader = function ({ container, api, message, onAnnotations, 
       entry.frame?.remove(); entry.frame = null; entry.ready = false; entry.initialized = false; entry.closing = false;
       const manual = entry.manualClosing; entry.closed?.(true); entry.closed = null;
       if (!manual && active === entry.config.id) mount(entry);
+    } else if (data.type === "flush-result") {
+      entry.flushed?.(data.success === true); entry.flushed = null;
     } else if (data.type === "open-link") {
       if (/^https?:\/\//i.test(data.url || "")) window.open(data.url, "_blank", "noopener,noreferrer");
     } else if (data.type === "error") {
@@ -117,9 +145,10 @@ window.createSourceReader = function ({ container, api, message, onAnnotations, 
   window.addEventListener("message", handleMessage);
   return {
     register(config) {
+      config = { ...config, read_only_reason: config.read_only_reason ?? config.readOnlyReason ?? "" };
       let entry = entries.get(config.id);
       if (!entry) { entry = { config, frame: null, pending: 0, failed: false, failedOperations: new Set(), viewState: null, closing: false, hasMounted: false, renewing: false, mountEpoch: 0, resetViewState: false }; entries.set(config.id, entry); }
-      else { entry.mountEpoch += 1; entry.config = config; if (entry.initialized && !entry.pending && !entry.failed) { send(entry, "annotations", { annotations: config.annotations }); if (config.location) send(entry, "navigate", { location: config.location }); } }
+      else { entry.mountEpoch += 1; entry.config = config; permissions(entry, config); if (entry.initialized && !entry.pending && !entry.failed) { send(entry, "annotations", { annotations: config.annotations }); if (config.location) send(entry, "navigate", { location: config.location }); } }
       return entry.config;
     },
     activate(id) {
@@ -131,12 +160,20 @@ window.createSourceReader = function ({ container, api, message, onAnnotations, 
       // Inactive windows flush durable edits before releasing their PDF canvases.
       for (const [key, entry] of entries) if (key !== active && entry.frame && entry.initialized && !entry.closing && !entry.closed && !entry.pending && !entry.failed) { entry.closing = true; send(entry, "close"); }
     },
-    async close(id) {
+    async close(id, { keepPending = false } = {}) {
       const entry = entries.get(id); if (!entry) return true;
-      if (entry.pending || entry.failed) { message("Resolve the pending annotation save before closing this PDF.", true); return false; }
+      let retained = [];
+      if (entry.pending) { message("Wait until the annotation changes are retained locally before closing this PDF.", true); return false; }
+      if (entry.failed) {
+        if (!keepPending) { message("Resolve the pending annotation save before closing this PDF.", true); return false; }
+        const result = await api("zotero/annotation-recovery", { scope: entry.config.scope, attachment_key: entry.config.attachment_key, start: 0, limit: 64 });
+        const durable = new Set((result.records || []).filter((row) => row.durable === true).map((row) => row.request_id));
+        retained = [...entry.failedOperations];
+        if (retained.some((id) => !durable.has(id)) || !retained.length && !(result.records || []).every((row) => row.durable === true)) { message("Some changes are not confirmed as retained locally. Keep this PDF open.", true); return false; }
+      }
       if (entry.frame && entry.initialized) {
         entry.manualClosing = true;
-        const okay = await new Promise((resolve) => { entry.closed = resolve; if (!entry.closing) { entry.closing = true; send(entry, "close"); } setTimeout(() => { if (entry.closed === resolve) { entry.closed = null; resolve(false); } }, 10000); });
+        const okay = await new Promise((resolve) => { entry.closed = resolve; if (!entry.closing) { entry.closing = true; send(entry, retained.length ? "close-retained" : "close", { operationIds: retained }); } setTimeout(() => { if (entry.closed === resolve) { entry.closed = null; resolve(false); } }, 10000); });
         if (!okay) { entry.manualClosing = false; entry.closing = false; message("The reader has not confirmed its edits are saved. The PDF remains open.", true); return false; }
       } else entry.frame?.remove();
       entry.mountEpoch += 1; persist(entry); entries.delete(id); if (active === id) active = null;
@@ -146,8 +183,12 @@ window.createSourceReader = function ({ container, api, message, onAnnotations, 
     hasPending: () => [...entries.values()].some((row) => row.pending || row.failed),
     async refresh(id) {
       const entry = entries.get(id); if (!entry || entry.pending) return;
-      const result = await api(entry.failed ? "zotero/annotation-reconcile" : "zotero/annotation-refresh", { scope: entry.config.scope, attachment_key: entry.config.attachment_key, request_ids: [...entry.failedOperations] });
-      if (entry.failed && !result.resolved) throw new Error("The pending annotation changes need reconciliation. Your edits remain retained; no automatic retry was made.");
+      let result;
+      try { result = await api(entry.failed && entry.failedOperations.size ? "zotero/annotation-reconcile" : "zotero/annotation-refresh", { scope: entry.config.scope, attachment_key: entry.config.attachment_key, ...(entry.failedOperations.size ? { request_ids: [...entry.failedOperations] } : {}) }); }
+      catch (error) { permissions(entry, { readOnly: true, read_only_reason: error.message }); throw error; }
+      permissions(entry, result);
+      if (result.pending_receipt_ids?.length || Array.isArray(result.pending) && result.pending.length) { entry.failed = true; permissions(entry); throw new Error("Saved annotation changes need recovery. Open Annotation changes to review them."); }
+      if (entry.failed && entry.failedOperations.size && !result.resolved) throw new Error("The pending annotation changes need reconciliation. Your edits remain retained; no automatic retry was made.");
       if (result.annotations) {
         const deletedIds = entry.config.annotations.filter((old) => !result.annotations.some((row) => row.id === old.id)).map((row) => row.id);
         entry.config.annotations = result.annotations;
@@ -157,10 +198,21 @@ window.createSourceReader = function ({ container, api, message, onAnnotations, 
       }
     },
     hasFailed: (id) => Boolean(entries.get(id)?.failed),
+    async refreshAll() { for (const id of entries.keys()) { try { await this.refresh(id); } catch (error) { message(error.message, true); } } },
+    async flushAll() {
+      for (const entry of entries.values()) {
+        if (entry.failed) return false;
+        if (!entry.frame || !entry.initialized) continue;
+        const okay = await new Promise((resolve) => { entry.flushed = resolve; send(entry, "flush"); setTimeout(() => { if (entry.flushed === resolve) { entry.flushed = null; resolve(false); } }, 10000); });
+        if (!okay) return false;
+      }
+      return ![...entries.values()].some((row) => row.pending || row.failed);
+    },
     async retry(id) {
       const entry = entries.get(id); if (!entry?.failed || entry.pending) return;
       const result = await api("zotero/annotation-retry", { scope: entry.config.scope, attachment_key: entry.config.attachment_key, request_ids: [...entry.failedOperations] });
       if (!result.resolved) throw new Error("Some annotation changes still require reconciliation. No unknown write was retried.");
+      permissions(entry, result);
       entry.config.annotations = result.annotations;
       entry.frame?.remove(); entry.frame = null; entry.failed = false; entry.failedOperations.clear(); onState?.(entry.config.id, entry.viewState);
       if (active === id) mount(entry);

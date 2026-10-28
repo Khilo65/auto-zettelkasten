@@ -23,6 +23,7 @@ def server(tmp_path):
         "items": {"PARNT234": record()}, "collections": {}, "version": 1,
         "server_id": "SERVER000001", "schema": 44, "calls": [], "revoked": False,
         "pdf_url": "", "drop_write": False, "change_after_page": False, "redirect": False,
+        "capabilities": None, "remember": True, "deny_authorization": False, "capability_native404": False,
     }
 
     class Handler(BaseHTTPRequestHandler):
@@ -47,7 +48,7 @@ def server(tmp_path):
             state["calls"].append(("GET", self.path, dict(self.headers), None))
             parts = urlsplit(self.path)
             path = parts.path
-            query = parse_qs(parts.query)
+            query = parse_qs(parts.query, keep_blank_values=True)
             if state["redirect"]:
                 self.send_response(302)
                 self.send_header("Location", "http://127.0.0.1:1/leak")
@@ -68,6 +69,28 @@ def server(tmp_path):
                 return
             kind = pieces[2]
             entries = state[kind]
+            if pieces[-1] == "az-annotation-capabilities":
+                if state["capabilities"] is None:
+                    if state["capability_native404"]:
+                        self.send_response(404)
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                    else:
+                        self.reply(404)
+                    return
+                selected = query.get("annotationKeys", [""])[0].split(",") if query.get("annotationKeys", [""])[0] else []
+                values = []
+                missing = []
+                for key in selected:
+                    if key not in entries:
+                        missing.append(key)
+                    else:
+                        values.append({"key": key, "version": entries[key]["version"], "isExternal": False, "readOnly": False,
+                                       **state["capabilities"].get(key, {})})
+                self.reply(200, {"bridge_version": 1, "zotero_version": "10.0.6", "server_id": state["server_id"], "scope": "/".join(pieces[:2]),
+                    "attachment_key": pieces[3], "attachment_version": entries[pieces[3]]["version"], "attachment_read_only": False,
+                    "annotations": values, "missing": missing, **state["capabilities"].get("response", {})})
+                return
             if len(pieces) >= 5 and pieces[4:] == ["file", "view", "url"]:
                 self.reply(200, state["pdf_url"], text=True)
                 return
@@ -111,7 +134,10 @@ def server(tmp_path):
                 self.reply(412)
                 return
             if self.path == "/api/local/authorize":
-                self.reply(200, {"key": "K" * 32, "remember": True})
+                if state["deny_authorization"]:
+                    self.reply(403, {"denied": True})
+                else:
+                    self.reply(200, {"key": "K" * 32, "remember": state["remember"]})
                 return
             if state["revoked"] or self.headers.get("Zotero-API-Key") != "K" * 32:
                 self.reply(401)
@@ -462,3 +488,195 @@ def test_credential_permissions_are_not_silently_widened_or_reused(server):
     stored["server_id"] = "DIFFERENT001"
     client.credential_path.write_text(json.dumps(stored))
     assert not another.status()["authorized"]
+
+
+def test_pinned_connection_rejects_wrong_server_before_consent_or_write(server):
+    client, state = server
+    pinned = ZoteroWorkspaceClient(client.base_url, credential_path=client.credential_path,
+        expected_server_id="WRONGSERVER2", allowed_origin=client.base_url)
+    with pytest.raises(ZoteroWorkspaceError):
+        pinned.authorize()
+    assert not any(method != "GET" for method, *_ in state["calls"])
+    assert {key.lower(): value for key, value in state["calls"][0][2].items()}["zotero-server-id"] == "WRONGSERVER2"
+    with pytest.raises(ValueError, match="allowed origin"):
+        ZoteroWorkspaceClient(client.base_url, allowed_origin="http://127.0.0.1:1")
+    pinned.base_url = "http://127.0.0.1:1"
+    with pytest.raises(ZoteroWorkspaceError, match="origin changed"):
+        pinned.authorize()
+
+
+def test_server_changes_are_checked_before_sending_a_saved_credential(server):
+    client, state = server
+    authorize(client)
+    state["server_id"] = "SERVER000002"
+    state["calls"].clear()
+    with pytest.raises(ZoteroWorkspaceError):
+        client.update_item("users/0", "PARNT234", {"title": "New"}, expected_version=1, write_token="no-wrong-server")
+    assert not any(method != "GET" for method, *_ in state["calls"])
+    assert not client.credential_path.exists()
+
+
+def test_companion_capabilities_enable_native_highlight_and_are_rechecked(server):
+    client, state = server
+    authorize(client)
+    state["capabilities"] = {}
+    state["items"]["PDFATT23"] = record("PDFATT23", itemType="attachment", parentItem="PARNT234", contentType="application/pdf")
+    state["items"]["ANNTA234"] = record("ANNTA234", itemType="annotation", parentItem="PDFATT23", **annotation_payload())
+    row = client.annotation_record("users/0", "PDFATT23", "ANNTA234")
+    assert row["isExternal"] is False and row["readOnly"] is False
+    assert client.status()["annotation_capabilities"] == "available"
+    updated = client.save_annotation("users/0", "PDFATT23", {**annotation_payload(), "annotationComment": "Edited native highlight"},
+        key="ANNTA234", expected_version=1, write_token="native-edit")
+    assert updated["data"]["annotationComment"] == "Edited native highlight"
+    state["capabilities"]["ANNTA234"] = {"readOnly": True}
+    with pytest.raises(ZoteroWorkspaceError, match="editability"):
+        client.delete_annotation("users/0", "PDFATT23", "ANNTA234", expected_version=updated["version"], write_token="no-delete")
+    assert not any(method == "DELETE" for method, *_ in state["calls"])
+    reads = [call for call in state["calls"] if "az-annotation-capabilities" in call[1]]
+    assert len(reads) >= 3
+    assert all("Zotero-API-Key" not in call[2] and "Zotero-Write-Token" not in call[2] for call in reads)
+
+
+@pytest.mark.parametrize("flags", [{"isExternal": True}, {"readOnly": True}, {"version": 9}])
+def test_companion_external_readonly_or_stale_cannot_be_overridden_by_creation_history(server, flags):
+    client, state = server
+    authorize(client)
+    state["capabilities"] = {"ANNTA234": flags}
+    state["items"]["PDFATT23"] = record("PDFATT23", itemType="attachment", parentItem="PARNT234", contentType="application/pdf")
+    state["items"]["ANNTA234"] = record("ANNTA234", itemType="annotation", parentItem="PDFATT23", **annotation_payload())
+    row = client.annotations("users/0", "PDFATT23")[0]
+    assert row["readOnly"]
+    with pytest.raises(ZoteroWorkspaceError, match="editability"):
+        client.save_annotation("users/0", "PDFATT23", annotation_payload(), key="ANNTA234", expected_version=1,
+            write_token="reject-edit", known_internal=True)
+    assert not any(method in {"PATCH", "DELETE"} for method, *_ in state["calls"])
+
+
+@pytest.mark.parametrize("response", [{"server_id": "SERVER000002"}, {"scope": "groups/12"}, {"attachment_key": "OTHERPDF"},
+    {"bridge_version": 9}, {"missing": ["ANNTA234"]}, {"zotero_version": "10.1.0"}])
+def test_incompatible_companion_keeps_annotation_readonly(server, response):
+    client, state = server
+    state["capabilities"] = {"response": response}
+    state["items"]["PDFATT23"] = record("PDFATT23", itemType="attachment", parentItem="PARNT234", contentType="application/pdf")
+    state["items"]["ANNTA234"] = record("ANNTA234", itemType="annotation", parentItem="PDFATT23", **annotation_payload())
+    assert client.annotation_record("users/0", "PDFATT23", "ANNTA234")["readOnly"]
+    assert client.status()["annotation_capabilities"] == "incompatible"
+
+
+def test_capabilities_are_bounded_and_do_not_consume_single_use_authorization(server):
+    client, state = server
+    state["remember"] = False
+    state["capabilities"] = {}
+    state["items"]["PDFATT23"] = record("PDFATT23", itemType="attachment", parentItem="PARNT234", contentType="application/pdf")
+    state["items"]["ANNTA234"] = record("ANNTA234", itemType="annotation", parentItem="PDFATT23", **annotation_payload())
+    authorize(client)
+    for invalid in (["ANNTA234"] * 2, [None], ["bad"], [f"A{i:07}" for i in range(65)]):
+        with pytest.raises(ValueError):
+            client.annotation_capabilities("users/0", "PDFATT23", invalid)
+    client.annotation_record("users/0", "PDFATT23", "ANNTA234")
+    assert client.status()["authorized"]
+    client.save_annotation("users/0", "PDFATT23", {**annotation_payload(), "annotationComment": "Consume consent for an actual change"}, key="ANNTA234", expected_version=1, write_token="single-use")
+    assert not client.status()["authorized"]
+    assert not client.credential_path.exists()
+
+
+def test_authorization_denial_never_persists_or_upgrades_permission(server):
+    client, state = server
+    state["deny_authorization"] = True
+    with pytest.raises(ZoteroWorkspaceError) as error:
+        client.authorize()
+    assert error.value.status == 403
+    assert not client.status()["authorized"]
+    assert not client.credential_path.exists()
+
+
+def test_unregistered_native_companion_route_can_omit_api_headers_without_granting_permission(server):
+    client, state = server
+    state["capability_native404"] = True
+    state["items"]["PDFATT23"] = record("PDFATT23", itemType="attachment", parentItem="PARNT234", contentType="application/pdf")
+    state["items"]["ANNTA234"] = record("ANNTA234", itemType="annotation", parentItem="PDFATT23", **annotation_payload())
+    row = client.annotation_record("users/0", "PDFATT23", "ANNTA234")
+    assert "readOnly" not in row and "isExternal" not in row
+    assert client.status()["annotation_capabilities"] == "unavailable"
+    authorize(client)
+    with pytest.raises(ZoteroWorkspaceError) as error:
+        client.save_annotation("users/0", "PDFATT23", annotation_payload(), key="ANNTA234", expected_version=1, write_token="no-bridge-write")
+    assert error.value.code == "annotation_read_only"
+    assert not any(method in {"PATCH", "DELETE"} for method, *_ in state["calls"])
+
+
+def test_annotation_noop_keeps_version_and_one_use_consent_without_patch(server):
+    client, state = server
+    state["remember"] = False
+    state["capabilities"] = {}
+    state["items"]["PDFATT23"] = record("PDFATT23", itemType="attachment", parentItem="PARNT234", contentType="application/pdf")
+    state["items"]["ANNTA234"] = record("ANNTA234", itemType="annotation", parentItem="PDFATT23", **annotation_payload())
+    authorize(client)
+    same = {**annotation_payload(), "annotationColor": "#FFCC00", "annotationComment": "  Check this  ",
+            "annotationPosition": '{"rects":[[1,2,3,4]],"pageIndex":0}'}
+    result = client.save_annotation("users/0", "PDFATT23", same, key="ANNTA234", expected_version=1, write_token="noop-1")
+    assert result["version"] == 1
+    assert not any(method == "PATCH" for method, *_ in state["calls"])
+    assert client.status()["authorized"]
+    changed = client.save_annotation("users/0", "PDFATT23", {**annotation_payload(), "annotationComment": "A real change"},
+        key="ANNTA234", expected_version=1, write_token="change-1")
+    assert changed["version"] > result["version"]
+    assert sum(method == "PATCH" for method, *_ in state["calls"]) == 1
+    assert not client.status()["authorized"]
+
+
+def test_annotation_noop_still_requires_fresh_version_permission_and_authorization(server):
+    client, state = server
+    state["capabilities"] = {}
+    state["items"]["PDFATT23"] = record("PDFATT23", itemType="attachment", parentItem="PARNT234", contentType="application/pdf")
+    state["items"]["ANNTA234"] = record("ANNTA234", version=2, itemType="annotation", parentItem="PDFATT23", **annotation_payload())
+    with pytest.raises(ZoteroWorkspaceError) as error:
+        client.save_annotation("users/0", "PDFATT23", annotation_payload(), key="ANNTA234", expected_version=1, write_token="stale-noop")
+    assert error.value.code == "version_conflict"
+    with pytest.raises(ZoteroWorkspaceError) as error:
+        client.save_annotation("users/0", "PDFATT23", annotation_payload(), key="ANNTA234", expected_version=2, write_token="unauth-noop")
+    assert error.value.code == "authorization_required"
+    authorize(client)
+    state["capabilities"]["ANNTA234"] = {"isExternal": True, "readOnly": True}
+    with pytest.raises(ZoteroWorkspaceError) as error:
+        client.save_annotation("users/0", "PDFATT23", annotation_payload(), key="ANNTA234", expected_version=2, write_token="external-noop", known_internal=True)
+    assert error.value.code == "annotation_read_only"
+    assert not any(method == "PATCH" for method, *_ in state["calls"])
+
+
+def test_attachment_permissions_cover_zero_annotations_and_refresh_each_time(server):
+    client, state = server
+    state["capabilities"] = {}
+    state["items"]["PDFATT23"] = record("PDFATT23", itemType="attachment", parentItem="PARNT234", contentType="application/pdf")
+    assert client.attachment_read_only("users/0", "PDFATT23") is False
+    state["capabilities"]["response"] = {"attachment_read_only": True}
+    assert client.attachment_read_only("users/0", "PDFATT23") is True
+    state["capabilities"]["response"] = {"attachment_read_only": False}
+    assert client.attachment_read_only("users/0", "PDFATT23") is False
+    reads = [call for call in state["calls"] if "az-annotation-capabilities" in call[1]]
+    assert len(reads) == 3
+    assert all(call[1].endswith("annotationKeys=") for call in reads)
+    assert all("zotero-api-key" not in {name.lower() for name in call[2]} for call in reads)
+
+
+def test_absent_attachment_companion_is_distinct_from_invalid_permissions(server):
+    client, state = server
+    state["capability_native404"] = True
+    state["items"]["PDFATT23"] = record("PDFATT23", itemType="attachment", parentItem="PARNT234", contentType="application/pdf")
+    assert client.attachment_read_only("users/0", "PDFATT23") is None
+    state["capabilities"] = {"response": {"attachment_version": 99}}
+    assert client.attachment_read_only("users/0", "PDFATT23") is True
+    assert client.status()["annotation_capabilities"] == "incompatible"
+    state["capabilities"] = {"response": {"scope": "groups/123"}}
+    assert client.attachment_read_only("users/0", "PDFATT23") is True
+
+
+def test_attachment_permission_reads_do_not_reuse_another_server(server):
+    client, state = server
+    state["capabilities"] = {}
+    state["items"]["PDFATT23"] = record("PDFATT23", itemType="attachment", parentItem="PARNT234", contentType="application/pdf")
+    assert client.attachment_read_only("users/0", "PDFATT23") is False
+    state["server_id"] = "SERVER000002"
+    with pytest.raises(ZoteroWorkspaceError) as error:
+        client.attachment_read_only("users/0", "PDFATT23")
+    assert error.value.code == "server_changed"

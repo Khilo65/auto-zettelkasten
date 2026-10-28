@@ -44,12 +44,34 @@
     let initializing = false;
     let closed = false;
     let closing = false;
+    let flushing = false;
     let requestedReadOnly = true;
+    let appliedReadOnly = true;
     let failedWrite = false;
     let counter = 0;
     let queuedWrites = 0;
     let tail = Promise.resolve();
     const pending = new Map();
+    const retainedWrites = new Map();
+    const retaining = new Map();
+
+    function setReadOnly(value) {
+      // Upstream also resets the active tool when this is called. A routine
+      // save acknowledgement must not interrupt typing or the selected tool.
+      if (reader && value !== appliedReadOnly) { reader.setReadOnly(value); appliedReadOnly = value; }
+    }
+
+    function retainUnsent() {
+      const manager = reader?._annotationManager;
+      const unsaved = [...(manager?._unsavedAnnotations || [])];
+      for (const deleting of [false, true]) {
+        const values = unsaved.filter(([, value]) => deleting ? value === null : value !== null);
+        if (!values.length) continue;
+        const operationId = `${instanceId}-retained-${++counter}`;
+        retainedWrites.set(operationId, { sent: true }); retaining.set(operationId, values.map(([id]) => id));
+        emit('retain-annotations', { operationId, deleting, ...(deleting ? { ids: values.map(([id]) => id) } : { annotations: values.map(([, value]) => value) }) });
+      }
+    }
 
     function emit(type, data = {}) {
       parent.postMessage({ channel: CHANNEL, instanceId, type, ...data }, origin);
@@ -63,24 +85,27 @@
     function operation(type, payload) {
       if (closed || failedWrite) return Promise.reject(new Error('Annotation writes require reconciliation'));
       queuedWrites += 1;
-      // Do not accumulate a second, unjournaled edit inside the upstream reader
-      // while the first save is unresolved and may require a frame reload.
-      reader?.setReadOnly(true);
+      // Keep typing available while the native save is in flight. On failure,
+      // freeze editing and durably retain any newer upstream-buffered changes.
       const operationId = `${instanceId}-${++counter}`;
+      retainedWrites.set(operationId, { sent: false });
       const execute = () => new Promise((resolve, reject) => {
         const timer = win.setTimeout(() => {
           // A missing acknowledgement is not evidence of failure or permission to retry.
-          reader?.setReadOnly(true);
+          failedWrite = true;
+          setReadOnly(true);
+          retainUnsent();
           error('write-acknowledgement-pending', 'Annotation save is still pending. Keep this tab open while the application reconciles it.');
         }, 30000);
         pending.set(operationId, { resolve, reject, timer });
+        retainedWrites.get(operationId).sent = true;
         emit(type, { operationId, ...payload });
       });
       const result = tail.then(execute);
       tail = result;
       const finished = () => {
         queuedWrites -= 1;
-        if (!queuedWrites && !failedWrite && !closing) reader?.setReadOnly(requestedReadOnly);
+        if (!queuedWrites && !failedWrite && !closing && !flushing) setReadOnly(requestedReadOnly);
       };
       result.then(finished, finished);
       // Keep a rejected save observable without an unhandled promise from upstream deletes.
@@ -88,21 +113,29 @@
       return result;
     }
 
-    async function close() {
+    async function close(retainedIds = null) {
       if (!reader) { closed = true; emit('closed'); return; }
       closing = true;
-      reader.setReadOnly(true);
+      setReadOnly(true);
       // Upstream has no public flush API. This is pinned to the declared revision;
       // the compatibility test intentionally fails when this bridge changes.
       const manager = reader._annotationManager;
       if (!manager || typeof manager._triggerSaving !== 'function') {
         throw new Error('Reader cannot safely flush pending edits');
       }
-      manager._skipAnnotationSavingDebounce = true;
-      await manager._triggerSaving();
-      await tail;
-      if (failedWrite || pending.size || manager._unsavedAnnotations?.size || manager._savingInProgress) {
-        throw new Error('Pending annotation changes must be reconciled before closing');
+      if (retainedIds !== null) {
+        const ids = new Set(retainedIds);
+        if (!failedWrite || pending.size || queuedWrites || manager._unsavedAnnotations?.size || !retainedWrites.size
+            || retaining.size || [...retainedWrites].some(([id, value]) => !value.sent || !ids.has(id))) {
+          throw new Error('Every reader change must be durably retained before closing');
+        }
+      } else {
+        manager._skipAnnotationSavingDebounce = true;
+        await manager._triggerSaving();
+        await tail;
+        if (failedWrite || pending.size || manager._unsavedAnnotations?.size || manager._savingInProgress) {
+          throw new Error('Pending annotation changes must be reconciled before closing');
+        }
       }
       reader.setSuspended(true);
       reader.trimMemory();
@@ -117,20 +150,45 @@
       emit('closed'); // Parent must now remove the iframe: the complete teardown boundary.
     }
 
+    async function flush() {
+      if (!reader) return;
+      const manager = reader._annotationManager;
+      if (!manager || typeof manager._triggerSaving !== 'function' || failedWrite || retaining.size) throw new Error('Resolve or retain the pending annotation changes before closing the application');
+      const previous = manager._skipAnnotationSavingDebounce;
+      flushing = true; setReadOnly(true); manager._skipAnnotationSavingDebounce = true;
+      try {
+        for (let attempt = 0; attempt < 8; attempt++) {
+          await manager._triggerSaving(); await tail; await Promise.resolve();
+          if (!pending.size && !manager._unsavedAnnotations?.size && !manager._savingInProgress && !queuedWrites) return;
+        }
+        throw new Error('The PDF reader has not confirmed all annotation changes');
+      } finally { flushing = false; manager._skipAnnotationSavingDebounce = previous; setReadOnly(failedWrite || closing || requestedReadOnly); }
+    }
+
     async function handle(event) {
       const data = event.data;
       if (event.source !== parent || event.origin !== origin || !data ||
           data.channel !== CHANNEL || data.instanceId !== instanceId || closed) return;
       try {
+        if (data.type === 'retention-result') {
+          const ids = retaining.get(data.operationId);
+          if (!ids) return;
+          if (data.retained === true) {
+            for (const id of ids) reader?._annotationManager?._unsavedAnnotations?.delete(id);
+            retaining.delete(data.operationId);
+          } else error('annotation-retention-failed', data.error || 'Newer edits are not yet retained. Keep this PDF open.');
+          return;
+        }
         if (data.type === 'operation-result') {
           const entry = pending.get(data.operationId);
           if (!entry) return;
           pending.delete(data.operationId);
           win.clearTimeout(entry.timer);
-          if (data.success === true) entry.resolve();
+          if (data.success === true) { retainedWrites.delete(data.operationId); entry.resolve(); }
           else {
             failedWrite = true;
-            reader?.setReadOnly(true);
+            setReadOnly(true);
+            retainUnsent();
             const message = typeof data.error === 'string' ? data.error : 'Annotation write needs reconciliation';
             error('annotation-write-failed', message);
             entry.reject(new Error(message));
@@ -145,6 +203,7 @@
           if (typeof win.createReader !== 'function') throw new Error('The pinned Zotero reader build is unavailable');
           initializing = true;
           requestedReadOnly = data.readOnly !== false;
+          appliedReadOnly = requestedReadOnly;
           reader = win.createReader({
             type: 'pdf', data: { url }, annotations, location,
             readOnly: requestedReadOnly,
@@ -187,21 +246,47 @@
         }
         if (!reader) throw new Error('Reader is not initialized');
         if (data.type === 'annotations') {
-          if (pending.size || failedWrite) throw new Error('Reconcile pending annotation writes before refreshing');
+          if (failedWrite) throw new Error('Reconcile pending annotation writes before refreshing');
           const annotations = annotationList(data.annotations || []);
           const ids = data.deletedIds || [];
           if (!Array.isArray(ids) || ids.some(id => !KEY.test(id))) throw new Error('Invalid deleted annotation identity');
-          reader.setAnnotations(annotations);
-          reader.unsetAnnotations(ids);
+          const local = new Set(reader._annotationManager?._unsavedAnnotations?.keys() || []);
+          const ownConfirmed = new Set(Array.isArray(data.confirmedIds) ? data.confirmedIds : []);
+          const permissionUpdates = [];
+          for (const value of annotations) if (ownConfirmed.has(value.id) && Number.isInteger(value.version)) {
+            const draft = reader._annotationManager._unsavedAnnotations.get(value.id);
+            if (draft) draft.version = value.version;
+            const shown = reader._annotationManager._annotations?.find(row => row.id === value.id);
+            if (shown) shown.version = value.version;
+            if (shown && typeof value.readOnly === 'boolean' && shown.readOnly !== value.readOnly) {
+              shown.readOnly = value.readOnly;
+              if (draft) draft.readOnly = value.readOnly;
+              permissionUpdates.push(shown);
+            }
+          }
+          const shown = new Map((reader._annotationManager?._annotations || []).map(value => [value.id, value]));
+          const updates = annotations.filter(value => !local.has(value.id) && !(ownConfirmed.has(value.id) && shown.has(value.id))
+            && JSON.stringify(shown.get(value.id)) !== JSON.stringify(value));
+          if (updates.length || permissionUpdates.length) reader.setAnnotations([...updates, ...permissionUpdates]);
+          const removed = ids.filter(id => !local.has(id));
+          if (removed.length) reader.unsetAnnotations(removed);
         }
         else if (data.type === 'navigate') await reader.navigate(readerLocation(data.location));
         else if (data.type === 'read-only') {
           requestedReadOnly = data.readOnly !== false;
-          reader.setReadOnly(failedWrite || closing || queuedWrites > 0 || requestedReadOnly);
+          setReadOnly(failedWrite || closing || flushing || requestedReadOnly);
         }
         else if (data.type === 'suspend') reader.setSuspended(data.suspended !== false);
         else if (data.type === 'trim-memory') reader.trimMemory();
         else if (data.type === 'close') await close();
+        else if (data.type === 'flush') {
+          try { await flush(); emit('flush-result', { success: true }); }
+          catch (err) { emit('flush-result', { success: false, error: err.message }); }
+        }
+        else if (data.type === 'close-retained') {
+          if (!Array.isArray(data.operationIds) || !data.operationIds.length || data.operationIds.some(id => typeof id !== 'string')) throw new Error('Invalid retained-operation identities');
+          await close(data.operationIds);
+        }
         else throw new Error('Unsupported reader command');
       }
       catch (err) { error('reader-command-failed', err.message || 'Reader command failed'); }
