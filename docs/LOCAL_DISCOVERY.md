@@ -90,16 +90,40 @@ auto-zettelkasten recall --workspace /path/to/workspace \
   --query "institutional change" --max-notes 8 --max-chars 12000
 ```
 
-Both commands load current compact profiles. Recall uses the same local index
-as candidate ranking and can include a bounded set of accepted neighboring
-relationships and supplied source/page references. Explicit variable roles in
-existing profiles remain searchable; roles are not inferred from controls or
-forced onto interpretive work.
+Candidate ranking loads compact profiles. Recall searches the complete
+substantive Markdown notes, including saved personal edits. It combines local
+word search and compatible cached MiniLM vectors, taking 32 candidates per
+route and combining ranks with reciprocal-rank fusion (constant 60). The
+default evidence packet contains at most eight notes and 12,000 serialized
+characters. It returns literal excerpts, source identities, note paths, hashes
+and coverage. Similarity ranks do not establish a research relationship.
 
-Reading the cache does not reacquire sources or prove current freshness. Cached
-reference coverage is labeled separately from source-note coverage. Omitting
-the instance ID excludes cached references; the user-library ID defaults to
-`0`. Missing cache records remain not examined.
+Quick-open in the desktop app uses the same search and shows short excerpts.
+Python integrations can call `auto_zettelkasten.api.recall(workspace, query)`.
+An existing local model can be selected with `recall --model-path /path/to/model`
+or the app's embedding-model setting. Search never downloads models, generates
+notes or invokes a provider. If compatible vectors or the local encoder are
+unavailable, full-note word search remains available and the response reports
+the semantic limitation. Changed notes cannot reuse stale semantic vectors.
+Use `recall --profile-only` for the previous compact-profile route.
+
+If no compatible note vectors exist, choose **Build local search index** in
+quick-open, or run `auto-zettelkasten index-recall --workspace /path/to/workspace
+--model-path /path/to/model`. This explicitly embeds the existing note text
+into a separate, resumable local cache. It does not regenerate notes or replace
+the mapping graph. Python integrations can call `api.prepare_recall(workspace,
+model_path="/path/to/model")`. Source-document vectors are reused only when
+they match the current complete note representation and encoder contract.
+
+Jev is separate optional enrichment, off by default. Search neither invokes it
+nor requires its approval to retrieve a note or preserve a discovery link.
+
+Reading the candidate cache does not reacquire sources or prove current
+freshness. Cached reference coverage is labeled separately from source-note
+coverage. Omitting the instance ID excludes cached references; candidate and
+profile-only routes default the user-library ID to `0`. Full-note recall
+searches all visible workspace notes unless a source scope is explicitly
+selected. Missing reference-cache records remain not examined.
 
 Popular postings, candidate fanout, pairs per source, total pairs, and recall
 characters are bounded. These limits can omit useful candidates or return fewer

@@ -56,6 +56,21 @@ communities refresh. Full source material remains available for auditing and
 citation extraction. Cleaning applies to the separate embedding representation,
 with excluded and unresolved text coverage reported rather than silently sampled.
 
+The semantic preparation removes generic note-template headings and invisible
+link destinations while retaining visible labels, meaningful headings, findings,
+negation, conditions and limitations. A narrowly recognized publisher-navigation
+footer is excluded; this is a bounded Markdown preparation step, not a complete
+HTML or Markdown rendering engine. Original text is unchanged for citation use.
+
+Retained fragments are joined within their original section and ownership group
+before tokenization, so a linked word does not become a separately weighted
+embedding. Chunk `source_spans` identify the exact retained slices of the original
+text; `start` and `end` bound those slices and may also enclose removed markup.
+The cleaning and chunking versions are part of the vector identity, so older
+representations are not silently mixed with the new representation. A markup-only
+change can reuse compatible chunk vectors when visible text and ownership stay
+the same, while source hashes and offset mappings update.
+
 Defaults bound the job to 10,000 sources, 100,000 chunks, 64 MiB of input text,
 a 1 GiB cache and 600 seconds, with two CPU threads and batches of eight.
 Resource checks run between native operations; they do not impose a hard

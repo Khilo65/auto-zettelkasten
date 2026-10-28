@@ -72,10 +72,15 @@ def _section(text: str, heading: str) -> tuple[str, int] | None:
     lines = text.splitlines(keepends=True)
     for index, line in enumerate(lines):
         if re.fullmatch(r"##\s+" + re.escape(heading) + r"\s*", line.strip(), re.I):
-            end = next((i for i in range(index + 1, len(lines)) if re.match(r"^#{1,2}\s", lines[i])), len(lines))
             first = index + 1
-            while first < end and not lines[first].strip():
+            # Some saved exports repeat the same heading at another level
+            # immediately inside the section. Skip only that empty prefix;
+            # a same-name heading after substantive text remains a boundary.
+            while first < len(lines) and (not lines[first].strip() or re.fullmatch(
+                r"#{1,2}\s+" + re.escape(heading) + r"\s*", lines[first].strip(), re.I
+            )):
                 first += 1
+            end = next((i for i in range(first, len(lines)) if re.match(r"^#{1,2}\s", lines[i])), len(lines))
             content = "".join(lines[first:end]).strip()
             return (content, first + 1) if content else None
     return None

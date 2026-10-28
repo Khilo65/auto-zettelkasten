@@ -22,7 +22,7 @@ from .profiles import profile_from_dict, profile_sidecar_path, profile_to_dict
 from .relationships import profile_content_hash, profile_hash_aliases
 
 
-CLEANING_VERSION = "local-map-spans-v3"
+CLEANING_VERSION = "local-map-spans-v5"
 MAX_TEXT_BYTES = 32 * 1024 * 1024
 MAX_TOTAL_BYTES = 384 * 1024 * 1024
 MAX_FILES = 20_000
@@ -42,6 +42,209 @@ _NONBODY = {
 _MANAGED_MARKERS = {GRAPH_START_MARKER: GRAPH_END_MARKER, LITERATURE_START_MARKER: LITERATURE_END_MARKER, SOURCE_START_MARKER: SOURCE_END_MARKER}
 _BODY_HEADING = re.compile(r"^(?:(?:chapter|part)\s+(?:\d+|[ivxlcdm]+|one|two|three|four|five|six|seven|eight|nine|ten)\b|\d+(?:\.\d+)*[.)]?\s+(?:introduction|background|conclusions?|discussion|results|methods|methodology|findings|appendix)\b)", re.I)
 _BODY_NAMES = {"introduction", "conclusion", "conclusions", "discussion", "results", "methods", "methodology", "findings", "appendix"}
+
+# Fixed template labels, not a vocabulary filter over substantive prose/headings.
+_TEMPLATE_HEADINGS = frozenset({
+    "thesis", "abstract", "key concepts and definitions", "method and research design",
+    "evidence and data", "detailed findings", "plain-english interpretation",
+    "strengths and contributions", "methodological critique", "limitations",
+    "what this source can support", "what this source cannot support", "locators",
+    "source structure and organization", "source metadata", "scope limitation",
+})
+_MANAGED_HEADING_MARKERS = {
+    "graph links": GRAPH_START_MARKER,
+    "position in the literature": LITERATURE_START_MARKER,
+}
+
+
+def _owns_following_block(text: str, start: int, title: str) -> bool:
+    marker = _MANAGED_HEADING_MARKERS.get(title)
+    if marker is None:
+        return False
+    # A personal section with the same heading is semantic. Only an immediately
+    # following owned marker (allowing blank lines) identifies this writer's UI.
+    return re.compile(r"(?:[ \t]*\r?\n)*[ \t]*" + re.escape(marker)
+                      + r"[ \t]*(?:\r?\n|\Z)").match(text, start) is not None
+
+
+_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+_ATX = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)(?:[ \t]+#+)?[ \t]*(?:\r?\n)?$")
+
+
+def _closing(text: str, start: int, left: str, right: str) -> int | None:
+    depth = 1
+    index = start + 1
+    quote = ""
+    while index < len(text):
+        if text[index] == "\\":
+            index += 2
+            continue
+        if quote:
+            if text[index] == quote:
+                quote = ""
+            index += 1
+            continue
+        if left == "(" and text[index] in "\"'" and text[index - 1].isspace():
+            quote = text[index]
+            index += 1
+            continue
+        if left == "(" and text[index] == "<":
+            angle_end = text.find(">", index + 1)
+            if angle_end >= 0:
+                index = angle_end + 1
+                continue
+        if text[index] == left:
+            depth += 1
+        elif text[index] == right:
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return None
+
+
+def _publisher_footer_end(text: str, start: int) -> int | None:
+    # Recognize a narrow publisher-export signature, not any mention of citations.
+    tail = text[start:start + 8192]
+    doi = re.search(r"\bDOI:[ \t]*10\.\d{4,9}/\S+", tail, re.I)
+    jel = re.search(r"(?m)^JEL Classification[ \t]*\r?$", tail)
+    journals = re.search(r"(?m)^Journals[ \t]*\r?$", tail)
+    if not (doi and jel and journals and doi.end() < jel.start() < journals.start()):
+        return None
+    # A later authored section still belongs to the note, not this footer.
+    next_heading = re.compile(r"(?m)^ {0,3}#{1,6}[ \t]+").search(text, start + journals.end())
+    return next_heading.start() if next_heading else len(text)
+
+
+def _semantic_exclusions(text: str) -> list[tuple[int, int, str]]:
+    """Locate invisible syntax without rewriting source slices or code literals."""
+    result = []
+    offset = 0
+    fence = ""
+    fence_size = 0
+    for line in text.splitlines(keepends=True):
+        match = _FENCE.match(line)
+        if fence:
+            if match and match[1][0] == fence and len(match[1]) >= fence_size and not match[2].strip():
+                fence = ""
+            offset += len(line)
+            continue
+        if match:
+            fence, fence_size = match[1][0], len(match[1])
+            offset += len(line)
+            continue
+        if line.strip() == "Citation":
+            footer_end = _publisher_footer_end(text, offset)
+            if footer_end is not None:
+                result.append((offset, footer_end, "publisher_navigation"))
+                offset += len(line)
+                continue
+        heading = _ATX.match(line)
+        if heading:
+            title = heading[2].strip().rstrip(":").casefold()
+            if title in _TEMPLATE_HEADINGS or _owns_following_block(text, offset + len(line), title):
+                result.append((offset, offset + len(line), "template_heading"))
+                offset += len(line)
+                continue
+        if re.match(r"^ {0,3}\[[^]\r\n]+\]:[ \t]*\S", line):
+            result.append((offset, offset + len(line), "link_destination"))
+            offset += len(line)
+            continue
+        index = 0
+        hidden_tails = {}
+        while index < len(line):
+            if index in hidden_tails:
+                index = hidden_tails[index]
+                continue
+            if line[index] == "\\":
+                index += 2
+                continue
+            if line[index] == "`":
+                stop = index + 1
+                while stop < len(line) and line[stop] == "`":
+                    stop += 1
+                size = stop - index
+                close = line.find("`" * size, stop)
+                index = close + size if close >= 0 else index + size
+                continue
+            if line.startswith("[[", index):
+                close = line.find("]]", index + 2)
+                if close < 0:
+                    break
+                content = line[index + 2:close]
+                pipe = next((i for i, char in enumerate(content) if char == "|" and (i == 0 or content[i - 1] != "\\")), -1)
+                start = index - 1 if index and line[index - 1] == "!" else index
+                if pipe >= 0 and content[pipe + 1:].strip():
+                    result.append((offset + start, offset + index + 3 + pipe, "link_destination"))
+                else:
+                    result.append((offset + start, offset + index + 2, "link_markup"))
+                    if pipe >= 0:
+                        result.append((offset + index + 2 + pipe, offset + close, "link_markup"))
+                result.append((offset + close, offset + close + 2, "link_markup"))
+                index = close + 2
+                continue
+            if line[index] == "[":
+                close = _closing(line, index, "[", "]")
+                if close is None:
+                    break
+                following = close + 1
+                if following < len(line) and line[following] in "([":
+                    ending = _closing(line, following, line[following], ")" if line[following] == "(" else "]")
+                    if ending is None and line[following] == "(":
+                        # Ordinary multiline destinations are bounded to one
+                        # paragraph; never consume a following fenced block.
+                        tail = text[offset + following:offset + following + 8192]
+                        boundary = re.search(r"\n[ \t]*\n|\n {0,3}(?:`{3,}|~{3,})", tail)
+                        if boundary:
+                            tail = tail[:boundary.start()]
+                        close_tail = _closing(tail, 0, "(", ")")
+                        if close_tail is not None:
+                            ending = following + close_tail
+                    if ending is not None:
+                        start = index - 1 if index and line[index - 1] == "!" else index
+                        result.append((offset + start, offset + index + 1, "link_markup"))
+                        result.append((offset + close, offset + ending + 1, "link_destination"))
+                        hidden_tails[close] = ending + 1
+                        index += 1  # Nested image/link labels remain visible syntax to inspect.
+                        continue
+                index = close + 1
+                continue
+            index += 1
+        offset += len(line)
+    # Semantic removals can touch at punctuation boundaries; merge overlapping
+    # ranges so every source character contributes to coverage at most once.
+    merged = []
+    for start, end, kind in sorted(result):
+        if merged and start < merged[-1][1]:
+            previous = merged[-1]
+            merged[-1] = (previous[0], max(end, previous[1]), previous[2])
+        else:
+            merged.append((start, end, kind))
+    return merged
+
+
+def _visible_spans(text: str, spans: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    removals = _semantic_exclusions(text)
+    prepared, excluded = [], []
+    removal_index = 0
+    for group, span in enumerate(spans):
+        start, end = span["start"], span["end"]
+        while removal_index < len(removals) and removals[removal_index][1] <= start:
+            removal_index += 1
+        position = start
+        index = removal_index
+        while index < len(removals) and removals[index][0] < end:
+            left, right, kind = removals[index]
+            left, right = max(start, left), min(end, right)
+            if position < left:
+                prepared.append({**span, "start": position, "end": left, "text": text[position:left], "embedding_group": group})
+            excluded.append({"start": left, "end": right, "owner": span["owner"], "section_kind": kind})
+            position = right
+            index += 1
+        if position < end:
+            prepared.append({**span, "start": position, "text": text[position:end], "embedding_group": group})
+    nonempty = {row["embedding_group"] for row in prepared if row["text"].strip()}
+    return [row for row in prepared if row["embedding_group"] in nonempty], excluded
 
 
 class _MappingReadBudget(_ReadBudget):
@@ -132,7 +335,10 @@ def _ownership(text: str, spans: Sequence[Mapping[str, Any]]) -> list[dict[str, 
 
 
 def prepare_embedding_spans(text: str, ownership_spans: Sequence[Mapping[str, Any]] = ()) -> dict[str, Any]:
-    """Filter explicit nonbody sections without rewriting text or its offsets.
+    """Filter nonbody and invisible syntax, retaining exact original slices.
+
+    Fragments sharing ``embedding_group`` must be rejoined before encoding, so
+    removing a link destination does not turn its label into a tiny new chunk.
 
     ``owner`` is an explicit supplied ownership label, never inferred from a
     book's editor or catalogue creator. Prefaces remain separately identified;
@@ -145,6 +351,8 @@ def prepare_embedding_spans(text: str, ownership_spans: Sequence[Mapping[str, An
     segments = []
     state, position, managed_end = "unknown", 0, ""
     excluded_level = 0
+    fence = ""
+    fence_size = 0
     # Public note YAML is metadata, not substantive embedding content.
     yaml_open = re.match(r"\A\ufeff?---[ \t]*\r?\n", text)
     yaml_close = re.compile(r"^---[ \t]*(?:\r?\n|\Z)", re.M).search(text, yaml_open.end()) if yaml_open else None
@@ -152,7 +360,7 @@ def prepare_embedding_spans(text: str, ownership_spans: Sequence[Mapping[str, An
     for line in text.splitlines(keepends=True):
         end = position + len(line)
         stripped = line.strip()
-        if stripped in _MANAGED_MARKERS:
+        if not fence and stripped in _MANAGED_MARKERS:
             managed_end = _MANAGED_MARKERS[stripped]
         if managed_end:
             kind = "generated_navigation"
@@ -161,7 +369,16 @@ def prepare_embedding_spans(text: str, ownership_spans: Sequence[Mapping[str, An
         elif position < yaml_end:
             kind = "frontmatter"
         else:
-            heading_kind, level = _heading(line)
+            marker = _FENCE.match(line)
+            if fence:
+                heading_kind, level = "", 0
+                if marker and marker[1][0] == fence and len(marker[1]) >= fence_size and not marker[2].strip():
+                    fence = ""
+            elif marker:
+                fence, fence_size = marker[1][0], len(marker[1])
+                heading_kind, level = "", 0
+            else:
+                heading_kind, level = _heading(line)
             # Nested headings still belong to the excluded section; a peer or
             # higher heading starts a new section whose content may be unknown.
             nested_excluded = state in _EXCLUDED and excluded_level and level > excluded_level
@@ -198,6 +415,9 @@ def prepare_embedding_spans(text: str, ownership_spans: Sequence[Mapping[str, An
             excluded.append({key: value for key, value in row.items() if key != "text"})
         elif row["text"].strip():
             prepared.append(row)
+    prepared, semantic_excluded = _visible_spans(text, prepared)
+    excluded.extend(semantic_excluded)
+    excluded.sort(key=lambda row: (row["start"], row["end"]))
     excluded_by_kind = Counter()
     for row in excluded:
         excluded_by_kind[row["section_kind"]] += row["end"] - row["start"]

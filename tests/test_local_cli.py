@@ -67,6 +67,10 @@ def test_offline_commands_use_only_bounded_local_adapters(tmp_path, monkeypatch,
     tools.scan_local_collection = scan
     tools.load_local_retrieval = load
     monkeypatch.setitem(sys.modules, tools.__name__, tools)
+    def full_recall(workspace, query, **kwargs):
+        calls.append(("full_recall", {"query": query, **kwargs}))
+        return {"status": "retrieved", "notes": [], "relationships": [], "chars": 0, "provider_calls": 0}
+    monkeypatch.setattr(cli, "recall", full_recall)
     common = ["--workspace", str(tmp_path), "--instance-id", "desktop-one"]
     assert cli.main(["local-discovery", *common, "--collection", "COLL0001", "--limit", "4", "--start", "8"]) == 0
     assert json.loads(capsys.readouterr().out)["provider_calls"] == 0
@@ -76,6 +80,10 @@ def test_offline_commands_use_only_bounded_local_adapters(tmp_path, monkeypatch,
     assert output["candidates"] == [candidate()] and output["coverage"]["bibliography"] == "not_examined"
     assert cli.main(["recall", *common, "--query", "mechanism", "--max-notes", "2"]) == 0
     assert json.loads(capsys.readouterr().out)["provider_calls"] == 0
+    assert calls[-1][0] == "full_recall" and calls[-1][1]["max_notes"] == 2
+    assert cli.main(["recall", *common, "--query", "mechanism", "--profile-only"]) == 0
+    assert json.loads(capsys.readouterr().out)["provider_calls"] == 0
+    assert calls[-1][0] == "load"
 
 
 def test_build_map_cli_only_passes_local_candidates_when_requested(tmp_path, monkeypatch, capsys):

@@ -9,6 +9,8 @@
     documents: new Map(), active: null, expanded: new Set(), treeFocus: "",
     descending: false, history: [], historyIndex: -1, view: null,
     quickResults: [], quickIndex: 0, quickFocus: null, quickOutside: false, createKind: "file", createParent: "",
+    quickSearchRows: [], quickSearchKey: "", quickSearchRequest: 0, quickSearchTimer: null, quickSearchStatus: "",
+    quickCanIndex: false, quickIndexBuilding: false,
     polling: false, confirmation: null, folderDialogGeneration: 0, sidebarHidden: window.innerWidth < 700, recoveryError: "",
     snapshot: null, linkIndex: null, indexing: false, indexRequest: 0, indexTimer: null, indexError: "", indexProgress: "", indexParser: null,
     previewDocuments: new Map(), previewRequests: new Map(),
@@ -745,7 +747,7 @@
           <label class="graph-check"><input id="${mode}-graph-citations" type="checkbox"> Citations</label>
           <label class="graph-check"><input id="${mode}-graph-discovery" type="checkbox"> Discovery links</label>
           <label for="${mode}-graph-discovery-scope">Discovery scope</label><select id="${mode}-graph-discovery-scope"><option value="">Both searches</option><option value="within_collection">Within-collection search</option><option value="whole_library">Whole-library search</option></select>
-          <label for="${mode}-graph-discovery-density">Discovery density</label><select id="${mode}-graph-discovery-density"><option value="8">Up to 8 per note</option><option value="16">Up to 16 per note</option><option value="32">Up to 32 per note</option><option value="all">All saved suggestions</option></select>
+          <label for="${mode}-graph-discovery-density">Discovery density</label><select id="${mode}-graph-discovery-density"><option value="2">Up to 2 per note</option><option value="4">Up to 4 per note</option><option value="8" selected>Up to 8 per note</option><option value="16">Up to 16 per note</option><option value="32">Up to 32 per note</option><option value="all">All saved suggestions</option></select>
           <p class="graph-origin-help">Display only. Accepted relationships, citations and the comparison queue are unchanged.</p>
           <label class="graph-check"><input id="${mode}-graph-relations" type="checkbox" checked> Accepted research relations</label>
           <label for="${mode}-graph-type">Relation type</label><select id="${mode}-graph-type"><option value="">All types</option></select>
@@ -1616,23 +1618,68 @@
     if (state.opening) return;
     if (!el("workspace-quick-dialog").open) state.quickFocus = document.activeElement;
     state.quickOutside = false;
+    resetQuickSearch();
     el("workspace-quick-query").value = ""; state.quickIndex = 0;
     renderQuickResults(); el("workspace-quick-dialog").showModal(); el("workspace-quick-query").focus();
   }
 
   function closeQuickOpen() {
     const focus = state.quickFocus; state.quickFocus = null; state.quickOutside = false;
+    resetQuickSearch();
     if (el("workspace-quick-dialog").open) el("workspace-quick-dialog").close();
     if (focus?.isConnected) focus.focus();
   }
 
+  function resetQuickSearch() {
+    window.clearTimeout(state.quickSearchTimer);
+    state.quickSearchRequest += 1;
+    state.quickSearchRows = []; state.quickSearchKey = ""; state.quickSearchStatus = "";
+    state.quickCanIndex = false;
+  }
+
+  function queueQuickSearch(query, key) {
+    window.clearTimeout(state.quickSearchTimer);
+    const request = ++state.quickSearchRequest, epoch = state.epoch, workspaceId = state.workspace.id;
+    state.quickSearchKey = key; state.quickSearchRows = [];
+    state.quickSearchStatus = query ? "Searching note contents locally…" : "Search titles and note contents locally.";
+    if (!query) return;
+    state.quickSearchTimer = window.setTimeout(async () => {
+      const current = () => request === state.quickSearchRequest && epoch === state.epoch
+        && workspaceId === state.workspace?.id && el("workspace-quick-dialog").open;
+      if (!current()) return;
+      try {
+        const result = await api("workspace/recall", { workspace_id: workspaceId, query, max_notes: 8, max_chars: 12000 });
+        if (!current()) return;
+        state.quickSearchRows = (result.notes || []).filter((note) => typeof note.note_path === "string" && note.note_path)
+          .map((note) => ({ path: note.note_path, name: note.title || basename(note.note_path), excerpt: note.text || "" }));
+        const semantic = result.provenance?.route === "full_note_hybrid";
+        const count = result.provenance?.vector_source_count, total = result.provenance?.source_count;
+        const partial = semantic && Number.isInteger(count) && Number.isInteger(total) && count < total;
+        state.quickSearchStatus = partial ? `Local text search. Semantic search covers ${count.toLocaleString()} of ${total.toLocaleString()} notes.`
+          : semantic ? "Local text and semantic search." : "Local text search. Semantic search is unavailable.";
+        state.quickCanIndex = !semantic || partial;
+      } catch (error) {
+        if (!current()) return;
+        state.quickSearchStatus = "Content search is unavailable. Showing title and path matches.";
+      }
+      renderQuickResults();
+    }, 180);
+  }
+
   function renderQuickResults() {
-    const query = el("workspace-quick-query").value.toLocaleLowerCase().trim();
+    const literal = el("workspace-quick-query").value.trim(), query = literal.toLocaleLowerCase();
+    const key = JSON.stringify([state.workspace?.id, state.snapshot?.generation, literal]);
+    if (state.workspace && state.quickSearchKey !== key) queueQuickSearch(literal, key);
     const indexed = state.linkIndex ? kit.searchNotes(state.linkIndex, query) : [], seen = new Set(indexed.map((entry) => entry.path));
-    state.quickResults = [...indexed, ...(state.workspace?.entries || []).filter((entry) => entry.kind === "file" && entry.path.toLocaleLowerCase().includes(query) && !seen.has(entry.path))].slice(0, 80);
+    const files = [...indexed, ...(state.workspace?.entries || []).filter((entry) => entry.kind === "file" && entry.path.toLocaleLowerCase().includes(query) && !seen.has(entry.path))];
+    const contentPaths = new Set(state.quickSearchRows.map((entry) => entry.path));
+    state.quickResults = [...state.quickSearchRows, ...files.filter((entry) => !contentPaths.has(entry.path))].slice(0, 80);
     state.quickIndex = Math.min(state.quickIndex, Math.max(0, state.quickResults.length - 1));
+    el("workspace-quick-status").textContent = state.quickIndexBuilding ? "Building the local search index. You can keep reading and editing." : state.quickSearchStatus;
+    el("workspace-quick-index").hidden = !state.quickCanIndex && !state.quickIndexBuilding;
+    el("workspace-quick-index").disabled = state.quickIndexBuilding;
     const list = el("workspace-quick-results");
-    const signature = JSON.stringify([query, state.quickIndex, state.quickResults.map((entry) => [entry.path, entry.name, entry.alias])]);
+    const signature = JSON.stringify([query, state.quickIndex, state.quickResults.map((entry) => [entry.path, entry.name, entry.alias, entry.excerpt])]);
     if (list.dataset.results === signature) return;
     list.dataset.results = signature; list.replaceChildren();
     if (!state.quickResults.length) { const p = document.createElement("p"); p.textContent = "No matching Markdown notes."; list.append(p); }
@@ -1641,7 +1688,9 @@
       button.id = `workspace-quick-result-${index}`; button.setAttribute("aria-selected", String(index === state.quickIndex));
       const name = document.createElement("span"), path = document.createElement("small");
       name.textContent = entry.alias || withoutExtension(entry.name || basename(entry.path)); path.textContent = entry.path;
-      button.append(name, path); button.addEventListener("click", () => { closeQuickOpen(); openDocument(entry.path); }); list.append(button);
+      button.append(name, path);
+      if (entry.excerpt) { const excerpt = document.createElement("small"); excerpt.className = "quick-excerpt"; excerpt.textContent = entry.excerpt.slice(0, 240); button.append(excerpt); }
+      button.addEventListener("click", () => { closeQuickOpen(); openDocument(entry.path); }); list.append(button);
     });
     if (state.quickResults.length) el("workspace-quick-query").setAttribute("aria-activedescendant", `workspace-quick-result-${state.quickIndex}`);
     else el("workspace-quick-query").removeAttribute("aria-activedescendant");
@@ -2170,6 +2219,22 @@
     if (dismiss) closeQuickOpen();
   });
   quickDialog.addEventListener("cancel", (event) => { event.preventDefault(); closeQuickOpen(); });
+  el("workspace-quick-index").addEventListener("click", async () => {
+    if (state.quickIndexBuilding || !state.workspace) return;
+    const epoch = state.epoch, workspaceId = state.workspace.id;
+    state.quickIndexBuilding = true; renderQuickResults();
+    try {
+      await api("workspace/recall-index", { workspace_id: workspaceId });
+      if (epoch !== state.epoch || state.workspace?.id !== workspaceId) return;
+      state.quickSearchKey = "";
+    } catch (error) {
+      if (epoch !== state.epoch || state.workspace?.id !== workspaceId) return;
+      state.quickSearchStatus = error.message;
+    } finally {
+      state.quickIndexBuilding = false;
+      if (el("workspace-quick-dialog").open) renderQuickResults();
+    }
+  });
   el("workspace-quick-query").addEventListener("input", () => { state.quickIndex = 0; renderQuickResults(); });
   el("workspace-quick-query").addEventListener("keydown", (event) => {
     if (event.key === "ArrowDown" || event.key === "ArrowUp") {

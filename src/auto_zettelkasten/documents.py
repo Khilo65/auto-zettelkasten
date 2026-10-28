@@ -560,6 +560,7 @@ class DocumentService:
         self._relocator = None
         self._index_run = None
         self._completed_index = None
+        self._recall_snapshot = None
         self._overrides = None
         if override_root is not None:
             from .document_overrides import Overrides
@@ -575,6 +576,7 @@ class DocumentService:
         with _LOCK:
             self._close_index_run()
             self._completed_index = None
+            self._recall_snapshot = None
             self._root = None
             self._root_identity = None
             self._workspace_id = ""
@@ -601,6 +603,102 @@ class DocumentService:
             self._workspace(workspace_id)
             with self._directory():
                 return hashlib.sha256(str(self._root.resolve()).encode("utf-8")).hexdigest()
+
+    def workspace_path(self, workspace_id: str) -> str:
+        """Return the selected, revalidated root for local read-only services."""
+        with _LOCK, self._errors():
+            self._workspace(workspace_id)
+            with self._directory():
+                return str(self._root)
+
+    def recall_corpus(self, workspace_id: str) -> dict[str, Any]:
+        """Read effective Markdown without the file-panel's display limits.
+
+        This has its own inventory and never consumes or invalidates the UI's
+        paged graph cursor. A second inventory pass binds every returned note to
+        one unchanged filesystem/override snapshot. Search limits fail openly.
+        """
+        with _LOCK, self._errors():
+            self._workspace(workspace_id)
+            stamp = self._index_root_stamp()
+            previous = getattr(self, "_recall_snapshot", None)
+
+            def run():
+                return {"root_stamp": stamp, "progress": {"scanned": 0}}
+
+            if previous and previous["workspace_id"] == workspace_id and previous["root_stamp"] == stamp:
+                try:
+                    for _ in self._index_inventory(run(), {}, previous["inventory"]):
+                        pass
+                    if self._index_root_stamp() == stamp:
+                        return copy.deepcopy(previous["result"])
+                except DocumentIndexChanged:
+                    pass
+            inventory, documents, skipped = {}, [], []
+            total_bytes = 0
+            iterator = self._index_inventory(run(), inventory)
+            try:
+                for item in iterator:
+                    if item is None or item[0] != "file":
+                        continue
+                    _, path, info, _, directory = item
+                    if len(documents) + len(skipped) >= 20_000:
+                        raise DocumentError("The recall corpus exceeds the 20,000-note resource limit.")
+                    try:
+                        raw, current = self._read_bytes(directory, Path(path).name)
+                        if _stamp(info) != _stamp(current):
+                            raise DocumentIndexChanged()
+                        text, _, newline = _decode(raw)
+                        reason = self._reason(directory, text, newline)
+                        document = {"path": path, "text": text, "revision": hashlib.sha256(raw).hexdigest(),
+                                    "editable": not reason, "reason": reason, "newline": newline}
+                        if self._overrides is not None:
+                            document = self._override_document(document)
+                        fields = _frontmatter(text)
+                        document.update(_document_metadata(path, fields), frontmatter=fields)
+                        total_bytes += len(document["text"].encode("utf-8"))
+                        if total_bytes > 128 * 1024 * 1024:
+                            raise _IndexResourceLimit("The recall corpus exceeds the 128 MiB text resource limit.")
+                        documents.append(document)
+                    except (DocumentIndexChanged, _IndexResourceLimit):
+                        raise
+                    except (DocumentError, UnicodeError):
+                        skipped.append(path)
+            finally:
+                iterator.close()
+            for _ in self._index_inventory(run(), {}, inventory):
+                pass
+            if self._index_root_stamp() != stamp:
+                raise DocumentIndexChanged()
+            result = {"documents": sorted(documents, key=lambda row: row["path"]),
+                      "truncated": bool(skipped), "skipped_note_count": len(skipped),
+                      "warnings": ["Some notes exceed the document size/format limit and were excluded from recall."] if skipped else []}
+            self._recall_snapshot = {"workspace_id": workspace_id, "root_stamp": stamp,
+                                     "inventory": inventory, "result": result}
+            return copy.deepcopy(result)
+
+    def recall_relationships(self, workspace_id: str, note_paths: list[str]) -> list[dict[str, Any]]:
+        """Project saved accepted links only between explicitly retrieved notes."""
+        if (not isinstance(note_paths, list) or len(note_paths) > 32
+                or any(not isinstance(path, str) for path in note_paths)):
+            raise DocumentError("Recall relationship endpoints must be at most 32 note paths.")
+        with _LOCK, self._errors():
+            self._workspace(workspace_id)
+            snapshot = self.recall_corpus(workspace_id)
+            selected = [row for row in snapshot["documents"] if row["path"] in note_paths]
+            stamp = self._index_root_stamp()
+            run = {"root_stamp": stamp, "note_ids": {}, "cluster_ids": {}, "projected": {},
+                   "unresolved": {}, "warnings": [], "truncated": False, "recall_only": True,
+                   "recall_paths": set(note_paths),
+                   "recall_overridden_paths": {row["path"] for row in selected if row.get("override_saved")}}
+            for row in snapshot["documents"]:
+                self._index_identity(run["note_ids"], row["frontmatter"].get("note_id"), row["path"],
+                                     2 if row["path"].split("/")[:2] == ["02_source_memory", "notes"] else 1)
+            for _ in self._index_registry(run):
+                pass
+            if self._index_root_stamp() != stamp:
+                raise DocumentIndexChanged()
+            return sorted(run["projected"].values(), key=lambda row: row["id"])
 
     def _note_origin(self, path, fields, *, dependencies=None, budget=None):
         """Only protected writer metadata establishes managed source provenance.
@@ -848,6 +946,7 @@ class DocumentService:
                 result = self.tree(self._workspace_id)
                 self._close_index_run()
                 self._completed_index = None
+                self._recall_snapshot = None
                 return result
             except (DocumentError, OSError):
                 self._root, self._root_identity, self._workspace_id, self._documents, self._document_ids = previous
@@ -1411,6 +1510,13 @@ class DocumentService:
             return
         if relation_type in SUBSTANTIVE_RELATION_TYPES and row.get("decision_status") != "accepted":
             return
+        if run.get("recall_only"):
+            endpoints = [run["note_ids"].get(row.get(key)) for key in ("source_note_id", "target_note_id")]
+            if any(not entry or not entry[1] or entry[1] not in run["recall_paths"] for entry in endpoints):
+                return
+            if (relation_type in SUBSTANTIVE_RELATION_TYPES
+                    and any(entry[1] in run["recall_overridden_paths"] for entry in endpoints)):
+                return
         if row.get("output_contract") == "jev-relationship-policy-v1":
             from .jev_relationships import jev_relationship_is_fresh
             if not jev_relationship_is_fresh(self._root, row, memo=run.setdefault("jev_freshness", {})):

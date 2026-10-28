@@ -73,6 +73,54 @@ test("Discovery display density never changes saved candidates, accepted relatio
   assert.equal(JSON.stringify(data), before);
 });
 
+test("Sparse discovery caps apply to both endpoints with deterministic score ties", async () => {
+  const { limitGraphDiscovery } = await import("../../tools/workspace_graph_communities.js");
+  const nodes = Array.from({ length: 7 }, (_, index) => ({ id: String(index), degree: 99 }));
+  const discovery = [];
+  for (let source = 0; source < nodes.length; source += 1) {
+    for (let target = source + 1; target < nodes.length; target += 1) {
+      discovery.push({ id: `${source}-${target}`, source: String(source), target: String(target),
+        layer: "discovery", type: "semantic_similarity", score: .8 });
+    }
+  }
+  const reference = { id: "manual", source: "0", target: "6", layer: "reference", type: "link" };
+  const citation = { id: "citation", source: "0", target: "5", layer: "citation", type: "cites" };
+  const data = { nodes, edges: [...discovery, reference, citation], marker: "retained" }, before = JSON.stringify(data);
+  for (const cap of [2, 4, 8]) {
+    const selected = limitGraphDiscovery(data, cap), reordered = limitGraphDiscovery({ ...data, edges: [...data.edges].reverse() }, cap);
+    const ids = (value) => value.edges.filter((edge) => edge.layer === "discovery").map((edge) => edge.id).sort();
+    assert.deepEqual(ids(selected), ids(reordered));
+    assert.equal(selected.nodes.length, nodes.length); assert.equal(selected.marker, "retained");
+    assert.ok(selected.edges.includes(reference)); assert.ok(selected.edges.includes(citation));
+    assert.equal(selected.hidden_discovery_edges, discovery.length - ids(selected).length);
+    for (const node of selected.nodes) {
+      assert.ok(selected.edges.filter((edge) => edge.layer === "discovery" && [edge.source, edge.target].includes(node.id)).length <= cap);
+      assert.equal(node.degree, selected.edges.filter((edge) => [edge.source, edge.target].includes(node.id)).length);
+    }
+  }
+  assert.deepEqual(limitGraphDiscovery(data).edges, limitGraphDiscovery(data, 8).edges);
+  assert.deepEqual(limitGraphDiscovery(data, 3).edges, limitGraphDiscovery(data, 8).edges);
+  assert.equal(JSON.stringify(data), before);
+});
+
+test("Experimental graph-value priority changes actual capped selection only when explicitly enabled", async () => {
+  const { limitGraphDiscovery } = await import("../../tools/workspace_graph_communities.js");
+  const nodes = ["A", "B", "C", "D", "E", "F"].map((id) => ({ id }));
+  const make = (target, score, graph_value_priority) => ({ id: `A-${target}`, source: "A", target,
+    layer: "discovery", type: "semantic_similarity", score, graph_value_priority });
+  const edges = [make("B", .9), make("C", .8), make("D", .2, 2), make("E", .1, 1), make("F", .01, "2")];
+  const manual = { id: "manual", source: "A", target: "F", layer: "reference", graph_value_priority: 2 };
+  const data = { nodes, edges: [...edges, manual] }, original = JSON.stringify(data);
+  const ids = (value) => value.edges.filter((edge) => edge.layer === "discovery").map((edge) => edge.id);
+  assert.deepEqual(ids(limitGraphDiscovery(data, 2)), ["A-B", "A-C"]);
+  assert.deepEqual(ids(limitGraphDiscovery(data, 2, { graphValuePriority: true })), ["A-D", "A-E"]);
+  assert.deepEqual(ids(limitGraphDiscovery(data, 2, { graphValuePriority: "true" })), ["A-B", "A-C"]);
+  assert.deepEqual(ids(limitGraphDiscovery({ nodes, edges: [make("B", .9, -1), make("C", .8, Infinity), make("D", .7, 99)] }, 2,
+    { graphValuePriority: true })), ["A-B", "A-C"]);
+  assert.ok(limitGraphDiscovery(data, 2, { graphValuePriority: true }).edges.includes(manual));
+  assert.equal(JSON.stringify(data), original);
+});
+
 test("Search-scope filtering changes only semantic suggestions and retains palette metadata", () => {
   const data = graph(), make = (id, scopes) => ({ id, source: "A.md", target: "B.md", layer: "discovery", type: "semantic_similarity", provenance: scopes && { discovery_scopes: scopes } });
   const citation = { id: "citation", source: "B.md", target: "C.md", type: "cites", layer: "citation" };

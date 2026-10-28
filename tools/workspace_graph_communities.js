@@ -42,12 +42,14 @@ export function communityHull(points) {
   const lower = half(sorted), upper = half([...sorted].reverse()); lower.pop(); upper.pop(); return [...lower, ...upper];
 }
 
-export function limitGraphDiscovery(data, cap = 8) {
+export function limitGraphDiscovery(data, cap = 8, options = {}) {
   if (cap === "all") return { ...data, hidden_discovery_edges: 0 };
-  if (![8, 16, 32].includes(cap)) cap = 8;
+  if (![2, 4, 8, 16, 32].includes(cap)) cap = 8;
   const degree = new Map(), retained = new Set();
+  const priority = (edge) => options?.graphValuePriority === true && [1, 2].includes(edge.graph_value_priority) ? edge.graph_value_priority : 0;
   const candidates = data.edges.filter((edge) => edge.layer === "discovery" && edge.type === "semantic_similarity")
-    .sort((a, b) => (Number.isFinite(b.score) ? b.score : -1) - (Number.isFinite(a.score) ? a.score : -1) || a.id.localeCompare(b.id));
+    .sort((a, b) => priority(b) - priority(a)
+      || (Number.isFinite(b.score) ? b.score : -1) - (Number.isFinite(a.score) ? a.score : -1) || a.id.localeCompare(b.id));
   for (const edge of candidates) {
     if ((degree.get(edge.source) || 0) >= cap || (degree.get(edge.target) || 0) >= cap) continue;
     retained.add(edge.id); degree.set(edge.source, (degree.get(edge.source) || 0) + 1); degree.set(edge.target, (degree.get(edge.target) || 0) + 1);

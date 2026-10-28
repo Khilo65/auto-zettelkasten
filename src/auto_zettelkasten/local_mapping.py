@@ -301,6 +301,54 @@ def _cache_size(path: Path) -> int:
     return total
 
 
+CHUNKING_VERSION = "tokenizer-mapped-semantic-blocks-v2"
+
+
+def _semantic_chunks(text: str, spans: Sequence[Mapping[str, Any]], tokenizer: Any,
+                     token_limit: int) -> list[dict[str, Any]]:
+    """Tokenize cleaned runs together, retaining exact original source slices.
+
+    A link label stays in its sentence rather than becoming an independent,
+    equally weighted embedding. Groups never cross original section/owner cuts.
+    ``start``/``end`` bound the original source; ``source_spans`` describe the
+    exact retained slices when removed markup makes that range discontinuous.
+    """
+    groups = []
+    previous_end = 0
+    for index, span in enumerate(spans):
+        left, right = span["start"], span["end"]
+        if (type(left) is not int or type(right) is not int or not previous_end <= left < right <= len(text)
+                or text[left:right] != span["text"]):
+            raise ValueError("cleaning spans must retain ordered exact source offsets and text")
+        previous_end = right
+        group = span.get("embedding_group", index)
+        if type(group) is not int or group < 0:
+            raise ValueError("embedding groups must be nonnegative integers")
+        key = (group, span.get("owner", ""), span.get("section_kind", "unknown"))
+        if not groups or groups[-1][0] != key:
+            groups.append((key, []))
+        groups[-1][1].append(span)
+    result = []
+    for (_, owner, kind), runs in groups:
+        semantic = "".join(run["text"] for run in runs)
+        offsets, cursor = [], 0
+        for run in runs:
+            offsets.append((cursor, cursor + len(run["text"]), run["start"]))
+            cursor += len(run["text"])
+        for left, right, piece in _token_chunks(semantic, 0, tokenizer, token_limit):
+            source_spans = []
+            for begin, end, original in offsets:
+                start, stop = max(left, begin), min(right, end)
+                if start < stop:
+                    source_spans.append({"start": original + start - begin, "end": original + stop - begin})
+            if not source_spans or "".join(text[row["start"]:row["end"]] for row in source_spans) != piece:
+                raise ValueError("semantic chunk source mapping differs from selected text")
+            result.append({"start": source_spans[0]["start"], "end": source_spans[-1]["end"],
+                           "text": piece, "source_spans": source_spans,
+                           "owner": owner, "section_kind": kind})
+    return result
+
+
 def _token_chunks(text: str, start: int, tokenizer: Any, token_limit: int) -> list[tuple[int, int, str]]:
     """Partition every token without truncation; keep exact original offsets."""
     special = tokenizer.num_special_tokens_to_add(pair=False)
@@ -641,7 +689,7 @@ def build_local_map(
         scope = _digest({source["source_id"]: source["identity"] for source, _, _ in prepared})
         # A source addition must not invalidate vectors for existing sources.
         embedding = {"encoder": encoder_identity, "cleaning_version": CLEANING_VERSION,
-                     "chunking_version": "tokenizer-offset-blocks-v1",
+                     "chunking_version": CHUNKING_VERSION,
                      "chunk_tokens": options.chunk_tokens, "aggregation": "mean_l2_chunk_vectors_then_l2"}
         embedding_digest = _digest(embedding)
         identity = {**embedding, "library_scope_sha256": scope,
@@ -670,39 +718,37 @@ def build_local_map(
                 writes += len(encoded)
             source["text_cache_file"] = str(full_path.relative_to(root))
             occurrences: dict[str, int] = defaultdict(int)
-            for span in spans:
-                span_start, span_end = span["start"], span["end"]
-                if type(span_start) is not int or type(span_end) is not int or text[span_start:span_end] != span["text"]:
-                    raise ValueError("cleaning spans must retain exact source offsets and text")
-                for left, right, piece in _token_chunks(span["text"], span_start, bundle.tokenizer, options.chunk_tokens):
-                    owner = span.get("owner", "")
-                    content = {"source_id": source["source_id"], "identity": source["identity"], "owner": owner,
-                               "section_kind": span.get("section_kind", "unknown"), "text_sha256": sha256_text(piece)}
-                    occurrence_key = _digest(content)
-                    content["occurrence"] = occurrences[occurrence_key]
-                    occurrences[occurrence_key] += 1
-                    chunk_id = _digest({"embedding_identity": embedding_digest, **content})
-                    chunk = {"chunk_id": chunk_id, **content, "start": left, "end": right}
-                    chunks.append(chunk)
-                    if len(chunks) > options.max_chunks:
-                        raise LocalMappingError("Tokenized source content exceeds max_chunks; no partial sample was substituted.")
-                    source["chunk_ids"].append(chunk_id)
-                    path = vector_dir / (chunk_id + ".json")
-                    try:
-                        cached = json.loads(path.read_text(encoding="utf-8"))
-                        binary = (vector_dir / (chunk_id + ".f32")).read_bytes()
-                        if cached.get("chunk_id") != chunk_id or cached.get("embedding_identity") != embedding_digest or cached.get("vector_sha256") != hashlib.sha256(binary).hexdigest() or len(binary) != dimension * 4:
-                            raise ValueError("checkpoint identity or checksum differs")
-                        vector = np.frombuffer(binary, dtype="<f4").copy()
-                        if not np.isfinite(vector).all() or abs(float(np.linalg.norm(vector)) - 1) > 1e-4:
-                            raise ValueError("checkpoint vector is not finite and unit-normalized")
-                    except FileNotFoundError:
-                        pending.append((chunk, piece))
-                    except (ValueError, OSError) as exc:
-                        raise LocalMappingError(f"Invalid mapping checkpoint {chunk_id}; progress is preserved and no stale row was reused.") from exc
-                    else:
-                        vectors[chunk_id] = vector
-                        reused += 1
+            for semantic_chunk in (_semantic_chunks(text, spans, bundle.tokenizer, options.chunk_tokens) if spans else ()):
+                left, right, piece = semantic_chunk["start"], semantic_chunk["end"], semantic_chunk["text"]
+                owner = semantic_chunk["owner"]
+                content = {"source_id": source["source_id"], "identity": source["identity"], "owner": owner,
+                           "section_kind": semantic_chunk["section_kind"], "text_sha256": sha256_text(piece)}
+                occurrence_key = _digest(content)
+                content["occurrence"] = occurrences[occurrence_key]
+                occurrences[occurrence_key] += 1
+                chunk_id = _digest({"embedding_identity": embedding_digest, **content})
+                chunk = {"chunk_id": chunk_id, **content, "start": left, "end": right,
+                         "source_spans": semantic_chunk["source_spans"]}
+                chunks.append(chunk)
+                if len(chunks) > options.max_chunks:
+                    raise LocalMappingError("Tokenized source content exceeds max_chunks; no partial sample was substituted.")
+                source["chunk_ids"].append(chunk_id)
+                path = vector_dir / (chunk_id + ".json")
+                try:
+                    cached = json.loads(path.read_text(encoding="utf-8"))
+                    binary = (vector_dir / (chunk_id + ".f32")).read_bytes()
+                    if cached.get("chunk_id") != chunk_id or cached.get("embedding_identity") != embedding_digest or cached.get("vector_sha256") != hashlib.sha256(binary).hexdigest() or len(binary) != dimension * 4:
+                        raise ValueError("checkpoint identity or checksum differs")
+                    vector = np.frombuffer(binary, dtype="<f4").copy()
+                    if not np.isfinite(vector).all() or abs(float(np.linalg.norm(vector)) - 1) > 1e-4:
+                        raise ValueError("checkpoint vector is not finite and unit-normalized")
+                except FileNotFoundError:
+                    pending.append((chunk, piece))
+                except (ValueError, OSError) as exc:
+                    raise LocalMappingError(f"Invalid mapping checkpoint {chunk_id}; progress is preserved and no stale row was reused.") from exc
+                else:
+                    vectors[chunk_id] = vector
+                    reused += 1
         phases["tokenization_and_cache_seconds"] = time.monotonic() - tokenization_started
         emit("embedding", chunks=len(chunks), reused_chunks=reused, pending_chunks=len(pending))
         for offset in range(0, len(pending), options.batch_size):

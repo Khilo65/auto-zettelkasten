@@ -76,6 +76,15 @@ HISTORICAL_BATCH_BILLING_POLICY_V2 = replace(
     template_version="relationship-batch-v2",
 )
 
+# Experimental graph-value admission is isolated from production/replay routes.
+GRAPH_VALUE_TEMPLATE_VERSION = "relationship-graph-value-experiment-v1"
+GRAPH_VALUE_BILLING_POLICY = replace(
+    STANDARD_BILLING_POLICY,
+    identity="typesafe-jev-1.13.0-graph-value-usd-20261026-v1",
+    template_version=GRAPH_VALUE_TEMPLATE_VERSION,
+    verified_on="2026-10-26",
+)
+
 
 @dataclass(frozen=True)
 class BillingAdmission:
@@ -104,7 +113,9 @@ class BillingAdmission:
             "verified_on": self.policy.verified_on,
             "source_urls": list(self.policy.sources),
             "assumptions": [
-                ("Pinned jev-1.13.0 standard text endpoint and at most three Choice questions."
+                ("Pinned jev-1.13.0 standard text endpoint and one or two Choice questions for one focus pair."
+                 if self.policy == GRAPH_VALUE_BILLING_POLICY else
+                 "Pinned jev-1.13.0 standard text endpoint and at most three Choice questions."
                  if self.policy in (BATCH_BILLING_POLICY, HISTORICAL_BATCH_BILLING_POLICY_V2) else
                  "Pinned jev-1.13.0 standard text endpoint and one Choice question."),
                 "No long-context or other danger-zone header, retries, or fallback model.",
@@ -217,6 +228,45 @@ def batch_billing_admission(
     if wire_bytes > policy.max_wire_bytes:
         raise BillingAdmissionError("prepared Jev batch exceeds the local wire-byte admission limit; split the batch")
     return BillingAdmission(policy=policy, wire_bytes=wire_bytes)
+
+
+def graph_value_billing_admission(
+    payload: Mapping[str, Any], *, policy: BillingPolicy | None = GRAPH_VALUE_BILLING_POLICY,
+    endpoint: str = SYSTEM_ONE_URL, headers: Mapping[str, str] | None = None,
+    template_version: str = GRAPH_VALUE_TEMPLATE_VERSION,
+) -> BillingAdmission:
+    """Admit the isolated experiment without broadening production contracts.
+
+    Semantic and exact packet binding are additionally checked by the graph-value
+    request builder. This is a full standard-context reservation, not a wire-byte
+    token estimate, a paid approval, or a guaranteed invoice cap.
+    """
+    if (type(policy) is not BillingPolicy
+            or not isinstance(policy.input_usd_per_token, Decimal)
+            or not policy.input_usd_per_token.is_finite()
+            or type(policy.input_token_ceiling) is not int
+            or type(policy.max_wire_bytes) is not int
+            or policy != GRAPH_VALUE_BILLING_POLICY):
+        raise BillingAdmissionError("the pinned graph-value experimental billing policy is required")
+    if template_version != GRAPH_VALUE_TEMPLATE_VERSION:
+        raise BillingAdmissionError("the graph-value experimental template must be pinned")
+    if not isinstance(payload, Mapping) or not isinstance(payload.get("questions"), Mapping):
+        raise BillingAdmissionError("graph-value admission requires named Choice questions")
+    questions = payload["questions"]
+    if list(questions) not in (["relationship"], ["relationship", "graph_value"]):
+        raise BillingAdmissionError("graph-value admission supports one focus relationship and optional graph value")
+    if "graph_value" in questions:
+        value = questions["graph_value"]
+        if (not isinstance(value, Mapping) or not isinstance(value.get("criteria"), Mapping)
+                or list(value["criteria"]) != [
+            "essential", "helpful", "redundant", "misleading", "uncertain",
+        ]):
+            raise BillingAdmissionError("graph-value choices must match the experimental rubric")
+    checked = batch_billing_admission(
+        payload, policy=BATCH_BILLING_POLICY, endpoint=endpoint, headers=headers,
+        template_version=BATCH_TEMPLATE_VERSION,
+    )
+    return BillingAdmission(policy=policy, wire_bytes=checked.wire_bytes)
 
 
 def _validate_nesting(root: Any, label: str) -> None:

@@ -9,6 +9,13 @@ from pathlib import Path
 import sys
 import tempfile
 
+# Frozen multiprocessing helpers must be diverted before importing GUI/model
+# code, otherwise their interpreter flags reach the desktop argument parser.
+if __name__ == "__main__":
+    import multiprocessing
+
+    multiprocessing.freeze_support()
+
 from auto_zettelkasten.desktop import main as desktop_main
 
 

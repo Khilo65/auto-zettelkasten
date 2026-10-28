@@ -1,7 +1,9 @@
 """Desktop build contracts; runtime smoke uses synthetic text and no model weights."""
 import importlib.util
 import json
+import multiprocessing
 from pathlib import Path
+import runpy
 from types import SimpleNamespace
 import tomllib
 
@@ -9,6 +11,23 @@ import pytest
 
 
 ROOT = Path(__file__).parents[1]
+
+
+def test_frozen_helper_diverts_before_desktop_imports(monkeypatch):
+    import builtins
+
+    original_import = builtins.__import__
+    def no_gui_import(name, *args, **kwargs):
+        if name.startswith("auto_zettelkasten"):
+            pytest.fail("A multiprocessing helper reached desktop imports")
+        return original_import(name, *args, **kwargs)
+    def helper_exit():
+        raise SystemExit(23)
+    monkeypatch.setattr(multiprocessing, "freeze_support", helper_exit)
+    monkeypatch.setattr(builtins, "__import__", no_gui_import)
+    with pytest.raises(SystemExit) as result:
+        runpy.run_path(str(ROOT / "tools/desktop_entry.py"), run_name="__main__")
+    assert result.value.code == 23
 
 
 def load_tool(name):

@@ -70,6 +70,10 @@ function harness(t, options = {}) {
     let status = 200, result;
     if (url === "/api/workspace/open" || url === "/api/workspace/tree") result = { workspace };
     else if (url === "/api/workspace/index") result = { documents: [{ ...data.disk }], relations: [], warnings: [], truncated: false };
+    else if (url === "/api/workspace/recall") {
+      result = options.recall ? await options.recall(body) : { notes: [], provenance: { route: "full_note_lexical" }, provider_calls: 0 };
+    }
+    else if (url === "/api/workspace/recall-index") result = options.prepareRecall ? await options.prepareRecall(body) : { status: "prepared", provider_calls: 0 };
     else if (url === "/api/workspace/read") result = { document: { ...data.disk } };
     else if (url === "/api/workspace/save" || url === "/api/workspace/save-override") {
       data.saves += 1;
@@ -126,6 +130,70 @@ function harness(t, options = {}) {
   };
   return { window, data, requests, element, click, open, append, mode, save, getView, confirm, poll: () => polls[0]() };
 }
+
+test("quick-open finds full-note content, renders literal excerpts and opens its bound file", async (t) => {
+  const app = harness(t, { recall: async (body) => {
+    assert.equal(body.query, "participatory budgeting");
+    assert.equal(body.max_notes, 8); assert.equal(body.max_chars, 12000);
+    return { notes: [{ title: "A research method", note_path: "Start.md", text: "A participatory budgeting mechanism. <img src=x>" }],
+      provenance: { route: "full_note_hybrid" }, provider_calls: 0 };
+  } });
+  await app.open(); app.click("workspace-quick-open");
+  app.element("workspace-quick-query").value = "participatory budgeting";
+  app.element("workspace-quick-query").dispatchEvent(new app.window.Event("input", { bubbles: true }));
+  await until(() => app.element("workspace-quick-results").querySelector(".quick-excerpt"), "full-note search results");
+  assert.match(app.element("workspace-quick-results").textContent, /participatory budgeting/);
+  assert.equal(app.element("workspace-quick-results").querySelector("img"), null);
+  assert.match(app.element("workspace-quick-status").textContent, /text and semantic search/);
+  app.element("workspace-quick-query").dispatchEvent(new app.window.KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  assert.equal(app.element("workspace-quick-dialog").open, false);
+});
+
+test("quick-open ignores older content responses and names lexical fallback honestly", async (t) => {
+  const old = deferred();
+  const app = harness(t, { recall: (body) => body.query === "older query" ? old.promise : Promise.resolve({
+    notes: [{ title: "Current result", note_path: "Start.md", text: "Only the newest evidence." }],
+    provenance: { route: "full_note_lexical" }, provider_calls: 0,
+  }) });
+  await app.open(); app.click("workspace-quick-open");
+  const input = app.element("workspace-quick-query");
+  const query = (value) => { input.value = value; input.dispatchEvent(new app.window.Event("input", { bubbles: true })); };
+  query("older query");
+  await until(() => app.requests.some(({ url, body }) => url.endsWith("/recall") && body.query === "older query"), "first content request");
+  query("newer query");
+  await until(() => app.element("workspace-quick-results").textContent.includes("Current result"), "newest result");
+  old.resolve({ notes: [{ title: "Stale result", note_path: "Old.md", text: "Wrong query." }], provenance: { route: "full_note_hybrid" } });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.doesNotMatch(app.element("workspace-quick-results").textContent, /Stale result/);
+  assert.match(app.element("workspace-quick-status").textContent, /Semantic search is unavailable/);
+});
+
+test("closing quick-open cancels queued content searches", async (t) => {
+  const app = harness(t);
+  await app.open(); app.click("workspace-quick-open");
+  const input = app.element("workspace-quick-query"); input.value = "pending content";
+  input.dispatchEvent(new app.window.Event("input", { bubbles: true }));
+  app.element("workspace-quick-dialog").dispatchEvent(new app.window.Event("cancel", { cancelable: true }));
+  await new Promise((resolve) => setTimeout(resolve, 220));
+  assert.equal(app.requests.some(({ url }) => url.endsWith("/recall")), false);
+});
+
+test("partial semantic coverage is visible and local indexing is explicit", async (t) => {
+  let indexed = false;
+  const app = harness(t, { recall: async () => ({
+    notes: [{ title: "A note", note_path: "Start.md", text: "Budgeting evidence." }],
+    provenance: { route: "full_note_hybrid", vector_source_count: indexed ? 3 : 1, source_count: 3 },
+  }), prepareRecall: async (body) => { assert.deepEqual(body, { workspace_id: "workspace-1" }); indexed = true; return { status: "prepared", provider_calls: 0 }; } });
+  await app.open(); app.click("workspace-quick-open");
+  const input = app.element("workspace-quick-query"); input.value = "budgeting";
+  input.dispatchEvent(new app.window.Event("input", { bubbles: true }));
+  await until(() => app.element("workspace-quick-status").textContent.includes("1 of 3"), "partial semantic coverage");
+  assert.equal(app.requests.some(({ url }) => url.endsWith("/recall-index")), false);
+  assert.equal(app.element("workspace-quick-index").hidden, false);
+  app.click("workspace-quick-index");
+  await until(() => app.element("workspace-quick-status").textContent === "Local text and semantic search.", "index refresh");
+  assert.equal(app.element("workspace-quick-index").hidden, true);
+});
 
 test("workspace opens offline and preserves Markdown, history and CRLF save conventions across modes", async (t) => {
   const app = harness(t);

@@ -15,6 +15,8 @@ from .api import (
     initialize_workspace,
     inventory,
     list_collections,
+    recall,
+    prepare_recall,
     resume_map,
     run_map,
     sync_zotero,
@@ -250,7 +252,7 @@ def build_parser() -> argparse.ArgumentParser:
         local_parser = commands.add_parser(name, help=help_text)
         local_parser.add_argument("--workspace", type=Path, required=True)
         local_parser.add_argument("--instance-id", default=None)
-        local_parser.add_argument("--library-id", default="0")
+        local_parser.add_argument("--library-id", default="0" if name == "candidates" else None)
         if name == "candidates":
             local_parser.add_argument("--max-pairs", type=int, default=256)
             local_parser.add_argument("--per-source-cap", type=int, default=8)
@@ -258,6 +260,12 @@ def build_parser() -> argparse.ArgumentParser:
             local_parser.add_argument("--query", required=True)
             local_parser.add_argument("--max-notes", type=int, default=8)
             local_parser.add_argument("--max-chars", type=int, default=12000)
+            local_parser.add_argument("--model-path", default="", help="Existing local MiniLM directory; never downloaded.")
+            local_parser.add_argument("--profile-only", action="store_true", help="Use the legacy compact-profile recall route.")
+
+    recall_index_parser = commands.add_parser("index-recall", help="Build the local semantic search cache from existing notes, without provider calls.")
+    recall_index_parser.add_argument("--workspace", type=Path, required=True)
+    recall_index_parser.add_argument("--model-path", default="", help="Existing local MiniLM directory; never downloaded.")
 
     jev_parser = commands.add_parser(
         "jev-review",
@@ -336,13 +344,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command in {"candidates", "recall"}:
             from .local_tools import load_local_retrieval
 
-            loaded = load_local_retrieval(args.workspace, instance_id=args.instance_id, library_id=args.library_id)
-            if args.command == "candidates":
+            if args.command == "recall" and not args.profile_only:
+                result = recall(args.workspace, args.query, max_notes=args.max_notes, max_chars=args.max_chars,
+                                model_path=args.model_path, instance_id=args.instance_id, library_id=args.library_id)
+            elif args.command == "candidates":
+                loaded = load_local_retrieval(args.workspace, instance_id=args.instance_id, library_id=args.library_id)
                 result = {"status": "prepared", "candidates": loaded["index"].candidate_pairs(
                     per_source_cap=args.per_source_cap, max_pairs=args.max_pairs), "coverage": loaded["status"], "provider_calls": 0}
             else:
+                loaded = load_local_retrieval(args.workspace, instance_id=args.instance_id, library_id=args.library_id or "0")
                 result = {"status": "retrieved", **loaded["index"].recall(args.query, relationships=loaded["relationships"],
                           max_notes=args.max_notes, max_chars=args.max_chars), "coverage": loaded["status"], "provider_calls": 0}
+        elif args.command == "index-recall":
+            result = prepare_recall(args.workspace, model_path=args.model_path)
         elif args.command == "jev-review":
             from .jev_cli import prepare_review
 

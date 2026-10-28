@@ -198,6 +198,9 @@ class LocalApp:
             journal_root=self.preferences_path.parent / "workspace-operations",
             override_root=self.preferences_path.parent / "workspace-overrides",
         )
+        from .note_recall import NoteRecallService
+
+        self.note_recall = NoteRecallService()
 
     def _editable(self):
         if self.run["status"] == "running" or self.auth["status"] == "pending":
@@ -292,6 +295,28 @@ class LocalApp:
 
     def handle(self, method: str, route: str, data: dict | None = None):
         data = data or {}
+        if method == "POST" and route in {"/api/workspace/recall", "/api/workspace/recall-index"}:
+            # Local encoding can take longer than file operations. Capture the
+            # opened workspace under the app lock, then let search use its own
+            # lock so polling and editing remain responsive.
+            try:
+                allowed = {"workspace_id"} if route.endswith("recall-index") else {"workspace_id", "query", "max_notes", "max_chars"}
+                if set(data) - allowed:
+                    raise RequestError("Unsupported note search options.")
+                with self.lock:
+                    workspace_id = data.get("workspace_id")
+                    workspace = self.documents.workspace_path(workspace_id)
+                    model_path = self.embedding_model_path
+                if route.endswith("recall-index"):
+                    return self.note_recall.prepare(workspace, model_path=model_path,
+                                                    documents=self.documents, workspace_id=workspace_id)
+                return self.note_recall.recall(
+                    workspace, data.get("query"), max_notes=data.get("max_notes", 8),
+                    max_chars=data.get("max_chars", 12000), model_path=model_path,
+                    documents=self.documents, workspace_id=workspace_id,
+                )
+            except (DocumentError, ValueError, RuntimeError, OSError) as exc:
+                raise RequestError(str(exc)) from exc
         with self.lock:
             if method == "POST" and route.startswith("/api/workspace/"):
                 return self._document_request(route, data)

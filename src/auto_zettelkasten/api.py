@@ -125,6 +125,8 @@ __all__ = [
     "initialize_workspace",
     "inventory",
     "list_collections",
+    "recall",
+    "prepare_recall",
     "resume_map",
     "run_map",
     "run_literature_map",
@@ -134,6 +136,30 @@ __all__ = [
 
 def initialize_workspace(workspace: Path | str, *, overwrite: bool = False) -> ArtifactManifest:
     return initialize(workspace, overwrite=overwrite)
+
+
+def recall(
+    workspace: Path | str, query: str, *, max_notes: int = 8,
+    max_chars: int = 12_000, model_path: str = "",
+    instance_id: str | None = None, library_id: str | None = None,
+) -> dict[str, Any]:
+    """Retrieve grounded full-note excerpts locally, without provider calls.
+
+    Uses lexical and compatible cached MiniLM rankings when available. The
+    response reports lexical-only fallback and semantic coverage explicitly.
+    This does not regenerate notes, acquire documents or invoke Jev.
+    """
+    from .note_recall import recall_workspace
+
+    return recall_workspace(workspace, query, max_notes=max_notes, max_chars=max_chars,
+                            model_path=model_path, instance_id=instance_id, library_id=library_id)
+
+
+def prepare_recall(workspace: Path | str, *, model_path: str = "") -> dict[str, Any]:
+    """Explicitly build a resumable local search cache from existing notes."""
+    from .note_recall import prepare_workspace_recall
+
+    return prepare_workspace_recall(workspace, model_path=model_path)
 
 
 def doctor(workspace: Path | str, *, client: ZoteroClient | None = None) -> StatusReport:
