@@ -436,6 +436,20 @@ def prepare_embedding_spans(text: str, ownership_spans: Sequence[Mapping[str, An
     }}
 
 
+def prepare_note_embedding_spans(text: str, *, annotation_hash: str | None = None) -> dict[str, Any]:
+    """Keep confirmed annotation projections out of source-summary vectors.
+
+    The hash must come from the private projection receipt, never the note's
+    frontmatter. Unverified or edited blocks remain ordinary personal prose.
+    Original offsets remain usable for grounded excerpts and cached chunks.
+    """
+    from .zotero_annotations import verified_annotation_span
+    span = verified_annotation_span(text, annotation_hash)
+    ownership = ([{"start": span[0], "end": span[1], "owner": "zotero_annotations",
+                   "section_kind": "generated_navigation"}] if span else [])
+    return prepare_embedding_spans(text, ownership)
+
+
 def _path(root: Path, value: Any) -> Path:
     if not isinstance(value, str) or not value or "\x00" in value or "://" in value:
         raise ValueError("mapping input path must be a local workspace path")

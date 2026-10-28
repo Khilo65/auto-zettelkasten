@@ -209,6 +209,7 @@ from .zotero import (
     normalize_collection_snapshot,
     scope_collection_snapshot,
 )
+from .zotero_links import item_library_scope, parse_zotero_uri, uri_for_item
 
 CHUNKING_VERSION = "3"
 CONTENT_CLASSIFIER_VERSION = "7"
@@ -20717,19 +20718,30 @@ def _source_reader_metadata(
     }
 
 
-def _with_source_navigation(content: dict[str, Any], target: Mapping[str, Any]) -> dict[str, Any]:
+def _with_source_navigation(content: dict[str, Any], target: Mapping[str, Any], *,
+                            library_item: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Bind navigation to the selected attachment independently of model output."""
     key = item_key(target)
     if not re.fullmatch(r"[A-Z0-9]{8}", key):
         return content
     data = item_data(target)
-    content["zotero_item_uri"] = f"zotero://select/library/items/{key}"
+    # The historical mapper client is personal-library only. Explicit metadata
+    # from a group library takes precedence, including when only the parent has it.
+    scope = item_library_scope(library_item or target, fallback="library")
+    target_scope = item_library_scope(target, fallback=scope)
+    if scope is None or target_scope is None or library_item is not None and target_scope != scope:
+        return content
+    parent_key = data.get("parentItem") if data.get("itemType") == "attachment" else None
+    item_uri = uri_for_item(target, key=parent_key if parent_key is not None else key, fallback_scope=scope)
+    if item_uri:
+        content["zotero_item_uri"] = item_uri
     if data.get("itemType") == "attachment" and content.get("media_type") == "application/pdf":
         content["attachment_key"] = key
-        uri = f"zotero://open-pdf/library/items/{key}"
+        uri = uri_for_item(target, "open-pdf", fallback_scope=scope)
         supplied = str(data.get("source_pdf_uri") or "")
         # Only an actual attachment's supplied annotation/page address may extend its URL.
-        if (supplied == uri or supplied.startswith(uri + "?")) and _source_navigation_link({"source_pdf_uri": supplied}):
+        parsed = parse_zotero_uri(supplied)
+        if parsed and parsed.action == "open-pdf" and parsed.scope == target_scope and parsed.key == key:
             uri = supplied
         content["source_pdf_uri"] = uri
     return content
@@ -20853,7 +20865,7 @@ def _acquire_content(
                     parent_data,
                     data,
                 )
-                candidates.append(_with_source_navigation(candidate, target))
+                candidates.append(_with_source_navigation(candidate, target, library_item=item))
                 base["attempts"].append(
                     _attempt(
                         base,
@@ -20934,13 +20946,13 @@ def _acquire_content(
                 )
             )
             if local_candidate is not None:
-                candidates.append(_with_source_navigation(local_candidate, target))
+                candidates.append(_with_source_navigation(local_candidate, target, library_item=item))
             elif local_primary_pdf:
                 failed_primary_pdf = _with_source_navigation(_failed_pdf_candidate(
                     extracted,
                     content_hash=local_hash,
                     source_file=str(extraction_path),
-                ), target)
+                ), target, library_item=item)
         try:
             file_result = client.file(target_key)
         except Exception as exc:
@@ -21025,13 +21037,13 @@ def _acquire_content(
             )
         )
         if downloaded_candidate is not None:
-            candidates.append(_with_source_navigation(downloaded_candidate, target))
+            candidates.append(_with_source_navigation(downloaded_candidate, target, library_item=item))
         elif downloaded_primary_pdf:
             failed_primary_pdf = _with_source_navigation(_failed_pdf_candidate(
                 extracted,
                 content_hash=document_hash,
                 source_file=str(custody_path),
-            ), target)
+            ), target, library_item=item)
     metadata_hash = sha256_text(
         json.dumps(parent_data, sort_keys=True, ensure_ascii=False, default=str)
     )

@@ -232,3 +232,34 @@ class _View:
                     os.unlink(temporary, dir_fd=self.directory.fd)
             except FileNotFoundError:
                 pass
+
+    def archive(self, path, expected_digest):
+        """Retire an overlay only after the active note and attachment verify.
+
+        The archived bytes stay private and recoverable. An interrupted archive
+        is recognized by its exact digest, so resuming never creates a new edit.
+        """
+        record, digest, _ = self.read(path)
+        archived = self.name(path) + ".archived-" + (expected_digest or "none")
+        if record is None:
+            if expected_digest is None:
+                return
+            try:
+                info = self.directory.stat(archived)
+            except FileNotFoundError as exc:
+                raise DocumentError("The former override is missing; do not finalize migration.") from exc
+            if not stat.S_ISREG(info.st_mode) or _linked(info) or info.st_nlink != 1:
+                raise DocumentError("The archived override changed.")
+            fd = os.open(archived, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self.directory.fd)
+            try:
+                raw = os.read(fd, _MAX_RECORD_BYTES + 1)
+                if hashlib.sha256(raw).hexdigest() != expected_digest:
+                    raise DocumentError("The archived override does not match the recovery journal.")
+            finally:
+                os.close(fd)
+            return
+        if digest != expected_digest:
+            raise DocumentError("The private override changed; migration cannot retire it.")
+        self.directory.verify()
+        os.replace(self.name(path), archived, src_dir_fd=self.directory.fd, dst_dir_fd=self.directory.fd)
+        os.fsync(self.directory.fd)

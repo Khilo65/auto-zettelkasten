@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en" dir="ltr" style="--sidebar-width:240px;--split-view-size:50%;--bottom-placeholder-height:0px;--toolbar-placeholder-width:0px">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <base href="./zotero-reader/">
+  <title>Source PDF reader</title>
+  <link rel="stylesheet" href="reader.css">
+  <style>
+    /* These require Zotero host dialogs that this integration does not expose. */
+    .preview > button.tags, .appearance-popup .theme.add { display: none; }
+    /* A paired pane is narrower than Zotero's standalone reader window. */
+    .toolbar { overflow-x: auto; gap: 12px; }
+    .toolbar > .start, .toolbar > .center, .toolbar > .end { flex-shrink: 0; }
+    .toolbar #numPages > div { position: static; white-space: nowrap; }
+    .toolbar .center.tools:has(button.highlight:disabled) { display: none; }
+  </style>
+  <script defer src="reader.js"></script>
+  <script defer src="../zotero-reader-host.js"></script>
+</head>
+<body class="sidebar-open">
+  <p id="reader-host-status" role="status">Connecting to the source reader…</p>
+  <div id="reader-ui"></div>
+  <div id="split-view">
+    <div id="primary-view" class="primary-view"></div>
+    <div id="secondary-view" class="secondary-view"></div>
+  </div>
+  <div id="printContainer"></div>
+</body>
+</html>

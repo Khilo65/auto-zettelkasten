@@ -345,3 +345,30 @@ html[data-theme=dark] body:not([data-theme=light]) :is(.global-graph-panel, .loc
 .workspace-dialog .organization-decline-note { font-size: 11px; margin-top: 16px; }
 .organization-actions { flex-wrap: wrap; }
 .organization-actions button { font-size: 12px; }
+
+/* Source reader and the existing editor share the document area and buffer. */
+.workspace-tree-switch { display:flex; gap:4px; padding:6px 12px; border-bottom:1px solid var(--workspace-line); }
+.workspace-tree-switch button { flex:1; padding:6px 10px; border:0; border-radius:4px; color:var(--workspace-muted); background:transparent; }
+.workspace-tree-switch button[aria-pressed=true] { color:var(--workspace-accent); background:var(--workspace-selection); }
+.workspace-zotero-panel { flex:1; min-height:0; overflow:auto; }
+.workspace-pdf-pane { min-width:0; min-height:0; display:flex; flex-direction:column; flex:0 0 var(--pdf-width,50%); background:var(--workspace-panel); }
+.source-reader-toolbar { display:flex; align-items:center; flex-wrap:wrap; gap:6px; padding:6px 10px; border-bottom:1px solid var(--workspace-line); font-size:11px; }
+.source-reader-toolbar span { flex:1 1 48px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.source-reader-toolbar button { flex:0 0 auto; padding:4px 7px; font-size:11px; white-space:nowrap; }
+.source-reader-toolbar .icon-button { flex:0 0 30px; padding:6px; }
+.document-header .source-action { flex:0 0 auto; padding:4px 7px; min-height:28px; font-size:11px; white-space:nowrap; }
+.source-reader-notice { padding:8px 12px; font-size:12px; margin:0; color:var(--workspace-muted); }
+.workspace-pdf-host { flex:1; min-height:0; position:relative; }
+.source-reader-frame { width:100%; height:100%; border:0; display:block; }
+.workspace-pdf-divider { flex:0 0 6px; cursor:col-resize; background:var(--workspace-line); touch-action:none; }
+.workspace-pdf-divider:hover,.workspace-pdf-divider:focus-visible { background:var(--workspace-accent); }
+.workspace-document-area.has-source > .workspace-content { flex:1 1 0; min-width:0; }
+.workspace-document-area.source-pdf-only > .workspace-content,.workspace-document-area.source-pdf-only > .workspace-context { display:none; }
+.workspace-document-area.source-pdf-only > .workspace-pdf-pane { flex:1 1 100%; }
+.workspace-document-area.source-note-only > .workspace-pdf-pane { flex:0 0 auto; width:100%; height:auto; }
+.workspace-document-area.source-note-only { flex-direction:column; }
+.workspace-document-area.source-note-only .workspace-pdf-host,.workspace-document-area.source-note-only .source-reader-notice { display:none; }
+.workspace-document-area.source-note-only > .workspace-content { flex:1; }
+.workspace-source-choices button { display:block; width:100%; text-align:left; margin:8px 0; }
+#workspace-migration-preview { max-height:35vh; overflow:auto; white-space:pre-wrap; font-size:12px; }
+@media (max-width:800px) { .workspace-document-area.has-source { flex-direction:column; } .workspace-pdf-pane { flex:0 0 50%; } .workspace-pdf-divider { display:none; } .source-reader-toolbar span { display:none; } }

@@ -205,7 +205,7 @@ def smoke_test() -> dict:
         finally:
             page.close()
     with tempfile.TemporaryDirectory(prefix="az-desktop-smoke-") as temporary:
-        app = LocalApp(preferences_path=Path(temporary) / "preferences.json")
+        app = LocalApp(preferences_path=Path(temporary).resolve() / "preferences.json")
         with LocalServer(("127.0.0.1", 0), app=app) as server:
             worker = threading.Thread(target=server.serve_forever, daemon=True)
             worker.start()

@@ -2,6 +2,7 @@ import MarkdownIt from "markdown-it";
 import { graphNodeOrigin } from "./workspace_graph_colors.js";
 import { compactCoverageNotice } from "./workspace_coverage.js";
 import { propertyLists, renderProperties } from "./workspace_properties.js";
+import { isZoteroScheme, parseZoteroURI, sourceLinkMarkup } from "./workspace_sources.js";
 
 export const LIMITS = Object.freeze({
   documents: 5000,
@@ -39,7 +40,7 @@ const encodePath = (path) => path.split("/").map((part) => encodeURIComponent(pa
 const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
 const privateParts = new Set(["node_modules", "venv", "__pycache__", "credentials", "credential", "secrets", "secret", "private", "01_custody", "11_state", "custody", "state", "profiles", "profile", "indexes", "index", "bundles", "packets", "fingerprints", "note_metadata", "read_attempts", "export_manifest.md"]);
 const privateNames = new Set(["credential", "credentials", "secret", "secrets", "password", "passwords", "api_key", "api_keys", "tokens"]);
-const externalLink = (value) => /^(?:https?:|mailto:)/i.test(value);
+const externalLink = (value) => /^(?:https?:|mailto:)/i.test(value) || isZoteroScheme(value);
 const syntaxCharacters = new Set("[]()*_~`<>!#|\\=-^\n\r");
 const researchRelationTypes = new Set(["supports", "undermines", "qualifies", "extends", "complements", "contrasts", "rival_explanation", "boundary_contrast", "methodological_fault_line", "sequential_relationship", "interpretive_or_normative_disagreement", "contextual_connection", "methodological_comparison", "potential_research_resource"]);
 const citationRelationTypes = new Set(["cites", "cited_by"]);
@@ -205,6 +206,7 @@ parser.inline.ruler.before("link", "workspace_wiki", (state, silent) => {
   if (!silent) {
     const token = state.push("workspace_wiki", "", 0);
     token.content = label;
+    if (parseZoteroURI(destination)) token.meta = { sourceURI: destination };
     const rawDestination = split < 0 ? raw : raw.slice(0, split);
     const destinationStart = start + rawDestination.length - rawDestination.trimStart().length;
     reference(state, from, end + 2, token, "wiki", embed, destination, label, { from: absolutePosition(state.env, destinationStart), to: absolutePosition(state.env, destinationStart + destination.length) });
@@ -1171,6 +1173,7 @@ function renderEmbed(index, sourcePath, ref, context) {
 
 parser.renderer.rules.workspace_wiki = (tokens, at, _options, env) => {
   const token = tokens[at];
+  if (token.meta?.sourceURI) return sourceLinkMarkup(token.meta.sourceURI, token.content);
   const raw = token.meta?.workspaceReference;
   const ref = raw ? { ...raw, from: raw.from + env.context.offset } : null;
   if (!ref) return escapeHtml(token.content);
@@ -1181,6 +1184,8 @@ parser.renderer.rules.workspace_wiki = (tokens, at, _options, env) => {
 parser.renderer.rules.link_open = (tokens, at, _options, env) => {
   const token = tokens[at];
   const href = token.attrGet("href") || "";
+  const source = parseZoteroURI(href);
+  if (source) return `<a href="#" class="source-link" data-source-uri="${escapeHtml(source.uri)}">`;
   if (/^https?:\/\//i.test(href)) return `<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">`;
   const raw = token.meta?.workspaceReference;
   const ref = raw ? { ...raw, from: raw.from + env.context.offset } : null;
@@ -1192,7 +1197,7 @@ parser.renderer.rules.link_close = (tokens, at, _options, env) => {
     if (tokens[before].type === "link_close") depth += 1;
     if (tokens[before].type !== "link_open") continue;
     if (depth) { depth -= 1; continue; }
-    if (/^https?:\/\//i.test(tokens[before].attrGet("href") || "")) return "</a>";
+    if (/^https?:\/\//i.test(tokens[before].attrGet("href") || "") || parseZoteroURI(tokens[before].attrGet("href"))) return "</a>";
     const raw = tokens[before].meta?.workspaceReference;
     const ref = raw ? { ...raw, from: raw.from + env.context.offset } : null;
     return ref ? linkMarkup(env.index, env.path, ref).close : "</span>";

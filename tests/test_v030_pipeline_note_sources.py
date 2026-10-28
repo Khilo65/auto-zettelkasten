@@ -35,6 +35,7 @@ def test_selected_pdf_attachment_identity_survives_frozen_content(tmp_path: Path
     assert content is not None
     # Equal route/priority uses the richer actual candidate, retaining its identity.
     assert content["attachment_key"] == "ATTACH02"
+    assert content["zotero_item_uri"] == "zotero://select/library/items/PARENT01"
     assert content["source_pdf_uri"] == "zotero://open-pdf/library/items/ATTACH02"
     checkpoint = tmp_path / "checkpoint"
     pipeline._write_frozen_content(checkpoint, content)
@@ -64,6 +65,19 @@ def test_annotation_extension_must_belong_to_selected_attachment():
     assert pipeline._with_source_navigation({"media_type": "application/pdf"}, target)["source_pdf_uri"] == reverse
     target["data"]["source_pdf_uri"] = uri.replace("ATTACH01", "OTHER001")
     assert pipeline._with_source_navigation({"media_type": "application/pdf"}, target)["source_pdf_uri"] == "zotero://open-pdf/library/items/ATTACH01"
+
+
+def test_group_navigation_uses_parent_identity_and_scope_without_guessing():
+    parent = {"key": "PARENT01", "library": {"type": "group", "id": 42}}
+    target = {"key": "PDFKEY01", "data": {"itemType": "attachment", "parentItem": "PARENT01",
+        "source_pdf_uri": "zotero://open-pdf/library/items/PDFKEY01?page=2&annotation=ANNOT001"}}
+    result = pipeline._with_source_navigation({"media_type": "application/pdf"}, target, library_item=parent)
+    assert result["zotero_item_uri"] == "zotero://select/groups/42/items/PARENT01"
+    assert result["source_pdf_uri"] == "zotero://open-pdf/groups/42/items/PDFKEY01"
+    target["library"] = {"type": "group", "id": 99}
+    assert pipeline._with_source_navigation({"media_type": "application/pdf"}, target, library_item=parent) == {"media_type": "application/pdf"}
+    target["library"] = {"type": "group", "id": "invalid"}
+    assert pipeline._with_source_navigation({"media_type": "application/pdf"}, target) == {"media_type": "application/pdf"}
 
 
 def test_new_source_bundle_keeps_analysis_without_legacy_anchor_validation(monkeypatch):

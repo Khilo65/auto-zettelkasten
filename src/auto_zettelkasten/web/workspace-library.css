@@ -1,0 +1,42 @@
+.zotero-library-panel { flex: 1; min-height: 0; overflow: auto; padding: 8px; color: var(--workspace-ink); font-size: 12px; }
+.zotero-library-toolbar { display: flex; flex-wrap: wrap; gap: 5px; }
+.zotero-library-panel button { border: 1px solid var(--workspace-line); border-radius: 4px; background: transparent; padding: 4px 7px; font: inherit; text-align: left; }
+.zotero-library-panel button:hover:not(:disabled) { background: var(--workspace-selection); }
+.zotero-library-panel button:disabled { opacity: .5; cursor: default; }
+.zotero-library-panel input, .zotero-library-panel select, .zotero-library-panel textarea { font: inherit; color: inherit; background: var(--workspace-paper); border: 1px solid var(--workspace-line); border-radius: 4px; padding: 6px; min-width: 0; max-width: 100%; }
+.zotero-library-select { width: 100%; }
+.zotero-library-notice { color: var(--workspace-muted); margin: 8px 3px; line-height: 1.5; overflow-wrap: anywhere; }
+.zotero-library-notice.is-error, .zotero-form-error { color: #a23546; }
+.zotero-library-search { display: flex; gap: 4px; margin: 10px 0; }
+.zotero-library-search input { flex: 1; width: 100%; }
+.zotero-library-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-weight: 600; padding: 10px 4px 5px; }
+.zotero-library-section-heading > span:first-child { overflow-wrap: anywhere; }
+.zotero-count { color: var(--workspace-muted); white-space: nowrap; font-weight: 400; }
+.zotero-library-collections { max-height: 28vh; overflow: auto; }
+.zotero-library-panel .zotero-collection-row { width: 100%; display: block; border: 0; padding: 5px 8px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.zotero-collection-row[aria-current="true"] { color: var(--workspace-accent); background: var(--workspace-selection); }
+.zotero-library-panel .zotero-collection-row[data-depth="1"] { padding-left: 20px; }
+.zotero-library-panel .zotero-collection-row[data-depth="2"] { padding-left: 32px; }
+.zotero-library-panel .zotero-collection-row[data-depth="3"] { padding-left: 44px; }
+.zotero-library-panel .zotero-collection-row[data-depth="4"] { padding-left: 56px; }
+.zotero-library-panel .zotero-collection-row[data-depth="5"] { padding-left: 68px; }
+.zotero-library-panel .zotero-collection-row[data-depth="6"] { padding-left: 80px; }
+.zotero-library-panel .zotero-collection-row[data-depth="7"] { padding-left: 92px; }
+.zotero-library-panel .zotero-collection-row[data-depth="8"] { padding-left: 104px; }
+.zotero-item-row { padding: 3px 0 7px; }
+.zotero-library-panel .zotero-item-title { display: block; width: 100%; border: 0; line-height: 1.45; padding: 5px 7px; overflow-wrap: anywhere; }
+.zotero-item-title[aria-expanded="true"] { background: var(--workspace-selection); color: var(--workspace-accent); }
+.zotero-item-status { display: block; padding: 0 7px; font-size: 11px; color: var(--workspace-muted); line-height: 1.5; margin: 2px 0; }
+.zotero-library-details { border-top: 1px solid var(--workspace-line); margin-top: 12px; padding: 8px 3px 24px; }
+.zotero-library-details h3 { font-size: 13px; font-weight: 600; line-height: 1.5; margin: 6px 0 10px; overflow-wrap: anywhere; }
+.zotero-library-details > button { display: block; width: 100%; margin: 5px 0; overflow-wrap: anywhere; }
+.zotero-html-note { padding: 8px 0; font-size: 12px; line-height: 1.6; }
+.zotero-html-note summary { cursor: pointer; }
+.zotero-html-note > div { white-space: pre-wrap; overflow-wrap: anywhere; padding: 8px 0; }
+.zotero-field { display: grid; gap: 4px; margin: 9px 0; }
+.zotero-field textarea { resize: vertical; min-height: 72px; }
+.zotero-library-form fieldset { min-width: 0; border: 1px solid var(--workspace-line); margin: 12px 0; padding: 8px; }
+.zotero-membership { display: flex; gap: 6px; align-items: baseline; line-height: 1.5; margin: 6px 0; overflow-wrap: anywhere; }
+.zotero-membership input { flex: 0 0 auto; }
+.zotero-form-actions { display: flex; gap: 6px; margin: 10px 0; }
+.zotero-form-error { line-height: 1.5; overflow-wrap: anywhere; }

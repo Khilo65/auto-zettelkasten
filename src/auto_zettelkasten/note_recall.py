@@ -12,6 +12,7 @@ import json
 import math
 from numbers import Real
 from pathlib import Path
+import re
 import struct
 import threading
 import shutil
@@ -20,7 +21,7 @@ from typing import Any, Mapping
 
 from .documents import DocumentError, DocumentIndexChanged, DocumentService
 from .hybrid_search import HybridSearchIndex
-from .mapping_text import CLEANING_VERSION, prepare_embedding_spans
+from .mapping_text import CLEANING_VERSION, prepare_embedding_spans, prepare_note_embedding_spans
 
 
 _MAX_CACHE_BYTES = 128 * 1024 * 1024
@@ -103,9 +104,19 @@ def _unit(values):
     return [float(v) / norm for v in values]
 
 
-def _corpus(snapshot, *, instance_id=None, library_id=None):
-    candidates, raw_by_source, excluded = [], {}, Counter()
+def _semantic_fingerprint(text):
+    # Blank separators around an inserted managed block are presentation. Keep
+    # substantive characters and indentation intact, including code examples.
+    return _sha(re.sub(r"\n(?:[ \t]*\n)+", "\n\n", text.replace("\r\n", "\n")).strip())
+
+
+def _corpus(snapshot, *, instance_id=None, library_id=None, annotation_snapshots=None):
+    candidates, raw_by_source, excluded, paths = [], {}, Counter(), set()
     for document in snapshot["documents"]:
+        if document["path"] in paths:
+            excluded["duplicate_path"] += 1
+            continue
+        paths.add(document["path"])
         fields = document["frontmatter"]
         scope = document["source_coverage"]["status"]
         if document["navigation"]:
@@ -121,37 +132,106 @@ def _corpus(snapshot, *, instance_id=None, library_id=None):
             excluded["different_source_scope"] += 1
             continue
         raw = document["text"]
-        clean = prepare_embedding_spans(raw)
+        receipt = (annotation_snapshots or {}).get(document["path"], {})
+        annotation_hash = receipt.get("block_hash")
+        clean = prepare_note_embedding_spans(raw, annotation_hash=annotation_hash) if annotation_hash else prepare_embedding_spans(raw)
         text = "".join(span["text"] for span in clean["spans"])
+        annotations = []
+        if annotation_hash:
+            from .zotero_annotations import annotation_recall_records, verified_annotation_span
+            if verified_annotation_span(raw, annotation_hash):
+                try:
+                    annotations = annotation_recall_records(receipt.get("groups", []))
+                except (ValueError, TypeError, KeyError):
+                    # A broken receipt cannot hide authored text or confer
+                    # source provenance on an invalid annotation snapshot.
+                    clean = prepare_embedding_spans(raw)
+                    text = "".join(span["text"] for span in clean["spans"])
         if not text.strip():
             excluded["empty_substantive_text"] += 1
             continue
         supplied = fields.get("source_id")
         sid = supplied if isinstance(supplied, str) and 0 < len(supplied) <= 256 else "note-" + _sha(document["path"])
-        candidates.append((sid, document, text, clean))
+        candidates.append((sid, document, text, clean, annotations))
     counts = Counter(row[0] for row in candidates)
     rows = []
-    for sid, document, text, clean in candidates:
+    for sid, document, text, clean, annotations in candidates:
         fields = document["frontmatter"]
         if counts[sid] > 1:
             sid = "note-" + _sha(document["path"])
         title = document.get("personal_display_title") or fields.get("title")
         title = title[:1000] if isinstance(title, str) and title.strip() else Path(document["path"]).stem[:1000]
+        semantic_text = text
+        annotation_ranges = []
+        for record in annotations:
+            quoted = record["quote"].strip()
+            comment = record["comment"].strip()
+            if not quoted and not comment:
+                continue
+            start = len(text)
+            text += "\n\n" + ("Source quotation: " + quoted if quoted else "")
+            text += ("\nPersonal comment: " + comment) if comment else ""
+            annotation_ranges.append({"start": start, "end": len(text), "record": record})
         row = {"source_id": sid, "title": title, "text": text, "content_sha256": _sha(text),
                "note_path": document["path"], "coverage": {**document["source_coverage"],
                    "input_representation": "full_note", "cleaning_version": CLEANING_VERSION,
-                   "note_content_sha256": _sha(raw), "excerpt_basis": "cleaned_note_text"}}
+                   "note_content_sha256": _sha(raw), "excerpt_basis":
+                   "source_summary_and_confirmed_annotations" if annotations else "cleaned_note_text"}}
         nid = fields.get("note_id")
         if isinstance(nid, str) and 0 < len(nid) <= 256:
             row["note_id"] = nid
         rows.append(row)
         raw_by_source[sid] = {"text": document["text"], "sha256": _sha(document["text"]),
-                              "clean": clean, "path": document["path"]}
+                              "clean": clean, "path": document["path"],
+                              "semantic_sha256": _semantic_fingerprint(semantic_text),
+                              "source_content_sha256": _sha(semantic_text),
+                              "annotation_ranges": annotation_ranges}
+        baseline = document.get("semantic_baseline_text")
+        if isinstance(baseline, str):
+            baseline_clean = prepare_embedding_spans(baseline)
+            baseline_text = "".join(span["text"] for span in baseline_clean["spans"])
+            if _semantic_fingerprint(baseline_text) == raw_by_source[sid]["semantic_sha256"]:
+                raw_by_source[sid]["mapping_baseline"] = {"text": baseline, "sha256": _sha(baseline),
+                                                        "clean": baseline_clean, "path": document["path"]}
     return rows, raw_by_source, dict(excluded)
 
 
 def _snapshot_identity(snapshot):
     return [(row["path"], row["revision"]) for row in snapshot["documents"]]
+
+
+def _annotation_pointers(result, raw_sources, max_chars):
+    """Attach locators only for confirmed annotation passages in the excerpt."""
+    while True:
+        for note in result["notes"]:
+            note.pop("annotation_pointers", None)
+            refs = []
+            for entry in raw_sources[note["source_id"]].get("annotation_ranges", []):
+                if entry["start"] < note["excerpt_end"] and entry["end"] > note["excerpt_start"]:
+                    record = entry["record"]
+                    refs.append({key: record[key] for key in ("scope", "attachment_key", "annotation_key",
+                                "page_index", "page_label", "uri", "type", "version")})
+            if refs:
+                note["annotation_pointers"] = refs
+        paths = {note["note_path"] for note in result["notes"]}
+        result["relationships"] = [row for row in result["relationships"]
+                                   if row["source"] in paths and row["target"] in paths]
+        size = len(_json({key: result[key] for key in ("notes", "relationships")}))
+        if size <= max_chars:
+            result["chars"] = size
+            if "saved_relationships_included" in result["provenance"]:
+                result["provenance"]["saved_relationships_included"] = len(result["relationships"])
+            return result
+        result["truncated"] = True
+        if not result["notes"]:
+            raise ValueError("Recall allowance cannot fit the evidence packet.")
+        note = result["notes"][-1]
+        length = max(0, len(note["text"]) - (size - max_chars))
+        if not length:
+            result["notes"].pop()
+        else:
+            note["text"] = note["text"][:length]
+            note["excerpt_end"] = note["excerpt_start"] + length
 
 
 class NoteRecallService:
@@ -160,9 +240,10 @@ class NoteRecallService:
     ``encoder_factory(options, cache_directory)`` is injectable for offline
     tests. Source embeddings are reused, never created as a search side effect.
     """
-    def __init__(self, *, encoder_factory=None, override_root=None):
+    def __init__(self, *, encoder_factory=None, override_root=None, annotation_resolver=None):
         self._lock = threading.RLock()
         self._factory = encoder_factory
+        self.annotation_resolver = annotation_resolver
         self._documents = DocumentService(override_root=override_root or _DEFAULT_OVERRIDES)
         self._workspace = None
         self._workspace_id = None
@@ -213,9 +294,15 @@ class NoteRecallService:
 
     @staticmethod
     def _note_vector_key(row, raw, embedding_identity):
+        return _digest({"key_version": 2, "embedding_identity": embedding_identity,
+                        "source_id": row["source_id"], "note_path": row["note_path"],
+                        "semantic_sha256": raw["semantic_sha256"]})
+
+    @staticmethod
+    def _legacy_vector_key(row, raw, embedding_identity):
         return _digest({"embedding_identity": embedding_identity, "source_id": row["source_id"],
                         "note_path": row["note_path"], "note_content_sha256": raw["sha256"],
-                        "content_sha256": row["content_sha256"]})
+                        "content_sha256": raw["source_content_sha256"]})
 
     def _dedicated_semantic(self, root, corpus, raw_sources, model_path):
         reader = _CacheReader(root)
@@ -235,20 +322,44 @@ class NoteRecallService:
         vector_directory = _safe_path(root, Path(".auto-zettelkasten/recall/vectors") / record["embedding_identity"])
         if vector_directory.is_dir():
             reader.stamps[str(vector_directory)] = _stamp(vector_directory)
+        legacy = None
         vectors, invalid = {}, 0
         for row in corpus:
-            key = self._note_vector_key(row, raw_sources[row["source_id"]], record["embedding_identity"])
+            raw = raw_sources[row["source_id"]]
+            key = self._note_vector_key(row, raw, record["embedding_identity"])
             relative = Path(".auto-zettelkasten/recall/vectors") / record["embedding_identity"] / (key + ".json")
             if not _safe_path(root, relative).is_file():
-                continue
-            try:
+                # Old receipts remain immutable. A metadata-only edit changes
+                # their byte key, but identical cleaned text still binds the
+                # vector. Validate the historical key and receipt below.
+                if legacy is None:
+                    legacy = {}
+                    for scanned, old in enumerate(sorted(vector_directory.glob("*.json"))):
+                        if scanned >= 20_000:
+                            raise ValueError("note_recall_legacy_inventory_limit")
+                        value = reader.object(old.relative_to(root), 64 * 1024)
+                        if value.get("key_version") is None:
+                            legacy[(value.get("source_id"), value.get("note_path"), value.get("content_sha256"))] = (old, value)
+                found = legacy.get((row["source_id"], row["note_path"], raw["source_content_sha256"]))
+                if found is None:
+                    continue
+                old, vector_record = found
+                key, relative = old.stem, old.relative_to(root)
+            else:
                 vector_record = reader.object(relative, 64 * 1024)
+            try:
                 payload = {k: v for k, v in vector_record.items() if k != "record_sha256"}
                 if (vector_record.get("record_sha256") != _digest(payload)
                         or payload.get("key") != key or payload.get("embedding_identity") != record["embedding_identity"]
-                        or payload.get("source_id") != row["source_id"] or payload.get("content_sha256") != row["content_sha256"]
-                        or payload.get("note_content_sha256") != raw_sources[row["source_id"]]["sha256"]
+                        or payload.get("source_id") != row["source_id"]
                         or payload.get("note_path") != row["note_path"] or len(payload.get("vector", [])) != encoder.dimension):
+                    raise ValueError("stale_note_vector")
+                if payload.get("key_version") == 2:
+                    if payload.get("semantic_sha256") != raw["semantic_sha256"] or key != self._note_vector_key(row, raw, record["embedding_identity"]):
+                        raise ValueError("stale_note_vector")
+                elif (payload.get("key_version") is not None
+                      or payload.get("content_sha256") != raw["source_content_sha256"]
+                      or key != self._legacy_vector_key(row, {**raw, "sha256": payload.get("note_content_sha256")}, record["embedding_identity"])):
                     raise ValueError("stale_note_vector")
                 values = payload["vector"]
                 if any(isinstance(v, bool) or not isinstance(v, Real) or not math.isfinite(v) for v in values):
@@ -272,7 +383,21 @@ class NoteRecallService:
         if _safe_path(root, ".auto-zettelkasten/recall/identity.json").is_file():
             if not model_path:
                 return {}, None, {"status": "unavailable", "reason": "local_model_not_configured", "source_count": 0}
-            return self._dedicated_semantic(root, corpus, raw_sources, model_path)
+            vectors, encoder, status = self._dedicated_semantic(root, corpus, raw_sources, model_path)
+            if len(vectors) < len(corpus) and _safe_path(root, ".auto-zettelkasten/mapping/result.json").is_file():
+                try:
+                    previous, _, mapped_status = self._mapped_semantic(root, raw_sources, model_path)
+                    if mapped_status.get("embedding_identity") == status.get("embedding_identity"):
+                        reused = len(set(previous) - set(vectors))
+                        vectors = {**previous, **vectors}
+                        status = {**status, "source_count": len(vectors),
+                                  "status": "complete" if len(vectors) == len(corpus) else "partial",
+                                  "mapped_vectors_reused": reused}
+                except (OSError, ValueError, RuntimeError, ImportError, KeyError, TypeError):
+                    # A damaged historical cache cannot invalidate current
+                    # independently verified note-vector checkpoints.
+                    pass
+            return vectors, encoder, status
         return self._mapped_semantic(root, raw_sources, model_path)
 
     def _mapped_semantic(self, root, raw_sources, model_path):
@@ -324,6 +449,7 @@ class NoteRecallService:
             current = raw_sources.get(sid)
             if current is None:
                 continue
+            current = current.get("mapping_baseline", current)
             if (source.get("full_text_sha256") != current["sha256"] or source.get("note_path") != current["path"]
                     or source.get("embedding_text_sha256") != _digest([span["text"] for span in current["clean"]["spans"]])):
                 excluded["stale_or_different_note_text"] += 1
@@ -374,9 +500,19 @@ class NoteRecallService:
         return vectors, encoder, status
 
     def _corpus_for(self, root, snapshot, instance_id=None, library_id=None):
-        key = (str(root), tuple(_snapshot_identity(snapshot)), instance_id, library_id)
+        annotations = {}
+        if self.annotation_resolver is not None:
+            for row in snapshot["documents"]:
+                try:
+                    receipt = self.annotation_resolver(root, row["path"])
+                except (OSError, ValueError):
+                    receipt = None
+                if isinstance(receipt, Mapping) and receipt:
+                    annotations[row["path"]] = receipt
+        key = (str(root), tuple(_snapshot_identity(snapshot)), instance_id, library_id, _digest(annotations))
         if not self._corpus_cache or self._corpus_cache[0] != key:
-            self._corpus_cache = (key, _corpus(snapshot, instance_id=instance_id, library_id=library_id))
+            self._corpus_cache = (key, _corpus(snapshot, instance_id=instance_id, library_id=library_id,
+                                            annotation_snapshots=annotations))
             self._search_cache = None
         return self._corpus_cache[1]
 
@@ -409,7 +545,7 @@ class NoteRecallService:
 
     def prepare(self, workspace, *, model_path="", documents=None, workspace_id=None,
                 max_wall_seconds=600., min_free_disk_bytes=1024 ** 3, max_cache_bytes=1024 ** 3,
-                progress=None):
+                progress=None, max_changed_notes=None, source_ids=None):
         """Explicitly build local note vectors, checkpointing each complete note.
 
         No original documents or graph are written. Search can use completed
@@ -424,6 +560,11 @@ class NoteRecallService:
             raise ValueError("Invalid local recall indexing resource limits.")
         if not isinstance(model_path, str) or "\x00" in model_path or len(model_path) > 4096:
             raise ValueError("The local model path is invalid.")
+        if max_changed_notes is not None and (type(max_changed_notes) is not int or not 1 <= max_changed_notes <= 64):
+            raise ValueError("Incremental indexing admits 1–64 changed notes per refresh.")
+        if source_ids is not None and (not isinstance(source_ids, (list, tuple, set, frozenset))
+                or len(source_ids) > 64 or any(not isinstance(sid, str) or not 0 < len(sid) <= 256 for sid in source_ids)):
+            raise ValueError("Incremental indexing requires at most 64 source identities.")
         with self._lock:
             root, documents, workspace_id = self._open_documents(workspace, documents, workspace_id)
             snapshot = documents.recall_corpus(workspace_id)
@@ -465,6 +606,10 @@ class NoteRecallService:
                         if sid in cached:
                             reused += 1; completed += 1
                             continue
+                        if source_ids is not None and sid not in source_ids:
+                            continue
+                        if max_changed_notes is not None and completed - reused >= max_changed_notes:
+                            raise RuntimeError("local_recall_changed_note_limit")
                         source = raw_sources[sid]
                         chunks = _semantic_chunks(source["text"], source["clean"]["spans"], encoder.tokenizer, 256)
                         if not chunks or len(chunks) > 10_000 or chunks_encoded + len(chunks) > 100_000:
@@ -481,8 +626,9 @@ class NoteRecallService:
                             check()
                         vector = _unit([sum(v[i] for v in values) / len(values) for i in range(encoder.dimension)])
                         key = self._note_vector_key(row, source, identity)
-                        record = {"key": key, "embedding_identity": identity, "source_id": sid,
-                                  "note_path": row["note_path"], "content_sha256": row["content_sha256"],
+                        record = {"key": key, "key_version": 2, "embedding_identity": identity, "source_id": sid,
+                                  "note_path": row["note_path"], "content_sha256": source["source_content_sha256"],
+                                  "semantic_sha256": source["semantic_sha256"],
                                   "note_content_sha256": source["sha256"], "vector": vector}
                         record["record_sha256"] = _digest(record)
                         serialized = _json(record) + "\n"
@@ -494,7 +640,7 @@ class NoteRecallService:
                         if progress:
                             progress({"phase": "indexing_notes", "completed": completed, "total": len(corpus)})
                 except RuntimeError as exc:
-                    if str(exc) not in {"local_recall_wall_limit", "local_recall_free_disk_limit", "local_recall_cache_limit", "local_recall_chunk_limit"}:
+                    if str(exc) not in {"local_recall_wall_limit", "local_recall_free_disk_limit", "local_recall_cache_limit", "local_recall_chunk_limit", "local_recall_changed_note_limit"}:
                         raise
                     stop_reason = str(exc)
                 if _snapshot_identity(documents.recall_corpus(workspace_id)) != _snapshot_identity(snapshot):
@@ -570,6 +716,7 @@ class NoteRecallService:
                 result["relationships"] = [row for row in selected if row["source"] in paths and row["target"] in paths]
                 result["chars"] = len(_json({k: result[k] for k in ("notes", "relationships")}))
                 result["provenance"]["saved_relationships_included"] = len(result["relationships"])
+            result = _annotation_pointers(result, raw_sources, max_chars)
             if _snapshot_identity(documents.recall_corpus(workspace_id)) != _snapshot_identity(snapshot):
                 raise DocumentIndexChanged()
             coverage = {"note_count": len(snapshot["documents"]), "searchable_note_count": len(corpus),
@@ -592,7 +739,10 @@ def _default_service():
     global _SERVICE
     with _SERVICE_LOCK:
         if _SERVICE is None:
-            _SERVICE = NoteRecallService()
+            from .zotero_workspace_service import read_annotation_snapshot
+            private_root = Path.home() / ".config/auto-zettelkasten/zotero-workspace"
+            _SERVICE = NoteRecallService(annotation_resolver=lambda workspace, path:
+                read_annotation_snapshot(private_root, workspace, path))
         return _SERVICE
 
 

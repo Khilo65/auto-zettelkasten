@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import mimetypes
 import os
 import re
 import secrets
@@ -26,6 +27,7 @@ from .readers import (ProviderError, _codex_environment, _codex_executable,
                       _attach_codex_process_job, _close_codex_process_job,
                       _redact_codex_diagnostic, codex_preflight_status)
 from .zotero import ZoteroLocalClient, _api_collection_path
+from .zotero_workspace import ZoteroWorkspaceError
 
 _POLICY = LiteratureMappingPolicy(cluster_generation_enabled=False)
 _GRAPH_PREFERENCES_DEFAULT = {"version": 1, "colorBy": "none",
@@ -158,7 +160,7 @@ def pick_folder(kind: str) -> str:
 
 
 class LocalApp:
-    def __init__(self, *, preferences_path: Path | None = None, client: Any = None, folder_picker: Callable[[str], str] | None = None):
+    def __init__(self, *, preferences_path: Path | None = None, client: Any = None, folder_picker: Callable[[str], str] | None = None, zotero_client: Any = None, zotero_writes_enabled: bool = False):
         self.lock = threading.RLock()
         self.token = secrets.token_urlsafe(32)
         self.client = client or ZoteroLocalClient()
@@ -200,7 +202,39 @@ class LocalApp:
         )
         from .note_recall import NoteRecallService
 
-        self.note_recall = NoteRecallService()
+        from .zotero_workspace_service import ZoteroWorkspaceService
+        self.zotero_workspace = ZoteroWorkspaceService(self.documents, self.preferences_path.parent / "zotero-workspace", client=zotero_client, writes_enabled=zotero_writes_enabled)
+        self.note_recall = NoteRecallService(annotation_resolver=self.zotero_workspace.annotation_snapshot)
+        from .incremental_notes import IncrementalNoteDiscovery
+        self.incremental_notes = IncrementalNoteDiscovery(self.preferences_path.parent / "incremental-notes", recall=self.note_recall)
+        self._discovery_queued = set()
+        self._document_revisions = {}
+        self.discovery_error = ""
+
+    def _queue_discovery(self, workspace_id):
+        if workspace_id in self._discovery_queued:
+            return
+        self._discovery_queued.add(workspace_id)
+        def enqueue():
+            try:
+                workspace = self.documents.workspace_path(workspace_id)
+                self.incremental_notes.enqueue(workspace, documents=self.documents, workspace_id=workspace_id)
+                self.discovery_error = ""
+            except (ValueError, RuntimeError, OSError) as exc:
+                self.discovery_error = str(exc)
+            finally:
+                self._discovery_queued.discard(workspace_id)
+        worker = threading.Timer(.75, enqueue)
+        worker.daemon = True
+        worker.start()
+
+    def _remember_document(self, workspace_id, document):
+        key = (workspace_id, document["path"])
+        previous = self._document_revisions.get(key)
+        self._document_revisions[key] = document["revision"]
+        if previous and previous != document["revision"]:
+            self._queue_discovery(workspace_id)
+        return document
 
     def _editable(self):
         if self.run["status"] == "running" or self.auth["status"] == "pending":
@@ -295,6 +329,25 @@ class LocalApp:
 
     def handle(self, method: str, route: str, data: dict | None = None):
         data = data or {}
+        if method == "POST" and route.startswith("/api/zotero/"):
+            try:
+                return self.zotero_workspace.handle(route.removeprefix("/api/zotero/"), data)
+            except (DocumentConflict, DocumentIndexChanged):
+                raise
+            except (ValueError, OSError) as exc:
+                raise RequestError(str(exc)) from exc
+        if method == "POST" and route in {"/api/workspace/discovery-refresh", "/api/workspace/discovery-projection", "/api/workspace/communities-refresh"}:
+            try:
+                if set(data) != {"workspace_id"}:
+                    raise RequestError("Discovery requires the selected workspace only.")
+                workspace_id = data["workspace_id"]
+                workspace = self.documents.workspace_path(workspace_id)
+                if route.endswith("discovery-projection"):
+                    return self.incremental_notes.projection(workspace, documents=self.documents, workspace_id=workspace_id)
+                fn = self.incremental_notes.refresh_communities if route.endswith("communities-refresh") else self.incremental_notes.refresh
+                return fn(workspace, documents=self.documents, workspace_id=workspace_id, model_path=self.embedding_model_path)
+            except (DocumentError, ValueError, RuntimeError, OSError) as exc:
+                raise RequestError(str(exc)) from exc
         if method == "POST" and route in {"/api/workspace/recall", "/api/workspace/recall-index"}:
             # Local encoding can take longer than file operations. Capture the
             # opened workspace under the app lock, then let search use its own
@@ -450,13 +503,17 @@ class LocalApp:
                 self._editable()
                 return self.documents.apply_relocation(workspace_id, data.get("token"), data.get("repair"), data.get("patches"))
             if route == "/api/workspace/read":
-                return {"document": self.documents.read(workspace_id, data.get("path"))}
+                return {"document": self._remember_document(workspace_id, self.documents.read(workspace_id, data.get("path")))}
             if route == "/api/workspace/save":
                 self._editable()
-                return {"document": self.documents.save(workspace_id, data.get("document_id"), data.get("revision"), data.get("text"))}
+                document = self.documents.save(workspace_id, data.get("document_id"), data.get("revision"), data.get("text"))
+                self._queue_discovery(workspace_id)
+                return {"document": self._remember_document(workspace_id, document)}
             if route == "/api/workspace/save-override":
                 self._editable()
-                return {"document": self.documents.save_override(workspace_id, data.get("document_id"), data.get("revision"), data.get("text"))}
+                document = self.documents.save_override(workspace_id, data.get("document_id"), data.get("revision"), data.get("text"))
+                self._queue_discovery(workspace_id)
+                return {"document": self._remember_document(workspace_id, document)}
             if route == "/api/workspace/save-personal-metadata":
                 self._editable()
                 if set(data) - {"workspace_id", "document_id", "revision", "display_title", "personal_properties"}:
@@ -709,9 +766,53 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Content-Security-Policy", f"default-src 'self'; style-src 'self' 'nonce-{self.server.app.token}'; script-src 'self'; connect-src 'self'; img-src 'none'; object-src 'none'; frame-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+        if self.path.split("?", 1)[0].startswith("/zotero-reader"):
+            self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self' blob:; img-src 'self' data: blob:; font-src 'self' data: blob:; worker-src 'self' blob:; object-src 'none'; frame-src 'self'; frame-ancestors 'self'; base-uri 'self'; form-action 'none'")
+        else:
+            self.send_header("Content-Security-Policy", f"default-src 'self'; style-src 'self' 'nonce-{self.server.app.token}'; script-src 'self'; connect-src 'self'; img-src 'none'; object-src 'none'; frame-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
         self.end_headers()
         self.wfile.write(body)
+
+    def _pdf(self, token):
+        """Stream an attachment-scoped capability; never accept a client path."""
+        try:
+            pdf = self.server.app.zotero_workspace.pdf_capability(token)
+            fd = os.open(pdf.path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(fd, "rb") as stream:
+                info = os.fstat(stream.fileno())
+                self.server.app.zotero_workspace.validate_pdf_stream(token, info)
+                current = pdf.path.stat()
+                if (info.st_size, info.st_mtime_ns, info.st_ino, info.st_dev) != (pdf.size, pdf.mtime_ns, current.st_ino, current.st_dev):
+                    raise ValueError("The PDF changed. Reopen its source attachment.")
+                start, end, status = 0, info.st_size - 1, 200
+                request_range = self.headers.get("Range")
+                if request_range:
+                    match = re.fullmatch(r"bytes=(\d*)-(\d*)", request_range)
+                    if not match or not any(match.groups()):
+                        self._reply(416, {"error": "Unsupported byte range."}); return
+                    if match[1]:
+                        start = int(match[1]); end = min(end, int(match[2])) if match[2] else end
+                    else:
+                        start = max(0, info.st_size - int(match[2]))
+                    if start > end or start >= info.st_size:
+                        self.send_response(416); self.send_header("Content-Range", f"bytes */{info.st_size}"); self.send_header("Content-Length", "0"); self.end_headers(); return
+                    status = 206
+                self.send_response(status)
+                self.send_header("Content-Type", "application/pdf")
+                self.send_header("Content-Length", str(end - start + 1))
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Referrer-Policy", "no-referrer")
+                if status == 206: self.send_header("Content-Range", f"bytes {start}-{end}/{info.st_size}")
+                self.end_headers(); stream.seek(start)
+                remaining = end - start + 1
+                while remaining:
+                    chunk = stream.read(min(65536, remaining))
+                    if not chunk: break
+                    self.wfile.write(chunk); remaining -= len(chunk)
+        except (ValueError, OSError) as exc:
+            self._reply(409, {"error": str(exc)})
 
     def _handle(self):
         port = self.server.server_port
@@ -722,6 +823,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         route = self.path.split("?", 1)[0]
         try:
+            pdf_route = re.fullmatch(r"/api/zotero/attachments/([A-Za-z0-9_-]{16,256})/file", route)
+            if pdf_route and self.command == "GET":
+                self._pdf(pdf_route[1])
+                return
             if route.startswith("/api/"):
                 if not secrets.compare_digest(self.headers.get("X-Session-Token", ""), self.server.app.token):
                     self._reply(403, {"error": "Invalid local session."})
@@ -734,7 +839,7 @@ class Handler(BaseHTTPRequestHandler):
                         length = int(self.headers.get("Content-Length", "0"))
                     except ValueError:
                         raise RequestError("Invalid request length.")
-                    limit = 6 * 1024 * 1024 + 16384 if route in {"/api/workspace/save", "/api/workspace/save-override", "/api/workspace/relocate"} else 16384
+                    limit = 6 * 1024 * 1024 + 16384 if route in {"/api/workspace/save", "/api/workspace/save-override", "/api/workspace/relocate"} else 2 * 1024 * 1024 if route.startswith("/api/zotero/annotation-") else 65536 if route.startswith("/api/zotero/") else 16384
                     if not 0 < length <= limit:
                         raise RequestError("Request too large or empty.")
                     try:
@@ -756,6 +861,18 @@ class Handler(BaseHTTPRequestHandler):
                 "/workspace-graph-worker.js": ("workspace-graph-worker.js", "text/javascript; charset=utf-8"),
                 "/workspace-licenses.txt": ("workspace-licenses.txt", "text/plain; charset=utf-8"),
             }
+            for name in ("workspace-library.js", "workspace-library.css", "workspace-source-reader.js", "zotero-reader-host.html", "zotero-reader-host.js"):
+                assets["/" + name] = (name, mimetypes.guess_type(name)[0] or "application/octet-stream")
+            if self.command == "GET" and route.startswith("/zotero-reader/"):
+                parts = route.lstrip("/").split("/")
+                if any(not re.fullmatch(r"[A-Za-z0-9_.@-]+", part) or part in {".", ".."} for part in parts):
+                    self._reply(404, {"error": "Not found."}); return
+                path = Path(__file__).parent / "web" / Path(*parts)
+                base = Path(__file__).parent / "web" / "zotero-reader"
+                if (not path.is_file() or any(part.is_symlink() for part in (path, *path.parents) if part != base.parent and part.is_relative_to(base)) or not path.resolve().is_relative_to(base.resolve())):
+                    self._reply(404, {"error": "Not found."}); return
+                self._reply(200, path.read_bytes(), mimetypes.guess_type(path.name)[0] or "application/octet-stream")
+                return
             if self.command != "GET" or route not in assets:
                 self._reply(404, {"error": "Not found."})
                 return
@@ -765,6 +882,9 @@ class Handler(BaseHTTPRequestHandler):
                 body = body.replace(b"__SESSION_TOKEN__", self.server.app.token.encode())
                 body = body.replace(b"__DESKTOP_SHELL__", b"true" if self.server.app.view_zoom else b"false")
             self._reply(200, body, content_type)
+        except ZoteroWorkspaceError as exc:
+            status = 409 if exc.status == 412 or exc.code in {"version_conflict", "write_uncertain"} else exc.status if exc.status in {401, 403, 404, 409, 429, 503} else 400
+            self._reply(status, {"error": str(exc), "code": exc.code})
         except DocumentConflict as exc:
             self._reply(409, {"error": str(exc), "code": "conflict", "current": exc.current})
         except DocumentIndexChanged as exc:

@@ -3,7 +3,8 @@
 Writes use directory handles, exclusive temporary files and revision checks.
 These checks detect ordinary concurrent edits and path replacement; they are not
 a cross-process transaction against a writer ignoring our lock. Generated
-source files remain read-only; optional private overrides store body edits elsewhere.
+source files remain read-only unless explicitly migrated to a shared active note;
+otherwise optional private overrides store body edits elsewhere.
 """
 from __future__ import annotations
 
@@ -204,16 +205,20 @@ def _frontmatter(text: str) -> dict[str, Any]:
         return {}
 
 
-def _origin_identity(data: bytes) -> dict[str, Any]:
-    """Project four scalar identity claims without constructing private YAML graphs.
+def _origin_identity(data: bytes, *, include_source_navigation=False) -> dict[str, Any]:
+    """Project bounded scalar provenance without constructing private YAML graphs.
 
     Writer metadata can share unrelated coverage structures through aliases. Their
     events are checked and skipped, never expanded into objects or identity values.
+    Source navigation permits larger historical sidecars (1 MiB) while preserving
+    the same event/depth bounds and strict direct identity mappings.
     """
-    if len(data) > _ORIGIN_RECORD_BYTES:
+    if len(data) > (MAX_FILE_BYTES if include_source_navigation else _ORIGIN_RECORD_BYTES):
         return {}
-    wanted = {("metadata_schema_version",), ("note_path",),
-              ("frontmatter", "note_id"), ("frontmatter", "source_id")}
+    required = {("metadata_schema_version",), ("note_path",),
+                ("frontmatter", "note_id"), ("frontmatter", "source_id")}
+    optional = {("frontmatter", key) for key in ("zotero_item_key", "attachment_key", "zotero_item_uri", "source_pdf_uri")} if include_source_navigation else set()
+    wanted = required | optional
     identity_maps = {(), ("frontmatter",)}
     values = {}
     anchors, active_anchors = set(), set()
@@ -248,7 +253,14 @@ def _origin_identity(data: bytes) -> dict[str, Any]:
                     raise ValueError("Duplicate origin metadata anchor")
                 anchors.add(anchor)
             if path in wanted:
-                values[path] = string(event)
+                if path in optional and isinstance(event, yaml.ScalarEvent):
+                    tag = event.tag or resolver.resolve(yaml.ScalarNode, event.value, event.implicit)
+                    if tag == "tag:yaml.org,2002:null":
+                        return
+                value = string(event)
+                if include_source_navigation and len(value) > 4096:
+                    raise ValueError("Source navigation scalar limit")
+                values[path] = value
                 return
             if path in identity_maps and (not isinstance(event, yaml.MappingStartEvent)
                     or event.tag not in (None, "tag:yaml.org,2002:map")):
@@ -290,12 +302,11 @@ def _origin_identity(data: bytes) -> dict[str, Any]:
         walk(advance(), 1, ())
         if not isinstance(advance(), yaml.DocumentEndEvent) or not isinstance(advance(), yaml.StreamEndEvent):
             return {}
-        if set(values) != wanted:
+        if not required <= set(values):
             return {}
         return {"metadata_schema_version": values[("metadata_schema_version",)],
                 "note_path": values[("note_path",)],
-                "frontmatter": {"note_id": values[("frontmatter", "note_id")],
-                                "source_id": values[("frontmatter", "source_id")]}}
+                "frontmatter": {path[1]: value for path, value in values.items() if len(path) == 2 and path[0] == "frontmatter"}}
     except (yaml.YAMLError, UnicodeError, RecursionError, ValueError, StopIteration):
         return {}
 
@@ -574,7 +585,7 @@ class DocumentService:
     stable identifiers for UI recovery storage, not on-disk backup locations.
     """
 
-    def __init__(self, *, journal_root: Path | None = None, override_root: Path | None = None) -> None:
+    def __init__(self, *, journal_root: Path | None = None, override_root: Path | None = None, live_root: Path | None = None) -> None:
         self._root: Path | None = None
         self._root_identity: tuple[int, int, int] | None = None
         self._workspace_id = ""
@@ -586,6 +597,10 @@ class DocumentService:
         self._completed_index = None
         self._recall_snapshot = None
         self._overrides = None
+        self._live_notes = None
+        if live_root is not None or override_root is not None:
+            from .live_notes import LiveNotes
+            self._live_notes = LiveNotes(live_root or Path.home() / ".config/auto-zettelkasten/workspace-live-notes")
         if override_root is not None:
             from .document_overrides import Overrides
             self._overrides = Overrides(override_root)
@@ -652,6 +667,9 @@ class DocumentService:
 
             if previous and previous["workspace_id"] == workspace_id and previous["root_stamp"] == stamp:
                 try:
+                    if any(self._semantic_dependency_stamp(_ORIGIN_METADATA_PARTS, name) != expected
+                           for name, expected in previous.get("navigation_dependencies", {}).items()):
+                        raise DocumentIndexChanged()
                     for _ in self._index_inventory(run(), {}, previous["inventory"]):
                         pass
                     if self._index_root_stamp() == stamp:
@@ -659,6 +677,7 @@ class DocumentService:
                 except DocumentIndexChanged:
                     pass
             inventory, documents, skipped = {}, [], []
+            navigation_dependencies = {}
             total_bytes = 0
             iterator = self._index_inventory(run(), inventory)
             try:
@@ -674,9 +693,14 @@ class DocumentService:
                             raise DocumentIndexChanged()
                         text, _, newline = _decode(raw)
                         reason = self._reason(directory, text, newline)
+                        fields = _frontmatter(text)
+                        note_id = fields.get("note_id")
+                        navigation_name = f"{note_id}.yml" if isinstance(note_id, str) and re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", note_id) else None
+                        if navigation_name:
+                            navigation_dependencies[navigation_name] = self._semantic_dependency_stamp(_ORIGIN_METADATA_PARTS, navigation_name)
                         document = {"path": path, "text": text, "revision": hashlib.sha256(raw).hexdigest(),
                                     "editable": not reason, "reason": reason, "newline": newline}
-                        if self._overrides is not None:
+                        if self._overrides is not None or self._live_notes is not None:
                             document = self._override_document(document)
                         fields = _frontmatter(text)
                         document.update(_document_metadata(path, fields), frontmatter=fields)
@@ -692,13 +716,15 @@ class DocumentService:
                 iterator.close()
             for _ in self._index_inventory(run(), {}, inventory):
                 pass
-            if self._index_root_stamp() != stamp:
+            if self._index_root_stamp() != stamp or any(
+                    self._semantic_dependency_stamp(_ORIGIN_METADATA_PARTS, name) != expected
+                    for name, expected in navigation_dependencies.items()):
                 raise DocumentIndexChanged()
             result = {"documents": sorted(documents, key=lambda row: row["path"]),
                       "truncated": bool(skipped), "skipped_note_count": len(skipped),
                       "warnings": ["Some notes exceed the document size/format limit and were excluded from recall."] if skipped else []}
             self._recall_snapshot = {"workspace_id": workspace_id, "root_stamp": stamp,
-                                     "inventory": inventory, "result": result}
+                                     "inventory": inventory, "result": result, "navigation_dependencies": navigation_dependencies}
             return copy.deepcopy(result)
 
     def recall_relationships(self, workspace_id: str, note_paths: list[str]) -> list[dict[str, Any]]:
@@ -888,6 +914,22 @@ class DocumentService:
         return self._overrides.generation(self._root, self._root_identity) if self._override_location() else None
 
     def _override_document(self, document, view=None, *, guarded=False, protected=None):
+        from .live_notes import source_navigation
+        navigation = source_navigation(self, document["path"], document["text"])
+        if navigation:
+            document = {**document, "source_navigation": navigation}
+        if self._live_notes:
+            record = self._live_notes.read(self._root, self._root_identity, document["path"])
+            if record:
+                # A prepared journal has not retired the effective private edit yet.
+                if record["phase"] == "prepared" and document["revision"] == record["baseline_revision"]:
+                    effective = self._legacy_override_document(document, view, guarded=guarded, protected=protected)
+                    return {**effective, "live_note": True, "live_note_phase": "prepared", "editable": False,
+                            "override_available": False, "reason": "Shared-note migration is pending; resume it before editing."}
+                return self._live_notes.projection(record, document)
+        return self._legacy_override_document(document, view, guarded=guarded, protected=protected)
+
+    def _legacy_override_document(self, document, view=None, *, guarded=False, protected=None):
         document = {**document, **_personal_projection(document)}
         if self._overrides is None:
             return document
@@ -902,7 +944,7 @@ class DocumentService:
         if not guarded:
             try:
                 with self._overrides.guard(self._root, self._root_identity) as opened:
-                    return self._override_document(document, opened, guarded=True, protected=parts)
+                    return self._legacy_override_document(document, opened, guarded=True, protected=parts)
             except DocumentError as exc:
                 if str(exc) == "Override storage is read-only.":
                     return result
@@ -935,7 +977,7 @@ class DocumentService:
         document = {
             "id": document_id, "path": relative, "name": Path(relative).name,
             "text": text, "revision": hashlib.sha256(data).hexdigest(),
-            "editable": not reason, "reason": reason, "bom": bom,
+            "editable": not reason, "reason": reason, "bom": bom, "disk_writable": bool(info.st_mode & 0o222),
             "newline": newline, "recovery_key": recovery_key,
             **_document_metadata(relative, fields),
             "note_origin": self._note_origin(relative, fields),
@@ -1034,10 +1076,12 @@ class DocumentService:
                                 try:
                                     text, _, newline = _decode(data)
                                     row_reason = self._reason(directory, text, newline)
-                                    if self._overrides is not None:
+                                    if self._overrides is not None or self._live_notes is not None:
                                         effective = self._override_document({"path": relative, "text": text, "reason": row_reason,
                                                                              "revision": hashlib.sha256(data).hexdigest(), "newline": newline})
                                         presentation = {key: effective[key] for key in ("display_title", "personal_display_title")}
+                                        if effective.get("live_note"):
+                                            row_reason = effective.get("reason", "")
                                 except DocumentError as exc:
                                     row_reason = str(exc)
                                 if not info.st_mode & 0o222 and not row_reason:
@@ -1214,8 +1258,8 @@ class DocumentService:
         return {"path": path, "source_id": fields.get("source_id"), "note_id": fields.get("note_id"),
                 "declared_ids": {key: fields[key] for key in ("source_id", "note_id") if key in fields},
                 "revision": effective["revision"],
-                "projection_hash": canonical_revision,
-                "effective_unchanged": effective["text"] == text}
+                "projection_hash": effective.get("live_equivalent_revision") or canonical_revision,
+                "effective_unchanged": (bool(effective.get("live_equivalent_revision")) if effective.get("live_note") else effective["text"] == text)}
 
     def _project_semantic_map(self, mapping, documents):
         """Project suggestions onto owned source notes without promoting evidence links."""
@@ -1478,7 +1522,7 @@ class DocumentService:
                         markers.append(None)
             stamp = (self._root_identity, directory.engine_owned(), self._published_indexes(directory),
                      self._reason(directory), self._index_registry_stamp(), tuple(markers), self._index_semantic_stamp())
-            return (*stamp, self._override_generation()) if self._overrides is not None else stamp
+            return (*stamp, self._override_generation(), self._live_notes.generation(self._root) if self._live_notes else None) if self._overrides is not None or self._live_notes else stamp
 
     def _index_inventory(self, run, inventory, expected=None):
         pending = deque([()])
@@ -1894,9 +1938,11 @@ class DocumentService:
                                 reason = "The note is read-only."
                             row.update(editable=not reason, reason=reason)
                             document = {"path": path, "text": text, "revision": hashlib.sha256(data).hexdigest(), "editable": not reason}
-                            if self._overrides is not None:
+                            if self._overrides is not None or self._live_notes is not None:
                                 document = self._override_document({**document, "reason": reason, "newline": newline})
                             row.update({key: document[key] for key in ("display_title", "personal_display_title") if key in document})
+                            if document.get("live_note"):
+                                row.update(editable=document["editable"], reason=document.get("reason", ""))
                             effective_bytes = len(document["text"].encode("utf-8")) if self._overrides is not None else len(data)
                             if page_bytes and page_bytes + effective_bytes > INDEX_PAGE_BYTES:
                                 run["pending"] = item
@@ -2026,7 +2072,7 @@ class DocumentService:
                                         "revision": hashlib.sha256(data).hexdigest(),
                                         "editable": not reason and bool(info.st_mode & 0o222),
                                     }
-                                    if self._overrides is not None:
+                                    if self._overrides is not None or self._live_notes is not None:
                                         effective = self._override_document({**document, "reason": reason, "newline": newline})
                                         inspected_bytes += len(effective["text"].encode("utf-8")) - len(data)
                                         if inspected_bytes > MAX_TREE_BYTES:
@@ -2115,10 +2161,12 @@ class DocumentService:
         resolution = {status: sum(status in values for values in run["unresolved"].values()) for status in ("missing", "ambiguous")}
         return [run["projected"][key] for key in sorted(run["projected"])], run["warnings"], resolution
 
-    def _writable(self, directory: _Directory) -> None:
+    def _writable(self, directory: _Directory, *, live=False) -> None:
         directory.verify()
+        if live and (not _SAFE_WRITES or not os.fstat(directory.fd).st_mode & 0o222):
+            raise DocumentError("Shared Markdown storage is read-only on this filesystem.")
         reason = self._reason(directory)
-        if reason:
+        if reason and not (live and reason == _ENGINE_REASON):
             raise DocumentError(reason)
         assert directory.fd is not None
         os.fsync(directory.fd)
@@ -2153,6 +2201,9 @@ class DocumentService:
                     raise DocumentConflict(current)
                 if not current["editable"]:
                     raise DocumentError(current["reason"])
+                if current.get("live_note"):
+                    record = self._live_notes.read(self._root, self._root_identity, relative)
+                    self._live_notes.validate(record, text)
                 normalized = text.replace("\r\n", "\n")
                 if current["newline"] == "crlf":
                     normalized = normalized.replace("\n", "\r\n")
@@ -2162,7 +2213,7 @@ class DocumentService:
                     raise DocumentError("The text cannot be encoded as UTF-8.") from exc
                 if len(data) > MAX_FILE_BYTES:
                     raise DocumentError("The note exceeds the 1 MiB document limit.")
-                self._writable(directory)
+                self._writable(directory, live=bool(current.get("live_note")))
                 if hashlib.sha256(data).hexdigest() == revision:
                     return current
                 temporary = f".az-{secrets.token_hex(16)}.tmp"
@@ -2180,7 +2231,7 @@ class DocumentService:
                     latest = self._document(relative, directory)
                     if latest["revision"] != revision or self._documents[document_id][1] != opened_identity:
                         raise DocumentConflict(latest)
-                    self._writable(directory)
+                    self._writable(directory, live=bool(current.get("live_note")))
                     if _stamp(directory.stat(temporary)) != _stamp(os.fstat(fd)):
                         raise DocumentError("The save temporary file changed.")
                     os.replace(temporary, parts[-1], src_dir_fd=directory.fd, dst_dir_fd=directory.fd)
@@ -2198,6 +2249,11 @@ class DocumentService:
                         pass
 
     def save_override(self, workspace_id: str, document_id: str, revision: str, text: str) -> dict[str, Any]:
+        with _LOCK, self._errors():
+            self._workspace(workspace_id)
+            relative = self._documents.get(document_id, (None,))[0]
+            if relative and self._live_notes and self._live_notes.read(self._root, self._root_identity, relative):
+                return self.save(workspace_id, document_id, revision, text)
         with _LOCK, self._errors():
             self._workspace(workspace_id)
             if not isinstance(document_id, str) or document_id not in self._documents:
@@ -2254,6 +2310,20 @@ class DocumentService:
                 raise DocumentError("A document revision is required.")
             if (not isinstance(changes, dict) or not changes or set(changes) - {"display_title", "personal_properties"}):
                 raise DocumentError("Unsupported personal metadata fields.")
+            relative = self._documents[document_id][0]
+            live = self._live_notes.read(self._root, self._root_identity, relative) if self._live_notes else None
+            if live:
+                from .live_notes import patch_properties
+                current = self.read(workspace_id, relative)
+                if current["revision"] != revision:
+                    raise DocumentConflict(current)
+                title, properties = personal_metadata(changes.get("display_title"), changes.get("personal_properties", {}))
+                updates = dict(properties)
+                if any(key in live["protected"] for key in updates):
+                    raise DocumentError("Personal properties cannot replace source identities or generated provenance.")
+                if "display_title" in changes:
+                    updates["title"] = title or live["generated_properties"].get("title") or Path(relative).stem
+                return self.save(workspace_id, document_id, revision, patch_properties(current["text"], updates))
             if not self._override_location():
                 raise DocumentError("Private override storage is unavailable or inside the workspace.")
             relative = self._documents[document_id][0]
@@ -2291,6 +2361,39 @@ class DocumentService:
                 view.write(relative, record.get("body"), record.get("source_revision", canonical["revision"]), verify,
                            metadata={"display_title": title, "personal_properties": properties})
                 return self._override_document(self._document(relative, directory, effective=False), view, guarded=True)
+
+    def preview_live_note(self, workspace_id, document_id, revision, binding):
+        with _LOCK, self._errors():
+            if not self._live_notes:
+                raise DocumentError("Private shared-note storage is unavailable.")
+            return self._live_notes.preview(self, workspace_id, document_id, revision, binding)
+
+    def prepare_live_note(self, workspace_id, document_id, revision, binding):
+        with _LOCK, self._errors(), self._relocations().guard(workspace_id):
+            if not self._live_notes:
+                raise DocumentError("Private shared-note storage is unavailable.")
+            self._relocations().ensure_ready()
+            return self._live_notes.migrate(self, workspace_id, document_id, revision, binding, None, prepare_only=True)
+
+    def migrate_live_note(self, workspace_id, document_id, revision, binding, registrar=None):
+        with _LOCK, self._errors(), self._relocations().guard(workspace_id):
+            if not self._live_notes:
+                raise DocumentError("Private shared-note storage is unavailable.")
+            self._relocations().ensure_ready()
+            return self._live_notes.migrate(self, workspace_id, document_id, revision, binding, registrar)
+
+    def confirm_annotation_projection(self, workspace_id, document_id, revision, block_hash):
+        with _LOCK, self._errors():
+            if not self._live_notes:
+                raise DocumentError("Private shared-note storage is unavailable.")
+            return self._live_notes.confirm_annotation_projection(self, workspace_id, document_id, revision, block_hash)
+
+    def restore_live_note(self, workspace_id, document_id, revision, registrar=None):
+        with _LOCK, self._errors(), self._relocations().guard(workspace_id):
+            if not self._live_notes:
+                raise DocumentError("Private shared-note storage is unavailable.")
+            self._relocations().ensure_ready()
+            return self._live_notes.restore(self, workspace_id, document_id, revision, registrar)
 
     def create(self, workspace_id: str, parent: str, name: str, kind: str) -> dict[str, Any]:
         with _LOCK, self._errors(), self._relocations().guard(workspace_id):

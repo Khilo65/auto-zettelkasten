@@ -1,4 +1,5 @@
 import { isAlias, isMap, isScalar, isSeq, parseDocument } from "yaml";
+import { sourceLinkMarkup } from "./workspace_sources.js";
 
 const MAX_HEADER = 65536;
 const MAX_NODES = 2048;
@@ -107,6 +108,8 @@ export function renderProperties(text, { editable = false, generated = false } =
   const parsed = inspectProperties(text);
   if (!parsed.frontmatter) return "";
   if (parsed.error) return `<details class="markdown-properties"><summary>Properties</summary><p class="property-warning">${escapeHtml(parsed.error)}</p><pre>${escapeHtml(parsed.frontmatter.text)}</pre></details>`;
-  const rows = parsed.rows.map((row) => `<div class="property-row" data-property-key="${escapeHtml(row.key)}" data-property-type="${row.type}"><span class="property-key">${escapeHtml(row.key)}</span><span class="property-value">${escapeHtml(Array.isArray(row.value) ? row.value.join(", ") : row.value === null ? "" : typeof row.value === "object" ? JSON.stringify(row.value) : row.value)}</span>${generated ? '<span class="property-origin">Generated</span>' : editable && row.editable ? `<button type="button" data-property-edit="${escapeHtml(row.key)}" aria-label="Edit ${escapeHtml(row.key)}">Edit</button>` : ""}</div>`).join("");
+  const valueMarkup = (value) => Array.isArray(value) ? value.map((item) => sourceLinkMarkup(item)).join(", ")
+    : sourceLinkMarkup(value === null ? "" : typeof value === "object" ? JSON.stringify(value) : value);
+  const rows = parsed.rows.map((row) => `<div class="property-row" data-property-key="${escapeHtml(row.key)}" data-property-type="${row.type}"><span class="property-key">${escapeHtml(row.key)}</span><span class="property-value">${valueMarkup(row.value)}</span>${generated ? '<span class="property-origin">Generated</span>' : editable && row.editable ? `<button type="button" data-property-edit="${escapeHtml(row.key)}" aria-label="Edit ${escapeHtml(row.key)}">Edit</button>` : ""}</div>`).join("");
   return `<details class="markdown-properties" open><summary>Properties</summary>${rows || '<p class="property-empty">No properties</p>'}</details>`;
 }

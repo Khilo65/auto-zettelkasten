@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "repository": "https://github.com/zotero/reader.git",
+  "revision": "8a26682e2fd2c9c6ee593f20674347c2f681569a",
+  "license": "AGPL-3.0-only",
+  "submodules": {
+    "epubjs/epub.js": "e68c8b9c868be6ccb5b9684213117e95e52ef880",
+    "pdfjs/pdf.js": "5f95f712bc629ac11159cb4859ed8091fdffa87b",
+    "structured-document-text": "7963c11faac4595be3bbe86b7574704a22c67bed"
+  },
+  "locale_revision": "a6a919234a360f5cc0f8dbf45b84e1fafc546f41",
+  "build_configuration": "web"
+}

@@ -6,6 +6,7 @@ export { searchKeymap, openSearchPanel, highlightSelectionMatches } from "@codem
 export { closeBrackets, closeBracketsKeymap, autocompletion, startCompletion, acceptCompletion, completionStatus } from "@codemirror/autocomplete";
 export { default as cytoscape } from "cytoscape";
 export * from "./workspace_links.js";
+export * from "./workspace_sources.js";
 export { compactCoverageNotice } from "./workspace_coverage.js";
 export * from "./workspace_properties.js";
 export { LibraryParser } from "./workspace_index_client.js";
@@ -13,6 +14,7 @@ export { fitGraph, layoutGraph } from "./workspace_graph.js";
 export { createGraphView } from "./workspace_graph_view.js";
 export * from "./workspace_graph_colors.js";
 export * from "./workspace_graph_communities.js";
+import { parseZoteroURI, sourceLinkMarkup } from "./workspace_sources.js";
 import { renderIndexedMarkdown, renderReferenceEmbed } from "./workspace_links.js";
 export { syntaxTree, syntaxHighlighting, defaultHighlightStyle, bracketMatching, indentOnInput, foldGutter, foldKeymap } from "@codemirror/language";
 export { markdown, markdownLanguage, markdownKeymap, insertNewlineContinueMarkup, deleteMarkupBackward } from "@codemirror/lang-markdown";
@@ -46,6 +48,7 @@ markdownRenderer.renderer.rules.image = (tokens, index) => {
 // Relative destinations need the workspace resolver; never navigate the local server.
 markdownRenderer.renderer.rules.link_open = (tokens, index) => {
   const href = tokens[index].attrGet("href") || "";
+  if (parseZoteroURI(href)) return sourceLinkMarkup(href, "").replace(/<\/a>$/, "");
   return /^https?:\/\//i.test(href)
     ? `<a href="${markdownRenderer.utils.escapeHtml(href)}" target="_blank" rel="noopener noreferrer">`
     : "<span class=\"markdown-link\">";
@@ -56,7 +59,7 @@ markdownRenderer.renderer.rules.link_close = (tokens, index) => {
     if (tokens[at].type === "link_close") depth += 1;
     if (tokens[at].type === "link_open") {
       if (depth) { depth -= 1; continue; }
-      return /^https?:\/\//i.test(tokens[at].attrGet("href") || "") ? "</a>" : "</span>";
+      return (parseZoteroURI(tokens[at].attrGet("href")) || /^https?:\/\//i.test(tokens[at].attrGet("href") || "")) ? "</a>" : "</span>";
     }
   }
   return "</span>";

@@ -615,7 +615,10 @@ def write_atomic_note(workspace: Path, frontmatter: Mapping[str, Any], analysis:
     notes_dir = workspace / "02_source_memory" / "notes"
     notes_dir.mkdir(parents=True, exist_ok=True)
     candidate = _note_candidate(notes_dir, frontmatter)
-    _assert_source_note_safe_to_replace(workspace, candidate)
+    from .live_notes import managed_note, generated_note_write
+    active = managed_note(workspace, candidate)
+    if not active:
+        _assert_source_note_safe_to_replace(workspace, candidate)
     text = render_atomic_note(frontmatter, analysis)
     validation = validate_atomic_note(text)
     if not validation.passed:
@@ -631,10 +634,11 @@ def write_atomic_note(workspace: Path, frontmatter: Mapping[str, Any], analysis:
     final_validation = validate_atomic_note(text)
     if final_validation.passed:
         public_text = _public_note_text(text, committed)
-        atomic_write_text(candidate, public_text)
-        _write_note_metadata(
-            workspace, candidate, committed, machine_text=public_text
-        )
+        with generated_note_write(workspace, candidate, public_text) as permitted:
+            if not permitted:
+                return candidate, NoteValidation(False, ["active_note_baseline_review_required"], final_validation.warnings)
+            atomic_write_text(candidate, public_text)
+            _write_note_metadata(workspace, candidate, committed, machine_text=public_text)
     return candidate, final_validation
 
 
@@ -646,7 +650,10 @@ def write_limited_note(
     notes_dir = workspace / "02_source_memory" / "notes"
     notes_dir.mkdir(parents=True, exist_ok=True)
     candidate = _note_candidate(notes_dir, frontmatter)
-    _assert_source_note_safe_to_replace(workspace, candidate)
+    from .live_notes import managed_note, generated_note_write
+    active = managed_note(workspace, candidate)
+    if not active:
+        _assert_source_note_safe_to_replace(workspace, candidate)
     text = render_limited_note(frontmatter, content)
     validation = validate_limited_note(text)
     if validation.passed:
@@ -658,10 +665,11 @@ def write_limited_note(
         validation = validate_limited_note(text)
         if validation.passed:
             public_text = _public_note_text(text, committed)
-            atomic_write_text(candidate, public_text)
-            _write_note_metadata(
-                workspace, candidate, committed, machine_text=public_text
-            )
+            with generated_note_write(workspace, candidate, public_text) as permitted:
+                if not permitted:
+                    return candidate, NoteValidation(False, ["active_note_baseline_review_required"], validation.warnings)
+                atomic_write_text(candidate, public_text)
+                _write_note_metadata(workspace, candidate, committed, machine_text=public_text)
     return candidate, validation
 
 
@@ -923,8 +931,13 @@ def update_note_frontmatter(path: Path, updates: Mapping[str, Any]) -> None:
         return
     workspace = _workspace_for_note(path)
     if workspace is not None:
-        _write_note_metadata(workspace, path, frontmatter)
-        frontmatter = public_note_frontmatter(frontmatter)
+        from .live_notes import generated_note_write
+        proposed = f"---\n{_dump_frontmatter(public_note_frontmatter(frontmatter))}\n---\n{body}"
+        with generated_note_write(workspace, path, proposed) as permitted:
+            if permitted:
+                atomic_write_text(path, proposed)
+                _write_note_metadata(workspace, path, frontmatter)
+        return
     yaml_text = _dump_frontmatter(frontmatter)
     atomic_write_text(path, f"---\n{yaml_text}\n---\n{body}")
 
@@ -978,6 +991,13 @@ def update_note_literature(
     )
     if projected == text:
         return False
+    workspace = _workspace_for_note(path)
+    if workspace is not None:
+        from .live_notes import generated_note_write
+        with generated_note_write(workspace, path, projected) as permitted:
+            if permitted:
+                atomic_write_text(path, projected)
+            return permitted
     atomic_write_text(path, projected)
     return True
 
@@ -1075,17 +1095,23 @@ def update_note_graph(
         raise ValueError("graph projection changed semantic note content")
     if text == desired_text and (unchanged_frontmatter or workspace is None):
         return False
-    atomic_write_text(path, desired_text)
     if workspace is not None:
-        _write_note_metadata(workspace, path, projected_frontmatter)
+        from .live_notes import generated_note_write
+        with generated_note_write(workspace, path, desired_text) as permitted:
+            if permitted:
+                atomic_write_text(path, desired_text)
+                _write_note_metadata(workspace, path, projected_frontmatter)
+            return permitted
+    atomic_write_text(path, desired_text)
     return True
 
 
 def _workspace_for_note(path: Path) -> Path | None:
     path = path.resolve()
-    if path.parent.name != "notes" or path.parent.parent.name != "02_source_memory":
-        return None
-    return path.parent.parent.parent
+    for parent in path.parents:
+        if parent.name == "notes" and parent.parent.name == "02_source_memory":
+            return parent.parent.parent
+    return None
 
 
 def _note_metadata_path(workspace: Path, note_id: str) -> Path:
@@ -1241,6 +1267,13 @@ def _existing_note_for_id(notes_dir: Path, note_id: str) -> Path | None:
         and str(stored_frontmatter.get("note_id") or "") == note_id
     ):
         candidate = workspace / stored_path
+        from .live_notes import managed_note, LiveNotes
+        active = managed_note(workspace, candidate)
+        if active:
+            if not candidate.is_file():
+                raise ValueError("active_note_missing_or_renamed")
+            LiveNotes.validate(active, candidate.read_text(encoding="utf-8"))
+            return candidate
         if candidate.is_file():
             try:
                 projected, _ = parse_atomic_note(candidate.read_text(encoding="utf-8"))
