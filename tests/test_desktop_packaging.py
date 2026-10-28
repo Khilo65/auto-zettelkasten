@@ -44,6 +44,8 @@ def test_build_command_keeps_local_mapping_runtime_and_platform_renderer(monkeyp
     monkeypatch.setattr(build, "check_dependencies", lambda: None)
     monkeypatch.setattr(build.importlib.util, "find_spec", lambda name: None if name == "hdbscan" else SimpleNamespace())
     command = build.build_command()
+    for distribution in ("pypdf", "pypdfium2", "Pillow"):
+        assert any(command[index:index + 2] == ["--copy-metadata", distribution] for index in range(len(command) - 1))
     # Parse the actual command with PyInstaller, including all repeated options.
     pyinstaller = pytest.importorskip("PyInstaller.__main__")
     options = pyinstaller.generate_parser().parse_args(command[3:])

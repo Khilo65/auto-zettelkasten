@@ -80,6 +80,7 @@ window.createAnnotationPanel = function ({ container, api, message = () => {}, g
       const item = node("article", "annotation-change"); item.dataset.syncId = row.id || "";
       item.append(node("h4", "", title(row)), node("p", "annotation-change-state", syncLabels[row.state] || "Note update pending"));
       if (row.reason) item.append(node("p", "annotation-change-reason", row.reason));
+      if (row.preview_status && row.preview_status !== "current") item.append(node("p", "annotation-change-reason", row.preview_reason || (row.preview_status === "last_confirmed" ? "Showing the last confirmed image previews." : row.preview_status === "stale" ? "Image previews need verification against the current PDF." : "Image previews are pending.")));
       const actions = node("div", "annotation-actions");
       if (onOpenNote && row.note_path) actions.append(button("Open note", () => onOpenNote(row.note_path)));
       if (["blocked", "paused"].includes(row.state)) { const value = button("Review annotation section", () => reviewProjection(row)); value.dataset.action = "projection"; actions.append(value); }

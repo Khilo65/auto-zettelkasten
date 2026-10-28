@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 import yaml
+from io import BytesIO
+from PIL import Image
 
 from auto_zettelkasten import markdown_link_export as export
 from auto_zettelkasten.documents import DocumentService
@@ -63,6 +65,78 @@ def sample(tmp_path):
 def run(sample, **kwargs):
     root, destination, service = sample
     return export.export_markdown_links(root, destination, documents=service, workspace_id="workspace", **kwargs)
+
+
+def _image_fixture(sample, target="attachments/figure 日本.png", reference="![[../attachments/figure 日本.png|400]]"):
+    root, _, service = sample
+    output = BytesIO()
+    Image.new("RGB", (20, 10), "purple").save(output, format="PNG")
+    asset = root / target
+    asset.parent.mkdir(exist_ok=True)
+    asset.write_bytes(output.getvalue())
+    row = service.notes["Notes/A.md"]
+    row["text"] += reference + "\n"
+    row["revision"] = hashlib.sha256(row["text"].encode()).hexdigest()
+    (root / "Notes/A.md").write_text(row["text"])
+    service.semantic["note_revisions"]["Notes/A.md"] = row["revision"]
+    return asset
+
+
+def test_export_freezes_and_copies_referenced_image_dependencies(sample):
+    asset = _image_fixture(sample)
+    root, destination, _ = sample
+    preview = run(sample)
+    assert preview["image_count"] == 1 and preview["image_bytes"] == asset.stat().st_size
+    assert preview["image_assets"][0]["path"] == "attachments/figure 日本.png"
+    assert preview["image_assets"][0]["revision"] == hashlib.sha256(asset.read_bytes()).hexdigest()
+    run(sample, apply=True, preview_identity=preview["preview_identity"])
+    assert (destination / asset.relative_to(root)).read_bytes() == asset.read_bytes()
+    assert "![[../attachments/figure 日本.png|400]]" in (destination / "Notes/A.md").read_text()
+    frozen = {str(path): path.read_bytes() for path in destination.rglob("*") if path.is_file()}
+    assert run(sample, apply=True, preview_identity=preview["preview_identity"])["status"] == "unchanged"
+    assert {str(path): path.read_bytes() for path in destination.rglob("*") if path.is_file()} == frozen
+
+
+def test_export_blocks_missing_and_ambiguous_images(sample):
+    asset = _image_fixture(sample)
+    asset.unlink()
+    with pytest.raises(ValueError, match="missing"):
+        run(sample)
+    _, destination, _ = sample
+    assert not destination.exists()
+
+
+def test_export_does_not_publish_when_asset_changes_after_preview(sample):
+    asset = _image_fixture(sample)
+    preview = run(sample)
+    output = BytesIO()
+    Image.new("RGB", (20, 10), "blue").save(output, format="PNG")
+    asset.write_bytes(output.getvalue())
+    with pytest.raises(ValueError, match="exact current preview"):
+        run(sample, apply=True, preview_identity=preview["preview_identity"])
+    assert not sample[1].exists()
+
+
+def test_export_rechecks_image_dependency_before_publication(sample, monkeypatch):
+    asset = _image_fixture(sample)
+    preview = run(sample)
+    original = export._asset_snapshot
+    calls = 0
+
+    def changing(*args):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            output = BytesIO()
+            Image.new("RGB", (20, 10), "blue").save(output, format="PNG")
+            asset.write_bytes(output.getvalue())
+        return original(*args)
+
+    monkeypatch.setattr(export, "_asset_snapshot", changing)
+    with pytest.raises(ValueError, match="Referenced images changed"):
+        run(sample, apply=True, preview_identity=preview["preview_identity"])
+    assert not sample[1].exists()
+    assert not list(sample[1].parent.glob(".related-export-*"))
 
 
 def test_preview_is_inert_and_apply_is_deterministic_idempotent(sample):

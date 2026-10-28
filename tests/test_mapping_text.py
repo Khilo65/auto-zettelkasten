@@ -17,6 +17,57 @@ def _sha(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+@pytest.mark.parametrize("markup", [
+    "![[attachments/figure.png]]", "![[attachments/figure.%70ng|400x200]]",
+    "![Long generated image label](attachments/figure.png)",
+    "![Other caption](<attachments/figure.%77ebp> \"A title\")",
+    "[figure.png](attachments/figure.png)",
+    "![Figure][picture]\n\n[picture]: attachments/figure.%70ng",
+    "![picture][]\n\n[picture]: <attachments/figure.png>",
+    "![picture]\n\n[picture]: attachments/figure.png",
+])
+def test_image_references_never_contribute_paths_dimensions_or_labels(markup):
+    text = "A substantive claim.\n" + markup + "\nA substantive limitation.\n"
+    result = prepare_embedding_spans(text)
+    clean = "".join(row["text"] for row in result["spans"])
+    assert [line for line in clean.splitlines() if line.strip()] == ["A substantive claim.", "A substantive limitation."]
+    assert all(text[row["start"]:row["end"]] == row["text"] for row in result["spans"])
+    assert result["coverage"]["cleaning_version"] == "local-map-spans-v5"
+
+
+@pytest.mark.parametrize("markup", [
+    "![A substantive note label](Other.md)",
+    "![A substantive note label](<Other.%6dd#Section> \"A title\")",
+    "![A substantive note label][note]\n\n[note]: Other.md",
+    "![A substantive note label][]\n\n[A substantive note label]: Other.md",
+    "![A substantive note label]\n\n[A substantive note label]: Other.md",
+])
+def test_image_filter_preserves_existing_markdown_note_embed_labels(markup):
+    result = prepare_embedding_spans(markup)
+    assert "A substantive note label" in "".join(row["text"] for row in result["spans"])
+    assert result["coverage"]["excluded_by_kind"].get("image_reference", 0) == 0
+
+
+@pytest.mark.parametrize("example", [
+    "`![Literal label](attachments/figure.png)`",
+    "```markdown\n![[attachments/figure.png|400]]\n```",
+    "~~~markdown\n![Literal label](attachments/figure.png)\n~~~",
+    "    ![Literal label](attachments/figure.png)",
+    "\t![[attachments/figure.png]]",
+    r"\!\[Literal label\]\(attachments/figure.png\)",
+])
+def test_image_filter_preserves_literal_code_examples(example):
+    clean = "".join(row["text"] for row in prepare_embedding_spans(example)["spans"])
+    assert example in clean
+
+
+def test_code_example_definitions_cannot_change_note_embed_classification():
+    text = "```markdown\n[shared]: image.png\n```\n![Substantive label][shared]\n\n[shared]: Other.md\n"
+    result = prepare_embedding_spans(text)
+    assert "Substantive label" in "".join(row["text"] for row in result["spans"])
+    assert result["coverage"]["excluded_by_kind"].get("image_reference", 0) == 0
+
+
 def _write(path: Path, value) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(value if isinstance(value, str) else yaml.safe_dump(value), encoding="utf-8")
@@ -140,6 +191,25 @@ def test_managed_graph_navigation_is_not_reembedded_as_a_source_claim():
     assert "Artificial hub" not in clean
     assert "A synthetic finding" in clean and "A bounded claim" in clean
     assert result["coverage"]["excluded_by_kind"]["generated_navigation"] > 0
+
+
+@pytest.mark.parametrize("image", [
+    "![[attachments/zotero/crop-a.png]]", "![[other-image.webp|400x200]]",
+    "![Annotation preview](attachments/zotero/crop.png)",
+    "![Different alt text](<attachments/images/Unicode figure.jpg>)",
+])
+def test_image_paths_labels_and_sizes_are_not_semantic_content(image):
+    text = f"A substantive finding.\n{image}\nA qualification.\n"
+    result = prepare_embedding_spans(text)
+    clean = "".join(row["text"] for row in result["spans"])
+    assert clean.replace("\n", "").strip() == "A substantive finding.A qualification."
+    assert result["coverage"]["excluded_by_kind"]["image_reference"] == len(image)
+
+
+def test_image_syntax_inside_code_is_preserved_as_authored_evidence():
+    text = "Use `![[figure.png]]` as syntax.\n```md\n![A](figure.png)\n```\n"
+    clean = "".join(row["text"] for row in prepare_embedding_spans(text)["spans"])
+    assert "![[figure.png]]" in clean and "![A](figure.png)" in clean
 
 
 def test_note_fallback_is_complete_note_only_and_input_changes_are_visible(tmp_path):

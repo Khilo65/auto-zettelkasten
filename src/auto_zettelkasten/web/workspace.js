@@ -16,6 +16,7 @@
     polling: false, confirmation: null, folderDialogGeneration: 0, sidebarHidden: window.innerWidth < 700, recoveryError: "",
     snapshot: null, linkIndex: null, indexing: false, indexRequest: 0, indexTimer: null, indexError: "", indexProgress: "", indexParser: null,
     previewDocuments: new Map(), previewRequests: new Map(),
+    imageRequests: new Map(), imageImport: null, imageVersion: 0, lastTreeRefresh: 0,
     contextOpen: false, contextMode: "backlinks", graphTab: false, graphActive: false, localPinned: null,
     graphs: new Map(), graphViews: new WeakMap(), graphLayouts: new Map(), graphSizes: new WeakMap(), graphLabels: new WeakMap(), graphSignatures: new Map(), graphLists: new Set(), graphPositions: new Map(),
     graphCommunities: new Map(),
@@ -52,11 +53,11 @@
   const normalizeText = (text) => text.replace(/\r\n/g, "\n");
   const recoveryKey = (doc) => `az.workspace.draft.${doc.recovery_key}`;
   const workspaceVisible = () => !screen.hidden;
-  const hasBusyWrite = () => state.opening || state.creating || Boolean(state.organization) || Boolean(state.linkExport?.pending) || [...state.documents.values()].some((doc) => doc.saving);
+  const hasBusyWrite = () => state.opening || state.creating || Boolean(state.imageImport) || Boolean(state.organization) || Boolean(state.linkExport?.pending) || [...state.documents.values()].some((doc) => doc.saving);
 
   window.workspaceHasUnsavedChanges = () => sourceReader?.hasPending() || libraryPanel?.hasDraft() || libraryPanel?.isBusy() || hasBusyWrite() || [...state.documents.values()].some((doc) => dirty(doc) || doc.recovery || metadataDraft(doc));
 
-  const sourceReader = window.createSourceReader?.({ container: el("workspace-pdf-host"), api, message, onAnnotations: projectSourceAnnotations, onState: updateSourceActions });
+  const sourceReader = window.createSourceReader?.({ container: el("workspace-pdf-host"), api, message, onAnnotations: projectSourceAnnotations, onPreview: requestAnnotationPreview, onState: updateSourceActions });
   const annotationPanel = window.createAnnotationPanel?.({ container: el("workspace-annotation-panel"), api, message, getWorkspace: () => state.workspace,
     getDocument: async (path) => { const doc = state.documents.get(path); return doc ? { ...doc, text: textOf(doc), dirty: dirty(doc) || metadataDraft(doc) } : (await api("workspace/read", { workspace_id: state.workspace.id, path })).document; },
     onUpdated: async (result) => { if (result.document) acceptAnnotationDocument(result.document); await sourceReader?.refreshAll(); await synchronizeAnnotationBuffers(); },
@@ -65,6 +66,85 @@
     getWorkspace: () => state.workspace, onOpenNote: (path) => openDocument(path), onOpenPDF: openSourcePDF, onMigrate: prepareSharedNote,
     onAuthorization: refreshZoteroPermission });
   let migration = null;
+  const imageViewer = kit.createImageViewer?.({ document, onSource: (uri) => openSourcePDF({ uri, note_path: active()?.path }) });
+  async function resolveImage(reference) {
+    if (!state.workspace) throw new Error("Open a workspace to view this image.");
+    const workspaceId = state.workspace.id, epoch = state.epoch;
+    const source_path = reference.sourcePath || active()?.path;
+    const key = JSON.stringify([epoch, source_path, reference.destination, reference.kind]);
+    if (!state.imageRequests.has(key)) {
+      const request = api("workspace/media-resolve", { workspace_id: workspaceId, source_path, target: reference.destination, wiki: reference.kind === "wiki" })
+        .then((result) => {
+          if (epoch !== state.epoch) throw new Error("The workspace changed.");
+          const job = result.asset?.path?.startsWith("attachments/zotero/") && state.annotationStatus?.jobs?.find((row) => row.note_path === source_path);
+          return { ...result.asset, ...(job?.preview_status ? { status: job.preview_status } : {}) };
+        })
+        .catch((error) => { state.imageRequests.delete(key); throw error; });
+      state.imageRequests.set(key, request);
+      if (state.imageRequests.size > 512) state.imageRequests.delete(state.imageRequests.keys().next().value);
+    }
+    return state.imageRequests.get(key);
+  }
+  function imageOptions() {
+    return { document, resolve: resolveImage, onOpen: (value) => imageViewer?.open(value), onSource: (uri) => openSourcePDF({ uri, note_path: active()?.path }) };
+  }
+  async function openImage(path) {
+    try { const result = await api("workspace/media-open", { workspace_id: state.workspace.id, path }); imageViewer?.open({ ...result.asset, label: basename(path) }); }
+    catch (error) { message(error.message, true); }
+  }
+  async function importImages(files, position) {
+    const doc = active();
+    if (!doc || !canEdit(doc) || doc.recovery || hasBusyWrite()) return message("Open an editable note and finish the current operation before adding images.", true);
+    files = [...files];
+    if (!files.length || files.length > 8 || files.some((file) => !/\.(?:png|jpe?g|webp)$/i.test(file.name || "") && !/^image\/(?:png|jpeg|webp)$/.test(file.type || ""))) return message("Choose up to eight PNG, JPEG or WebP images.", true);
+    const selection = doc.editorState.selection.main;
+    const reading = doc.mode === "reading" && position === undefined;
+    const operation = { doc, epoch: state.epoch, from: position ?? (reading ? doc.editorState.doc.length : selection.from), to: position ?? (reading ? doc.editorState.doc.length : selection.to), changed: false, block: reading };
+    const frontmatter = kit.inspectProperties?.(textOf(doc)).frontmatter;
+    if (frontmatter && operation.from < frontmatter.to) {
+      if (position === undefined && operation.from === 0 && operation.to === 0) { operation.from = operation.to = frontmatter.to; operation.block = true; }
+      else return message("Choose an insertion point in the note body. Images cannot be inserted into properties.", true);
+    }
+    state.imageImport = operation;
+    const assets = [];
+    try {
+      for (const file of files) {
+        if (file.size > 25 * 1024 * 1024) throw new Error("Image imports must be at most 25 MiB.");
+        const query = new URLSearchParams({ workspace_id: state.workspace.id, source_path: doc.path, filename: file.name || "pasted-image.png" });
+        const response = await fetch(`/api/workspace/import-image?${query}`, { method: "POST", headers: { "X-Session-Token": token, "Content-Type": "application/octet-stream" }, body: file });
+        const result = await response.json();
+        if (!response.ok || !result.asset?.relative_path) throw new Error(result.error || "The image could not be imported. Your note is unchanged.");
+        assets.push({ ...result.asset, import_label: file.name || "Image" }); if (result.workspace && operation.epoch === state.epoch) applyWorkspace(result.workspace);
+      }
+      if (operation.epoch !== state.epoch || operation.changed || state.documents.get(doc.path) !== doc) throw new Error("The insertion text changed. Your images are retained in attachments/images; choose an insertion point and try again.");
+      let insert = assets.map((asset) => `![${asset.import_label.replace(/[\[\]\\]/g, "")}](<${asset.relative_path.replace(/>/g, "%3E")}>)`).join("\n\n");
+      if (operation.block) {
+        const before = doc.editorState.doc.sliceString(0, operation.from), after = doc.editorState.doc.sliceString(operation.to);
+        if (before && !before.endsWith("\n\n")) insert = (before.endsWith("\n") ? "\n" : "\n\n") + insert;
+        if (after && !after.startsWith("\n\n")) insert += after.startsWith("\n") ? "\n" : "\n\n";
+      }
+      const change = { changes: { from: operation.from, to: operation.to, insert }, selection: { anchor: operation.from + insert.length }, userEvent: "input.paste" };
+      state.imageImport = null;
+      if (active() === doc && state.view) state.view.dispatch(change); else { doc.editorState = doc.editorState.update(change).state; persistDraft(doc); scheduleLinks(); }
+      if (active() === doc) { if (doc.mode === "reading") setMode("live"); else renderActive(); }
+      message(`${assets.length === 1 ? "Image" : "Images"} added. Save the note to keep the reference.`);
+    } catch (error) { message(error.message, true); }
+    finally { if (state.imageImport === operation) state.imageImport = null; }
+  }
+  async function requestAnnotationPreview(config, annotation, enabled) {
+    if (!state.workspace || !config.note_path) throw new Error("Share an editable atomic note with this Zotero item before adding image previews.");
+    const workspaceId = state.workspace.id, epoch = state.epoch;
+    await synchronizeAnnotationBuffers();
+    const doc = state.documents.get(config.note_path) || (await api("workspace/read", { workspace_id: workspaceId, path: config.note_path })).document;
+    const result = await api("zotero/annotation-preview-request", { workspace_id: workspaceId, note_path: config.note_path, document_id: doc.id, revision: doc.revision, scope: config.scope, attachment_key: config.attachment_key,
+      annotation_key: annotation.id, expected_version: annotation.version, enabled });
+    if (epoch === state.epoch) {
+      state.imageRequests.clear(); state.imageVersion += 1;
+      await annotationPanel?.refresh();
+      message(enabled ? "Image preview queued. A pending note draft will be preserved until it is saved or discarded." : "Image preview disabled. Its source quotation and annotation remain unchanged.");
+    }
+    return result;
+  }
   let annotationCloseState = "idle";
   let annotationCloseGeneration = 0;
   window.workspacePrepareClose = () => {
@@ -396,6 +476,7 @@
       if (state.workspace) await synchronizeAnnotationBuffers();
       const result = await api("workspace/open", { path });
       state.epoch += 1; state.requiresReopen = false;
+      imageViewer?.close(); state.imageRequests.clear();
       state.openRequest += 1;
       state.workspace = result.workspace;
       state.documents.clear(); state.active = null;
@@ -702,7 +783,8 @@
         if (entry.kind === "directory") {
           if (state.expanded.has(entry.path)) state.expanded.delete(entry.path); else state.expanded.add(entry.path);
           renderTree(true);
-        } else openDocument(entry.path);
+        } else if (entry.kind === "asset") openImage(entry.path);
+        else openDocument(entry.path);
       });
       row.addEventListener("contextmenu", (event) => { event.preventDefault(); state.treeFocus = entry.path; row.focus(); showFileActions(entry); });
       row.addEventListener("keydown", (event) => {
@@ -980,6 +1062,7 @@
       if (this.embed) {
         const node = document.createElement("div"); node.className = "live-note-embed";
         node.innerHTML = kit.renderEmbed(state.linkIndex, this.reference);
+        kit.hydrateImages?.(node, imageOptions());
         return node;
       }
       const node = document.createElement("button"); node.type = "button";
@@ -988,6 +1071,18 @@
       node.addEventListener("click", (event) => { event.preventDefault(); navigateLink(this.reference.destination, this.reference.kind, this.reference.sourcePath); });
       return node;
     }
+    ignoreEvent() { return true; }
+  }
+
+  class ImageWidget extends (kit?.WidgetType || class {}) {
+    constructor(reference) { super(); this.reference = reference; this.key = JSON.stringify([state.epoch, state.imageVersion, reference.sourcePath, reference.destination, reference.width, reference.height, reference.label]); }
+    eq(other) { return other.key === this.key; }
+    toDOM() {
+      const node = kit.createImageElement(this.reference, imageOptions());
+      node.imageReady?.then(() => { node.querySelector("img")?.addEventListener("load", () => state.view?.requestMeasure(), { once: true }); state.view?.requestMeasure(); });
+      return node;
+    }
+    destroy(node) { node.cancelImageLoad?.(); }
     ignoreEvent() { return true; }
   }
 
@@ -1006,6 +1101,20 @@
       } else {
         ranges.push(kit.Decoration.mark({ class: `note-link-source ${resolved ? "resolved" : "unresolved"}`, attributes: { title: `${reference.destination} · ${reference.resolution?.status || "unavailable"} · ⌘/Ctrl+Enter to follow` } }).range(reference.from, reference.to));
       }
+    }
+    if (doc.mode === "live" && kit.createImageElement) for (const reference of parsed.assets || []) {
+      if (reference.from < 0 || reference.to > editorState.doc.length || reference.from >= reference.to || !(reference.to < start || reference.from > end)) continue;
+      const line = editorState.doc.lineAt(reference.from);
+      const block = reference.embed && line.from === reference.from && line.to === reference.to;
+      const prefix = editorState.doc.sliceString(0, reference.from);
+      const annotationStart = prefix.lastIndexOf("<!-- auto-zettelkasten:annotations:start -->");
+      const annotationEnd = prefix.lastIndexOf("<!-- auto-zettelkasten:annotations:end -->");
+      const entry = annotationStart > annotationEnd ? prefix.slice(Math.max(annotationStart, prefix.lastIndexOf("\n- ["))) : "";
+      const headerURI = /^\n?- \[[^\n]+\]\((zotero:\/\/open-pdf\/[^\s)<>]+)\)/.exec(entry)?.[1];
+      const pageURI = entry && /^\s*\[Open in PDF\]\((zotero:\/\/open-pdf\/[^\s)<>]+)\)/.exec(editorState.doc.sliceString(reference.to, Math.min(editorState.doc.length, reference.to + 2048)))?.[1];
+      const headerSource = kit.parseZoteroURI?.(headerURI), pageSource = kit.parseZoteroURI?.(pageURI);
+      const sourceURI = pageURI ? (headerSource && pageSource && headerSource.scope === pageSource.scope && headerSource.key === pageSource.key && headerSource.annotation_key === pageSource.annotation_key ? pageURI : undefined) : headerURI;
+      ranges.push(kit.Decoration.replace({ widget: new ImageWidget({ ...reference, sourceURI }), block: Boolean(block) }).range(reference.from, reference.to));
     }
     return kit.Decoration.set(ranges, true);
   }
@@ -1595,6 +1704,11 @@
       extensions: [
         kit.EditorState.transactionFilter.of((transaction) => (state.organization || state.requiresReopen) && transaction.docChanged ? [] : transaction),
         kit.basicSetup, kit.markdown(), kit.EditorView.lineWrapping, kit.EditorState.lineSeparator.of("\n"),
+        kit.EditorView.domEventHandlers({
+          paste(event) { const files = event.clipboardData?.files; if (!files?.length) return false; event.preventDefault(); importImages(files); return true; },
+          dragover(event) { if ([...(event.dataTransfer?.types || [])].includes("Files")) { event.preventDefault(); return true; } return false; },
+          drop(event, view) { const files = event.dataTransfer?.files; if (!files?.length) return false; event.preventDefault(); importImages(files, view.posAtCoords({ x: event.clientX, y: event.clientY }) ?? undefined); return true; },
+        }),
         kit.autocompletion({ override: [(context) => wikiCompletion(context, doc)], interactionDelay: 0 }),
         kit.EditorView.cspNonce.of(token),
         doc.editability.of([
@@ -1622,6 +1736,12 @@
         }),
         kit.EditorView.updateListener.of((update) => {
           doc.editorState = update.state;
+          if (update.docChanged && state.imageImport?.doc === doc) {
+            const pending = state.imageImport;
+            update.changes.iterChangedRanges((from, to) => { if (pending.from < pending.to && from < pending.to && to > pending.from) pending.changed = true; });
+            const collapsed = pending.from === pending.to;
+            pending.from = update.changes.mapPos(pending.from, 1); pending.to = update.changes.mapPos(pending.to, collapsed ? 1 : -1);
+          }
           if (update.docChanged && !doc.ignoreChanges) {
             persistDraft(doc);
             scheduleLinks();
@@ -1885,6 +2005,7 @@
     el("workspace-reader").querySelector(":scope > .markdown-properties")?.remove();
     for (const anchor of el("workspace-reader").querySelectorAll('a:not([data-note-destination])')) anchor.setAttribute("rel", "noopener noreferrer");
     hydrateEmbeds();
+    kit.hydrateImages?.(el("workspace-reader"), imageOptions());
   }
 
   async function hydrateEmbeds() {
@@ -2199,11 +2320,14 @@
     const epoch = state.epoch, workspaceId = state.workspace.id;
     const doc = active(), beforeRevision = doc?.revision;
     try {
-      if (!state.snapshot?.generation) {
+      const hasImages = state.workspace.entries.some((row) => row.kind === "asset") || state.linkIndex?.documents.get(doc?.path)?.assets?.length || state.annotationStatus?.jobs?.some((row) => row.preview_status);
+      if (!state.snapshot?.generation || hasImages && Date.now() - state.lastTreeRefresh > 15000) {
         const { workspace } = await api("workspace/tree", { workspace_id: workspaceId });
         if (epoch !== state.epoch || state.opening || state.organization) return;
         const tree = el("workspace-tree"), wasFocused = tree.contains(document.activeElement);
         applyWorkspace(workspace); if (wasFocused) renderTree(true);
+        state.lastTreeRefresh = Date.now(); state.imageRequests.clear(); state.imageVersion += 1;
+        if (doc?.mode === "reading") renderReading(doc); else state.view?.dispatch({});
       }
       const source = state.sourceTabs.get(state.sourceActive);
       if (source && Date.now() - (source.lastAnnotationRefresh || 0) > 15000) { source.lastAnnotationRefresh = Date.now(); await sourceReader.refresh(source.id); }
@@ -2350,9 +2474,14 @@
       if (state.linkExport !== operation || operation.epoch !== state.epoch || operation.workspaceId !== state.workspace?.id) return;
       if (!(apply ? ["exported", "unchanged"].includes(result.status) : result.status === "preview") || typeof result.preview_identity !== "string" || !result.preview_identity
           || [result.note_count, result.edge_count, result.override_count].some((value) => !Number.isSafeInteger(value) || value < 0)) throw new Error("The export result could not be verified. Review a fresh preview before trying again.");
-      const summary = `${result.note_count} notes · ${result.edge_count} automatic connections · notes with personal edits: ${result.override_count}${result.personal_metadata_count ? ` · ${result.personal_title_count || 0} personal titles and ${result.personal_property_count || 0} personal properties included` : ""}${result.personal_property_conflict_count ? ` · ${result.personal_property_conflict_count} conflicting personal properties preserved in provenance, not substituted for source fields` : ""}${result.stale_source_count ? ` · ${result.stale_source_count} changed notes exported without stale automatic links` : ""}`;
+      const summary = `${result.note_count} notes · ${result.edge_count} automatic connections · notes with personal edits: ${result.override_count}${result.image_count ? ` · ${result.image_count} images (${(result.image_bytes / 1024).toFixed(1)} KiB)` : ""}${result.personal_metadata_count ? ` · ${result.personal_title_count || 0} personal titles and ${result.personal_property_count || 0} personal properties included` : ""}${result.personal_property_conflict_count ? ` · ${result.personal_property_conflict_count} conflicting personal properties preserved in provenance, not substituted for source fields` : ""}${result.stale_source_count ? ` · ${result.stale_source_count} changed notes exported without stale automatic links` : ""}`;
       operation.preview = apply ? null : { preview_identity: result.preview_identity, destination, degree_cap };
       el("workspace-export-summary").textContent = apply ? `${summary}. Exported to ${result.destination || destination}.` : `${summary}. Your source notes stay unchanged. Choose Export to create the new folder.`;
+      if (!apply && result.image_assets?.length) {
+        const list = document.createElement("ul");
+        for (const asset of result.image_assets) { const row = document.createElement("li"); row.textContent = `${asset.path} · ${asset.size} bytes · ${asset.revision || asset.sha256 || ""}`; list.append(row); }
+        el("workspace-export-summary").append(list);
+      }
     } catch (error) {
       if (state.linkExport === operation) {
         operation.preview = null;
@@ -2526,7 +2655,8 @@
     }
     const edits = el("workspace-organization-edits"); edits.replaceChildren();
     if (!plan.patches.length) { const p = document.createElement("p"); p.textContent = "No writable link changes are available."; edits.append(p); }
-    for (const patch of plan.patches) {
+    const imageRepairs = preview.image_repairs || [];
+    for (const patch of [...plan.patches, ...imageRepairs]) {
       const details = document.createElement("details"); details.open = true;
       const summary = document.createElement("summary"); summary.textContent = `${patch.path} (${patch.edits.length})`;
       details.append(summary);
@@ -2541,7 +2671,7 @@
     el("workspace-organization-review-error").textContent = "";
     el("workspace-organization-decline").textContent = rename ? "Rename without updating links" : "Move without updating links";
     el("workspace-organization-repair").textContent = rename ? "Update links and rename" : "Update links and move";
-    el("workspace-organization-repair").disabled = !plan.safe || !plan.patches.length || Boolean(plan.blocked?.length);
+    el("workspace-organization-repair").disabled = !plan.safe || !(plan.patches.length || imageRepairs.length) || Boolean(plan.blocked?.length);
     el("workspace-organization-decline").disabled = false;
   }
 
@@ -2700,6 +2830,16 @@
 
 
   fillIcons(); setSidebar(state.sidebarHidden);
+  if (kit.createImageViewer) {
+    const upload = document.createElement("input"); upload.type = "file"; upload.accept = "image/png,image/jpeg,image/webp"; upload.multiple = true; upload.hidden = true;
+    const button = document.createElement("button"); button.type = "button"; button.id = "workspace-import-image"; button.className = "source-action"; button.textContent = "Add image"; button.setAttribute("aria-label", "Add image to note");
+    button.addEventListener("click", () => upload.click()); upload.addEventListener("change", () => { importImages(upload.files); upload.value = ""; });
+    el("workspace-save").after(button, upload);
+    const reader = el("workspace-reader");
+    reader.addEventListener("paste", (event) => { if (event.clipboardData?.files?.length) { event.preventDefault(); importImages(event.clipboardData.files); } });
+    reader.addEventListener("dragover", (event) => { if ([...(event.dataTransfer?.types || [])].includes("Files")) event.preventDefault(); });
+    reader.addEventListener("drop", (event) => { if (event.dataTransfer?.files?.length) { event.preventDefault(); importImages(event.dataTransfer.files); } });
+  }
   el("show-workspace").addEventListener("click", () => { state.graphActive = false; showWorkspace(); renderActive(); });
   el("workspace-graph-open").addEventListener("click", showGlobalGraph);
   el("show-mapping").addEventListener("click", showMapping);

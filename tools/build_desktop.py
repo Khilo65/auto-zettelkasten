@@ -68,6 +68,9 @@ def build_command() -> list[str]:
         command += ["--collect-all", module]
     for distribution in ("numpy", "torch", "sentence-transformers", "igraph", "leidenalg"):
         command += ["--recursive-copy-metadata", distribution]
+    # Preview cache identities include the exact local rasterizer versions.
+    for distribution in ("pypdf", "pypdfium2", "Pillow"):
+        command += ["--copy-metadata", distribution]
     if importlib.util.find_spec("hdbscan") is not None:
         command += ["--collect-all", "hdbscan", "--copy-metadata", "hdbscan"]
     excluded = [

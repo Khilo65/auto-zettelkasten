@@ -365,3 +365,116 @@ def test_interrupted_receipt_without_outbox_operations_blocks_note_projection(se
         assert START not in (root / "Note.md").read_text()
     finally:
         resumed.close()
+
+
+def _preview_pdf(client):
+    from pypdf import PdfWriter
+    writer = PdfWriter(); writer.add_blank_page(width=200, height=300)
+    with client.pdf.open("wb") as stream:
+        writer.write(stream)
+
+
+def test_area_previews_update_closed_note_without_text_change_and_rebuild_missing_asset(setup):
+    root, _, ws, client, _, sync = setup
+    _preview_pdf(client)
+    row = annotation(); row["data"]["annotationType"] = "image"
+    client.rows[PDF] = [row]
+    buffers(setup); sync.run_once()
+    text = (root / "Note.md").read_text()
+    assert "![Image preview · PDF page 1](attachments/zotero/" in text
+    assert "[Open in PDF](zotero://open-pdf/library/items/" in text
+    job = sync.status(ws)["jobs"][0]
+    assert job["preview_status"] == "current" and job["preview_pending"] == 0
+    asset = next((root / "attachments" / "zotero").glob("*.png"))
+    asset.unlink()
+    sync.enqueue_attachment("users/0", PDF); sync.run_once()
+    assert asset.exists()
+    assert (root / "Note.md").read_text() == text
+    assert sync.status(ws)["counts"]["current"] == 1
+
+
+def test_optional_highlight_preview_is_read_only_derivative_and_survives_restart(setup, tmp_path):
+    from auto_zettelkasten.annotation_previews import AnnotationPreviews
+    root, docs, ws, client, service, sync = setup
+    _preview_pdf(client)
+    buffers(setup); sync.run_once()
+    current = docs.read(ws, "Note.md")
+    request = {"workspace_id": ws, "note_path": "Note.md", "document_id": current["id"], "revision": current["revision"],
+               "scope": "users/0", "attachment_key": PDF, "annotation_key": ANN, "expected_version": 2, "enabled": True}
+    assert not service.writes_enabled and not client.status()["authorized"]
+    enabled = service.handle("annotation-preview-request", request)
+    assert enabled["queued"] and enabled["enabled"]
+    sync.run_once()
+    text = (root / "Note.md").read_text()
+    assert "A source quotation" in text and "My comment" in text and "![Highlight preview" in text
+    assert not (service.private_root / "requests").exists()
+    service._annotation_previews = AnnotationPreviews(docs, service._annotation_previews.root)
+    sync.enqueue_attachment("users/0", PDF); sync.run_once()
+    assert (root / "Note.md").read_text() == text
+    current = docs.read(ws, "Note.md")
+    service.handle("annotation-preview-request", {**request, "revision": current["revision"], "enabled": False})
+    sync.run_once()
+    assert "![Highlight preview" not in (root / "Note.md").read_text()
+    assert list((root / "attachments" / "zotero").glob("*.png"))
+
+
+def test_preview_request_rejects_stale_version_detached_copy_and_wrong_source(setup, tmp_path):
+    root, docs, ws, _, service, _ = setup
+    current = docs.read(ws, "Note.md")
+    request = {"workspace_id": ws, "note_path": "Note.md", "document_id": current["id"], "revision": current["revision"],
+               "scope": "users/0", "attachment_key": PDF, "annotation_key": ANN, "expected_version": 1}
+    with pytest.raises(ValueError, match="annotation changed"):
+        service.handle("annotation-preview-request", request)
+    with pytest.raises(ValueError, match="boolean"):
+        service.handle("annotation-preview-request", {**request, "expected_version": 2, "enabled": 1})
+    with pytest.raises(ValueError):
+        service.handle("annotation-preview-request", {**request, "expected_version": 2, "scope": "groups/42"})
+    copied = tmp_path / "copy"; copied.mkdir()
+    (copied / "Note.md").write_text(current["text"])
+    new = docs.open(copied); copy_note = docs.read(new["id"], "Note.md")
+    with pytest.raises(ValueError, match="shared note"):
+        service.handle("annotation-preview-request", {**request, "workspace_id": new["id"], "document_id": copy_note["id"], "revision": copy_note["revision"], "expected_version": 2})
+
+
+def test_bad_preview_does_not_turn_saved_annotation_into_a_failed_note_update(setup):
+    root, _, ws, client, _, sync = setup
+    row = annotation(); row["data"]["annotationType"] = "image"
+    client.rows[PDF] = [row]  # deliberately invalid PDF bytes from legacy fixture
+    buffers(setup); sync.run_once()
+    text = (root / "Note.md").read_text()
+    assert START in text and "image preview pending" in text
+    status = sync.status(ws)
+    assert status["counts"]["current"] == 1 and status["jobs"][0]["preview_status"] == "unavailable"
+
+
+def test_previews_defer_draft_projection_and_refresh_ink_color_without_mutating_source(setup):
+    root, docs, ws, client, _, sync = setup
+    _preview_pdf(client)
+    row = annotation(); row["data"].update(annotationType="ink", annotationPosition=json.dumps({"pageIndex": 0, "paths": [[20, 40, 60, 80]], "width": 2}))
+    client.rows[PDF] = [row]
+    current = docs.read(ws, "Note.md")
+    buffers(setup, [{"path": "Note.md", "revision": current["revision"], "dirty": True, "text": current["text"] + "Pending thought.\n"}])
+    sync.run_once()
+    assert sync.status(ws)["jobs"][0]["state"] == "waiting_for_draft"
+    assert START not in (root / "Note.md").read_text()
+    buffers(setup, release_paths=["Note.md"]); sync.run_once()
+    first = (root / "Note.md").read_text()
+    assert "![Ink preview" in first
+    old_assets = set((root / "attachments" / "zotero").glob("*.png"))
+    row["data"]["annotationColor"] = "#ff0000"
+    sync.enqueue_attachment("users/0", PDF); sync.run_once()
+    assert (root / "Note.md").read_text() != first
+    assert set((root / "attachments" / "zotero").glob("*.png")) > old_assets
+    assert "Source summary." in (root / "Note.md").read_text()
+    assert client.rows[PDF][0]["data"]["annotationColor"] == "#ff0000"
+
+
+def test_unavailable_preview_inventory_preserves_confirmed_text_projection(setup, monkeypatch):
+    root, _, ws, _, service, sync = setup
+    def unavailable(*args, **kwargs):
+        raise ValueError("Invalid private annotation-preview inventory")
+    monkeypatch.setattr(service._annotation_previews, "prepare", unavailable)
+    buffers(setup); sync.run_once()
+    assert "A source quotation" in (root / "Note.md").read_text()
+    job = sync.status(ws)["jobs"][0]
+    assert job["state"] == "current" and job["preview_status"] == "unavailable"

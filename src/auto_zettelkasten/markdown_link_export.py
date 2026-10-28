@@ -24,6 +24,7 @@ import yaml
 from .documents import DocumentService, MAX_FILE_BYTES
 from .notes import GRAPH_END_MARKER, GRAPH_START_MARKER, RELATED_END_MARKER, RELATED_START_MARKER, RELATED_HEADING
 from .workspace import resolve_workspace
+from .workspace_media import WorkspaceMedia, image_references
 
 
 SCHEMA_VERSION = "markdown-related-export-v1"
@@ -344,7 +345,22 @@ def _snapshot(documents, workspace_id, cap):
     return contents, selected, _digest(identity), sum(row["override_saved"] for row in notes.values()), len(candidates), stale_count, personal_metadata
 
 
-def _matches_export(target, contents, manifest):
+def _asset_snapshot(documents, workspace_id, contents):
+    if not any(image_references(text) for text in contents.values()):
+        return {}
+    if hasattr(documents, "_directory"):
+        return WorkspaceMedia(documents).dependencies(workspace_id, contents)
+    # Experimental adapters may expose only note snapshots. The image reader
+    # still uses the same confined filesystem implementation, never Path reads.
+    service = DocumentService()
+    try:
+        identity = service.open(documents.workspace_path(workspace_id))["id"]
+        return WorkspaceMedia(service).dependencies(identity, contents)
+    finally:
+        service.close()
+
+
+def _matches_export(target, contents, manifest, assets=None):
     if not target.exists():
         return False
     if not any(target.iterdir()):
@@ -353,7 +369,8 @@ def _matches_export(target, contents, manifest):
     marker = target / _MANIFEST
     if metadata.is_symlink() or marker.is_symlink() or not marker.is_file() or marker.stat().st_size > 16 * 1024 * 1024:
         raise ValueError("Export destination contains existing files; choose a fresh folder.")
-    wanted = set(contents) | {_MANIFEST}
+    assets = assets or {}
+    wanted = set(contents) | set(assets) | {_MANIFEST}
     actual = set()
     for path in target.rglob("*"):
         if path.is_symlink():
@@ -365,6 +382,9 @@ def _matches_export(target, contents, manifest):
     for path, text in {**contents, _MANIFEST: _json(manifest) + "\n"}.items():
         if (target / path).read_bytes() != text.encode("utf-8"):
             raise ValueError("Existing export was edited or differs; choose a fresh folder.")
+    for path, row in assets.items():
+        if (target / path).read_bytes() != row["data"]:
+            raise ValueError("Existing export image was edited or differs; choose a fresh folder.")
     return True
 
 
@@ -394,14 +414,23 @@ def export_markdown_links(workspace, destination, *, apply=False, preview_identi
         elif not workspace_id or Path(documents.workspace_path(workspace_id)) != root:
             raise ValueError("Supply the current document workspace identity.")
         contents, selected, source_identity, override_count, candidate_count, stale_count, personal_metadata = _snapshot(documents, workspace_id, degree_cap)
+        assets = _asset_snapshot(documents, workspace_id, contents)
+        asset_metadata = {path: row["metadata"] for path, row in sorted(assets.items())}
+        normalized_paths = [unicodedata.normalize("NFKC", path).casefold() for path in [*contents, *assets]]
+        if len(normalized_paths) != len(set(normalized_paths)):
+            raise ValueError("Export image paths collide after portable case/Unicode normalization.")
         file_hashes = {path: hashlib.sha256(text.encode("utf-8")).hexdigest() for path, text in contents.items()}
+        file_hashes.update({path: row["metadata"]["revision"] for path, row in assets.items()})
         identity = _digest({"schema_version": SCHEMA_VERSION, "source": str(root), "destination": str(target),
                             "source_identity": source_identity, "degree_cap": degree_cap, "files": file_hashes})
         manifest = {"schema_version": SCHEMA_VERSION, "preview_identity": identity, "source_identity": source_identity,
                     "source_workspace": str(root), "degree_cap": degree_cap, "links": selected,
                     "files": file_hashes, "personal_metadata": personal_metadata,
                     "automatic_link_origin": "local_embedding_similarity", "jev_enabled": False, "provider_calls": 0}
-        existing = _matches_export(target, contents, manifest)
+        # Keep historical image-free manifests byte compatible.
+        if assets:
+            manifest["image_assets"] = asset_metadata
+        existing = _matches_export(target, contents, manifest, assets)
         report = {"status": "preview", "applied": False, "preview_identity": identity, "destination": str(target),
                   "note_count": len(contents), "edge_count": len(selected), "candidate_count": candidate_count,
                   "override_count": override_count, "degree_cap": degree_cap, "provider_calls": 0,
@@ -410,7 +439,9 @@ def export_markdown_links(workspace, destination, *, apply=False, preview_identi
                   "personal_property_count": sum(len(row["personal_properties"]) for row in personal_metadata.values()),
                   "personal_property_conflict_count": sum(len(row["property_conflicts"]) for row in personal_metadata.values()),
                   "jev_enabled": False, "source_changed": False,
-                  "planned_files": list(contents), "existing_matching_export": existing}
+                  "planned_files": [*contents, *sorted(assets)], "existing_matching_export": existing,
+                  "image_count": len(assets), "image_bytes": sum(row["metadata"]["size"] for row in assets.values()),
+                  "image_assets": list(asset_metadata.values())}
         if not apply:
             return report
         if preview_identity != identity:
@@ -427,9 +458,19 @@ def export_markdown_links(workspace, destination, *, apply=False, preview_identi
                     stream.write(text.encode("utf-8"))
                     stream.flush()
                     os.fsync(stream.fileno())
+            for relative, row in sorted(assets.items()):
+                file = stage / relative
+                file.parent.mkdir(parents=True, exist_ok=True)
+                with file.open("xb") as stream:
+                    stream.write(row["data"])
+                    stream.flush()
+                    os.fsync(stream.fileno())
             fresh = _snapshot(documents, workspace_id, degree_cap)
             if fresh[2] != source_identity:
                 raise ValueError("Notes or saved map changed before export; preview again.")
+            fresh_assets = _asset_snapshot(documents, workspace_id, fresh[0])
+            if {path: row["metadata"] for path, row in fresh_assets.items()} != asset_metadata:
+                raise ValueError("Referenced images changed before export; preview again.")
             if _destination(target, root, protected_overrides) != target or (target.parent.stat().st_dev, target.parent.stat().st_ino) != (parent_stamp.st_dev, parent_stamp.st_ino):
                 raise ValueError("Export destination changed before publication.")
             if target.exists() and any(target.iterdir()):

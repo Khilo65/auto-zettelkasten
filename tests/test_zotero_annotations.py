@@ -411,3 +411,18 @@ def test_projection_separates_personal_comment_from_source_blockquote(newline):
     assert ")\n\n  **Source quotation:**\n\n  > Source line one\n  > Source line two\n\n  **Personal comment:**\n\n  My interpretation  \n  Another personal line  \n" in normalized
     assert projected.startswith(human) and projected.endswith(tail)
     assert projected.count(START) == projected.count(END) == 1
+
+
+def test_structured_preview_pages_rebase_nested_notes_and_keep_exact_locators():
+    row = reader(); row["position"]["nextPageRects"] = [[10, 20, 30, 40]]
+    previews = {(SCOPE, ATTACHMENT, KEY): [
+        {"path": "attachments/zotero/first.png", "page_index": 0},
+        {"path": "attachments/zotero/next.png", "page_index": 1}]}
+    result = project_annotations("Human prose.\n", groups(row), previews=previews, source_path="notes/research/Note.md")
+    assert "../../attachments/zotero/first.png" in result["text"]
+    assert "PDF page 2" in result["text"] and "page=2&annotation=" + KEY in result["text"]
+    assert "A quoted finding" in result["text"] and "My interpretation" in result["text"]
+    for invalid in [[{"path": "../secret.png", "page_index": 0}], [{"path": "https://bad/image.png", "page_index": 0}],
+                    [{"path": "attachments/zotero/image.png", "page_index": 999}], previews[(SCOPE, ATTACHMENT, KEY)] * 2]:
+        with pytest.raises(AnnotationError):
+            project_annotations("", groups(row), previews={(SCOPE, ATTACHMENT, KEY): invalid}, source_path="notes/Note.md")

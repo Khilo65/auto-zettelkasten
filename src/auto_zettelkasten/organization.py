@@ -17,12 +17,15 @@ import stat
 import sys
 import time
 import unicodedata
+import posixpath
+from urllib.parse import quote
 
 from .documents import (
     DocumentError, MAX_ENTRIES, MAX_FILE_BYTES, MAX_SCANNED_ENTRIES, MAX_TREE_BYTES,
     _Anchor, _Directory, _ENGINE_DIRS, _SAFE_WRITES, _decode, _identity, _linked,
     _parts, _stamp,
 )
+from .workspace_media import IMAGE_EXTENSIONS, WorkspaceMedia, image_references
 
 
 def _hash(data):
@@ -211,6 +214,13 @@ class Relocations:
                         data[path] = raw
                         value = {"identity": list(_identity(info)), "mode": stat.S_IMODE(info.st_mode),
                                  "kind": "file", "revision": _hash(raw), "editable": documents[path]["editable"]}
+                    elif child and not _linked(info) and stat.S_ISREG(info.st_mode) and Path(path).suffix.casefold() in IMAGE_EXTENSIONS:
+                        try:
+                            _, metadata = WorkspaceMedia(service).read(service._workspace_id, path)
+                            value = {"identity": list(_identity(info)), "mode": stat.S_IMODE(info.st_mode),
+                                     "kind": "asset", "revision": metadata["revision"], "size": metadata["size"]}
+                        except (DocumentError, OSError):
+                            pass
                     inventory[path] = value
                 directory.verify()
         if len(inventory) > MAX_SCANNED_ENTRIES + 1 or len(documents) > MAX_ENTRIES:
@@ -218,6 +228,46 @@ class Relocations:
         if set(data) != set(documents):
             raise DocumentError("The workspace changed while preparing organization. Review a new preview.")
         return {"documents": documents, "inventory": inventory, "data": data}
+
+    def _image_repairs(self, capture, source, destination):
+        """Freeze image-path repairs using actual assets, never filename guesses."""
+        service, media, patches = self.service, WorkspaceMedia(self.service), []
+        for path, raw in capture["data"].items():
+            text, _, _ = _decode(raw)
+            text = text.replace("\r\n", "\n")
+            moved_path = _mapped(path, source, destination)
+            edits = []
+            for reference in image_references(text):
+                try:
+                    asset = media.resolve(service._workspace_id, path, reference["target"], wiki=reference["wiki"])
+                except DocumentError:
+                    # Unresolved pre-existing images cannot be repaired safely.
+                    # A moved note must not silently acquire a new interpretation.
+                    if moved_path != path:
+                        raise DocumentError("Resolve missing or ambiguous images before moving this note or folder.")
+                    continue
+                moved_asset = _mapped(asset["path"], source, destination)
+                if moved_path == path and moved_asset == asset["path"]:
+                    continue
+                relative = posixpath.relpath(moved_asset, posixpath.dirname(moved_path) or ".")
+                if reference["wiki"]:
+                    if any(char in relative for char in "#|[]"):
+                        raise DocumentError("An image path cannot be represented safely as a wikilink at this destination.")
+                    replacement = relative
+                else:
+                    replacement = quote(relative, safe="/")
+                before = text[reference["from"]:reference["to"]]
+                if before == replacement:
+                    continue
+                with service._directory(_parts(path)[:-1]) as directory:
+                    if not capture["documents"][path]["editable"] or service._reason(directory, text):
+                        raise DocumentError("This move would require repairing a protected generated note's image reference.")
+                edits.append({"from": len(text[:reference["from"]].encode("utf-16-le")) // 2,
+                              "to": len(text[:reference["to"]].encode("utf-16-le")) // 2,
+                              "before": before, "after": replacement})
+            if edits:
+                patches.append({"path": path, "revision": capture["documents"][path]["revision"], "edits": edits})
+        return patches
 
     def _collision(self, destination):
         parts = _parts(destination)
@@ -244,6 +294,9 @@ class Relocations:
             service._writable(directory)
         self._store()
         capture = self._capture()
+        if source == "attachments/zotero" or source.startswith("attachments/zotero/") or (
+                "attachments/zotero" in capture["inventory"] and "attachments/zotero".startswith(source + "/")):
+            raise DocumentError("Generated annotation asset folders cannot be moved in this rollout.")
         parent = "/".join(destination_parts[:-1])
         if capture["inventory"].get(parent, {}).get("kind") != "directory":
             raise DocumentError("Choose an existing destination folder using its current workspace path.")
@@ -261,16 +314,20 @@ class Relocations:
             if item["kind"] == "file":
                 if not item["editable"]:
                     raise DocumentError("Generated or read-only notes cannot be moved or renamed.")
+            elif item["kind"] == "asset":
+                if path.startswith("attachments/zotero/"):
+                    raise DocumentError("Generated annotation asset folders cannot be moved in this rollout.")
             elif item["kind"] == "directory":
                 with service._directory(_parts(path)) as directory:
                     service._writable(directory)
             else:
-                raise DocumentError("Folders containing hidden files, attachments, linked paths, or engine state cannot be moved.")
+                raise DocumentError("Folders containing hidden files, unsupported attachments, linked paths, or engine state cannot be moved.")
         self._collision(destination)
+        image_repairs = self._image_repairs(capture, source, destination)
         token = secrets.token_urlsafe(32)
         self.previews.clear()
         self.previews[token] = {"workspace_id": service._workspace_id, "source": source, "destination": destination,
-                                "kind": kind, "capture": capture, "created": time.monotonic()}
+                                "kind": kind, "capture": capture, "created": time.monotonic(), "image_repairs": image_repairs}
         moves = [{"from": path, "to": _mapped(path, source, destination),
                   "recovery_key": _hash(f"{service._root}\0{path}".encode()),
                   "target_recovery_key": _hash(f"{service._root}\0{_mapped(path, source, destination)}".encode())}
@@ -279,7 +336,10 @@ class Relocations:
             document["recovery_key"] = _hash(f"{service._root}\0{path}".encode())
         self.previews[token]["moves"] = moves
         return {"token": token, "source": source, "destination": destination, "kind": kind,
-                "moves": moves, "documents": list(capture["documents"].values()), "warnings": [], "truncated": False}
+                "moves": moves, "documents": list(capture["documents"].values()), "warnings": [], "truncated": False,
+                "image_repairs": image_repairs,
+                "image_assets": [{"path": path, "revision": item["revision"], "size": item["size"]}
+                                 for path, item in capture["inventory"].items() if item["kind"] == "asset"]}
 
     def _patch(self, capture, patches):
         if not isinstance(patches, list) or len(patches) > MAX_ENTRIES:
@@ -624,12 +684,16 @@ class Relocations:
         for path, entry in journal["subtree"].items():
             _parts(path)
             if ((path != journal["source"] and not path.startswith(journal["source"] + "/"))
-                    or not isinstance(entry, dict) or entry.get("kind") not in {"file", "directory"}
+                    or not isinstance(entry, dict) or entry.get("kind") not in {"file", "directory", "asset"}
                     or not identity(entry.get("identity"), stat.S_IFDIR if entry.get("kind") == "directory" else stat.S_IFREG)
                     or not mode(entry.get("mode"))):
                 raise DocumentError("The recovery journal contains an invalid subtree.")
             if entry["kind"] == "file" and (not revision(entry.get("revision")) or entry.get("editable") is not True):
                 raise DocumentError("The recovery journal contains an invalid note identity.")
+            if entry["kind"] == "asset" and (not revision(entry.get("revision")) or type(entry.get("size")) is not int
+                                               or not 0 < entry["size"] <= 25 * MAX_FILE_BYTES
+                                               or Path(path).suffix.casefold() not in IMAGE_EXTENSIONS):
+                raise DocumentError("The recovery journal contains an invalid image identity.")
         if journal["subtree"][journal["source"]]["kind"] != journal["kind"]:
             raise DocumentError("The recovery source kind does not match its identity.")
         for record in journal["records"]:
@@ -684,6 +748,21 @@ class Relocations:
         with self.service._directory() as directory:
             self.service._writable(directory)
         self._collision(preview["destination"])
+        if repair and preview.get("image_repairs"):
+            if not isinstance(patches, list) or any(not isinstance(patch, dict) for patch in patches):
+                raise DocumentError("Supply a bounded list of reviewed reference repairs.")
+            combined = {patch.get("path"): {**patch, "edits": list(patch.get("edits", []))}
+                        for patch in patches}
+            if len(combined) != len(patches):
+                raise DocumentError("Reference repairs require unique writable notes.")
+            for patch in preview["image_repairs"]:
+                if patch["path"] in combined:
+                    if combined[patch["path"]].get("revision") != patch["revision"]:
+                        raise DocumentError("The reviewed image-reference revision changed.")
+                    combined[patch["path"]]["edits"].extend(patch["edits"])
+                else:
+                    combined[patch["path"]] = {**patch, "edits": list(patch["edits"])}
+            patches = list(combined.values())
         replacements = self._patch(preview["capture"], patches)
         try:
             journal = self._journal_create(preview, replacements)

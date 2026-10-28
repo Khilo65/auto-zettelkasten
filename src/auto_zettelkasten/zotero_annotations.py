@@ -13,7 +13,8 @@ import hashlib
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import posixpath
 import re
 import secrets
 import stat
@@ -369,11 +370,13 @@ def annotation_recall_records(groups):
     return sorted(records, key=lambda row: (row["scope"], row["attachment_key"], row["page_index"], row["sort_index"], row["annotation_key"]))
 
 
-def project_annotations(markdown, attachment_groups, *, expected_hash=None, previews=None):
+def project_annotations(markdown, attachment_groups, *, expected_hash=None, previews=None, source_path=None):
     """Return a projection, never mutate the note. Its returned hash is a CAS token.
 
     ``previews`` maps (scope, attachment key, annotation key) to already-created
-    relative PNG/JPEG/WebP assets. Image extraction is the caller's responsibility.
+    relative PNG/JPEG/WebP assets. Structured lists contain verified workspace
+    asset paths and physical page indices. Image extraction is the caller's
+    responsibility; source_path rebases workspace paths for portable Markdown.
     """
     if not isinstance(markdown, str) or len(markdown.encode("utf-8")) > 16 * 1024 * 1024:
         raise AnnotationError("Note exceeds the annotation projection limit.")
@@ -411,13 +414,42 @@ def project_annotations(markdown, attachment_groups, *, expected_hash=None, prev
             lines.extend(f"  {_escape(line)}  " for line in record["comment"].split("\n"))
         preview = previews.get((*attachment, record["annotation_key"]))
         if preview is not None:
-            if (record["type"] not in {"image", "ink"} or not isinstance(preview, str) or len(preview) > 512
-                    or not re.fullmatch(r"[A-Za-z0-9_./-]+\.(?:png|jpe?g|webp)", preview, re.I)
-                    or preview.startswith("/") or ".." in preview.split("/") or "//" in preview):
-                raise AnnotationError("Annotation previews require a safe relative image asset.")
-            lines += ["", f"  ![Annotation preview]({preview})"]
+            if record["type"] not in {"image", "ink", "highlight", "underline"}:
+                raise AnnotationError("This annotation does not support image previews.")
+            legacy = isinstance(preview, str)
+            if legacy:
+                if (len(preview) > 512 or not re.fullmatch(r"[A-Za-z0-9_./-]+\.(?:png|jpe?g|webp)", preview, re.I)
+                        or preview.startswith("/") or ".." in preview.split("/") or "//" in preview):
+                    raise AnnotationError("Annotation previews require a safe relative image asset.")
+                assets = [{"path": preview, "page_index": record["page_index"]}]
+            else:
+                assets = preview
+                if not isinstance(assets, list) or not 1 <= len(assets) <= 2:
+                    raise AnnotationError("Annotation previews require at most two page images.")
+            if source_path is not None:
+                source = PurePosixPath(source_path)
+                if (source.is_absolute() or ".." in source.parts or any(p.startswith(".") for p in source.parts)
+                        or source.suffix.lower() != ".md" or str(source) != source_path):
+                    raise AnnotationError("Annotation preview source must be a direct Markdown path.")
+            pages = set()
+            for asset in assets:
+                if not isinstance(asset, dict):
+                    raise AnnotationError("Annotation preview requires a verified image path and page.")
+                path, page = asset.get("path"), asset.get("page_index")
+                if (not isinstance(path, str) or len(path) > 1024 or "\\" in path or "\x00" in path
+                        or not re.fullmatch(r"[A-Za-z0-9_./-]+\.(?:png|jpe?g|webp)", path, re.I)
+                        or path.startswith("/") or ".." in path.split("/") or "//" in path
+                        or type(page) is not int or page not in {record["page_index"], record["page_index"] + 1}
+                        or page in pages or page != record["page_index"] and record["type"] not in {"highlight", "underline"}):
+                    raise AnnotationError("Annotation previews require a safe relative image asset and exact page.")
+                pages.add(page)
+                relative = posixpath.relpath(path, str(PurePosixPath(source_path).parent)) if source_path is not None and not legacy else path
+                alt = "Annotation preview" if legacy else f"{record['type'].capitalize()} preview · PDF page {page + 1}"
+                lines += ["", f"  ![{alt}]({relative})"]
+                if not legacy:
+                    lines += ["", f"  [Open in PDF]({annotation_uri(record['scope'], record['attachment_key'], record['annotation_key'], page)})"]
         elif record["type"] in {"image", "ink"}:
-            lines += ["", "  Visual annotation; open the PDF to inspect it."]
+            lines += ["", "  Visual annotation; image preview pending. Open the PDF to inspect it."]
         lines.append("")
     if not records:
         lines += ["No confirmed annotations.", ""]

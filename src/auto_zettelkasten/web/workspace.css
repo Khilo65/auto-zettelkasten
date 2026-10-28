@@ -8,6 +8,18 @@
   --workspace-accent: oklch(52% .20 295);
   --workspace-selection: oklch(93.5% .025 295);
 }
+.markdown-image { display: inline-block; max-width: 100%; vertical-align: top; }
+.markdown-image-open { display: block; max-width: 100%; padding: 0; border: 0; background: transparent; cursor: zoom-in; }
+.markdown-image img { display: block; max-width: 100%; object-fit: contain; }
+.markdown-image img:not([height]) { height: auto; }
+.markdown-image-status { display: block; font-size: .85em; color: var(--workspace-muted); padding: .3em 0; }
+.markdown-image-source { display: block; margin-top: .3em; color: var(--workspace-accent); background: transparent; border: 0; padding: 2px 0; font-size: .85em; }
+.workspace-image-viewer { position: fixed; inset: 0; z-index: 100; display: flex; flex-direction: column; align-items: center; gap: 16px; padding: 16px; overflow: auto; background: oklch(12% .008 290 / .94); color: var(--workspace-paper); }
+.workspace-image-viewer > header { align-self: stretch; display: flex; align-items: center; justify-content: flex-end; gap: 12px; flex: 0 0 auto; }
+.workspace-image-viewer > header > :first-child { margin-right: auto; overflow-wrap: anywhere; }
+.workspace-image-viewer button { border: 1px solid oklch(80% .01 290 / .6); border-radius: 5px; padding: 5px 12px; background: transparent; color: inherit; font: inherit; cursor: pointer; }
+.workspace-image-viewer button:focus-visible { outline: 2px solid oklch(78% .13 295); outline-offset: 3px; }
+.workspace-image-viewer > img { display: block; object-fit: contain; max-width: 100%; max-height: calc(100dvh - 100px); flex: 0 1 auto; min-height: 0; margin: auto; }
 body { padding-left: 44px; }
 body.workspace-active { overflow: hidden; background: var(--workspace-paper); }
 .workspace-rail { position: fixed; inset: 0 auto 0 0; width: 44px; z-index: 20; display: flex; flex-direction: column; align-items: center; gap: 5px; padding: 8px 2px; background: var(--workspace-rail); border-right: 1px solid var(--workspace-line); }

@@ -13,7 +13,7 @@ const url = `${origin}/api/zotero/attachments/opaque-capability-123456/file`;
 const annotation = { id: 'ABCD1234', type: 'highlight', text: 'Synthetic quotation', sortIndex: '00000|000001', position: { pageIndex: 0, rects: [[10, 10, 50, 25]] } };
 
 function setup() {
-  const events = [], calls = [], timers = new Map();
+  const events = [], calls = [], timers = new Map(), listeners = new Map();
   let options;
   const reader = {
     initializedPromise: new Promise(() => {}),
@@ -33,15 +33,63 @@ function setup() {
   const win = {
     location: { origin, hash: `#instance=${instanceId}` }, parent,
     document: { getElementById: () => ({ hidden: false, textContent: '' }) },
-    addEventListener: () => {},
+    addEventListener: (type, fn) => listeners.set(type, fn),
     setTimeout: fn => { const id = timers.size + 1; timers.set(id, fn); return id; },
     clearTimeout: id => timers.delete(id),
     createReader: input => { options = input; return reader; },
   };
   const host = createHost(win);
   const send = (data, overrides = {}) => host.handle({ source: parent, origin, data: { channel: CHANNEL, instanceId, ...data }, ...overrides });
-  return { events, calls, timers, host, reader, send, options: () => options };
+  const previewMenu = ids => {
+    const items = [];
+    listeners.get('customEvent')?.({ detail: { type: 'createAnnotationContextMenu', reader, params: { ids }, append: (...rows) => items.push(...rows) } });
+    return items;
+  };
+  return { events, calls, timers, host, reader, send, previewMenu, options: () => options };
 }
+
+test('confirmed read-only highlights have a separate preview action without native writes or consent', async () => {
+  const f = setup();
+  await f.send({ type: 'init', document: { url }, annotations: [{ ...annotation, version: 3, readOnly: true }] });
+  const items = f.previewMenu([annotation.id]);
+  assert.equal(items.length, 1); assert.equal(items[0].label, 'Show image in note');
+  items[0].onCommand();
+  const request = f.events.find(row => row.type === 'preview-request');
+  assert.equal(request.annotationId, annotation.id); assert.equal(request.annotationVersion, 3); assert.equal(request.enabled, true);
+  assert.equal(f.events.some(row => ['save-annotations', 'delete-annotations', 'retain-annotations'].includes(row.type)), false);
+  assert.equal(f.calls.some(row => row[0] === 'readOnly'), false);
+  assert.equal(f.timers.size, 0);
+  assert.equal(f.previewMenu([annotation.id]).length, 0, 'one preview request at a time');
+  await f.send({ type: 'preview-result', annotationId: annotation.id, annotationVersion: 2, success: true, enabled: true });
+  assert.equal(f.previewMenu([annotation.id]).length, 0, 'stale preview acknowledgements are ignored');
+  await f.send({ type: 'preview-result', annotationId: annotation.id, annotationVersion: 3, success: true, enabled: true });
+  assert.equal(f.previewMenu([annotation.id])[0].label, 'Hide image in note');
+});
+
+test('preview menus reject unconfirmed, unsaved, unknown and multiple selections', async () => {
+  const f = setup();
+  await f.send({ type: 'init', document: { url }, annotations: [{ ...annotation, version: 3 }, { ...annotation, id: 'ZERO0000', version: 0 }, { ...annotation, id: 'AREA0001', type: 'image', version: 3 }] });
+  for (const ids of [[], ['UNKNOWN1'], ['ZERO0000'], ['AREA0001'], [annotation.id, 'AREA0001']]) assert.equal(f.previewMenu(ids).length, 0);
+  const items = f.previewMenu([annotation.id]);
+  f.reader._annotationManager._unsavedAnnotations.set(annotation.id, { ...annotation, comment: 'not confirmed' });
+  assert.equal(f.previewMenu([annotation.id]).length, 0);
+  items[0].onCommand(); assert.equal(f.events.some(row => row.type === 'preview-request'), false, 'menu actions recheck unsaved state');
+  f.reader._annotationManager._unsavedAnnotations.clear();
+  await f.send({ type: 'annotations', annotations: [{ ...annotation, version: 4 }] });
+  items[0].onCommand(); assert.equal(f.events.some(row => row.type === 'preview-request'), false, 'old menus cannot bind to a new version');
+});
+
+test('preview preferences survive reader setup and failures do not fail annotation writes', async () => {
+  const f = setup();
+  await f.send({ type: 'init', document: { url }, annotations: [{ ...annotation, version: 1 }], previewPreferences: { [annotation.id]: true } });
+  assert.equal(f.previewMenu([annotation.id])[0].label, 'Hide image in note');
+  f.previewMenu([annotation.id])[0].onCommand();
+  await f.send({ type: 'preview-result', annotationId: annotation.id, annotationVersion: 1, success: false, error: 'Preview unavailable' });
+  assert.equal(f.previewMenu([annotation.id])[0].label, 'Hide image in note');
+  assert.equal(f.events.some(row => row.type === 'error'), false);
+  await f.send({ type: 'preview-preferences', previewPreferences: { [annotation.id]: false } });
+  assert.equal(f.previewMenu([annotation.id])[0].label, 'Show image in note');
+});
 
 test('PDF URL accepts only a same-origin capability endpoint', () => {
   assert.equal(attachmentURL(url, origin), url);

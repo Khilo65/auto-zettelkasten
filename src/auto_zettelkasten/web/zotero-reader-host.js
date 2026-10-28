@@ -54,6 +54,45 @@
     const pending = new Map();
     const retainedWrites = new Map();
     const retaining = new Map();
+    const confirmedAnnotations = new Map();
+    const previewPending = new Map();
+    let previewPreferences = {};
+
+    function previewSettings(value) {
+      if (value === undefined) return {};
+      if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length > 10000
+          || Object.entries(value).some(([id, enabled]) => !KEY.test(id) || typeof enabled !== 'boolean')) throw new Error('Invalid annotation preview preferences');
+      return { ...value };
+    }
+
+    function previewable(id) {
+      const annotation = confirmedAnnotations.get(id);
+      if (closed || closing || queuedWrites || failedWrite || previewPending.has(id)
+          || !annotation || !['highlight', 'underline'].includes(annotation.type)
+          || !Number.isSafeInteger(annotation.version) || annotation.version < 1
+          || reader?._annotationManager?._unsavedAnnotations?.has(id)) return null;
+      return annotation;
+    }
+
+    function previewMenu(event) {
+      // This pinned upstream extension hook retains annotation IDs; the
+      // rendered onOpenContextMenu callback deliberately does not expose them.
+      const detail = event.detail;
+      if (!reader || detail?.reader !== reader || detail.type !== 'createAnnotationContextMenu'
+          || !Array.isArray(detail.params?.ids) || detail.params.ids.length !== 1 || typeof detail.append !== 'function') return;
+      const id = detail.params.ids[0], annotation = previewable(id);
+      if (!annotation) return;
+      const enabled = previewPreferences[id] !== true;
+      detail.append({
+        label: enabled ? 'Show image in note' : 'Hide image in note',
+        onCommand: () => {
+          const current = previewable(id);
+          if (!current || current.version !== annotation.version) return;
+          previewPending.set(id, { version: current.version, enabled });
+          emit('preview-request', { annotationId: id, annotationVersion: current.version, enabled });
+        },
+      });
+    }
 
     function setReadOnly(value) {
       // Upstream also resets the active tool when this is called. A routine
@@ -170,6 +209,14 @@
       if (event.source !== parent || event.origin !== origin || !data ||
           data.channel !== CHANNEL || data.instanceId !== instanceId || closed) return;
       try {
+        if (data.type === 'preview-result') {
+          const request = previewPending.get(data.annotationId);
+          if (!request || request.version !== data.annotationVersion) return;
+          previewPending.delete(data.annotationId);
+          if (data.success === true && data.enabled === request.enabled) previewPreferences[data.annotationId] = request.enabled;
+          else if (typeof data.error === 'string' && status) { status.textContent = data.error; status.hidden = false; }
+          return;
+        }
         if (data.type === 'retention-result') {
           const ids = retaining.get(data.operationId);
           if (!ids) return;
@@ -199,6 +246,8 @@
           if (reader || initializing) throw new Error('Reader already initialized');
           const url = attachmentURL(data.document?.url, origin);
           const annotations = annotationList(data.annotations || []);
+          previewPreferences = previewSettings(data.previewPreferences);
+          for (const row of annotations) confirmedAnnotations.set(row.id, row);
           const location = readerLocation(data.location);
           if (typeof win.createReader !== 'function') throw new Error('The pinned Zotero reader build is unavailable');
           initializing = true;
@@ -248,6 +297,7 @@
         if (data.type === 'annotations') {
           if (failedWrite) throw new Error('Reconcile pending annotation writes before refreshing');
           const annotations = annotationList(data.annotations || []);
+          if (data.previewPreferences !== undefined) previewPreferences = previewSettings(data.previewPreferences);
           const ids = data.deletedIds || [];
           if (!Array.isArray(ids) || ids.some(id => !KEY.test(id))) throw new Error('Invalid deleted annotation identity');
           const local = new Set(reader._annotationManager?._unsavedAnnotations?.keys() || []);
@@ -270,7 +320,10 @@
           if (updates.length || permissionUpdates.length) reader.setAnnotations([...updates, ...permissionUpdates]);
           const removed = ids.filter(id => !local.has(id));
           if (removed.length) reader.unsetAnnotations(removed);
+          for (const value of annotations) confirmedAnnotations.set(value.id, value);
+          for (const id of ids) { confirmedAnnotations.delete(id); previewPending.delete(id); delete previewPreferences[id]; }
         }
+        else if (data.type === 'preview-preferences') previewPreferences = previewSettings(data.previewPreferences);
         else if (data.type === 'navigate') await reader.navigate(readerLocation(data.location));
         else if (data.type === 'read-only') {
           requestedReadOnly = data.readOnly !== false;
@@ -297,6 +350,7 @@
       return { handle, close };
     }
     win.addEventListener('message', handle);
+    win.addEventListener('customEvent', previewMenu);
     emit('ready');
     return { handle, close };
   }

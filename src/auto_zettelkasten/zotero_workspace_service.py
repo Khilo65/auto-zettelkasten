@@ -239,6 +239,8 @@ class ZoteroWorkspaceService:
         self._unbound_notes = {}
         self.annotation_sync = None
         self._projection_previews = {}
+        from .annotation_previews import AnnotationPreviews
+        self._annotation_previews = AnnotationPreviews(documents, self.private_root / "annotation-previews")
 
     def _status(self):
         value = self.client.status()
@@ -784,6 +786,7 @@ class ZoteroWorkspaceService:
         reader = {"id": self._reader_id(pdf), "title": _record_data(attachment).get("title") or "Source PDF",
             "url": f"/api/zotero/attachments/{token}/file", "scope": scope, "attachment_key": key,
             "item_key": pdf.parent_item, "annotations": annotations, "location": location,
+            "preview_preferences": self._preview_preferences(data.get("workspace_id"), pdf, annotations),
             "readOnly": not status["writable"] or replaced or blocked or attachment_read_only, "attachment_read_only": attachment_read_only,
             "pdf_identity": identity, "source_pdf_uri": source_uri,
             "readOnlyReason": "Pending annotation changes require recovery." if blocked else
@@ -1112,6 +1115,7 @@ class ZoteroWorkspaceService:
                 "The PDF changed; verify annotations before editing." if replaced else
                 "Authorize editing in Zotero." if not status["writable"] else permission_reason,
             annotations=self._annotations(scope, key, writable=status["writable"] and not replaced and not blocked and not attachment_read_only))
+        result["preview_preferences"] = self._preview_preferences(data.get("workspace_id"), pdf, result["annotations"])
         if confirmed_change:
             self._notify_annotations(scope, key)
         if not reconcile and status["connected"] and not replaced:
@@ -1289,6 +1293,74 @@ class ZoteroWorkspaceService:
     def _projection_pause_path(receipt_path):
         return receipt_path.with_suffix(".pause.json")
 
+    def _preview_note(self, data):
+        """Verify a shared binding without acquiring native write authorization."""
+        current = self.documents.read(data["workspace_id"], data["note_path"])
+        if current["id"] != data.get("document_id"):
+            raise ValueError("The preview request is not bound to the selected note.")
+        if current["revision"] != data.get("revision"):
+            raise DocumentConflict(current)
+        if (not current.get("live_note") or current.get("live_note_phase") != "archived"
+                or current.get("live_identity_valid") is not True):
+            raise ValueError("Annotation previews require a verified active shared note.")
+        status = self._status()
+        scope, key = _scope(data.get("scope", "users/0")), _key(data.get("attachment_key"))
+        pdf = self.client.pdf_file(scope, key)
+        binding = current["live_binding"]
+        binding_scope = "users/0" if binding["library_type"] == "user" and binding["library_id"] == "0" else f"groups/{binding['library_id']}"
+        if (not status["connected"] or status.get("server_id") != binding["server_id"]
+                or (binding["server_id"], binding_scope, binding["item_key"]) != (pdf.server_id, scope, pdf.parent_item)
+                or self._pdf_baseline(pdf)[2]):
+            raise ValueError("The PDF no longer matches this active source note.")
+        return current, pdf
+
+    def _preview_preferences(self, workspace_id, pdf, annotations):
+        if not isinstance(workspace_id, str):
+            return {}
+        return self._annotation_previews.preferences(workspace_id, pdf, annotations)
+
+    def _annotation_preview_request(self, data):
+        current, pdf = self._preview_note(data)
+        key, version = _key(data.get("annotation_key")), _version(data.get("expected_version"))
+        enabled = data.get("enabled", True)
+        if type(enabled) is not bool:
+            raise ValueError("The preview preference requires an explicit boolean.")
+        pending, receipts = self._pending_attachment(pdf.scope, pdf.attachment_key)
+        if pending or receipts:
+            raise AnnotationConflict("Resolve retained annotation changes before choosing their image preview.")
+        annotation = next((row for row in self._annotations(pdf.scope, pdf.attachment_key) if row["id"] == key), None)
+        if annotation is None or annotation["version"] != version:
+            raise AnnotationConflict("The annotation changed. Refresh it before choosing its image preview.")
+        if annotation["type"] not in {"highlight", "underline"}:
+            raise ValueError("Area and drawing previews are automatic; only text selection previews are optional.")
+        self._annotation_previews.preference(data["workspace_id"], pdf, key, enabled)
+        if self.annotation_sync is not None:
+            self.annotation_sync.enqueue_attachment(pdf.scope, pdf.attachment_key)
+        return {"queued": True, "enabled": enabled, "annotation_key": key,
+                "preview_status": "pending" if enabled else "disabled", "revision": current["revision"],
+                "preview_preferences": self._preview_preferences(data["workspace_id"], pdf, self._annotations(pdf.scope, pdf.attachment_key))}
+
+    def _prepare_images(self, workspace_id, note_path, pdf, annotations, *, render):
+        try:
+            return self._annotation_previews.prepare(workspace_id, note_path, pdf, annotations, render=render)
+        except (ValueError, OSError, RuntimeError, ImportError) as exc:
+            # Derived-image failures must not prevent confirmed quotations and
+            # comments reaching the note. Invalid private state is not rewritten.
+            return {"items": {}, "status": "unavailable", "reason": "Image preview pending: " + str(exc),
+                    "visual_hash": _sha("annotation-preview-unavailable"), "pending_count": 1, "rendered": 0}
+
+    def prepare_annotation_previews(self, data, annotations):
+        # Internal worker interface. The HTTP action never accepts client-supplied
+        # geometry or paths; it reads its own authoritative annotation records.
+        with self._lock:
+            _, pdf = self._preview_note(data)
+            return self._prepare_images(data["workspace_id"], data["note_path"], pdf, annotations, render=True)
+
+    @staticmethod
+    def _projection_assets(groups):
+        return {(group["scope"], group["attachment_key"], key): assets
+                for group in groups for key, assets in group.get("preview_assets", {}).items()}
+
     def _projection_context(self, data, root, root_identity, receipt_path):
         workspace_id, note_path = data["workspace_id"], data["note_path"]
         current = self.documents.read(workspace_id, note_path)
@@ -1309,9 +1381,12 @@ class ZoteroWorkspaceService:
         groups = previous["groups"] if previous else []
         groups = [group for group in groups if (group["scope"], group["attachment_key"]) != (scope, key)]
         attachment = self.client.item(scope, key)
+        annotations = self._annotations(scope, key)
+        preview = self._prepare_images(workspace_id, note_path, pdf, annotations, render=False)
         groups.append({"scope": scope, "attachment_key": key, "title": _record_data(attachment).get("title") or "Source PDF",
             "confirmed": True, "pdf_hash": identity, "expected_pdf_hash": identity,
-            "annotations": self._annotations(scope, key)})
+            "annotations": annotations, "preview_assets": preview["items"],
+            "preview_status": preview["status"], "visual_hash": preview["visual_hash"]})
         return current, previous, groups
 
     def _projection_status(self, data):
@@ -1337,7 +1412,8 @@ class ZoteroWorkspaceService:
             if self._projection_status(data)["paused"]:
                 return {"deferred": True, "paused": True, "reason": "Automatic annotation updates are paused for this note."}
             current, previous, groups = self._projection_context(data, root, root_identity, receipt_path)
-            projected = project_annotations(current["text"], groups, expected_hash=previous["block_hash"] if previous else None)
+            projected = project_annotations(current["text"], groups, expected_hash=previous["block_hash"] if previous else None,
+                previews=self._projection_assets(groups), source_path=note_path)
             return self._commit_projection(data, root, root_identity, receipt_path, current, previous, groups, projected)
 
     def _commit_projection(self, data, root, root_identity, receipt_path, current, previous, groups, projected):
@@ -1356,7 +1432,8 @@ class ZoteroWorkspaceService:
         if self.annotation_sync is not None:
             self.annotation_sync.projected(data["workspace_id"], data["note_path"], _scope(data.get("scope", "users/0")),
                 _key(data.get("attachment_key")), document["revision"])
-        return {"document": document, "block_hash": projected["block_hash"], "annotation_count": len(projected["annotations"]), "unchanged": unchanged}
+        return {"document": document, "block_hash": projected["block_hash"], "annotation_count": len(projected["annotations"]), "unchanged": unchanged,
+            "preview_status": next((group["preview_status"] for group in groups if group.get("preview_status") not in {None, "current"}), "current")}
 
     @staticmethod
     def _existing_section(text):
@@ -1375,7 +1452,7 @@ class ZoteroWorkspaceService:
         with _receipt_guard(receipt_path):
             current, previous, groups = self._projection_context(data, root, root_identity, receipt_path)
             _, existing = self._existing_section(current["text"])
-            proposed = project_annotations("", groups)["text"]
+            proposed = project_annotations("", groups, previews=self._projection_assets(groups), source_path=data["note_path"])["text"]
             token = secrets.token_urlsafe(24)
             self._projection_previews = {key: value for key, value in self._projection_previews.items() if value["expires"] > time.monotonic()}
             while len(self._projection_previews) >= 32:
@@ -1420,7 +1497,7 @@ class ZoteroWorkspaceService:
                 text = text.replace(START, "").replace(END, "")
                 if existing:
                     text = text.replace("## Highlights and annotations", "## Personal annotation notes", 1)
-            projected = project_annotations(text, groups)
+            projected = project_annotations(text, groups, previews=self._projection_assets(groups), source_path=data["note_path"])
             result = self._commit_projection(data, root, root_identity, receipt_path, current, previous, groups, projected)
             self._projection_pause_path(receipt_path).unlink(missing_ok=True)
             self._projection_previews.pop(data["preview_token"], None)
@@ -1490,6 +1567,8 @@ class ZoteroWorkspaceService:
                 return self._annotation_retry(data)
             if action == "annotation-discard":
                 return self._annotation_discard(data)
+            if action == "annotation-preview-request":
+                return self._annotation_preview_request(data)
             if action == "annotation-project":
                 return self._project(data)
             if action == "annotation-projection-status":

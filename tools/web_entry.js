@@ -9,6 +9,7 @@ export * from "./workspace_links.js";
 export * from "./workspace_sources.js";
 export { compactCoverageNotice } from "./workspace_coverage.js";
 export * from "./workspace_properties.js";
+export * from "./workspace_images.js";
 export { LibraryParser } from "./workspace_index_client.js";
 export { fitGraph, layoutGraph } from "./workspace_graph.js";
 export { createGraphView } from "./workspace_graph_view.js";
@@ -16,6 +17,7 @@ export * from "./workspace_graph_colors.js";
 export * from "./workspace_graph_communities.js";
 import { parseZoteroURI, sourceLinkMarkup } from "./workspace_sources.js";
 import { renderIndexedMarkdown, renderReferenceEmbed } from "./workspace_links.js";
+import { imagePlaceholder, isImageDestination, parseImageReference } from "./workspace_images.js";
 export { syntaxTree, syntaxHighlighting, defaultHighlightStyle, bracketMatching, indentOnInput, foldGutter, foldKeymap } from "@codemirror/language";
 export { markdown, markdownLanguage, markdownKeymap, insertNewlineContinueMarkup, deleteMarkupBackward } from "@codemirror/lang-markdown";
 
@@ -41,14 +43,29 @@ export const icons = Object.fromEntries(Object.entries(iconNodes).map(([name, no
 ]));
 
 const markdownRenderer = new MarkdownIt({ html: false, linkify: false, typographer: false });
+markdownRenderer.inline.ruler.before("link", "workspace_image_wiki", (state, silent) => {
+  const from = state.pos, embed = state.src.startsWith("![[", from);
+  if ((!embed && !state.src.startsWith("[[", from)) || state.linkLevel > 0) return false;
+  const start = from + (embed ? 3 : 2), end = state.src.indexOf("]]", start);
+  if (end < 0 || end - start > 2048 || /[\n\r]/.test(state.src.slice(start, end))) return false;
+  const raw = state.src.slice(start, end), split = raw.indexOf("|");
+  const destination = (split < 0 ? raw : raw.slice(0, split)).trim();
+  if (!isImageDestination(destination) || raw.includes("[[")) return false;
+  if (!silent) {
+    const token = state.push("workspace_image", "", 0);
+    token.meta = parseImageReference(destination, split < 0 ? destination : raw.slice(split + 1).trim(), { kind: "wiki", embed });
+  }
+  state.pos = end + 2; return true;
+});
+markdownRenderer.renderer.rules.workspace_image = (tokens, index) => imagePlaceholder(tokens[index].meta);
 markdownRenderer.renderer.rules.image = (tokens, index) => {
-  const alt = markdownRenderer.utils.escapeHtml(tokens[index].content || "Image");
-  return `<span class="markdown-image">[${alt}]</span>`;
+  return imagePlaceholder(parseImageReference(tokens[index].attrGet("src") || "", tokens[index].content, { embed: true }));
 };
 // Relative destinations need the workspace resolver; never navigate the local server.
 markdownRenderer.renderer.rules.link_open = (tokens, index) => {
   const href = tokens[index].attrGet("href") || "";
   if (parseZoteroURI(href)) return sourceLinkMarkup(href, "").replace(/<\/a>$/, "");
+  if (isImageDestination(href) && !/^https?:\/\//i.test(href)) return imagePlaceholder(parseImageReference(href, "", { embed: false }), { openOnly: true });
   return /^https?:\/\//i.test(href)
     ? `<a href="${markdownRenderer.utils.escapeHtml(href)}" target="_blank" rel="noopener noreferrer">`
     : "<span class=\"markdown-link\">";

@@ -11,6 +11,7 @@ import hashlib
 from pathlib import Path
 import re
 from typing import Any, Mapping, Sequence
+from urllib.parse import unquote
 
 from .files import safe_filename
 from .indexes import local_retrieval_projection
@@ -118,9 +119,46 @@ def _publisher_footer_end(text: str, start: int) -> int | None:
     return next_heading.start() if next_heading else len(text)
 
 
+def _link_destination(value: str) -> str:
+    match = re.match(r"[ \t\r\n]*(?:<([^>\r\n]*)>|((?:\\.|[^\s])+))", value)
+    return unquote(re.sub(r"\\(.)", r"\1", (match[1] if match[1] is not None else match[2]))) if match else ""
+
+
+def _reference_destinations(text: str) -> dict[str, str]:
+    """Read reference targets without treating fenced examples as definitions."""
+    result = {}
+    fence = ""
+    fence_size = 0
+    for line in text.splitlines():
+        marker = _FENCE.match(line)
+        if marker:
+            if not fence:
+                fence, fence_size = marker[1][0], len(marker[1])
+            elif marker[1][0] == fence and len(marker[1]) >= fence_size and not marker[2].strip():
+                fence = ""
+            continue
+        if fence:
+            continue
+        match = re.match(r"^ {0,3}\[([^]\r\n]+)\]:[ \t]*(.+)$", line)
+        if match:
+            key = " ".join(match[1].split()).casefold()
+            result.setdefault(key, _link_destination(match[2]))
+    return result
+
+
+def _image_markup_start(line: str, index: int) -> int:
+    if not index or line[index - 1] != "!":
+        return index
+    before, escapes = index - 2, 0
+    while before >= 0 and line[before] == "\\":
+        before, escapes = before - 1, escapes + 1
+    return index - 1 if escapes % 2 == 0 else index
+
+
 def _semantic_exclusions(text: str) -> list[tuple[int, int, str]]:
     """Locate invisible syntax without rewriting source slices or code literals."""
     result = []
+    reference_destinations = _reference_destinations(text)
     offset = 0
     fence = ""
     fence_size = 0
@@ -133,6 +171,9 @@ def _semantic_exclusions(text: str) -> list[tuple[int, int, str]]:
             continue
         if match:
             fence, fence_size = match[1][0], len(match[1])
+            offset += len(line)
+            continue
+        if line.startswith(("    ", "\t")):
             offset += len(line)
             continue
         if line.strip() == "Citation":
@@ -175,7 +216,12 @@ def _semantic_exclusions(text: str) -> list[tuple[int, int, str]]:
                     break
                 content = line[index + 2:close]
                 pipe = next((i for i, char in enumerate(content) if char == "|" and (i == 0 or content[i - 1] != "\\")), -1)
-                start = index - 1 if index and line[index - 1] == "!" else index
+                start = _image_markup_start(line, index)
+                destination = unquote(content.split("|", 1)[0]).split("#", 1)[0].strip()
+                if re.search(r"\.(?:png|jpe?g|webp|gif|svg|avif|bmp|tiff?)$", destination, re.I):
+                    result.append((offset + start, offset + close + 2, "image_reference"))
+                    index = close + 2
+                    continue
                 if pipe >= 0 and content[pipe + 1:].strip():
                     result.append((offset + start, offset + index + 3 + pipe, "link_destination"))
                 else:
@@ -203,12 +249,27 @@ def _semantic_exclusions(text: str) -> list[tuple[int, int, str]]:
                         if close_tail is not None:
                             ending = following + close_tail
                     if ending is not None:
-                        start = index - 1 if index and line[index - 1] == "!" else index
+                        start = _image_markup_start(line, index)
+                        if line[following] == "(":
+                            destination = _link_destination(text[offset + following + 1:offset + ending])
+                        else:
+                            key = line[following + 1:ending] or line[index + 1:close]
+                            destination = reference_destinations.get(" ".join(key.split()).casefold(), "")
+                        image_target = re.search(r"\.(?:png|jpe?g|webp|gif|svg|avif|bmp|tiff?)(?:[?#].*)?$", destination, re.I)
+                        if image_target:
+                            result.append((offset + start, offset + ending + 1, "image_reference"))
+                            index = ending + 1
+                            continue
                         result.append((offset + start, offset + index + 1, "link_markup"))
                         result.append((offset + close, offset + ending + 1, "link_destination"))
                         hidden_tails[close] = ending + 1
                         index += 1  # Nested image/link labels remain visible syntax to inspect.
                         continue
+                start = _image_markup_start(line, index)
+                destination = reference_destinations.get(" ".join(line[index + 1:close].split()).casefold(), "")
+                if (start < index
+                        and re.search(r"\.(?:png|jpe?g|webp|gif|svg|avif|bmp|tiff?)(?:[?#].*)?$", destination, re.I)):
+                    result.append((offset + start, offset + close + 1, "image_reference"))
                 index = close + 1
                 continue
             index += 1

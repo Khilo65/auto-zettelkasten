@@ -2,7 +2,7 @@
 
 // Each PDF lives in its own upstream reader window. The note editor stays owned
 // by workspace.js so source and note tabs never create competing text buffers.
-window.createSourceReader = function ({ container, api, message, onAnnotations, onState }) {
+window.createSourceReader = function ({ container, api, message, onAnnotations, onState, onPreview }) {
   const channel = "az-zotero-reader-v1", entries = new Map();
   let active = null;
   function permissions(entry, result = {}) {
@@ -80,13 +80,32 @@ window.createSourceReader = function ({ container, api, message, onAnnotations, 
     if (data.type === "ready") {
       entry.ready = true;
       send(entry, "init", { document: { url: entry.config.url, attachmentKey: entry.config.attachment_key }, annotations: entry.config.annotations,
-        location: entry.config.location, viewState: entry.resetViewState ? null : entry.viewState || savedState(entry), readOnly: entry.config.readOnly !== false });
+        location: entry.config.location, viewState: entry.resetViewState ? null : entry.viewState || savedState(entry), readOnly: entry.config.readOnly !== false,
+        previewPreferences: entry.config.preview_preferences || {} });
     } else if (data.type === "initialized") {
       entry.initialized = true; entry.frame.inert = false;
       permissions(entry);
       send(entry, "suspend", { suspended: active !== entry.config.id });
     } else if (data.type === "view-state" && data.primary !== false && data.viewState) {
       entry.viewState = data.viewState; entry.resetViewState = false; persist(entry); onState?.(entry.config.id, data.viewState);
+    } else if (data.type === "preview-request") {
+      const annotation = entry.config.annotations.find(row => row.id === data.annotationId);
+      const reply = fields => send(entry, "preview-result", { annotationId: data.annotationId, annotationVersion: data.annotationVersion, ...fields });
+      let admitted = false;
+      try {
+        if (!entry.initialized || entry.pending || entry.failed || entry.previewPending.has(data.annotationId)
+            || typeof onPreview !== "function" || typeof data.enabled !== "boolean"
+            || !annotation || !/^[A-Z0-9]{8}$/.test(annotation.id) || !["highlight", "underline"].includes(annotation.type)
+            || !Number.isSafeInteger(annotation.version) || annotation.version < 1 || annotation.version !== data.annotationVersion) {
+          throw new Error("Refresh and save this annotation before requesting its image preview.");
+        }
+        entry.previewPending.add(data.annotationId); admitted = true;
+        await onPreview(entry.config, { ...annotation }, data.enabled);
+        entry.config.preview_preferences = { ...(entry.config.preview_preferences || {}), [annotation.id]: data.enabled };
+        reply({ success: true, enabled: data.enabled });
+      } catch (error) {
+        reply({ success: false, error: error.message }); message(`Annotation image: ${error.message}`, true);
+      } finally { if (admitted) entry.previewPending.delete(data.annotationId); }
     } else if (data.type === "retain-annotations") {
       entry.pending += 1; entry.failed = true; entry.failedOperations.add(data.operationId); permissions(entry);
       try {
@@ -147,8 +166,8 @@ window.createSourceReader = function ({ container, api, message, onAnnotations, 
     register(config) {
       config = { ...config, read_only_reason: config.read_only_reason ?? config.readOnlyReason ?? "" };
       let entry = entries.get(config.id);
-      if (!entry) { entry = { config, frame: null, pending: 0, failed: false, failedOperations: new Set(), viewState: null, closing: false, hasMounted: false, renewing: false, mountEpoch: 0, resetViewState: false }; entries.set(config.id, entry); }
-      else { entry.mountEpoch += 1; entry.config = config; permissions(entry, config); if (entry.initialized && !entry.pending && !entry.failed) { send(entry, "annotations", { annotations: config.annotations }); if (config.location) send(entry, "navigate", { location: config.location }); } }
+      if (!entry) { entry = { config, frame: null, pending: 0, previewPending: new Set(), failed: false, failedOperations: new Set(), viewState: null, closing: false, hasMounted: false, renewing: false, mountEpoch: 0, resetViewState: false }; entries.set(config.id, entry); }
+      else { entry.mountEpoch += 1; entry.config = config; permissions(entry, config); if (entry.initialized && !entry.pending && !entry.failed) { send(entry, "annotations", { annotations: config.annotations, previewPreferences: config.preview_preferences || {} }); if (config.location) send(entry, "navigate", { location: config.location }); } }
       return entry.config;
     },
     activate(id) {
@@ -192,8 +211,9 @@ window.createSourceReader = function ({ container, api, message, onAnnotations, 
       if (result.annotations) {
         const deletedIds = entry.config.annotations.filter((old) => !result.annotations.some((row) => row.id === old.id)).map((row) => row.id);
         entry.config.annotations = result.annotations;
+        if (result.preview_preferences) entry.config.preview_preferences = result.preview_preferences;
         if (entry.failed) { entry.frame?.remove(); entry.frame = null; entry.failed = false; entry.failedOperations.clear(); onState?.(entry.config.id, entry.viewState); if (active === id) mount(entry); }
-        else if (entry.initialized) send(entry, "annotations", { annotations: result.annotations, deletedIds });
+        else if (entry.initialized) send(entry, "annotations", { annotations: result.annotations, deletedIds, previewPreferences: entry.config.preview_preferences || {} });
         await onAnnotations?.(entry.config);
       }
     },

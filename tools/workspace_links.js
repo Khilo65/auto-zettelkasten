@@ -3,6 +3,7 @@ import { graphNodeOrigin } from "./workspace_graph_colors.js";
 import { compactCoverageNotice } from "./workspace_coverage.js";
 import { propertyLists, renderProperties } from "./workspace_properties.js";
 import { isZoteroScheme, parseZoteroURI, sourceLinkMarkup } from "./workspace_sources.js";
+import { imagePlaceholder, isImageDestination, parseImageReference } from "./workspace_images.js";
 
 export const LIMITS = Object.freeze({
   documents: 5000,
@@ -176,8 +177,11 @@ function absolutePosition(env, local) {
 
 function reference(state, from, to, token, kind, embed, destination, label, range = null) {
   if (state.env.suppressReferences) return;
-  if (state.env.referencesFound.length >= state.env.referenceBudget) { state.env.referenceLimit = true; return; }
-  if (externalLink(destination)) return;
+  const image = (embed && kind === "markdown" && (!/\.md(?:#|$)/i.test(destination) || externalLink(destination)))
+    || (isImageDestination(destination) && (embed || !externalLink(destination)));
+  if (!image && externalLink(destination)) return;
+  if (image && state.env.assetsFound.length >= state.env.assetBudget) return;
+  if (!image && state.env.referencesFound.length >= state.env.referenceBudget) { state.env.referenceLimit = true; return; }
   const first = absolutePosition(state.env, from);
   const last = absolutePosition(state.env, to);
   const line = lineAt(state.env.originalStarts, first);
@@ -187,6 +191,12 @@ function reference(state, from, to, token, kind, embed, destination, label, rang
     destination, label, embed, kind,
     ...(range ? { destinationFrom: range.from, destinationTo: range.to, destinationRaw: state.env.original.slice(range.from, range.to), ...(range.definition ? { definition: range.definition } : {}) } : {}),
   };
+  if (image) {
+    const asset = { ...result, ...parseImageReference(destination, label, { kind, embed, from: first, to: last, sourcePath: state.env.path }) };
+    token.meta = { ...token.meta, workspaceAsset: asset };
+    state.env.assetsFound.push(asset);
+    return;
+  }
   token.meta = { ...token.meta, workspaceReference: result };
   state.env.referencesFound.push(result);
 }
@@ -305,7 +315,7 @@ function parseNote(path, text, budgets, limits) {
   text = String(text ?? "");
   const referenceBudget = Math.max(0, Math.min(limits.references, budgets.referenceBudget ?? limits.references));
   const syntaxBudget = Math.max(0, Math.min(limits.syntaxPerDocument, budgets.syntaxBudget ?? limits.syntaxPerDocument));
-  const result = { path, text, aliases: [], tags: [], headings: [], blocks: [], references: [], tokens: [], warnings: [], truncated: false, unsupported: false, referenceBudget, referenceLimited: false, syntaxBudget, syntaxCost: 0, syntaxLimited: false };
+  const result = { path, text, aliases: [], tags: [], headings: [], blocks: [], references: [], images: [], assets: [], tokens: [], warnings: [], truncated: false, unsupported: false, referenceBudget, referenceLimited: false, syntaxBudget, syntaxCost: 0, syntaxLimited: false };
   if (text.length > limits.documentCharacters) { result.truncated = true; result.warnings.push("Note exceeds the link-index character limit"); return result; }
   result.syntaxCost = syntaxCost(text, syntaxBudget);
   if (result.syntaxCost > syntaxBudget) {
@@ -324,7 +334,7 @@ function parseNote(path, text, budgets, limits) {
   result.frontmatter = properties.frontmatter;
   result.warnings.push(...properties.warnings);
   const source = properties.frontmatter ? normalized.slice(0, properties.frontmatter.to).replace(/[^\n]/g, " ") + normalized.slice(properties.frontmatter.to) : normalized;
-  const env = { original: text, originalStarts, normalizedStarts, normalizedLines: source.split("\n"), referencesFound: [], tagsFound: new Set(), excluded: [], htmlComments: [], referenceBudget, destinationDefinitions: new Map() };
+  const env = { path, original: text, originalStarts, normalizedStarts, normalizedLines: source.split("\n"), referencesFound: [], assetsFound: [], tagsFound: new Set(), excluded: [], htmlComments: [], referenceBudget, assetBudget: limits.references, destinationDefinitions: new Map() };
   try { result.tokens = parser.parse(source, env); }
   catch { result.unsupported = true; result.warnings.push("Note could not be parsed for links"); return result; }
   for (const token of result.tokens) {
@@ -339,6 +349,8 @@ function parseNote(path, text, budgets, limits) {
     }
   }
   result.references = env.referencesFound.sort((left, right) => left.from - right.from);
+  result.assets = env.assetsFound.sort((left, right) => left.from - right.from);
+  result.images = result.assets.filter(ref => ref.embed);
   const literature = result.tokens.filter((token) => token.type === "html_block" && /^<!-- auto-zettelkasten:literature:(?:start|end) -->\s*$/.test(token.content) && text.slice(originalStarts[token.map[0]], originalStarts[token.map[0] + 1] ?? text.length).trimEnd() === token.content.trim());
   if (literature.length === 2 && literature[0].content.trim() === "<!-- auto-zettelkasten:literature:start -->" && literature[1].content.trim() === "<!-- auto-zettelkasten:literature:end -->") {
     const from = originalStarts[literature[0].map[1]], to = originalStarts[literature[1].map[0]];
@@ -1174,6 +1186,7 @@ function renderEmbed(index, sourcePath, ref, context) {
 parser.renderer.rules.workspace_wiki = (tokens, at, _options, env) => {
   const token = tokens[at];
   if (token.meta?.sourceURI) return sourceLinkMarkup(token.meta.sourceURI, token.content);
+  if (token.meta?.workspaceAsset) return imagePlaceholder({ ...token.meta.workspaceAsset, sourcePath: env.path });
   const raw = token.meta?.workspaceReference;
   const ref = raw ? { ...raw, from: raw.from + env.context.offset } : null;
   if (!ref) return escapeHtml(token.content);
@@ -1187,6 +1200,7 @@ parser.renderer.rules.link_open = (tokens, at, _options, env) => {
   const source = parseZoteroURI(href);
   if (source) return `<a href="#" class="source-link" data-source-uri="${escapeHtml(source.uri)}">`;
   if (/^https?:\/\//i.test(href)) return `<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">`;
+  if (token.meta?.workspaceAsset) return imagePlaceholder({ ...token.meta.workspaceAsset, sourcePath: env.path }, { openOnly: true });
   const raw = token.meta?.workspaceReference;
   const ref = raw ? { ...raw, from: raw.from + env.context.offset } : null;
   return ref ? linkMarkup(env.index, env.path, ref).open : "<span>";
@@ -1198,6 +1212,7 @@ parser.renderer.rules.link_close = (tokens, at, _options, env) => {
     if (tokens[before].type !== "link_open") continue;
     if (depth) { depth -= 1; continue; }
     if (/^https?:\/\//i.test(tokens[before].attrGet("href") || "") || parseZoteroURI(tokens[before].attrGet("href"))) return "</a>";
+    if (tokens[before].meta?.workspaceAsset) return "</span>";
     const raw = tokens[before].meta?.workspaceReference;
     const ref = raw ? { ...raw, from: raw.from + env.context.offset } : null;
     return ref ? linkMarkup(env.index, env.path, ref).close : "</span>";
@@ -1205,6 +1220,7 @@ parser.renderer.rules.link_close = (tokens, at, _options, env) => {
   return "</span>";
 };
 parser.renderer.rules.image = (tokens, at, _options, env) => {
+  if (tokens[at].meta?.workspaceAsset) return imagePlaceholder({ ...tokens[at].meta.workspaceAsset, sourcePath: env.path });
   const raw = tokens[at].meta?.workspaceReference;
   const ref = raw ? { ...raw, from: raw.from + env.context.offset } : null;
   return ref && /\.md(?:#|$)/i.test(ref.destination) ? renderEmbed(env.index, env.path, ref, env.context) : `<span class="markdown-image">[${escapeHtml(tokens[at].content || "Image")}]</span>`;

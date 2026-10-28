@@ -222,7 +222,7 @@ class AnnotationSyncService:
             value = self._state()
         jobs = []
         for job in sorted(value["jobs"].values(), key=lambda row: (row["note_path"], row["attachment_key"])):
-            item = {key: copy.deepcopy(job[key]) for key in ("id", "note_path", "scope", "attachment_key", "server_id", "state", "reason", "document_id", "revision", "ready", "updated_at") if key in job}
+            item = {key: copy.deepcopy(job[key]) for key in ("id", "note_path", "scope", "attachment_key", "server_id", "state", "reason", "document_id", "revision", "ready", "updated_at", "preview_status", "preview_reason", "preview_pending") if key in job}
             jobs.append(item)
         counts = {state: sum(job["state"] == state for job in jobs) for state in sorted(_STATES)}
         drafts = [copy.deepcopy(row) for row in value["drafts"].values()]
@@ -431,8 +431,16 @@ class AnnotationSyncService:
             annotations = result.get("annotations")
             if not isinstance(annotations, list):
                 raise ValueError("A complete annotation snapshot is unavailable.")
-            checked = self._snapshot_hash(annotations)
-            self._update_job(token, epoch, checked_hash=checked)
+            preview = self.zotero.prepare_annotation_previews(data, annotations)
+            # Visual freshness is independent of substantive annotation text:
+            # a color edit, enabled preview or deleted asset still needs work.
+            checked = _digest([self._snapshot_hash(annotations), preview["visual_hash"]])
+            self._update_job(token, epoch, checked_hash=checked, preview_status=preview["status"],
+                             preview_reason=preview["reason"], preview_pending=preview["pending_count"])
+            next_due = time.time() + self.poll_seconds
+            if preview["pending_count"] and preview["rendered"]:
+                next_due = 0
+                self._event.set()
             with self._projection_lock:
                 with self._lock:
                     if epoch != self._epoch or not self._started:
@@ -445,28 +453,30 @@ class AnnotationSyncService:
                     blocked = any(row["note_path"] == job["note_path"] for row in value["drafts"].values())
                     opened = job["note_path"] in self._open_paths()
                 if checked == latest.get("snapshot_hash") and projection.get("state") == "current":
-                    self._update_job(token, epoch, state="current", reason="Annotations are saved in Zotero and this note.", due_at=time.time() + self.poll_seconds)
+                    self._update_job(token, epoch, state="current", reason="Annotations are saved in Zotero and this note.", due_at=next_due)
                 elif blocked:
-                    self._update_job(token, epoch, state="waiting_for_draft", reason="Saved in Zotero. Save or discard the note draft to update its annotation section.", due_at=time.time() + self.poll_seconds)
+                    self._update_job(token, epoch, state="waiting_for_draft", reason="Saved in Zotero. Save or discard the note draft to update its annotation section.", due_at=next_due)
                 elif opened:
-                    self._update_job(token, epoch, state="ready", ready=True, reason="Saved in Zotero. The open editor can apply the note update.", due_at=time.time() + self.poll_seconds)
+                    self._update_job(token, epoch, state="ready", ready=True, reason="Saved in Zotero. The open editor can apply the note update.", due_at=next_due)
                 else:
                     # Never hold the sync lock across a service call: confirmed
                     # projection calls projected(), and native writes enqueue jobs.
                     result = self.zotero.handle("annotation-project", data)
                     if result.get("deferred"):
-                        self._update_job(token, epoch, state="waiting_for_draft", reason=result.get("reason", "The note update is waiting."), due_at=time.time() + self.poll_seconds)
+                        self._update_job(token, epoch, state="waiting_for_draft", reason=result.get("reason", "The note update is waiting."), due_at=next_due)
                     else:
                         document = result.get("document", current)
                         self._update_job(token, epoch, state="current", snapshot_hash=checked, ready=False, revision=document.get("revision", current["revision"]),
-                                         reason="Annotations are saved in Zotero and this note.", due_at=time.time() + self.poll_seconds)
+                                         reason="Annotations are saved in Zotero and this note.", due_at=next_due)
         except (DocumentConflict, AnnotationConflict) as exc:
             self._update_job(token, epoch, state="blocked", ready=False, reason=str(exc), due_at=time.time() + self.poll_seconds)
         except (ValueError, RuntimeError, OSError) as exc:
             code = getattr(exc, "code", "")
             waiting = code in {"unavailable", "authorization_required", "access_denied", "server_changed"}
             self._update_job(token, epoch, state="waiting_for_zotero" if waiting else "failed", ready=False,
-                             reason=str(exc), due_at=time.time() + self.poll_seconds)
+                             reason=str(exc), preview_status="last_confirmed" if waiting else "stale",
+                             preview_reason="Last confirmed preview; source verification is unavailable." if waiting else "Preview verification is required: " + str(exc),
+                             due_at=time.time() + self.poll_seconds)
 
     def _due_jobs(self, epoch):
         with self._lock:

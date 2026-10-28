@@ -18,6 +18,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Mapping
+from urllib.parse import parse_qs, urlsplit
 
 from . import api
 from .documents import DocumentConflict, DocumentError, DocumentIndexChanged, DocumentService
@@ -200,6 +201,9 @@ class LocalApp:
             journal_root=self.preferences_path.parent / "workspace-operations",
             override_root=self.preferences_path.parent / "workspace-overrides",
         )
+        from .workspace_media import WorkspaceMedia
+        self.media = WorkspaceMedia(self.documents)
+        self._media_grants = {}
         from .note_recall import NoteRecallService
 
         from .zotero_workspace_service import ZoteroWorkspaceService
@@ -471,8 +475,23 @@ class LocalApp:
     def _document_request(self, route: str, data: dict):
         try:
             if route == "/api/workspace/open":
+                self._media_grants.clear()
                 return {"workspace": self.documents.open(data.get("path"))}
             workspace_id = data.get("workspace_id")
+            if route == "/api/workspace/media-open":
+                if set(data) != {"workspace_id", "path"}:
+                    raise RequestError("Choose an image in the selected workspace.")
+                _, asset = self.media.read(workspace_id, data.get("path"))
+                return {"asset": self._media_reference(workspace_id, asset)}
+            if route == "/api/workspace/media-resolve":
+                if set(data) - {"workspace_id", "source_path", "target", "wiki"} or type(data.get("wiki", False)) is not bool:
+                    raise RequestError("Unsupported image reference options.")
+                asset = self.media.resolve(workspace_id, data.get("source_path"), data.get("target"), wiki=data.get("wiki", False))
+                return {"asset": self._media_reference(workspace_id, asset)}
+            if route == "/api/workspace/media-inventory":
+                if set(data) != {"workspace_id"}:
+                    raise RequestError("Image inventory requires the selected workspace only.")
+                return self.media.inventory(workspace_id)
             if route in {"/api/workspace/export-links-preview", "/api/workspace/export-links"}:
                 self._editable()
                 allowed = {"workspace_id", "destination", "degree_cap"}
@@ -542,6 +561,30 @@ class LocalApp:
             raise
         except DocumentError as exc:
             raise RequestError(str(exc)) from exc
+
+    def _media_reference(self, workspace_id, asset):
+        identity = (workspace_id, asset["path"], asset["revision"])
+        for capability, record in self._media_grants.items():
+            if record == identity:
+                return {**asset, "url": f"/api/workspace/media/{capability}"}
+        while len(self._media_grants) >= 2048:
+            self._media_grants.pop(next(iter(self._media_grants)))
+        capability = secrets.token_urlsafe(32)
+        self._media_grants[capability] = identity
+        return {**asset, "url": f"/api/workspace/media/{capability}"}
+
+    def import_image(self, workspace_id, source_path, payload, filename):
+        with self.lock:
+            self._editable()
+            asset = self.media.import_image(workspace_id, source_path, payload, filename=filename)
+            return {"asset": self._media_reference(workspace_id, asset), "workspace": self.documents.tree(workspace_id)}
+
+    def read_media(self, capability):
+        with self.lock:
+            record = self._media_grants.get(capability)
+            if record is None:
+                raise RequestError("This image reference expired. Reopen the note.")
+            return self.media.read(record[0], record[1], revision=record[2])
 
     @staticmethod
     def _check_workspace(workspace):
@@ -784,7 +827,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.split("?", 1)[0].startswith("/zotero-reader"):
             self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self' blob:; img-src 'self' data: blob:; font-src 'self' data: blob:; worker-src 'self' blob:; object-src 'none'; frame-src 'self'; frame-ancestors 'self'; base-uri 'self'; form-action 'none'")
         else:
-            self.send_header("Content-Security-Policy", f"default-src 'self'; style-src 'self' 'nonce-{self.server.app.token}'; script-src 'self'; connect-src 'self'; img-src 'none'; object-src 'none'; frame-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+            self.send_header("Content-Security-Policy", f"default-src 'self'; style-src 'self' 'nonce-{self.server.app.token}'; script-src 'self'; connect-src 'self'; img-src 'self'; object-src 'none'; frame-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
         self.end_headers()
         self.wfile.write(body)
 
@@ -838,6 +881,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         route = self.path.split("?", 1)[0]
         try:
+            media_route = re.fullmatch(r"/api/workspace/media/([A-Za-z0-9_-]{32,128})", route)
+            if media_route and self.command == "GET":
+                body, metadata = self.server.app.read_media(media_route[1])
+                self._reply(200, body, metadata["mime"])
+                return
             pdf_route = re.fullmatch(r"/api/zotero/attachments/([A-Za-z0-9_-]{16,256})/file", route)
             if pdf_route and self.command == "GET":
                 self._pdf(pdf_route[1])
@@ -845,6 +893,26 @@ class Handler(BaseHTTPRequestHandler):
             if route.startswith("/api/"):
                 if not secrets.compare_digest(self.headers.get("X-Session-Token", ""), self.server.app.token):
                     self._reply(403, {"error": "Invalid local session."})
+                    return
+                if route == "/api/workspace/import-image" and self.command == "POST":
+                    from .workspace_media import MAX_IMAGE_BYTES
+                    try:
+                        query = parse_qs(urlsplit(self.path).query, keep_blank_values=True, max_num_fields=3)
+                    except ValueError:
+                        raise RequestError("Invalid image import options.")
+                    if set(query) != {"workspace_id", "source_path", "filename"} or any(len(values) != 1 for values in query.values()):
+                        raise RequestError("An image import requires its workspace, note and filename.")
+                    try:
+                        length = int(self.headers.get("Content-Length", "0"))
+                    except ValueError:
+                        raise RequestError("Invalid image length.")
+                    if not 0 < length <= MAX_IMAGE_BYTES:
+                        raise RequestError("Image imports must be at most 25 MiB.")
+                    payload = self.rfile.read(length)
+                    if len(payload) != length:
+                        raise RequestError("Image upload was interrupted. Your note is unchanged.")
+                    result = self.server.app.import_image(query["workspace_id"][0], query["source_path"][0], payload, query["filename"][0])
+                    self._reply(200, result)
                     return
                 data = None
                 if self.command == "POST":
@@ -904,7 +972,7 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(409, {"error": str(exc), "code": "conflict", "current": exc.current})
         except DocumentIndexChanged as exc:
             self._reply(409, {"error": str(exc), "code": "index_changed"})
-        except RequestError as exc:
+        except (RequestError, DocumentError) as exc:
             self._reply(400, {"error": str(exc)})
         except Exception:
             self._reply(500, {"error": "The local operation failed. Check Zotero, your connection, and destination."})

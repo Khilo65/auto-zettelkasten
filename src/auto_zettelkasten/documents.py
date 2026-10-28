@@ -1086,6 +1086,10 @@ class DocumentService:
                                     row_reason = str(exc)
                                 if not info.st_mode & 0o222 and not row_reason:
                                     row_reason = "The note is read-only."
+                        elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and Path(name).suffix.casefold() in {".png", ".jpg", ".jpeg", ".webp"}:
+                            kind = "asset"
+                            presentation = {"media_type": "image"}
+                            row_reason = "Image attachment. Open to view; organize through a reviewed move."
                         else:
                             continue
                         entries.append({"path": relative, "name": name, "kind": kind, "editable": not row_reason, "reason": row_reason, **presentation})
