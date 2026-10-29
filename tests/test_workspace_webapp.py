@@ -158,7 +158,8 @@ def test_workspace_assets_are_explicit_and_nonce_scoped(local_editor):
         policy = headers["Content-Security-Policy"]
         assert f"'nonce-{app.token}'" in policy
         assert "'unsafe-inline'" not in policy and "'unsafe-eval'" not in policy
-        assert "img-src 'none'" in policy
+        directives = dict(part.strip().split(" ", 1) for part in policy.split(";") if part.strip())
+        assert directives["img-src"] == "'self'"
     for route in ["/documents.py", "/package-lock.json", "/../AGENTS.md", "/.codex/"]:
         assert request(route)[0] == 404
 

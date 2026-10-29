@@ -302,6 +302,7 @@ def test_concurrent_enqueue_has_one_winner_and_isolates_library(tmp_path):
 
 def test_outbox_rejects_public_directory_symlinks_and_external_records(tmp_path):
     public = tmp_path / "public"; public.mkdir(mode=0o755)
+    public.chmod(0o755)  # Keep the insecure fixture explicit under restrictive process umasks.
     with pytest.raises(AnnotationError):
         PendingAnnotations(public).pending()
     real = tmp_path / "real"; real.mkdir(mode=0o700)
