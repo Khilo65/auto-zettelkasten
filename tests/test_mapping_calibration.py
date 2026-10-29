@@ -8,6 +8,13 @@ from auto_zettelkasten.local_mapping import LocalMappingError, LocalMappingOptio
 from auto_zettelkasten import mapping_calibration as calibration
 
 
+@pytest.fixture
+def native_graph():
+    pytest.importorskip("numpy")
+    pytest.importorskip("igraph")
+    pytest.importorskip("leidenalg")
+
+
 def _data():
     np = pytest.importorskip("numpy")
     ids = [f"source-{number:02d}" for number in range(20)]
@@ -147,7 +154,7 @@ def test_cached_vectors_reuse_checkpoints_without_encoder_and_fail_corruption(tm
     assert (tmp_path / "result.json").read_bytes() == saved
 
 
-def test_auto_gate_reuses_embeddings_and_adds_scales_without_touching_notes(tmp_path):
+def test_auto_gate_reuses_embeddings_and_adds_scales_without_touching_notes(native_graph, tmp_path):
     from test_local_mapping import _Encoder, _row, _text
     from auto_zettelkasten.local_mapping import build_local_map
     ids, _, collections, reviews = _data()
@@ -192,7 +199,7 @@ def test_held_out_vectors_cannot_change_training_policy():
     assert changed["selected_parameters"] == baseline["selected_parameters"]
 
 
-def test_training_top64_not_cut_off_by_held_out_neighbors():
+def test_training_top64_not_cut_off_by_held_out_neighbors(native_graph):
     np = pytest.importorskip("numpy")
     ids = [f"source-{number:03d}" for number in range(100)]
     collections = {sid: ["A" if index < 50 else "B"] for index, sid in enumerate(ids)}
@@ -223,7 +230,7 @@ def test_boundary_validation_is_explicit(field, value):
         calibration.calibrate_mapping(**kwargs)
 
 
-def test_new_auto_library_checks_resolution_without_review_or_model_refit(tmp_path):
+def test_new_auto_library_checks_resolution_without_review_or_model_refit(native_graph, tmp_path):
     from test_local_mapping import _Encoder, _row, _text
     from auto_zettelkasten.local_mapping import build_local_map
     encoder = _Encoder()
@@ -239,7 +246,7 @@ def test_new_auto_library_checks_resolution_without_review_or_model_refit(tmp_pa
     assert "reviewed discovery calibration" in " ".join(result["tuning"]["limitations"])
 
 
-def test_citation_signals_bound_to_allowed_split_and_report_identity(monkeypatch):
+def test_citation_signals_bound_to_allowed_split_and_report_identity(native_graph, monkeypatch):
     ids, vectors, collections, reviews = _data()
     held = calibration.stratified_holdout(collections)
     train = [sid for sid in ids if sid not in held]

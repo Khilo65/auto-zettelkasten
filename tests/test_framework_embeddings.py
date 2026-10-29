@@ -227,6 +227,7 @@ def test_cross_text_batches_stop_before_next_inference_when_guard_changes():
 
 
 def hippo_embedder_fixture(monkeypatch, hook):
+    pytest.importorskip("numpy")
     import sys
     from types import SimpleNamespace
     class BaseEmbeddingModel:
@@ -241,7 +242,7 @@ def hippo_embedder_fixture(monkeypatch, hook):
 
 @pytest.mark.parametrize('count', [1024, 1025, 2050])
 def test_hippo_large_logical_batches_preserve_vectors_order_and_derived_limits(monkeypatch, count):
-    import numpy as np
+    np = pytest.importorskip("numpy")
     guards, batches = [], []
     transport, seen = fixture_transport(guard=lambda: guards.append(True))
     class RecordingDerived(DerivedEmbeddingTransport):
@@ -270,7 +271,7 @@ def test_hippo_large_logical_batches_preserve_vectors_order_and_derived_limits(m
 
 
 def test_hippo_batch_validation_and_single_query_behavior_stay_strict(monkeypatch):
-    import numpy as np
+    np = pytest.importorskip("numpy")
     transport, seen = fixture_transport()
     client = hippo_embedder_fixture(monkeypatch, DerivedEmbeddingTransport(transport))
     for texts in ([], b'bytes', None, iter(['x']), ['x'] * 1024 + [' '], ['x'] * 1024 + [2]):
